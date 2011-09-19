@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <ctype.h>
 #include <string.h>
+#include <fnmatch.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <errno.h>
@@ -2059,7 +2060,7 @@ static char *underscores(char *string)
 void *supported_file;
 unsigned long supported_size;
 
-static const char *supported(struct module *mod)
+static const char *supported(const char *modname)
 {
 	unsigned long pos = 0;
 	char *line;
@@ -2067,8 +2068,9 @@ static const char *supported(struct module *mod)
 	/* In a first shot, do a simple linear scan. */
 	while ((line = get_next_line(&pos, supported_file,
 				     supported_size))) {
-		const char *basename, *how = "yes";
+		const char *how = "yes";
 		char *l = line;
+		char *pat_basename, *mod, *orig_mod, *mod_basename;
 
 		/* optional type-of-support flag */
 		for (l = line; *l != '\0'; l++) {
@@ -2078,29 +2080,38 @@ static const char *supported(struct module *mod)
 				break;
 			}
 		}
-
-		/* skip directory components */
-		if ((l = strrchr(line, '/')))
-			line = l + 1;
 		/* strip .ko extension */
 		l = line + strlen(line);
 		if (l - line > 3 && !strcmp(l-3, ".ko"))
 			*(l-3) = '\0';
-		underscores(line);
 
-		/* skip directory components */
-		if ((basename = strrchr(mod->name, '/')))
-			basename++;
+		/*
+		 * convert dashes to underscores in the last path component
+		 * of line and mod
+		 */
+		if ((pat_basename = strrchr(line, '/')))
+			pat_basename++;
 		else
-			basename = mod->name;
-		basename = strdup(basename);
-		underscores(basename);
+			pat_basename = line;
+		underscores(pat_basename);
 
-		if (!strcmp(basename, line)) {
-			free(basename);
+		orig_mod = mod = strdup(modname);
+		if ((mod_basename = strrchr(mod, '/')))
+			mod_basename++;
+		else
+			mod_basename = mod;
+		underscores(mod_basename);
+
+		/* only compare the last component if no wildcards are used */
+		if (strcspn(line, "[]*?") == strlen(line)) {
+			line = pat_basename;
+			mod = mod_basename;
+		}
+		if (!fnmatch(line, mod, 0)) {
+			free(orig_mod);
 			return how;
 		}
-		free(basename);
+		free(orig_mod);
 	}
 	return NULL;
 }
@@ -2407,7 +2418,7 @@ static void add_staging_flag(struct buffer *b, const char *name)
 #ifdef CONFIG_SUSE_KERNEL_SUPPORTED
 static void add_supported_flag(struct buffer *b, struct module *mod)
 {
-	const char *how = supported(mod);
+	const char *how = supported(mod->name);
 	if (how)
 		buf_printf(b, "\nMODULE_INFO(supported, \"%s\");\n", how);
 }
