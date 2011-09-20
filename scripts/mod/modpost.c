@@ -2024,6 +2024,38 @@ static char *remove_dot(char *s)
 }
 
 #ifdef CONFIG_SUSE_KERNEL_SUPPORTED
+/*
+ * Replace dashes with underscores.
+ * Dashes inside character range patterns (e.g. [0-9]) are left unchanged.
+ * (copied from module-init-tools/util.c)
+ */
+static char *underscores(char *string)
+{
+	unsigned int i;
+
+	if (!string)
+		return NULL;
+
+	for (i = 0; string[i]; i++) {
+		switch (string[i]) {
+		case '-':
+			string[i] = '_';
+			break;
+
+		case ']':
+			warn("Unmatched bracket in %s\n", string);
+			break;
+
+		case '[':
+			i += strcspn(&string[i], "]");
+			if (!string[i])
+				warn("Unmatched bracket in %s\n", string);
+			break;
+		}
+	}
+	return string;
+}
+
 void *supported_file;
 unsigned long supported_size;
 
@@ -2054,14 +2086,21 @@ static const char *supported(struct module *mod)
 		l = line + strlen(line);
 		if (l - line > 3 && !strcmp(l-3, ".ko"))
 			*(l-3) = '\0';
+		underscores(line);
 
 		/* skip directory components */
 		if ((basename = strrchr(mod->name, '/')))
 			basename++;
 		else
 			basename = mod->name;
-		if (!strcmp(basename, line))
+		basename = strdup(basename);
+		underscores(basename);
+
+		if (!strcmp(basename, line)) {
+			free(basename);
 			return how;
+		}
+		free(basename);
 	}
 	return NULL;
 }
