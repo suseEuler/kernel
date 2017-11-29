@@ -194,6 +194,10 @@ static int __init load_uefi_certs(void)
 	/* Load the MokListRT certs */
 	rc = load_moklist_certs();
 
+	/* the MOK can not be trusted when secure boot is disabled */
+	if (!efi_enabled(EFI_SECURE_BOOT))
+		return 0;
+
 	return rc;
 }
 late_initcall(load_uefi_certs);
