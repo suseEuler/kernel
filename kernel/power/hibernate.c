@@ -82,7 +82,19 @@ void hibernate_release(void)
 
 bool hibernation_available(void)
 {
-	return nohibernate == 0 && !security_locked_down(LOCKDOWN_HIBERNATION);
+	if (nohibernate != 0)
+		return false;
+
+	if (security_locked_down(LOCKDOWN_HIBERNATION) || snapshot_is_enforce_verify()) {
+		snapshot_set_enforce_verify();
+		if (get_efi_secret_key())
+			return true;
+		else
+			pr_warn("the secret key is invalid\n");
+		return false;
+	} else {
+		return true;
+	}
 }
 
 /**
