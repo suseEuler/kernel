@@ -241,7 +241,7 @@ enum mem_type {
 #define MEM_FLAG_WIO2		BIT(MEM_WIO2)
 
 /**
- * enum edac-type - Error Detection and Correction capabilities and mode
+ * enum edac_type - Error Detection and Correction capabilities and mode
  * @EDAC_UNKNOWN:	Unknown if ECC is available
  * @EDAC_NONE:		Doesn't support ECC
  * @EDAC_RESERVED:	Reserved ECC type
@@ -321,7 +321,7 @@ enum scrub_type {
 #define OP_OFFLINE		0x300
 
 /**
- * enum edac_mc_layer - memory controller hierarchy layer
+ * enum edac_mc_layer_type - memory controller hierarchy layer
  *
  * @EDAC_MC_LAYER_BRANCH:	memory layer is named "branch"
  * @EDAC_MC_LAYER_CHANNEL:	memory layer is named "channel"
