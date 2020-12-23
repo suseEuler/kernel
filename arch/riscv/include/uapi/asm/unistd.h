@@ -17,8 +17,11 @@
 
 #ifdef __LP64__
 #define __ARCH_WANT_NEW_STAT
-#define __ARCH_WANT_SET_GET_RLIMIT
 #endif /* __LP64__ */
+#define __ARCH_WANT_SET_GET_RLIMIT
+#ifndef __LP64__
+#define __ARCH_WANT_TIME32_SYSCALLS
+#endif
 
 #define __ARCH_WANT_SYS_CLONE3
 
