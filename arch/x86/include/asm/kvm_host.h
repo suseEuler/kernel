@@ -1030,6 +1030,7 @@ struct kvm_vm_stat {
 };
 
 struct kvm_vcpu_stat {
+	u64 pid;
 	u64 pf_fixed;
 	u64 pf_guest;
 	u64 tlb_flush;
