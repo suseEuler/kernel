@@ -1062,8 +1062,7 @@ xfs_create(
 	/*
 	 * Reserve disk quota and the inode.
 	 */
-	error = xfs_trans_reserve_quota(tp, mp, udqp, gdqp,
-						pdqp, resblks, 1, 0);
+	error = xfs_trans_reserve_quota_icreate(tp, udqp, gdqp, pdqp, resblks);
 	if (error)
 		goto out_trans_cancel;
 
@@ -1194,8 +1193,7 @@ xfs_create_tmpfile(
 	if (error)
 		goto out_release_inode;
 
-	error = xfs_trans_reserve_quota(tp, mp, udqp, gdqp,
-						pdqp, resblks, 1, 0);
+	error = xfs_trans_reserve_quota_icreate(tp, udqp, gdqp, pdqp, resblks);
 	if (error)
 		goto out_trans_cancel;
 
