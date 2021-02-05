@@ -470,7 +470,6 @@ static inline int set_ud_wqe(struct hns_roce_qp *qp,
 	int ret;
 
 	valid_num_sge = calc_wr_sge_num(wr, &msg_len);
-	memset(ud_sq_wqe, 0, sizeof(*ud_sq_wqe));
 
 	ret = set_ud_opcode(ud_sq_wqe, wr);
 	if (WARN_ON(ret))
@@ -576,7 +575,6 @@ static inline int set_rc_wqe(struct hns_roce_qp *qp,
 	int ret;
 
 	valid_num_sge = calc_wr_sge_num(wr, &msg_len);
-	memset(rc_sq_wqe, 0, sizeof(*rc_sq_wqe));
 
 	rc_sq_wqe->msg_len = cpu_to_le32(msg_len);
 
