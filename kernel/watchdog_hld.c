@@ -14,6 +14,7 @@
 
 #include <linux/nmi.h>
 #include <linux/atomic.h>
+#include <linux/kprobes.h>
 #include <linux/module.h>
 #include <linux/sched/debug.h>
 
@@ -180,6 +181,7 @@ static void watchdog_overflow_callback(struct perf_event *event,
 
 	watchdog_hardlockup_check(regs);
 }
+NOKPROBE_SYMBOL(watchdog_hardlockup_check);
 
 static int hardlockup_detector_event_create(void)
 {
