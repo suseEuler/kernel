@@ -66,6 +66,7 @@
 #define ARM64_HAS_TLB_RANGE			56
 #define ARM64_MTE				57
 #define ARM64_WORKAROUND_1508412		58
+#define ARM64_HAS_MPAM				59
 #define ARM64_HAS_ECV				64
 #define ARM64_HAS_EPAN				65
 
