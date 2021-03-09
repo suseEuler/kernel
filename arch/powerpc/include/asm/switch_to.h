@@ -81,6 +81,16 @@ static inline void disable_kernel_vsx(void)
 {
 	BUILD_BUG();
 }
+#else
+static inline void enable_kernel_vsx(void)
+{
+	BUILD_BUG();
+}
+
+static inline void disable_kernel_vsx(void)
+{
+	BUILD_BUG();
+}
 #endif
 
 #ifdef CONFIG_SPE
