@@ -37,6 +37,8 @@
 
 #define ECC_POINT_INIT(x, y, ndigits)	(struct ecc_point) { x, y, ndigits }
 
+#define ECC_MAX_BYTES (ECC_MAX_DIGITS << ECC_DIGITS_TO_BYTES_SHIFT)
+
 /**
  * ecc_is_key_valid() - Validate a given ECDH private key
  *
@@ -77,6 +79,29 @@ int ecc_gen_privkey(unsigned int curve_id, unsigned int ndigits, u64 *privkey);
  */
 int ecc_make_pub_key(const unsigned int curve_id, unsigned int ndigits,
 		     const u64 *private_key, u64 *public_key);
+
+/**
+ * ecc_swap_digits() - Copy ndigits from big endian array to native array
+ * @in:       Input array
+ * @out:      Output array
+ * @ndigits:  Number of digits to copy
+ */
+static inline void ecc_swap_digits(const u64 *in, u64 *out, unsigned int ndigits)
+{
+	const __be64 *src = (__force __be64 *)in;
+	int i;
+
+	for (i = 0; i < ndigits; i++)
+		out[i] = be64_to_cpu(src[ndigits - 1 - i]);
+}
+
+/**
+ * ecc_get_curve()  - Get a curve given its curve_id
+ * @curve_id:  Id of the curve
+ *
+ * Returns pointer to the curve data, NULL if curve is not available
+ */
+const struct ecc_curve *ecc_get_curve(unsigned int curve_id);
 
 /**
  * crypto_ecdh_shared_secret() - Compute a shared secret
