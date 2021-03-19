@@ -207,7 +207,7 @@ static int alloc_cq_buf(struct hns_roce_dev *hr_dev, struct hns_roce_cq *hr_cq,
 	buf_attr.region_count = 1;
 
 	ret = hns_roce_mtr_create(hr_dev, &hr_cq->mtr, &buf_attr,
-				  hr_dev->caps.cqe_ba_pg_sz + HNS_HW_PAGE_SHIFT,
+				  hr_dev->caps.cqe_ba_pg_sz + PAGE_SHIFT,
 				  udata, addr);
 	if (ret)
 		ibdev_err(ibdev, "failed to alloc CQ mtr, ret = %d.\n", ret);
