@@ -1072,6 +1072,7 @@ struct kvm_vcpu_stat {
 	u64 utime;
 	u64 stime;
 	u64 gtime;
+	u64 preemption_timer_exits;
 };
 
 struct x86_instruction_info;
