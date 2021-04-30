@@ -2848,9 +2848,6 @@ retry:
 	if (gfp_mask & __GFP_RETRY_MAYFAIL)
 		goto nomem;
 
-	if (gfp_mask & __GFP_NOFAIL)
-		goto force;
-
 	/* Avoid endless loop for tasks bypassed by the oom killer */
 	if (passed_oom && task_is_dying())
 		goto nomem;
