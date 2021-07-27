@@ -36,6 +36,11 @@
 
 #define CRASH_ADDR_HIGH_MAX	MEMBLOCK_ALLOC_ACCESSIBLE
 
+#ifdef CONFIG_ARM64_CPU_PARK
+/* CPU park state flag: "park" */
+#define PARK_MAGIC 0x7061726b
+#endif
+
 #ifndef __ASSEMBLY__
 
 /**
@@ -100,6 +105,7 @@ static inline bool crash_is_nosave(unsigned long pfn) {return false; }
 static inline void crash_prepare_suspend(void) {}
 static inline void crash_post_resume(void) {}
 #endif
+void machine_kexec_mask_interrupts(void);
 
 #ifdef CONFIG_KEXEC_CORE
 extern void __init reserve_crashkernel(void);
