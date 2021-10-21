@@ -1115,6 +1115,15 @@ PHONY += prepare0
 export MODORDER := $(extmod-prefix)modules.order
 export MODULES_NSDEPS := $(extmod-prefix)modules.nsdeps
 
+suse_version_h := include/generated/uapi/linux/suse_version.h
+
+define filechk_suse_version
+	$(CONFIG_SHELL) $(srctree)/scripts/gen-suse_version_h.sh
+endef
+
+$(suse_version_h): include/config/auto.conf FORCE
+	$(call filechk,suse_version)
+
 ifeq ($(KBUILD_EXTMOD),)
 core-y		+= kernel/ certs/ mm/ fs/ ipc/ security/ crypto/ block/
 
@@ -1213,7 +1222,7 @@ PHONY += prepare archprepare
 
 archprepare: outputmakefile archheaders archscripts scripts include/config/kernel.release \
 	asm-generic $(version_h) $(autoksyms_h) include/generated/utsrelease.h \
-	include/generated/autoconf.h
+	include/generated/autoconf.h $(suse_version_h)
 
 prepare0: archprepare
 	$(Q)$(MAKE) $(build)=scripts/mod
