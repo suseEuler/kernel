@@ -1,0 +1,1278 @@
+From 26a57873aa241106c213fe2b103fb3fc6f20991e Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Fri, 26 Feb 2021 20:22:23 +0800
+Subject: [PATCH] arm64/mpam: Using software-defined id for rdtgroup instead of
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 26a57873aa241106c213fe2b103fb3fc6f20991e
+
+ 32-bit integer
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+Currently we use partid and pmg (Performance Monitoring Group) to filter
+some performance events so that the performance of a particular partid
+and pmg can be monitored, but pmg looks useless except for making a
+filter with partid, especially when pmg varies in different MPAM resources,
+it makes difficult to allocate pmg resource when creating new mon group
+in resctrl sysfs, even causes a lot of waste.
+
+So we use a software-defined sd_closid instead of 32-bit integer to label
+each rdtgroup (including mon group), sd_closid include intpartid for
+allocation and reqpartid for synchronizing configuration and monitoring,
+Given MPAM has narrowing feature, also includes the concept (hw_reqpartid,
+hw_intpartid we named), when narrowing is not supported, number of intpartid
+and reqpartid equals to hw_reqpartid, otherwise intpartid and reqpartid is
+related to minimum number of both hw_reqpartid and hw_intpartid supported
+across different resources, by using this way, not only we solve above
+problem but also use relax reqpartid for creating new mon group. additionally,
+pmg is also preferred when it is available.
+
+e.g.
+     hw_intpartid:  0  1  2  3  4  5  6  7
+     hw_reqpartid:  0  1  2  3  4  5  6  7  8  9  10 11 12 13 14 15
+
+                    |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+                                            |  |  |  |  |  |  |  |
+resctrl ctrl group: p0 p1 p2 p3 p4 p5 p6 p7 |  |  |  |  |  |  |  |
+                          |     |
+resctrl mon group:        |     +-----------------------m4 m5 m6 m7
+                          +-----------------m0 m1 m2 m3
+                          In this case, use extra reqpartid to create
+                          m0, m1, m2, m3 mon group for p2 ctrl group,
+                          and m4, m5, m6, m7 for p4.
+
+As we know reqpartid both supports allocating and monitoring filter, we
+should synchronize config of ctrl group with child mon groups under this
+design, each mon group's configuration indexed by a reqpartid that called
+slave is closely following it's father ctrl group that called master
+whenever configuration changes. not only that, we let task_struct keep
+both intpartid and reqpartid so we can know if tasks belong to a same
+ctrl group through intpartid and change cpu's partid by writing MPAMx_ELx
+through reqpartid when tasks switching.
+
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/mpam.h          |  18 +-
+ arch/arm64/include/asm/mpam_resource.h |   2 +
+ arch/arm64/include/asm/resctrl.h       |  46 ++++-
+ arch/arm64/kernel/mpam/mpam_ctrlmon.c  | 111 ++++++++----
+ arch/arm64/kernel/mpam/mpam_device.c   |  45 +++--
+ arch/arm64/kernel/mpam/mpam_internal.h |   4 +-
+ arch/arm64/kernel/mpam/mpam_mon.c      |   4 +-
+ arch/arm64/kernel/mpam/mpam_resctrl.c  | 224 +++++++++++++++++--------
+ fs/resctrlfs.c                         | 126 +++++++++-----
+ 9 files changed, 396 insertions(+), 184 deletions(-)
+
+diff --git a/arch/arm64/include/asm/mpam.h b/arch/arm64/include/asm/mpam.h
+index ec2fc0f2eadb..5a76fb5d0fc6 100644
+--- a/arch/arm64/include/asm/mpam.h
++++ b/arch/arm64/include/asm/mpam.h
+@@ -185,7 +185,7 @@ struct resctrl_staged_config {
+ 	hw_closid_t     hw_closid;
+ 	u32             new_ctrl;
+ 	bool            have_new_ctrl;
+-	enum resctrl_conf_type  new_ctrl_type;
++	enum resctrl_conf_type  conf_type;
+ };
+ 
+ /* later move to resctrl common directory */
+@@ -257,14 +257,10 @@ void post_resctrl_mount(void);
+ #define mpam_readl(addr) readl(addr)
+ #define mpam_writel(v, addr) writel(v, addr)
+ 
+-/**
+- * struct msr_param - set a range of MSRs from a domain
+- * @res:	The resource to use
+- * @value:	value
+- */
++struct sd_closid;
++
+ struct msr_param {
+-	struct resctrl_resource	*res;
+-	u64			value;
++	struct sd_closid *closid;
+ };
+ 
+ /**
+@@ -299,13 +295,13 @@ struct raw_resctrl_resource {
+ 	u16                 hdl_wd;
+ 
+ 	void (*msr_update)(struct resctrl_resource *r, struct rdt_domain *d,
+-					struct list_head *opt_list, int partid);
+-	u64 (*msr_read)(struct rdt_domain *d, int partid);
++			struct list_head *opt_list, struct msr_param *para);
++	u64 (*msr_read)(struct rdt_domain *d, struct msr_param *para);
+ 
+ 	int			data_width;
+ 	const char		*format_str;
+ 	int (*parse_ctrlval)(char *buf, struct raw_resctrl_resource *r,
+-			struct resctrl_staged_config *cfg, hw_closid_t closid);
++			struct resctrl_staged_config *cfg);
+ 
+ 	u16                num_mon;
+ 	u64 (*mon_read)(struct rdt_domain *d, void *md_priv);
+diff --git a/arch/arm64/include/asm/mpam_resource.h b/arch/arm64/include/asm/mpam_resource.h
+index 4c042eb2da20..cc863183e1be 100644
+--- a/arch/arm64/include/asm/mpam_resource.h
++++ b/arch/arm64/include/asm/mpam_resource.h
+@@ -95,6 +95,8 @@
+  * Set MPAMCFG_INTPARTID internal bit
+  */
+ #define MPAMCFG_INTPARTID_INTERNAL  BIT(16)
++#define INTPARTID_INTPARTID_MASK    (BIT(15) - 1)
++#define MPAMCFG_INTPARTID_INTPARTID_GET(r) (r & INTPARTID_INTPARTID_MASK)
+ /*
+  * Set MPAMCFG_PART_SEL internal bit
+  */
+diff --git a/arch/arm64/include/asm/resctrl.h b/arch/arm64/include/asm/resctrl.h
+index 68e515ea8779..0c1f2cef0c36 100644
+--- a/arch/arm64/include/asm/resctrl.h
++++ b/arch/arm64/include/asm/resctrl.h
+@@ -49,12 +49,20 @@ struct mongroup {
+ 	int         init;
+ };
+ 
++/**
++ * struct sd_closid - software defined closid
++ * @intpartid:  closid for this rdtgroup only for allocation
++ * @weak_closid:    closid for synchronizing configuration and monitoring
++ */
++struct sd_closid {
++	u32         intpartid;
++	u32         reqpartid;
++};
++
+ /**
+  * struct rdtgroup - store rdtgroup's data in resctrl file system.
+  * @kn:             kernfs node
+  * @resctrl_group_list:     linked list for all rdtgroups
+- * @closid:         closid for this rdtgroup
+- * #endif
+  * @cpu_mask:           CPUs assigned to this rdtgroup
+  * @flags:          status bits
+  * @waitcount:          how many cpus expect to find this
+@@ -66,7 +74,7 @@ struct mongroup {
+ struct rdtgroup {
+ 	struct kernfs_node  *kn;
+ 	struct list_head    resctrl_group_list;
+-	u32         closid;
++	struct sd_closid    closid;
+ 	struct cpumask      cpu_mask;
+ 	int         flags;
+ 	atomic_t        waitcount;
+@@ -80,12 +88,17 @@ void schemata_list_destroy(void);
+ 
+ int resctrl_lru_request_mon(void);
+ 
+-int alloc_mon_id(void);
+-void free_mon_id(u32 id);
++int alloc_rmid(void);
++void free_rmid(u32 id);
+ 
++enum closid_type {
++	CLOSID_INT    = 0x1,
++	CLOSID_REQ      = 0x2,
++	CLOSID_NUM_TYPES,
++};
+ int resctrl_id_init(void);
+-int resctrl_id_alloc(void);
+-void resctrl_id_free(int id);
++int resctrl_id_alloc(enum closid_type);
++void resctrl_id_free(enum closid_type, int id);
+ 
+ void update_cpu_closid_rmid(void *info);
+ void update_closid_rmid(const struct cpumask *cpu_mask, struct resctrl_group *r);
+@@ -127,6 +140,25 @@ int resctrl_mkdir_mondata_all_subdir(struct kernfs_node *parent_kn,
+ struct resctrl_resource *
+ mpam_resctrl_get_resource(enum resctrl_resource_level level);
+ 
++int resctrl_update_groups_config(struct rdtgroup *rdtgrp);
++
+ #define RESCTRL_MAX_CLOSID 32
+ 
++/*
++ * left 16 bits of closid store parent(master)'s
++ * closid, the reset store current group's closid,
++ * this used for judging if tasks are allowed to move
++ * another ctrlmon/mon group, it is because when
++ * a mon group is permited to allocated another
++ * closid different from it's parent, only closid
++ * is not sufficient to do that.
++ */
++#define TASK_CLOSID_SET(prclosid, closid)    \
++		((prclosid << 16) | closid)
++
++#define TASK_CLOSID_CUR_GET(closid)   \
++		(closid & GENMASK(15, 0))
++#define TASK_CLOSID_PR_GET(closid)    \
++		((closid & GENMASK(31, 16)) >> 16)
++
+ #endif /* _ASM_ARM64_RESCTRL_H */
+diff --git a/arch/arm64/kernel/mpam/mpam_ctrlmon.c b/arch/arm64/kernel/mpam/mpam_ctrlmon.c
+index 3547f3cdc26e..b906e5b85698 100644
+--- a/arch/arm64/kernel/mpam/mpam_ctrlmon.c
++++ b/arch/arm64/kernel/mpam/mpam_ctrlmon.c
+@@ -115,10 +115,16 @@ static int resctrl_group_update_domains(struct rdtgroup *rdtgrp,
+ 			struct resctrl_resource *r)
+ {
+ 	int i;
+-	u32 partid;
+ 	struct rdt_domain *d;
+ 	struct raw_resctrl_resource *rr;
+ 	struct resctrl_staged_config *cfg;
++	hw_closid_t hw_closid;
++	struct sd_closid closid;
++	struct list_head *head;
++	struct rdtgroup *entry;
++	struct msr_param para;
++
++	para.closid = &closid;
+ 
+ 	rr = r->res;
+ 	list_for_each_entry(d, &r->domains, list) {
+@@ -127,15 +133,38 @@ static int resctrl_group_update_domains(struct rdtgroup *rdtgrp,
+ 			if (!cfg[i].have_new_ctrl)
+ 				continue;
+ 
+-			partid = hw_closid_val(cfg[i].hw_closid);
+-			/* apply cfg */
+-			if (d->ctrl_val[partid] == cfg[i].new_ctrl)
+-				continue;
+-
+-			d->ctrl_val[partid] = cfg[i].new_ctrl;
+-			d->have_new_ctrl = true;
+-
+-			rr->msr_update(r, d, NULL, partid);
++			/*
++			 * for ctrl group configuration, hw_closid of cfg[i]
++			 * equals to rdtgrp->closid.intpartid.
++			 */
++			closid.intpartid = hw_closid_val(cfg[i].hw_closid);
++
++			/* if ctrl group's config has changed, refresh it first. */
++			if (d->ctrl_val[closid.intpartid] != cfg[i].new_ctrl) {
++				/*
++				 * duplicate ctrl group's configuration indexed
++				 * by intpartid from domain ctrl_val array.
++				 */
++				resctrl_cdp_map(clos, rdtgrp->closid.reqpartid,
++						cfg[i].conf_type, hw_closid);
++				closid.reqpartid = hw_closid_val(hw_closid);
++
++				d->ctrl_val[closid.intpartid] = cfg[i].new_ctrl;
++				d->have_new_ctrl = true;
++				rr->msr_update(r, d, NULL, &para);
++			}
++			/*
++			 * we should synchronize all child mon groups'
++			 * configuration from this ctrl rdtgrp
++			 */
++			head = &rdtgrp->mon.crdtgrp_list;
++			list_for_each_entry(entry, head, mon.crdtgrp_list) {
++				resctrl_cdp_map(clos, entry->closid.reqpartid,
++					cfg[i].conf_type, hw_closid);
++				closid.reqpartid = hw_closid_val(hw_closid);
++
++				rr->msr_update(r, d, NULL, &para);
++			}
+ 		}
+ 	}
+ 
+@@ -171,8 +200,10 @@ static int parse_line(char *line, struct resctrl_resource *r,
+ 	list_for_each_entry(d, &r->domains, list) {
+ 		if (d->id == dom_id) {
+ 			resctrl_cdp_map(clos, closid, t, hw_closid);
+-			if (rr->parse_ctrlval(dom, rr, &d->staged_cfg[t], hw_closid))
++			if (rr->parse_ctrlval(dom, rr, &d->staged_cfg[t]))
+ 				return -EINVAL;
++			d->staged_cfg[t].hw_closid = hw_closid;
++			d->staged_cfg[t].conf_type = t;
+ 			goto next;
+ 		}
+ 	}
+@@ -231,7 +262,7 @@ ssize_t resctrl_group_schemata_write(struct kernfs_open_file *of,
+ 
+ 	rdt_last_cmd_clear();
+ 
+-	closid = rdtgrp->closid;
++	closid = rdtgrp->closid.intpartid;
+ 
+ 	for_each_supported_resctrl_exports(res) {
+ 		r = &res->resctrl_res;
+@@ -264,15 +295,7 @@ ssize_t resctrl_group_schemata_write(struct kernfs_open_file *of,
+ 			goto out;
+ 	}
+ 
+-	for_each_supported_resctrl_exports(res) {
+-		r = &res->resctrl_res;
+-		if (r->alloc_enabled) {
+-			ret = resctrl_group_update_domains(rdtgrp, r);
+-			if (ret)
+-				goto out;
+-		}
+-	}
+-
++	ret = resctrl_update_groups_config(rdtgrp);
+ out:
+ 	resctrl_group_kn_unlock(of->kn);
+ 	return ret ?: nbytes;
+@@ -289,21 +312,24 @@ ssize_t resctrl_group_schemata_write(struct kernfs_open_file *of,
+  * a single "S" simply.
+  */
+ static void show_doms(struct seq_file *s, struct resctrl_resource *r,
+-		char *schema_name, int partid)
++		char *schema_name, struct sd_closid *closid)
+ {
+ 	struct raw_resctrl_resource *rr = r->res;
+ 	struct rdt_domain *dom;
++	struct msr_param para;
+ 	bool sep = false;
+ 	bool rg = false;
+ 	bool prev_auto_fill = false;
+ 	u32 reg_val;
+ 
++	para.closid = closid;
++
+ 	if (r->dom_num > RESCTRL_SHOW_DOM_MAX_NUM)
+ 		rg = true;
+ 
+ 	seq_printf(s, "%*s:", max_name_width, schema_name);
+ 	list_for_each_entry(dom, &r->domains, list) {
+-		reg_val = rr->msr_read(dom, partid);
++		reg_val = rr->msr_read(dom, &para);
+ 
+ 		if (rg && reg_val == r->default_ctrl &&
+ 				prev_auto_fill == true)
+@@ -331,7 +357,7 @@ int resctrl_group_schemata_show(struct kernfs_open_file *of,
+ 	struct resctrl_schema *rs;
+ 	int ret = 0;
+ 	hw_closid_t hw_closid;
+-	u32 partid;
++	struct sd_closid closid;
+ 
+ 	rdtgrp = resctrl_group_kn_lock_live(of->kn);
+ 	if (rdtgrp) {
+@@ -340,11 +366,15 @@ int resctrl_group_schemata_show(struct kernfs_open_file *of,
+ 			if (!r)
+ 				continue;
+ 			if (r->alloc_enabled) {
+-				resctrl_cdp_map(clos, rdtgrp->closid,
++				resctrl_cdp_map(clos, rdtgrp->closid.intpartid,
++					rs->conf_type, hw_closid);
++				closid.intpartid = hw_closid_val(hw_closid);
++
++				resctrl_cdp_map(clos, rdtgrp->closid.reqpartid,
+ 					rs->conf_type, hw_closid);
+-				partid = hw_closid_val(hw_closid);
+-				if (partid < mpam_sysprops_num_partid())
+-					show_doms(s, r, rs->name, partid);
++				closid.reqpartid = hw_closid_val(hw_closid);
++
++				show_doms(s, r, rs->name, &closid);
+ 			}
+ 		}
+ 	} else {
+@@ -465,7 +495,8 @@ static int resctrl_mkdir_mondata_dom(struct kernfs_node *parent_kn,
+ 
+ 	md.u.rid = r->rid;
+ 	md.u.domid = d->id;
+-	resctrl_cdp_map(clos, prgrp->closid, s->conf_type, hw_closid);
++	/* monitoring use reqpartid (reqpartid) */
++	resctrl_cdp_map(clos, prgrp->closid.reqpartid, s->conf_type, hw_closid);
+ 	md.u.partid = hw_closid_val(hw_closid);
+ 	resctrl_cdp_map(mon, prgrp->mon.mon, s->conf_type, hw_monid);
+ 	md.u.mon = hw_monid_val(hw_monid);
+@@ -611,9 +642,9 @@ int resctrl_group_init_alloc(struct rdtgroup *rdtgrp)
+ 	list_for_each_entry(s, &resctrl_all_schema, list) {
+ 		r = s->res;
+ 		if (r->rid == RDT_RESOURCE_MC) {
+-			rdtgroup_init_mba(r, rdtgrp->closid);
++			rdtgroup_init_mba(r, rdtgrp->closid.intpartid);
+ 		} else {
+-			ret = rdtgroup_init_cat(s, rdtgrp->closid);
++			ret = rdtgroup_init_cat(s, rdtgrp->closid.intpartid);
+ 			if (ret < 0)
+ 				return ret;
+ 		}
+@@ -627,3 +658,21 @@ int resctrl_group_init_alloc(struct rdtgroup *rdtgrp)
+ 
+ 	return 0;
+ }
++
++int resctrl_update_groups_config(struct rdtgroup *rdtgrp)
++{
++	int ret = 0;
++	struct resctrl_resource *r;
++	struct mpam_resctrl_res *res;
++
++	for_each_supported_resctrl_exports(res) {
++		r = &res->resctrl_res;
++		if (r->alloc_enabled) {
++			ret = resctrl_group_update_domains(rdtgrp, r);
++			if (ret)
++				break;
++		}
++	}
++
++	return ret;
++}
+diff --git a/arch/arm64/kernel/mpam/mpam_device.c b/arch/arm64/kernel/mpam/mpam_device.c
+index a331ec67fa42..e67289732a28 100644
+--- a/arch/arm64/kernel/mpam/mpam_device.c
++++ b/arch/arm64/kernel/mpam/mpam_device.c
+@@ -965,7 +965,7 @@ static u32 mpam_device_read_csu_mon(struct mpam_device *dev,
+ 	clt = MSMON_CFG_CTL_MATCH_PARTID | MSMON_CFG_CSU_TYPE;
+ 	if (args->match_pmg)
+ 		clt |= MSMON_CFG_CTL_MATCH_PMG;
+-	flt = args->partid |
++	flt = args->closid.reqpartid |
+ 		(args->pmg << MSMON_CFG_CSU_FLT_PMG_SHIFT);
+ 
+ 	/*
+@@ -1014,7 +1014,7 @@ static u32 mpam_device_read_mbwu_mon(struct mpam_device *dev,
+ 	clt = MSMON_CFG_CTL_MATCH_PARTID | MSMON_CFG_MBWU_TYPE;
+ 	if (args->match_pmg)
+ 		clt |= MSMON_CFG_CTL_MATCH_PMG;
+-	flt = args->partid |
++	flt = args->closid.reqpartid |
+ 		(args->pmg << MSMON_CFG_MBWU_FLT_PMG_SHIFT);
+ 
+ 	/*
+@@ -1096,13 +1096,20 @@ static void mpam_device_narrow_map(struct mpam_device *dev, u32 partid,
+ 	mpam_write_reg(dev, MPAMCFG_INTPARTID, intpartid);
+ }
+ 
+-static int mpam_device_config(struct mpam_device *dev, u32 partid,
++static int
++mpam_device_config(struct mpam_device *dev, struct sd_closid *closid,
+ 					struct mpam_config *cfg)
+ {
+ 	u16 cmax = GENMASK(dev->cmax_wd, 0);
+ 	u32 pri_val = 0;
+ 	u16 intpri, dspri, max_intpri, max_dspri;
+ 	u32 mbw_pbm, mbw_max;
++	/*
++	 * if dev supports narrowing, narrowing first and then apply this slave's
++	 * configuration.
++	 */
++	u32 intpartid = closid->intpartid;
++	u32 partid = closid->reqpartid;
+ 
+ 	lockdep_assert_held(&dev->lock);
+ 
+@@ -1115,9 +1122,9 @@ static int mpam_device_config(struct mpam_device *dev, u32 partid,
+ 	 */
+ 	if (mpam_has_feature(mpam_feat_part_nrw, dev->features)) {
+ 		if (cfg && mpam_has_feature(mpam_feat_part_nrw, cfg->valid))
+-			mpam_device_narrow_map(dev, partid, cfg->intpartid);
++			mpam_device_narrow_map(dev, partid, intpartid);
+ 		/* intpartid success, set 16 bit to 1*/
+-		partid = PART_SEL_SET_INTERNAL(cfg->intpartid);
++		partid = PART_SEL_SET_INTERNAL(intpartid);
+ 	}
+ 
+ 	mpam_write_reg(dev, MPAMCFG_PART_SEL, partid);
+@@ -1199,7 +1206,7 @@ static int mpam_device_config(struct mpam_device *dev, u32 partid,
+ static void mpam_component_device_sync(void *__ctx)
+ {
+ 	int err = 0;
+-	u32 partid;
++	u32 reqpartid;
+ 	unsigned long flags;
+ 	struct mpam_device *dev;
+ 	struct mpam_device_sync *ctx = (struct mpam_device_sync *)__ctx;
+@@ -1220,12 +1227,16 @@ static void mpam_component_device_sync(void *__ctx)
+ 		err = 0;
+ 		spin_lock_irqsave(&dev->lock, flags);
+ 		if (args) {
+-			partid = args->partid;
++			/*
++			 * at this time reqpartid shows where the
++			 * configuration was stored.
++			 */
++			reqpartid = args->closid.reqpartid;
+ 			if (ctx->config_mon)
+ 				err = mpam_device_frob_mon(dev, ctx);
+ 			else
+-				err = mpam_device_config(dev, partid,
+-					&comp->cfg[partid]);
++				err = mpam_device_config(dev, &args->closid,
++					&comp->cfg[reqpartid]);
+ 		} else {
+ 			mpam_reset_device(comp, dev);
+ 		}
+@@ -1357,11 +1368,8 @@ static void mpam_component_read_mpamcfg(void *_ctx)
+ 		return;
+ 
+ 	reg = args->reg;
+-	/*
+-	 * args->partid is possible reqpartid or intpartid,
+-	 * if narrow enabled, it should be intpartid.
+-	 */
+-	partid = args->partid;
++
++	partid = args->closid.reqpartid;
+ 
+ 	list_for_each_entry(dev, &comp->devices, comp_list) {
+ 		if (!cpumask_test_cpu(smp_processor_id(),
+@@ -1369,8 +1377,13 @@ static void mpam_component_read_mpamcfg(void *_ctx)
+ 			continue;
+ 
+ 		spin_lock_irqsave(&dev->lock, flags);
+-		if (mpam_has_feature(mpam_feat_part_nrw, dev->features))
+-			partid = PART_SEL_SET_INTERNAL(partid);
++		if (mpam_has_feature(mpam_feat_part_nrw, dev->features)) {
++			/*
++			 * partid is possible reqpartid or intpartid,
++			 * if narrow enabled, it should be intpartid.
++			 */
++			partid = PART_SEL_SET_INTERNAL(args->closid.intpartid);
++		}
+ 		mpam_write_reg(dev, MPAMCFG_PART_SEL, partid);
+ 		wmb();
+ 		val = mpam_read_reg(dev, reg);
+diff --git a/arch/arm64/kernel/mpam/mpam_internal.h b/arch/arm64/kernel/mpam/mpam_internal.h
+index 57a08a78bb6e..cc35dfc73449 100644
+--- a/arch/arm64/kernel/mpam/mpam_internal.h
++++ b/arch/arm64/kernel/mpam/mpam_internal.h
+@@ -37,7 +37,7 @@ struct mpam_resctrl_res {
+ struct sync_args {
+ 	u8  domid;
+ 	u8  pmg;
+-	u32 partid;
++	struct sd_closid closid;
+ 	u32 mon;
+ 	bool match_pmg;
+ 	enum rdt_event_id eventid;
+@@ -95,8 +95,6 @@ struct mpam_config {
+ 	 * hardlimit or not
+ 	 */
+ 	bool            hdl;
+-
+-	u32             intpartid;
+ };
+ 
+ /* Bits for mpam_features_t */
+diff --git a/arch/arm64/kernel/mpam/mpam_mon.c b/arch/arm64/kernel/mpam/mpam_mon.c
+index fbf92bb79ad2..8dfdba6a5ba2 100644
+--- a/arch/arm64/kernel/mpam/mpam_mon.c
++++ b/arch/arm64/kernel/mpam/mpam_mon.c
+@@ -73,12 +73,12 @@ static void free_pmg(u32 pmg)
+ 	pmg_free_map |= 1 << pmg;
+ }
+ 
+-int alloc_mon_id(void)
++int alloc_rmid(void)
+ {
+ 	return alloc_pmg();
+ }
+ 
+-void free_mon_id(u32 id)
++void free_rmid(u32 id)
+ {
+ 	free_pmg(id);
+ }
+diff --git a/arch/arm64/kernel/mpam/mpam_resctrl.c b/arch/arm64/kernel/mpam/mpam_resctrl.c
+index bd6bc36c8079..626511b64bf4 100644
+--- a/arch/arm64/kernel/mpam/mpam_resctrl.c
++++ b/arch/arm64/kernel/mpam/mpam_resctrl.c
+@@ -107,14 +107,15 @@ bool is_resctrl_cdp_enabled(void)
+ 
+ static void
+ mpam_resctrl_update_component_cfg(struct resctrl_resource *r,
+-	struct rdt_domain *d, struct list_head *opt_list, u32 partid);
++	struct rdt_domain *d, struct list_head *opt_list,
++	struct sd_closid *closid);
+ 
+ static void
+ common_wrmsr(struct resctrl_resource *r, struct rdt_domain *d,
+-	struct list_head *opt_list, int partid);
++	struct list_head *opt_list, struct msr_param *para);
+ 
+-static u64 cache_rdmsr(struct rdt_domain *d, int partid);
+-static u64 mbw_rdmsr(struct rdt_domain *d, int partid);
++static u64 cache_rdmsr(struct rdt_domain *d, struct msr_param *para);
++static u64 mbw_rdmsr(struct rdt_domain *d, struct msr_param *para);
+ 
+ static u64 cache_rdmon(struct rdt_domain *d, void *md_priv);
+ static u64 mbw_rdmon(struct rdt_domain *d, void *md_priv);
+@@ -122,9 +123,9 @@ static u64 mbw_rdmon(struct rdt_domain *d, void *md_priv);
+ static int common_wrmon(struct rdt_domain *d, void *md_priv);
+ 
+ static int parse_cbm(char *buf, struct raw_resctrl_resource *r,
+-		struct resctrl_staged_config *cfg, hw_closid_t hw_closid);
++		struct resctrl_staged_config *cfg);
+ static int parse_bw(char *buf, struct raw_resctrl_resource *r,
+-		struct resctrl_staged_config *cfg, hw_closid_t hw_closid);
++		struct resctrl_staged_config *cfg);
+ 
+ struct raw_resctrl_resource raw_resctrl_resources_all[] = {
+ 	[RDT_RESOURCE_L3] = {
+@@ -189,7 +190,7 @@ static bool cbm_validate(char *buf, unsigned long *data,
+  */
+ static int
+ parse_cbm(char *buf, struct raw_resctrl_resource *r,
+-		struct resctrl_staged_config *cfg, hw_closid_t hw_closid)
++		struct resctrl_staged_config *cfg)
+ {
+ 	unsigned long data;
+ 
+@@ -203,7 +204,6 @@ parse_cbm(char *buf, struct raw_resctrl_resource *r,
+ 
+ 	cfg->new_ctrl = data;
+ 	cfg->have_new_ctrl = true;
+-	cfg->hw_closid = hw_closid;
+ 
+ 	return 0;
+ }
+@@ -253,7 +253,7 @@ static bool bw_validate(char *buf, unsigned long *data,
+ 
+ static int
+ parse_bw(char *buf, struct raw_resctrl_resource *r,
+-		struct resctrl_staged_config *cfg, hw_closid_t hw_closid)
++		struct resctrl_staged_config *cfg)
+ {
+ 	unsigned long data;
+ 
+@@ -267,34 +267,36 @@ parse_bw(char *buf, struct raw_resctrl_resource *r,
+ 
+ 	cfg->new_ctrl = data;
+ 	cfg->have_new_ctrl = true;
+-	cfg->hw_closid = hw_closid;
+ 
+ 	return 0;
+ }
+ 
+ static void
+ common_wrmsr(struct resctrl_resource *r, struct rdt_domain *d,
+-			struct list_head *opt_list, int partid)
++			struct list_head *opt_list, struct msr_param *para)
+ {
+ 	struct sync_args args;
+ 	struct mpam_resctrl_dom *dom;
+ 
+-	args.partid = partid;
+-
+ 	dom = container_of(d, struct mpam_resctrl_dom, resctrl_dom);
+ 
+-	mpam_resctrl_update_component_cfg(r, d, opt_list, partid);
++	mpam_resctrl_update_component_cfg(r, d, opt_list, para->closid);
+ 
++	/*
++	 * so far we have accomplished configuration replication,
++	 * it is ready to apply this configuration.
++	 */
++	args.closid = *para->closid;
+ 	mpam_component_config(dom->comp, &args);
+ }
+ 
+-static u64 cache_rdmsr(struct rdt_domain *d, int partid)
++static u64 cache_rdmsr(struct rdt_domain *d, struct msr_param *para)
+ {
+ 	u32 result;
+ 	struct sync_args args;
+ 	struct mpam_resctrl_dom *dom;
+ 
+-	args.partid = partid;
++	args.closid = *para->closid;
+ 	args.reg = MPAMCFG_CPBM;
+ 
+ 	dom = container_of(d, struct mpam_resctrl_dom, resctrl_dom);
+@@ -303,14 +305,15 @@ static u64 cache_rdmsr(struct rdt_domain *d, int partid)
+ 
+ 	return result;
+ }
+-static u64 mbw_rdmsr(struct rdt_domain *d, int partid)
++
++static u64 mbw_rdmsr(struct rdt_domain *d, struct msr_param *para)
+ {
+ 	u64 max;
+ 	u32 result;
+ 	struct sync_args args;
+ 	struct mpam_resctrl_dom *dom;
+ 
+-	args.partid = partid;
++	args.closid = *para->closid;
+ 	args.reg = MPAMCFG_MBW_MAX;
+ 
+ 	dom = container_of(d, struct mpam_resctrl_dom, resctrl_dom);
+@@ -336,7 +339,8 @@ static u64 cache_rdmon(struct rdt_domain *d, void *md_priv)
+ 
+ 	md.priv = md_priv;
+ 
+-	args.partid = md.u.partid;
++	/* monitoring only need reqpartid */
++	args.closid.reqpartid = md.u.partid;
+ 	args.mon = md.u.mon;
+ 	args.pmg = md.u.pmg;
+ 	args.match_pmg = true;
+@@ -376,7 +380,8 @@ static u64 mbw_rdmon(struct rdt_domain *d, void *md_priv)
+ 
+ 	md.priv = md_priv;
+ 
+-	args.partid = md.u.partid;
++	/* monitoring only need reqpartid */
++	args.closid.reqpartid = md.u.partid;
+ 	args.mon = md.u.mon;
+ 	args.pmg = md.u.pmg;
+ 	args.match_pmg = true;
+@@ -411,7 +416,8 @@ common_wrmon(struct rdt_domain *d, void *md_priv)
+ 	struct mpam_resctrl_dom *dom;
+ 
+ 	md.priv = md_priv;
+-	args.partid = md.u.partid;
++	/* monitoring only need reqpartid */
++	args.closid.reqpartid = md.u.partid;
+ 	args.mon = md.u.mon;
+ 	args.pmg = md.u.pmg;
+ 
+@@ -444,63 +450,120 @@ common_wrmon(struct rdt_domain *d, void *md_priv)
+  *   limited as the number of resources grows.
+  */
+ 
+-static unsigned long *closid_free_map;
+-static int num_closid;
++static unsigned long *intpartid_free_map, *reqpartid_free_map;
++static int num_intpartid, num_reqpartid;
+ 
+-int closid_init(void)
++static void mpam_resctrl_closid_collect(void)
+ {
+-	int pos;
+-	u32 times, flag;
++	struct mpam_resctrl_res *res;
++	struct raw_resctrl_resource *rr;
++
++	/*
++	 * num_reqpartid refers to the maximum partid number
++	 * that system width provides.
++	 */
++	num_reqpartid = mpam_sysprops_num_partid();
++	/*
++	 * we make intpartid the closid, this is because when
++	 * system platform supports intpartid narrowing, this
++	 * intpartid concept represents the resctrl maximum
++	 * group we can create, so it should be less than
++	 * maximum reqpartid number and maximum closid number
++	 * allowed by resctrl sysfs provided by @Intel-RDT.
++	 */
++	num_intpartid = mpam_sysprops_num_partid();
++	num_intpartid = min(num_reqpartid, RESCTRL_MAX_CLOSID);
+ 
+-	if (closid_free_map)
+-		kfree(closid_free_map);
++	/*
++	 * as we know we make intpartid the closid given to
++	 * resctrl, we should know if any resource supports
++	 * intpartid narrowing.
++	 */
++	for_each_supported_resctrl_exports(res) {
++		rr = res->resctrl_res.res;
++		if (!rr->num_intpartid)
++			continue;
++		num_intpartid = min(num_intpartid, (int)rr->num_intpartid);
++	}
++}
+ 
+-	num_closid = mpam_sysprops_num_partid();
+-	num_closid = min(num_closid, RESCTRL_MAX_CLOSID);
++static inline int local_closid_bitmap_init(int bits_num, unsigned long **ptr)
++{
++	int pos;
++	u32 times, flag;
+ 
+ 	hw_alloc_times_validate(times, flag);
+ 
+ 	if (flag)
+-		num_closid = rounddown(num_closid, 2);
++		bits_num = rounddown(bits_num, 2);
+ 
+-	closid_free_map = bitmap_zalloc(num_closid, GFP_KERNEL);
+-	if (!closid_free_map)
+-		return -ENOMEM;
++	if (!*ptr) {
++		*ptr = bitmap_zalloc(bits_num, GFP_KERNEL);
++		if (!*ptr)
++			return -ENOMEM;
++	}
+ 
+-	bitmap_set(closid_free_map, 0, num_closid);
++	bitmap_set(*ptr, 0, bits_num);
+ 
+ 	/* CLOSID 0 is always reserved for the default group */
+-	pos = find_first_bit(closid_free_map, num_closid);
+-	bitmap_clear(closid_free_map, pos, times);
++	pos = find_first_bit(*ptr, bits_num);
++	bitmap_clear(*ptr, pos, times);
++
++	return 0;
++}
++
++int closid_bitmap_init(void)
++{
++	int ret;
++
++	mpam_resctrl_closid_collect();
++	if (!num_intpartid || !num_reqpartid)
++		return -EINVAL;
++
++	if (intpartid_free_map)
++		kfree(intpartid_free_map);
++	if (reqpartid_free_map)
++		kfree(reqpartid_free_map);
++
++	ret = local_closid_bitmap_init(num_intpartid, &intpartid_free_map);
++	if (ret)
++		goto out;
++
++	ret = local_closid_bitmap_init(num_reqpartid, &reqpartid_free_map);
++	if (ret)
++		goto out;
+ 
+ 	return 0;
++out:
++	return ret;
+ }
++
+ /*
+  * If cdp enabled, allocate two closid once time, then return first
+  * allocated id.
+  */
+-int closid_alloc(void)
++static int closid_bitmap_alloc(int bits_num, unsigned long *ptr)
+ {
+ 	int pos;
+ 	u32 times, flag;
+ 
+ 	hw_alloc_times_validate(times, flag);
+ 
+-	pos = find_first_bit(closid_free_map, num_closid);
+-	if (pos == num_closid)
++	pos = find_first_bit(ptr, bits_num);
++	if (pos == bits_num)
+ 		return -ENOSPC;
+ 
+-	bitmap_clear(closid_free_map, pos, times);
++	bitmap_clear(ptr, pos, times);
+ 
+ 	return pos;
+ }
+ 
+-void closid_free(int closid)
++static void closid_bitmap_free(int pos, unsigned long *ptr)
+ {
+ 	u32 times, flag;
+ 
+ 	hw_alloc_times_validate(times, flag);
+-	bitmap_set(closid_free_map, closid, times);
++	bitmap_set(ptr, pos, times);
+ }
+ 
+ /*
+@@ -628,7 +691,7 @@ void update_cpu_closid_rmid(void *info)
+ 	struct rdtgroup *r = info;
+ 
+ 	if (r) {
+-		this_cpu_write(pqr_state.default_closid, r->closid);
++		this_cpu_write(pqr_state.default_closid, r->closid.reqpartid);
+ 		this_cpu_write(pqr_state.default_rmid, r->mon.rmid);
+ 	}
+ 
+@@ -723,10 +786,14 @@ int __resctrl_group_move_task(struct task_struct *tsk,
+ 		 * their parent CTRL group.
+ 		 */
+ 		if (rdtgrp->type == RDTCTRL_GROUP) {
+-			tsk->closid = rdtgrp->closid;
++			tsk->closid = TASK_CLOSID_SET(rdtgrp->closid.intpartid,
++				rdtgrp->closid.reqpartid);
+ 			tsk->rmid = rdtgrp->mon.rmid;
+ 		} else if (rdtgrp->type == RDTMON_GROUP) {
+-			if (rdtgrp->mon.parent->closid == tsk->closid) {
++			if (rdtgrp->mon.parent->closid.intpartid ==
++				TASK_CLOSID_PR_GET(tsk->closid)) {
++				tsk->closid = TASK_CLOSID_SET(rdtgrp->closid.intpartid,
++					rdtgrp->closid.reqpartid);
+ 				tsk->rmid = rdtgrp->mon.rmid;
+ 			} else {
+ 				rdt_last_cmd_puts("Can't move task to different control group\n");
+@@ -1088,12 +1155,14 @@ static void show_resctrl_tasks(struct rdtgroup *r, struct seq_file *s)
+ 
+ 	rcu_read_lock();
+ 	for_each_process_thread(p, t) {
+-		if ((r->type == RDTCTRL_GROUP && t->closid == r->closid) ||
+-		    (r->type == RDTMON_GROUP && t->closid == r->closid &&
+-		     t->rmid == r->mon.rmid))
+-			seq_printf(s, "%d: partid = %d, pmg = %d, (group: partid %d, pmg %d, mon %d)\n",
+-				   t->pid, t->closid, t->rmid,
+-				   r->closid, r->mon.rmid, r->mon.mon);
++		if ((r->type == RDTMON_GROUP &&
++			TASK_CLOSID_CUR_GET(t->closid) == r->closid.reqpartid &&
++			t->rmid == r->mon.rmid) ||
++			(r->type == RDTCTRL_GROUP &&
++			TASK_CLOSID_PR_GET(t->closid) == r->closid.intpartid))
++			seq_printf(s, "group:(gid:%d mon:%d) task:(pid:%d gid:%d rmid:%d)\n",
++				r->closid.reqpartid, r->mon.mon, t->pid,
++				(int)TASK_CLOSID_CUR_GET(t->closid), t->rmid);
+ 	}
+ 	rcu_read_unlock();
+ }
+@@ -1254,7 +1323,7 @@ void __mpam_sched_in(void)
+ 	 */
+ 	if (static_branch_likely(&resctrl_alloc_enable_key)) {
+ 		if (current->closid)
+-			closid = current->closid;
++			closid = TASK_CLOSID_CUR_GET(current->closid);
+ 	}
+ 
+ 	if (static_branch_likely(&resctrl_mon_enable_key)) {
+@@ -1347,33 +1416,38 @@ mpam_update_from_resctrl_cfg(struct mpam_resctrl_res *res,
+ 
+ static void
+ mpam_resctrl_update_component_cfg(struct resctrl_resource *r,
+-		struct rdt_domain *d, struct list_head *opt_list, u32 partid)
++		struct rdt_domain *d, struct list_head *opt_list,
++		struct sd_closid *closid)
+ {
+ 	struct mpam_resctrl_dom *dom;
+ 	struct mpam_resctrl_res *res;
+-	struct mpam_config *mpam_cfg;
+-	u32 resctrl_cfg = d->ctrl_val[partid];
++	struct mpam_config *slave_mpam_cfg;
++	u32 intpartid = closid->intpartid;
++	u32 reqpartid = closid->reqpartid;
++	u32 resctrl_cfg = d->ctrl_val[intpartid];
+ 
+ 	lockdep_assert_held(&resctrl_group_mutex);
+ 
+ 	/* Out of range */
+-	if (partid >= mpam_sysprops_num_partid())
++	if (intpartid >= mpam_sysprops_num_partid() ||
++		reqpartid >= mpam_sysprops_num_partid())
+ 		return;
+ 
+ 	res = container_of(r, struct mpam_resctrl_res, resctrl_res);
+ 	dom = container_of(d, struct mpam_resctrl_dom, resctrl_dom);
+ 
+-	mpam_cfg = &dom->comp->cfg[partid];
+-	if (WARN_ON_ONCE(!mpam_cfg))
++	/*
++	 * now reqpartid is used for duplicating master's configuration,
++	 * mpam_cfg[intpartid] needn't duplicate this setting,
++	 * it is because only reqpartid stands for each rdtgroup's
++	 * mpam_cfg index id.
++	 */
++	slave_mpam_cfg = &dom->comp->cfg[reqpartid];
++	if (WARN_ON_ONCE(!slave_mpam_cfg))
+ 		return;
+ 
+-	mpam_cfg->valid = 0;
+-	if (partid != mpam_cfg->intpartid) {
+-		mpam_cfg->intpartid = partid;
+-		mpam_set_feature(mpam_feat_part_nrw, &mpam_cfg->valid);
+-	}
+-
+-	mpam_update_from_resctrl_cfg(res, resctrl_cfg, mpam_cfg);
++	slave_mpam_cfg->valid = 0;
++	mpam_update_from_resctrl_cfg(res, resctrl_cfg, slave_mpam_cfg);
+ }
+ 
+ static void mpam_reset_cfg(struct mpam_resctrl_res *res,
+@@ -1441,7 +1515,7 @@ int resctrl_id_init(void)
+ {
+ 	int ret;
+ 
+-	ret = closid_init();
++	ret = closid_bitmap_init();
+ 	if (ret)
+ 		goto out;
+ 
+@@ -1452,12 +1526,20 @@ int resctrl_id_init(void)
+ 	return ret;
+ }
+ 
+-int resctrl_id_alloc(void)
++int resctrl_id_alloc(enum closid_type type)
+ {
+-	return closid_alloc();
++	if (type == CLOSID_INT)
++		return closid_bitmap_alloc(num_intpartid, intpartid_free_map);
++	else if (type == CLOSID_REQ)
++		return closid_bitmap_alloc(num_reqpartid, reqpartid_free_map);
++
++	return -ENOSPC;
+ }
+ 
+-void resctrl_id_free(int id)
++void resctrl_id_free(enum closid_type type, int id)
+ {
+-	closid_free(id);
++	if (type == CLOSID_INT)
++		return closid_bitmap_free(id, intpartid_free_map);
++	else if (type == CLOSID_REQ)
++		return closid_bitmap_free(id, reqpartid_free_map);
+ }
+diff --git a/fs/resctrlfs.c b/fs/resctrlfs.c
+index 4b32d8842861..ce0c7511b10d 100644
+--- a/fs/resctrlfs.c
++++ b/fs/resctrlfs.c
+@@ -343,21 +343,26 @@ mongroup_create_dir(struct kernfs_node *parent_kn, struct resctrl_group *prgrp,
+ 	return ret;
+ }
+ 
+-static void mkdir_mondata_all_prepare_clean(struct resctrl_group *prgrp)
++static inline void free_mon_id(struct resctrl_group *rdtgrp)
+ {
+-	if (prgrp->type == RDTCTRL_GROUP)
+-		return;
++	if (rdtgrp->mon.rmid)
++		free_rmid(rdtgrp->mon.rmid);
++	else if (rdtgrp->closid.reqpartid)
++		resctrl_id_free(CLOSID_REQ, rdtgrp->closid.reqpartid);
++}
+ 
+-	if (prgrp->closid)
+-		resctrl_id_free(prgrp->closid);
+-	if (prgrp->mon.rmid)
+-		free_mon_id(prgrp->mon.rmid);
++static void mkdir_mondata_all_prepare_clean(struct resctrl_group *prgrp)
++{
++	if (prgrp->type == RDTCTRL_GROUP && prgrp->closid.intpartid)
++		resctrl_id_free(CLOSID_INT, prgrp->closid.intpartid);
++	free_mon_id(prgrp);
+ }
+ 
+ static int mkdir_mondata_all_prepare(struct resctrl_group *rdtgrp)
+ {
+ 	int ret = 0;
+-	int mon, mon_id, closid;
++	int mon, rmid, reqpartid;
++	struct resctrl_group *prgrp;
+ 
+ 	mon = resctrl_lru_request_mon();
+ 	if (mon < 0) {
+@@ -367,25 +372,40 @@ static int mkdir_mondata_all_prepare(struct resctrl_group *rdtgrp)
+ 	}
+ 	rdtgrp->mon.mon = mon;
+ 
++	prgrp = rdtgrp->mon.parent;
++
+ 	if (rdtgrp->type == RDTMON_GROUP) {
+-		mon_id = alloc_mon_id();
+-		if (mon_id < 0) {
+-			closid = resctrl_id_alloc();
+-			if (closid < 0) {
++		/*
++		 * this for mon id allocation, for mpam, rmid
++		 * (pmg) is just reserved for creating monitoring
++		 * group, it has the same effect with reqpartid
++		 * (reqpartid) except for config allocation, but
++		 * for some fuzzy reasons, we keep it until spec
++		 * changes. We also allocate rmid first if it's
++		 * available.
++		 */
++		rmid = alloc_rmid();
++		if (rmid < 0) {
++			reqpartid = resctrl_id_alloc(CLOSID_REQ);
++			if (reqpartid < 0) {
+ 				rdt_last_cmd_puts("out of closID\n");
+-				free_mon_id(mon_id);
+ 				ret = -EINVAL;
+ 				goto out;
+ 			}
+-			rdtgrp->closid = closid;
++			rdtgrp->closid.reqpartid = reqpartid;
+ 			rdtgrp->mon.rmid = 0;
+ 		} else {
+-			struct resctrl_group *prgrp;
+-
+-			prgrp = rdtgrp->mon.parent;
+-			rdtgrp->closid = prgrp->closid;
+-			rdtgrp->mon.rmid = mon_id;
++			/*
++			 * this time copy reqpartid from father group,
++			 * as rmid is sufficient to monitoring.
++			 */
++			rdtgrp->closid.reqpartid = prgrp->closid.reqpartid;
++			rdtgrp->mon.rmid = rmid;
+ 		}
++		/*
++		 * establish relationship from ctrl to mon group.
++		 */
++		rdtgrp->closid.intpartid = prgrp->closid.intpartid;
+ 	}
+ 
+ out:
+@@ -516,16 +536,10 @@ static int resctrl_get_tree(struct fs_context *fc)
+ 	return ret;
+ }
+ 
+-static bool is_closid_match(struct task_struct *t, struct resctrl_group *r)
+-{
+-	return (resctrl_alloc_capable &&
+-		(r->type == RDTCTRL_GROUP) && (t->closid == r->closid));
+-}
+-
+-static bool is_rmid_match(struct task_struct *t, struct resctrl_group *r)
++static inline bool
++is_task_match_resctrl_group(struct task_struct *t, struct resctrl_group *r)
+ {
+-	return (resctrl_mon_capable &&
+-		(r->type == RDTMON_GROUP) && (t->rmid == r->mon.rmid));
++	return (TASK_CLOSID_PR_GET(t->closid) == r->closid.intpartid);
+ }
+ 
+ /*
+@@ -543,9 +557,9 @@ static void resctrl_move_group_tasks(struct resctrl_group *from, struct resctrl_
+ 
+ 	read_lock(&tasklist_lock);
+ 	for_each_process_thread(p, t) {
+-		if (!from || is_closid_match(t, from) ||
+-		    is_rmid_match(t, from)) {
+-			t->closid = to->closid;
++		if (!from || is_task_match_resctrl_group(t, from)) {
++			t->closid = TASK_CLOSID_SET(to->closid.intpartid,
++				to->closid.reqpartid);
+ 			t->rmid = to->mon.rmid;
+ 
+ #ifdef CONFIG_SMP
+@@ -573,7 +587,8 @@ static void free_all_child_rdtgrp(struct resctrl_group *rdtgrp)
+ 
+ 	head = &rdtgrp->mon.crdtgrp_list;
+ 	list_for_each_entry_safe(sentry, stmp, head, mon.crdtgrp_list) {
+-		free_mon_id(sentry->mon.rmid);
++		/* rmid may not be used */
++		free_mon_id(sentry);
+ 		list_del(&sentry->mon.crdtgrp_list);
+ 		kfree(sentry);
+ 	}
+@@ -605,7 +620,7 @@ static void rmdir_all_sub(void)
+ 		cpumask_or(&resctrl_group_default.cpu_mask,
+ 			   &resctrl_group_default.cpu_mask, &rdtgrp->cpu_mask);
+ 
+-		free_mon_id(rdtgrp->mon.rmid);
++		free_mon_id(rdtgrp);
+ 
+ 		kernfs_remove(rdtgrp->kn);
+ 		list_del(&rdtgrp->resctrl_group_list);
+@@ -715,13 +730,25 @@ static int mkdir_resctrl_prepare(struct kernfs_node *parent_kn,
+ 	rdtgrp->mon.parent = prdtgrp;
+ 	rdtgrp->type = rtype;
+ 
++	/*
++	 * for ctrlmon group, intpartid is used for
++	 * applying configuration, reqpartid is
++	 * used for following this configuration and
++	 * getting monitoring for child mon groups.
++	 */
+ 	if (rdtgrp->type == RDTCTRL_GROUP) {
+-		ret = resctrl_id_alloc();
++		ret = resctrl_id_alloc(CLOSID_INT);
+ 		if (ret < 0) {
+ 			rdt_last_cmd_puts("out of CLOSIDs\n");
+ 			goto out_unlock;
+ 		}
+-		rdtgrp->closid = ret;
++		rdtgrp->closid.intpartid = ret;
++		ret = resctrl_id_alloc(CLOSID_REQ);
++		if (ret < 0) {
++			rdt_last_cmd_puts("out of SLAVE CLOSIDs\n");
++			goto out_unlock;
++		}
++		rdtgrp->closid.reqpartid = ret;
+ 		ret = 0;
+ 	}
+ 
+@@ -769,6 +796,7 @@ static int mkdir_resctrl_prepare(struct kernfs_node *parent_kn,
+ 			goto out_prepare_clean;
+ 		}
+ 	}
++
+ 	kernfs_activate(kn);
+ 
+ 	/*
+@@ -818,6 +846,12 @@ static int resctrl_group_mkdir_mon(struct kernfs_node *parent_kn,
+ 	 */
+ 	list_add_tail(&rdtgrp->mon.crdtgrp_list, &prgrp->mon.crdtgrp_list);
+ 
++	/*
++	 * update all mon group's configuration under this parent group
++	 * for master-slave model.
++	 */
++	ret = resctrl_update_groups_config(prgrp);
++
+ 	resctrl_group_kn_unlock(prgrp_kn);
+ 	return ret;
+ }
+@@ -920,9 +954,11 @@ static void resctrl_group_rm_mon(struct resctrl_group *rdtgrp,
+ 	/* Give any tasks back to the parent group */
+ 	resctrl_move_group_tasks(rdtgrp, prdtgrp, tmpmask);
+ 
+-	/* Update per cpu rmid of the moved CPUs first */
+-	for_each_cpu(cpu, &rdtgrp->cpu_mask)
++	/* Update per cpu closid and rmid of the moved CPUs first */
++	for_each_cpu(cpu, &rdtgrp->cpu_mask) {
++		per_cpu(pqr_state.default_closid, cpu) = prdtgrp->closid.reqpartid;
+ 		per_cpu(pqr_state.default_rmid, cpu) = prdtgrp->mon.rmid;
++	}
+ 	/*
+ 	 * Update the MSR on moved CPUs and CPUs which have moved
+ 	 * task running on them.
+@@ -931,7 +967,8 @@ static void resctrl_group_rm_mon(struct resctrl_group *rdtgrp,
+ 	update_closid_rmid(tmpmask, NULL);
+ 
+ 	rdtgrp->flags |= RDT_DELETED;
+-	free_mon_id(rdtgrp->mon.rmid);
++
++	free_mon_id(rdtgrp);
+ 
+ 	/*
+ 	 * Remove the rdtgrp from the parent ctrl_mon group's list
+@@ -968,8 +1005,10 @@ static void resctrl_group_rm_ctrl(struct resctrl_group *rdtgrp, cpumask_var_t tm
+ 
+ 	/* Update per cpu closid and rmid of the moved CPUs first */
+ 	for_each_cpu(cpu, &rdtgrp->cpu_mask) {
+-		per_cpu(pqr_state.default_closid, cpu) = resctrl_group_default.closid;
+-		per_cpu(pqr_state.default_rmid, cpu) = resctrl_group_default.mon.rmid;
++		per_cpu(pqr_state.default_closid, cpu) =
++			resctrl_group_default.closid.reqpartid;
++		per_cpu(pqr_state.default_rmid, cpu) =
++			resctrl_group_default.mon.rmid;
+ 	}
+ 
+ 	/*
+@@ -980,8 +1019,8 @@ static void resctrl_group_rm_ctrl(struct resctrl_group *rdtgrp, cpumask_var_t tm
+ 	update_closid_rmid(tmpmask, NULL);
+ 
+ 	rdtgrp->flags |= RDT_DELETED;
+-	resctrl_id_free(rdtgrp->closid);
+-	free_mon_id(rdtgrp->mon.rmid);
++	resctrl_id_free(CLOSID_INT, rdtgrp->closid.intpartid);
++	resctrl_id_free(CLOSID_REQ, rdtgrp->closid.reqpartid);
+ 
+ 	/*
+ 	 * Free all the child monitor group rmids.
+@@ -1056,7 +1095,8 @@ static struct kernfs_syscall_ops resctrl_group_kf_syscall_ops = {
+ 
+ static void resctrl_group_default_init(struct resctrl_group *r)
+ {
+-	r->closid = 0;
++	r->closid.intpartid = 0;
++	r->closid.reqpartid = 0;
+ 	r->mon.rmid = 0;
+ 	r->type = RDTCTRL_GROUP;
+ }
+-- 
+2.26.2
+

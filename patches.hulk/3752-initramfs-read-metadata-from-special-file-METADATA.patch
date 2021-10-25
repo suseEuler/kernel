@@ -1,0 +1,154 @@
+From 4adaeecd5d23cc75ffd1883d9b677bbd67c535d1 Mon Sep 17 00:00:00 2001
+From: Roberto Sassu <roberto.sassu@huawei.com>
+Date: Wed, 3 Mar 2021 08:43:49 +0100
+Subject: [PATCH] initramfs: read metadata from special file METADATA!!!
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 4adaeecd5d23cc75ffd1883d9b677bbd67c535d1
+
+
+hulk inclusion
+category: feature
+feature: IMA Digest Lists extension
+bugzilla: 46797
+
+-------------------------------------------------
+
+Instead of changing the CPIO format, metadata are parsed from regular files
+with special name 'METADATA!!!'. This file immediately follows the file
+metadata are added to.
+
+This patch checks if the file being extracted has the special name and, if
+yes, creates a buffer with the content of that file and calls
+do_parse_metadata() to parse metadata from the buffer.
+
+Signed-off-by: Roberto Sassu <roberto.sassu@huawei.com>
+Reported-by: kbuild test robot <lkp@intel.com>
+Signed-off-by: Tianxing Zhang <zhangtianxing3@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ init/initramfs.c | 50 +++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 49 insertions(+), 1 deletion(-)
+
+diff --git a/init/initramfs.c b/init/initramfs.c
+index 5b222e0b3146..15cc75281550 100644
+--- a/init/initramfs.c
++++ b/init/initramfs.c
+@@ -223,6 +223,7 @@ static void __init read_into(char *buf, unsigned size, enum state next)
+ }
+ 
+ static __initdata char *header_buf, *symlink_buf, *name_buf, *metadata_buf;
++static __initdata char *metadata_buf_ptr, *previous_name_buf;
+ 
+ static int __init do_start(void)
+ {
+@@ -404,6 +405,7 @@ static int __init __maybe_unused do_parse_metadata(char *pathname)
+ 
+ static __initdata struct file *wfile;
+ static __initdata loff_t wfile_pos;
++static int metadata __initdata;
+ 
+ static int __init do_name(void)
+ {
+@@ -412,6 +414,10 @@ static int __init do_name(void)
+ 	if (strcmp(collected, "TRAILER!!!") == 0) {
+ 		free_hash();
+ 		return 0;
++	} else if (strcmp(collected, METADATA_FILENAME) == 0) {
++		metadata = 1;
++	} else {
++		memcpy(previous_name_buf, collected, strlen(collected) + 1);
+ 	}
+ 	clean_path(collected, mode);
+ 	if (S_ISREG(mode)) {
+@@ -448,12 +454,48 @@ static int __init do_name(void)
+ 	return 0;
+ }
+ 
++static int __init do_process_metadata(char *buf, int len, bool last)
++{
++	int ret = 0;
++
++	if (!metadata_buf) {
++		metadata_buf_ptr = metadata_buf = kmalloc(body_len, GFP_KERNEL);
++		if (!metadata_buf_ptr) {
++			ret = -ENOMEM;
++			goto out;
++		}
++
++		metadata_len = body_len;
++	}
++
++	if (metadata_buf_ptr + len > metadata_buf + metadata_len) {
++		ret = -EINVAL;
++		goto out;
++	}
++
++	memcpy(metadata_buf_ptr, buf, len);
++	metadata_buf_ptr += len;
++
++	if (last)
++		do_parse_metadata(previous_name_buf);
++out:
++	if (ret < 0 || last) {
++		kfree(metadata_buf);
++		metadata_buf = NULL;
++		metadata = 0;
++	}
++
++	return ret;
++}
++
+ static int __init do_copy(void)
+ {
+ 	if (byte_count >= body_len) {
+ 		struct timespec64 t[2] = { };
+ 		if (xwrite(wfile, victim, body_len, &wfile_pos) != body_len)
+ 			error("write error");
++		if (metadata)
++			do_process_metadata(victim, body_len, true);
+ 
+ 		t[0].tv_sec = mtime;
+ 		t[1].tv_sec = mtime;
+@@ -466,6 +508,8 @@ static int __init do_copy(void)
+ 	} else {
+ 		if (xwrite(wfile, victim, byte_count, &wfile_pos) != byte_count)
+ 			error("write error");
++		if (metadata)
++			do_process_metadata(victim, byte_count, false);
+ 		body_len -= byte_count;
+ 		eat(byte_count);
+ 		return 1;
+@@ -475,6 +519,7 @@ static int __init do_copy(void)
+ static int __init do_symlink(void)
+ {
+ 	collected[N_ALIGN(name_len) + body_len] = '\0';
++	memcpy(previous_name_buf, collected, strlen(collected) + 1);
+ 	clean_path(collected, 0);
+ 	init_symlink(collected + N_ALIGN(name_len), collected);
+ 	init_chown(collected, uid, gid, AT_SYMLINK_NOFOLLOW);
+@@ -542,8 +587,10 @@ static char * __init unpack_to_rootfs(char *buf, unsigned long len)
+ 	header_buf = kmalloc(110, GFP_KERNEL);
+ 	symlink_buf = kmalloc(PATH_MAX + N_ALIGN(PATH_MAX) + 1, GFP_KERNEL);
+ 	name_buf = kmalloc(N_ALIGN(PATH_MAX), GFP_KERNEL);
++	previous_name_buf = kmalloc(PATH_MAX + N_ALIGN(PATH_MAX) + 1,
++				    GFP_KERNEL);
+ 
+-	if (!header_buf || !symlink_buf || !name_buf)
++	if (!header_buf || !symlink_buf || !name_buf || !previous_name_buf)
+ 		panic("can't allocate buffers");
+ 
+ 	state = Start;
+@@ -588,6 +635,7 @@ static char * __init unpack_to_rootfs(char *buf, unsigned long len)
+ 		len -= my_inptr;
+ 	}
+ 	dir_utime();
++	kfree(previous_name_buf);
+ 	kfree(name_buf);
+ 	kfree(symlink_buf);
+ 	kfree(header_buf);
+-- 
+2.26.2
+

@@ -1,0 +1,148 @@
+From 3e272c5406dd5cd135b463d94cf7d79e192f0611 Mon Sep 17 00:00:00 2001
+From: Cheng Jian <cj.chengjian@huawei.com>
+Date: Sat, 29 May 2021 14:42:39 +0800
+Subject: [PATCH] livepatch/core: Restrict livepatch patched/unpatched when
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 3e272c5406dd5cd135b463d94cf7d79e192f0611
+
+ plant kprobe
+
+euler inclusion
+category: feature
+bugzilla: 51921
+CVE: N/A
+
+----------------------------------------
+
+livepatch wo_ftrace and kprobe are in conflict, because kprobe
+may modify the instructions anywhere in the function.
+
+So it's dangerous to patched/unpatched an function when there are
+some kprobes registered on it. Restrict these situation.
+
+we should hold kprobe_mutex in klp_check_patch_kprobed, but it's
+static and can't export, so protect klp_check_patch_probe in
+stop_machine to avoid registing kprobes when patching.
+
+we do nothing for (un)register kprobes on the (old) function
+which has been patched. because there are sone engineers need this.
+certainly, it will not lead to hangs, but not recommended.
+
+Signed-off-by: Cheng Jian <cj.chengjian@huawei.com>
+Reviewed-by: Li Bin <huawei.libin@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+
+Signed-off-by: Ye Weihua <yeweihua4@huawei.com>
+Reviewed-by: Yang Jihong <yangjihong1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/livepatch/Kconfig | 10 +++++++++
+ kernel/livepatch/core.c  | 47 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 57 insertions(+)
+
+diff --git a/kernel/livepatch/Kconfig b/kernel/livepatch/Kconfig
+index fbbe99edf0bb..4e6dfea097f3 100644
+--- a/kernel/livepatch/Kconfig
++++ b/kernel/livepatch/Kconfig
+@@ -57,5 +57,15 @@ config LIVEPATCH_STACK
+ 	help
+ 	  Say N here if you want to remove the patch stacking principle.
+ 
++config LIVEPATCH_RESTRICT_KPROBE
++	bool "Enforing check livepatch and kprobe restrict"
++	depends on LIVEPATCH_WO_FTRACE
++	depends on KPROBES
++	default y
++	help
++	  Livepatch without ftrace and kprobe are conflicting.
++	  We should not patch for the functions where registered with kprobe,
++	  and vice versa.
++	  Say Y here if you want to check those.
+ endmenu
+ endif
+diff --git a/kernel/livepatch/core.c b/kernel/livepatch/core.c
+index b37df4ec904a..f20aba5a8e35 100644
+--- a/kernel/livepatch/core.c
++++ b/kernel/livepatch/core.c
+@@ -24,6 +24,9 @@
+ #include "patch.h"
+ #include <linux/proc_fs.h>
+ #include <linux/seq_file.h>
++#ifdef CONFIG_LIVEPATCH_RESTRICT_KPROBE
++#include <linux/kprobes.h>
++#endif
+ #ifdef CONFIG_LIVEPATCH_FTRACE
+ #include "state.h"
+ #include "transition.h"
+@@ -58,6 +61,40 @@ struct patch_data {
+ };
+ #endif
+ 
++#ifdef CONFIG_LIVEPATCH_RESTRICT_KPROBE
++/*
++ * Check whether a function has been registered with kprobes before patched.
++ * We can't patched this function util we unregistered the kprobes.
++ */
++struct kprobe *klp_check_patch_kprobed(struct klp_patch *patch)
++{
++	struct klp_object *obj;
++	struct klp_func *func;
++	struct kprobe *kp;
++	int i;
++
++	klp_for_each_object(patch, obj) {
++		klp_for_each_func(obj, func) {
++			for (i = 0; i < func->old_size; i++) {
++				kp = get_kprobe(func->old_func + i);
++				if (kp) {
++					pr_err("func %s has been probed, (un)patch failed\n",
++						func->old_name);
++					return kp;
++				}
++			}
++		}
++	}
++
++	return NULL;
++}
++#else
++static inline struct kprobe *klp_check_patch_kprobed(struct klp_patch *patch)
++{
++	return NULL;
++}
++#endif /* CONFIG_LIVEPATCH_RESTRICT_KPROBE */
++
+ static bool klp_is_module(struct klp_object *obj)
+ {
+ 	return obj->name;
+@@ -1107,6 +1144,11 @@ int klp_try_disable_patch(void *data)
+ 	if (atomic_inc_return(&pd->cpu_count) == 1) {
+ 		struct klp_patch *patch = pd->patch;
+ 
++		if (klp_check_patch_kprobed(patch)) {
++			atomic_inc(&pd->cpu_count);
++			return -EINVAL;
++		}
++
+ 		ret = klp_check_calltrace(patch, 0);
+ 		if (ret) {
+ 			atomic_inc(&pd->cpu_count);
+@@ -1258,6 +1300,11 @@ int klp_try_enable_patch(void *data)
+ 	if (atomic_inc_return(&pd->cpu_count) == 1) {
+ 		struct klp_patch *patch = pd->patch;
+ 
++		if (klp_check_patch_kprobed(patch)) {
++			atomic_inc(&pd->cpu_count);
++			return -EINVAL;
++		}
++
+ 		ret = klp_check_calltrace(patch, 1);
+ 		if (ret) {
+ 			atomic_inc(&pd->cpu_count);
+-- 
+2.26.2
+

@@ -1,0 +1,137 @@
+From efed88dd593493653466917a7e95868ec38bef41 Mon Sep 17 00:00:00 2001
+From: Zengruan Ye <yezengruan@huawei.com>
+Date: Tue, 2 Feb 2021 17:44:53 +0800
+Subject: [PATCH] KVM: arm64: Implement PV_SCHED_KICK_CPU call
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: efed88dd593493653466917a7e95868ec38bef41
+
+
+virt inclusion
+category: feature
+bugzilla: 47624
+CVE: NA
+
+--------------------------------
+
+Implement the service call for waking up a WFI state vCPU.
+
+Signed-off-by: Zengruan Ye <yezengruan@huawei.com>
+Reviewed-by: Zhanghailiang <zhang.zhanghailiang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/kvm_host.h |  2 ++
+ arch/arm64/kvm/arm.c              |  4 +++-
+ arch/arm64/kvm/handle_exit.c      |  1 +
+ arch/arm64/kvm/hypercalls.c       |  3 +++
+ arch/arm64/kvm/pvsched.c          | 25 +++++++++++++++++++++++++
+ 5 files changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/include/asm/kvm_host.h b/arch/arm64/include/asm/kvm_host.h
+index 4911931318e0..ffe75fb241b1 100644
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@ -384,6 +384,7 @@ struct kvm_vcpu_arch {
+ 
+ 	/* Guest PV sched state */
+ 	struct {
++		bool pv_unhalted;
+ 		gpa_t base;
+ 	} pvsched;
+ };
+@@ -596,6 +597,7 @@ static inline bool kvm_arm_is_pvtime_enabled(struct kvm_vcpu_arch *vcpu_arch)
+ 
+ long kvm_hypercall_pvsched_features(struct kvm_vcpu *vcpu);
+ void kvm_update_pvsched_preempted(struct kvm_vcpu *vcpu, u32 preempted);
++long kvm_pvsched_kick_vcpu(struct kvm_vcpu *vcpu);
+ 
+ static inline void kvm_arm_pvsched_vcpu_init(struct kvm_vcpu_arch *vcpu_arch)
+ {
+diff --git a/arch/arm64/kvm/arm.c b/arch/arm64/kvm/arm.c
+index 8ae8bbf1b481..16c65e844ef7 100644
+--- a/arch/arm64/kvm/arm.c
++++ b/arch/arm64/kvm/arm.c
+@@ -467,7 +467,9 @@ int kvm_arch_vcpu_ioctl_set_mpstate(struct kvm_vcpu *vcpu,
+ int kvm_arch_vcpu_runnable(struct kvm_vcpu *v)
+ {
+ 	bool irq_lines = *vcpu_hcr(v) & (HCR_VI | HCR_VF);
+-	return ((irq_lines || kvm_vgic_vcpu_pending_irq(v))
++	bool pv_unhalted = v->arch.pvsched.pv_unhalted;
++
++	return ((irq_lines || kvm_vgic_vcpu_pending_irq(v) || pv_unhalted)
+ 		&& !v->arch.power_off && !v->arch.pause);
+ }
+ 
+diff --git a/arch/arm64/kvm/handle_exit.c b/arch/arm64/kvm/handle_exit.c
+index 7199dd851454..00d7ece1727d 100644
+--- a/arch/arm64/kvm/handle_exit.c
++++ b/arch/arm64/kvm/handle_exit.c
+@@ -97,6 +97,7 @@ static int kvm_handle_wfx(struct kvm_vcpu *vcpu)
+ 	} else {
+ 		trace_kvm_wfx_arm64(*vcpu_pc(vcpu), false);
+ 		vcpu->stat.wfi_exit_stat++;
++		vcpu->arch.pvsched.pv_unhalted = false;
+ 		kvm_vcpu_block(vcpu);
+ 		kvm_clear_request(KVM_REQ_UNHALT, vcpu);
+ 	}
+diff --git a/arch/arm64/kvm/hypercalls.c b/arch/arm64/kvm/hypercalls.c
+index a6fc39682a65..02f38b3f8912 100644
+--- a/arch/arm64/kvm/hypercalls.c
++++ b/arch/arm64/kvm/hypercalls.c
+@@ -88,6 +88,9 @@ int kvm_hvc_call_handler(struct kvm_vcpu *vcpu)
+ 		vcpu->arch.pvsched.base = GPA_INVALID;
+ 		val = SMCCC_RET_SUCCESS;
+ 		break;
++	case ARM_SMCCC_HV_PV_SCHED_KICK_CPU:
++		val = kvm_pvsched_kick_vcpu(vcpu);
++		break;
+ 	default:
+ 		return kvm_psci_call(vcpu);
+ 	}
+diff --git a/arch/arm64/kvm/pvsched.c b/arch/arm64/kvm/pvsched.c
+index b923c4b6c52e..8f2db8e298a6 100644
+--- a/arch/arm64/kvm/pvsched.c
++++ b/arch/arm64/kvm/pvsched.c
+@@ -34,6 +34,30 @@ void kvm_update_pvsched_preempted(struct kvm_vcpu *vcpu, u32 preempted)
+ 	pagefault_enable();
+ }
+ 
++long kvm_pvsched_kick_vcpu(struct kvm_vcpu *vcpu)
++{
++	unsigned int vcpu_idx;
++	long val = SMCCC_RET_NOT_SUPPORTED;
++	struct kvm *kvm = vcpu->kvm;
++	struct kvm_vcpu *target = NULL;
++
++	vcpu_idx = smccc_get_arg1(vcpu);
++	target = kvm_get_vcpu(kvm, vcpu_idx);
++	if (!target)
++		goto out;
++
++	target->arch.pvsched.pv_unhalted = true;
++	kvm_make_request(KVM_REQ_IRQ_PENDING, target);
++	kvm_vcpu_kick(target);
++	if (READ_ONCE(target->ready))
++		kvm_vcpu_yield_to(target);
++
++	val = SMCCC_RET_SUCCESS;
++
++out:
++	return val;
++}
++
+ long kvm_hypercall_pvsched_features(struct kvm_vcpu *vcpu)
+ {
+ 	u32 feature = smccc_get_arg1(vcpu);
+@@ -43,6 +67,7 @@ long kvm_hypercall_pvsched_features(struct kvm_vcpu *vcpu)
+ 	case ARM_SMCCC_HV_PV_SCHED_FEATURES:
+ 	case ARM_SMCCC_HV_PV_SCHED_IPA_INIT:
+ 	case ARM_SMCCC_HV_PV_SCHED_IPA_RELEASE:
++	case ARM_SMCCC_HV_PV_SCHED_KICK_CPU:
+ 		val = SMCCC_RET_SUCCESS;
+ 		break;
+ 	}
+-- 
+2.26.2
+

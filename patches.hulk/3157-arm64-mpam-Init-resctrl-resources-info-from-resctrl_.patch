@@ -1,0 +1,488 @@
+From 00de25ec9e97c1b3f0d48f2469d22d31375efd1a Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Fri, 26 Feb 2021 20:21:59 +0800
+Subject: [PATCH] arm64/mpam: Init resctrl resources' info from resctrl_res
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 00de25ec9e97c1b3f0d48f2469d22d31375efd1a
+
+ selected
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+Initialize resctrl resources from exported resctrl_res which contains the
+class distinguished by mpam type and level (just for Cache).
+
+resctrl resource structure and initialization process need to be modified
+for it doesn't distinguish between L2 and L3.
+
+Part of code refers to James's, See links, others refer to Intel-RDT's
+and with appropriate expands.
+
+Link: http://www.linux-arm.org/git?p=linux-jm.git;a=patch;h=b6870246e25f8f6f9c7b275f0aaa50fc772094a6
+Link: http://www.linux-arm.org/git?p=linux-jm.git;a=patch;h=676d9aee8c2b27a17dd9cbebe5c9ecdd63c6281f
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/mpam.h          |   9 --
+ arch/arm64/include/asm/resctrl.h       |   2 +-
+ arch/arm64/kernel/mpam/mpam_ctrlmon.c  |   2 +-
+ arch/arm64/kernel/mpam/mpam_internal.h |   6 ++
+ arch/arm64/kernel/mpam/mpam_mon.c      |   2 +-
+ arch/arm64/kernel/mpam/mpam_resctrl.c  |  73 +++++++++-----
+ arch/arm64/kernel/mpam/mpam_setup.c    | 128 +++++++++++++++++++++++++
+ include/linux/resctrlfs.h              |  37 +++++++
+ 8 files changed, 223 insertions(+), 36 deletions(-)
+
+diff --git a/arch/arm64/include/asm/mpam.h b/arch/arm64/include/asm/mpam.h
+index b83f940e0432..97e259703933 100644
+--- a/arch/arm64/include/asm/mpam.h
++++ b/arch/arm64/include/asm/mpam.h
+@@ -212,15 +212,6 @@ extern struct resctrl_resource resctrl_resources_all[];
+ 
+ int __init resctrl_group_init(void);
+ 
+-enum {
+-	MPAM_RESOURCE_SMMU,
+-	MPAM_RESOURCE_CACHE,
+-	MPAM_RESOURCE_MC,
+-
+-	/* Must be the last */
+-	MPAM_NUM_RESOURCES,
+-};
+-
+ void rdt_last_cmd_clear(void);
+ void rdt_last_cmd_puts(const char *s);
+ void rdt_last_cmd_printf(const char *fmt, ...);
+diff --git a/arch/arm64/include/asm/resctrl.h b/arch/arm64/include/asm/resctrl.h
+index 258baefc2360..d0d30a0fdc1d 100644
+--- a/arch/arm64/include/asm/resctrl.h
++++ b/arch/arm64/include/asm/resctrl.h
+@@ -71,7 +71,7 @@ int resctrl_group_schemata_show(struct kernfs_open_file *of,
+ 
+ #define for_each_resctrl_resource(r)					\
+ 	for (r = resctrl_resources_all;					\
+-	     r < resctrl_resources_all + MPAM_NUM_RESOURCES;		\
++	     r < resctrl_resources_all + RDT_NUM_RESOURCES;		\
+ 	     r++)							\
+ 
+ int mpam_get_mon_config(struct resctrl_resource *r);
+diff --git a/arch/arm64/kernel/mpam/mpam_ctrlmon.c b/arch/arm64/kernel/mpam/mpam_ctrlmon.c
+index 9518c1fb6abf..7de890c3932b 100644
+--- a/arch/arm64/kernel/mpam/mpam_ctrlmon.c
++++ b/arch/arm64/kernel/mpam/mpam_ctrlmon.c
+@@ -534,7 +534,7 @@ int mkdir_mondata_all(struct kernfs_node *parent_kn,
+ 		if (r->mon_enabled) {
+ 			/* HHA does not support monitor by pmg */
+ 			if ((prgrp->type == RDTMON_GROUP) &&
+-			    (r->rid == MPAM_RESOURCE_MC))
++			    (r->rid == RDT_RESOURCE_MC))
+ 				continue;
+ 
+ 			ret = mkdir_mondata_subdir_alldom(kn, r, prgrp);
+diff --git a/arch/arm64/kernel/mpam/mpam_internal.h b/arch/arm64/kernel/mpam/mpam_internal.h
+index 3115f934917d..be4109c19de9 100644
+--- a/arch/arm64/kernel/mpam/mpam_internal.h
++++ b/arch/arm64/kernel/mpam/mpam_internal.h
+@@ -9,12 +9,15 @@ typedef u32 mpam_features_t;
+ struct mpam_component;
+ struct rdt_domain;
+ struct mpam_class;
++struct raw_resctrl_resource;
+ 
+ extern bool rdt_alloc_capable;
+ extern bool rdt_mon_capable;
+ 
+ extern struct list_head mpam_classes;
+ 
++#define MAX_MBA_BW  100u
++
+ struct mpam_resctrl_dom {
+ 	struct mpam_component   *comp;
+ 
+@@ -120,4 +123,7 @@ void mpam_class_list_lock_held(void);
+ 
+ int mpam_resctrl_setup(void);
+ 
++struct raw_resctrl_resource *
++mpam_get_raw_resctrl_resource(u32 level);
++
+ #endif
+diff --git a/arch/arm64/kernel/mpam/mpam_mon.c b/arch/arm64/kernel/mpam/mpam_mon.c
+index cffafc8d7dde..df63641a0215 100644
+--- a/arch/arm64/kernel/mpam/mpam_mon.c
++++ b/arch/arm64/kernel/mpam/mpam_mon.c
+@@ -42,7 +42,7 @@ void pmg_init(void)
+ {
+ 	/* use L3's num_pmg as system num_pmg */
+ 	struct raw_resctrl_resource *rr =
+-		resctrl_resources_all[MPAM_RESOURCE_CACHE].res;
++		resctrl_resources_all[RDT_RESOURCE_L3].res;
+ 	int num_pmg = rr->num_pmg;
+ 
+ 	mon_init();
+diff --git a/arch/arm64/kernel/mpam/mpam_resctrl.c b/arch/arm64/kernel/mpam/mpam_resctrl.c
+index 65b532dab004..e63c8409a65b 100644
+--- a/arch/arm64/kernel/mpam/mpam_resctrl.c
++++ b/arch/arm64/kernel/mpam/mpam_resctrl.c
+@@ -190,7 +190,7 @@ int mpam_create_cache_node(u32 component_id,
+ 	struct mpam_node *new;
+ 	char *name;
+ 
+-	if (validate_mpam_node(MPAM_RESOURCE_CACHE, component_id))
++	if (validate_mpam_node(RDT_RESOURCE_L3, component_id))
+ 		goto skip;
+ 
+ 	new = kzalloc(sizeof(struct mpam_node), GFP_KERNEL);
+@@ -206,7 +206,7 @@ int mpam_create_cache_node(u32 component_id,
+ 
+ 	mpam_node_assign_val(new,
+ 			name,
+-			MPAM_RESOURCE_CACHE,
++			RDT_RESOURCE_L3,
+ 			hwpage_address,
+ 			component_id);
+ 	list_add_tail(&new->list, &mpam_nodes_ptr->list);
+@@ -221,7 +221,7 @@ int mpam_create_memory_node(u32 component_id,
+ 	struct mpam_node *new;
+ 	char *name;
+ 
+-	if (validate_mpam_node(MPAM_RESOURCE_MC, component_id))
++	if (validate_mpam_node(RDT_RESOURCE_MC, component_id))
+ 		goto skip;
+ 
+ 	new = kzalloc(sizeof(struct mpam_node), GFP_KERNEL);
+@@ -237,7 +237,7 @@ int mpam_create_memory_node(u32 component_id,
+ 
+ 	mpam_node_assign_val(new,
+ 			name,
+-			MPAM_RESOURCE_MC,
++			RDT_RESOURCE_MC,
+ 			hwpage_address,
+ 			component_id);
+ 	list_add_tail(&new->list, &mpam_nodes_ptr->list);
+@@ -296,7 +296,7 @@ static int csu_write(struct rdt_domain *d, struct rdtgroup *g, bool enable);
+ #define domain_init(id) LIST_HEAD_INIT(resctrl_resources_all[id].domains)
+ 
+ struct raw_resctrl_resource raw_resctrl_resources_all[] = {
+-	[MPAM_RESOURCE_CACHE] = {
++	[RDT_RESOURCE_L3] = {
+ 		.msr_update		= cat_wrmsr,
+ 		.msr_read		= cat_rdmsr,
+ 		.parse_ctrlval		= parse_cbm,
+@@ -304,7 +304,15 @@ struct raw_resctrl_resource raw_resctrl_resources_all[] = {
+ 		.mon_read		= csu_read,
+ 		.mon_write		= csu_write,
+ 	},
+-	[MPAM_RESOURCE_MC] = {
++	[RDT_RESOURCE_L2] = {
++		.msr_update		= cat_wrmsr,
++		.msr_read		= cat_rdmsr,
++		.parse_ctrlval		= parse_cbm,
++		.format_str		= "%d=%0*x",
++		.mon_read		= csu_read,
++		.mon_write		= csu_write,
++	},
++	[RDT_RESOURCE_MC] = {
+ 		.msr_update		= bw_wrmsr,
+ 		.msr_read		= bw_rdmsr,
+ 		.parse_ctrlval		= parse_bw,	/* add parse_bw() helper */
+@@ -315,24 +323,41 @@ struct raw_resctrl_resource raw_resctrl_resources_all[] = {
+ };
+ 
+ struct resctrl_resource resctrl_resources_all[] = {
+-	[MPAM_RESOURCE_CACHE] = {
+-		.rid			= MPAM_RESOURCE_CACHE,
+-		.name			= "L3",
+-		.domains		= domain_init(MPAM_RESOURCE_CACHE),
+-		.res			= &raw_resctrl_resources_all[MPAM_RESOURCE_CACHE],
+-		.fflags			= RFTYPE_RES_CACHE,
+-		.alloc_enabled		= 1,
++	[RDT_RESOURCE_L3] = {
++		.rid		= RDT_RESOURCE_L3,
++		.name		= "L3",
++		.domains	= domain_init(RDT_RESOURCE_L3),
++		.res		= &raw_resctrl_resources_all[RDT_RESOURCE_L3],
++		.fflags		= RFTYPE_RES_CACHE,
++		.alloc_enabled	= 1,
++	},
++	[RDT_RESOURCE_L2] = {
++		.rid		= RDT_RESOURCE_L2,
++		.name		= "L2",
++		.domains	= domain_init(RDT_RESOURCE_L2),
++		.res		= &raw_resctrl_resources_all[RDT_RESOURCE_L2],
++		.fflags		= RFTYPE_RES_CACHE,
++		.alloc_enabled	= 1,
+ 	},
+-	[MPAM_RESOURCE_MC] = {
+-		.rid			= MPAM_RESOURCE_MC,
+-		.name			= "MB",
+-		.domains		= domain_init(MPAM_RESOURCE_MC),
+-		.res			= &raw_resctrl_resources_all[MPAM_RESOURCE_MC],
+-		.fflags			= RFTYPE_RES_MC,
+-		.alloc_enabled		= 1,
++	[RDT_RESOURCE_MC] = {
++		.rid		= RDT_RESOURCE_MC,
++		.name		= "MB",
++		.domains	= domain_init(RDT_RESOURCE_MC),
++		.res		= &raw_resctrl_resources_all[RDT_RESOURCE_MC],
++		.fflags		= RFTYPE_RES_MC,
++		.alloc_enabled	= 1,
+ 	},
+ };
+ 
++struct raw_resctrl_resource *
++mpam_get_raw_resctrl_resource(enum resctrl_resource_level level)
++{
++	if (level >= RDT_NUM_RESOURCES)
++		return NULL;
++
++	return &raw_resctrl_resources_all[level];
++}
++
+ static void
+ cat_wrmsr(struct rdt_domain *d, int partid)
+ {
+@@ -1319,13 +1344,13 @@ static void mpam_domains_init(struct resctrl_resource *r)
+ 		r->mon_capable = MPAMF_IDR_HAS_MSMON(val);
+ 		r->mon_enabled = MPAMF_IDR_HAS_MSMON(val);
+ 
+-		if (r->rid == MPAM_RESOURCE_CACHE) {
++		if (r->rid == RDT_RESOURCE_L3) {
+ 			r->alloc_capable = MPAMF_IDR_HAS_CPOR_PART(val);
+ 			r->alloc_enabled = MPAMF_IDR_HAS_CPOR_PART(val);
+ 
+ 			val = mpam_readl(d->base + MPAMF_CSUMON_IDR);
+ 			rr->num_mon = MPAMF_IDR_NUM_MON(val);
+-		} else if (r->rid == MPAM_RESOURCE_MC) {
++		} else if (r->rid == RDT_RESOURCE_MC) {
+ 			r->alloc_capable = MPAMF_IDR_HAS_MBW_PART(val);
+ 			r->alloc_enabled = MPAMF_IDR_HAS_MBW_PART(val);
+ 
+@@ -1382,8 +1407,8 @@ static int __init mpam_init(void)
+ 		goto out;
+ 	}
+ 
+-	mpam_domains_init(&resctrl_resources_all[MPAM_RESOURCE_CACHE]);
+-	mpam_domains_init(&resctrl_resources_all[MPAM_RESOURCE_MC]);
++	mpam_domains_init(&resctrl_resources_all[RDT_RESOURCE_L3]);
++	mpam_domains_init(&resctrl_resources_all[RDT_RESOURCE_MC]);
+ 
+ 	state = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN,
+ 				  "arm64/mpam:online:",
+diff --git a/arch/arm64/kernel/mpam/mpam_setup.c b/arch/arm64/kernel/mpam/mpam_setup.c
+index fd8c47570fa0..a80584cbe61b 100644
+--- a/arch/arm64/kernel/mpam/mpam_setup.c
++++ b/arch/arm64/kernel/mpam/mpam_setup.c
+@@ -200,9 +200,128 @@ static void mpam_resctrl_pick_event_mbm_local(void)
+ 	}
+ }
+ 
++static int mpam_resctrl_resource_init(struct mpam_resctrl_res *res)
++{
++	struct mpam_class *class = res->class;
++	struct resctrl_resource *r = &res->resctrl_res;
++
++	if (class == mpam_resctrl_exports[RDT_RESOURCE_SMMU].class) {
++		return 0;
++	} else if (class == mpam_resctrl_exports[RDT_RESOURCE_MC].class) {
++		r->rid = RDT_RESOURCE_MC;
++		r->name = "MB";
++		r->fflags = RFTYPE_RES_MC;
++		r->mbw.delay_linear = true;
++		r->res = mpam_get_raw_resctrl_resource(RDT_RESOURCE_MC);
++
++		if (mpam_has_feature(mpam_feat_mbw_part, class->features)) {
++			res->resctrl_mba_uses_mbw_part = true;
++
++			/*
++			 * The maximum throttling is the number of bits we can
++			 * unset in the bitmap. We never clear all of them,
++			 * so the minimum is one bit, as a percentage.
++			 */
++			r->mbw.min_bw = MAX_MBA_BW / class->mbw_pbm_bits;
++		} else {
++			/* we're using mpam_feat_mbw_max's */
++			res->resctrl_mba_uses_mbw_part = false;
++
++			/*
++			 * The maximum throttling is the number of fractions we
++			 * can represent with the implemented bits. We never
++			 * set 0. The minimum is the LSB, as a percentage.
++			 */
++			r->mbw.min_bw = MAX_MBA_BW /
++				((1ULL << class->bwa_wd) - 1);
++			/* the largest mbw_max is 100 */
++			r->default_ctrl = 100;
++		}
++		/* Just in case we have an excessive number of bits */
++		if (!r->mbw.min_bw)
++			r->mbw.min_bw = 1;
++
++		/*
++		 * because its linear with no offset, the granule is the same
++		 * as the smallest value
++		 */
++		r->mbw.bw_gran = r->mbw.min_bw;
++
++		/* We will only pick a class that can monitor and control */
++		r->alloc_capable = true;
++		r->alloc_enabled = true;
++		rdt_alloc_capable = true;
++		r->mon_capable = true;
++		r->mon_enabled = true;
++	} else if (class == mpam_resctrl_exports[RDT_RESOURCE_L3].class) {
++		r->rid = RDT_RESOURCE_L3;
++		r->res = mpam_get_raw_resctrl_resource(RDT_RESOURCE_L3);
++		r->fflags = RFTYPE_RES_CACHE;
++		r->name = "L3";
++
++		r->cache.cbm_len = class->cpbm_wd;
++		r->default_ctrl = GENMASK(class->cpbm_wd - 1, 0);
++		/*
++		 * Which bits are shared with other ...things...
++		 * Unknown devices use partid-0 which uses all the bitmap
++		 * fields. Until we configured the SMMU and GIC not to do this
++		 * 'all the bits' is the correct answer here.
++		 */
++		r->cache.shareable_bits = r->default_ctrl;
++		r->cache.min_cbm_bits = 1;
++
++		if (mpam_has_feature(mpam_feat_cpor_part, class->features)) {
++			r->alloc_capable = true;
++			r->alloc_enabled = true;
++			rdt_alloc_capable = true;
++		}
++		/*
++		 * While this is a CPU-interface feature of MPAM, we only tell
++		 * resctrl about it for caches, as that seems to be how x86
++		 * works, and thus what resctrl expects.
++		 */
++		r->cdp_capable = true;
++		r->mon_capable = true;
++		r->mon_enabled = true;
++
++	} else if (class == mpam_resctrl_exports[RDT_RESOURCE_L2].class) {
++		r->rid = RDT_RESOURCE_L2;
++		r->res = mpam_get_raw_resctrl_resource(RDT_RESOURCE_L2);
++		r->fflags = RFTYPE_RES_CACHE;
++		r->name = "L2";
++
++		r->cache.cbm_len = class->cpbm_wd;
++		r->default_ctrl = GENMASK(class->cpbm_wd - 1, 0);
++		/*
++		 * Which bits are shared with other ...things...
++		 * Unknown devices use partid-0 which uses all the bitmap
++		 * fields. Until we configured the SMMU and GIC not to do this
++		 * 'all the bits' is the correct answer here.
++		 */
++		r->cache.shareable_bits = r->default_ctrl;
++
++		if (mpam_has_feature(mpam_feat_cpor_part, class->features)) {
++			r->alloc_capable = true;
++			r->alloc_enabled = true;
++			rdt_alloc_capable = true;
++		}
++
++		/*
++		 * While this is a CPU-interface feature of MPAM, we only tell
++		 * resctrl about it for caches, as that seems to be how x86
++		 * works, and thus what resctrl expects.
++		 */
++		r->cdp_capable = true;
++		r->mon_capable = false;
++	}
++
++	return 0;
++}
++
+ /* Called with the mpam classes lock held */
+ int mpam_resctrl_setup(void)
+ {
++	int rc;
+ 	struct mpam_resctrl_res *res;
+ 	enum resctrl_resource_level level = 0;
+ 
+@@ -219,5 +338,14 @@ int mpam_resctrl_setup(void)
+ 	mpam_resctrl_pick_event_mbm_total();
+ 	mpam_resctrl_pick_event_mbm_local();
+ 
++	for_each_supported_resctrl_exports(res) {
++		rc = mpam_resctrl_resource_init(res);
++		if (rc)
++			return rc;
++	}
++
++	if (!rdt_alloc_capable && !rdt_mon_capable)
++		return -EOPNOTSUPP;
++
+ 	return 0;
+ }
+diff --git a/include/linux/resctrlfs.h b/include/linux/resctrlfs.h
+index b7a2ff9a7832..da2be20fd47c 100644
+--- a/include/linux/resctrlfs.h
++++ b/include/linux/resctrlfs.h
+@@ -10,6 +10,36 @@
+ #include <linux/seq_buf.h>
+ #include <linux/seq_file.h>
+ 
++/**
++ * struct resctrl_cache - Cache allocation related data
++ * @cbm_len:        Length of the cache bit mask
++ * @min_cbm_bits:   Minimum number of consecutive bits to be set
++ * @cbm_idx_mult:   Multiplier of CBM index
++ * @cbm_idx_offset: Offset of CBM index. CBM index is computed by:
++ *          closid * cbm_idx_multi + cbm_idx_offset
++ *          in a cache bit mask
++ * @shareable_bits: Bitmask of shareable resource with other
++ *          executing entities
++ * @arch_has_sparse_bitmaps:   True if a bitmap like f00f is valid.
++ */
++struct resctrl_cache {
++	u32     cbm_len;
++	u32     shareable_bits;
++	u32     min_cbm_bits;
++};
++
++/**
++ * struct resctrl_membw - Memory bandwidth allocation related data
++ * @min_bw:     Minimum memory bandwidth percentage user can request
++ * @bw_gran:        Granularity at which the memory bandwidth is allocated
++ * @delay_linear:   True if memory B/W delay is in linear scale
++ */
++struct resctrl_membw {
++	u32     min_bw;
++	u32     bw_gran;
++	u32     delay_linear;
++};
++
+ struct resctrl_resource {
+ 	int			rid;
+ 	bool			alloc_enabled;
+@@ -21,6 +51,13 @@ struct resctrl_resource {
+ 	struct list_head	evt_list;
+ 	unsigned long		fflags;
+ 
++	struct resctrl_cache cache;
++	struct resctrl_membw mbw;
++
++	bool cdp_capable;
++	bool cdp_enable;
++	u32 default_ctrl;
++
+ 	void *res;
+ };
+ 
+-- 
+2.26.2
+

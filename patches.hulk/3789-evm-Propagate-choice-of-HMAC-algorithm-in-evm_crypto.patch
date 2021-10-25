@@ -1,0 +1,224 @@
+From c79f60847f2b6080cf59c0f25ff3b20b707843a2 Mon Sep 17 00:00:00 2001
+From: Roberto Sassu <roberto.sassu@huawei.com>
+Date: Wed, 3 Mar 2021 08:44:26 +0100
+Subject: [PATCH] evm: Propagate choice of HMAC algorithm in evm_crypto.c
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: c79f60847f2b6080cf59c0f25ff3b20b707843a2
+
+
+hulk inclusion
+category: feature
+feature: IMA Digest Lists extension
+bugzilla: 46797
+
+-------------------------------------------------
+
+Commit 5feeb61183dd ("evm: Allow non-SHA1 digital signatures") introduced
+the possibility to use different hash algorithm for signatures, but kept
+the algorithm for the HMAC hard-coded (SHA1). Switching to a different
+algorithm for HMAC would require to change the code in different places.
+
+This patch introduces a new global variable called evm_hash_algo, and
+consistently uses it whenever EVM perform HMAC-related operations. It also
+introduces a new kernel configuration option called CONFIG_EVM_DEFAULT_HASH
+so that evm_hash_algo can be defined at kernel compilation time.
+
+Signed-off-by: Roberto Sassu <roberto.sassu@huawei.com>
+Acked-by: Hanjun Guo <guohanjun@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Tianxing Zhang <zhangtianxing3@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ security/integrity/evm/Kconfig      | 32 +++++++++++++++++++++++++++++
+ security/integrity/evm/evm.h        |  1 +
+ security/integrity/evm/evm_crypto.c | 15 +++++++++-----
+ security/integrity/evm/evm_main.c   | 15 +++++++++-----
+ security/integrity/integrity.h      |  2 +-
+ 5 files changed, 54 insertions(+), 11 deletions(-)
+
+diff --git a/security/integrity/evm/Kconfig b/security/integrity/evm/Kconfig
+index a6e19d23e700..844f2686cce7 100644
+--- a/security/integrity/evm/Kconfig
++++ b/security/integrity/evm/Kconfig
+@@ -13,6 +13,38 @@ config EVM
+ 
+ 	  If you are unsure how to answer this question, answer N.
+ 
++choice
++	prompt "Default EVM hash algorithm"
++	default EVM_DEFAULT_HASH_SHA256
++	depends on EVM
++	help
++	   Select the default hash algorithm used for the HMAC.
++
++	config EVM_DEFAULT_HASH_SHA1
++		bool "SHA1 (default)"
++		depends on CRYPTO_SHA1=y
++
++	config EVM_DEFAULT_HASH_SHA256
++		bool "SHA256"
++		depends on CRYPTO_SHA256=y
++
++	config EVM_DEFAULT_HASH_SHA512
++		bool "SHA512"
++		depends on CRYPTO_SHA512=y
++
++	config EVM_DEFAULT_HASH_WP512
++		bool "WP512"
++		depends on CRYPTO_WP512=y
++endchoice
++
++config EVM_DEFAULT_HASH
++	string
++	depends on EVM
++	default "sha1" if EVM_DEFAULT_HASH_SHA1
++	default "sha256" if EVM_DEFAULT_HASH_SHA256
++	default "sha512" if EVM_DEFAULT_HASH_SHA512
++	default "wp512" if EVM_DEFAULT_HASH_WP512
++
+ config EVM_ATTR_FSUUID
+ 	bool "FSUUID (version 2)"
+ 	default y
+diff --git a/security/integrity/evm/evm.h b/security/integrity/evm/evm.h
+index f2fef2b5ed51..ca7ed2e532dc 100644
+--- a/security/integrity/evm/evm.h
++++ b/security/integrity/evm/evm.h
+@@ -32,6 +32,7 @@ struct xattr_list {
+ };
+ 
+ extern int evm_initialized;
++extern enum hash_algo evm_hash_algo;
+ 
+ #define EVM_ATTR_FSUUID		0x0001
+ 
+diff --git a/security/integrity/evm/evm_crypto.c b/security/integrity/evm/evm_crypto.c
+index 6782c1c87d8c..01aa74e9bebf 100644
+--- a/security/integrity/evm/evm_crypto.c
++++ b/security/integrity/evm/evm_crypto.c
+@@ -33,7 +33,7 @@ static DEFINE_MUTEX(mutex);
+ 
+ static unsigned long evm_set_key_flags;
+ 
+-static const char evm_hmac[] = "hmac(sha1)";
++enum hash_algo evm_hash_algo __ro_after_init = HASH_ALGO_SHA1;
+ 
+ /**
+  * evm_set_key() - set EVM HMAC key from the kernel
+@@ -74,8 +74,12 @@ static struct shash_desc *init_desc(char type, uint8_t hash_algo)
+ 	long rc;
+ 	const char *algo;
+ 	struct crypto_shash **tfm, *tmp_tfm = NULL;
++	char evm_hmac[CRYPTO_MAX_ALG_NAME];
+ 	struct shash_desc *desc;
+ 
++	snprintf(evm_hmac, sizeof(evm_hmac), "hmac(%s)",
++		 CONFIG_EVM_DEFAULT_HASH);
++
+ 	if (type == EVM_XATTR_HMAC) {
+ 		if (!(evm_initialized & EVM_INIT_HMAC)) {
+ 			pr_err_once("HMAC key is not set\n");
+@@ -320,14 +324,15 @@ int evm_update_evmxattr(struct dentry *dentry, const char *xattr_name,
+ 	if (rc)
+ 		return -EPERM;
+ 
+-	data.hdr.algo = HASH_ALGO_SHA1;
++	data.hdr.algo = evm_hash_algo;
+ 	rc = evm_calc_hmac(dentry, xattr_name, xattr_value,
+ 			   xattr_value_len, &data);
+ 	if (rc == 0) {
+ 		data.hdr.xattr.sha1.type = EVM_XATTR_HMAC;
+ 		rc = __vfs_setxattr_noperm(dentry, XATTR_NAME_EVM,
+ 					   &data.hdr.xattr.data[1],
+-					   SHA1_DIGEST_SIZE + 1, 0);
++					   hash_digest_size[evm_hash_algo] + 1,
++					   0);
+ 	} else if (rc == -ENODATA && (inode->i_opflags & IOP_XATTR)) {
+ 		rc = __vfs_removexattr(dentry, XATTR_NAME_EVM);
+ 	}
+@@ -339,7 +344,7 @@ int evm_init_hmac(struct inode *inode, const struct xattr *lsm_xattr,
+ {
+ 	struct shash_desc *desc;
+ 
+-	desc = init_desc(EVM_XATTR_HMAC, HASH_ALGO_SHA1);
++	desc = init_desc(EVM_XATTR_HMAC, evm_hash_algo);
+ 	if (IS_ERR(desc)) {
+ 		pr_info("init_desc failed\n");
+ 		return PTR_ERR(desc);
+@@ -352,7 +357,7 @@ int evm_init_hmac(struct inode *inode, const struct xattr *lsm_xattr,
+ }
+ 
+ /*
+- * Get the key from the TPM for the SHA1-HMAC
++ * Get the key from the TPM for the HMAC
+  */
+ int evm_init_key(void)
+ {
+diff --git a/security/integrity/evm/evm_main.c b/security/integrity/evm/evm_main.c
+index c6eb6904277a..99db24fcb66c 100644
+--- a/security/integrity/evm/evm_main.c
++++ b/security/integrity/evm/evm_main.c
+@@ -213,17 +213,17 @@ static enum integrity_status evm_verify_hmac(struct dentry *dentry,
+ 	/* check value type */
+ 	switch (xattr_data->type) {
+ 	case EVM_XATTR_HMAC:
+-		if (xattr_len != sizeof(struct evm_xattr)) {
++		if (xattr_len != hash_digest_size[evm_hash_algo] + 1) {
+ 			evm_status = INTEGRITY_FAIL;
+ 			goto out;
+ 		}
+-		digest.hdr.algo = HASH_ALGO_SHA1;
++		digest.hdr.algo = evm_hash_algo;
+ 		rc = evm_calc_hmac(dentry, xattr_name, xattr_value,
+ 				   xattr_value_len, &digest);
+ 		if (rc)
+ 			break;
+ 		rc = crypto_memneq(xattr_data->data, digest.digest,
+-				   SHA1_DIGEST_SIZE);
++				   hash_digest_size[evm_hash_algo]);
+ 		if (rc)
+ 			rc = -EINVAL;
+ 		break;
+@@ -780,7 +780,7 @@ int evm_inode_init_security(struct inode *inode,
+ 		goto out;
+ 
+ 	evm_xattr->value = xattr_data;
+-	evm_xattr->value_len = sizeof(*xattr_data);
++	evm_xattr->value_len = hash_digest_size[evm_hash_algo] + 1;
+ 	evm_xattr->name = XATTR_EVM_SUFFIX;
+ 	return 0;
+ out:
+@@ -802,9 +802,14 @@ void __init evm_load_x509(void)
+ 
+ static int __init init_evm(void)
+ {
+-	int error;
++	int error, i;
+ 	struct list_head *pos, *q;
+ 
++	i = match_string(hash_algo_name, HASH_ALGO__LAST,
++			 CONFIG_EVM_DEFAULT_HASH);
++	if (i >= 0)
++		evm_hash_algo = i;
++
+ 	evm_init_config();
+ 
+ 	error = integrity_init_keyring(INTEGRITY_KEYRING_EVM);
+diff --git a/security/integrity/integrity.h b/security/integrity/integrity.h
+index 3f846d7b28e9..a006ea5bc023 100644
+--- a/security/integrity/integrity.h
++++ b/security/integrity/integrity.h
+@@ -92,7 +92,7 @@ struct evm_ima_xattr_data {
+ /* Only used in the EVM HMAC code. */
+ struct evm_xattr {
+ 	struct evm_ima_xattr_data data;
+-	u8 digest[SHA1_DIGEST_SIZE];
++	u8 digest[SHA512_DIGEST_SIZE];
+ } __packed;
+ 
+ #define IMA_MAX_DIGEST_SIZE	64
+-- 
+2.26.2
+

@@ -1,0 +1,155 @@
+From c2d80e345f0128811f8c643f42df85a6f3f43ad4 Mon Sep 17 00:00:00 2001
+From: Roberto Sassu <roberto.sassu@huawei.com>
+Date: Wed, 3 Mar 2021 08:43:54 +0100
+Subject: [PATCH] ima: Generalize ima_read_policy()
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: c2d80e345f0128811f8c643f42df85a6f3f43ad4
+
+
+hulk inclusion
+category: feature
+feature: IMA Digest Lists extension
+bugzilla: 46797
+
+-------------------------------------------------
+
+This patch renames ima_read_policy() to ima_read_file() so that the
+function can be used to read files for different purposes. It also adds the
+opened file in securityfs as parameter so that the function can determine
+which action it should do with the passed data.
+
+This patch replaces kernel_read_file_from_path() with filp_open() +
+kernel_read_file() so that the file descriptor can be used for further
+checks.
+
+Signed-off-by: Roberto Sassu <roberto.sassu@huawei.com>
+Signed-off-by: Tianxing Zhang <zhangtianxing3@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ security/integrity/ima/ima_fs.c | 50 ++++++++++++++++++++++-----------
+ 1 file changed, 34 insertions(+), 16 deletions(-)
+
+diff --git a/security/integrity/ima/ima_fs.c b/security/integrity/ima/ima_fs.c
+index ea8ff8a07b36..444394f4b8d9 100644
+--- a/security/integrity/ima/ima_fs.c
++++ b/security/integrity/ima/ima_fs.c
+@@ -21,11 +21,20 @@
+ #include <linux/rcupdate.h>
+ #include <linux/parser.h>
+ #include <linux/vmalloc.h>
++#include <linux/file.h>
+ 
+ #include "ima.h"
+ 
+ static DEFINE_MUTEX(ima_write_mutex);
+ 
++static struct dentry *ima_dir;
++static struct dentry *ima_symlink;
++static struct dentry *binary_runtime_measurements;
++static struct dentry *ascii_runtime_measurements;
++static struct dentry *runtime_measurements_count;
++static struct dentry *violations;
++static struct dentry *ima_policy;
++
+ bool ima_canonical_fmt;
+ static int __init default_canonical_fmt_setup(char *str)
+ {
+@@ -271,11 +280,13 @@ static const struct file_operations ima_ascii_measurements_ops = {
+ 	.release = seq_release,
+ };
+ 
+-static ssize_t ima_read_policy(char *path)
++static ssize_t ima_read_file(char *path, struct dentry *dentry)
+ {
+ 	void *data = NULL;
+ 	char *datap;
+ 	size_t size;
++	struct file *file;
++	enum kernel_read_file_id file_id = READING_POLICY;
+ 	int rc, pathlen = strlen(path);
+ 
+ 	char *p;
+@@ -284,25 +295,39 @@ static ssize_t ima_read_policy(char *path)
+ 	datap = path;
+ 	strsep(&datap, "\n");
+ 
+-	rc = kernel_read_file_from_path(path, 0, &data, INT_MAX, NULL,
+-					READING_POLICY);
++	file = filp_open(path, O_RDONLY, 0);
++	if (IS_ERR(file)) {
++		pr_err("Unable to open file: %s (%ld)", path, PTR_ERR(file));
++		return PTR_ERR(file);
++	}
++
++	rc = kernel_read_file(file, 0, &data, INT_MAX, NULL, file_id);
+ 	if (rc < 0) {
+-		pr_err("Unable to open file: %s (%d)", path, rc);
++		pr_err("Unable to read file: %s (%d)", path, rc);
++		fput(file);
+ 		return rc;
+ 	}
+ 	size = rc;
+ 	rc = 0;
+ 
+ 	datap = data;
+-	while (size > 0 && (p = strsep(&datap, "\n"))) {
+-		pr_debug("rule: %s\n", p);
+-		rc = ima_parse_add_rule(p);
++	while (size > 0) {
++		if (dentry == ima_policy) {
++			p = strsep(&datap, "\n");
++			if (p == NULL)
++				break;
++
++			pr_debug("rule: %s\n", p);
++			rc = ima_parse_add_rule(p);
++		}
++
+ 		if (rc < 0)
+ 			break;
+ 		size -= rc;
+ 	}
+ 
+ 	vfree(data);
++	fput(file);
+ 	if (rc < 0)
+ 		return rc;
+ 	else if (size)
+@@ -316,6 +341,7 @@ static ssize_t ima_write_policy(struct file *file, const char __user *buf,
+ {
+ 	char *data;
+ 	ssize_t result;
++	struct dentry *dentry = file_dentry(file);
+ 
+ 	if (datalen >= PAGE_SIZE)
+ 		datalen = PAGE_SIZE - 1;
+@@ -336,7 +362,7 @@ static ssize_t ima_write_policy(struct file *file, const char __user *buf,
+ 		goto out_free;
+ 
+ 	if (data[0] == '/') {
+-		result = ima_read_policy(data);
++		result = ima_read_file(data, dentry);
+ 	} else if (ima_appraise & IMA_APPRAISE_POLICY) {
+ 		pr_err("signed policy file (specified as an absolute pathname) required\n");
+ 		integrity_audit_msg(AUDIT_INTEGRITY_STATUS, NULL, NULL,
+@@ -356,14 +382,6 @@ static ssize_t ima_write_policy(struct file *file, const char __user *buf,
+ 	return result;
+ }
+ 
+-static struct dentry *ima_dir;
+-static struct dentry *ima_symlink;
+-static struct dentry *binary_runtime_measurements;
+-static struct dentry *ascii_runtime_measurements;
+-static struct dentry *runtime_measurements_count;
+-static struct dentry *violations;
+-static struct dentry *ima_policy;
+-
+ enum ima_fs_flags {
+ 	IMA_FS_BUSY,
+ };
+-- 
+2.26.2
+

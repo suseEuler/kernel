@@ -1,0 +1,191 @@
+From 93ed83adc1ee8ed1242aee5cad4133f6137c7315 Mon Sep 17 00:00:00 2001
+From: Zenghui Yu <yuzenghui@huawei.com>
+Date: Fri, 26 Nov 2021 16:27:00 +0800
+Subject: [PATCH] KVM: arm64: Adjust entry/exit and trap related tracepoints
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 93ed83adc1ee8ed1242aee5cad4133f6137c7315
+
+
+virt inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4IZPY
+CVE: NA
+
+-------------------------------------------------
+
+Currently, we use trace_kvm_exit() to report exception type (e.g.,
+"IRQ", "TRAP") and exception class (ESR_ELx's bit[31:26]) together.
+But hardware only saves the exit class to ESR_ELx on synchronous
+exceptions, not on asynchronous exceptions. When the guest exits
+due to external interrupts, we will get tracing output like:
+
+	"kvm_exit: IRQ: HSR_EC: 0x0000 (UNKNOWN), PC: 0xffff87259e30"
+
+Obviously, "HSR_EC" here is meaningless.
+
+This patch splits "exit" and "trap" events by adding two tracepoints
+explicitly in handle_trap_exceptions(). Let trace_kvm_exit() report VM
+exit events, and trace_kvm_trap_exit() report VM trap events.
+
+These tracepoints are adjusted also in preparation for supporting
+'perf kvm stat' on arm64.
+
+Signed-off-by: Zenghui Yu <yuzenghui@huawei.com>
+Reviewed-by: Hailiang Zhang <zhang.zhanghailiang@huawei.com>
+Signed-off-by: Zenghui Yu <yuzenghui@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Link: https://lore.kernel.org/r/1560330526-15468-3-git-send-email-yuzenghui@huawei.com
+Link: https://gitee.com/openeuler/kernel/commit/14b85d8d7d2d
+Reviewed-by: Yanan Wang <wangyanan55@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/kvm/arm.c               |  4 ++--
+ arch/arm64/kvm/handle_exit.c       |  3 +++
+ arch/arm64/kvm/trace_arm.h         | 21 +++++++++---------
+ arch/arm64/kvm/trace_handle_exit.h | 35 ++++++++++++++++++++++++++++++
+ 4 files changed, 51 insertions(+), 12 deletions(-)
+
+diff --git a/arch/arm64/kvm/arm.c b/arch/arm64/kvm/arm.c
+index 1dc68282c840..d27aa51a163b 100644
+--- a/arch/arm64/kvm/arm.c
++++ b/arch/arm64/kvm/arm.c
+@@ -836,7 +836,7 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
+ 		/**************************************************************
+ 		 * Enter the guest
+ 		 */
+-		trace_kvm_entry(*vcpu_pc(vcpu));
++		trace_kvm_entry(vcpu->vcpu_id, *vcpu_pc(vcpu));
+ 		guest_enter_irqoff();
+ 
+ 		ret = kvm_call_hyp_ret(__kvm_vcpu_run, vcpu);
+@@ -894,7 +894,7 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
+ 		 * guest time.
+ 		 */
+ 		guest_exit();
+-		trace_kvm_exit(ret, kvm_vcpu_trap_get_class(vcpu), *vcpu_pc(vcpu));
++		trace_kvm_exit(vcpu->vcpu_id, ret, *vcpu_pc(vcpu));
+ 
+ 		/* Exit types that need handling before we can be preempted */
+ 		handle_exit_early(vcpu, ret);
+diff --git a/arch/arm64/kvm/handle_exit.c b/arch/arm64/kvm/handle_exit.c
+index 00d7ece1727d..a3837c9f3521 100644
+--- a/arch/arm64/kvm/handle_exit.c
++++ b/arch/arm64/kvm/handle_exit.c
+@@ -232,7 +232,10 @@ static int handle_trap_exceptions(struct kvm_vcpu *vcpu)
+ 		exit_handle_fn exit_handler;
+ 
+ 		exit_handler = kvm_get_exit_handler(vcpu);
++		trace_kvm_trap_enter(vcpu->vcpu_id,
++				     kvm_vcpu_trap_get_class(vcpu));
+ 		handled = exit_handler(vcpu);
++		trace_kvm_trap_exit(vcpu->vcpu_id);
+ 	}
+ 
+ 	return handled;
+diff --git a/arch/arm64/kvm/trace_arm.h b/arch/arm64/kvm/trace_arm.h
+index 6fb8b11abdc2..d5edb4cb217b 100644
+--- a/arch/arm64/kvm/trace_arm.h
++++ b/arch/arm64/kvm/trace_arm.h
+@@ -12,40 +12,41 @@
+  * Tracepoints for entry/exit to guest
+  */
+ TRACE_EVENT(kvm_entry,
+-	TP_PROTO(unsigned long vcpu_pc),
+-	TP_ARGS(vcpu_pc),
++	TP_PROTO(unsigned int vcpu_id, unsigned long vcpu_pc),
++	TP_ARGS(vcpu_id, vcpu_pc),
+ 
+ 	TP_STRUCT__entry(
++		__field(	unsigned int,	vcpu_id		)
+ 		__field(	unsigned long,	vcpu_pc		)
+ 	),
+ 
+ 	TP_fast_assign(
++		__entry->vcpu_id		= vcpu_id;
+ 		__entry->vcpu_pc		= vcpu_pc;
+ 	),
+ 
+-	TP_printk("PC: 0x%016lx", __entry->vcpu_pc)
++	TP_printk("VCPU %u: PC=0x%016lx", __entry->vcpu_id, __entry->vcpu_pc)
+ );
+ 
+ TRACE_EVENT(kvm_exit,
+-	TP_PROTO(int ret, unsigned int esr_ec, unsigned long vcpu_pc),
+-	TP_ARGS(ret, esr_ec, vcpu_pc),
++	TP_PROTO(unsigned int vcpu_id, int ret, unsigned long vcpu_pc),
++	TP_ARGS(vcpu_id, ret, vcpu_pc),
+ 
+ 	TP_STRUCT__entry(
++		__field(	unsigned int,	vcpu_id		)
+ 		__field(	int,		ret		)
+-		__field(	unsigned int,	esr_ec		)
+ 		__field(	unsigned long,	vcpu_pc		)
+ 	),
+ 
+ 	TP_fast_assign(
++		__entry->vcpu_id		= vcpu_id;
+ 		__entry->ret			= ARM_EXCEPTION_CODE(ret);
+-		__entry->esr_ec = ARM_EXCEPTION_IS_TRAP(ret) ? esr_ec : 0;
+ 		__entry->vcpu_pc		= vcpu_pc;
+ 	),
+ 
+-	TP_printk("%s: HSR_EC: 0x%04x (%s), PC: 0x%016lx",
++	TP_printk("VCPU %u: exit_type=%s, PC=0x%016lx",
++		  __entry->vcpu_id,
+ 		  __print_symbolic(__entry->ret, kvm_arm_exception_type),
+-		  __entry->esr_ec,
+-		  __print_symbolic(__entry->esr_ec, kvm_arm_exception_class),
+ 		  __entry->vcpu_pc)
+ );
+ 
+diff --git a/arch/arm64/kvm/trace_handle_exit.h b/arch/arm64/kvm/trace_handle_exit.h
+index 8d78acc4fba7..486721fb6bda 100644
+--- a/arch/arm64/kvm/trace_handle_exit.h
++++ b/arch/arm64/kvm/trace_handle_exit.h
+@@ -8,6 +8,41 @@
+ #undef TRACE_SYSTEM
+ #define TRACE_SYSTEM kvm
+ 
++TRACE_EVENT(kvm_trap_enter,
++	TP_PROTO(unsigned int vcpu_id, unsigned int esr_ec),
++	TP_ARGS(vcpu_id, esr_ec),
++
++	TP_STRUCT__entry(
++		__field(unsigned int,	vcpu_id)
++		__field(unsigned int,	esr_ec)
++	),
++
++	TP_fast_assign(
++		__entry->vcpu_id	= vcpu_id;
++		__entry->esr_ec		= esr_ec;
++	),
++
++	TP_printk("VCPU %u: HSR_EC=0x%04x (%s)",
++		  __entry->vcpu_id,
++		  __entry->esr_ec,
++		  __print_symbolic(__entry->esr_ec, kvm_arm_exception_class))
++);
++
++TRACE_EVENT(kvm_trap_exit,
++	TP_PROTO(unsigned int vcpu_id),
++	TP_ARGS(vcpu_id),
++
++	TP_STRUCT__entry(
++		__field(unsigned int,	vcpu_id)
++	),
++
++	TP_fast_assign(
++		__entry->vcpu_id	= vcpu_id;
++	),
++
++	TP_printk("VCPU %u", __entry->vcpu_id)
++);
++
+ TRACE_EVENT(kvm_wfx_arm64,
+ 	TP_PROTO(unsigned long vcpu_pc, bool is_wfe),
+ 	TP_ARGS(vcpu_pc, is_wfe),
+-- 
+2.26.2
+

@@ -1,0 +1,82 @@
+From 9ce4e2cd1e002a4b65003b77f1460657058c9eff Mon Sep 17 00:00:00 2001
+From: Cheng Jian <cj.chengjian@huawei.com>
+Date: Sat, 29 May 2021 14:42:51 +0800
+Subject: [PATCH] livepatch/arm: Fix current backtracking in
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 9ce4e2cd1e002a4b65003b77f1460657058c9eff
+
+ klp_check_calltrace
+
+euler inclusion
+category: bugfix
+bugzilla: 51923
+CVE: NA
+
+---------------------------------
+
+We through stack checking to ensure the consistency of livepatch.
+Task blocked in __switch_to when switch out, thread_saved_fs/pc
+store the FP and PC when switching, it can be useful when tracing
+blocked threads. For running task, __builtin_frame_address can be
+used, but it's difficult to backtracking the running task on other
+CPUs.
+
+Fortunately, all CPUs will stay in this function, the current's
+backtrace is so similar. so just backtracking the current on this
+CPU, skip the current of other CPUs.
+
+Signed-off-by: Cheng Jian <cj.chengjian@huawei.com>
+Reviewed-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: zhangyi (F) <yi.zhang@huawei.com>
+
+Signed-off-by: Dong Kai <dongkai11@huawei.com>
+
+Signed-off-by: Ye Weihua <yeweihua4@huawei.com>
+Reviewed-by: Yang Jihong <yangjihong1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm/kernel/livepatch.c | 26 +++++++++++++++++++++++---
+ 1 file changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/arch/arm/kernel/livepatch.c b/arch/arm/kernel/livepatch.c
+index 5f87d98a9e99..35c48fe456d3 100644
+--- a/arch/arm/kernel/livepatch.c
++++ b/arch/arm/kernel/livepatch.c
+@@ -93,9 +93,29 @@ int klp_check_calltrace(struct klp_patch *patch, int enable)
+ 	};
+ 
+ 	for_each_process_thread(g, t) {
+-		frame.fp = thread_saved_fp(t);
+-		frame.sp = thread_saved_sp(t);
+-		frame.pc = thread_saved_pc(t);
++		if (t == current) {
++			frame.fp = (unsigned long)__builtin_frame_address(0);
++			frame.sp = current_stack_pointer;
++			frame.lr = (unsigned long)__builtin_return_address(0);
++			frame.pc = (unsigned long)klp_check_calltrace;
++		} else if (strncmp(t->comm, "migration/", 10) == 0) {
++			/*
++			 * current on other CPU
++			 * we call this in stop_machine, so the current
++			 * of each CPUs is mirgation, just compare the
++			 * task_comm here, because we can't get the
++			 * cpu_curr(task_cpu(t))). This assumes that no
++			 * other thread will pretend to be a stopper via
++			 * task_comm.
++			 */
++			continue;
++		} else {
++			frame.fp = thread_saved_fp(t);
++			frame.sp = thread_saved_sp(t);
++			frame.lr = 0;           /* recovered from the stack */
++			frame.pc = thread_saved_pc(t);
++		}
++
+ 		walk_stackframe(&frame, klp_check_activeness_func, &args);
+ 		if (args.ret) {
+ 			ret = args.ret;
+-- 
+2.26.2
+

@@ -1,0 +1,276 @@
+From 455d7f848d6bbd6ba848e1c7369dbc3b6c9ccbe1 Mon Sep 17 00:00:00 2001
+From: Guoqing Jiang <guoqing.jiang@suse.com>
+Date: Thu, 21 Oct 2021 12:31:48 +0800
+Subject: [PATCH] kernel: add product-identifying information to kernel build
+
+Patch-mainline: Never, SUSE specific
+References: FATE#325281
+
+Our kernels may be offered using the same base kernel version across
+several product streams.  We have tags in our git repository to map
+specific versions to a release, but that requires having easy access
+to the repository and taking the multiple steps to resolve the release
+information.
+
+This patch makes the product release easier to discover by both SUSE
+support staff and third-party developers.
+
+This adds a new <linux/suse_version.h> header that defines several
+values that can be used to programatically discover what kernel
+version is being used:
+
+* SUSE_PRODUCT_FAMILY     The "family" of product, e.g. SUSEEULER
+* SUSE_PRODUCT_NAME       The full product name, which may consist of
+                          several whitespace-separated words, e.g.
+			  "SUSE Euler"
+* SUSE_PRODUCT_SHORTNAME  The abbreviated product name where it makes
+                          sense, e.g. SEL-2.
+* SUSE_VERSION            Numeric major number of release
+* SUSE_PATCHLEVEL         The minor numer or service pack level of the
+                          release
+* SUSE_AUXRELEASE         Currently unused
+* SUSE_PRODUCT_CODE       An encoded product code that is the result of
+                          combining the family, version, patchlevel, and
+                          aux release
+* SUSE_PRODUCT            Macro to use to generate the code
+
+It also adds a new "suserelease" module tag that contains the
+shortname and also prints the shortname after the kernel version during
+system faults.
+
+[1]. https://suse.pingcode.com/wiki/spaces/614b4f02cb5d3e2c7d88d00c/pages/615042decb5d3e816d88d318
+
+Signed-off-by: Jeff Mahoney <jeffm@suse.com>
+[gjiang: refresh to 5.10 kernel, replace SLE/openSUSE info with SUSE Euler]
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ Makefile                      | 11 +++++-
+ init/Kconfig.suse             | 35 +++++++++++++++++
+ lib/dump_stack.c              |  5 ++-
+ scripts/gen-suse_version_h.sh | 71 +++++++++++++++++++++++++++++++++++
+ scripts/mod/modpost.c         | 10 +++++
+ 5 files changed, 129 insertions(+), 3 deletions(-)
+ create mode 100644 scripts/gen-suse_version_h.sh
+
+diff --git a/Makefile b/Makefile
+index 4e3d6bbc492c..770b46dc8b80 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1114,6 +1114,15 @@ PHONY += prepare0
+ export MODORDER := $(extmod-prefix)modules.order
+ export MODULES_NSDEPS := $(extmod-prefix)modules.nsdeps
+ 
++suse_version_h := include/generated/uapi/linux/suse_version.h
++
++define filechk_suse_version
++	$(CONFIG_SHELL) $(srctree)/scripts/gen-suse_version_h.sh
++endef
++
++$(suse_version_h): include/config/auto.conf FORCE
++	$(call filechk,suse_version)
++
+ ifeq ($(KBUILD_EXTMOD),)
+ core-y		+= kernel/ certs/ mm/ fs/ ipc/ security/ crypto/ block/
+ 
+@@ -1212,7 +1221,7 @@ PHONY += prepare archprepare
+ 
+ archprepare: outputmakefile archheaders archscripts scripts include/config/kernel.release \
+ 	asm-generic $(version_h) $(autoksyms_h) include/generated/utsrelease.h \
+-	include/generated/autoconf.h
++	include/generated/autoconf.h $(suse_version_h)
+ 
+ prepare0: archprepare
+ 	$(Q)$(MAKE) $(build)=scripts/mod
+diff --git a/init/Kconfig.suse b/init/Kconfig.suse
+index 74fab9c6db90..ad988a8ba6d4 100644
+--- a/init/Kconfig.suse
++++ b/init/Kconfig.suse
+@@ -1,6 +1,40 @@
+ config SUSE_KERNEL
+ 	def_bool y
+ 
++menu "SUSE Release Details"
++choice SUSE_PRODUCT_CODE
++	prompt "SUSE Product Family"
++	default SUSE_PRODUCT_EULER
++	depends on SUSE_KERNEL
++	help
++	  This option defines the SUSE product family that owns this
++	  kernel release.
++
++config SUSE_PRODUCT_EULER
++	bool "SUSE Euler Linux"
++endchoice
++
++config SUSE_PRODUCT_CODE
++	int
++	default 1 if SUSE_PRODUCT_EULER
++
++if SUSE_PRODUCT_EULER
++config SUSE_VERSION
++	int "Release Version"
++	range 0 255
++	default 2
++
++config SUSE_PATCHLEVEL
++	int "Service Pack Version"
++	range 0 255
++	default 0
++endif
++
++config SUSE_AUXRELEASE
++	int
++	range 0 255
++	default 0
++
+ config SUSE_KERNEL_SUPPORTED
+ 	bool "Enable enterprise support facility"
+ 	depends on SUSE_KERNEL
+@@ -18,3 +52,4 @@ config SUSE_KERNEL_SUPPORTED
+ 	  If you aren't building a kernel for an enterprise distribution,
+ 	  say n.
+ 
++endmenu
+diff --git a/lib/dump_stack.c b/lib/dump_stack.c
+index a00ee6eedc7c..4ceade56ddb2 100644
+--- a/lib/dump_stack.c
++++ b/lib/dump_stack.c
+@@ -12,6 +12,7 @@
+ #include <linux/atomic.h>
+ #include <linux/kexec.h>
+ #include <linux/utsname.h>
++#include <linux/suse_version.h>
+ 
+ static char dump_stack_arch_desc_str[128];
+ 
+@@ -44,13 +45,13 @@ void __init dump_stack_set_arch_desc(const char *fmt, ...)
+  */
+ void dump_stack_print_info(const char *log_lvl)
+ {
+-	printk("%sCPU: %d PID: %d Comm: %.20s %s%s %s %.*s\n",
++	printk("%sCPU: %d PID: %d Comm: %.20s %s%s %s %.*s %s\n",
+ 	       log_lvl, raw_smp_processor_id(), current->pid, current->comm,
+ 	       kexec_crash_loaded() ? "Kdump: loaded " : "",
+ 	       print_tainted(),
+ 	       init_utsname()->release,
+ 	       (int)strcspn(init_utsname()->version, " "),
+-	       init_utsname()->version);
++	       init_utsname()->version, SUSE_PRODUCT_SHORTNAME);
+ 
+ 	if (dump_stack_arch_desc_str[0] != '\0')
+ 		printk("%sHardware name: %s\n",
+diff --git a/scripts/gen-suse_version_h.sh b/scripts/gen-suse_version_h.sh
+new file mode 100644
+index 000000000000..f87847a5b5f8
+--- /dev/null
++++ b/scripts/gen-suse_version_h.sh
+@@ -0,0 +1,71 @@
++#!/bin/bash
++
++if test -e include/config/auto.conf; then
++        . include/config/auto.conf
++else
++        echo "Error: auto.conf not generated - run 'make prepare' to create it" >&2
++	exit 1
++fi
++
++VERSION="${CONFIG_SUSE_VERSION}"
++PATCHLEVEL="${CONFIG_SUSE_PATCHLEVEL}"
++AUXRELEASE="${CONFIG_SUSE_AUXRELEASE}"
++
++if [ -z "$VERSION" -o -z "$PATCHLEVEL" -o -z "$AUXRELEASE" ]; then
++	# This would be a bug in the Kconfig
++	cat <<- END >&2
++	ERROR: Missing VERSION, PATCHLEVEL, or AUXRELEASE."
++	Please check init/Kconfig.suse for correctness.
++	END
++	exit 1
++fi
++
++if [ "$VERSION" = 255 -o "$PATCHLEVEL" = 255 ]; then
++	cat <<- END >&2
++
++	ERROR: This release needs to be properly configured.
++	Please add real values for SUSE_VERSION and SUSE_PATCHLEVEL.
++
++	END
++	exit 1
++fi
++
++
++case "$CONFIG_SUSE_PRODUCT_CODE" in
++	1)
++		if [ "${PATCHLEVEL}" = "0" ]; then
++			SP=""
++		else
++			SP="${PATCHLEVEL}"
++		fi
++		SUSE_PRODUCT_NAME="SUSE Euler ${VERSION}${SP:+ SP}${SP}"
++		SUSE_PRODUCT_SHORTNAME="SEL-${VERSION}${SP:+-SP}${SP}"
++		SUSE_PRODUCT_FAMILY="SUSEEULER"
++		;;
++	*)
++		echo "Unknown SUSE_PRODUCT_CODE=${CONFIG_SUSE_PRODUCT_CODE}" >&2
++		exit 1
++		;;
++esac
++
++SUSE_PRODUCT_CODE=$(( (${CONFIG_SUSE_PRODUCT_CODE} << 24) + \
++		      (${VERSION} << 16) + (${PATCHLEVEL} << 8) + \
++		       ${AUXRELEASE} ))
++
++cat <<END
++#ifndef _SUSE_VERSION_H
++#define _SUSE_VERSION_H
++
++#define SUSE_PRODUCT_FAMILY     "${SUSE_PRODUCT_FAMILY}"
++#define SUSE_PRODUCT_NAME       "${SUSE_PRODUCT_NAME}"
++#define SUSE_PRODUCT_SHORTNAME  "${SUSE_PRODUCT_SHORTNAME}"
++#define SUSE_VERSION            ${VERSION}
++#define SUSE_PATCHLEVEL         ${PATCHLEVEL}
++#define SUSE_AUXRELEASE		${AUXRELEASE}
++#define SUSE_PRODUCT_CODE       ${SUSE_PRODUCT_CODE}
++#define SUSE_PRODUCT(product, version, patchlevel, auxrelease)		\\
++	(((product) << 24) + ((version) << 16) +			\\
++	 ((patchlevel) << 8) + (auxrelease))
++
++#endif /* _SUSE_VERSION_H */
++END
+diff --git a/scripts/mod/modpost.c b/scripts/mod/modpost.c
+index fa6981f2df49..7aed460cccd7 100644
+--- a/scripts/mod/modpost.c
++++ b/scripts/mod/modpost.c
+@@ -23,6 +23,7 @@
+ #include "modpost.h"
+ #include "../../include/generated/autoconf.h"
+ #include "../../include/linux/license.h"
++#include "../../include/generated/uapi/linux/suse_version.h"
+ 
+ /* Are we using CONFIG_MODVERSIONS? */
+ static int modversions = 0;
+@@ -2531,6 +2532,14 @@ static void write_buf(struct buffer *b, const char *fname)
+ 	}
+ }
+ 
++static void add_suserelease(struct buffer *b, struct module *mod)
++{
++#ifdef SUSE_PRODUCT_SHORTNAME
++	buf_printf(b, "\n");
++	buf_printf(b, "MODULE_INFO(suserelease, \"%s\");\n",
++		   SUSE_PRODUCT_SHORTNAME);
++#endif
++}
+ static void write_if_changed(struct buffer *b, const char *fname)
+ {
+ 	char *tmp;
+@@ -2794,6 +2803,7 @@ int main(int argc, char **argv)
+ 		add_depends(&buf, mod);
+ 		add_moddevtable(&buf, mod);
+ 		add_srcversion(&buf, mod);
++		add_suserelease(&buf, mod);
+ 
+ 		sprintf(fname, "%s.mod.c", mod->name);
+ 		write_if_changed(&buf, fname);
+-- 
+2.26.2
+

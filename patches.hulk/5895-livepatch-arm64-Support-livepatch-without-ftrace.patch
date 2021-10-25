@@ -1,0 +1,463 @@
+From e429c61d12bf540fc0e0fe0bf681856f95e02e4e Mon Sep 17 00:00:00 2001
+From: Cheng Jian <cj.chengjian@huawei.com>
+Date: Sat, 29 May 2021 14:42:43 +0800
+Subject: [PATCH] livepatch/arm64: Support livepatch without ftrace
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: e429c61d12bf540fc0e0fe0bf681856f95e02e4e
+
+
+hulk inclusion
+category: feature
+bugzilla: 51921
+CVE: N/A
+
+----------------------------------------
+
+support livepatch without ftrace for ARM64
+
+supported now:
+        livepatch relocation when init_patch after load_module;
+        instruction patched when enable;
+        activeness function check;
+        enforcing the patch stacking principle;
+        long jump (both livepatch relocation and insn patched)
+        module plts request by livepatch-relocation
+
+Signed-off-by: Cheng Jian <cj.chengjian@huawei.com>
+Reviewed-by: Li Bin <huawei.libin@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Signed-off-by: Dong Kai <dongkai11@huawei.com>
+
+Signed-off-by: Ye Weihua <yeweihua4@huawei.com>
+Reviewed-by: Yang Jihong <yangjihong1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/Kconfig                   |   3 +
+ arch/arm64/include/asm/livepatch.h   |  51 +++++
+ arch/arm64/include/asm/thread_info.h |   2 +
+ arch/arm64/kernel/Makefile           |   1 +
+ arch/arm64/kernel/livepatch.c        | 297 +++++++++++++++++++++++++++
+ 5 files changed, 354 insertions(+)
+ create mode 100644 arch/arm64/include/asm/livepatch.h
+ create mode 100644 arch/arm64/kernel/livepatch.c
+
+diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
+index 8d15a5c5b98d..2b0dd68f1c6b 100644
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -202,6 +202,7 @@ config ARM64
+ 	select SWIOTLB
+ 	select SYSCTL_EXCEPTION_TRACE
+ 	select THREAD_INFO_IN_TASK
++	select HAVE_LIVEPATCH_WO_FTRACE
+ 	help
+ 	  ARM 64-bit (AArch64) Linux support.
+ 
+@@ -350,6 +351,8 @@ config ARCH_HAS_CPU_RELAX
+ 
+ source "arch/arm64/Kconfig.platforms"
+ 
++source "kernel/livepatch/Kconfig"
++
+ menu "Kernel Features"
+ 
+ menu "ARM errata workarounds via the alternatives framework"
+diff --git a/arch/arm64/include/asm/livepatch.h b/arch/arm64/include/asm/livepatch.h
+new file mode 100644
+index 000000000000..d85991fff647
+--- /dev/null
++++ b/arch/arm64/include/asm/livepatch.h
+@@ -0,0 +1,51 @@
++/* SPDX-License-Identifier: GPL-2.0
++ *
++ * Copyright (C) 2014-2019, Huawei.
++ *	Author: Li Bin <huawei.libin@huawei.com>
++ *	Author: Cheng Jian <cj.chengjian@huawei.com>
++ *
++ * livepatch.h - arm64-specific Kernel Live Patching Core
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef _ASM_ARM64_LIVEPATCH_H
++#define _ASM_ARM64_LIVEPATCH_H
++
++#include <linux/module.h>
++#include <linux/livepatch.h>
++
++
++#ifdef CONFIG_LIVEPATCH
++
++struct klp_patch;
++struct klp_func;
++
++#define klp_smp_isb() isb()
++
++static inline int klp_check_compiler_support(void)
++{
++	return 0;
++}
++
++int arch_klp_patch_func(struct klp_func *func);
++void arch_klp_unpatch_func(struct klp_func *func);
++#ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
++int klp_check_calltrace(struct klp_patch *patch, int enable);
++#endif
++#else
++#error Live patching support is disabled; check CONFIG_LIVEPATCH
++#endif
++
++#endif /* _ASM_ARM64_LIVEPATCH_H */
+diff --git a/arch/arm64/include/asm/thread_info.h b/arch/arm64/include/asm/thread_info.h
+index abf418077ce8..8b9f936a860e 100644
+--- a/arch/arm64/include/asm/thread_info.h
++++ b/arch/arm64/include/asm/thread_info.h
+@@ -84,6 +84,7 @@ void arch_release_task_struct(struct task_struct *tsk);
+ #define TIF_SSBD		25	/* Wants SSB mitigation */
+ #define TIF_TAGGED_ADDR		26	/* Allow tagged user addresses */
+ #define TIF_32BIT_AARCH64	27	/* 32 bit process on AArch64(ILP32) */
++#define TIF_PATCH_PENDING	28	/* pending live patching update */
+ 
+ #define _TIF_SIGPENDING		(1 << TIF_SIGPENDING)
+ #define _TIF_NEED_RESCHED	(1 << TIF_NEED_RESCHED)
+@@ -101,6 +102,7 @@ void arch_release_task_struct(struct task_struct *tsk);
+ #define _TIF_SVE		(1 << TIF_SVE)
+ #define _TIF_MTE_ASYNC_FAULT	(1 << TIF_MTE_ASYNC_FAULT)
+ #define _TIF_32BIT_AARCH64	(1 << TIF_32BIT_AARCH64)
++#define _TIF_PATCH_PENDING	(1 << TIF_PATCH_PENDING)
+ #define _TIF_POLLING_NRFLAG	(1 << TIF_POLLING_NRFLAG)
+ 
+ #define _TIF_WORK_MASK		(_TIF_NEED_RESCHED | _TIF_SIGPENDING | \
+diff --git a/arch/arm64/kernel/Makefile b/arch/arm64/kernel/Makefile
+index 5f45a62b2675..e1a50865def8 100644
+--- a/arch/arm64/kernel/Makefile
++++ b/arch/arm64/kernel/Makefile
+@@ -40,6 +40,7 @@ obj-$(CONFIG_HW_PERF_EVENTS)		+= perf_event.o
+ obj-$(CONFIG_HAVE_HW_BREAKPOINT)	+= hw_breakpoint.o
+ obj-$(CONFIG_CPU_PM)			+= sleep.o suspend.o
+ obj-$(CONFIG_CPU_IDLE)			+= cpuidle.o
++obj-$(CONFIG_LIVEPATCH)			+= livepatch.o
+ obj-$(CONFIG_JUMP_LABEL)		+= jump_label.o
+ obj-$(CONFIG_KGDB)			+= kgdb.o
+ obj-$(CONFIG_EFI)			+= efi.o efi-entry.stub.o		\
+diff --git a/arch/arm64/kernel/livepatch.c b/arch/arm64/kernel/livepatch.c
+new file mode 100644
+index 000000000000..f593fadbea69
+--- /dev/null
++++ b/arch/arm64/kernel/livepatch.c
+@@ -0,0 +1,297 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * livepatch.c - arm64-specific Kernel Live Patching Core
++ *
++ * Copyright (C) 2014 Li Bin <huawei.libin@huawei.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/module.h>
++#include <linux/uaccess.h>
++#include <linux/livepatch.h>
++#include <asm/livepatch.h>
++#include <asm/stacktrace.h>
++#include <asm/cacheflush.h>
++#include <linux/slab.h>
++#include <asm/insn.h>
++#include <asm-generic/sections.h>
++#include <asm/ptrace.h>
++#include <linux/ftrace.h>
++#include <linux/sched/debug.h>
++
++#ifdef CONFIG_ARM64_MODULE_PLTS
++static inline bool offset_in_range(unsigned long pc, unsigned long addr,
++		long range)
++{
++	long offset = addr - pc;
++
++	return (offset >= -range && offset < range);
++}
++#endif
++
++#ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
++struct walk_stackframe_args {
++	struct klp_patch *patch;
++	int enable;
++	int ret;
++};
++
++static inline int klp_compare_address(unsigned long pc, unsigned long func_addr,
++				unsigned long func_size, const char *func_name)
++{
++	if (pc >= func_addr && pc < func_addr + func_size) {
++		pr_err("func %s is in use!\n", func_name);
++		return -EBUSY;
++	}
++	return 0;
++}
++
++static bool klp_check_activeness_func(void *data, unsigned long pc)
++{
++	struct walk_stackframe_args *args = data;
++	struct klp_patch *patch = args->patch;
++	struct klp_object *obj;
++	struct klp_func *func;
++	unsigned long func_addr, func_size;
++	const char *func_name;
++
++	if (args->ret)
++		return false;
++
++	for (obj = patch->objs; obj->funcs; obj++) {
++		for (func = obj->funcs; func->old_name; func++) {
++			if (args->enable) {
++				func_addr = (unsigned long)func->old_func;
++				func_size = func->old_size;
++			} else {
++				func_addr = (unsigned long)func->new_func;
++				func_size = func->new_size;
++			}
++			func_name = func->old_name;
++			args->ret = klp_compare_address(pc, func_addr,
++					func_size, func_name);
++			if (args->ret)
++				return false;
++		}
++	}
++
++	return true;
++}
++
++int klp_check_calltrace(struct klp_patch *patch, int enable)
++{
++	struct task_struct *g, *t;
++	struct stackframe frame;
++	int ret = 0;
++
++	struct walk_stackframe_args args = {
++		.patch = patch,
++		.enable = enable,
++		.ret = 0
++	};
++
++	for_each_process_thread(g, t) {
++		frame.fp = thread_saved_fp(t);
++		frame.pc = thread_saved_pc(t);
++		start_backtrace(&frame, frame.fp, frame.pc);
++		walk_stackframe(t, &frame, klp_check_activeness_func, &args);
++		if (args.ret) {
++			ret = args.ret;
++			pr_info("PID: %d Comm: %.20s\n", t->pid, t->comm);
++			show_stack(t, NULL, KERN_INFO);
++			goto out;
++		}
++	}
++
++out:
++	return ret;
++}
++#endif
++
++#define LJMP_INSN_SIZE 4
++
++struct klp_func_node {
++	struct list_head node;
++	struct list_head func_stack;
++	void   *old_func;
++#ifdef CONFIG_ARM64_MODULE_PLTS
++	u32	old_insns[LJMP_INSN_SIZE];
++#else
++	u32	old_insn;
++#endif
++};
++
++static LIST_HEAD(klp_func_list);
++
++static struct klp_func_node *klp_find_func_node(void *old_func)
++{
++	struct klp_func_node *func_node;
++
++	list_for_each_entry(func_node, &klp_func_list, node) {
++		if (func_node->old_func == old_func)
++			return func_node;
++	}
++
++	return NULL;
++}
++
++int arch_klp_patch_func(struct klp_func *func)
++{
++	struct klp_func_node *func_node;
++	unsigned long pc, new_addr;
++	u32 insn;
++	u32 memory_flag = 0;
++#ifdef CONFIG_ARM64_MODULE_PLTS
++	int i;
++	u32 insns[LJMP_INSN_SIZE];
++#endif
++	int ret = 0;
++
++	func_node = klp_find_func_node(func->old_func);
++	if (!func_node) {
++		func_node = kzalloc(sizeof(*func_node), GFP_ATOMIC);
++		if (!func_node)
++			return -ENOMEM;
++		memory_flag = 1;
++
++		INIT_LIST_HEAD(&func_node->func_stack);
++		func_node->old_func = func->old_func;
++
++#ifdef CONFIG_ARM64_MODULE_PLTS
++		for (i = 0; i < LJMP_INSN_SIZE; i++) {
++			ret = aarch64_insn_read(((u32 *)func->old_func) + i,
++					&func_node->old_insns[i]);
++			if (ret)
++				break;
++		}
++#else
++		ret = aarch64_insn_read((void *)func->old_func,
++					&func_node->old_insn);
++#endif
++		if (ret) {
++			kfree(func_node);
++			return -EPERM;
++		}
++
++		list_add_rcu(&func_node->node, &klp_func_list);
++	}
++
++	list_add_rcu(&func->stack_node, &func_node->func_stack);
++
++	pc = (unsigned long)func->old_func;
++	new_addr = (unsigned long)func->new_func;
++
++#ifdef CONFIG_ARM64_MODULE_PLTS
++	if (offset_in_range(pc, new_addr, SZ_128M)) {
++		insn = aarch64_insn_gen_branch_imm(pc, new_addr,
++				AARCH64_INSN_BRANCH_NOLINK);
++		if (aarch64_insn_patch_text_nosync((void *)pc, insn))
++			goto ERR_OUT;
++	} else {
++		insns[0] = cpu_to_le32(0x92800010 | (((~new_addr) & 0xffff)) << 5);
++		insns[1] = cpu_to_le32(0xf2a00010 | (((new_addr >> 16) & 0xffff)) << 5);
++		insns[2] = cpu_to_le32(0xf2c00010 | (((new_addr >> 32) & 0xffff)) << 5);
++		insns[3] = cpu_to_le32(0xd61f0200);
++		for (i = 0; i < LJMP_INSN_SIZE; i++) {
++			if (aarch64_insn_patch_text_nosync(((u32 *)pc) + i, insns[i]))
++				goto ERR_OUT;
++		}
++	}
++#else
++	insn = aarch64_insn_gen_branch_imm(pc, new_addr,
++			AARCH64_INSN_BRANCH_NOLINK);
++
++	if (aarch64_insn_patch_text_nosync((void *)pc, insn))
++		goto ERR_OUT;
++#endif
++	return 0;
++
++ERR_OUT:
++	list_del_rcu(&func->stack_node);
++	if (memory_flag) {
++		list_del_rcu(&func_node->node);
++		kfree(func_node);
++	}
++
++	return -EPERM;
++}
++
++void arch_klp_unpatch_func(struct klp_func *func)
++{
++	struct klp_func_node *func_node;
++	struct klp_func *next_func;
++	unsigned long pc, new_addr;
++	u32 insn;
++#ifdef CONFIG_ARM64_MODULE_PLTS
++	int i;
++	u32 insns[LJMP_INSN_SIZE];
++#endif
++	func_node = klp_find_func_node(func->old_func);
++	if (WARN_ON(!func_node))
++		return;
++
++	pc = (unsigned long)func_node->old_func;
++	if (list_is_singular(&func_node->func_stack)) {
++#ifdef CONFIG_ARM64_MODULE_PLTS
++		for (i = 0; i < LJMP_INSN_SIZE; i++)
++			insns[i] = func_node->old_insns[i];
++#else
++		insn = func_node->old_insn;
++#endif
++		list_del_rcu(&func->stack_node);
++		list_del_rcu(&func_node->node);
++		kfree(func_node);
++
++#ifdef CONFIG_ARM64_MODULE_PLTS
++		for (i = 0; i < LJMP_INSN_SIZE; i++) {
++			aarch64_insn_patch_text_nosync(((u32 *)pc) + i,
++					insns[i]);
++		}
++#else
++		aarch64_insn_patch_text_nosync((void *)pc, insn);
++#endif
++	} else {
++		list_del_rcu(&func->stack_node);
++		next_func = list_first_or_null_rcu(&func_node->func_stack,
++					struct klp_func, stack_node);
++		if (WARN_ON(!next_func))
++			return;
++
++		new_addr = (unsigned long)next_func->new_func;
++#ifdef CONFIG_ARM64_MODULE_PLTS
++		if (offset_in_range(pc, new_addr, SZ_128M)) {
++			insn = aarch64_insn_gen_branch_imm(pc, new_addr,
++					AARCH64_INSN_BRANCH_NOLINK);
++
++			aarch64_insn_patch_text_nosync((void *)pc, insn);
++		} else {
++			insns[0] = cpu_to_le32(0x92800010 | (((~new_addr) & 0xffff)) << 5);
++			insns[1] = cpu_to_le32(0xf2a00010 | (((new_addr >> 16) & 0xffff)) << 5);
++			insns[2] = cpu_to_le32(0xf2c00010 | (((new_addr >> 32) & 0xffff)) << 5);
++			insns[3] = cpu_to_le32(0xd61f0200);
++			for (i = 0; i < LJMP_INSN_SIZE; i++)
++				aarch64_insn_patch_text_nosync(((u32 *)pc) + i,
++						insns[i]);
++		}
++#else
++		insn = aarch64_insn_gen_branch_imm(pc, new_addr,
++				AARCH64_INSN_BRANCH_NOLINK);
++
++		aarch64_insn_patch_text_nosync((void *)pc, insn);
++#endif
++	}
++}
+-- 
+2.26.2
+

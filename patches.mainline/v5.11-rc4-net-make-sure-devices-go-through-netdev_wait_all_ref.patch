@@ -1,0 +1,68 @@
+From 766b0515d5bec4b780750773ed3009b148df8c0a Mon Sep 17 00:00:00 2001
+From: Jakub Kicinski <kuba@kernel.org>
+Date: Wed, 6 Jan 2021 10:40:07 -0800
+Subject: [PATCH] net: make sure devices go through netdev_wait_all_refs
+Git-commit: 766b0515d5bec4b780750773ed3009b148df8c0a
+Patch-mainline: v5.11-rc4
+References: bsn#12
+
+
+If register_netdevice() fails at the very last stage - the
+notifier call - some subsystems may have already seen it and
+grabbed a reference. struct net_device can't be freed right
+away without calling netdev_wait_all_refs().
+
+Now that we have a clean interface in form of dev->needs_free_netdev
+and lenient free_netdev() we can undo what commit 93ee31f14f6f ("[NET]:
+Fix free_netdev on register_netdev failure.") has done and complete
+the unregistration path by bringing the net_set_todo() call back.
+
+After registration fails user is still expected to explicitly
+free the net_device, so make sure ->needs_free_netdev is cleared,
+otherwise rolling back the registration will cause the old double
+free for callers who release rtnl_lock before the free.
+
+This also solves the problem of priv_destructor not being called
+on notifier error.
+
+net_set_todo() will be moved back into unregister_netdevice_queue()
+in a follow up.
+
+Reported-by: Hulk Robot <hulkci@huawei.com>
+Reported-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ net/core/dev.c | 14 ++++----------
+ 1 file changed, 4 insertions(+), 10 deletions(-)
+
+diff --git a/net/core/dev.c b/net/core/dev.c
+index adde93cbca9f..0071a11a6dc3 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -10077,17 +10077,11 @@ int register_netdevice(struct net_device *dev)
+ 	ret = call_netdevice_notifiers(NETDEV_REGISTER, dev);
+ 	ret = notifier_to_errno(ret);
+ 	if (ret) {
++		/* Expect explicit free_netdev() on failure */
++		dev->needs_free_netdev = false;
+ 		rollback_registered(dev);
+-		rcu_barrier();
+-
+-		dev->reg_state = NETREG_UNREGISTERED;
+-		/* We should put the kobject that hold in
+-		 * netdev_unregister_kobject(), otherwise
+-		 * the net device cannot be freed when
+-		 * driver calls free_netdev(), because the
+-		 * kobject is being hold.
+-		 */
+-		kobject_put(&dev->dev.kobj);
++		net_set_todo(dev);
++		goto out;
+ 	}
+ 	/*
+ 	 *	Prevent userspace races by waiting until the network
+-- 
+2.31.1
+

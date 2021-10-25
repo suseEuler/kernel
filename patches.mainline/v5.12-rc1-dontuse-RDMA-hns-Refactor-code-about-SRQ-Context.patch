@@ -1,0 +1,185 @@
+From eacb45ca8f4bb722ab5a9734379b37e4bd99f3c0 Mon Sep 17 00:00:00 2001
+From: Wenpeng Liang <liangwenpeng@huawei.com>
+Date: Sat, 30 Jan 2021 16:58:05 +0800
+Subject: [PATCH] RDMA/hns: Refactor code about SRQ Context
+Git-commit: eacb45ca8f4bb722ab5a9734379b37e4bd99f3c0
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+Reduce parameter numbers of write_srqc() and move some related code into
+it from alloc_srqc().
+
+Link: https://lore.kernel.org/r/1611997090-48820-8-git-send-email-liweihang@huawei.com
+Signed-off-by: Wenpeng Liang <liangwenpeng@huawei.com>
+Signed-off-by: Weihang Li <liweihang@huawei.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ drivers/infiniband/hw/hns/hns_roce_device.h |  6 +--
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.c  | 33 +++++++++++++---
+ drivers/infiniband/hw/hns/hns_roce_srq.c    | 44 ++++++---------------
+ 3 files changed, 42 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/infiniband/hw/hns/hns_roce_device.h b/drivers/infiniband/hw/hns/hns_roce_device.h
+index b325b9c4b485..d51641af9342 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_device.h
++++ b/drivers/infiniband/hw/hns/hns_roce_device.h
+@@ -953,11 +953,7 @@ struct hns_roce_hw {
+ 	int (*modify_cq)(struct ib_cq *cq, u16 cq_count, u16 cq_period);
+ 	int (*init_eq)(struct hns_roce_dev *hr_dev);
+ 	void (*cleanup_eq)(struct hns_roce_dev *hr_dev);
+-	void (*write_srqc)(struct hns_roce_dev *hr_dev,
+-			   struct hns_roce_srq *srq, void *mb_buf,
+-			   u64 *mtts_wqe, u64 *mtts_idx,
+-			   dma_addr_t dma_handle_wqe,
+-			   dma_addr_t dma_handle_idx);
++	int (*write_srqc)(struct hns_roce_srq *srq, void *mb_buf);
+ 	int (*modify_srq)(struct ib_srq *ibsrq, struct ib_srq_attr *srq_attr,
+ 		       enum ib_srq_attr_mask srq_attr_mask,
+ 		       struct ib_udata *udata);
+diff --git a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+index ec2d64c91114..dd5f7b57f007 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+@@ -5227,17 +5227,38 @@ static int hns_roce_v2_qp_flow_control_init(struct hns_roce_dev *hr_dev,
+ 	return ret;
+ }
+ 
+-static void hns_roce_v2_write_srqc(struct hns_roce_dev *hr_dev,
+-				   struct hns_roce_srq *srq, void *mb_buf,
+-				   u64 *mtts_wqe, u64 *mtts_idx,
+-				   dma_addr_t dma_handle_wqe,
+-				   dma_addr_t dma_handle_idx)
++static int hns_roce_v2_write_srqc(struct hns_roce_srq *srq, void *mb_buf)
+ {
++	struct ib_device *ibdev = srq->ibsrq.device;
++	struct hns_roce_dev *hr_dev = to_hr_dev(ibdev);
+ 	struct hns_roce_srq_context *srq_context;
++	u64 mtts_wqe[MTT_MIN_COUNT] = {};
++	u64 mtts_idx[MTT_MIN_COUNT] = {};
++	dma_addr_t dma_handle_wqe = 0;
++	dma_addr_t dma_handle_idx = 0;
++	int ret;
+ 
+ 	srq_context = mb_buf;
+ 	memset(srq_context, 0, sizeof(*srq_context));
+ 
++	/* Get the physical address of srq buf */
++	ret = hns_roce_mtr_find(hr_dev, &srq->buf_mtr, 0, mtts_wqe,
++				ARRAY_SIZE(mtts_wqe), &dma_handle_wqe);
++	if (ret < 1) {
++		ibdev_err(ibdev, "failed to find mtr for SRQ WQE, ret = %d.\n",
++			  ret);
++		return -ENOBUFS;
++	}
++
++	/* Get physical address of idx que buf */
++	ret = hns_roce_mtr_find(hr_dev, &srq->idx_que.mtr, 0, mtts_idx,
++				ARRAY_SIZE(mtts_idx), &dma_handle_idx);
++	if (ret < 1) {
++		ibdev_err(ibdev, "failed to find mtr for SRQ idx, ret = %d.\n",
++			  ret);
++		return -ENOBUFS;
++	}
++
+ 	roce_set_field(srq_context->byte_4_srqn_srqst, SRQC_BYTE_4_SRQ_ST_M,
+ 		       SRQC_BYTE_4_SRQ_ST_S, 1);
+ 
+@@ -5319,6 +5340,8 @@ static void hns_roce_v2_write_srqc(struct hns_roce_dev *hr_dev,
+ 
+ 	roce_set_bit(srq_context->db_record_addr_record_en,
+ 		     SRQC_BYTE_60_SRQ_RECORD_EN_S, 0);
++
++	return 0;
+ }
+ 
+ static int hns_roce_v2_modify_srq(struct ib_srq *ibsrq,
+diff --git a/drivers/infiniband/hw/hns/hns_roce_srq.c b/drivers/infiniband/hw/hns/hns_roce_srq.c
+index 5069b8103b98..d5a6de0e7095 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_srq.c
++++ b/drivers/infiniband/hw/hns/hns_roce_srq.c
+@@ -82,34 +82,11 @@ static int alloc_srqc(struct hns_roce_dev *hr_dev, struct hns_roce_srq *srq)
+ 	struct hns_roce_srq_table *srq_table = &hr_dev->srq_table;
+ 	struct ib_device *ibdev = &hr_dev->ib_dev;
+ 	struct hns_roce_cmd_mailbox *mailbox;
+-	u64 mtts_wqe[MTT_MIN_COUNT] = { 0 };
+-	u64 mtts_idx[MTT_MIN_COUNT] = { 0 };
+-	dma_addr_t dma_handle_wqe = 0;
+-	dma_addr_t dma_handle_idx = 0;
+ 	int ret;
+ 
+-	/* Get the physical address of srq buf */
+-	ret = hns_roce_mtr_find(hr_dev, &srq->buf_mtr, 0, mtts_wqe,
+-				ARRAY_SIZE(mtts_wqe), &dma_handle_wqe);
+-	if (ret < 1) {
+-		ibdev_err(ibdev, "failed to find mtr for SRQ WQE, ret = %d.\n",
+-			  ret);
+-		return -ENOBUFS;
+-	}
+-
+-	/* Get physical address of idx que buf */
+-	ret = hns_roce_mtr_find(hr_dev, &srq->idx_que.mtr, 0, mtts_idx,
+-				ARRAY_SIZE(mtts_idx), &dma_handle_idx);
+-	if (ret < 1) {
+-		ibdev_err(ibdev, "failed to find mtr for SRQ idx, ret = %d.\n",
+-			  ret);
+-		return -ENOBUFS;
+-	}
+-
+ 	ret = hns_roce_bitmap_alloc(&srq_table->bitmap, &srq->srqn);
+ 	if (ret) {
+-		ibdev_err(ibdev,
+-			  "failed to alloc SRQ number, ret = %d.\n", ret);
++		ibdev_err(ibdev, "failed to alloc SRQ number.\n");
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -127,31 +104,36 @@ static int alloc_srqc(struct hns_roce_dev *hr_dev, struct hns_roce_srq *srq)
+ 
+ 	mailbox = hns_roce_alloc_cmd_mailbox(hr_dev);
+ 	if (IS_ERR_OR_NULL(mailbox)) {
+-		ret = -ENOMEM;
+ 		ibdev_err(ibdev, "failed to alloc mailbox for SRQC.\n");
++		ret = -ENOMEM;
+ 		goto err_xa;
+ 	}
+ 
+-	hr_dev->hw->write_srqc(hr_dev, srq, mailbox->buf, mtts_wqe, mtts_idx,
+-			       dma_handle_wqe, dma_handle_idx);
++	ret = hr_dev->hw->write_srqc(srq, mailbox->buf);
++	if (ret) {
++		ibdev_err(ibdev, "failed to write SRQC.\n");
++		goto err_mbox;
++	}
+ 
+ 	ret = hns_roce_hw_create_srq(hr_dev, mailbox, srq->srqn);
+-	hns_roce_free_cmd_mailbox(hr_dev, mailbox);
+ 	if (ret) {
+ 		ibdev_err(ibdev, "failed to config SRQC, ret = %d.\n", ret);
+-		goto err_xa;
++		goto err_mbox;
+ 	}
+ 
++	hns_roce_free_cmd_mailbox(hr_dev, mailbox);
++
+ 	return 0;
+ 
++err_mbox:
++	hns_roce_free_cmd_mailbox(hr_dev, mailbox);
+ err_xa:
+ 	xa_erase(&srq_table->xa, srq->srqn);
+-
+ err_put:
+ 	hns_roce_table_put(hr_dev, &srq_table->table, srq->srqn);
+-
+ err_out:
+ 	hns_roce_bitmap_free(&srq_table->bitmap, srq->srqn, BITMAP_NO_RR);
++
+ 	return ret;
+ }
+ 
+-- 
+2.31.1
+

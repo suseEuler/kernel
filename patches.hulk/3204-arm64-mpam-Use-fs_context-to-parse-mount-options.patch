@@ -1,0 +1,320 @@
+From 100e2317e9b95e893742656a742c2c32b8e6f86a Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Fri, 26 Feb 2021 20:22:46 +0800
+Subject: [PATCH] arm64/mpam: Use fs_context to parse mount options
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 100e2317e9b95e893742656a742c2c32b8e6f86a
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+Use fs_context to parse mount options, this old process parsing from
+parse_rdtgroupfs_options() will be obsoleted and removed.
+
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/resctrl.h      |  32 +++++++-
+ arch/arm64/kernel/mpam/mpam_resctrl.c |  49 ++----------
+ fs/resctrlfs.c                        | 103 +++++++++++++++++++++++++-
+ 3 files changed, 135 insertions(+), 49 deletions(-)
+
+diff --git a/arch/arm64/include/asm/resctrl.h b/arch/arm64/include/asm/resctrl.h
+index 22e848bf295e..d7b70916a42b 100644
+--- a/arch/arm64/include/asm/resctrl.h
++++ b/arch/arm64/include/asm/resctrl.h
+@@ -409,9 +409,6 @@ void rdt_last_cmd_printf(const char *fmt, ...);
+ 
+ void resctrl_resource_reset(void);
+ 
+-#define release_resctrl_group_fs_options release_rdtgroupfs_options
+-#define parse_resctrl_group_fs_options parse_rdtgroupfs_options
+-
+ int resctrl_group_init_alloc(struct rdtgroup *rdtgrp);
+ 
+ static inline int __resctrl_group_show_options(struct seq_file *seq)
+@@ -451,6 +448,15 @@ int resctrl_group_add_files(struct kernfs_node *kn, unsigned long fflags);
+ 
+ struct resctrl_fs_context {
+ 	struct kernfs_fs_context        kfc;
++	bool enable_cdpl3;
++	bool enable_cdpl2;
++	bool enable_mbMax;
++	bool enable_mbMin;
++	bool enable_mbHdl;
++	bool enable_mbPrio;
++	bool enable_caPbm;
++	bool enable_caMax;
++	bool enable_caPrio;
+ };
+ 
+ static inline struct resctrl_fs_context *resctrl_fc2context(struct fs_context *fc)
+@@ -492,5 +498,25 @@ static inline u32 resctrl_navie_closid(struct sd_closid closid)
+ 	return closid.intpartid;
+ }
+ 
++void extend_ctrl_disable(void);
++void basic_ctrl_enable(void);
++void disable_cdp(void);
++
++int cdpl2_enable(void);
++int cdpl3_enable(void);
++int extend_ctrl_enable(char *tok);
++#define DEFINE_INLINE_CTRL_FEATURE_ENABLE_FUNC(name)    \
++	static inline int name##_enable(void) \
++	{   \
++		return extend_ctrl_enable(#name);	\
++	}
++DEFINE_INLINE_CTRL_FEATURE_ENABLE_FUNC(mbMax);
++DEFINE_INLINE_CTRL_FEATURE_ENABLE_FUNC(mbMin);
++DEFINE_INLINE_CTRL_FEATURE_ENABLE_FUNC(mbHdl);
++DEFINE_INLINE_CTRL_FEATURE_ENABLE_FUNC(mbPrio);
++DEFINE_INLINE_CTRL_FEATURE_ENABLE_FUNC(caPbm);
++DEFINE_INLINE_CTRL_FEATURE_ENABLE_FUNC(caMax);
++DEFINE_INLINE_CTRL_FEATURE_ENABLE_FUNC(caPrio);
++
+ #endif
+ #endif /* _ASM_ARM64_RESCTRL_H */
+diff --git a/arch/arm64/kernel/mpam/mpam_resctrl.c b/arch/arm64/kernel/mpam/mpam_resctrl.c
+index ca9704222797..aa0124c2960a 100644
+--- a/arch/arm64/kernel/mpam/mpam_resctrl.c
++++ b/arch/arm64/kernel/mpam/mpam_resctrl.c
+@@ -1067,7 +1067,7 @@ void release_rdtgroupfs_options(void)
+ {
+ }
+ 
+-static void disable_cdp(void)
++void disable_cdp(void)
+ {
+ 	struct mpam_resctrl_res *res;
+ 	struct resctrl_resource *r;
+@@ -1093,17 +1093,17 @@ static int try_to_enable_cdp(enum resctrl_resource_level level)
+ 	return 0;
+ }
+ 
+-static int cdpl3_enable(void)
++int cdpl3_enable(void)
+ {
+ 	return try_to_enable_cdp(RDT_RESOURCE_L3);
+ }
+ 
+-static int cdpl2_enable(void)
++int cdpl2_enable(void)
+ {
+ 	return try_to_enable_cdp(RDT_RESOURCE_L2);
+ }
+ 
+-static void basic_ctrl_enable(void)
++void basic_ctrl_enable(void)
+ {
+ 	struct mpam_resctrl_res *res;
+ 	struct raw_resctrl_resource *rr;
+@@ -1115,7 +1115,7 @@ static void basic_ctrl_enable(void)
+ 	}
+ }
+ 
+-static int extend_ctrl_enable(char *tok)
++int extend_ctrl_enable(char *tok)
+ {
+ 	bool match = false;
+ 	struct resctrl_resource *r;
+@@ -1153,7 +1153,7 @@ static int extend_ctrl_enable(char *tok)
+ 	return 0;
+ }
+ 
+-static void extend_ctrl_disable(void)
++void extend_ctrl_disable(void)
+ {
+ 	struct raw_resctrl_resource *rr;
+ 	struct mpam_resctrl_res *res;
+@@ -1169,44 +1169,7 @@ static void extend_ctrl_disable(void)
+ 	}
+ }
+ 
+-int parse_rdtgroupfs_options(char *data)
+-{
+-	char *token;
+-	char *o = data;
+-	int ret = 0;
+-
+-	disable_cdp();
+-	extend_ctrl_disable();
+-	basic_ctrl_enable();
+-
+-	while ((token = strsep(&o, ",")) != NULL) {
+-		if (!*token) {
+-			ret = -EINVAL;
+-			goto out;
+-		}
+-
+-		if (!strcmp(token, "cdpl3")) {
+-			ret = cdpl3_enable();
+-			if (ret)
+-				goto out;
+-		} else if (!strcmp(token, "cdpl2")) {
+-			ret = cdpl2_enable();
+-			if (ret)
+-				goto out;
+-		} else {
+-			ret = extend_ctrl_enable(token);
+-			if (ret)
+-				goto out;
+-		}
+-	}
+-
+-	return 0;
+-
+-out:
+-	pr_err("Invalid mount option \"%s\"\n", token);
+ 
+-	return ret;
+-}
+ 
+ /*
+  * This is safe against intel_resctrl_sched_in() called from __switch_to()
+diff --git a/fs/resctrlfs.c b/fs/resctrlfs.c
+index 0476c5a7cb16..6fa02741427d 100644
+--- a/fs/resctrlfs.c
++++ b/fs/resctrlfs.c
+@@ -220,7 +220,40 @@ void resctrl_group_kn_unlock(struct kernfs_node *kn)
+ 
+ static int resctrl_enable_ctx(struct resctrl_fs_context *ctx)
+ {
+-	return 0;
++	int ret = 0;
++
++	extend_ctrl_disable();
++	basic_ctrl_enable();
++	disable_cdp();
++
++	if (ctx->enable_cdpl3)
++		ret = cdpl3_enable();
++
++	if (!ret && ctx->enable_cdpl2)
++		ret = cdpl2_enable();
++
++	if (!ret && ctx->enable_mbMax)
++		ret = mbMax_enable();
++
++	if (!ret && ctx->enable_mbMin)
++		ret = mbMin_enable();
++
++	if (!ret && ctx->enable_mbHdl)
++		ret = mbHdl_enable();
++
++	if (!ret && ctx->enable_mbPrio)
++		ret = mbPrio_enable();
++
++	if (!ret && ctx->enable_caPbm)
++		ret = caPbm_enable();
++
++	if (!ret && ctx->enable_caMax)
++		ret = caMax_enable();
++
++	if (!ret && ctx->enable_caPrio)
++		ret = caPrio_enable();
++
++	return ret;
+ }
+ 
+ static int
+@@ -541,14 +574,78 @@ static void resctrl_kill_sb(struct super_block *sb)
+ 	cpus_read_unlock();
+ }
+ 
+-static const struct fs_parameter_spec resctrl_fs_parameters = {
++enum resctrl_param {
++	Opt_cdpl3,
++	Opt_cdpl2,
++	Opt_mbMax,
++	Opt_mbMin,
++	Opt_mbHdl,
++	Opt_mbPrio,
++	Opt_caPbm,
++	Opt_caMax,
++	Opt_caPrio,
++	nr__resctrl_params
++};
++
++static const struct fs_parameter_spec resctrl_fs_parameters[] = {
++	fsparam_flag("cdpl3",        Opt_cdpl3),
++	fsparam_flag("cdpl2",        Opt_cdpl2),
++	fsparam_flag("mbMax",        Opt_mbMax),
++	fsparam_flag("mbMin",        Opt_mbMin),
++	fsparam_flag("mbHdl",        Opt_mbHdl),
++	fsparam_flag("mbPrio",       Opt_mbPrio),
++	fsparam_flag("caPbm",        Opt_caPbm),
++	fsparam_flag("caMax",        Opt_caMax),
++	fsparam_flag("caPrio",       Opt_caPrio),
++	{}
+ };
+ 
+ static int resctrl_parse_param(struct fs_context *fc, struct fs_parameter *param)
+ {
++	struct resctrl_fs_context *ctx = resctrl_fc2context(fc);
++	struct fs_parse_result result;
++	int opt;
++
++	opt = fs_parse(fc, resctrl_fs_parameters, param, &result);
++	if (opt < 0)
++		return opt;
++
++	switch (opt) {
++	case Opt_cdpl3:
++		ctx->enable_cdpl3 = true;
++		return 0;
++	case Opt_cdpl2:
++		ctx->enable_cdpl2 = true;
++		return 0;
++	case Opt_mbMax:
++		ctx->enable_mbMax = true;
++		return 0;
++	case Opt_mbMin:
++		ctx->enable_mbMin = true;
++		return 0;
++	case Opt_mbHdl:
++		ctx->enable_mbHdl = true;
++		return 0;
++	case Opt_mbPrio:
++		ctx->enable_mbPrio = true;
++		return 0;
++	case Opt_caPbm:
++		ctx->enable_caPbm = true;
++		return 0;
++	case Opt_caMax:
++		ctx->enable_caMax = true;
++		return 0;
++	case Opt_caPrio:
++		ctx->enable_caPrio = true;
++		return 0;
++
+ 	return 0;
+ }
+ 
++return -EINVAL;
++
++}
++
+ static void resctrl_fs_context_free(struct fs_context *fc)
+ {
+ 	struct resctrl_fs_context *ctx = resctrl_fc2context(fc);
+@@ -585,7 +682,7 @@ static int resctrl_init_fs_context(struct fs_context *fc)
+ static struct file_system_type resctrl_fs_type = {
+ 	.name                   = "resctrl",
+ 	.init_fs_context        = resctrl_init_fs_context,
+-	.parameters             = &resctrl_fs_parameters,
++	.parameters             = resctrl_fs_parameters,
+ 	.kill_sb                = resctrl_kill_sb,
+ };
+ 
+-- 
+2.26.2
+

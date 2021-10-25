@@ -1,0 +1,241 @@
+From 48b9f44a56cb6036d23c14e64e7eab69145acd69 Mon Sep 17 00:00:00 2001
+From: Krzysztof Struczynski <krzysztof.struczynski@huawei.com>
+Date: Fri, 10 Sep 2021 19:59:54 +0800
+Subject: [PATCH] ima: Load per ima namespace x509 certificate
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 48b9f44a56cb6036d23c14e64e7eab69145acd69
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I49KW1
+CVE: NA
+
+--------------------------------
+
+If configured, load the x509 certificate when the first process is
+born into the new ima namespace. User can set the path to the
+certificate by writing to the x509_for_children entry in the ima
+securityfs. The certificate may be appraised in the parent ima namespace,
+in that case it may need to be signed with the parent ns' key. Appraisal
+of the key in the newly created namespace is disabled as for the original
+ima.
+
+Signed-off-by: Krzysztof Struczynski <krzysztof.struczynski@huawei.com>
+Reviewed-by: Zhang Tianxing <zhangtianxing3@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/ima.h               |  1 +
+ security/integrity/digsig.c       |  6 +--
+ security/integrity/ima/ima_main.c | 12 ++++--
+ security/integrity/ima/ima_ns.c   | 65 ++++++++++++++++++++++++-------
+ security/integrity/integrity.h    |  2 +-
+ 5 files changed, 65 insertions(+), 21 deletions(-)
+
+diff --git a/include/linux/ima.h b/include/linux/ima.h
+index eb022229c694..f011c6e6aa86 100644
+--- a/include/linux/ima.h
++++ b/include/linux/ima.h
+@@ -240,6 +240,7 @@ struct ima_namespace {
+ #ifdef CONFIG_KEYS
+ 	struct key_tag *key_domain;
+ #endif
++	struct task_struct *activating_tsk; /* used only for the ns activation */
+ } __randomize_layout;
+ 
+ extern struct ima_namespace init_ima_ns;
+diff --git a/security/integrity/digsig.c b/security/integrity/digsig.c
+index 4d2579a2c5ea..2c923dc0dbd3 100644
+--- a/security/integrity/digsig.c
++++ b/security/integrity/digsig.c
+@@ -171,8 +171,8 @@ int __init integrity_init_keyring(const unsigned int id)
+ 	return __integrity_init_keyring(id, perm, restriction);
+ }
+ 
+-int __init integrity_add_key(const unsigned int id, const void *data,
+-			     off_t size, key_perm_t perm)
++int integrity_add_key(const unsigned int id, const void *data,
++		      off_t size, key_perm_t perm)
+ {
+ 	key_ref_t key;
+ 	int rc = 0;
+@@ -196,7 +196,7 @@ int __init integrity_add_key(const unsigned int id, const void *data,
+ 
+ }
+ 
+-int __init integrity_load_x509(const unsigned int id, const char *path)
++int integrity_load_x509(const unsigned int id, const char *path)
+ {
+ 	void *data = NULL;
+ 	size_t size;
+diff --git a/security/integrity/ima/ima_main.c b/security/integrity/ima/ima_main.c
+index 663552073997..84826e4c844d 100644
+--- a/security/integrity/ima/ima_main.c
++++ b/security/integrity/ima/ima_main.c
+@@ -364,9 +364,12 @@ static int process_ns_measurement(struct file *file, const struct cred *cred,
+ 		return 0;
+ 
+ 	if (ima_ns != current_ima_ns) {
+-		iint = integrity_iint_rb_find(ima_ns->iint_tree, inode);
+-		if (!iint)
+-			return 0;
++		if (!(ima_ns->activating_tsk && (ima_ns->activating_tsk ==
++						 current))) {
++			iint = integrity_iint_rb_find(ima_ns->iint_tree, inode);
++			if (!iint)
++				return 0;
++		}
+ 	}
+ 
+ 	/* Return an IMA_MEASURE, IMA_APPRAISE, IMA_AUDIT action
+@@ -411,7 +414,8 @@ static int process_ns_measurement(struct file *file, const struct cred *cred,
+ 		goto out;
+ 	if (!action)
+ 		goto out;
+-	if (ima_ns != current_ima_ns)
++	if ((ima_ns != current_ima_ns) &&
++	    !(ima_ns->activating_tsk && (ima_ns->activating_tsk == current)))
+ 		goto out;
+ 
+ 	mutex_lock(&iint->mutex);
+diff --git a/security/integrity/ima/ima_ns.c b/security/integrity/ima/ima_ns.c
+index 639e5eadee31..b04f35f35f85 100644
+--- a/security/integrity/ima/ima_ns.c
++++ b/security/integrity/ima/ima_ns.c
+@@ -49,6 +49,30 @@ static void dec_ima_namespaces(struct ucounts *ucounts)
+ 	return dec_ucount(ucounts, UCOUNT_IMA_NAMESPACES);
+ }
+ 
++#ifdef CONFIG_IMA_LOAD_X509
++static int ima_ns_load_x509(struct ima_namespace *ima_ns)
++{
++	int res = 0;
++	int unset_flags =
++		ima_ns->policy_data->ima_policy_flag & IMA_APPRAISE;
++
++	if (!ima_ns->x509_path_for_children)
++		return res;
++
++	ima_ns->policy_data->ima_policy_flag &= ~unset_flags;
++	res = integrity_load_x509(INTEGRITY_KEYRING_IMA,
++				  ima_ns->x509_path_for_children);
++	ima_ns->policy_data->ima_policy_flag |= unset_flags;
++
++	return res;
++}
++#else
++static inline int ima_ns_load_x509(struct ima_namespace *ima_ns)
++{
++	return 0;
++}
++#endif
++
+ static struct ima_namespace *ima_ns_alloc(void)
+ {
+ 	struct ima_namespace *ima_ns;
+@@ -361,6 +385,22 @@ static int imans_activate(struct ima_namespace *ima_ns)
+ 	list_add_tail(&ima_ns->list, &ima_ns_list);
+ 	up_write(&ima_ns_list_lock);
+ 
++	/* The x509 certificate has to be measured in the new namespace as
++	 * well as in the parent namespace, therefore it has to be loaded
++	 * after adding the namespace to the list of active namespaces. If
++	 * defined in the policy, the parent IMA ns can also appraise the
++	 * certificate, appraisal is disabled only in the new namespace. If
++	 * loading the certificate fails, print a warning but don't return an
++	 * error - there is no way to handle it well at this point, in
++	 * the worst case, user will end up with a failed appraisal */
++	ima_ns->activating_tsk = current;
++	res = ima_ns_load_x509(ima_ns);
++	ima_ns->activating_tsk = NULL;
++	if (res < 0) {
++		pr_err("IMA ns x509 cert. loading failed, appraisal will fail\n");
++		res = 0;
++	}
++
+ 	destroy_child_config(ima_ns);
+ out:
+ 	mutex_unlock(&frozen_lock);
+@@ -370,9 +410,10 @@ static int imans_activate(struct ima_namespace *ima_ns)
+ 
+ static int imans_install(struct nsset *nsset, struct ns_common *new)
+ {
+-	int res;
++	int res = 0;
+ 	struct nsproxy *nsproxy = nsset->nsproxy;
+ 	struct ima_namespace *ns = to_ima_ns(new);
++	struct ima_namespace *old_ns = nsproxy->ima_ns;
+ 
+ 	if (!current_is_single_threaded())
+ 		return -EUSERS;
+@@ -381,19 +422,20 @@ static int imans_install(struct nsset *nsset, struct ns_common *new)
+ 	    !ns_capable(nsset->cred->user_ns, CAP_SYS_ADMIN))
+ 		return -EPERM;
+ 
+-	res = imans_activate(ns);
+-	if (res)
+-		return res;
+-
+ 	get_ima_ns(ns);
+-	put_ima_ns(nsproxy->ima_ns);
++	put_ima_ns(old_ns);
+ 	nsproxy->ima_ns = ns;
+ 
+ 	get_ima_ns(ns);
+ 	put_ima_ns(nsproxy->ima_ns_for_children);
+ 	nsproxy->ima_ns_for_children = ns;
+ 
+-	return res;
++	if (!ns->frozen && (ns->user_ns != nsset->cred->user_ns)) {
++		res = ima_swap_user_ns(ns, nsset->cred->user_ns);
++		if (res)
++			return res;
++	}
++	return imans_activate(ns);
+ }
+ 
+ int imans_on_fork(struct nsproxy *nsproxy, struct task_struct *tsk,
+@@ -401,6 +443,7 @@ int imans_on_fork(struct nsproxy *nsproxy, struct task_struct *tsk,
+ {
+ 	int res;
+ 	struct ima_namespace *ima_ns = nsproxy->ima_ns_for_children;
++	struct ima_namespace *old_ima_ns = nsproxy->ima_ns;
+ 
+ 	/* create_new_namespaces() already incremented the ref counter */
+ 	if (nsproxy->ima_ns == ima_ns)
+@@ -416,15 +459,11 @@ int imans_on_fork(struct nsproxy *nsproxy, struct task_struct *tsk,
+ 			return res;
+ 	}
+ 
+-	res = imans_activate(ima_ns);
+-	if (res)
+-		return res;
+-
+ 	get_ima_ns(ima_ns);
+-	put_ima_ns(nsproxy->ima_ns);
++	put_ima_ns(old_ima_ns);
+ 	nsproxy->ima_ns = ima_ns;
+ 
+-	return res;
++	return imans_activate(ima_ns);
+ }
+ 
+ static struct user_namespace *imans_owner(struct ns_common *ns)
+diff --git a/security/integrity/integrity.h b/security/integrity/integrity.h
+index 423e61627716..e00adc23f3e9 100644
+--- a/security/integrity/integrity.h
++++ b/security/integrity/integrity.h
+@@ -223,7 +223,7 @@ int integrity_digsig_verify(const unsigned int id, const char *sig, int siglen,
+ int integrity_modsig_verify(unsigned int id, const struct modsig *modsig);
+ 
+ int __init integrity_init_keyring(const unsigned int id);
+-int __init integrity_load_x509(const unsigned int id, const char *path);
++int integrity_load_x509(const unsigned int id, const char *path);
+ int __init integrity_load_cert(const unsigned int id, const char *source,
+ 			       const void *data, size_t len, key_perm_t perm);
+ #else
+-- 
+2.26.2
+

@@ -1,0 +1,156 @@
+From f92820e88ef3b1b2aee9f779cfb879f43959f37b Mon Sep 17 00:00:00 2001
+From: Kunkun Jiang <jiangkunkun@huawei.com>
+Date: Thu, 15 Jul 2021 11:00:18 +0800
+Subject: [PATCH] iommu/io-pgtable-arm: Add and realize sync_dirty_log ops
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: f92820e88ef3b1b2aee9f779cfb879f43959f37b
+
+
+virt inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I3ZUKK
+CVE: NA
+
+------------------------------
+
+During dirty log tracking, user will try to retrieve dirty log from
+iommu if it supports hardware dirty log. Scan leaf TTD and treat it
+is dirty if it's writable. As we just set DBM bit for stage1 mapping,
+so check whether AP[2] is not set.
+
+Co-developed-by: Keqian Zhu <zhukeqian1@huawei.com>
+Signed-off-by: Kunkun Jiang <jiangkunkun@huawei.com>
+Reviewed-by: Keqian Zhu <zhukeqian1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/iommu/io-pgtable-arm.c | 89 ++++++++++++++++++++++++++++++++++
+ include/linux/io-pgtable.h     |  4 ++
+ 2 files changed, 93 insertions(+)
+
+diff --git a/drivers/iommu/io-pgtable-arm.c b/drivers/iommu/io-pgtable-arm.c
+index 275bf9bdf549..f87520fc9135 100644
+--- a/drivers/iommu/io-pgtable-arm.c
++++ b/drivers/iommu/io-pgtable-arm.c
+@@ -878,6 +878,94 @@ static size_t arm_lpae_merge_page(struct io_pgtable_ops *ops, unsigned long iova
+ 	return __arm_lpae_merge_page(data, iova, paddr, size, lvl, ptep, prot);
+ }
+ 
++static int __arm_lpae_sync_dirty_log(struct arm_lpae_io_pgtable *data,
++				     unsigned long iova, size_t size,
++				     int lvl, arm_lpae_iopte *ptep,
++				     unsigned long *bitmap,
++				     unsigned long base_iova,
++				     unsigned long bitmap_pgshift)
++{
++	arm_lpae_iopte pte;
++	struct io_pgtable *iop = &data->iop;
++	size_t base, next_size;
++	unsigned long offset;
++	int nbits, ret;
++
++	if (WARN_ON(lvl == ARM_LPAE_MAX_LEVELS))
++		return -EINVAL;
++
++	ptep += ARM_LPAE_LVL_IDX(iova, lvl, data);
++	pte = READ_ONCE(*ptep);
++	if (WARN_ON(!pte))
++		return -EINVAL;
++
++	if (size == ARM_LPAE_BLOCK_SIZE(lvl, data)) {
++		if (iopte_leaf(pte, lvl, iop->fmt)) {
++			if (pte & ARM_LPAE_PTE_AP_RDONLY)
++				return 0;
++
++			/* It is writable, set the bitmap */
++			nbits = size >> bitmap_pgshift;
++			offset = (iova - base_iova) >> bitmap_pgshift;
++			bitmap_set(bitmap, offset, nbits);
++			return 0;
++		}
++		/* Current level is table, traverse next level */
++		next_size = ARM_LPAE_BLOCK_SIZE(lvl + 1, data);
++		ptep = iopte_deref(pte, data);
++		for (base = 0; base < size; base += next_size) {
++			ret = __arm_lpae_sync_dirty_log(data, iova + base,
++					next_size, lvl + 1, ptep, bitmap,
++					base_iova, bitmap_pgshift);
++			if (ret)
++				return ret;
++		}
++		return 0;
++	} else if (iopte_leaf(pte, lvl, iop->fmt)) {
++		if (pte & ARM_LPAE_PTE_AP_RDONLY)
++			return 0;
++
++		/* Though the size is too small, also set bitmap */
++		nbits = size >> bitmap_pgshift;
++		offset = (iova - base_iova) >> bitmap_pgshift;
++		bitmap_set(bitmap, offset, nbits);
++		return 0;
++	}
++
++	/* Keep on walkin */
++	ptep = iopte_deref(pte, data);
++	return __arm_lpae_sync_dirty_log(data, iova, size, lvl + 1, ptep,
++			bitmap, base_iova, bitmap_pgshift);
++}
++
++static int arm_lpae_sync_dirty_log(struct io_pgtable_ops *ops,
++				   unsigned long iova, size_t size,
++				   unsigned long *bitmap,
++				   unsigned long base_iova,
++				   unsigned long bitmap_pgshift)
++{
++	struct arm_lpae_io_pgtable *data = io_pgtable_ops_to_data(ops);
++	struct io_pgtable_cfg *cfg = &data->iop.cfg;
++	arm_lpae_iopte *ptep = data->pgd;
++	int lvl = data->start_level;
++	long iaext = (s64)iova >> cfg->ias;
++
++	if (WARN_ON(!size || (size & cfg->pgsize_bitmap) != size))
++		return -EINVAL;
++
++	if (cfg->quirks & IO_PGTABLE_QUIRK_ARM_TTBR1)
++		iaext = ~iaext;
++	if (WARN_ON(iaext))
++		return -EINVAL;
++
++	if (data->iop.fmt != ARM_64_LPAE_S1 &&
++	    data->iop.fmt != ARM_32_LPAE_S1)
++		return -EINVAL;
++
++	return __arm_lpae_sync_dirty_log(data, iova, size, lvl, ptep,
++					 bitmap, base_iova, bitmap_pgshift);
++}
++
+ static void arm_lpae_restrict_pgsizes(struct io_pgtable_cfg *cfg)
+ {
+ 	unsigned long granule, page_sizes;
+@@ -958,6 +1046,7 @@ arm_lpae_alloc_pgtable(struct io_pgtable_cfg *cfg)
+ 		.iova_to_phys	= arm_lpae_iova_to_phys,
+ 		.split_block	= arm_lpae_split_block,
+ 		.merge_page	= arm_lpae_merge_page,
++		.sync_dirty_log	= arm_lpae_sync_dirty_log,
+ 	};
+ 
+ 	return data;
+diff --git a/include/linux/io-pgtable.h b/include/linux/io-pgtable.h
+index caa3436cf09c..38d80bd08520 100644
+--- a/include/linux/io-pgtable.h
++++ b/include/linux/io-pgtable.h
+@@ -171,6 +171,10 @@ struct io_pgtable_ops {
+ 			      size_t size);
+ 	size_t (*merge_page)(struct io_pgtable_ops *ops, unsigned long iova,
+ 			     phys_addr_t phys, size_t size, int prot);
++	int (*sync_dirty_log)(struct io_pgtable_ops *ops,
++			      unsigned long iova, size_t size,
++			      unsigned long *bitmap, unsigned long base_iova,
++			      unsigned long bitmap_pgshift);
+ };
+ 
+ /**
+-- 
+2.26.2
+

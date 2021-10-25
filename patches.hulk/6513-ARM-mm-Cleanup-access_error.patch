@@ -1,0 +1,116 @@
+From ff099425464ca186b865edd48eb6aca08f9904bb Mon Sep 17 00:00:00 2001
+From: Kefeng Wang <wangkefeng.wang@huawei.com>
+Date: Wed, 23 Jun 2021 15:41:06 +0800
+Subject: [PATCH] ARM: mm: Cleanup access_error()
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: ff099425464ca186b865edd48eb6aca08f9904bb
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 167379
+CVE: NA
+
+Reference: https://lore.kernel.org/linux-arm-kernel/20210610123556.171328-1-wangkefeng.wang@huawei.com/
+
+-------------------------------------------------
+
+Now the write fault check in do_page_fault() and access_error() twice,
+we can cleanup access_error(), and make the fault check and vma flags set
+into do_page_fault() directly, then pass the vma flags to __do_page_fault.
+
+No functional change.
+
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Chen Jun <chenjun102@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm/mm/fault.c | 38 ++++++++++++++------------------------
+ 1 file changed, 14 insertions(+), 24 deletions(-)
+
+diff --git a/arch/arm/mm/fault.c b/arch/arm/mm/fault.c
+index c79e25f01923..1f9fb9c95137 100644
+--- a/arch/arm/mm/fault.c
++++ b/arch/arm/mm/fault.c
+@@ -196,26 +196,9 @@ void do_bad_area(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+ #define VM_FAULT_BADMAP		0x010000
+ #define VM_FAULT_BADACCESS	0x020000
+ 
+-/*
+- * Check that the permissions on the VMA allow for the fault which occurred.
+- * If we encountered a write fault, we must have write permission, otherwise
+- * we allow any permission.
+- */
+-static inline bool access_error(unsigned int fsr, struct vm_area_struct *vma)
+-{
+-	unsigned int mask = VM_ACCESS_FLAGS;
+-
+-	if ((fsr & FSR_WRITE) && !(fsr & FSR_CM))
+-		mask = VM_WRITE;
+-	if (fsr & FSR_LNX_PF)
+-		mask = VM_EXEC;
+-
+-	return vma->vm_flags & mask ? false : true;
+-}
+-
+ static vm_fault_t __kprobes
+-__do_page_fault(struct mm_struct *mm, unsigned long addr, unsigned int fsr,
+-		unsigned int flags, struct pt_regs *regs)
++__do_page_fault(struct mm_struct *mm, unsigned long addr, unsigned int flags,
++		unsigned long vma_flags, struct pt_regs *regs)
+ {
+ 	struct vm_area_struct *vma = find_vma(mm, addr);
+ 	if (unlikely(!vma))
+@@ -231,10 +214,10 @@ __do_page_fault(struct mm_struct *mm, unsigned long addr, unsigned int fsr,
+ 	}
+ 
+ 	/*
+-	 * Ok, we have a good vm_area for this
+-	 * memory access, so we can handle it.
++	 * ok, we have a good vm_area for this memory access, check the
++	 * permissions on the VMA allow for the fault which occurred.
+ 	 */
+-	if (access_error(fsr, vma))
++	if (!(vma->vm_flags & vma_flags))
+ 		return VM_FAULT_BADACCESS;
+ 
+ 	return handle_mm_fault(vma, addr & PAGE_MASK, flags, regs);
+@@ -247,6 +230,7 @@ do_page_fault(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+ 	int sig, code;
+ 	vm_fault_t fault;
+ 	unsigned int flags = FAULT_FLAG_DEFAULT;
++	unsigned long vm_flags = VM_ACCESS_FLAGS;
+ 
+ 	if (kprobe_page_fault(regs, fsr))
+ 		return 0;
+@@ -265,8 +249,14 @@ do_page_fault(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+ 
+ 	if (user_mode(regs))
+ 		flags |= FAULT_FLAG_USER;
+-	if ((fsr & FSR_WRITE) && !(fsr & FSR_CM))
++
++	if ((fsr & FSR_WRITE) && !(fsr & FSR_CM)) {
+ 		flags |= FAULT_FLAG_WRITE;
++		vm_flags = VM_WRITE;
++	}
++
++	if (fsr & FSR_LNX_PF)
++		vm_flags = VM_EXEC;
+ 
+ 	perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS, 1, regs, addr);
+ 
+@@ -294,7 +284,7 @@ do_page_fault(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+ #endif
+ 	}
+ 
+-	fault = __do_page_fault(mm, addr, fsr, flags, regs);
++	fault = __do_page_fault(mm, addr, flags, vm_flags, regs);
+ 
+ 	/* If we need to retry but a fatal signal is pending, handle the
+ 	 * signal first. We do not need to release the mmap_lock because
+-- 
+2.26.2
+

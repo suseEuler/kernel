@@ -1,0 +1,143 @@
+From f9a7d23ac0a00e628539fcdeaee585776af65411 Mon Sep 17 00:00:00 2001
+From: Joseph Qi <joseph.qi@linux.alibaba.com>
+Date: Thu, 11 Nov 2021 16:28:38 +0800
+Subject: [PATCH] psi: introduce psi_v1 boot parameter
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: f9a7d23ac0a00e628539fcdeaee585776af65411
+
+
+hulk inclusion
+category: feature
+bugzilla: 182979 https://gitee.com/openeuler/kernel/issues/I4HOX6
+
+------------------------------------------
+
+Instead using static kconfig CONFIG_PSI_CGROUP_V1, we introduce a boot
+parameter psi_v1 to enable psi cgroup v1 support. Default it is
+disabled
+
+Signed-off-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+Acked-by: Xunlei Pang <xlpang@linux.alibaba.com>
+Signed-off-by: Chen Wandun <chenwandun@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ Documentation/admin-guide/kernel-parameters.txt |  4 ++++
+ include/linux/psi.h                             |  2 ++
+ init/Kconfig                                    | 10 ----------
+ kernel/sched/cpuacct.c                          | 13 +++++++++++++
+ kernel/sched/psi.c                              | 14 +++++++-------
+ 5 files changed, 26 insertions(+), 17 deletions(-)
+
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index b0b9265fe5f3..8eca743da732 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -4085,6 +4085,10 @@
+ 			tracking.
+ 			Format: <bool>
+ 
++	psi_v1=		[KNL] Enable or disable pressure stall information
++			tracking on cgroup v1.
++			Format: <bool>
++
+ 	psmouse.proto=	[HW,MOUSE] Highest PS2 mouse protocol extension to
+ 			probe for; one of (bare|imps|exps|lifebook|any).
+ 	psmouse.rate=	[HW,MOUSE] Set desired mouse report rate, in reports
+diff --git a/include/linux/psi.h b/include/linux/psi.h
+index 7361023f3fdd..8f59276b566b 100644
+--- a/include/linux/psi.h
++++ b/include/linux/psi.h
+@@ -14,6 +14,8 @@ struct css_set;
+ extern struct static_key_false psi_disabled;
+ extern struct psi_group psi_system;
+ 
++extern struct static_key_false psi_v1_disabled;
++
+ void psi_init(void);
+ 
+ void psi_task_change(struct task_struct *task, int clear, int set);
+diff --git a/init/Kconfig b/init/Kconfig
+index 0afdb08131eb..04bc46ca0b9e 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -635,16 +635,6 @@ config PSI_DEFAULT_DISABLED
+ 
+ 	  Say N if unsure.
+ 
+-config PSI_CGROUP_V1
+-	bool "Support PSI under cgroup v1"
+-	default Y
+-	depends on PSI
+-	help
+-	  If set, pressure stall information tracking will be used
+-	  for cgroup v1 other than v2.
+-
+-	  Say N if unsure.
+-
+ endmenu # "CPU/Task time and stats accounting"
+ 
+ config CPU_ISOLATION
+diff --git a/kernel/sched/cpuacct.c b/kernel/sched/cpuacct.c
+index 4e5488659339..60a95eb67d9b 100644
+--- a/kernel/sched/cpuacct.c
++++ b/kernel/sched/cpuacct.c
+@@ -376,8 +376,21 @@ struct cgroup_subsys cpuacct_cgrp_subsys = {
+ };
+ 
+ #ifdef CONFIG_PSI
++
++static bool psi_v1_enable;
++static int __init setup_psi_v1(char *str)
++{
++	return kstrtobool(str, &psi_v1_enable) == 0;
++}
++__setup("psi_v1=", setup_psi_v1);
++
+ static int __init cgroup_v1_psi_init(void)
+ {
++	if (!psi_v1_enable) {
++		static_branch_enable(&psi_v1_disabled);
++		return 0;
++	}
++
+ 	cgroup_add_legacy_cftypes(&cpuacct_cgrp_subsys, cgroup_v1_psi_files);
+ 	return 0;
+ }
+diff --git a/kernel/sched/psi.c b/kernel/sched/psi.c
+index 0b48a74cbfac..9f363830e40d 100644
+--- a/kernel/sched/psi.c
++++ b/kernel/sched/psi.c
+@@ -145,6 +145,7 @@
+ static int psi_bug __read_mostly;
+ 
+ DEFINE_STATIC_KEY_FALSE(psi_disabled);
++DEFINE_STATIC_KEY_FALSE(psi_v1_disabled);
+ 
+ #ifdef CONFIG_PSI_DEFAULT_DISABLED
+ static bool psi_enable;
+@@ -751,13 +752,12 @@ static struct psi_group *iterate_groups(struct task_struct *task, void **iter)
+ #ifdef CONFIG_CGROUPS
+ 	struct cgroup *cgroup = NULL;
+ 
+-	if (!*iter)
+-#ifdef CONFIG_PSI_CGROUP_V1
+-		cgroup = task_cgroup(task, cpuacct_cgrp_id);
+-#else
+-		cgroup = task->cgroups->dfl_cgrp;
+-#endif
+-	else if (*iter == &psi_system)
++	if (!*iter) {
++		if (static_branch_likely(&psi_v1_disabled))
++			cgroup = task->cgroups->dfl_cgrp;
++		else
++			cgroup = task_cgroup(task, cpuacct_cgrp_id);
++	} else if (*iter == &psi_system)
+ 		return NULL;
+ 	else
+ 		cgroup = cgroup_parent(*iter);
+-- 
+2.26.2
+

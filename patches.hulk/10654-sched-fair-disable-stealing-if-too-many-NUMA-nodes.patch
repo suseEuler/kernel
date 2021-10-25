@@ -1,0 +1,247 @@
+From 8cb0e8e46794cb5335f76e770833ce2fe63fff23 Mon Sep 17 00:00:00 2001
+From: Steve Sistare <steven.sistare@oracle.com>
+Date: Thu, 11 Nov 2021 16:28:47 +0800
+Subject: [PATCH] sched/fair: disable stealing if too many NUMA nodes
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 8cb0e8e46794cb5335f76e770833ce2fe63fff23
+
+
+hulk inclusion
+category: feature
+bugzilla: 38261, https://gitee.com/openeuler/kernel/issues/I49XPZ
+CVE: NA
+
+---------------------------
+
+The STEAL feature causes regressions on hackbench on larger NUMA systems,
+so disable it on systems with more than sched_steal_node_limit nodes
+(default 2).  Note that the feature remains enabled as seen in features.h
+and /sys/kernel/debug/sched_features, but stealing is only performed if
+nodes <= sched_steal_node_limit.  This arrangement allows users to activate
+stealing on reboot by setting the kernel parameter sched_steal_node_limit
+on kernels built without CONFIG_SCHED_DEBUG.  The parameter is temporary
+and will be deleted when the regression is fixed.
+
+Details of the regression follow.  With the STEAL feature set, hackbench
+is slower on many-node systems:
+
+X5-8: 8 sockets * 18 cores * 2 hyperthreads = 288 CPUs
+Intel(R) Xeon(R) CPU E7-8895 v3 @ 2.60GHz
+Average of 10 runs of: hackbench <groups> processes 50000
+
+          --- base --    --- new ---
+groups    time %stdev    time %stdev  %speedup
+     1   3.627   15.8   3.876    7.3      -6.5
+     2   4.545   24.7   5.583   16.7     -18.6
+     3   5.716   25.0   7.367   14.2     -22.5
+     4   6.901   32.9   7.718   14.5     -10.6
+     8   8.604   38.5   9.111   16.0      -5.6
+    16   7.734    6.8  11.007    8.2     -29.8
+
+Total CPU time increases.  Profiling shows that CPU time increases
+uniformly across all functions, suggesting a systemic increase in cache
+or memory latency.  This may be due to NUMA migrations, as they cause
+loss of LLC cache footprint and remote memory latencies.
+
+The domains for this system and their flags are:
+
+  domain0 (SMT) : 1 core
+    SD_LOAD_BALANCE SD_BALANCE_NEWIDLE SD_BALANCE_EXEC SD_BALANCE_FORK
+    SD_SHARE_PKG_RESOURCES SD_PREFER_SIBLING SD_SHARE_CPUCAPACITY
+    SD_WAKE_AFFINE
+
+  domain1 (MC) : 1 socket
+    SD_LOAD_BALANCE SD_BALANCE_NEWIDLE SD_BALANCE_EXEC SD_BALANCE_FORK
+    SD_SHARE_PKG_RESOURCES SD_PREFER_SIBLING
+    SD_WAKE_AFFINE
+
+  domain2 (NUMA) : 4 sockets
+    SD_LOAD_BALANCE SD_BALANCE_NEWIDLE SD_BALANCE_EXEC SD_BALANCE_FORK
+    SD_SERIALIZE SD_OVERLAP SD_NUMA
+    SD_WAKE_AFFINE
+
+  domain3 (NUMA) : 8 sockets
+    SD_LOAD_BALANCE SD_BALANCE_NEWIDLE
+    SD_SERIALIZE SD_OVERLAP SD_NUMA
+
+Schedstats point to the root cause of the regression.  hackbench is run
+10 times per group and the average schedstat accumulation per-run and
+per-cpu is shown below.  Note that domain3 moves are zero because
+SD_WAKE_AFFINE is not set there.
+
+NO_STEAL
+                                         --- domain2 ---   --- domain3 ---
+grp time %busy sched  idle   wake steal remote  move pull remote  move pull
+ 1 20.3 10.3  28710  14346  14366     0    490  3378    0   4039     0    0
+ 2 26.4 18.8  56721  28258  28469     0    792  7026   12   9229     0    7
+ 3 29.9 28.3  90191  44933  45272     0   5380  7204   19  16481     0    3
+ 4 30.2 35.8 121324  60409  60933     0   7012  9372   27  21438     0    5
+ 8 27.7 64.2 229174 111917 117272     0  11991  1837  168  44006     0   32
+16 32.6 74.0 334615 146784 188043     0   3404  1468   49  61405     0    8
+
+STEAL
+                                         --- domain2 ---   --- domain3 ---
+grp time %busy sched  idle   wake steal remote  move pull remote  move pull
+ 1 20.6 10.2  28490  14232  14261    18      3  3525    0   4254     0    0
+ 2 27.9 18.8  56757  28203  28562   303   1675  7839    5   9690     0    2
+ 3 35.3 27.7  87337  43274  44085   698    741 12785   14  15689     0    3
+ 4 36.8 36.0 118630  58437  60216  1579   2973 14101   28  18732     0    7
+ 8 48.1 73.8 289374 133681 155600 18646  35340 10179  171  65889     0   34
+16 41.4 82.5 268925  91908 177172 47498  17206  6940  176  71776     0   20
+
+Cross-numa-node migrations are caused by load balancing pulls and
+wake_affine moves.  Pulls are small and similar for no_steal and steal.
+However, moves are significantly higher for steal, and rows above with the
+highest moves have the worst regressions for time; see for example grp=8.
+
+Moves increase for steal due to the following logic in wake_affine_idle()
+for synchronous wakeup:
+
+    if (sync && cpu_rq(this_cpu)->nr_running == 1)
+        return this_cpu;        // move the task
+
+The steal feature does a better job of smoothing the load between idle
+and busy CPUs, so nr_running is 1 more often, and moves are performed
+more often.  For hackbench, cross-node affine moves early in the run are
+good because they colocate wakers and wakees from the same group on the
+same node, but continued moves later in the run are bad, because the wakee
+is moved away from peers on its previous node.  Note that even no_steal
+is far from optimal; binding an instance of "hackbench 2" to each of the
+8 NUMA nodes runs much faster than running "hackbench 16" with no binding.
+
+Clearing SD_WAKE_AFFINE for domain2 eliminates the affine cross-node
+migrations and eliminates the difference between no_steal and steal
+performance.  However, overall performance is lower than WA_IDLE because
+some migrations are helpful as explained above.
+
+I have tried many heuristics in a attempt to optimize the number of
+cross-node moves in all conditions, with limited success.  The fundamental
+problem is that the scheduler does not track which groups of tasks talk to
+each other.  Parts of several groups become entrenched on the same node,
+filling it to capacity, leaving no room for either group to pull its peers
+over, and there is neither data nor mechanism for the scheduler to evict
+one group to make room for the other.
+
+For now, disable STEAL on such systems until we can do better, or it is
+shown that hackbench is atypical and most workloads benefit from stealing.
+
+Signed-off-by: Steve Sistare <steven.sistare@oracle.com>
+Signed-off-by: Cheng Jian <cj.chengjian@huawei.com>
+Reviewed-by: Hanjun Guo <guohanjun@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Reviewed-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Reviewed-by: Chen Hui <judy.chenhui@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Kai Liu <kai.liu@suse.com>
+---
+ kernel/sched/fair.c     | 16 +++++++++++++---
+ kernel/sched/sched.h    |  3 ++-
+ kernel/sched/topology.c | 25 +++++++++++++++++++++++++
+ 3 files changed, 40 insertions(+), 4 deletions(-)
+
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -4163,11 +4163,21 @@ static inline void rq_idle_stamp_clear(s
+ 	rq->idle_stamp = 0;
+ }
+ 
++static inline bool steal_enabled(void)
++{
++#ifdef CONFIG_NUMA
++	bool allow = static_branch_likely(&sched_steal_allow);
++#else
++	bool allow = true;
++#endif
++	return sched_feat(STEAL) && allow;
++}
++
+ static void overload_clear(struct rq *rq)
+ {
+ 	struct sparsemask *overload_cpus;
+ 
+-	if (!sched_feat(STEAL))
++	if (!steal_enabled())
+ 		return;
+ 
+ 	rcu_read_lock();
+@@ -4181,7 +4191,7 @@ static void overload_set(struct rq *rq)
+ {
+ 	struct sparsemask *overload_cpus;
+ 
+-	if (!sched_feat(STEAL))
++	if (!steal_enabled())
+ 		return;
+ 
+ 	rcu_read_lock();
+@@ -11191,7 +11201,7 @@ static int try_steal(struct rq *dst_rq,
+ 	int stolen = 0;
+ 	struct sparsemask *overload_cpus;
+ 
+-	if (!sched_feat(STEAL))
++	if (!steal_enabled())
+ 		return 0;
+ 
+ 	if (!cpu_active(dst_cpu))
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1085,7 +1085,6 @@ static inline int cpu_of(struct rq *rq)
+ #endif
+ }
+ 
+-
+ #ifdef CONFIG_SCHED_SMT
+ extern void __update_idle_core(struct rq *rq);
+ 
+@@ -1348,6 +1347,8 @@ this_rq_lock_irq(struct rq_flags *rf)
+ }
+ 
+ #ifdef CONFIG_NUMA
++extern struct static_key_true sched_steal_allow;
++
+ enum numa_topology_type {
+ 	NUMA_DIRECT,
+ 	NUMA_GLUELESS_MESH,
+--- a/kernel/sched/topology.c
++++ b/kernel/sched/topology.c
+@@ -1630,6 +1630,30 @@ static void init_numa_topology_type(void
+ 
+ #define NR_DISTANCE_VALUES (1 << DISTANCE_BITS)
+ 
++DEFINE_STATIC_KEY_TRUE(sched_steal_allow);
++static int sched_steal_node_limit;
++#define SCHED_STEAL_NODE_LIMIT_DEFAULT 2
++
++static int __init steal_node_limit_setup(char *buf)
++{
++	get_option(&buf, &sched_steal_node_limit);
++	return 0;
++}
++
++early_param("sched_steal_node_limit", steal_node_limit_setup);
++
++static void check_node_limit(void)
++{
++	int n = num_possible_nodes();
++
++	if (sched_steal_node_limit == 0)
++		sched_steal_node_limit = SCHED_STEAL_NODE_LIMIT_DEFAULT;
++	if (n > sched_steal_node_limit) {
++		static_branch_disable(&sched_steal_allow);
++		pr_debug("Suppressing sched STEAL. To enable, reboot with sched_steal_node_limit=%d", n);
++	}
++}
++
+ void sched_init_numa(void)
+ {
+ 	struct sched_domain_topology_level *tl;
+@@ -1772,6 +1796,7 @@ void sched_init_numa(void)
+ 	sched_max_numa_distance = sched_domains_numa_distance[nr_levels - 1];
+ 
+ 	init_numa_topology_type();
++	check_node_limit();
+ }
+ 
+ void sched_domains_numa_masks_set(unsigned int cpu)

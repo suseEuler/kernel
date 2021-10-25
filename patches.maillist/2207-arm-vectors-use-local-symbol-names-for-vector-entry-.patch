@@ -1,0 +1,163 @@
+From fc08a5d537497edcbddcfea15713b680720261a6 Mon Sep 17 00:00:00 2001
+From: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+Date: Wed, 24 Feb 2021 04:32:40 -0500
+Subject: [PATCH] arm: vectors: use local symbol names for vector entry points
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: fc08a5d537497edcbddcfea15713b680720261a6
+
+
+maillist inclusion
+commit 11f8bbc5b0d4d76b3d7114bf9af1805607a20372
+category: feature
+feature: ARM kaslr support
+bugzilla: 47952
+CVE: NA
+
+Reference: https://git.kernel.org/pub/scm/linux/kernel/git/ardb/linux.git/commit/?h=arm-kaslr-latest&id=11f8bbc5b0d4d76b3d7114bf9af1805607a20372
+
+-------------------------------------------------
+
+The location of the ARM vector table in virtual memory is not
+a compile time constant, and so the virtual addresses of the
+various entry points are rather meaningless (although they are
+most likely to reside at the offsets below)
+
+  ffff1004 t vector_rst
+  ffff1020 t vector_irq
+  ffff10a0 t vector_dabt
+  ffff1120 t vector_pabt
+  ffff11a0 t vector_und
+  ffff1220 t vector_addrexcptn
+  ffff1240 T vector_fiq
+
+However, when running with KASLR enabled, the virtual addresses are
+subject to runtime relocation, which means we should avoid to take
+absolute references to these symbols, not only directly (by taking
+the address in C code), but also via /proc/kallsyms or other kernel
+facilities that deal with ELF symbols. For instance, /proc/kallsyms
+will list their addresses as
+
+  0abf1004 t vector_rst
+  0abf1020 t vector_irq
+  0abf10a0 t vector_dabt
+  0abf1120 t vector_pabt
+  0abf11a0 t vector_und
+  0abf1220 t vector_addrexcptn
+  0abf1240 T vector_fiq
+
+when running randomized, which may confuse tools like perf that may
+use /proc/kallsyms to annotate stack traces.
+
+So use .L prefixes for these symbols. This will prevent them from
+being visible at all outside the assembler source.
+
+Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+Signed-off-by: Cui GaoSheng <cuigaosheng1@huawei.com>
+Reviewed-by: Xiu Jianfeng <xiujianfeng@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm/include/asm/vmlinux.lds.h |  4 +---
+ arch/arm/kernel/entry-armv.S       | 32 ++++++++++++++++--------------
+ 2 files changed, 18 insertions(+), 18 deletions(-)
+
+diff --git a/arch/arm/include/asm/vmlinux.lds.h b/arch/arm/include/asm/vmlinux.lds.h
+index c1ced85cd8e5..68e1fc0b7175 100644
+--- a/arch/arm/include/asm/vmlinux.lds.h
++++ b/arch/arm/include/asm/vmlinux.lds.h
+@@ -126,10 +126,8 @@
+ 		*(.stubs)						\
+ 	}								\
+ 	. = __stubs_start + SIZEOF(.stubs);				\
+-	__stubs_end = .;						\
++	__stubs_end = .;
+ 									\
+-	PROVIDE(vector_fiq_offset = vector_fiq - ADDR(.vectors));
+-
+ #define ARM_TCM								\
+ 	__itcm_start = ALIGN(4);					\
+ 	.text_itcm ITCM_OFFSET : AT(__itcm_start - LOAD_OFFSET) {	\
+diff --git a/arch/arm/kernel/entry-armv.S b/arch/arm/kernel/entry-armv.S
+index c9af7e2338eb..cd0a00032b22 100644
+--- a/arch/arm/kernel/entry-armv.S
++++ b/arch/arm/kernel/entry-armv.S
+@@ -1002,7 +1002,7 @@ __kuser_helper_end:
+ 	.macro	vector_stub, name, mode, correction=0
+ 	.align	5
+ 
+-vector_\name:
++.Lvector_\name:
+ 	.if \correction
+ 	sub	lr, lr, #\correction
+ 	.endif
+@@ -1031,7 +1031,7 @@ vector_\name:
+ 	mov	r0, sp
+  ARM(	ldr	lr, [pc, lr, lsl #2]	)
+ 	movs	pc, lr			@ branch to handler in SVC mode
+-ENDPROC(vector_\name)
++ENDPROC(.Lvector_\name)
+ 
+ 	.align	2
+ 	@ handler addresses follow this label
+@@ -1039,14 +1039,18 @@ ENDPROC(vector_\name)
+ 	.endm
+ 
+ 	.section .stubs, "ax", %progbits
++#ifdef CONFIG_FIQ
++	.global	vector_fiq_offset
++	.set	vector_fiq_offset, .Lvector_fiq - . + 0x1000
++#endif
+ 	@ This must be the first word
+ 	.word	vector_swi
+ 
+-vector_rst:
++.Lvector_rst:
+  ARM(	swi	SYS_ERROR0	)
+  THUMB(	svc	#0		)
+  THUMB(	nop			)
+-	b	vector_und
++	b	.Lvector_und
+ 
+ /*
+  * Interrupt dispatcher
+@@ -1148,8 +1152,8 @@ vector_rst:
+  * (they're not supposed to happen, and won't happen in 32-bit data mode).
+  */
+ 
+-vector_addrexcptn:
+-	b	vector_addrexcptn
++.Lvector_addrexcptn:
++	b	.Lvector_addrexcptn
+ 
+ /*=============================================================================
+  * FIQ "NMI" handler
+@@ -1176,18 +1180,16 @@ vector_addrexcptn:
+ 	.long	__fiq_svc			@  e
+ 	.long	__fiq_svc			@  f
+ 
+-	.globl	vector_fiq
+-
+ 	.section .vectors, "ax", %progbits
+ .L__vectors_start:
+-	W(b)	vector_rst
+-	W(b)	vector_und
++	W(b)	.Lvector_rst
++	W(b)	.Lvector_und
+ 	W(ldr)	pc, .L__vectors_start + 0x1000
+-	W(b)	vector_pabt
+-	W(b)	vector_dabt
+-	W(b)	vector_addrexcptn
+-	W(b)	vector_irq
+-	W(b)	vector_fiq
++	W(b)	.Lvector_pabt
++	W(b)	.Lvector_dabt
++	W(b)	.Lvector_addrexcptn
++	W(b)	.Lvector_irq
++	W(b)	.Lvector_fiq
+ 
+ 	.data
+ 	.align	2
+-- 
+2.26.2
+

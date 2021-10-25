@@ -1,0 +1,385 @@
+From 8a655676e63680d2c02acf479f4cfaa923a5bdf9 Mon Sep 17 00:00:00 2001
+From: liubo <liubo254@huawei.com>
+Date: Wed, 24 Feb 2021 16:23:42 +0800
+Subject: [PATCH] memig: add memig-swap feature to openEuler
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 8a655676e63680d2c02acf479f4cfaa923a5bdf9
+
+
+euleros inclusion
+category: feature
+feature: add memig swap feature patch to openEuler kernel
+bugzilla: 48246
+
+-------------------------------------------------
+
+reason:This patch is used to add memig swap feature to openEuler system.
+memig_swap.ko is used to transfer the address
+passed in the user state for page migration
+
+Signed-off-by: yanxiaodan <yanxiaodan@huawei.com>
+Signed-off-by: linmiaohe <linmiaohe@huawei.com>
+Signed-off-by: louhongxiang <louhongxiang@huawei.com>
+Signed-off-by: liubo <liubo254@huawei.com>
+Signed-off-by: geruijun <geruijun@huawei.com>
+Signed-off-by: liangchenshu <liangchenshu@huawei.com>
+Reviewed-by: Jing Xiangfeng <jingxiangfeng@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/configs/openeuler_defconfig |   1 +
+ arch/x86/configs/openeuler_defconfig   |   1 +
+ fs/proc/Makefile                       |   1 +
+ fs/proc/base.c                         |   2 +
+ fs/proc/internal.h                     |   1 +
+ fs/proc/memig_swap.c                   | 102 +++++++++++++++++++++++++
+ fs/proc/task_mmu.c                     |  51 +++++++++++++
+ include/linux/swap.h                   |   3 +
+ lib/Kconfig                            |   5 ++
+ mm/vmscan.c                            |  57 ++++++++++++++
+ 10 files changed, 224 insertions(+)
+ create mode 100644 fs/proc/memig_swap.c
+
+diff --git a/arch/arm64/configs/openeuler_defconfig b/arch/arm64/configs/openeuler_defconfig
+index 87a5b9a219e1..8f9106fc88de 100644
+--- a/arch/arm64/configs/openeuler_defconfig
++++ b/arch/arm64/configs/openeuler_defconfig
+@@ -7099,3 +7099,4 @@ CONFIG_MPAM=y
+ CONFIG_RESCTRL=y
+ CONFIG_ACPI_MPAM=y
+ CONFIG_MEMIG_SCAN_MODULE=m
++CONFIG_MEMIG_SWAP_MODULE=m
+diff --git a/arch/x86/configs/openeuler_defconfig b/arch/x86/configs/openeuler_defconfig
+index 4868ac924aed..33f91d148906 100644
+--- a/arch/x86/configs/openeuler_defconfig
++++ b/arch/x86/configs/openeuler_defconfig
+@@ -8490,3 +8490,4 @@ CONFIG_ARCH_HAS_KCOV=y
+ # end of Kernel Testing and Coverage
+ # end of Kernel hacking
+ CONFIG_MEMIG_SCAN_MODULE=m
++CONFIG_MEMIG_SWAP_MODULE=m
+diff --git a/fs/proc/Makefile b/fs/proc/Makefile
+index 50c6de6f4979..e6747114a75b 100644
+--- a/fs/proc/Makefile
++++ b/fs/proc/Makefile
+@@ -35,3 +35,4 @@ proc-$(CONFIG_PRINTK)	+= kmsg.o
+ proc-$(CONFIG_PROC_PAGE_MONITOR)	+= page.o
+ proc-$(CONFIG_BOOT_CONFIG)	+= bootconfig.o
+ obj-$(CONFIG_MEMIG_SCAN_MODULE)     += memig_scan.o
++obj-$(CONFIG_MEMIG_SWAP_MODULE)     += memig_swap.o
+diff --git a/fs/proc/base.c b/fs/proc/base.c
+index 31dbcdf9ffd9..5e0406eb975e 100644
+--- a/fs/proc/base.c
++++ b/fs/proc/base.c
+@@ -3219,6 +3219,7 @@ static const struct pid_entry tgid_base_stuff[] = {
+ 	REG("smaps_rollup", S_IRUGO, proc_pid_smaps_rollup_operations),
+ 	REG("pagemap",    S_IRUSR, proc_pagemap_operations),
+ 	REG("idle_pages", S_IRUSR|S_IWUSR, proc_mm_idle_operations),
++	REG("swap_pages", S_IWUSR, proc_mm_swap_operations),
+ #endif
+ #ifdef CONFIG_SECURITY
+ 	DIR("attr",       S_IRUGO|S_IXUGO, proc_attr_dir_inode_operations, proc_attr_dir_operations),
+@@ -3559,6 +3560,7 @@ static const struct pid_entry tid_base_stuff[] = {
+ 	REG("smaps_rollup", S_IRUGO, proc_pid_smaps_rollup_operations),
+ 	REG("pagemap",    S_IRUSR, proc_pagemap_operations),
+ 	REG("idle_pages", S_IRUSR|S_IWUSR, proc_mm_idle_operations),
++	REG("swap_pages", S_IWUSR, proc_mm_swap_operations),
+ #endif
+ #ifdef CONFIG_SECURITY
+ 	DIR("attr",      S_IRUGO|S_IXUGO, proc_attr_dir_inode_operations, proc_attr_dir_operations),
+diff --git a/fs/proc/internal.h b/fs/proc/internal.h
+index ca93fd1d85cd..d1fdb722f0ca 100644
+--- a/fs/proc/internal.h
++++ b/fs/proc/internal.h
+@@ -305,6 +305,7 @@ extern const struct file_operations proc_pid_smaps_rollup_operations;
+ extern const struct file_operations proc_clear_refs_operations;
+ extern const struct file_operations proc_pagemap_operations;
+ extern const struct file_operations proc_mm_idle_operations;
++extern const struct file_operations proc_mm_swap_operations;
+ 
+ extern unsigned long task_vsize(struct mm_struct *);
+ extern unsigned long task_statm(struct mm_struct *,
+diff --git a/fs/proc/memig_swap.c b/fs/proc/memig_swap.c
+new file mode 100644
+index 000000000000..b24c706c3b2a
+--- /dev/null
++++ b/fs/proc/memig_swap.c
+@@ -0,0 +1,102 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/string.h>
++#include <linux/proc_fs.h>
++#include <linux/sched/mm.h>
++#include <linux/mm.h>
++#include <linux/swap.h>
++#include <linux/mempolicy.h>
++#include <linux/uaccess.h>
++#include <linux/delay.h>
++
++static ssize_t swap_pages_write(struct file *file, const char __user *buf,
++				size_t count, loff_t *ppos)
++{
++	char *p, *data, *data_ptr_res;
++	unsigned long vaddr;
++	struct mm_struct *mm = file->private_data;
++	struct page *page;
++	LIST_HEAD(pagelist);
++	int ret = 0;
++
++	if (!mm || !mmget_not_zero(mm)) {
++		ret = -ESRCH;
++		goto out;
++	}
++
++	if (count < 0) {
++		ret = -EOPNOTSUPP;
++		goto out_mm;
++	}
++
++	data = memdup_user_nul(buf, count);
++	if (IS_ERR(data)) {
++		ret = PTR_ERR(data);
++		goto out_mm;
++	}
++
++	data_ptr_res = data;
++	while ((p = strsep(&data, "\n")) != NULL) {
++		if (!*p)
++			continue;
++
++		ret = kstrtoul(p, 16, &vaddr);
++		if (ret != 0)
++			continue;
++		/*If get page struct failed, ignore it, get next page*/
++		page = get_page_from_vaddr(mm, vaddr);
++		if (!page)
++			continue;
++
++		add_page_for_swap(page, &pagelist);
++	}
++
++	if (!list_empty(&pagelist))
++		reclaim_pages(&pagelist);
++
++	ret = count;
++	kfree(data_ptr_res);
++out_mm:
++	mmput(mm);
++out:
++	return ret;
++}
++
++static int swap_pages_open(struct inode *inode, struct file *file)
++{
++	if (!try_module_get(THIS_MODULE))
++		return -EBUSY;
++
++	return 0;
++}
++
++static int swap_pages_release(struct inode *inode, struct file *file)
++{
++	module_put(THIS_MODULE);
++	return 0;
++}
++
++
++extern struct file_operations proc_swap_pages_operations;
++
++static int swap_pages_entry(void)
++{
++		proc_swap_pages_operations.owner = THIS_MODULE;
++		proc_swap_pages_operations.write = swap_pages_write;
++		proc_swap_pages_operations.open = swap_pages_open;
++		proc_swap_pages_operations.release = swap_pages_release;
++
++		return 0;
++}
++
++static void swap_pages_exit(void)
++{
++	memset(&proc_swap_pages_operations, 0,
++			sizeof(proc_swap_pages_operations));
++}
++
++MODULE_LICENSE("GPL");
++module_init(swap_pages_entry);
++module_exit(swap_pages_exit);
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index 0b0f74bfd9b0..328018d6cb49 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -1753,7 +1753,58 @@ const struct file_operations proc_mm_idle_operations = {
+ 	.release	= mm_idle_release,
+ };
+ 
++/*swap pages*/
++struct file_operations proc_swap_pages_operations = {
++};
++EXPORT_SYMBOL_GPL(proc_swap_pages_operations);
++
++static ssize_t mm_swap_write(struct file *file, const char __user *buf,
++		size_t count, loff_t *ppos)
++{
++	if (proc_swap_pages_operations.write)
++		return proc_swap_pages_operations.write(file, buf, count, ppos);
++
++	return -1;
++}
++
++static int mm_swap_open(struct inode *inode, struct file *file)
++{
++	struct mm_struct *mm = NULL;
++
++	if (!file_ns_capable(file, &init_user_ns, CAP_SYS_ADMIN))
++		return -EPERM;
++
++	mm = proc_mem_open(inode, PTRACE_MODE_READ);
++	if (IS_ERR(mm))
++		return PTR_ERR(mm);
++
++	file->private_data = mm;
++
++	if (proc_swap_pages_operations.open)
++		return proc_swap_pages_operations.open(inode, file);
++
++	return 0;
++}
++
++static int mm_swap_release(struct inode *inode, struct file *file)
++{
++	struct mm_struct *mm = file->private_data;
+ 
++	if (mm)
++		mmdrop(mm);
++
++	if (proc_swap_pages_operations.release)
++		return proc_swap_pages_operations.release(inode, file);
++
++	return 0;
++}
++
++const struct file_operations proc_mm_swap_operations = {
++	.llseek     = mem_lseek,
++	.write      = mm_swap_write,
++	.open       = mm_swap_open,
++	.release    = mm_swap_release,
++};
+ #endif /* CONFIG_PROC_PAGE_MONITOR */
+ 
+ #ifdef CONFIG_NUMA
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index fbc6805358da..b2ae6f50b5f6 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -372,6 +372,9 @@ extern int vm_swappiness;
+ extern int remove_mapping(struct address_space *mapping, struct page *page);
+ 
+ extern unsigned long reclaim_pages(struct list_head *page_list);
++extern int add_page_for_swap(struct page *page, struct list_head *pagelist);
++extern struct page *get_page_from_vaddr(struct mm_struct *mm,
++					unsigned long vaddr);
+ #ifdef CONFIG_NUMA
+ extern int node_reclaim_mode;
+ extern int sysctl_min_unmapped_ratio;
+diff --git a/lib/Kconfig b/lib/Kconfig
+index 57f0012c77f4..87bec73787dc 100644
+--- a/lib/Kconfig
++++ b/lib/Kconfig
+@@ -666,6 +666,11 @@ config MEMIG_SCAN_MODULE
+ 	 memig page scan feature
+ 	 used to scan the virtual address of the target process
+ 
++config MEMIG_SWAP_MODULE
++       tristate "module: memig page swap for memig support"
++       help
++         memig page swap feature
++
+ config STRING_SELFTEST
+ 	tristate "Test string functions"
+ 
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 67d38334052e..e77ad460223e 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -36,6 +36,7 @@
+ #include <linux/topology.h>
+ #include <linux/cpu.h>
+ #include <linux/cpuset.h>
++#include <linux/mempolicy.h>
+ #include <linux/compaction.h>
+ #include <linux/notifier.h>
+ #include <linux/rwsem.h>
+@@ -2154,6 +2155,7 @@ unsigned long reclaim_pages(struct list_head *page_list)
+ 
+ 	return nr_reclaimed;
+ }
++EXPORT_SYMBOL_GPL(reclaim_pages);
+ 
+ static unsigned long shrink_list(enum lru_list lru, unsigned long nr_to_scan,
+ 				 struct lruvec *lruvec, struct scan_control *sc)
+@@ -4311,3 +4313,58 @@ void check_move_unevictable_pages(struct pagevec *pvec)
+ 	}
+ }
+ EXPORT_SYMBOL_GPL(check_move_unevictable_pages);
++
++int add_page_for_swap(struct page *page, struct list_head *pagelist)
++{
++	int err = -EBUSY;
++	struct page *head;
++
++	/*If the page is mapped by more than one process, do not swap it */
++	if (page_mapcount(page) > 1)
++		return -EACCES;
++
++	if (PageHuge(page))
++		return -EACCES;
++
++	head = compound_head(page);
++	err = isolate_lru_page(head);
++	if (err) {
++		put_page(page);
++		return err;
++	}
++	put_page(page);
++	if (PageUnevictable(page))
++		putback_lru_page(page);
++	else
++		list_add_tail(&head->lru, pagelist);
++
++	err = 0;
++	return err;
++}
++EXPORT_SYMBOL_GPL(add_page_for_swap);
++
++struct page *get_page_from_vaddr(struct mm_struct *mm, unsigned long vaddr)
++{
++	struct page *page;
++	struct vm_area_struct *vma;
++	unsigned int follflags;
++
++	down_read(&mm->mmap_lock);
++
++	vma = find_vma(mm, vaddr);
++	if (!vma || vaddr < vma->vm_start || !vma_migratable(vma)) {
++		up_read(&mm->mmap_lock);
++		return NULL;
++	}
++
++	follflags = FOLL_GET | FOLL_DUMP;
++	page = follow_page(vma, vaddr, follflags);
++	if (IS_ERR(page) || !page) {
++		up_read(&mm->mmap_lock);
++		return NULL;
++	}
++
++	up_read(&mm->mmap_lock);
++	return page;
++}
++EXPORT_SYMBOL_GPL(get_page_from_vaddr);
+-- 
+2.26.2
+

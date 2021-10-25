@@ -1,0 +1,148 @@
+From bca6b146b15bd81b99947e60b45ceceb5e10582f Mon Sep 17 00:00:00 2001
+From: Kunkun Jiang <jiangkunkun@huawei.com>
+Date: Thu, 15 Jul 2021 11:00:17 +0800
+Subject: [PATCH] iommu/io-pgtable-arm: Add and realize merge_page ops
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: bca6b146b15bd81b99947e60b45ceceb5e10582f
+
+
+virt inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I3ZUKK
+CVE: NA
+
+------------------------------
+
+If block(largepage) mappings are split during start dirty log, then
+when stop dirty log, we need to recover them for better DMA performance.
+
+This recovers block mappings and unmap the span of page mappings. BBML1
+or BBML2 feature is required.
+
+Merging page is designed to be only used by dirty log tracking, which
+does not concurrently work with other pgtable ops that access underlying
+page table, so race condition does not exist.
+
+Co-developed-by: Keqian Zhu <zhukeqian1@huawei.com>
+Signed-off-by: Kunkun Jiang <jiangkunkun@huawei.com>
+Reviewed-by: Keqian Zhu <zhukeqian1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/iommu/io-pgtable-arm.c | 78 ++++++++++++++++++++++++++++++++++
+ include/linux/io-pgtable.h     |  2 +
+ 2 files changed, 80 insertions(+)
+
+diff --git a/drivers/iommu/io-pgtable-arm.c b/drivers/iommu/io-pgtable-arm.c
+index abc48c76c770..275bf9bdf549 100644
+--- a/drivers/iommu/io-pgtable-arm.c
++++ b/drivers/iommu/io-pgtable-arm.c
+@@ -801,6 +801,83 @@ static size_t arm_lpae_split_block(struct io_pgtable_ops *ops,
+ 	return __arm_lpae_split_block(data, iova, size, lvl, ptep);
+ }
+ 
++static size_t __arm_lpae_merge_page(struct arm_lpae_io_pgtable *data,
++				    unsigned long iova, phys_addr_t paddr,
++				    size_t size, int lvl, arm_lpae_iopte *ptep,
++				    arm_lpae_iopte prot)
++{
++	arm_lpae_iopte pte, *tablep;
++	struct io_pgtable *iop = &data->iop;
++	struct io_pgtable_cfg *cfg = &data->iop.cfg;
++
++	if (WARN_ON(lvl == ARM_LPAE_MAX_LEVELS))
++		return 0;
++
++	ptep += ARM_LPAE_LVL_IDX(iova, lvl, data);
++	pte = READ_ONCE(*ptep);
++	if (WARN_ON(!pte))
++		return 0;
++
++	if (size == ARM_LPAE_BLOCK_SIZE(lvl, data)) {
++		if (iopte_leaf(pte, lvl, iop->fmt))
++			return size;
++
++		/* Race does not exist */
++		if (cfg->quirks & IO_PGTABLE_QUIRK_ARM_BBML1) {
++			prot |= ARM_LPAE_PTE_NT;
++			__arm_lpae_init_pte(data, paddr, prot, lvl, ptep);
++			io_pgtable_tlb_flush_walk(iop, iova, size,
++						  ARM_LPAE_GRANULE(data));
++
++			prot &= ~(ARM_LPAE_PTE_NT);
++			__arm_lpae_init_pte(data, paddr, prot, lvl, ptep);
++		} else {
++			__arm_lpae_init_pte(data, paddr, prot, lvl, ptep);
++		}
++
++		tablep = iopte_deref(pte, data);
++		__arm_lpae_free_pgtable(data, lvl + 1, tablep);
++		return size;
++	} else if (iopte_leaf(pte, lvl, iop->fmt)) {
++		/* The size is too small, already merged */
++		return size;
++	}
++
++	/* Keep on walkin */
++	ptep = iopte_deref(pte, data);
++	return __arm_lpae_merge_page(data, iova, paddr, size, lvl + 1, ptep, prot);
++}
++
++static size_t arm_lpae_merge_page(struct io_pgtable_ops *ops, unsigned long iova,
++				  phys_addr_t paddr, size_t size, int iommu_prot)
++{
++	struct arm_lpae_io_pgtable *data = io_pgtable_ops_to_data(ops);
++	struct io_pgtable_cfg *cfg = &data->iop.cfg;
++	arm_lpae_iopte *ptep = data->pgd;
++	int lvl = data->start_level;
++	arm_lpae_iopte prot;
++	long iaext = (s64)iova >> cfg->ias;
++
++	if (WARN_ON(!size || (size & cfg->pgsize_bitmap) != size))
++		return 0;
++
++	if (cfg->quirks & IO_PGTABLE_QUIRK_ARM_TTBR1)
++		iaext = ~iaext;
++	if (WARN_ON(iaext || paddr >> cfg->oas))
++		return 0;
++
++	/* If no access, then nothing to do */
++	if (!(iommu_prot & (IOMMU_READ | IOMMU_WRITE)))
++		return size;
++
++	/* If it is smallest granule, then nothing to do */
++	if (size == ARM_LPAE_BLOCK_SIZE(ARM_LPAE_MAX_LEVELS - 1, data))
++		return size;
++
++	prot = arm_lpae_prot_to_pte(data, iommu_prot);
++	return __arm_lpae_merge_page(data, iova, paddr, size, lvl, ptep, prot);
++}
++
+ static void arm_lpae_restrict_pgsizes(struct io_pgtable_cfg *cfg)
+ {
+ 	unsigned long granule, page_sizes;
+@@ -880,6 +957,7 @@ arm_lpae_alloc_pgtable(struct io_pgtable_cfg *cfg)
+ 		.unmap		= arm_lpae_unmap,
+ 		.iova_to_phys	= arm_lpae_iova_to_phys,
+ 		.split_block	= arm_lpae_split_block,
++		.merge_page	= arm_lpae_merge_page,
+ 	};
+ 
+ 	return data;
+diff --git a/include/linux/io-pgtable.h b/include/linux/io-pgtable.h
+index 8a8711baa4f1..caa3436cf09c 100644
+--- a/include/linux/io-pgtable.h
++++ b/include/linux/io-pgtable.h
+@@ -169,6 +169,8 @@ struct io_pgtable_ops {
+ 				    unsigned long iova);
+ 	size_t (*split_block)(struct io_pgtable_ops *ops, unsigned long iova,
+ 			      size_t size);
++	size_t (*merge_page)(struct io_pgtable_ops *ops, unsigned long iova,
++			     phys_addr_t phys, size_t size, int prot);
+ };
+ 
+ /**
+-- 
+2.26.2
+

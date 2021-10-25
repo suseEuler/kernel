@@ -1,0 +1,172 @@
+From 675345bc28661d6bf874eb80ab82122652b69468 Mon Sep 17 00:00:00 2001
+From: James Morse <james.morse@arm.com>
+Date: Fri, 26 Feb 2021 20:21:55 +0800
+Subject: [PATCH] arm64/mpam: Reset controls when CPUs come online
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 675345bc28661d6bf874eb80ab82122652b69468
+
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+As only the hardware's default partid has its configuration reset
+in hardware, we have to do all the others in software.
+
+If this cpu coming online has made a new device accessible, reset it.
+For cpuhp we assume its configuration has been lost.
+
+Write the maximum values for all discovered controls.
+
+[Wang ShaoBo: few version adaption changes]
+
+Signed-off-by: James Morse <james.morse@arm.com>
+Link: http://www.linux-arm.org/git?p=linux-jm.git;a=patch;h=a6160f572b09dceb6bd65f15a30f47e6a0fe7f4e
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/mpam_resource.h |  5 ++
+ arch/arm64/kernel/mpam/mpam_device.c   | 88 ++++++++++++++++++++++++++
+ 2 files changed, 93 insertions(+)
+
+diff --git a/arch/arm64/include/asm/mpam_resource.h b/arch/arm64/include/asm/mpam_resource.h
+index caa0b822d8ff..57ec024c2c50 100644
+--- a/arch/arm64/include/asm/mpam_resource.h
++++ b/arch/arm64/include/asm/mpam_resource.h
+@@ -72,6 +72,7 @@
+ #define BWA_WD              6		/* hard code for P680 */
+ #define MBW_MAX_MASK        0xFC00
+ #define MBW_MAX_HARDLIM     BIT(31)
++#define MBW_MAX_BWA_FRACT(w)        GENMASK(w - 1, 0)
+ #define MBW_MAX_SET(v)      (MBW_MAX_HARDLIM|((v) << (16 - BWA_WD)))
+ #define MBW_MAX_GET(v)      (((v) & MBW_MAX_MASK) >> (16 - BWA_WD))
+ 
+@@ -85,6 +86,10 @@
+ #define MSMON_CFG_CSU_TYPE          0x43
+ #define MSMON_CFG_MBWU_TYPE         0x42
+ 
++/*
++ * Set MPAMCFG_PART_SEL internal bit
++ */
++#define PART_SEL_SET_INTERNAL(r)    (r | BIT(16))
+ /*
+  * Size of the memory mapped registers: 4K of feature page then 2 x 4K
+  * bitmap registers
+diff --git a/arch/arm64/kernel/mpam/mpam_device.c b/arch/arm64/kernel/mpam/mpam_device.c
+index 431318baa845..c37e297fb0ba 100644
+--- a/arch/arm64/kernel/mpam/mpam_device.c
++++ b/arch/arm64/kernel/mpam/mpam_device.c
+@@ -530,6 +530,91 @@ int __init mpam_discovery_start(void)
+ 	return 0;
+ }
+ 
++static void mpam_reset_device_bitmap(struct mpam_device *dev, u16 reg, u16 wd)
++{
++	u32 bm = ~0;
++	int i;
++
++	lockdep_assert_held(&dev->lock);
++
++	/* write all but the last full-32bit-word */
++	for (i = 0; i < wd / 32; i++, reg += sizeof(bm))
++		mpam_write_reg(dev, reg, bm);
++
++	/* and the last partial 32bit word */
++	bm = GENMASK(wd % 32, 0);
++	if (bm)
++		mpam_write_reg(dev, reg, bm);
++}
++
++static void mpam_reset_device_config(struct mpam_component *comp,
++				struct mpam_device *dev, u32 partid)
++{
++	u16 intpri = GENMASK(dev->intpri_wd, 0);
++	u16 dspri = GENMASK(dev->dspri_wd, 0);
++	u32 pri_val = 0;
++	u32 mbw_max;
++
++	lockdep_assert_held(&dev->lock);
++
++	if (mpam_has_feature(mpam_feat_part_nrw, dev->features))
++		partid = PART_SEL_SET_INTERNAL(partid);
++	mpam_write_reg(dev, MPAMCFG_PART_SEL, partid);
++	wmb(); /* subsequent writes must be applied to our new partid */
++
++	if (mpam_has_feature(mpam_feat_cpor_part, dev->features))
++		mpam_reset_device_bitmap(dev, MPAMCFG_CPBM, dev->cpbm_wd);
++	if (mpam_has_feature(mpam_feat_mbw_part, dev->features))
++		mpam_reset_device_bitmap(dev, MPAMCFG_MBW_PBM,
++				dev->mbw_pbm_bits);
++	if (mpam_has_feature(mpam_feat_mbw_max, dev->features)) {
++		mbw_max = MBW_MAX_SET(MBW_MAX_BWA_FRACT(dev->bwa_wd));
++		mpam_write_reg(dev, MPAMCFG_MBW_MAX, mbw_max);
++	}
++	if (mpam_has_feature(mpam_feat_mbw_min, dev->features)) {
++		mpam_write_reg(dev, MPAMCFG_MBW_MIN, 0);
++	}
++
++	if (mpam_has_feature(mpam_feat_intpri_part, dev->features) ||
++		mpam_has_feature(mpam_feat_dspri_part, dev->features)) {
++		/* aces high? */
++		if (!mpam_has_feature(mpam_feat_intpri_part_0_low,
++				dev->features))
++			intpri = 0;
++		if (!mpam_has_feature(mpam_feat_dspri_part_0_low,
++				dev->features))
++			dspri = 0;
++
++		if (mpam_has_feature(mpam_feat_intpri_part, dev->features))
++			pri_val |= intpri;
++		if (mpam_has_feature(mpam_feat_dspri_part, dev->features))
++			pri_val |= (dspri << MPAMCFG_PRI_DSPRI_SHIFT);
++
++		mpam_write_reg(dev, MPAMCFG_PRI, pri_val);
++	}
++	mb(); /* complete the configuration before the cpu can use this partid */
++}
++
++/*
++ * Called from cpuhp callbacks and with the cpus_read_lock() held from
++ * mpam_reset_devices().
++ */
++static void mpam_reset_device(struct mpam_component *comp,
++				struct mpam_device *dev)
++{
++	u32 partid;
++
++	lockdep_assert_held(&dev->lock);
++
++	if (!mpam_has_feature(mpam_feat_part_nrw, dev->features)) {
++		for (partid = 0; partid < dev->num_partid; partid++)
++			mpam_reset_device_config(comp, dev, partid);
++	} else {
++		for (partid = 0; partid < dev->num_intpartid; partid++)
++			mpam_reset_device_config(comp, dev, partid);
++	}
++}
++
+ static int __online_devices(struct mpam_component *comp, int cpu)
+ {
+ 	int err = 0;
+@@ -548,6 +633,9 @@ static int __online_devices(struct mpam_component *comp, int cpu)
+ 				new_device_probed = true;
+ 		}
+ 
++		if (!err && cpumask_empty(&dev->online_affinity))
++			mpam_reset_device(comp, dev);
++
+ 		cpumask_set_cpu(cpu, &dev->online_affinity);
+ 		spin_unlock_irqrestore(&dev->lock, flags);
+ 
+-- 
+2.26.2
+

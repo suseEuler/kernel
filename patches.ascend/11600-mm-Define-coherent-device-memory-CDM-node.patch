@@ -1,0 +1,268 @@
+From 4cda25d3b495c42c41149b221d663523de4d8e6c Mon Sep 17 00:00:00 2001
+From: Anshuman Khandual <khandual@linux.vnet.ibm.com>
+Date: Mon, 29 Nov 2021 16:28:41 +0800
+Subject: [PATCH] mm: Define coherent device memory (CDM) node
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 4cda25d3b495c42c41149b221d663523de4d8e6c
+
+
+ascend inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4JMLR
+CVE: NA
+-------------------
+
+There are certain devices like specialized accelerator, GPU cards, network
+cards, FPGA cards etc which might contain onboard memory which is coherent
+along with the existing system RAM while being accessed either from the CPU
+or from the device. They share some similar properties with that of normal
+system RAM but at the same time can also be different with respect to
+system RAM.
+
+User applications might be interested in using this kind of coherent device
+memory explicitly or implicitly along side the system RAM utilizing all
+possible core memory functions like anon mapping (LRU), file mapping (LRU),
+page cache (LRU), driver managed (non LRU), HW poisoning, NUMA migrations
+etc. To achieve this kind of tight integration with core memory subsystem,
+the device onboard coherent memory must be represented as a memory only
+NUMA node. At the same time arch must export some kind of a function to
+identify of this node as a coherent device memory not any other regular
+cpu less memory only NUMA node.
+
+After achieving the integration with core memory subsystem coherent device
+memory might still need some special consideration inside the kernel. There
+can be a variety of coherent memory nodes with different expectations from
+the core kernel memory. But right now only one kind of special treatment is
+considered which requires certain isolation.
+
+Now consider the case of a coherent device memory node type which requires
+isolation. This kind of coherent memory is onboard an external device
+attached to the system through a link where there is always a chance of a
+link failure taking down the entire memory node with it. More over the
+memory might also have higher chance of ECC failure as compared to the
+system RAM. Hence allocation into this kind of coherent memory node should
+be regulated. Kernel allocations must not come here. Normal user space
+allocations too should not come here implicitly (without user application
+knowing about it). This summarizes isolation requirement of certain kind of
+coherent device memory node as an example. There can be different kinds of
+isolation requirement also.
+
+Some coherent memory devices might not require isolation altogether after
+all. Then there might be other coherent memory devices which might require
+some other special treatment after being part of core memory representation
+. For now, will look into isolation seeking coherent device memory node not
+the other ones.
+
+To implement the integration as well as isolation, the coherent memory node
+must be present in N_MEMORY and a new N_COHERENT_DEVICE node mask inside
+the node_states[] array. During memory hotplug operations, the new nodemask
+N_COHERENT_DEVICE is updated along with N_MEMORY for these coherent device
+memory nodes. This also creates the following new sysfs based interface to
+list down all the coherent memory nodes of the system.
+
+	/sys/devices/system/node/is_cdm_node
+
+Architectures must export function arch_check_node_cdm() which identifies
+any coherent device memory node in case they enable CONFIG_COHERENT_DEVICE.
+
+Signed-off-by: Anshuman Khandual <khandual@linux.vnet.ibm.com>
+Signed-off-by: Lijun Fang <fanglijun3@huawei.com>
+Reviewed-by: Weilong Chen <chenweilong@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/mm/numa.c     |  7 ++++
+ drivers/base/node.c      |  6 ++++
+ include/linux/nodemask.h | 76 +++++++++++++++++++++++++++++++++++++++-
+ mm/Kconfig               |  7 ++++
+ mm/page_alloc.c          |  8 +++--
+ 5 files changed, 101 insertions(+), 3 deletions(-)
+
+diff --git a/arch/arm64/mm/numa.c b/arch/arm64/mm/numa.c
+index a8303bc6b62a..dae7179ba609 100644
+--- a/arch/arm64/mm/numa.c
++++ b/arch/arm64/mm/numa.c
+@@ -25,6 +25,13 @@ static int numa_distance_cnt;
+ static u8 *numa_distance;
+ bool numa_off;
+ 
++#ifdef CONFIG_COHERENT_DEVICE
++inline int arch_check_node_cdm(int nid)
++{
++	return 0;
++}
++#endif
++
+ static __init int numa_parse_early_param(char *opt)
+ {
+ 	if (!opt)
+diff --git a/drivers/base/node.c b/drivers/base/node.c
+index 21965de8538b..fecfac25cf16 100644
+--- a/drivers/base/node.c
++++ b/drivers/base/node.c
+@@ -1016,6 +1016,9 @@ static struct node_attr node_state_attr[] = {
+ 	[N_CPU] = _NODE_ATTR(has_cpu, N_CPU),
+ 	[N_GENERIC_INITIATOR] = _NODE_ATTR(has_generic_initiator,
+ 					   N_GENERIC_INITIATOR),
++#ifdef CONFIG_COHERENT_DEVICE
++	[N_COHERENT_DEVICE] = _NODE_ATTR(is_cdm_node, N_COHERENT_DEVICE),
++#endif
+ };
+ 
+ static struct attribute *node_state_attrs[] = {
+@@ -1028,6 +1031,9 @@ static struct attribute *node_state_attrs[] = {
+ 	&node_state_attr[N_MEMORY].attr.attr,
+ 	&node_state_attr[N_CPU].attr.attr,
+ 	&node_state_attr[N_GENERIC_INITIATOR].attr.attr,
++#ifdef CONFIG_COHERENT_DEVICE
++	&node_state_attr[N_COHERENT_DEVICE].attr.attr,
++#endif
+ 	NULL
+ };
+ 
+diff --git a/include/linux/nodemask.h b/include/linux/nodemask.h
+index ac398e143c9a..90ea204cc059 100644
+--- a/include/linux/nodemask.h
++++ b/include/linux/nodemask.h
+@@ -397,9 +397,12 @@ enum node_states {
+ #else
+ 	N_HIGH_MEMORY = N_NORMAL_MEMORY,
+ #endif
+-	N_MEMORY,		/* The node has memory(regular, high, movable) */
++	N_MEMORY,	/* The node has memory(regular, high, movable, cdm) */
+ 	N_CPU,		/* The node has one or more cpus */
+ 	N_GENERIC_INITIATOR,	/* The node has one or more Generic Initiators */
++#ifdef CONFIG_COHERENT_DEVICE
++	N_COHERENT_DEVICE,	/* The node has CDM memory */
++#endif
+ 	NR_NODE_STATES
+ };
+ 
+@@ -503,6 +506,77 @@ static inline int node_random(const nodemask_t *mask)
+ }
+ #endif
+ 
++#ifdef CONFIG_COHERENT_DEVICE
++extern int arch_check_node_cdm(int nid);
++
++static inline nodemask_t system_mem_nodemask(void)
++{
++	nodemask_t system_mem;
++
++	nodes_clear(system_mem);
++	nodes_andnot(system_mem, node_states[N_MEMORY],
++			node_states[N_COHERENT_DEVICE]);
++	return system_mem;
++}
++
++static inline bool is_cdm_node(int node)
++{
++	return node_isset(node, node_states[N_COHERENT_DEVICE]);
++}
++
++static inline bool nodemask_has_cdm(nodemask_t mask)
++{
++	int node, i;
++
++	node = first_node(mask);
++	for (i = 0; i < nodes_weight(mask); i++) {
++		if (is_cdm_node(node))
++			return true;
++		node = next_node(node, mask);
++	}
++	return false;
++}
++
++static inline void node_set_state_cdm(int node)
++{
++	if (arch_check_node_cdm(node))
++		node_set_state(node, N_COHERENT_DEVICE);
++}
++
++static inline void node_clear_state_cdm(int node)
++{
++	if (arch_check_node_cdm(node))
++		node_clear_state(node, N_COHERENT_DEVICE);
++}
++
++#else
++
++static inline int arch_check_node_cdm(int nid) { return 0; }
++
++static inline nodemask_t system_mem_nodemask(void)
++{
++	return node_states[N_MEMORY];
++}
++
++static inline bool is_cdm_node(int node)
++{
++	return false;
++}
++
++static inline bool nodemask_has_cdm(nodemask_t mask)
++{
++	return false;
++}
++
++static inline void node_set_state_cdm(int node)
++{
++}
++
++static inline void node_clear_state_cdm(int node)
++{
++}
++#endif	/* CONFIG_COHERENT_DEVICE */
++
+ #define node_online_map 	node_states[N_ONLINE]
+ #define node_possible_map 	node_states[N_POSSIBLE]
+ 
+diff --git a/mm/Kconfig b/mm/Kconfig
+index f565fc82c200..8207683afaf2 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -145,6 +145,13 @@ config NUMA_KEEP_MEMINFO
+ config MEMORY_ISOLATION
+ 	bool
+ 
++config COHERENT_DEVICE
++	bool "coherent device memory"
++	def_bool n
++	depends on CPUSETS && ARM64 && NUMA
++	help
++	  Enable coherent device memory (CDM) support.
++
+ #
+ # Only be set on architectures that have completely implemented memory hotplug
+ # feature. If you are not sure, don't touch it.
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 4528a50690f2..308b570cdcec 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -7355,8 +7355,10 @@ static unsigned long __init early_calculate_totalpages(void)
+ 		unsigned long pages = end_pfn - start_pfn;
+ 
+ 		totalpages += pages;
+-		if (pages)
++		if (pages) {
++			node_set_state_cdm(nid);
+ 			node_set_state(nid, N_MEMORY);
++		}
+ 	}
+ 	return totalpages;
+ }
+@@ -7694,8 +7696,10 @@ void __init free_area_init(unsigned long *max_zone_pfn)
+ 		free_area_init_node(nid);
+ 
+ 		/* Any memory on that node */
+-		if (pgdat->node_present_pages)
++		if (pgdat->node_present_pages) {
++			node_set_state_cdm(nid);
+ 			node_set_state(nid, N_MEMORY);
++		}
+ 		check_for_memory(pgdat, nid);
+ 	}
+ 
+-- 
+2.26.2
+

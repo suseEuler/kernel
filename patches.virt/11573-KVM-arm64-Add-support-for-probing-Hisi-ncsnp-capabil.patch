@@ -1,0 +1,150 @@
+From 6de859093a7078b9320c3103fdb705bed8d072e2 Mon Sep 17 00:00:00 2001
+From: Zenghui Yu <yuzenghui@huawei.com>
+Date: Fri, 26 Nov 2021 16:27:04 +0800
+Subject: [PATCH] KVM: arm64: Add support for probing Hisi ncsnp capability
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 6de859093a7078b9320c3103fdb705bed8d072e2
+
+
+virt inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4IZOS
+CVE: NA
+
+----------------------------------------------------
+
+Kunpeng 920 offers the HHA ncsnp capability, with which hypervisor doesn't
+need to perform a lot of cache maintenance like before (in case the guest
+has some non-cacheable Stage-1 mappings). Currently we apply this hardware
+capability when
+
+ - vCPU switching MMU+caches on/off
+ - creating Stage-2 mappings for Daborts
+
+Signed-off-by: Zenghui Yu <yuzenghui@huawei.com>
+Signed-off-by: Yanan Wang <wangyanan55@huawei.com>
+Reviewed-by: Zenghui Yu <yuzenghui@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/hisi_cpu_model.h |  2 ++
+ arch/arm64/include/asm/kvm_mmu.h        |  2 +-
+ arch/arm64/kvm/arm.c                    |  2 ++
+ arch/arm64/kvm/hisi_cpu_model.c         | 34 +++++++++++++++++++++++++
+ arch/arm64/kvm/hyp/pgtable.c            |  4 +--
+ 5 files changed, 41 insertions(+), 3 deletions(-)
+
+diff --git a/arch/arm64/include/asm/hisi_cpu_model.h b/arch/arm64/include/asm/hisi_cpu_model.h
+index f686a7591e8f..e0da0ef61613 100644
+--- a/arch/arm64/include/asm/hisi_cpu_model.h
++++ b/arch/arm64/include/asm/hisi_cpu_model.h
+@@ -14,6 +14,8 @@ enum hisi_cpu_type {
+ };
+ 
+ extern enum hisi_cpu_type hi_cpu_type;
++extern bool kvm_ncsnp_support;
+ 
+ void probe_hisi_cpu_type(void);
++void probe_hisi_ncsnp_support(void);
+ #endif /* __HISI_CPU_MODEL_H__ */
+diff --git a/arch/arm64/include/asm/kvm_mmu.h b/arch/arm64/include/asm/kvm_mmu.h
+index 331394306cce..da041664602b 100644
+--- a/arch/arm64/include/asm/kvm_mmu.h
++++ b/arch/arm64/include/asm/kvm_mmu.h
+@@ -150,7 +150,7 @@ static inline void __clean_dcache_guest_page(kvm_pfn_t pfn, unsigned long size)
+ 	 * faulting in pages. Furthermore, FWB implies IDC, so cleaning to
+ 	 * PoU is not required either in this case.
+ 	 */
+-	if (cpus_have_const_cap(ARM64_HAS_STAGE2_FWB))
++	if (kvm_ncsnp_support || cpus_have_const_cap(ARM64_HAS_STAGE2_FWB))
+ 		return;
+ 
+ 	kvm_flush_dcache_to_poc(va, size);
+diff --git a/arch/arm64/kvm/arm.c b/arch/arm64/kvm/arm.c
+index 901691d5d24d..7f64131641a4 100644
+--- a/arch/arm64/kvm/arm.c
++++ b/arch/arm64/kvm/arm.c
+@@ -60,6 +60,7 @@ static bool vgic_present;
+ 
+ /* Hisi cpu type enum */
+ enum hisi_cpu_type hi_cpu_type = UNKNOWN_HI_TYPE;
++bool kvm_ncsnp_support;
+ 
+ static DEFINE_PER_CPU(unsigned char, kvm_arm_hardware_enabled);
+ DEFINE_STATIC_KEY_FALSE(userspace_irqchip_in_use);
+@@ -1838,6 +1839,7 @@ int kvm_arch_init(void *opaque)
+ 
+ 	/* Probe the Hisi CPU type */
+ 	probe_hisi_cpu_type();
++	probe_hisi_ncsnp_support();
+ 
+ 	in_hyp_mode = is_kernel_in_hyp_mode();
+ 
+diff --git a/arch/arm64/kvm/hisi_cpu_model.c b/arch/arm64/kvm/hisi_cpu_model.c
+index 4d5a099bc27a..52eecf1ba1cf 100644
+--- a/arch/arm64/kvm/hisi_cpu_model.c
++++ b/arch/arm64/kvm/hisi_cpu_model.c
+@@ -81,3 +81,37 @@ void probe_hisi_cpu_type(void)
+ 	if (hi_cpu_type == UNKNOWN_HI_TYPE)
+ 		pr_warn("UNKNOWN Hisi cpu type.\n");
+ }
++
++#define NCSNP_MMIO_BASE	0x20107E238
++
++/*
++ * We have the fantastic HHA ncsnp capability on Kunpeng 920,
++ * with which hypervisor doesn't need to perform a lot of cache
++ * maintenance like before (in case the guest has non-cacheable
++ * Stage-1 mappings).
++ */
++void probe_hisi_ncsnp_support(void)
++{
++	void __iomem *base;
++	unsigned int high;
++
++	kvm_ncsnp_support = false;
++
++	if (hi_cpu_type != HI_1620)
++		goto out;
++
++	base = ioremap(NCSNP_MMIO_BASE, 4);
++	if (!base) {
++		pr_err("Unable to map MMIO region when probing ncsnp!\n");
++		goto out;
++	}
++
++	high = readl_relaxed(base) >> 28;
++	iounmap(base);
++	if (high != 0x1)
++		kvm_ncsnp_support = true;
++
++out:
++	kvm_info("Hisi ncsnp: %s\n", kvm_ncsnp_support ? "enabled" :
++							 "disabled");
++}
+diff --git a/arch/arm64/kvm/hyp/pgtable.c b/arch/arm64/kvm/hyp/pgtable.c
+index 4d99d07c610c..87bced701c8a 100644
+--- a/arch/arm64/kvm/hyp/pgtable.c
++++ b/arch/arm64/kvm/hyp/pgtable.c
+@@ -643,7 +643,7 @@ int kvm_pgtable_stage2_map(struct kvm_pgtable *pgt, u64 addr, u64 size,
+ 
+ static void stage2_flush_dcache(void *addr, u64 size)
+ {
+-	if (cpus_have_const_cap(ARM64_HAS_STAGE2_FWB))
++	if (kvm_ncsnp_support || cpus_have_const_cap(ARM64_HAS_STAGE2_FWB))
+ 		return;
+ 
+ 	__flush_dcache_area(addr, size);
+@@ -847,7 +847,7 @@ int kvm_pgtable_stage2_flush(struct kvm_pgtable *pgt, u64 addr, u64 size)
+ 		.flags	= KVM_PGTABLE_WALK_LEAF,
+ 	};
+ 
+-	if (cpus_have_const_cap(ARM64_HAS_STAGE2_FWB))
++	if (kvm_ncsnp_support || cpus_have_const_cap(ARM64_HAS_STAGE2_FWB))
+ 		return 0;
+ 
+ 	return kvm_pgtable_walk(pgt, addr, size, &walker);
+-- 
+2.26.2
+

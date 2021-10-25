@@ -1,0 +1,132 @@
+From d30a2a28f4129b9060c4abe2ba2b6f6b226a51aa Mon Sep 17 00:00:00 2001
+From: Jean-Philippe Brucker <jean-philippe.brucker@arm.com>
+Date: Sat, 29 May 2021 07:03:12 +0000
+Subject: [PATCH] mm: notify remote TLBs when dirtying a PTE
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: d30a2a28f4129b9060c4abe2ba2b6f6b226a51aa
+
+
+maillist inclusion
+category: feature
+bugzilla: 51855
+CVE: NA
+
+Reference: https://jpbrucker.net/git/linux/commit/?h=sva/2021-03-01&id=d32d8baaf293aaefef8a1c9b8a4508ab2ec46c61
+
+---------------------------------------------
+
+The ptep_set_access_flags path in handle_pte_fault, can cause a change of
+the pte's permissions on some architectures. A Read-Only and
+writeable-clean entry becomes Read-Write and dirty. This requires us to
+call the MMU notifier to invalidate the entry in remote TLBs, for instance
+in a PCIe Address Translation Cache (ATC).
+
+Here is a scenario where the lack of notifier call ends up locking a
+device:
+
+1) A shared anonymous buffer is mapped with READ|WRITE prot, at VA.
+
+2) A PCIe device with ATS/PRI/PASID capabilities wants to read the buffer,
+   using its virtual address.
+
+   a) Device asks for translation of VA for reading (NW=1)
+
+   b) The IOMMU cannot fulfill the request, so the device does a Page
+      Request for VA. The fault is handled with do_read_fault, after which
+      the PTE has flags young, write and rdonly.
+
+   c) Device retries the translation; IOMMU sends a Translation Completion
+      with the PA and Read-Only permission.
+
+   d) The VA->PA translation is stored in the ATC, with Read-Only
+      permission. From the device's point of view, the page may or may not
+      be writeable. It didn't ask for writeability, so it doesn't get a
+      definite answer on that point.
+
+3) The same device now wants to write the buffer. It needs to restart
+   the AT-PR-AT dance for writing this time.
+
+   a) Device could asks for translation of VA for reading and writing
+      (NW=0). The IOMMU would reply with the same Read-Only mapping, so
+      this time the device is certain that the page isn't writeable. Some
+      implementations might update their ATC entry to store that
+      information. The ATS specification is pretty fuzzy on the behaviour
+      to adopt.
+
+   b) The entry is Read-Only, so we fault again. The PTE exists and is
+      valid, all we need to do is mark it dirty. TLBs are invalidated, but
+      not the ATC since there is no notifier.
+
+   c) Now the behaviour depends on the device implementation. If 3a)
+      didn't update the ATC entry, the device is still uncertain on the
+      writeability of the page, goto 3a) - repeat the Translation Request
+      and get Read-Write permissions.
+
+      But if 3a) updated the ATC entry, the device is certain of the
+      PTE's permissions, and will goto 3b) instead - repeat the page
+      fault, again and again. This time we take the "spurious fault" path
+      in the same function, which invalidates the TLB but doesn't call an
+      MMU notifier either.
+
+To avoid this page request loop, call mmu_notifier_change_pte after
+dirtying the PTE.
+
+Note: if the IOMMU supports hardware update of the access/dirty bits, 3a)
+dirties the PTE, and the IOMMU returns RW permission to the device, so
+there is no need to do a Page Request.
+
+Signed-off-by: Jean-Philippe Brucker <jean-philippe@linaro.org>
+Signed-off-by: Lijun Fang <fanglijun3@huawei.com>
+Reviewed-by: Weilong Chen <chenweilong@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/memory.c | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/mm/memory.c b/mm/memory.c
+index b70bd3ba3388..76e21f0978a7 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -4349,6 +4349,7 @@ static vm_fault_t wp_huge_pud(struct vm_fault *vmf, pud_t orig_pud)
+ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+ {
+ 	pte_t entry;
++	bool is_write = vmf->flags & FAULT_FLAG_WRITE;
+ 
+ 	if (unlikely(pmd_none(*vmf->pmd))) {
+ 		/*
+@@ -4406,15 +4407,18 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+ 		update_mmu_tlb(vmf->vma, vmf->address, vmf->pte);
+ 		goto unlock;
+ 	}
+-	if (vmf->flags & FAULT_FLAG_WRITE) {
++	if (is_write) {
+ 		if (!pte_write(entry))
+ 			return do_wp_page(vmf);
+ 		entry = pte_mkdirty(entry);
+ 	}
+ 	entry = pte_mkyoung(entry);
+ 	if (ptep_set_access_flags(vmf->vma, vmf->address, vmf->pte, entry,
+-				vmf->flags & FAULT_FLAG_WRITE)) {
++				  is_write)) {
+ 		update_mmu_cache(vmf->vma, vmf->address, vmf->pte);
++		if (is_write)
++			mmu_notifier_change_pte(vmf->vma->vm_mm, vmf->address,
++						*vmf->pte);
+ 	} else {
+ 		/* Skip spurious TLB flush for retried page fault */
+ 		if (vmf->flags & FAULT_FLAG_TRIED)
+@@ -4425,7 +4429,7 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+ 		 * This still avoids useless tlb flushes for .text page faults
+ 		 * with threads.
+ 		 */
+-		if (vmf->flags & FAULT_FLAG_WRITE)
++		if (is_write)
+ 			flush_tlb_fix_spurious_fault(vmf->vma, vmf->address);
+ 	}
+ unlock:
+-- 
+2.26.2
+

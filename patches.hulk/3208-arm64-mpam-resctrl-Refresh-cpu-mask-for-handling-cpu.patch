@@ -1,0 +1,143 @@
+From 867ae5b23823bcf7dadfb21b7fb32c805d28c1a1 Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Fri, 26 Feb 2021 20:22:50 +0800
+Subject: [PATCH] arm64/mpam: resctrl: Refresh cpu mask for handling cpuhp
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 867ae5b23823bcf7dadfb21b7fb32c805d28c1a1
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+This fixes two problems:
+
+1) when cpu offline, we should clear cpu mask from all associated resctrl
+   group but not only default group.
+
+2) when cpu online, we should set cpu mask for default group and update
+   default group's cpus to default state if cdp on, this operation is to
+   fill code and data fields of mpam sysregs with appropriate value.
+
+Fixes: 2e2c511ff49d ("arm64/mpam: resctrl: Handle cpuhp and resctrl_dom allocation")
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Jian Cheng <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/resctrl.h      | 26 ++++++++++++++++++++++++++
+ arch/arm64/kernel/mpam/mpam_resctrl.c | 15 ++++++++++++---
+ fs/resctrlfs.c                        | 22 ----------------------
+ 3 files changed, 38 insertions(+), 25 deletions(-)
+
+diff --git a/arch/arm64/include/asm/resctrl.h b/arch/arm64/include/asm/resctrl.h
+index d7b70916a42b..f2157df661af 100644
+--- a/arch/arm64/include/asm/resctrl.h
++++ b/arch/arm64/include/asm/resctrl.h
+@@ -444,6 +444,32 @@ int parse_rdtgroupfs_options(char *data);
+ 
+ int resctrl_group_add_files(struct kernfs_node *kn, unsigned long fflags);
+ 
++static inline void resctrl_cdp_update_cpus_state(struct resctrl_group *rdtgrp)
++{
++	int cpu;
++
++	/*
++	 * If cdp on, tasks in resctrl default group with closid=0
++	 * and rmid=0 don't know how to fill proper partid_i/pmg_i
++	 * and partid_d/pmg_d into MPAMx_ELx sysregs by mpam_sched_in()
++	 * called by __switch_to(), it's because current cpu's default
++	 * closid and rmid are also equal to 0 and make the operation
++	 * modifying configuration passed. Update per cpu default closid
++	 * of none-zero value, call update_closid_rmid() to update each
++	 * cpu's mpam proper MPAMx_ELx sysregs for setting partid and
++	 * pmg when mounting resctrl sysfs, which is a practical method;
++	 * Besides, to support cpu online and offline we should set
++	 * cur_closid to 0.
++	 */
++	for_each_cpu(cpu, &rdtgrp->cpu_mask) {
++		per_cpu(pqr_state.default_closid, cpu) = ~0;
++		per_cpu(pqr_state.cur_closid, cpu) = 0;
++	}
++
++	update_closid_rmid(&rdtgrp->cpu_mask, NULL);
++}
++
++
+ #define RESCTRL_MAX_CBM 32
+ 
+ struct resctrl_fs_context {
+diff --git a/arch/arm64/kernel/mpam/mpam_resctrl.c b/arch/arm64/kernel/mpam/mpam_resctrl.c
+index 546b209a0c77..0746800feb5d 100644
+--- a/arch/arm64/kernel/mpam/mpam_resctrl.c
++++ b/arch/arm64/kernel/mpam/mpam_resctrl.c
+@@ -85,15 +85,24 @@ static bool resctrl_cdp_enabled;
+ 
+ int mpam_resctrl_set_default_cpu(unsigned int cpu)
+ {
+-    /* The cpu is set in default rdtgroup after online. */
++	/* The cpu is set in default rdtgroup after online. */
+ 	cpumask_set_cpu(cpu, &resctrl_group_default.cpu_mask);
++
++	/* Update CPU mpam sysregs' default setting when cdp enabled */
++	if (resctrl_cdp_enabled)
++		resctrl_cdp_update_cpus_state(&resctrl_group_default);
++
+ 	return 0;
+ }
+ 
+ void mpam_resctrl_clear_default_cpu(unsigned int cpu)
+ {
+-	/* The cpu is set in default rdtgroup after online. */
+-	cpumask_clear_cpu(cpu, &resctrl_group_default.cpu_mask);
++	struct resctrl_group *rdtgrp;
++
++	list_for_each_entry(rdtgrp, &resctrl_all_groups, resctrl_group_list) {
++		/* The cpu is clear in associated rdtgroup after offline. */
++		cpumask_clear_cpu(cpu, &rdtgrp->cpu_mask);
++	}
+ }
+ 
+ bool is_resctrl_cdp_enabled(void)
+diff --git a/fs/resctrlfs.c b/fs/resctrlfs.c
+index b66969b95775..e1c996ff4e79 100644
+--- a/fs/resctrlfs.c
++++ b/fs/resctrlfs.c
+@@ -357,28 +357,6 @@ static int mkdir_mondata_all(struct kernfs_node *parent_kn,
+ 	return ret;
+ }
+ 
+-static void resctrl_cdp_update_cpus_state(struct resctrl_group *r)
+-{
+-	int cpu;
+-
+-	/*
+-     * If cdp on, tasks in resctrl default group with closid=0
+-	 * and rmid=0 don't know how to fill proper partid_i/pmg_i
+-	 * and partid_d/pmg_d into MPAMx_ELx sysregs by mpam_sched_in()
+-	 * called by __switch_to(), it's because current cpu's default
+-	 * closid and rmid are also equal to 0 and to make the operation
+-	 * modifying configuration passed. Update per cpu default closid
+-	 * of none-zero value, call update_closid_rmid() to update each
+-	 * cpu's mpam proper MPAMx_ELx sysregs for setting partid and
+-	 * pmg when mounting resctrl sysfs, it looks like a practical
+-	 * method.
+-	 */
+-	for_each_cpu(cpu, &r->cpu_mask)
+-		per_cpu(pqr_state.default_closid, cpu) = ~0;
+-
+-	update_closid_rmid(&r->cpu_mask, NULL);
+-}
+-
+ static int resctrl_get_tree(struct fs_context *fc)
+ {
+ 	int ret;
+-- 
+2.26.2
+

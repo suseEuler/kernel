@@ -1,0 +1,200 @@
+From 6d1da2d7b7fd00b18952efdf55a0a8a935869aa1 Mon Sep 17 00:00:00 2001
+From: Guo Fan <guofan5@huawei.com>
+Date: Fri, 16 Jul 2021 16:51:00 +0800
+Subject: [PATCH] userswap: support userswap via userfaultfd
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 6d1da2d7b7fd00b18952efdf55a0a8a935869aa1
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I40AXF
+CVE: NA
+
+--------------------------------------
+
+This patch modify the userfaultfd to support userswap. To check whether
+tha pages are dirty since the last swap in, we make them clean when we
+swap in the pages. The userspace may swap in a large area and part of it
+are not swapped out. We need to skip those pages that are not swapped
+out.
+
+Signed-off-by: Guo Fan <guofan5@huawei.com>
+Signed-off-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: tong tiangen <tongtiangen@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/userfaultfd.c                 | 26 +++++++++++++++++++++++++-
+ include/linux/userfaultfd_k.h    |  4 ++++
+ include/uapi/linux/userfaultfd.h |  1 +
+ mm/memory.c                      | 19 +++++++++++++++++++
+ mm/userfaultfd.c                 | 26 ++++++++++++++++++++++++++
+ 5 files changed, 75 insertions(+), 1 deletion(-)
+
+diff --git a/fs/userfaultfd.c b/fs/userfaultfd.c
+index 000b457ad087..b5b3cd07da20 100644
+--- a/fs/userfaultfd.c
++++ b/fs/userfaultfd.c
+@@ -329,6 +329,10 @@ static inline bool userfaultfd_must_wait(struct userfaultfd_ctx *ctx,
+ 	 * Lockless access: we're in a wait_event so it's ok if it
+ 	 * changes under us.
+ 	 */
++#ifdef CONFIG_USERSWAP
++	if ((reason & VM_USWAP) && (!pte_present(*pte)))
++		ret = true;
++#endif
+ 	if (pte_none(*pte))
+ 		ret = true;
+ 	if (!pte_write(*pte) && (reason & VM_UFFD_WP))
+@@ -1281,10 +1285,30 @@ static int userfaultfd_register(struct userfaultfd_ctx *ctx,
+ 	ret = -EINVAL;
+ 	if (!uffdio_register.mode)
+ 		goto out;
++	vm_flags = 0;
++#ifdef CONFIG_USERSWAP
++	/*
++	 * register the whole vma overlapping with the address range to avoid
++	 * splitting the vma.
++	 */
++	if (uffdio_register.mode & UFFDIO_REGISTER_MODE_USWAP) {
++		uffdio_register.mode &= ~UFFDIO_REGISTER_MODE_USWAP;
++		vm_flags |= VM_USWAP;
++		end = uffdio_register.range.start + uffdio_register.range.len - 1;
++		vma = find_vma(mm, uffdio_register.range.start);
++		if (!vma)
++			goto out;
++		uffdio_register.range.start = vma->vm_start;
++
++		vma = find_vma(mm, end);
++		if (!vma)
++			goto out;
++		uffdio_register.range.len = vma->vm_end - uffdio_register.range.start;
++	}
++#endif
+ 	if (uffdio_register.mode & ~(UFFDIO_REGISTER_MODE_MISSING|
+ 				     UFFDIO_REGISTER_MODE_WP))
+ 		goto out;
+-	vm_flags = 0;
+ 	if (uffdio_register.mode & UFFDIO_REGISTER_MODE_MISSING)
+ 		vm_flags |= VM_UFFD_MISSING;
+ 	if (uffdio_register.mode & UFFDIO_REGISTER_MODE_WP)
+diff --git a/include/linux/userfaultfd_k.h b/include/linux/userfaultfd_k.h
+index a8e5f3ea9bb2..e91f31a4c830 100644
+--- a/include/linux/userfaultfd_k.h
++++ b/include/linux/userfaultfd_k.h
+@@ -54,7 +54,11 @@ static inline bool is_mergeable_vm_userfaultfd_ctx(struct vm_area_struct *vma,
+ 
+ static inline bool userfaultfd_missing(struct vm_area_struct *vma)
+ {
++#ifdef CONFIG_USERSWAP
++	return (vma->vm_flags & VM_UFFD_MISSING) && !(vma->vm_flags & VM_USWAP);
++#else
+ 	return vma->vm_flags & VM_UFFD_MISSING;
++#endif
+ }
+ 
+ static inline bool userfaultfd_wp(struct vm_area_struct *vma)
+diff --git a/include/uapi/linux/userfaultfd.h b/include/uapi/linux/userfaultfd.h
+index e7e98bde221f..ada058f8b94b 100644
+--- a/include/uapi/linux/userfaultfd.h
++++ b/include/uapi/linux/userfaultfd.h
+@@ -195,6 +195,7 @@ struct uffdio_register {
+ 	struct uffdio_range range;
+ #define UFFDIO_REGISTER_MODE_MISSING	((__u64)1<<0)
+ #define UFFDIO_REGISTER_MODE_WP		((__u64)1<<1)
++#define UFFDIO_REGISTER_MODE_USWAP		((__u64)1<<2)
+ 	__u64 mode;
+ 
+ 	/*
+diff --git a/mm/memory.c b/mm/memory.c
+index f674761674ee..4e8dc5c25cf1 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -3304,6 +3304,25 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 		goto out;
+ 
+ 	entry = pte_to_swp_entry(vmf->orig_pte);
++#ifdef CONFIG_USERSWAP
++	if (swp_type(entry) == SWP_USERSWAP_ENTRY) {
++		/* print error if we come across a nested fault */
++		if (!strncmp(current->comm, "uswap", 5)) {
++			pr_err("USWAP: fault %lx is triggered by %s\n",
++					vmf->address, current->comm);
++			return VM_FAULT_SIGBUS;
++		}
++		if (!(vma->vm_flags & VM_UFFD_MISSING)) {
++			pr_err("USWAP: addr %lx flags %lx is not a user swap page",
++					vmf->address, vma->vm_flags);
++			goto skip_uswap;
++		}
++		BUG_ON(!(vma->vm_flags & VM_UFFD_MISSING));
++		ret = handle_userfault(vmf, VM_UFFD_MISSING | VM_USWAP);
++		return ret;
++	}
++skip_uswap:
++#endif
+ 	if (unlikely(non_swap_entry(entry))) {
+ 		if (is_migration_entry(entry)) {
+ 			migration_entry_wait(vma->vm_mm, vmf->pmd,
+diff --git a/mm/userfaultfd.c b/mm/userfaultfd.c
+index 9a3d451402d7..a8676b57abb8 100644
+--- a/mm/userfaultfd.c
++++ b/mm/userfaultfd.c
+@@ -88,6 +88,10 @@ static int mcopy_atomic_pte(struct mm_struct *dst_mm,
+ 		*pagep = NULL;
+ 	}
+ 
++#ifdef CONFIG_USERSWAP
++	if (dst_vma->vm_flags & VM_USWAP)
++		ClearPageDirty(page);
++#endif
+ 	/*
+ 	 * The memory barrier inside __SetPageUptodate makes sure that
+ 	 * preceding stores to the page contents become visible before
+@@ -106,6 +110,10 @@ static int mcopy_atomic_pte(struct mm_struct *dst_mm,
+ 		else
+ 			_dst_pte = pte_mkwrite(_dst_pte);
+ 	}
++#ifdef CONFIG_USERSWAP
++	if (dst_vma->vm_flags & VM_USWAP)
++		_dst_pte = pte_mkclean(_dst_pte);
++#endif
+ 
+ 	dst_pte = pte_offset_map_lock(dst_mm, dst_pmd, dst_addr, &ptl);
+ 	if (dst_vma->vm_file) {
+@@ -117,9 +125,27 @@ static int mcopy_atomic_pte(struct mm_struct *dst_mm,
+ 		if (unlikely(offset >= max_off))
+ 			goto out_release_uncharge_unlock;
+ 	}
++
++#ifdef CONFIG_USERSWAP
++	if (!(dst_vma->vm_flags & VM_USWAP)) {
++		ret = -EEXIST;
++		if (!pte_none(*dst_pte))
++			goto out_release_uncharge_unlock;
++	} else {
++		/*
++		 * The userspace may swap in a large area. Part of the area is
++		 * not swapped out. Skip those pages.
++		 */
++		ret = 0;
++		if (swp_type(pte_to_swp_entry(*dst_pte)) != SWP_USERSWAP_ENTRY ||
++		    pte_present(*dst_pte))
++			goto out_release_uncharge_unlock;
++	}
++#else
+ 	ret = -EEXIST;
+ 	if (!pte_none(*dst_pte))
+ 		goto out_release_uncharge_unlock;
++#endif
+ 
+ 	inc_mm_counter(dst_mm, MM_ANONPAGES);
+ 	page_add_new_anon_rmap(page, dst_vma, dst_addr, false);
+-- 
+2.26.2
+

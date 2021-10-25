@@ -1,0 +1,283 @@
+From c92dc856848f32781e37b88c1b7f875e274f5efb Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Fri, 27 Nov 2020 12:34:00 +0100
+Subject: [PATCH] ext4: defer saving error info from atomic context
+Git-commit: c92dc856848f32781e37b88c1b7f875e274f5efb
+Patch-mainline: v5.11-rc1
+References: bsn#12
+
+
+When filesystem inconsistency is detected with group locked, we
+currently try to modify superblock to store error there without
+blocking. However this can cause superblock checksum failures (or
+DIF/DIX failure) when the superblock is just being written out.
+
+Make error handling code just store error information in ext4_sb_info
+structure and copy it to on-disk superblock only in ext4_commit_super().
+In case of error happening with group locked, we just postpone the
+superblock flushing to a workqueue.
+
+[ Added fixup so that s_first_error_* does not get updated after
+  the file system is remounted.
+  Also added fix for syzbot failure.  - Ted ]
+
+Signed-off-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20201127113405.26867-8-jack@suse.cz
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Cc: Hillf Danton <hdanton@sina.com>
+Reported-by: syzbot+9043030c040ce1849a60@syzkaller.appspotmail.com
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/ext4/ext4.h  |  21 +++++++++
+ fs/ext4/super.c | 118 +++++++++++++++++++++++++++++++++---------------
+ 2 files changed, 103 insertions(+), 36 deletions(-)
+
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -1621,6 +1621,27 @@ struct ext4_sb_info {
+ 	errseq_t s_bdev_wb_err;
+ 	spinlock_t s_bdev_wb_lock;
+ 
++	/* Information about errors that happened during this mount */
++	spinlock_t s_error_lock;
++	int s_add_error_count;
++	int s_first_error_code;
++	__u32 s_first_error_line;
++	__u32 s_first_error_ino;
++	__u64 s_first_error_block;
++	const char *s_first_error_func;
++	time64_t s_first_error_time;
++	int s_last_error_code;
++	__u32 s_last_error_line;
++	__u32 s_last_error_ino;
++	__u64 s_last_error_block;
++	const char *s_last_error_func;
++	time64_t s_last_error_time;
++	/*
++	 * If we are in a context where we cannot update error information in
++	 * the on-disk superblock, we queue this work to do it.
++	 */
++	struct work_struct s_error_work;
++
+ 	/* Ext4 fast commit stuff */
+ 	atomic_t s_fc_subtid;
+ 	atomic_t s_fc_ineligible_updates;
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -404,10 +404,8 @@ void ext4_itable_unused_set(struct super
+ 		bg->bg_itable_unused_hi = cpu_to_le16(count >> 16);
+ }
+ 
+-static void __ext4_update_tstamp(__le32 *lo, __u8 *hi)
++static void __ext4_update_tstamp(__le32 *lo, __u8 *hi, time64_t now)
+ {
+-	time64_t now = ktime_get_real_seconds();
+-
+ 	now = clamp_val(now, 0, (1ull << 40) - 1);
+ 
+ 	*lo = cpu_to_le32(lower_32_bits(now));
+@@ -419,7 +417,8 @@ static time64_t __ext4_get_tstamp(__le32
+ 	return ((time64_t)(*hi) << 32) + le32_to_cpu(*lo);
+ }
+ #define ext4_update_tstamp(es, tstamp) \
+-	__ext4_update_tstamp(&(es)->tstamp, &(es)->tstamp ## _hi)
++	__ext4_update_tstamp(&(es)->tstamp, &(es)->tstamp ## _hi, \
++			     ktime_get_real_seconds())
+ #define ext4_get_tstamp(es, tstamp) \
+ 	__ext4_get_tstamp(&(es)->tstamp, &(es)->tstamp ## _hi)
+ 
+@@ -591,7 +590,7 @@ static void __save_error_info(struct sup
+ 			      __u32 ino, __u64 block,
+ 			      const char *func, unsigned int line)
+ {
+-	struct ext4_super_block *es = EXT4_SB(sb)->s_es;
++	struct ext4_sb_info *sbi = EXT4_SB(sb);
+ 
+ 	EXT4_SB(sb)->s_mount_state |= EXT4_ERROR_FS;
+ 	if (bdev_read_only(sb->s_bdev))
+@@ -599,30 +598,24 @@ static void __save_error_info(struct sup
+ 	/* We default to EFSCORRUPTED error... */
+ 	if (error == 0)
+ 		error = EFSCORRUPTED;
+-	es->s_state |= cpu_to_le16(EXT4_ERROR_FS);
+-	ext4_update_tstamp(es, s_last_error_time);
+-	strncpy(es->s_last_error_func, func, sizeof(es->s_last_error_func));
+-	es->s_last_error_line = cpu_to_le32(line);
+-	es->s_last_error_ino = cpu_to_le32(ino);
+-	es->s_last_error_block = cpu_to_le64(block);
+-	es->s_last_error_errcode = ext4_errno_to_code(error);
+-	if (!es->s_first_error_time) {
+-		es->s_first_error_time = es->s_last_error_time;
+-		es->s_first_error_time_hi = es->s_last_error_time_hi;
+-		strncpy(es->s_first_error_func, func,
+-			sizeof(es->s_first_error_func));
+-		es->s_first_error_line = cpu_to_le32(line);
+-		es->s_first_error_ino = es->s_last_error_ino;
+-		es->s_first_error_block = es->s_last_error_block;
+-		es->s_first_error_errcode = es->s_last_error_errcode;
+-	}
+-	/*
+-	 * Start the daily error reporting function if it hasn't been
+-	 * started already
+-	 */
+-	if (!es->s_error_count)
+-		mod_timer(&EXT4_SB(sb)->s_err_report, jiffies + 24*60*60*HZ);
+-	le32_add_cpu(&es->s_error_count, 1);
++
++	spin_lock(&sbi->s_error_lock);
++	sbi->s_add_error_count++;
++	sbi->s_last_error_code = error;
++	sbi->s_last_error_line = line;
++	sbi->s_last_error_ino = ino;
++	sbi->s_last_error_block = block;
++	sbi->s_last_error_func = func;
++	sbi->s_last_error_time = ktime_get_real_seconds();
++	if (!sbi->s_first_error_time) {
++		sbi->s_first_error_code = error;
++		sbi->s_first_error_line = line;
++		sbi->s_first_error_ino = ino;
++		sbi->s_first_error_block = block;
++		sbi->s_first_error_func = func;
++		sbi->s_first_error_time = sbi->s_last_error_time;
++	}
++	spin_unlock(&sbi->s_error_lock);
+ }
+ 
+ static void save_error_info(struct super_block *sb, int error,
+@@ -685,6 +678,14 @@ static void ext4_handle_error(struct sup
+ 	sb->s_flags |= SB_RDONLY;
+ }
+ 
++static void flush_stashed_error_work(struct work_struct *work)
++{
++	struct ext4_sb_info *sbi = container_of(work, struct ext4_sb_info,
++						s_error_work);
++
++	ext4_commit_super(sbi->s_sb, 1);
++}
++
+ #define ext4_error_ratelimit(sb)					\
+ 		___ratelimit(&(EXT4_SB(sb)->s_err_ratelimit_state),	\
+ 			     "EXT4-fs error")
+@@ -925,8 +926,6 @@ __acquires(bitlock)
+ 		return;
+ 
+ 	trace_ext4_error(sb, function, line);
+-	__save_error_info(sb, EFSCORRUPTED, ino, block, function, line);
+-
+ 	if (ext4_error_ratelimit(sb)) {
+ 		va_start(args, fmt);
+ 		vaf.fmt = fmt;
+@@ -942,16 +941,15 @@ __acquires(bitlock)
+ 		va_end(args);
+ 	}
+ 
+-	if (test_opt(sb, WARN_ON_ERROR))
+-		WARN_ON_ONCE(1);
+-
+ 	if (test_opt(sb, ERRORS_CONT)) {
+-		ext4_commit_super(sb, 0);
++		if (test_opt(sb, WARN_ON_ERROR))
++			WARN_ON_ONCE(1);
++		__save_error_info(sb, EFSCORRUPTED, ino, block, function, line);
++		schedule_work(&EXT4_SB(sb)->s_error_work);
+ 		return;
+ 	}
+-
+ 	ext4_unlock_group(sb, grp);
+-	ext4_commit_super(sb, 1);
++	save_error_info(sb, EFSCORRUPTED, ino, block, function, line);
+ 	ext4_handle_error(sb, false);
+ 	/*
+ 	 * We only get here in the ERRORS_RO case; relocking the group
+@@ -1124,6 +1122,7 @@ static void ext4_put_super(struct super_
+ 	ext4_unregister_li_request(sb);
+ 	ext4_quota_off_umount(sb);
+ 
++	flush_work(&sbi->s_error_work);
+ 	destroy_workqueue(sbi->rsv_conversion_wq);
+ 
+ 	/*
+@@ -4669,6 +4668,8 @@ static int ext4_fill_super(struct super_
+ 	}
+ 
+ 	timer_setup(&sbi->s_err_report, print_daily_error_info, 0);
++	spin_lock_init(&sbi->s_error_lock);
++	INIT_WORK(&sbi->s_error_work, flush_stashed_error_work);
+ 
+ 	/* Register extent status tree shrinker */
+ 	if (ext4_es_register_shrinker(sbi))
+@@ -5121,6 +5122,7 @@ failed_mount3a:
+ 	ext4_es_unregister_shrinker(sbi);
+ failed_mount3:
+ 	del_timer_sync(&sbi->s_err_report);
++	flush_work(&sbi->s_error_work);
+ 	ext4_stop_mmpd(sbi);
+ failed_mount2:
+ 	rcu_read_lock();
+@@ -5447,6 +5449,7 @@ err_out:
+ 
+ static int ext4_commit_super(struct super_block *sb, int sync)
+ {
++	struct ext4_sb_info *sbi = EXT4_SB(sb);
+ 	struct ext4_super_block *es = EXT4_SB(sb)->s_es;
+ 	struct buffer_head *sbh = EXT4_SB(sb)->s_sbh;
+ 	int error = 0;
+@@ -5485,6 +5488,46 @@ static int ext4_commit_super(struct supe
+ 		es->s_free_inodes_count =
+ 			cpu_to_le32(percpu_counter_sum_positive(
+ 				&EXT4_SB(sb)->s_freeinodes_counter));
++	/* Copy error information to the on-disk superblock */
++	spin_lock(&sbi->s_error_lock);
++	if (sbi->s_add_error_count > 0) {
++		es->s_state |= cpu_to_le16(EXT4_ERROR_FS);
++		if (!es->s_first_error_time && !es->s_first_error_time_hi) {
++			__ext4_update_tstamp(&es->s_first_error_time,
++					     &es->s_first_error_time_hi,
++					     sbi->s_first_error_time);
++			strncpy(es->s_first_error_func, sbi->s_first_error_func,
++				sizeof(es->s_first_error_func));
++			es->s_first_error_line =
++				cpu_to_le32(sbi->s_first_error_line);
++			es->s_first_error_ino =
++				cpu_to_le32(sbi->s_first_error_ino);
++			es->s_first_error_block =
++				cpu_to_le64(sbi->s_first_error_block);
++			es->s_first_error_errcode =
++				ext4_errno_to_code(sbi->s_first_error_code);
++		}
++		__ext4_update_tstamp(&es->s_last_error_time,
++				     &es->s_last_error_time_hi,
++				     sbi->s_last_error_time);
++		strncpy(es->s_last_error_func, sbi->s_last_error_func,
++			sizeof(es->s_last_error_func));
++		es->s_last_error_line = cpu_to_le32(sbi->s_last_error_line);
++		es->s_last_error_ino = cpu_to_le32(sbi->s_last_error_ino);
++		es->s_last_error_block = cpu_to_le64(sbi->s_last_error_block);
++		es->s_last_error_errcode =
++				ext4_errno_to_code(sbi->s_last_error_code);
++		/*
++		 * Start the daily error reporting function if it hasn't been
++		 * started already
++		 */
++		if (!es->s_error_count)
++			mod_timer(&sbi->s_err_report, jiffies + 24*60*60*HZ);
++		le32_add_cpu(&es->s_error_count, sbi->s_add_error_count);
++		sbi->s_add_error_count = 0;
++	}
++	spin_unlock(&sbi->s_error_lock);
++
+ 	BUFFER_TRACE(sbh, "marking dirty");
+ 	ext4_superblock_csum_set(sb);
+ 	if (sync)
+@@ -5838,6 +5881,9 @@ static int ext4_remount(struct super_blo
+ 		set_task_ioprio(sbi->s_journal->j_task, journal_ioprio);
+ 	}
+ 
++	/* Flush outstanding errors before changing fs state */
++	flush_work(&sbi->s_error_work);
++
+ 	if ((bool)(*flags & SB_RDONLY) != sb_rdonly(sb)) {
+ 		if (ext4_test_mount_flag(sb, EXT4_MF_FS_ABORTED)) {
+ 			err = -EROFS;

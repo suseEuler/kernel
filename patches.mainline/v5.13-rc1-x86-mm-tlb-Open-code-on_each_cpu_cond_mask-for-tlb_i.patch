@@ -1,0 +1,99 @@
+From 6035152d8eebe16a5bb60398d3e05dc7799067b0 Mon Sep 17 00:00:00 2001
+From: Nadav Amit <namit@vmware.com>
+Date: Sat, 20 Feb 2021 15:17:06 -0800
+Subject: [PATCH] x86/mm/tlb: Open-code on_each_cpu_cond_mask() for
+Git-commit: 6035152d8eebe16a5bb60398d3e05dc7799067b0
+Patch-mainline: v5.13-rc1
+References: bsn#12
+
+ tlb_is_not_lazy()
+
+Open-code on_each_cpu_cond_mask() in native_flush_tlb_others() to
+optimize the code. Open-coding eliminates the need for the indirect branch
+that is used to call is_lazy(), and in CPUs that are vulnerable to
+Spectre v2, it eliminates the retpoline. In addition, it allows to use a
+preallocated cpumask to compute the CPUs that should be.
+
+This would later allow us not to adapt on_each_cpu_cond_mask() to
+support local and remote functions.
+
+Note that calling tlb_is_not_lazy() for every CPU that needs to be
+flushed, as done in native_flush_tlb_multi() might look ugly, but it is
+equivalent to what is currently done in on_each_cpu_cond_mask().
+Actually, native_flush_tlb_multi() does it more efficiently since it
+avoids using an indirect branch for the matter.
+
+Signed-off-by: Nadav Amit <namit@vmware.com>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Reviewed-by: Dave Hansen <dave.hansen@linux.intel.com>
+Link: https://lore.kernel.org/r/20210220231712.2475218-4-namit@vmware.com
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ arch/x86/mm/tlb.c | 37 ++++++++++++++++++++++++++++++++-----
+ 1 file changed, 32 insertions(+), 5 deletions(-)
+
+diff --git a/arch/x86/mm/tlb.c b/arch/x86/mm/tlb.c
+index bf12371db6c4..07b6701a540a 100644
+--- a/arch/x86/mm/tlb.c
++++ b/arch/x86/mm/tlb.c
+@@ -788,11 +788,13 @@ static void flush_tlb_func(void *info)
+ 			nr_invalidate);
+ }
+ 
+-static bool tlb_is_not_lazy(int cpu, void *data)
++static bool tlb_is_not_lazy(int cpu)
+ {
+ 	return !per_cpu(cpu_tlbstate.is_lazy, cpu);
+ }
+ 
++static DEFINE_PER_CPU(cpumask_t, flush_tlb_mask);
++
+ STATIC_NOPV void native_flush_tlb_others(const struct cpumask *cpumask,
+ 					 const struct flush_tlb_info *info)
+ {
+@@ -813,12 +815,37 @@ STATIC_NOPV void native_flush_tlb_others(const struct cpumask *cpumask,
+ 	 * up on the new contents of what used to be page tables, while
+ 	 * doing a speculative memory access.
+ 	 */
+-	if (info->freed_tables)
++	if (info->freed_tables) {
+ 		smp_call_function_many(cpumask, flush_tlb_func,
+ 			       (void *)info, 1);
+-	else
+-		on_each_cpu_cond_mask(tlb_is_not_lazy, flush_tlb_func,
+-				(void *)info, 1, cpumask);
++	} else {
++		/*
++		 * Although we could have used on_each_cpu_cond_mask(),
++		 * open-coding it has performance advantages, as it eliminates
++		 * the need for indirect calls or retpolines. In addition, it
++		 * allows to use a designated cpumask for evaluating the
++		 * condition, instead of allocating one.
++		 *
++		 * This code works under the assumption that there are no nested
++		 * TLB flushes, an assumption that is already made in
++		 * flush_tlb_mm_range().
++		 *
++		 * cond_cpumask is logically a stack-local variable, but it is
++		 * more efficient to have it off the stack and not to allocate
++		 * it on demand. Preemption is disabled and this code is
++		 * non-reentrant.
++		 */
++		struct cpumask *cond_cpumask = this_cpu_ptr(&flush_tlb_mask);
++		int cpu;
++
++		cpumask_clear(cond_cpumask);
++
++		for_each_cpu(cpu, cpumask) {
++			if (tlb_is_not_lazy(cpu))
++				__cpumask_set_cpu(cpu, cond_cpumask);
++		}
++		smp_call_function_many(cond_cpumask, flush_tlb_func, (void *)info, 1);
++	}
+ }
+ 
+ void flush_tlb_others(const struct cpumask *cpumask,
+-- 
+2.31.1
+

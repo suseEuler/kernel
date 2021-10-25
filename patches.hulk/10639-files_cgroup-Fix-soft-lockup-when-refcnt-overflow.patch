@@ -1,0 +1,82 @@
+From 7e485fecbd7f3762249ce69125f0301b2d7ac04f Mon Sep 17 00:00:00 2001
+From: Zhang Xiaoxu <zhangxiaoxu5@huawei.com>
+Date: Sat, 30 Oct 2021 15:51:29 +0800
+Subject: [PATCH] files_cgroup: Fix soft lockup when refcnt overflow.
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 7e485fecbd7f3762249ce69125f0301b2d7ac04f
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4G4S5
+
+---------------------
+
+There is a soft lockup call trace as below:
+  CPU: 0 PID: 1360 Comm: imapsvcd Kdump: loaded Tainted: G           OE
+  task: ffff8a7296e1eeb0 ti: ffff8a7296aa0000 task.ti: ffff8a7296aa0000
+  RIP: 0010:[<ffffffffb691ecb4>]  [<ffffffffb691ecb4>]
+  __css_tryget+0x24/0x50
+  RSP: 0018:ffff8a7296aa3db8  EFLAGS: 00000a87
+  RAX: 0000000080000000 RBX: ffff8a7296aa3df8 RCX: ffff8a72820d9a08
+  RDX: 0000000000000000 RSI: 0000000000000001 RDI: ffff8a72820d9a00
+  RBP: ffff8a7296aa3db8 R08: 000000000001c360 R09: ffffffffb6a478f4
+  R10: ffffffffb6935e83 R11: ffffffffffffffd0 R12: 0000000057d35cd8
+  R13: 000000d000000002 R14: ffffffffb6892fbe R15: 000000d000000002
+  FS:  0000000000000000(0000) GS:ffff8a72fec00000(0063)
+  knlGS:00000000c6e65b40
+  CS:  0010 DS: 002b ES: 002b CR0: 0000000080050033
+  CR2: 0000000057d35cd8 CR3: 00000007e8008000 CR4: 00000000003607f0
+  DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+  DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+  Call Trace:
+   [<ffffffffb6a93578>] files_cgroup_assign+0x48/0x60
+   [<ffffffffb6a47972>] dup_fd+0xb2/0x2f0
+   [<ffffffffb6935e83>] ? audit_alloc+0xe3/0x180
+   [<ffffffffb6893a03>] copy_process+0xbd3/0x1a40
+   [<ffffffffb6894a21>] do_fork+0x91/0x320
+   [<ffffffffb6f329e6>] ? trace_do_page_fault+0x56/0x150
+   [<ffffffffb6894d36>] SyS_clone+0x16/0x20
+   [<ffffffffb6f3bf8c>] ia32_ptregs_common+0x4c/0xfc
+   code: 1f 84 00 00 00 00 00 0f 1f 44 00 00 55 48 8d 4f 08 48 89 e5 8b
+         47 08 8d 90 00 00 00 80 85 c0 0f 49 d0 8d 72 01 89 d0 f0 0f b1
+
+When the child process exit, we doesn't call dec refcnt, so, the refcnt
+maybe overflow. Then the 'task_get_css' will dead loop because the
+'css_refcnt' will return an unbias refcnt, if the refcnt is negitave,
+'__css_tryget' always return false, then 'task_get_css' dead looped.
+
+The child process always call 'close_files' when exit, add dec refcnt in
+it.
+
+Signed-off-by: Zhang Xiaoxu <zhangxiaoxu5@huawei.com>
+Reviewed-by: Hou Tao <houtao1@huawei.com>
+Signed-off-by: Zhang Xiaoxu <zhangxiaoxu5@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+
+Signed-off-by: Lu Jialin <lujialin4@huawei.com>
+Reviewed-by: weiyang wang <wangweiyang2@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/file.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/fs/file.c b/fs/file.c
+index 3b99457518ef..df17b9e9e67e 100644
+--- a/fs/file.c
++++ b/fs/file.c
+@@ -436,6 +436,9 @@ static struct fdtable *close_files(struct files_struct * files)
+ 			set >>= 1;
+ 		}
+ 	}
++#ifdef CONFIG_CGROUP_FILES
++	files_cgroup_remove(files);
++#endif
+ 
+ 	return fdt;
+ }
+-- 
+2.26.2
+

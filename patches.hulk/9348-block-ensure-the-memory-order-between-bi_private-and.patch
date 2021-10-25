@@ -1,0 +1,138 @@
+From 6d1f82e6bf1aa1b9e2404bff2df9ac7010e21902 Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Fri, 15 Oct 2021 16:16:14 +0800
+Subject: [PATCH] block: ensure the memory order between bi_private and
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 6d1f82e6bf1aa1b9e2404bff2df9ac7010e21902
+
+ bi_status
+
+hulk inclusion
+category: bugfix
+bugzilla: 167067 https://gitee.com/openeuler/kernel/issues/I4DDEL
+
+--------------------------------
+
+When running stress test on null_blk under linux-4.19.y, the following
+warning is reported:
+
+  percpu_ref_switch_to_atomic_rcu: percpu ref (css_release) <= 0 (-3) after switching to atomic
+
+The cause is that css_put() is invoked twice on the same bio as shown below:
+
+CPU 1:                         CPU 2:
+
+// IO completion kworker       // IO submit thread
+                               __blkdev_direct_IO_simple
+                                 submit_bio
+
+bio_endio
+  bio_uninit(bio)
+    css_put(bi_css)
+    bi_css = NULL
+                               set_current_state(TASK_UNINTERRUPTIBLE)
+  bio->bi_end_io
+    blkdev_bio_end_io_simple
+      bio->bi_private = NULL
+                               // bi_private is NULL
+                               READ_ONCE(bio->bi_private)
+        wake_up_process
+          smp_mb__after_spinlock
+
+                               bio_unint(bio)
+                                 // read bi_css as no-NULL
+                                 // so call css_put() again
+                                 css_put(bi_css)
+
+Because there is no memory barriers between the reading and the writing of
+bi_private and bi_css, so reading bi_private as NULL can not guarantee
+bi_css will also be NULL on weak-memory model host (e.g, ARM64).
+
+For the latest kernel source, css_put() has been removed from bio_unint(),
+but the memory-order problem still exists, because the order between
+bio->bi_private and {bi_status|bi_blkg} is also assumed in
+__blkdev_direct_IO_simple(). It is reproducible that
+__blkdev_direct_IO_simple() may read bi_status as 0 event if
+bi_status is set as an errno in req_bio_endio().
+
+In __blkdev_direct_IO(), the memory order between dio->waiter and
+dio->bio.bi_status is not guaranteed neither. Until now it is unable to
+reproduce it, maybe because dio->waiter and dio->bio.bi_status are
+in the same cache-line. But it is better to add guarantee for memory
+order.
+
+Fixing it by using smp_wmb() and spm_rmb() to guarantee the order between
+{bio->bi_private|dio->waiter} and {bi_status|bi_blkg}.
+
+Fixes: 189ce2b9dcc3 ("block: fast-path for small and simple direct I/O requests")
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Hou Tao <houtao1@huawei.com>
+Signed-off-by: Chen Jun <chenjun102@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/block_dev.c | 24 ++++++++++++++++++++++--
+ 1 file changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/fs/block_dev.c b/fs/block_dev.c
+index 7bc660054d21..d2881fd351a3 100644
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@ -229,6 +229,11 @@ static void blkdev_bio_end_io_simple(struct bio *bio)
+ {
+ 	struct task_struct *waiter = bio->bi_private;
+ 
++	/*
++	 * Paired with smp_rmb() in __blkdev_direct_IO_simple() to ensure
++	 * the order between bi_private and bi_xxx.
++	 */
++	smp_wmb();
+ 	WRITE_ONCE(bio->bi_private, NULL);
+ 	blk_wake_io_task(waiter);
+ }
+@@ -288,8 +293,15 @@ __blkdev_direct_IO_simple(struct kiocb *iocb, struct iov_iter *iter,
+ 	qc = submit_bio(&bio);
+ 	for (;;) {
+ 		set_current_state(TASK_UNINTERRUPTIBLE);
+-		if (!READ_ONCE(bio.bi_private))
++		if (!READ_ONCE(bio.bi_private)) {
++			/*
++			 * Paired with smp_wmb() in
++			 * blkdev_bio_end_io_simple().
++			 */
++			smp_rmb();
+ 			break;
++		}
++
+ 		if (!(iocb->ki_flags & IOCB_HIPRI) ||
+ 		    !blk_poll(bdev_get_queue(bdev), qc, true))
+ 			blk_io_schedule();
+@@ -358,6 +370,11 @@ static void blkdev_bio_end_io(struct bio *bio)
+ 		} else {
+ 			struct task_struct *waiter = dio->waiter;
+ 
++			/*
++			 * Paired with smp_rmb() in __blkdev_direct_IO() to
++			 * ensure the order between dio->waiter and bio->bi_xxx.
++			 */
++			smp_wmb();
+ 			WRITE_ONCE(dio->waiter, NULL);
+ 			blk_wake_io_task(waiter);
+ 		}
+@@ -483,8 +500,11 @@ __blkdev_direct_IO(struct kiocb *iocb, struct iov_iter *iter, int nr_pages)
+ 
+ 	for (;;) {
+ 		set_current_state(TASK_UNINTERRUPTIBLE);
+-		if (!READ_ONCE(dio->waiter))
++		if (!READ_ONCE(dio->waiter)) {
++			/* Paired with smp_wmb() in blkdev_bio_end_io(). */
++			smp_rmb();
+ 			break;
++		}
+ 
+ 		if (!(iocb->ki_flags & IOCB_HIPRI) ||
+ 		    !blk_poll(bdev_get_queue(bdev), qc, true))
+-- 
+2.26.2
+

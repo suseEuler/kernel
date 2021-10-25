@@ -1,0 +1,137 @@
+From 2d9bc8aa86a0b945db241f498cc99b552de01158 Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Fri, 26 Feb 2021 20:22:27 +0800
+Subject: [PATCH] arm64/mpam: Store intpri and dspri for mpam device reset
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 2d9bc8aa86a0b945db241f498cc99b552de01158
+
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+Register MPAMCFG_PRI's default value is also used for software default
+usage after probing resources, two fields hwdef_intpri and hwdef_dspri are
+placed into mpam_device structure to store the default priority setting.
+
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/mpam_resource.h |  5 ++++-
+ arch/arm64/kernel/mpam/mpam_device.c   | 27 +++++++++++++++-----------
+ arch/arm64/kernel/mpam/mpam_device.h   |  4 ++++
+ 3 files changed, 24 insertions(+), 12 deletions(-)
+
+diff --git a/arch/arm64/include/asm/mpam_resource.h b/arch/arm64/include/asm/mpam_resource.h
+index 339615124dbf..3da5e0154f03 100644
+--- a/arch/arm64/include/asm/mpam_resource.h
++++ b/arch/arm64/include/asm/mpam_resource.h
+@@ -134,7 +134,10 @@
+  * MPAMCFG_MBW_MAX SET - temp Hard code
+  */
+ #define MPAMCFG_PRI_DSPRI_SHIFT			16
+-#define MPAMCFG_PRI_GET(r)  ((r & GENMASK(15, 0)) | (r & GENMASK(31, 16)) >> 16)
++#define MPAMCFG_INTPRI_GET(r)  (r & GENMASK(15, 0))
++#define MPAMCFG_DSPRI_GET(r)   ((r & GENMASK(31, 16)) >> 16)
++/* Always same if both supported */
++#define MPAMCFG_PRI_GET(r)     (MPAMCFG_DSPRI_GET(r) | MPAMCFG_INTPRI_GET(r))
+ 
+ /* MPAMF_PRI_IDR - MPAM features priority partitioning ID register */
+ #define MPAMF_PRI_IDR_HAS_INTPRI        BIT(0)
+diff --git a/arch/arm64/kernel/mpam/mpam_device.c b/arch/arm64/kernel/mpam/mpam_device.c
+index e67289732a28..82c6938ba3e9 100644
+--- a/arch/arm64/kernel/mpam/mpam_device.c
++++ b/arch/arm64/kernel/mpam/mpam_device.c
+@@ -206,26 +206,37 @@ static int mpam_device_probe(struct mpam_device *dev)
+ 	/* Priority partitioning */
+ 	if (MPAMF_IDR_HAS_PRI_PART(hwfeatures)) {
+ 		u32 pri_features = mpam_read_reg(dev, MPAMF_PRI_IDR);
++		u32 hwdef_pri = mpam_read_reg(dev, MPAMCFG_PRI);
+ 
+ 		pr_debug("probe: probed PRI_PART\n");
+ 
+ 		dev->intpri_wd = (pri_features & MPAMF_PRI_IDR_INTPRI_WD) >>
+ 				MPAMF_PRI_IDR_INTPRI_WD_SHIFT;
+-		if (dev->intpri_wd && (pri_features &
+-				MPAMF_PRI_IDR_HAS_INTPRI)) {
++		if (dev->intpri_wd && (pri_features & MPAMF_PRI_IDR_HAS_INTPRI)) {
+ 			mpam_set_feature(mpam_feat_intpri_part, &dev->features);
++			dev->hwdef_intpri = MPAMCFG_INTPRI_GET(hwdef_pri);
+ 			if (pri_features & MPAMF_PRI_IDR_INTPRI_0_IS_LOW)
+ 				mpam_set_feature(mpam_feat_intpri_part_0_low,
+ 					&dev->features);
++			else
++				/* keep higher value higher priority */
++				dev->hwdef_intpri = GENMASK(dev->intpri_wd - 1, 0) &
++					~dev->hwdef_intpri;
++
+ 		}
+ 
+ 		dev->dspri_wd = (pri_features & MPAMF_PRI_IDR_DSPRI_WD) >>
+ 				MPAMF_PRI_IDR_DSPRI_WD_SHIFT;
+ 		if (dev->dspri_wd && (pri_features & MPAMF_PRI_IDR_HAS_DSPRI)) {
+ 			mpam_set_feature(mpam_feat_dspri_part, &dev->features);
++			dev->hwdef_dspri = MPAMCFG_DSPRI_GET(hwdef_pri);
+ 			if (pri_features & MPAMF_PRI_IDR_DSPRI_0_IS_LOW)
+ 				mpam_set_feature(mpam_feat_dspri_part_0_low,
+ 					&dev->features);
++			else
++				/* keep higher value higher priority */
++				dev->hwdef_dspri = GENMASK(dev->dspri_wd - 1, 0) &
++					~dev->hwdef_dspri;
+ 		}
+ 	}
+ 
+@@ -723,8 +734,7 @@ static void mpam_reset_device_bitmap(struct mpam_device *dev, u16 reg, u16 wd)
+ static void mpam_reset_device_config(struct mpam_component *comp,
+ 				struct mpam_device *dev, u32 partid)
+ {
+-	u16 intpri = GENMASK(dev->intpri_wd, 0);
+-	u16 dspri = GENMASK(dev->dspri_wd, 0);
++	u16 intpri, dspri;
+ 	u32 pri_val = 0;
+ 	u32 mbw_max;
+ 
+@@ -751,13 +761,8 @@ static void mpam_reset_device_config(struct mpam_component *comp,
+ 
+ 	if (mpam_has_feature(mpam_feat_intpri_part, dev->features) ||
+ 		mpam_has_feature(mpam_feat_dspri_part, dev->features)) {
+-		/* aces high? */
+-		if (!mpam_has_feature(mpam_feat_intpri_part_0_low,
+-				dev->features))
+-			intpri = 0;
+-		if (!mpam_has_feature(mpam_feat_dspri_part_0_low,
+-				dev->features))
+-			dspri = 0;
++		intpri = dev->hwdef_intpri;
++		dspri = dev->hwdef_dspri;
+ 
+ 		if (mpam_has_feature(mpam_feat_intpri_part, dev->features))
+ 			pri_val |= intpri;
+diff --git a/arch/arm64/kernel/mpam/mpam_device.h b/arch/arm64/kernel/mpam/mpam_device.h
+index 9930ca70e0ce..b1f852e65d83 100644
+--- a/arch/arm64/kernel/mpam/mpam_device.h
++++ b/arch/arm64/kernel/mpam/mpam_device.h
+@@ -54,6 +54,10 @@ struct mpam_device {
+ 	u16         num_pmg;
+ 	u16         num_csu_mon;
+ 	u16         num_mbwu_mon;
++
++	/* for reset device MPAMCFG_PRI */
++	u16         hwdef_intpri;
++	u16         hwdef_dspri;
+ };
+ 
+ /*
+-- 
+2.26.2
+

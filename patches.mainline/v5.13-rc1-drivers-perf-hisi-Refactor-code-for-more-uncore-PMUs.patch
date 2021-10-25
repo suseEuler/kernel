@@ -1,0 +1,430 @@
+From baff06c315a146a6943b4fcabb4fe4fa36167413 Mon Sep 17 00:00:00 2001
+From: Shaokun Zhang <zhangshaokun@hisilicon.com>
+Date: Mon, 8 Mar 2021 14:50:30 +0800
+Subject: [PATCH] drivers/perf: hisi: Refactor code for more uncore PMUs
+Git-commit: baff06c315a146a6943b4fcabb4fe4fa36167413
+Patch-mainline: v5.13-rc1
+References: bsn#12
+
+
+On HiSilicon uncore PMU drivers, interrupt handling function and interrupt
+registration function are very similar in differents PMU modules. Let's
+refactor the frame.
+
+Two new callbacks are added for the HW accessors:
+
+* hisi_uncore_ops::get_int_status returns a bitmap of events which
+  have overflowed and raised an interrupt
+
+* hisi_uncore_ops::clear_int_status clears the overflow status for a
+  specific event
+
+These callback functions are used by a common IRQ handler,
+hisi_uncore_pmu_isr().
+
+One more function hisi_uncore_pmu_init_irq() is added to replace each
+PMU initialization IRQ interface and simplify the code.
+
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Will Deacon <will@kernel.org>
+Cc: John Garry <john.garry@huawei.com>
+Cc: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+Reviewed-by: John Garry <john.garry@huawei.com>
+Co-developed-by: Qi Liu <liuqi115@huawei.com>
+Signed-off-by: Qi Liu <liuqi115@huawei.com>
+Signed-off-by: Shaokun Zhang <zhangshaokun@hisilicon.com>
+Link: https://lore.kernel.org/r/1615186237-22263-3-git-send-email-zhangshaokun@hisilicon.com
+Signed-off-by: Will Deacon <will@kernel.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ drivers/perf/hisilicon/hisi_uncore_ddrc_pmu.c | 59 +++----------------
+ drivers/perf/hisilicon/hisi_uncore_hha_pmu.c  | 59 +++----------------
+ drivers/perf/hisilicon/hisi_uncore_l3c_pmu.c  | 59 +++----------------
+ drivers/perf/hisilicon/hisi_uncore_pmu.c      | 54 +++++++++++++++++
+ drivers/perf/hisilicon/hisi_uncore_pmu.h      |  6 +-
+ 5 files changed, 80 insertions(+), 157 deletions(-)
+
+diff --git a/drivers/perf/hisilicon/hisi_uncore_ddrc_pmu.c b/drivers/perf/hisilicon/hisi_uncore_ddrc_pmu.c
+index 38344b49d7af..7f7827cd54d7 100644
+--- a/drivers/perf/hisilicon/hisi_uncore_ddrc_pmu.c
++++ b/drivers/perf/hisilicon/hisi_uncore_ddrc_pmu.c
+@@ -14,7 +14,6 @@
+ #include <linux/interrupt.h>
+ #include <linux/irq.h>
+ #include <linux/list.h>
+-#include <linux/platform_device.h>
+ #include <linux/smp.h>
+ 
+ #include "hisi_uncore_pmu.h"
+@@ -165,60 +164,14 @@ static void hisi_ddrc_pmu_disable_counter_int(struct hisi_pmu *ddrc_pmu,
+ 	writel(val, ddrc_pmu->base + DDRC_INT_MASK);
+ }
+ 
+-static irqreturn_t hisi_ddrc_pmu_isr(int irq, void *dev_id)
++static u32 hisi_ddrc_pmu_get_int_status(struct hisi_pmu *ddrc_pmu)
+ {
+-	struct hisi_pmu *ddrc_pmu = dev_id;
+-	struct perf_event *event;
+-	unsigned long overflown;
+-	int idx;
+-
+-	/* Read the DDRC_INT_STATUS register */
+-	overflown = readl(ddrc_pmu->base + DDRC_INT_STATUS);
+-	if (!overflown)
+-		return IRQ_NONE;
+-
+-	/*
+-	 * Find the counter index which overflowed if the bit was set
+-	 * and handle it
+-	 */
+-	for_each_set_bit(idx, &overflown, DDRC_NR_COUNTERS) {
+-		/* Write 1 to clear the IRQ status flag */
+-		writel((1 << idx), ddrc_pmu->base + DDRC_INT_CLEAR);
+-
+-		/* Get the corresponding event struct */
+-		event = ddrc_pmu->pmu_events.hw_events[idx];
+-		if (!event)
+-			continue;
+-
+-		hisi_uncore_pmu_event_update(event);
+-		hisi_uncore_pmu_set_event_period(event);
+-	}
+-
+-	return IRQ_HANDLED;
++	return readl(ddrc_pmu->base + DDRC_INT_STATUS);
+ }
+ 
+-static int hisi_ddrc_pmu_init_irq(struct hisi_pmu *ddrc_pmu,
+-				  struct platform_device *pdev)
++static void hisi_ddrc_pmu_clear_int_status(struct hisi_pmu *ddrc_pmu, int idx)
+ {
+-	int irq, ret;
+-
+-	/* Read and init IRQ */
+-	irq = platform_get_irq(pdev, 0);
+-	if (irq < 0)
+-		return irq;
+-
+-	ret = devm_request_irq(&pdev->dev, irq, hisi_ddrc_pmu_isr,
+-			       IRQF_NOBALANCING | IRQF_NO_THREAD,
+-			       dev_name(&pdev->dev), ddrc_pmu);
+-	if (ret < 0) {
+-		dev_err(&pdev->dev,
+-			"Fail to request IRQ:%d ret:%d\n", irq, ret);
+-		return ret;
+-	}
+-
+-	ddrc_pmu->irq = irq;
+-
+-	return 0;
++	writel(1 << idx, ddrc_pmu->base + DDRC_INT_CLEAR);
+ }
+ 
+ static const struct acpi_device_id hisi_ddrc_pmu_acpi_match[] = {
+@@ -328,6 +281,8 @@ static const struct hisi_uncore_ops hisi_uncore_ddrc_ops = {
+ 	.disable_counter_int	= hisi_ddrc_pmu_disable_counter_int,
+ 	.write_counter		= hisi_ddrc_pmu_write_counter,
+ 	.read_counter		= hisi_ddrc_pmu_read_counter,
++	.get_int_status		= hisi_ddrc_pmu_get_int_status,
++	.clear_int_status	= hisi_ddrc_pmu_clear_int_status,
+ };
+ 
+ static int hisi_ddrc_pmu_dev_probe(struct platform_device *pdev,
+@@ -339,7 +294,7 @@ static int hisi_ddrc_pmu_dev_probe(struct platform_device *pdev,
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = hisi_ddrc_pmu_init_irq(ddrc_pmu, pdev);
++	ret = hisi_uncore_pmu_init_irq(ddrc_pmu, pdev);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/perf/hisilicon/hisi_uncore_hha_pmu.c b/drivers/perf/hisilicon/hisi_uncore_hha_pmu.c
+index a4b8c7daefa6..667eebddcc82 100644
+--- a/drivers/perf/hisilicon/hisi_uncore_hha_pmu.c
++++ b/drivers/perf/hisilicon/hisi_uncore_hha_pmu.c
+@@ -14,7 +14,6 @@
+ #include <linux/interrupt.h>
+ #include <linux/irq.h>
+ #include <linux/list.h>
+-#include <linux/platform_device.h>
+ #include <linux/smp.h>
+ 
+ #include "hisi_uncore_pmu.h"
+@@ -155,60 +154,14 @@ static void hisi_hha_pmu_disable_counter_int(struct hisi_pmu *hha_pmu,
+ 	writel(val, hha_pmu->base + HHA_INT_MASK);
+ }
+ 
+-static irqreturn_t hisi_hha_pmu_isr(int irq, void *dev_id)
++static u32 hisi_hha_pmu_get_int_status(struct hisi_pmu *hha_pmu)
+ {
+-	struct hisi_pmu *hha_pmu = dev_id;
+-	struct perf_event *event;
+-	unsigned long overflown;
+-	int idx;
+-
+-	/* Read HHA_INT_STATUS register */
+-	overflown = readl(hha_pmu->base + HHA_INT_STATUS);
+-	if (!overflown)
+-		return IRQ_NONE;
+-
+-	/*
+-	 * Find the counter index which overflowed if the bit was set
+-	 * and handle it
+-	 */
+-	for_each_set_bit(idx, &overflown, HHA_NR_COUNTERS) {
+-		/* Write 1 to clear the IRQ status flag */
+-		writel((1 << idx), hha_pmu->base + HHA_INT_CLEAR);
+-
+-		/* Get the corresponding event struct */
+-		event = hha_pmu->pmu_events.hw_events[idx];
+-		if (!event)
+-			continue;
+-
+-		hisi_uncore_pmu_event_update(event);
+-		hisi_uncore_pmu_set_event_period(event);
+-	}
+-
+-	return IRQ_HANDLED;
++	return readl(hha_pmu->base + HHA_INT_STATUS);
+ }
+ 
+-static int hisi_hha_pmu_init_irq(struct hisi_pmu *hha_pmu,
+-				 struct platform_device *pdev)
++static void hisi_hha_pmu_clear_int_status(struct hisi_pmu *hha_pmu, int idx)
+ {
+-	int irq, ret;
+-
+-	/* Read and init IRQ */
+-	irq = platform_get_irq(pdev, 0);
+-	if (irq < 0)
+-		return irq;
+-
+-	ret = devm_request_irq(&pdev->dev, irq, hisi_hha_pmu_isr,
+-			      IRQF_NOBALANCING | IRQF_NO_THREAD,
+-			      dev_name(&pdev->dev), hha_pmu);
+-	if (ret < 0) {
+-		dev_err(&pdev->dev,
+-			"Fail to request IRQ:%d ret:%d\n", irq, ret);
+-		return ret;
+-	}
+-
+-	hha_pmu->irq = irq;
+-
+-	return 0;
++	writel(1 << idx, hha_pmu->base + HHA_INT_CLEAR);
+ }
+ 
+ static const struct acpi_device_id hisi_hha_pmu_acpi_match[] = {
+@@ -340,6 +293,8 @@ static const struct hisi_uncore_ops hisi_uncore_hha_ops = {
+ 	.disable_counter_int	= hisi_hha_pmu_disable_counter_int,
+ 	.write_counter		= hisi_hha_pmu_write_counter,
+ 	.read_counter		= hisi_hha_pmu_read_counter,
++	.get_int_status		= hisi_hha_pmu_get_int_status,
++	.clear_int_status	= hisi_hha_pmu_clear_int_status,
+ };
+ 
+ static int hisi_hha_pmu_dev_probe(struct platform_device *pdev,
+@@ -351,7 +306,7 @@ static int hisi_hha_pmu_dev_probe(struct platform_device *pdev,
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = hisi_hha_pmu_init_irq(hha_pmu, pdev);
++	ret = hisi_uncore_pmu_init_irq(hha_pmu, pdev);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/perf/hisilicon/hisi_uncore_l3c_pmu.c b/drivers/perf/hisilicon/hisi_uncore_l3c_pmu.c
+index f73be6d76abc..831622e0c445 100644
+--- a/drivers/perf/hisilicon/hisi_uncore_l3c_pmu.c
++++ b/drivers/perf/hisilicon/hisi_uncore_l3c_pmu.c
+@@ -14,7 +14,6 @@
+ #include <linux/interrupt.h>
+ #include <linux/irq.h>
+ #include <linux/list.h>
+-#include <linux/platform_device.h>
+ #include <linux/smp.h>
+ 
+ #include "hisi_uncore_pmu.h"
+@@ -154,60 +153,14 @@ static void hisi_l3c_pmu_disable_counter_int(struct hisi_pmu *l3c_pmu,
+ 	writel(val, l3c_pmu->base + L3C_INT_MASK);
+ }
+ 
+-static irqreturn_t hisi_l3c_pmu_isr(int irq, void *dev_id)
++static u32 hisi_l3c_pmu_get_int_status(struct hisi_pmu *l3c_pmu)
+ {
+-	struct hisi_pmu *l3c_pmu = dev_id;
+-	struct perf_event *event;
+-	unsigned long overflown;
+-	int idx;
+-
+-	/* Read L3C_INT_STATUS register */
+-	overflown = readl(l3c_pmu->base + L3C_INT_STATUS);
+-	if (!overflown)
+-		return IRQ_NONE;
+-
+-	/*
+-	 * Find the counter index which overflowed if the bit was set
+-	 * and handle it.
+-	 */
+-	for_each_set_bit(idx, &overflown, L3C_NR_COUNTERS) {
+-		/* Write 1 to clear the IRQ status flag */
+-		writel((1 << idx), l3c_pmu->base + L3C_INT_CLEAR);
+-
+-		/* Get the corresponding event struct */
+-		event = l3c_pmu->pmu_events.hw_events[idx];
+-		if (!event)
+-			continue;
+-
+-		hisi_uncore_pmu_event_update(event);
+-		hisi_uncore_pmu_set_event_period(event);
+-	}
+-
+-	return IRQ_HANDLED;
++	return readl(l3c_pmu->base + L3C_INT_STATUS);
+ }
+ 
+-static int hisi_l3c_pmu_init_irq(struct hisi_pmu *l3c_pmu,
+-				 struct platform_device *pdev)
++static void hisi_l3c_pmu_clear_int_status(struct hisi_pmu *l3c_pmu, int idx)
+ {
+-	int irq, ret;
+-
+-	/* Read and init IRQ */
+-	irq = platform_get_irq(pdev, 0);
+-	if (irq < 0)
+-		return irq;
+-
+-	ret = devm_request_irq(&pdev->dev, irq, hisi_l3c_pmu_isr,
+-			       IRQF_NOBALANCING | IRQF_NO_THREAD,
+-			       dev_name(&pdev->dev), l3c_pmu);
+-	if (ret < 0) {
+-		dev_err(&pdev->dev,
+-			"Fail to request IRQ:%d ret:%d\n", irq, ret);
+-		return ret;
+-	}
+-
+-	l3c_pmu->irq = irq;
+-
+-	return 0;
++	writel(1 << idx, l3c_pmu->base + L3C_INT_CLEAR);
+ }
+ 
+ static const struct acpi_device_id hisi_l3c_pmu_acpi_match[] = {
+@@ -330,6 +283,8 @@ static const struct hisi_uncore_ops hisi_uncore_l3c_ops = {
+ 	.disable_counter_int	= hisi_l3c_pmu_disable_counter_int,
+ 	.write_counter		= hisi_l3c_pmu_write_counter,
+ 	.read_counter		= hisi_l3c_pmu_read_counter,
++	.get_int_status		= hisi_l3c_pmu_get_int_status,
++	.clear_int_status	= hisi_l3c_pmu_clear_int_status,
+ };
+ 
+ static int hisi_l3c_pmu_dev_probe(struct platform_device *pdev,
+@@ -341,7 +296,7 @@ static int hisi_l3c_pmu_dev_probe(struct platform_device *pdev,
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = hisi_l3c_pmu_init_irq(l3c_pmu, pdev);
++	ret = hisi_uncore_pmu_init_irq(l3c_pmu, pdev);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/perf/hisilicon/hisi_uncore_pmu.c b/drivers/perf/hisilicon/hisi_uncore_pmu.c
+index 44b7553a3e42..c9d8e2ec499a 100644
+--- a/drivers/perf/hisilicon/hisi_uncore_pmu.c
++++ b/drivers/perf/hisilicon/hisi_uncore_pmu.c
+@@ -128,6 +128,60 @@ static void hisi_uncore_pmu_clear_event_idx(struct hisi_pmu *hisi_pmu, int idx)
+ 	clear_bit(idx, hisi_pmu->pmu_events.used_mask);
+ }
+ 
++static irqreturn_t hisi_uncore_pmu_isr(int irq, void *data)
++{
++	struct hisi_pmu *hisi_pmu = data;
++	struct perf_event *event;
++	unsigned long overflown;
++	int idx;
++
++	overflown = hisi_pmu->ops->get_int_status(hisi_pmu);
++	if (!overflown)
++		return IRQ_NONE;
++
++	/*
++	 * Find the counter index which overflowed if the bit was set
++	 * and handle it.
++	 */
++	for_each_set_bit(idx, &overflown, hisi_pmu->num_counters) {
++		/* Write 1 to clear the IRQ status flag */
++		hisi_pmu->ops->clear_int_status(hisi_pmu, idx);
++		/* Get the corresponding event struct */
++		event = hisi_pmu->pmu_events.hw_events[idx];
++		if (!event)
++			continue;
++
++		hisi_uncore_pmu_event_update(event);
++		hisi_uncore_pmu_set_event_period(event);
++	}
++
++	return IRQ_HANDLED;
++}
++
++int hisi_uncore_pmu_init_irq(struct hisi_pmu *hisi_pmu,
++			     struct platform_device *pdev)
++{
++	int irq, ret;
++
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0)
++		return irq;
++
++	ret = devm_request_irq(&pdev->dev, irq, hisi_uncore_pmu_isr,
++			       IRQF_NOBALANCING | IRQF_NO_THREAD,
++			       dev_name(&pdev->dev), hisi_pmu);
++	if (ret < 0) {
++		dev_err(&pdev->dev,
++			"Fail to request IRQ: %d ret: %d.\n", irq, ret);
++		return ret;
++	}
++
++	hisi_pmu->irq = irq;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(hisi_uncore_pmu_init_irq);
++
+ int hisi_uncore_pmu_event_init(struct perf_event *event)
+ {
+ 	struct hw_perf_event *hwc = &event->hw;
+diff --git a/drivers/perf/hisilicon/hisi_uncore_pmu.h b/drivers/perf/hisilicon/hisi_uncore_pmu.h
+index 6a7f5491ef7d..933020c99e3e 100644
+--- a/drivers/perf/hisilicon/hisi_uncore_pmu.h
++++ b/drivers/perf/hisilicon/hisi_uncore_pmu.h
+@@ -16,6 +16,7 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/perf_event.h>
++#include <linux/platform_device.h>
+ #include <linux/types.h>
+ 
+ #undef pr_fmt
+@@ -47,6 +48,8 @@ struct hisi_uncore_ops {
+ 	void (*disable_counter_int)(struct hisi_pmu *, struct hw_perf_event *);
+ 	void (*start_counters)(struct hisi_pmu *);
+ 	void (*stop_counters)(struct hisi_pmu *);
++	u32 (*get_int_status)(struct hisi_pmu *hisi_pmu);
++	void (*clear_int_status)(struct hisi_pmu *hisi_pmu, int idx);
+ };
+ 
+ struct hisi_pmu_hwevents {
+@@ -101,6 +104,7 @@ int hisi_uncore_pmu_offline_cpu(unsigned int cpu, struct hlist_node *node);
+ ssize_t hisi_uncore_pmu_identifier_attr_show(struct device *dev,
+ 					     struct device_attribute *attr,
+ 					     char *page);
+-
++int hisi_uncore_pmu_init_irq(struct hisi_pmu *hisi_pmu,
++			     struct platform_device *pdev);
+ 
+ #endif /* __HISI_UNCORE_PMU_H__ */
+-- 
+2.31.1
+

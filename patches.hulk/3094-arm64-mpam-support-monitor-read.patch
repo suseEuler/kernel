@@ -1,0 +1,183 @@
+From c89d858c75ed405c79201b39534e1657cfe1f7cb Mon Sep 17 00:00:00 2001
+From: Xie XiuQi <xiexiuqi@huawei.com>
+Date: Fri, 26 Feb 2021 20:20:56 +0800
+Subject: [PATCH] arm64/mpam: support monitor read
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: c89d858c75ed405c79201b39534e1657cfe1f7cb
+
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+Signed-off-by: Xie XiuQi <xiexiuqi@huawei.com>
+Reviewed-by: Hanjun Guo <guohanjun@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/mpam.h    |  4 ++++
+ arch/arm64/kernel/mpam.c         | 28 +++++++++++++++++++++++++
+ arch/arm64/kernel/mpam_ctrlmon.c | 36 +++++++++++++-------------------
+ 3 files changed, 47 insertions(+), 21 deletions(-)
+
+diff --git a/arch/arm64/include/asm/mpam.h b/arch/arm64/include/asm/mpam.h
+index 8dc8f24e879b..f9f1a961db57 100644
+--- a/arch/arm64/include/asm/mpam.h
++++ b/arch/arm64/include/asm/mpam.h
+@@ -328,6 +328,7 @@ struct raw_resctrl_resource {
+ 	int (*parse_ctrlval)	(char *buf, struct raw_resctrl_resource *r,
+ 				 struct rdt_domain *d);
+ 	int			num_pmg;
++	u64 (*mon_read)		(struct rdt_domain *d, struct rdtgroup *g);
+ };
+ 
+ int parse_cbm(char *buf, struct raw_resctrl_resource *r, struct rdt_domain *d);
+@@ -342,4 +343,7 @@ union mon_data_bits {
+ 	} u;
+ };
+ 
++struct rdt_domain *mpam_find_domain(struct resctrl_resource *r, int id,
++		struct list_head **pos);
++
+ #endif /* _ASM_ARM64_MPAM_H */
+diff --git a/arch/arm64/kernel/mpam.c b/arch/arm64/kernel/mpam.c
+index 5883b9b2fedb..eb488ab407eb 100644
+--- a/arch/arm64/kernel/mpam.c
++++ b/arch/arm64/kernel/mpam.c
+@@ -165,6 +165,9 @@ bw_wrmsr(struct rdt_domain *d, int partid);
+ u64 cat_rdmsr(struct rdt_domain *d, int partid);
+ u64 bw_rdmsr(struct rdt_domain *d, int partid);
+ 
++static u64 mbwu_read(struct rdt_domain *d, struct rdtgroup *g);
++static u64 csu_read(struct rdt_domain *d, struct rdtgroup *g);
++
+ #define domain_init(id) LIST_HEAD_INIT(resctrl_resources_all[id].domains)
+ 
+ struct raw_resctrl_resource raw_resctrl_resources_all[] = {
+@@ -173,18 +176,21 @@ struct raw_resctrl_resource raw_resctrl_resources_all[] = {
+ 		.msr_read		= cat_rdmsr,
+ 		.parse_ctrlval		= parse_cbm,
+ 		.format_str		= "%d=%0*x",
++		.mon_read		= csu_read,
+ 	},
+ 	[MPAM_RESOURCE_CACHE] = {
+ 		.msr_update		= cat_wrmsr,
+ 		.msr_read		= cat_rdmsr,
+ 		.parse_ctrlval		= parse_cbm,
+ 		.format_str		= "%d=%0*x",
++		.mon_read		= csu_read,
+ 	},
+ 	[MPAM_RESOURCE_MC] = {
+ 		.msr_update		= bw_wrmsr,
+ 		.msr_read		= bw_rdmsr,
+ 		.parse_ctrlval		= parse_cbm,	/* [FIXME] add parse_bw() helper */
+ 		.format_str		= "%d=%0*x",
++		.mon_read		= mbwu_read,
+ 	},
+ };
+ 
+@@ -247,6 +253,28 @@ u64 bw_rdmsr(struct rdt_domain *d, int partid)
+ 	return MBW_MAX_GET(max);
+ }
+ 
++/*
++ * [FIXME]
++ * use pmg as monitor id
++ * just use match_pardid only.
++ */
++static u64 mbwu_read(struct rdt_domain *d, struct rdtgroup *g)
++{
++	u32 pmg = g->mon.rmid;
++
++	mpam_writel(pmg, d->base + MSMON_CFG_MON_SEL);
++	return mpam_readl(d->base + MSMON_MBWU);
++}
++
++static u64 csu_read(struct rdt_domain *d, struct rdtgroup *g)
++{
++	u32 pmg = g->mon.rmid;
++
++	mpam_writel(pmg, d->base + MSMON_CFG_MON_SEL);
++	return mpam_readl(d->base + MSMON_CSU);
++}
++
++
+ /*
+  * Trivial allocator for CLOSIDs. Since h/w only supports a small number,
+  * we can keep a bitmap of free CLOSIDs in a single integer.
+diff --git a/arch/arm64/kernel/mpam_ctrlmon.c b/arch/arm64/kernel/mpam_ctrlmon.c
+index 032313421a98..23ec86c3501d 100644
+--- a/arch/arm64/kernel/mpam_ctrlmon.c
++++ b/arch/arm64/kernel/mpam_ctrlmon.c
+@@ -251,27 +251,6 @@ int resctrl_group_schemata_show(struct kernfs_open_file *of,
+ 	return ret;
+ }
+ 
+-/*
+- * [FIXME]
+- * use pmg as monitor id
+- * just use match_pardid only.
+- */
+-static inline u64 mbwu_read(struct rdt_domain *d, struct rdtgroup *g)
+-{
+-	u32 pmg = g->mon.rmid;
+-
+-	mpam_writel(pmg, d->base + MSMON_CFG_MON_SEL);
+-	return mpam_readl(d->base + MSMON_MBWU);
+-}
+-
+-static inline u64 csu_read(struct rdt_domain *d, struct rdtgroup *g)
+-{
+-	u32 pmg = g->mon.rmid;
+-
+-	mpam_writel(pmg, d->base + MSMON_CFG_MON_SEL);
+-	return mpam_readl(d->base + MSMON_CSU);
+-}
+-
+ static inline char *kernfs_node_name(struct kernfs_open_file *of)
+ {
+ 	return (char *)(of ? of->kn->name : NULL);
+@@ -306,9 +285,13 @@ int resctrl_group_mondata_show(struct seq_file *m, void *arg)
+ {
+ 	struct kernfs_open_file *of = m->private;
+ 	struct rdtgroup *rdtgrp;
++	struct rdt_domain *d;
++	struct resctrl_resource *r;
++	struct raw_resctrl_resource *rr;
+ 	union mon_data_bits md;
+ 	int ret = 0;
+ 	char *resname = get_resource_name(kernfs_node_name(of));
++	u64 usage;
+ 
+ 	if (!resname)
+ 		return -ENOMEM;
+@@ -330,7 +313,18 @@ int resctrl_group_mondata_show(struct seq_file *m, void *arg)
+ 		rdtgrp->mon.rmid
+ 	       );
+ 
++	r = &resctrl_resources_all[md.u.rid];
++	rr = r->res;
++
+ 	/* show monitor data */
++	d = mpam_find_domain(r, md.u.domid, NULL);
++	if (IS_ERR(d)) {
++		pr_warn("Could't find domain id %d\n", md.u.domid);
++		return -ENOENT;
++	}
++
++	usage = rr->mon_read(d, rdtgrp);
++	seq_printf(m, "%llu\n", usage);
+ 
+ 	put_resource_name(resname);
+ 	resctrl_group_kn_unlock(of->kn);
+-- 
+2.26.2
+

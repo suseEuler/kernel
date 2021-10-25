@@ -1,0 +1,253 @@
+From 6a5bcd84e886a9a91982e515c539529c28acdcc2 Mon Sep 17 00:00:00 2001
+From: Ilias Apalodimas <ilias.apalodimas@linaro.org>
+Date: Mon, 7 Jun 2021 21:02:38 +0200
+Subject: [PATCH] page_pool: Allow drivers to hint on SKB recycling
+Git-commit: 6a5bcd84e886a9a91982e515c539529c28acdcc2
+Patch-mainline: v5.14-rc1
+References: bsn#12
+
+
+Up to now several high speed NICs have custom mechanisms of recycling
+the allocated memory they use for their payloads.
+Our page_pool API already has recycling capabilities that are always
+used when we are running in 'XDP mode'. So let's tweak the API and the
+kernel network stack slightly and allow the recycling to happen even
+during the standard operation.
+The API doesn't take into account 'split page' policies used by those
+drivers currently, but can be extended once we have users for that.
+
+The idea is to be able to intercept the packet on skb_release_data().
+If it's a buffer coming from our page_pool API recycle it back to the
+pool for further usage or just release the packet entirely.
+
+To achieve that we introduce a bit in struct sk_buff (pp_recycle:1) and
+a field in struct page (page->pp) to store the page_pool pointer.
+Storing the information in page->pp allows us to recycle both SKBs and
+their fragments.
+We could have skipped the skb bit entirely, since identical information
+can bederived from struct page. However, in an effort to affect the free path
+as less as possible, reading a single bit in the skb which is already
+in cache, is better that trying to derive identical information for the
+page stored data.
+
+The driver or page_pool has to take care of the sync operations on it's own
+during the buffer recycling since the buffer is, after opting-in to the
+recycling, never unmapped.
+
+Since the gain on the drivers depends on the architecture, we are not
+enabling recycling by default if the page_pool API is used on a driver.
+In order to enable recycling the driver must call skb_mark_for_recycle()
+to store the information we need for recycling in page->pp and
+enabling the recycling bit, or page_pool_store_mem_info() for a fragment.
+
+Co-developed-by: Jesper Dangaard Brouer <brouer@redhat.com>
+Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+Co-developed-by: Matteo Croce <mcroce@microsoft.com>
+Signed-off-by: Matteo Croce <mcroce@microsoft.com>
+Signed-off-by: Ilias Apalodimas <ilias.apalodimas@linaro.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Chenxi Mao <chenxi.mao@suse.com>
+---
+ include/linux/skbuff.h  | 33 ++++++++++++++++++++++++++++++---
+ include/net/page_pool.h |  9 +++++++++
+ net/core/page_pool.c    | 22 ++++++++++++++++++++++
+ net/core/skbuff.c       | 20 ++++++++++++++++----
+ 4 files changed, 77 insertions(+), 7 deletions(-)
+
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -37,6 +37,7 @@
+ #include <linux/in6.h>
+ #include <linux/if_packet.h>
+ #include <net/flow.h>
++#include <net/page_pool.h>
+ #if IS_ENABLED(CONFIG_NF_CONNTRACK)
+ #include <linux/netfilter/nf_conntrack_common.h>
+ #endif
+@@ -664,6 +665,8 @@ typedef unsigned char *sk_buff_data_t;
+  *	@head_frag: skb was allocated from page fragments,
+  *		not allocated by kmalloc() or vmalloc().
+  *	@pfmemalloc: skbuff was allocated from PFMEMALLOC reserves
++ *	@pp_recycle: mark the packet for recycling instead of freeing (implies
++ *		page_pool support on driver)
+  *	@active_extensions: active extensions (skb_ext_id types)
+  *	@ndisc_nodetype: router type (from link layer)
+  *	@ooo_okay: allow the mapping of a socket to a queue to be changed
+@@ -784,10 +787,12 @@ struct sk_buff {
+ 				fclone:2,
+ 				peeked:1,
+ 				head_frag:1,
+-				pfmemalloc:1;
++				pfmemalloc:1,
++				pp_recycle:1; /* page_pool recycle indicator */
+ #ifdef CONFIG_SKB_EXTENSIONS
+ 	__u8			active_extensions;
+ #endif
++
+ 	/* fields enclosed in headers_start/headers_end are copied
+ 	 * using a single memcpy() in __copy_skb_header()
+ 	 */
+@@ -3034,7 +3039,13 @@ static inline void skb_frag_ref(struct s
+  */
+ static inline void __skb_frag_unref(skb_frag_t *frag, bool recycle)
+ {
+-	put_page(skb_frag_page(frag));
++	struct page *page = skb_frag_page(frag);
++
++#ifdef CONFIG_PAGE_POOL
++	if (recycle && page_pool_return_skb_page(page))
++		return;
++#endif
++	put_page(page);
+ }
+ 
+ /**
+@@ -3046,7 +3057,7 @@ static inline void __skb_frag_unref(skb_
+  */
+ static inline void skb_frag_unref(struct sk_buff *skb, int f)
+ {
+-	__skb_frag_unref(&skb_shinfo(skb)->frags[f], false);
++	__skb_frag_unref(&skb_shinfo(skb)->frags[f], skb->pp_recycle);
+ }
+ 
+ /**
+@@ -4660,5 +4671,21 @@ static inline bool skb_csum_is_sctp(stru
+ {
+ 	return skb->csum_not_inet;
+ }
++
++#ifdef CONFIG_PAGE_POOL
++static inline void skb_mark_for_recycle(struct sk_buff *skb, struct page *page,
++				struct page_pool *pp)
++{
++	skb->pp_recycle = 1;
++	page_pool_store_mem_info(page, pp);
++}
++#endif
++
++static inline bool skb_pp_recycle(struct sk_buff *skb, void *data)
++{
++	if (!IS_ENABLED(CONFIG_PAGE_POOL) || !skb->pp_recycle)
++		return false;
++	return page_pool_return_skb_page(virt_to_page(data));
++}
+ #endif	/* __KERNEL__ */
+ #endif	/* _LINUX_SKBUFF_H */
+--- a/include/net/page_pool.h
++++ b/include/net/page_pool.h
+@@ -146,6 +146,8 @@ inline enum dma_data_direction page_pool
+ 	return pool->p.dma_dir;
+ }
+ 
++bool page_pool_return_skb_page(struct page *page);
++
+ struct page_pool *page_pool_create(const struct page_pool_params *params);
+ 
+ #ifdef CONFIG_PAGE_POOL
+@@ -251,4 +253,11 @@ static inline void page_pool_ring_unlock
+ 		spin_unlock_bh(&pool->ring.producer_lock);
+ }
+ 
++/* Store mem_info on struct page and use it while recycling skb frags */
++static inline
++void page_pool_store_mem_info(struct page *page, struct page_pool *pp)
++{
++	page->pp = pp;
++}
++
+ #endif /* _NET_PAGE_POOL_H */
+--- a/net/core/page_pool.c
++++ b/net/core/page_pool.c
+@@ -629,3 +629,25 @@ void page_pool_update_nid(struct page_po
+ 	}
+ }
+ EXPORT_SYMBOL(page_pool_update_nid);
++
++bool page_pool_return_skb_page(struct page *page)
++{
++	struct page_pool *pp;
++
++	page = compound_head(page);
++	if (unlikely(page->pp_magic != PP_SIGNATURE))
++		return false;
++
++	pp = page->pp;
++
++	/* Driver set this to memory recycling info. Reset it on recycle.
++	 * This will *not* work for NIC using a split-page memory model.
++	 * The page will be returned to the pool here regardless of the
++	 * 'flipped' fragment being in use or not.
++	 */
++	page->pp = NULL;
++	page_pool_put_full_page(pp, page, false);
++
++	return true;
++}
++EXPORT_SYMBOL(page_pool_return_skb_page);
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -69,6 +69,7 @@
+ #include <net/xfrm.h>
+ #include <net/mpls.h>
+ #include <net/mptcp.h>
++#include <net/page_pool.h>
+ 
+ #include <linux/uaccess.h>
+ #include <trace/events/skb.h>
+@@ -598,10 +599,13 @@ static void skb_free_head(struct sk_buff
+ {
+ 	unsigned char *head = skb->head;
+ 
+-	if (skb->head_frag)
++	if (skb->head_frag) {
++		if (skb_pp_recycle(skb, head))
++			return;
+ 		skb_free_frag(head);
+-	else
++	} else {
+ 		kfree(head);
++	}
+ }
+ 
+ static void skb_release_data(struct sk_buff *skb)
+@@ -617,7 +621,7 @@ static void skb_release_data(struct sk_b
+ 	skb_zcopy_clear(skb, true);
+ 
+ 	for (i = 0; i < shinfo->nr_frags; i++)
+-		__skb_frag_unref(&shinfo->frags[i], false);
++		__skb_frag_unref(&shinfo->frags[i], skb->pp_recycle);
+ 
+ 	if (shinfo->frag_list)
+ 		kfree_skb_list(shinfo->frag_list);
+@@ -1004,6 +1008,7 @@ static struct sk_buff *__skb_clone(struc
+ 	n->nohdr = 0;
+ 	n->peeked = 0;
+ 	C(pfmemalloc);
++	C(pp_recycle);
+ 	n->destructor = NULL;
+ 	C(tail);
+ 	C(end);
+@@ -3419,7 +3424,7 @@ int skb_shift(struct sk_buff *tgt, struc
+ 		fragto = &skb_shinfo(tgt)->frags[merge];
+ 
+ 		skb_frag_size_add(fragto, skb_frag_size(fragfrom));
+-		__skb_frag_unref(fragfrom, false);
++		__skb_frag_unref(fragfrom, skb->pp_recycle);
+ 	}
+ 
+ 	/* Reposition in the original skb */
+@@ -5192,6 +5197,13 @@ bool skb_try_coalesce(struct sk_buff *to
+ 	if (skb_cloned(to))
+ 		return false;
+ 
++	/* The page pool signature of struct page will eventually figure out
++	 * which pages can be recycled or not but for now let's prohibit slab
++	 * allocated and page_pool allocated SKBs from being coalesced.
++	 */
++	if (to->pp_recycle != from->pp_recycle)
++		return false;
++
+ 	if (len <= skb_tailroom(to)) {
+ 		if (len)
+ 			BUG_ON(skb_copy_bits(from, 0, skb_put(to, len), len));

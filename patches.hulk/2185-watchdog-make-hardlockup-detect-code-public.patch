@@ -1,0 +1,190 @@
+From 4ffed7d5435d12be6762e6fdef92fd2c67fc27df Mon Sep 17 00:00:00 2001
+From: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Date: Sat, 20 Feb 2021 11:00:54 +0800
+Subject: [PATCH] watchdog: make hardlockup detect code public
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 4ffed7d5435d12be6762e6fdef92fd2c67fc27df
+
+
+hulk inclusion
+category: feature
+bugzilla: 48046
+CVE: NA
+
+-------------------------------------------------------------------------
+
+In current code, the hardlockup detect code is contained by
+CONFIG_HARDLOCKUP_DETECTOR_PERF. This patch makes this code public so
+that other arch hardlockup detector can use it.
+
+Signed-off-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Hanjun Guo <guohanjun@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/nmi.h   | 15 ++++++++++---
+ kernel/Makefile       |  2 +-
+ kernel/watchdog_hld.c | 50 ++++++++++++++++++++++++++-----------------
+ lib/Kconfig.debug     |  2 +-
+ 4 files changed, 44 insertions(+), 25 deletions(-)
+
+--- a/include/linux/nmi.h
++++ b/include/linux/nmi.h
+@@ -7,7 +7,7 @@
+ 
+ #include <linux/sched.h>
+ #include <asm/irq.h>
+-#if defined(CONFIG_HAVE_NMI_WATCHDOG)
++#if defined(CONFIG_HAVE_NMI_WATCHDOG) && !defined(CONFIG_SDEI_WATCHDOG)
+ #include <asm/nmi.h>
+ #endif
+ 
+@@ -83,6 +83,7 @@ static inline void reset_hung_task_detec
+ 
+ #if defined(CONFIG_HARDLOCKUP_DETECTOR)
+ extern void hardlockup_detector_disable(void);
++extern void watchdog_hardlockup_check(struct pt_regs *regs);
+ extern unsigned int hardlockup_panic;
+ #else
+ static inline void hardlockup_detector_disable(void) {}
+@@ -94,8 +95,17 @@ static inline void hardlockup_detector_d
+ # define NMI_WATCHDOG_SYSCTL_PERM	0444
+ #endif
+ 
+-#if defined(CONFIG_HARDLOCKUP_DETECTOR_PERF)
++#if defined(CONFIG_HARDLOCKUP_DETECTOR)
++#ifndef CONFIG_PPC
+ extern void arch_touch_nmi_watchdog(void);
++#endif
++#else
++# if !defined(CONFIG_HAVE_NMI_WATCHDOG)
++static inline void arch_touch_nmi_watchdog(void) {}
++# endif
++#endif
++
++#if defined(CONFIG_HARDLOCKUP_DETECTOR_PERF)
+ extern void hardlockup_detector_perf_stop(void);
+ extern void hardlockup_detector_perf_restart(void);
+ extern void hardlockup_detector_perf_disable(void);
+@@ -110,7 +120,6 @@ static inline void hardlockup_detector_p
+ static inline void hardlockup_detector_perf_cleanup(void) { }
+ # if !defined(CONFIG_HAVE_NMI_WATCHDOG)
+ static inline int hardlockup_detector_perf_init(void) { return -ENODEV; }
+-static inline void arch_touch_nmi_watchdog(void) {}
+ # else
+ static inline int hardlockup_detector_perf_init(void) { return 0; }
+ # endif
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -89,7 +89,7 @@ obj-$(CONFIG_FAIL_FUNCTION) += fail_func
+ obj-$(CONFIG_KGDB) += debug/
+ obj-$(CONFIG_DETECT_HUNG_TASK) += hung_task.o
+ obj-$(CONFIG_LOCKUP_DETECTOR) += watchdog.o
+-obj-$(CONFIG_HARDLOCKUP_DETECTOR_PERF) += watchdog_hld.o
++obj-$(CONFIG_HARDLOCKUP_DETECTOR) += watchdog_hld.o
+ obj-$(CONFIG_SECCOMP) += seccomp.o
+ obj-$(CONFIG_RELAY) += relay.o
+ obj-$(CONFIG_SYSCTL) += utsname_sysctl.o
+--- a/kernel/watchdog_hld.c
++++ b/kernel/watchdog_hld.c
+@@ -22,14 +22,11 @@
+ 
+ static DEFINE_PER_CPU(bool, hard_watchdog_warn);
+ static DEFINE_PER_CPU(bool, watchdog_nmi_touch);
+-static DEFINE_PER_CPU(struct perf_event *, watchdog_ev);
+-static DEFINE_PER_CPU(struct perf_event *, dead_event);
+-static struct cpumask dead_events_mask;
+ 
+ static unsigned long hardlockup_allcpu_dumped;
+-static atomic_t watchdog_cpus = ATOMIC_INIT(0);
+ 
+-notrace void arch_touch_nmi_watchdog(void)
++#ifndef CONFIG_PPC
++notrace void __weak arch_touch_nmi_watchdog(void)
+ {
+ 	/*
+ 	 * Using __raw here because some code paths have
+@@ -41,6 +38,7 @@ notrace void arch_touch_nmi_watchdog(voi
+ 	raw_cpu_write(watchdog_nmi_touch, true);
+ }
+ EXPORT_SYMBOL(arch_touch_nmi_watchdog);
++#endif
+ 
+ #ifdef CONFIG_HARDLOCKUP_CHECK_TIMESTAMP
+ static DEFINE_PER_CPU(ktime_t, last_timestamp);
+@@ -98,22 +96,8 @@ static inline bool watchdog_check_timest
+ }
+ #endif
+ 
+-static struct perf_event_attr wd_hw_attr = {
+-	.type		= PERF_TYPE_HARDWARE,
+-	.config		= PERF_COUNT_HW_CPU_CYCLES,
+-	.size		= sizeof(struct perf_event_attr),
+-	.pinned		= 1,
+-	.disabled	= 1,
+-};
+-
+-/* Callback function for perf event subsystem */
+-static void watchdog_overflow_callback(struct perf_event *event,
+-				       struct perf_sample_data *data,
+-				       struct pt_regs *regs)
++void watchdog_hardlockup_check(struct pt_regs *regs)
+ {
+-	/* Ensure the watchdog never gets throttled */
+-	event->hw.interrupts = 0;
+-
+ 	if (__this_cpu_read(watchdog_nmi_touch) == true) {
+ 		__this_cpu_write(watchdog_nmi_touch, false);
+ 		return;
+@@ -163,6 +147,31 @@ static void watchdog_overflow_callback(s
+ 	return;
+ }
+ 
++#ifdef CONFIG_HARDLOCKUP_DETECTOR_PERF
++static DEFINE_PER_CPU(struct perf_event *, watchdog_ev);
++static DEFINE_PER_CPU(struct perf_event *, dead_event);
++static struct cpumask dead_events_mask;
++static atomic_t watchdog_cpus = ATOMIC_INIT(0);
++
++static struct perf_event_attr wd_hw_attr = {
++	.type		= PERF_TYPE_HARDWARE,
++	.config		= PERF_COUNT_HW_CPU_CYCLES,
++	.size		= sizeof(struct perf_event_attr),
++	.pinned		= 1,
++	.disabled	= 1,
++};
++
++/* Callback function for perf event subsystem */
++static void watchdog_overflow_callback(struct perf_event *event,
++				       struct perf_sample_data *data,
++				       struct pt_regs *regs)
++{
++	/* Ensure the watchdog never gets throttled */
++	event->hw.interrupts = 0;
++
++	watchdog_hardlockup_check(regs);
++}
++
+ static int hardlockup_detector_event_create(void)
+ {
+ 	unsigned int cpu = smp_processor_id();
+@@ -294,3 +303,4 @@ int __init hardlockup_detector_perf_init
+ 	}
+ 	return ret;
+ }
++#endif /* CONFIG_HARDLOCKUP_DETECTOR_PERF */
+--- a/lib/Kconfig.debug
++++ b/lib/Kconfig.debug
+@@ -980,7 +980,7 @@ config HARDLOCKUP_DETECTOR
+ 	bool "Detect Hard Lockups"
+ 	depends on DEBUG_KERNEL && !S390
+ 	depends on HAVE_HARDLOCKUP_DETECTOR_PERF || HAVE_HARDLOCKUP_DETECTOR_ARCH
+-	select LOCKUP_DETECTOR
++	select SOFTLOCKUP_DETECTOR
+ 	select HARDLOCKUP_DETECTOR_PERF if HAVE_HARDLOCKUP_DETECTOR_PERF
+ 	help
+ 	  Say Y here to enable the kernel to act as a watchdog to detect

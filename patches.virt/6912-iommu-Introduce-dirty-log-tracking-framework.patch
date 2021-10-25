@@ -1,0 +1,443 @@
+From bbf3b39e5576bee4e931ea2b9081153364fc8f13 Mon Sep 17 00:00:00 2001
+From: Keqian Zhu <zhukeqian1@huawei.com>
+Date: Thu, 15 Jul 2021 11:00:14 +0800
+Subject: [PATCH] iommu: Introduce dirty log tracking framework
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: bbf3b39e5576bee4e931ea2b9081153364fc8f13
+
+
+virt inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I3ZUKK
+CVE: NA
+
+------------------------------
+
+Some types of IOMMU are capable of tracking DMA dirty log, such as
+ARM SMMU with HTTU or Intel IOMMU with SLADE. This introduces the
+dirty log tracking framework in the IOMMU base layer.
+
+Four new essential interfaces are added, and we maintaince the status
+of dirty log tracking in iommu_domain.
+1. iommu_support_dirty_log: Check whether domain supports dirty log tracking
+2. iommu_switch_dirty_log: Perform actions to start|stop dirty log tracking
+3. iommu_sync_dirty_log: Sync dirty log from IOMMU into a dirty bitmap
+4. iommu_clear_dirty_log: Clear dirty log of IOMMU by a mask bitmap
+
+Note: Don't concurrently call these interfaces with other ops that
+access underlying page table.
+
+Signed-off-by: Keqian Zhu <zhukeqian1@huawei.com>
+Signed-off-by: Kunkun Jiang <jiangkunkun@huawei.com>
+Reviewed-by: Keqian Zhu <zhukeqian1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/iommu/iommu.c        | 201 +++++++++++++++++++++++++++++++++++
+ include/linux/iommu.h        |  67 +++++++++++-
+ include/trace/events/iommu.h |  63 +++++++++++
+ 3 files changed, 330 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/iommu/iommu.c b/drivers/iommu/iommu.c
+index 86e3dbdfb7bd..e85ab69f6318 100644
+--- a/drivers/iommu/iommu.c
++++ b/drivers/iommu/iommu.c
+@@ -2073,6 +2073,7 @@ static struct iommu_domain *__iommu_domain_alloc(struct bus_type *bus,
+ 	domain->type = type;
+ 	/* Assume all sizes by default; the driver may override this later */
+ 	domain->pgsize_bitmap  = bus->iommu_ops->pgsize_bitmap;
++	mutex_init(&domain->switch_log_lock);
+ 
+ 	return domain;
+ }
+@@ -2890,6 +2891,206 @@ int iommu_domain_set_attr(struct iommu_domain *domain,
+ }
+ EXPORT_SYMBOL_GPL(iommu_domain_set_attr);
+ 
++bool iommu_support_dirty_log(struct iommu_domain *domain)
++{
++	const struct iommu_ops *ops = domain->ops;
++
++	return ops->support_dirty_log && ops->support_dirty_log(domain);
++}
++EXPORT_SYMBOL_GPL(iommu_support_dirty_log);
++
++int iommu_switch_dirty_log(struct iommu_domain *domain, bool enable,
++			   unsigned long iova, size_t size, int prot)
++{
++	const struct iommu_ops *ops = domain->ops;
++	unsigned long orig_iova = iova;
++	unsigned int min_pagesz;
++	size_t orig_size = size;
++	bool flush = false;
++	int ret = 0;
++
++	if (unlikely(!ops->switch_dirty_log))
++		return -ENODEV;
++
++	min_pagesz = 1 << __ffs(domain->pgsize_bitmap);
++	if (!IS_ALIGNED(iova | size, min_pagesz)) {
++		pr_err("unaligned: iova 0x%lx size 0x%zx min_pagesz 0x%x\n",
++		       iova, size, min_pagesz);
++		return -EINVAL;
++	}
++
++	mutex_lock(&domain->switch_log_lock);
++	if (enable && domain->dirty_log_tracking) {
++		ret = -EBUSY;
++		goto out;
++	} else if (!enable && !domain->dirty_log_tracking) {
++		ret = -EINVAL;
++		goto out;
++	}
++
++	pr_debug("switch_dirty_log %s for: iova 0x%lx size 0x%zx\n",
++		 enable ? "enable" : "disable", iova, size);
++
++	while (size) {
++		size_t pgsize = iommu_pgsize(domain, iova, size);
++
++		flush = true;
++		ret = ops->switch_dirty_log(domain, enable, iova, pgsize, prot);
++		if (ret)
++			break;
++
++		pr_debug("switch_dirty_log handled: iova 0x%lx size 0x%zx\n",
++			 iova, pgsize);
++
++		iova += pgsize;
++		size -= pgsize;
++	}
++
++	if (flush)
++		iommu_flush_iotlb_all(domain);
++
++	if (!ret) {
++		domain->dirty_log_tracking = enable;
++		trace_switch_dirty_log(orig_iova, orig_size, enable);
++	}
++out:
++	mutex_unlock(&domain->switch_log_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(iommu_switch_dirty_log);
++
++int iommu_sync_dirty_log(struct iommu_domain *domain, unsigned long iova,
++			 size_t size, unsigned long *bitmap,
++			 unsigned long base_iova, unsigned long bitmap_pgshift)
++{
++	const struct iommu_ops *ops = domain->ops;
++	unsigned long orig_iova = iova;
++	unsigned int min_pagesz;
++	size_t orig_size = size;
++	int ret = 0;
++
++	if (unlikely(!ops->sync_dirty_log))
++		return -ENODEV;
++
++	min_pagesz = 1 << __ffs(domain->pgsize_bitmap);
++	if (!IS_ALIGNED(iova | size, min_pagesz)) {
++		pr_err("unaligned: iova 0x%lx size 0x%zx min_pagesz 0x%x\n",
++		       iova, size, min_pagesz);
++		return -EINVAL;
++	}
++
++	mutex_lock(&domain->switch_log_lock);
++	if (!domain->dirty_log_tracking) {
++		ret = -EINVAL;
++		goto out;
++	}
++
++	pr_debug("sync_dirty_log for: iova 0x%lx size 0x%zx\n", iova, size);
++
++	while (size) {
++		size_t pgsize = iommu_pgsize(domain, iova, size);
++
++		ret = ops->sync_dirty_log(domain, iova, pgsize,
++					  bitmap, base_iova, bitmap_pgshift);
++		if (ret)
++			break;
++
++		pr_debug("sync_dirty_log handled: iova 0x%lx size 0x%zx\n",
++			 iova, pgsize);
++
++		iova += pgsize;
++		size -= pgsize;
++	}
++
++	if (!ret)
++		trace_sync_dirty_log(orig_iova, orig_size);
++out:
++	mutex_unlock(&domain->switch_log_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(iommu_sync_dirty_log);
++
++static int __iommu_clear_dirty_log(struct iommu_domain *domain,
++				   unsigned long iova, size_t size,
++				   unsigned long *bitmap,
++				   unsigned long base_iova,
++				   unsigned long bitmap_pgshift)
++{
++	const struct iommu_ops *ops = domain->ops;
++	unsigned long orig_iova = iova;
++	size_t orig_size = size;
++	int ret = 0;
++
++	if (unlikely(!ops->clear_dirty_log))
++		return -ENODEV;
++
++	pr_debug("clear_dirty_log for: iova 0x%lx size 0x%zx\n", iova, size);
++
++	while (size) {
++		size_t pgsize = iommu_pgsize(domain, iova, size);
++
++		ret = ops->clear_dirty_log(domain, iova, pgsize, bitmap,
++					   base_iova, bitmap_pgshift);
++		if (ret)
++			break;
++
++		pr_debug("clear_dirty_log handled: iova 0x%lx size 0x%zx\n",
++			 iova, pgsize);
++
++		iova += pgsize;
++		size -= pgsize;
++	}
++
++	if (!ret)
++		trace_clear_dirty_log(orig_iova, orig_size);
++
++	return ret;
++}
++
++int iommu_clear_dirty_log(struct iommu_domain *domain,
++			  unsigned long iova, size_t size,
++			  unsigned long *bitmap, unsigned long base_iova,
++			  unsigned long bitmap_pgshift)
++{
++	unsigned long riova, rsize;
++	unsigned int min_pagesz;
++	bool flush = false;
++	int rs, re, start, end;
++	int ret = 0;
++
++	min_pagesz = 1 << __ffs(domain->pgsize_bitmap);
++	if (!IS_ALIGNED(iova | size, min_pagesz)) {
++		pr_err("unaligned: iova 0x%lx min_pagesz 0x%x\n",
++		       iova, min_pagesz);
++		return -EINVAL;
++	}
++
++	mutex_lock(&domain->switch_log_lock);
++	if (!domain->dirty_log_tracking) {
++		ret = -EINVAL;
++		goto out;
++	}
++
++	start = (iova - base_iova) >> bitmap_pgshift;
++	end = start + (size >> bitmap_pgshift);
++	bitmap_for_each_set_region(bitmap, rs, re, start, end) {
++		flush = true;
++		riova = base_iova + (rs << bitmap_pgshift);
++		rsize = (re - rs) << bitmap_pgshift;
++		ret = __iommu_clear_dirty_log(domain, riova, rsize, bitmap,
++					      base_iova, bitmap_pgshift);
++		if (ret)
++			break;
++	}
++
++	if (flush)
++		iommu_flush_iotlb_all(domain);
++out:
++	mutex_unlock(&domain->switch_log_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(iommu_clear_dirty_log);
++
+ void iommu_get_resv_regions(struct device *dev, struct list_head *list)
+ {
+ 	const struct iommu_ops *ops = dev->bus->iommu_ops;
+diff --git a/include/linux/iommu.h b/include/linux/iommu.h
+index 3ff424d4f481..35413ebf2ba5 100644
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@ -87,6 +87,8 @@ struct iommu_domain {
+ 	void *handler_token;
+ 	struct iommu_domain_geometry geometry;
+ 	void *iova_cookie;
++	bool dirty_log_tracking;
++	struct mutex switch_log_lock;
+ };
+ 
+ enum iommu_cap {
+@@ -217,6 +219,10 @@ struct iommu_iotlb_gather {
+  * @device_group: find iommu group for a particular device
+  * @domain_get_attr: Query domain attributes
+  * @domain_set_attr: Change domain attributes
++ * @support_dirty_log: Check whether domain supports dirty log tracking
++ * @switch_dirty_log: Perform actions to start|stop dirty log tracking
++ * @sync_dirty_log: Sync dirty log from IOMMU into a dirty bitmap
++ * @clear_dirty_log: Clear dirty log of IOMMU by a mask bitmap
+  * @get_resv_regions: Request list of reserved regions for a device
+  * @put_resv_regions: Free list of reserved regions for a device
+  * @apply_resv_region: Temporary helper call-back for iova reserved ranges
+@@ -274,6 +280,22 @@ struct iommu_ops {
+ 	int (*domain_set_attr)(struct iommu_domain *domain,
+ 			       enum iommu_attr attr, void *data);
+ 
++	/*
++	 * Track dirty log. Note: Don't concurrently call these interfaces with
++	 * other ops that access underlying page table.
++	 */
++	bool (*support_dirty_log)(struct iommu_domain *domain);
++	int (*switch_dirty_log)(struct iommu_domain *domain, bool enable,
++				unsigned long iova, size_t size, int prot);
++	int (*sync_dirty_log)(struct iommu_domain *domain,
++			      unsigned long iova, size_t size,
++			      unsigned long *bitmap, unsigned long base_iova,
++			      unsigned long bitmap_pgshift);
++	int (*clear_dirty_log)(struct iommu_domain *domain,
++			       unsigned long iova, size_t size,
++			       unsigned long *bitmap, unsigned long base_iova,
++			       unsigned long bitmap_pgshift);
++
+ 	/* Request/Free a list of reserved regions for a device */
+ 	void (*get_resv_regions)(struct device *dev, struct list_head *list);
+ 	void (*put_resv_regions)(struct device *dev, struct list_head *list);
+@@ -536,6 +558,17 @@ extern int iommu_domain_get_attr(struct iommu_domain *domain, enum iommu_attr,
+ 				 void *data);
+ extern int iommu_domain_set_attr(struct iommu_domain *domain, enum iommu_attr,
+ 				 void *data);
++extern bool iommu_support_dirty_log(struct iommu_domain *domain);
++extern int iommu_switch_dirty_log(struct iommu_domain *domain, bool enable,
++				  unsigned long iova, size_t size, int prot);
++extern int iommu_sync_dirty_log(struct iommu_domain *domain, unsigned long iova,
++				size_t size, unsigned long *bitmap,
++				unsigned long base_iova,
++				unsigned long bitmap_pgshift);
++extern int iommu_clear_dirty_log(struct iommu_domain *domain, unsigned long iova,
++				 size_t dma_size, unsigned long *bitmap,
++				 unsigned long base_iova,
++				 unsigned long bitmap_pgshift);
+ 
+ /* Window handling function prototypes */
+ extern int iommu_domain_window_enable(struct iommu_domain *domain, u32 wnd_nr,
+@@ -934,7 +967,39 @@ static inline int iommu_domain_set_attr(struct iommu_domain *domain,
+ 	return -EINVAL;
+ }
+ 
+-static inline int  iommu_device_register(struct iommu_device *iommu)
++static inline bool iommu_support_dirty_log(struct iommu_domain *domain)
++{
++	return false;
++}
++
++static inline int iommu_switch_dirty_log(struct iommu_domain *domain,
++					 bool enable, unsigned long iova,
++					 size_t size, int prot)
++{
++	return -EINVAL;
++}
++
++static inline int iommu_sync_dirty_log(struct iommu_domain *domain,
++				       unsigned long iova, size_t size,
++				       unsigned long *bitmap,
++				       unsigned long base_iova,
++				       unsigned long pgshift)
++{
++	return -EINVAL;
++}
++
++static inline int iommu_clear_dirty_log(struct iommu_domain *domain,
++					unsigned long iova, size_t size,
++					unsigned long *bitmap,
++					unsigned long base_iova,
++					unsigned long pgshift)
++{
++	return -EINVAL;
++}
++
++static inline int iommu_device_register(struct iommu_device *iommu,
++					const struct iommu_ops *ops,
++					struct device *hwdev)
+ {
+ 	return -ENODEV;
+ }
+diff --git a/include/trace/events/iommu.h b/include/trace/events/iommu.h
+index 7a7801bc0562..cfd2c9aba028 100644
+--- a/include/trace/events/iommu.h
++++ b/include/trace/events/iommu.h
+@@ -131,6 +131,69 @@ TRACE_EVENT(unmap,
+ 	)
+ );
+ 
++TRACE_EVENT(switch_dirty_log,
++
++	TP_PROTO(unsigned long iova, size_t size, bool enable),
++
++	TP_ARGS(iova, size, enable),
++
++	TP_STRUCT__entry(
++		__field(u64, iova)
++		__field(size_t, size)
++		__field(bool, enable)
++	),
++
++	TP_fast_assign(
++		__entry->iova = iova;
++		__entry->size = size;
++		__entry->enable = enable;
++	),
++
++	TP_printk("IOMMU: iova=0x%016llx size=%zu enable=%u",
++			__entry->iova, __entry->size, __entry->enable
++	)
++);
++
++TRACE_EVENT(sync_dirty_log,
++
++	TP_PROTO(unsigned long iova, size_t size),
++
++	TP_ARGS(iova, size),
++
++	TP_STRUCT__entry(
++		__field(u64, iova)
++		__field(size_t, size)
++	),
++
++	TP_fast_assign(
++		__entry->iova = iova;
++		__entry->size = size;
++	),
++
++	TP_printk("IOMMU: iova=0x%016llx size=%zu", __entry->iova,
++			__entry->size)
++);
++
++TRACE_EVENT(clear_dirty_log,
++
++	TP_PROTO(unsigned long iova, size_t size),
++
++	TP_ARGS(iova, size),
++
++	TP_STRUCT__entry(
++		__field(u64, iova)
++		__field(size_t, size)
++	),
++
++	TP_fast_assign(
++		__entry->iova = iova;
++		__entry->size = size;
++	),
++
++	TP_printk("IOMMU: iova=0x%016llx size=%zu", __entry->iova,
++			__entry->size)
++);
++
+ DECLARE_EVENT_CLASS(iommu_error,
+ 
+ 	TP_PROTO(struct device *dev, unsigned long iova, int flags),
+-- 
+2.26.2
+

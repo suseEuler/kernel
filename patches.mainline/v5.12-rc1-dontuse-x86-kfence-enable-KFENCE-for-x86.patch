@@ -1,0 +1,166 @@
+From 1dc0da6e9ec0f8d735756374697912cd50f402cf Mon Sep 17 00:00:00 2001
+From: Alexander Potapenko <glider@google.com>
+Date: Thu, 25 Feb 2021 17:18:57 -0800
+Subject: [PATCH] x86, kfence: enable KFENCE for x86
+Git-commit: 1dc0da6e9ec0f8d735756374697912cd50f402cf
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+Add architecture specific implementation details for KFENCE and enable
+KFENCE for the x86 architecture. In particular, this implements the
+required interface in <asm/kfence.h> for setting up the pool and
+providing helper functions for protecting and unprotecting pages.
+
+For x86, we need to ensure that the pool uses 4K pages, which is done
+using the set_memory_4k() helper function.
+
+[elver@google.com: add missing copyright and description header]
+  Link: https://lkml.kernel.org/r/20210118092159.145934-2-elver@google.com
+
+Link: https://lkml.kernel.org/r/20201103175841.3495947-3-elver@google.com
+Signed-off-by: Marco Elver <elver@google.com>
+Signed-off-by: Alexander Potapenko <glider@google.com>
+Reviewed-by: Dmitry Vyukov <dvyukov@google.com>
+Co-developed-by: Marco Elver <elver@google.com>
+Reviewed-by: Jann Horn <jannh@google.com>
+Cc: Andrey Konovalov <andreyknvl@google.com>
+Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Christopher Lameter <cl@linux.com>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Eric Dumazet <edumazet@google.com>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Hillf Danton <hdanton@sina.com>
+Cc: "H. Peter Anvin" <hpa@zytor.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Joern Engel <joern@purestorage.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Cc: Kees Cook <keescook@chromium.org>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Paul E. McKenney <paulmck@kernel.org>
+Cc: Pekka Enberg <penberg@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: SeongJae Park <sjpark@amazon.de>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Will Deacon <will@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ arch/x86/Kconfig              |    1 
+ arch/x86/include/asm/kfence.h |   70 ++++++++++++++++++++++++++++++++++++++++++
+ arch/x86/mm/fault.c           |    5 +++
+ 3 files changed, 76 insertions(+)
+ create mode 100644 arch/x86/include/asm/kfence.h
+
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -146,6 +146,7 @@ config X86
+ 	select HAVE_ARCH_JUMP_LABEL_RELATIVE
+ 	select HAVE_ARCH_KASAN			if X86_64
+ 	select HAVE_ARCH_KASAN_VMALLOC		if X86_64
++	select HAVE_ARCH_KFENCE
+ 	select HAVE_ARCH_KGDB
+ 	select HAVE_ARCH_MMAP_RND_BITS		if MMU
+ 	select HAVE_ARCH_MMAP_RND_COMPAT_BITS	if MMU && COMPAT
+--- /dev/null
++++ b/arch/x86/include/asm/kfence.h
+@@ -0,0 +1,70 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * x86 KFENCE support.
++ *
++ * Copyright (C) 2020, Google LLC.
++ */
++
++#ifndef _ASM_X86_KFENCE_H
++#define _ASM_X86_KFENCE_H
++
++#include <linux/bug.h>
++#include <linux/kfence.h>
++
++#include <asm/pgalloc.h>
++#include <asm/pgtable.h>
++#include <asm/set_memory.h>
++#include <asm/tlbflush.h>
++
++/*
++ * The page fault handler entry function, up to which the stack trace is
++ * truncated in reports.
++ */
++#define KFENCE_SKIP_ARCH_FAULT_HANDLER "asm_exc_page_fault"
++
++/* Force 4K pages for __kfence_pool. */
++static inline bool arch_kfence_init_pool(void)
++{
++	unsigned long addr;
++
++	for (addr = (unsigned long)__kfence_pool; is_kfence_address((void *)addr);
++	     addr += PAGE_SIZE) {
++		unsigned int level;
++
++		if (!lookup_address(addr, &level))
++			return false;
++
++		if (level != PG_LEVEL_4K)
++			set_memory_4k(addr, 1);
++	}
++
++	return true;
++}
++
++/* Protect the given page and flush TLB. */
++static inline bool kfence_protect_page(unsigned long addr, bool protect)
++{
++	unsigned int level;
++	pte_t *pte = lookup_address(addr, &level);
++
++	if (WARN_ON(!pte || level != PG_LEVEL_4K))
++		return false;
++
++	/*
++	 * We need to avoid IPIs, as we may get KFENCE allocations or faults
++	 * with interrupts disabled. Therefore, the below is best-effort, and
++	 * does not flush TLBs on all CPUs. We can tolerate some inaccuracy;
++	 * lazy fault handling takes care of faults after the page is PRESENT.
++	 */
++
++	if (protect)
++		set_pte(pte, __pte(pte_val(*pte) & ~_PAGE_PRESENT));
++	else
++		set_pte(pte, __pte(pte_val(*pte) | _PAGE_PRESENT));
++
++	/* Flush this CPU's TLB. */
++	flush_tlb_one_kernel(addr);
++	return true;
++}
++
++#endif /* _ASM_X86_KFENCE_H */
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@ -9,6 +9,7 @@
+ #include <linux/kdebug.h>		/* oops_begin/end, ...		*/
+ #include <linux/extable.h>		/* search_exception_tables	*/
+ #include <linux/memblock.h>		/* max_low_pfn			*/
++#include <linux/kfence.h>		/* kfence_handle_page_fault	*/
+ #include <linux/kprobes.h>		/* NOKPROBE_SYMBOL, ...		*/
+ #include <linux/mmiotrace.h>		/* kmmio_handler, ...		*/
+ #include <linux/perf_event.h>		/* perf_sw_event		*/
+@@ -732,6 +733,10 @@ no_context(struct pt_regs *regs, unsigne
+ 	if (IS_ENABLED(CONFIG_EFI))
+ 		efi_recover_from_page_fault(address);
+ 
++	/* Only not-present faults should be handled by KFENCE. */
++	if (!(error_code & X86_PF_PROT) && kfence_handle_page_fault(address))
++		return;
++
+ oops:
+ 	/*
+ 	 * Oops. The kernel tried to access some bad page. We'll have to

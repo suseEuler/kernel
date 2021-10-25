@@ -1,0 +1,522 @@
+From 260d3f830a8730103c9c53c41066867c9389911d Mon Sep 17 00:00:00 2001
+From: Xie XiuQi <xiexiuqi@huawei.com>
+Date: Fri, 26 Feb 2021 20:21:02 +0800
+Subject: [PATCH] arm64/mpam: support monitor
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 260d3f830a8730103c9c53c41066867c9389911d
+
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+Signed-off-by: Xie XiuQi <xiexiuqi@huawei.com>
+Reviewed-by: Hanjun Guo <guohanjun@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/mpam.h    |  18 ++-
+ arch/arm64/kernel/mpam.c         | 193 +++++++++++++++++++++++++++----
+ arch/arm64/kernel/mpam_ctrlmon.c |  47 ++++++--
+ arch/arm64/kernel/mpam_mon.c     |  33 +++++-
+ fs/resctrlfs.c                   |  10 +-
+ 5 files changed, 268 insertions(+), 33 deletions(-)
+
+diff --git a/arch/arm64/include/asm/mpam.h b/arch/arm64/include/asm/mpam.h
+index b4c7d68b24a4..4b800abe45f9 100644
+--- a/arch/arm64/include/asm/mpam.h
++++ b/arch/arm64/include/asm/mpam.h
+@@ -127,12 +127,14 @@ enum rdt_group_type {
+  * @parent:			parent rdtgrp
+  * @crdtgrp_list:		child rdtgroup node list
+  * @rmid:			rmid for this rdtgroup
++ * @mon:			monnitor id
+  */
+ struct mongroup {
+ 	struct kernfs_node	*mon_data_kn;
+ 	struct rdtgroup		*parent;
+ 	struct list_head	crdtgrp_list;
+ 	u32			rmid;
++	u32			mon;
+ 	int			init;
+ };
+ 
+@@ -164,7 +166,8 @@ struct rdtgroup {
+ extern int max_name_width, max_data_width;
+ 
+ /* rdtgroup.flags */
+-#define	RDT_DELETED		1
++#define	RDT_DELETED		BIT(0)
++#define	RDT_CTRLMON		BIT(1)
+ 
+ /**
+  * struct rdt_domain - group of cpus sharing an RDT resource
+@@ -327,8 +330,9 @@ struct raw_resctrl_resource {
+ 	int (*parse_ctrlval)	(char *buf, struct raw_resctrl_resource *r,
+ 				 struct rdt_domain *d);
+ 	int			num_pmg;
++	int			num_mon;
+ 	u64 (*mon_read)		(struct rdt_domain *d, struct rdtgroup *g);
+-	int (*mon_write)	(struct rdt_domain *d, struct rdtgroup *g, u32 match);
++	int (*mon_write)	(struct rdt_domain *d, struct rdtgroup *g, bool enable);
+ };
+ 
+ int parse_cbm(char *buf, struct raw_resctrl_resource *r, struct rdt_domain *d);
+@@ -346,4 +350,14 @@ union mon_data_bits {
+ struct rdt_domain *mpam_find_domain(struct resctrl_resource *r, int id,
+ 		struct list_head **pos);
+ 
++int resctrl_group_alloc_mon(struct rdtgroup *grp);
++
++void mon_init(void);
++int alloc_mon(void);
++void free_mon(u32 mon);
++
++int resctrl_mkdir_ctrlmon_mondata(struct kernfs_node *parent_kn,
++				  struct rdtgroup *prgrp,
++				  struct kernfs_node **dest_kn);
++
+ #endif /* _ASM_ARM64_MPAM_H */
+diff --git a/arch/arm64/kernel/mpam.c b/arch/arm64/kernel/mpam.c
+index 4261c64f2a12..c172a41488b7 100644
+--- a/arch/arm64/kernel/mpam.c
++++ b/arch/arm64/kernel/mpam.c
+@@ -168,8 +168,8 @@ u64 bw_rdmsr(struct rdt_domain *d, int partid);
+ static u64 mbwu_read(struct rdt_domain *d, struct rdtgroup *g);
+ static u64 csu_read(struct rdt_domain *d, struct rdtgroup *g);
+ 
+-static int mbwu_write(struct rdt_domain *d, struct rdtgroup *g, u32 match);
+-static int csu_write(struct rdt_domain *d, struct rdtgroup *g, u32 match);
++static int mbwu_write(struct rdt_domain *d, struct rdtgroup *g, bool enable);
++static int csu_write(struct rdt_domain *d, struct rdtgroup *g, bool enable);
+ 
+ #define domain_init(id) LIST_HEAD_INIT(resctrl_resources_all[id].domains)
+ 
+@@ -266,43 +266,55 @@ u64 bw_rdmsr(struct rdt_domain *d, int partid)
+  */
+ static u64 mbwu_read(struct rdt_domain *d, struct rdtgroup *g)
+ {
+-	u32 pmg = g->mon.rmid;
++	u32 mon = g->mon.mon;
+ 
+-	mpam_writel(pmg, d->base + MSMON_CFG_MON_SEL);
++	mpam_writel(mon, d->base + MSMON_CFG_MON_SEL);
+ 	return mpam_readl(d->base + MSMON_MBWU);
+ }
+ 
+ static u64 csu_read(struct rdt_domain *d, struct rdtgroup *g)
+ {
+-	u32 pmg = g->mon.rmid;
++	u32 mon = g->mon.mon;
+ 
+-	mpam_writel(pmg, d->base + MSMON_CFG_MON_SEL);
++	mpam_writel(mon, d->base + MSMON_CFG_MON_SEL);
+ 	return mpam_readl(d->base + MSMON_CSU);
+ }
+ 
+-static int mbwu_write(struct rdt_domain *d, struct rdtgroup *g, u32 match)
++static int mbwu_write(struct rdt_domain *d, struct rdtgroup *g, bool enable)
+ {
+-	u32 pmg = g->mon.rmid;
+-	u32 partid = g->closid;
+-	u32 flt = MSMON_CFG_FLT_SET(pmg, partid);
+-	u32 ctl = MSMON_CFG_MBWU_CTL_SET(match);
++	u32 mon, pmg, partid, flt, ctl = 0;
++
++	if (enable) {
++		mon = g->mon.mon;
++		pmg = g->mon.rmid;
++		partid = g->closid;
++		flt = MSMON_CFG_FLT_SET(pmg, partid);
++		ctl = MSMON_CFG_MBWU_CTL_SET(MSMON_MATCH_PMG|MSMON_MATCH_PARTID);
++
++		mpam_writel(mon, d->base + MSMON_CFG_MON_SEL);
++		mpam_writel(flt, d->base + MSMON_CFG_MBWU_FLT);
++	}
+ 
+-	mpam_writel(pmg, d->base + MSMON_CFG_MON_SEL);
+-	mpam_writel(flt, d->base + MSMON_CFG_MBWU_FLT);
+ 	mpam_writel(ctl, d->base + MSMON_CFG_MBWU_CTL);
+ 
+ 	return 0;
+ }
+ 
+-static int csu_write(struct rdt_domain *d, struct rdtgroup *g, u32 match)
++static int csu_write(struct rdt_domain *d, struct rdtgroup *g, bool enable)
+ {
+-	u32 pmg = g->mon.rmid;
+-	u32 partid = g->closid;
+-	u32 flt = MSMON_CFG_FLT_SET(pmg, partid);
+-	u32 ctl = MSMON_CFG_CSU_CTL_SET(match);
++	u32 mon, pmg, partid, flt, ctl = 0;
++
++	if (enable) {
++		mon = g->mon.mon;
++		pmg = g->mon.rmid;
++		partid = g->closid;
++		flt = MSMON_CFG_FLT_SET(pmg, partid);
++		ctl = MSMON_CFG_CSU_CTL_SET(MSMON_MATCH_PMG|MSMON_MATCH_PARTID);
++
++		mpam_writel(mon, d->base + MSMON_CFG_MON_SEL);
++		mpam_writel(flt, d->base + MSMON_CFG_CSU_FLT);
++	}
+ 
+-	mpam_writel(pmg, d->base + MSMON_CFG_MON_SEL);
+-	mpam_writel(flt, d->base + MSMON_CFG_CSU_FLT);
+ 	mpam_writel(ctl, d->base + MSMON_CFG_CSU_CTL);
+ 
+ 	return 0;
+@@ -933,6 +945,139 @@ static int resctrl_group_tasks_show(struct kernfs_open_file *of,
+ 	return ret;
+ }
+ 
++int resctrl_ctrlmon_enable(struct kernfs_node *parent_kn,
++			  struct resctrl_group *prgrp,
++			  struct kernfs_node **dest_kn)
++{
++	int ret;
++
++	pr_info("%s: out of monitors: ret %d, MON_GROUP %d\n",
++		__func__, prgrp->type, RDTMON_GROUP);
++	/* only for RDTCTRL_GROUP */
++	if (prgrp->type == RDTMON_GROUP)
++		return 0;
++
++	ret = alloc_mon();
++	if (ret < 0) {
++		rdt_last_cmd_puts("out of monitors\n");
++		pr_info("out of monitors: ret %d\n", ret);
++		return ret;
++	}
++	prgrp->mon.mon = ret;
++	prgrp->mon.rmid = 0;
++
++	pr_info("%s: prev dest_kn %016llx, closid %d, flags %d, type %d, rmid %d, mon %d\n",
++		__func__, (u64)*dest_kn, prgrp->closid, prgrp->flags, prgrp->type,
++		prgrp->mon.rmid, prgrp->mon.mon);
++
++	ret = mkdir_mondata_all(parent_kn, prgrp, dest_kn);
++	if (ret) {
++		rdt_last_cmd_puts("kernfs subdir error\n");
++		free_mon(ret);
++	}
++
++	pr_info("%s: post dest_kn %016llx, closid %d, flags %d, type %d, rmid %d, mon %d\n",
++		__func__, (u64)*dest_kn, prgrp->closid, prgrp->flags, prgrp->type,
++		prgrp->mon.rmid, prgrp->mon.mon);
++
++	return ret;
++}
++
++int resctrl_ctrlmon_disable(struct kernfs_node *kn_mondata,
++			    struct resctrl_group *prgrp)
++{
++	struct resctrl_resource *r;
++	struct raw_resctrl_resource *rr;
++	struct rdt_domain *dom;
++	int ret, mon = prgrp->mon.mon;
++
++	/* only for RDTCTRL_GROUP */
++	if (prgrp->type == RDTMON_GROUP)
++		return 0;
++
++	/* disable monitor before free mon */
++	for_each_resctrl_resource(r) {
++		if (r->mon_enabled) {
++			rr = (struct raw_resctrl_resource *)r->res;
++
++			list_for_each_entry(dom, &r->domains, list) {
++				rr->mon_write(dom, prgrp, false);
++			}
++		}
++	}
++
++	free_mon(mon);
++
++	pr_info("%s: prev kn_mondta %016llx, closid %d, flags %d, type %d, rmid %d, mon %d\n",
++		__func__, (u64)kn_mondata, prgrp->closid, prgrp->flags, prgrp->type,
++		prgrp->mon.rmid, prgrp->mon.mon);
++
++	kernfs_remove(kn_mondata);
++
++	pr_info("%s: post kn_mondta %016llx, closid %d, flags %d, type %d, rmid %d, mon %d\n",
++		__func__, (u64)kn_mondata, prgrp->closid, prgrp->flags, prgrp->type,
++		prgrp->mon.rmid, prgrp->mon.mon);
++
++	return ret;
++}
++
++static ssize_t resctrl_group_ctrlmon_write(struct kernfs_open_file *of,
++				    char *buf, size_t nbytes, loff_t off)
++{
++	struct rdtgroup *rdtgrp;
++	int ret = 0;
++	int ctrlmon;
++
++	if (kstrtoint(strstrip(buf), 0, &ctrlmon) || ctrlmon < 0)
++		return -EINVAL;
++	rdtgrp = resctrl_group_kn_lock_live(of->kn);
++	rdt_last_cmd_clear();
++
++	pr_info("%s: prev of->kn %016llx, closid %d, flags %d, type %d, rmid %d, mon %d\n",
++		__func__, (u64)of->kn, rdtgrp->closid, rdtgrp->flags, rdtgrp->type,
++		rdtgrp->mon.rmid, rdtgrp->mon.mon);
++
++	if (rdtgrp) {
++		if ((rdtgrp->flags & RDT_CTRLMON) && !ctrlmon) {
++			/* [FIXME] disable & remove mon_data dir */
++			rdtgrp->flags &= ~RDT_CTRLMON;
++			resctrl_ctrlmon_disable(rdtgrp->mon.mon_data_kn, rdtgrp);
++		} else if (!(rdtgrp->flags & RDT_CTRLMON) && ctrlmon) {
++			rdtgrp->flags |= RDT_CTRLMON;
++			resctrl_ctrlmon_enable(rdtgrp->kn, rdtgrp,
++					       &rdtgrp->mon.mon_data_kn);
++		} else {
++			ret = -ENOENT;
++		}
++	} else {
++		ret = -ENOENT;
++	}
++
++	pr_info("%s: post of->kn %016llx, closid %d, flags %d, type %d, rmid %d, mon %d\n",
++		__func__, (u64)of->kn, rdtgrp->closid, rdtgrp->flags, rdtgrp->type,
++		rdtgrp->mon.rmid, rdtgrp->mon.mon);
++
++	resctrl_group_kn_unlock(of->kn);
++
++	return ret ?: nbytes;
++}
++
++static int resctrl_group_ctrlmon_show(struct kernfs_open_file *of,
++			       struct seq_file *s, void *v)
++{
++	struct rdtgroup *rdtgrp;
++	int ret = 0;
++
++	rdtgrp = resctrl_group_kn_lock_live(of->kn);
++	if (rdtgrp)
++		seq_printf(s, "%d", !!(rdtgrp->flags & RDT_CTRLMON));
++	else
++		ret = -ENOENT;
++	resctrl_group_kn_unlock(of->kn);
++
++	return ret;
++}
++
+ /* rdtgroup information files for one cache resource. */
+ static struct rftype res_specific_files[] = {
+ 	{
+@@ -989,6 +1134,14 @@ static struct rftype res_specific_files[] = {
+ 		.seq_show	= resctrl_group_schemata_show,
+ 		.fflags		= RF_CTRL_BASE,
+ 	},
++	{
++		.name		= "ctrlmon",
++		.mode		= 0644,
++		.kf_ops		= &resctrl_group_kf_single_ops,
++		.write		= resctrl_group_ctrlmon_write,
++		.seq_show	= resctrl_group_ctrlmon_show,
++		.fflags		= RF_CTRL_BASE,
++	},
+ };
+ 
+ struct rdt_domain *mpam_find_domain(struct resctrl_resource *r, int id,
+diff --git a/arch/arm64/kernel/mpam_ctrlmon.c b/arch/arm64/kernel/mpam_ctrlmon.c
+index 70a4b57b4851..1e5b2a2d2cfc 100644
+--- a/arch/arm64/kernel/mpam_ctrlmon.c
++++ b/arch/arm64/kernel/mpam_ctrlmon.c
+@@ -128,9 +128,6 @@ static int update_domains(struct resctrl_resource *r, struct rdtgroup *g)
+ 			d->ctrl_val[partid] = d->new_ctrl;
+ 			rr->msr_update(d, partid);
+ 		}
+-
+-		/* only match partid for monitoring this whole group */
+-		rr->mon_write(d, g, MSMON_MATCH_PARTID);
+ 	}
+ 
+ 	return 0;
+@@ -307,14 +304,15 @@ int resctrl_group_mondata_show(struct seq_file *m, void *arg)
+ 	}
+ 
+ 	md.priv = of->kn->priv;
+-	pr_info("%s: resname %s, rid %d, domid %d, partid %d, pmg %d, (group: partid %d, pmg %d)\n",
++	pr_info("%s: resname %s, rid %d, domid %d, partid %d, pmg %d, (group: partid %d, pmg %d, mon %d)\n",
+ 		__func__, resname,
+ 		md.u.rid,
+ 		md.u.domid,
+ 		md.u.partid,
+ 		md.u.pmg,
+ 		rdtgrp->closid,
+-		rdtgrp->mon.rmid
++		rdtgrp->mon.rmid,
++		rdtgrp->mon.mon
+ 	       );
+ 
+ 	r = &resctrl_resources_all[md.u.rid];
+@@ -409,9 +407,8 @@ static int mkdir_mondata_subdir(struct kernfs_node *parent_kn,
+ 	}
+ 
+ 
+-	/* set mon id for mon_groups */
+-	if (prgrp->type == RDTMON_GROUP)
+-		rr->mon_write(d, prgrp, MSMON_MATCH_PMG);
++	/* [FIXME] Could we remove the MATCH_* param ? */
++	rr->mon_write(d, prgrp, true);
+ 
+ 	return ret;
+ #if 0
+@@ -583,3 +580,37 @@ int mkdir_mondata_all(struct kernfs_node *parent_kn,
+ 	kernfs_remove(kn);
+ 	return ret;
+ }
++
++int resctrl_mkdir_ctrlmon_mondata(struct kernfs_node *parent_kn,
++				  struct resctrl_group *prgrp,
++				  struct kernfs_node **dest_kn)
++{
++	int ret;
++
++	/* disalbe monitor by default for mpam. */
++	if (prgrp->type == RDTCTRL_GROUP)
++		return 0;
++
++	ret = alloc_mon();
++	if (ret < 0) {
++		rdt_last_cmd_puts("out of monitors\n");
++		return ret;
++	}
++	prgrp->mon.mon = ret;
++
++	ret = alloc_mon_id();
++	if (ret < 0) {
++		rdt_last_cmd_puts("out of PMGs\n");
++		free_mon(prgrp->mon.mon);
++		return ret;
++	}
++
++	prgrp->mon.rmid = ret;
++
++	ret = mkdir_mondata_all(parent_kn, prgrp, dest_kn);
++	if (ret) {
++		rdt_last_cmd_puts("kernfs subdir error\n");
++		free_mon(ret);
++	}
++	return ret;
++}
+diff --git a/arch/arm64/kernel/mpam_mon.c b/arch/arm64/kernel/mpam_mon.c
+index 38fe89268eca..ae946b2ee681 100644
+--- a/arch/arm64/kernel/mpam_mon.c
++++ b/arch/arm64/kernel/mpam_mon.c
+@@ -36,11 +36,13 @@
+ bool rdt_mon_capable;
+ 
+ static int pmg_free_map;
+-
++void mon_init(void);
+ void pmg_init(void)
+ {
+ 	int pmg_max = 16;
+ 
++	mon_init();
++
+ 	pmg_free_map = BIT_MASK(pmg_max) - 1;
+ 
+ 	/* pmg 0 is always reserved for the default group */
+@@ -65,6 +67,35 @@ void free_pmg(u32 pmg)
+ 	pmg_free_map |= 1 << pmg;
+ }
+ 
++static int mon_free_map;
++void mon_init(void)
++{
++	// [FIXME] hard code for max mon.
++	int mon_max = 8;
++
++	mon_free_map = BIT_MASK(mon_max) - 1;
++
++	/* pmg 0 is always reserved for the default group */
++	mon_free_map &= ~1;
++}
++
++int alloc_mon(void)
++{
++	u32 mon = ffs(mon_free_map);
++
++	if (mon == 0)
++		return -ENOSPC;
++
++	mon--;
++	mon_free_map &= ~(1 << mon);
++
++	return mon;
++}
++
++void free_mon(u32 mon)
++{
++	mon_free_map |= 1 << mon;
++}
+ 
+ /*
+  * As of now the RMIDs allocation is global.
+diff --git a/fs/resctrlfs.c b/fs/resctrlfs.c
+index d95118fdd57f..39bbb6e1fd88 100644
+--- a/fs/resctrlfs.c
++++ b/fs/resctrlfs.c
+@@ -591,6 +591,9 @@ static int mkdir_resctrl_prepare(struct kernfs_node *parent_kn,
+ 	}
+ 
+ 	if (resctrl_mon_capable) {
++#ifdef CONFIG_ARM64
++		resctrl_mkdir_ctrlmon_mondata(kn, rdtgrp, &rdtgrp->mon.mon_data_kn);
++#else
+ 		ret = alloc_mon_id();
+ 		if (ret < 0) {
+ 			rdt_last_cmd_puts("out of RMIDs\n");
+@@ -603,6 +606,7 @@ static int mkdir_resctrl_prepare(struct kernfs_node *parent_kn,
+ 			rdt_last_cmd_puts("kernfs subdir error\n");
+ 			goto out_idfree;
+ 		}
++#endif
+ 	}
+ 	kernfs_activate(kn);
+ 
+@@ -611,8 +615,10 @@ static int mkdir_resctrl_prepare(struct kernfs_node *parent_kn,
+ 	 */
+ 	return 0;
+ 
++#ifndef CONFIG_ARM64
+ out_idfree:
+ 	free_mon_id(rdtgrp->mon.rmid);
++#endif
+ out_destroy:
+ 	kernfs_remove(rdtgrp->kn);
+ out_free_rgrp:
+@@ -777,7 +783,7 @@ static void resctrl_group_rm_mon(struct resctrl_group *rdtgrp,
+ 	cpumask_or(tmpmask, tmpmask, &rdtgrp->cpu_mask);
+ 	update_closid_rmid(tmpmask, NULL);
+ 
+-	rdtgrp->flags = RDT_DELETED;
++	rdtgrp->flags |= RDT_DELETED;
+ 	free_mon_id(rdtgrp->mon.rmid);
+ 
+ 	/*
+@@ -826,7 +832,7 @@ static void resctrl_group_rm_ctrl(struct resctrl_group *rdtgrp, cpumask_var_t tm
+ 	cpumask_or(tmpmask, tmpmask, &rdtgrp->cpu_mask);
+ 	update_closid_rmid(tmpmask, NULL);
+ 
+-	rdtgrp->flags = RDT_DELETED;
++	rdtgrp->flags |= RDT_DELETED;
+ 	resctrl_id_free(rdtgrp->closid);
+ 	free_mon_id(rdtgrp->mon.rmid);
+ 
+-- 
+2.26.2
+

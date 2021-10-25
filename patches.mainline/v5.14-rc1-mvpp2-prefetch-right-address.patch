@@ -1,0 +1,72 @@
+From d8ea89fe8a49bfa18b009b16b66c137dba263f87 Mon Sep 17 00:00:00 2001
+From: Matteo Croce <mcroce@microsoft.com>
+Date: Wed, 9 Jun 2021 15:47:13 +0200
+Subject: [PATCH] mvpp2: prefetch right address
+Git-commit: d8ea89fe8a49bfa18b009b16b66c137dba263f87
+Patch-mainline: v5.14-rc1
+References: bsn#12
+
+
+In the RX buffer, the received data starts after a headroom used to
+align the IP header and to allow prepending headers efficiently.
+The prefetch() should take this into account, and prefetch from
+the very start of the received data.
+
+We can see that ether_addr_equal_64bits(), which is the first function
+to access the data, drops from the top of the perf top output.
+
+prefetch(data):
+
+Overhead  Shared Object     Symbol
+  11.64%  [kernel]          [k] eth_type_trans
+
+prefetch(data + MVPP2_MH_SIZE + MVPP2_SKB_HEADROOM):
+
+Overhead  Shared Object     Symbol
+  13.42%  [kernel]          [k] build_skb
+  10.35%  [mvpp2]           [k] mvpp2_rx
+   9.35%  [kernel]          [k] __netif_receive_skb_core
+   8.24%  [kernel]          [k] kmem_cache_free
+   7.97%  [kernel]          [k] dev_gro_receive
+   7.68%  [kernel]          [k] page_pool_put_page
+   7.32%  [kernel]          [k] kmem_cache_alloc
+   7.09%  [mvpp2]           [k] mvpp2_bm_pool_put
+   3.36%  [kernel]          [k] eth_type_trans
+
+Also, move the eth_type_trans() call a bit down, to give the RAM more
+time to prefetch the data.
+
+Signed-off-by: Matteo Croce <mcroce@microsoft.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+index 5663c1b21870..07d8f3e31b52 100644
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+@@ -3938,7 +3938,7 @@ static int mvpp2_rx(struct mvpp2_port *port, struct napi_struct *napi,
+ 			goto err_drop_frame;
+ 
+ 		/* Prefetch header */
+-		prefetch(data);
++		prefetch(data + MVPP2_MH_SIZE + MVPP2_SKB_HEADROOM);
+ 
+ 		if (bm_pool->frag_size > PAGE_SIZE)
+ 			frag_size = 0;
+@@ -4008,8 +4008,8 @@ static int mvpp2_rx(struct mvpp2_port *port, struct napi_struct *napi,
+ 
+ 		skb_reserve(skb, MVPP2_MH_SIZE + MVPP2_SKB_HEADROOM);
+ 		skb_put(skb, rx_bytes);
+-		skb->protocol = eth_type_trans(skb, dev);
+ 		mvpp2_rx_csum(port, rx_status, skb);
++		skb->protocol = eth_type_trans(skb, dev);
+ 
+ 		napi_gro_receive(napi, skb);
+ 		continue;
+-- 
+2.31.1
+

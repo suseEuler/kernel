@@ -1,0 +1,319 @@
+From 4da32073a8feaedd328f41b9b8dbeff726c3395d Mon Sep 17 00:00:00 2001
+From: Jing Xiangfeng <jingxiangfeng@huawei.com>
+Date: Tue, 6 Jul 2021 16:51:02 +0800
+Subject: [PATCH] memcg: support priority for oom
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 4da32073a8feaedd328f41b9b8dbeff726c3395d
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I3ZN3O
+CVE: NA
+
+--------------------------------------
+
+We first kill the process from the low priority memcg if OOM occurs.
+If the process is not found, then fallback to normal handle.
+
+Signed-off-by: Jing Xiangfeng <jingxiangfeng@huawei.com>
+Reviewed-by: Liu Shixin <liushixin2@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/memcontrol.h |  12 ++++
+ mm/Kconfig                 |  12 ++++
+ mm/memcontrol.c            | 127 +++++++++++++++++++++++++++++++++++++
+ mm/oom_kill.c              |  49 +++++++++++++-
+ 4 files changed, 199 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index c691b1ac95f8..5440fcb38e06 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -295,6 +295,12 @@ struct mem_cgroup {
+ 	bool			tcpmem_active;
+ 	int			tcpmem_pressure;
+ 
++#ifdef CONFIG_MEMCG_QOS
++	/* Currently support 0 and -1.
++	 * in the future it can expand to other value.
++	 */
++	int	memcg_priority;
++#endif
+ #ifdef CONFIG_MEMCG_KMEM
+         /* Index in the kmem_cache->memcg_params.memcg_caches array */
+ 	int kmemcg_id;
+@@ -335,6 +341,12 @@ struct mem_cgroup {
+ 	/* WARNING: nodeinfo must be the last member here */
+ };
+ 
++#ifdef CONFIG_MEMCG_QOS
++bool memcg_low_priority_scan_tasks(int (*)(struct task_struct *, void *),
++				   void *);
++void memcg_print_bad_task(void *arg, int ret);
++#endif
++
+ /*
+  * size of first charge trial. "32" comes from vmscan.c's magic value.
+  * TODO: maybe necessary to use big numbers in big irons.
+diff --git a/mm/Kconfig b/mm/Kconfig
+index 9d606d258ab4..e76ecfae6d45 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -486,6 +486,18 @@ config FRONTSWAP
+ 
+ 	  If unsure, say Y to enable frontswap.
+ 
++config MEMCG_QOS
++	bool "Enable Memory Cgroup Priority"
++	depends on MEMCG
++	depends on X86 || ARM64
++	default y
++	help
++	  MEMCG_QOS means that we first kill the process from the low priority
++	  memcg if OOM occurs. If the process is not found, then fallback to
++	  normal handle.
++
++	  If unsure, say "n".
++
+ config CMA
+ 	bool "Contiguous Memory Allocator"
+ 	depends on MMU
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 60fd91c7f1b8..e1eb2ffbd131 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -1328,6 +1328,9 @@ int mem_cgroup_scan_tasks(struct mem_cgroup *memcg,
+ 			break;
+ 		}
+ 	}
++#ifdef CONFIG_MEMCG_QOS
++	memcg_print_bad_task(arg, ret);
++#endif
+ 	return ret;
+ }
+ 
+@@ -3953,6 +3956,119 @@ static int mem_cgroup_move_charge_write(struct cgroup_subsys_state *css,
+ }
+ #endif
+ 
++#ifdef CONFIG_MEMCG_QOS
++static void memcg_qos_init(struct mem_cgroup *memcg)
++{
++	struct mem_cgroup *parent = parent_mem_cgroup(memcg);
++
++	if (!parent)
++		return;
++
++	if (parent->memcg_priority && parent->use_hierarchy)
++		memcg->memcg_priority = parent->memcg_priority;
++}
++
++static s64 memcg_qos_read(struct cgroup_subsys_state *css,
++				      struct cftype *cft)
++{
++	return mem_cgroup_from_css(css)->memcg_priority;
++}
++
++static int memcg_qos_write(struct cgroup_subsys_state *css,
++				       struct cftype *cft, s64 val)
++{
++	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
++
++	if (val >= 0)
++		memcg->memcg_priority = 0;
++	else
++		memcg->memcg_priority = -1;
++
++	return 0;
++}
++
++static struct mem_cgroup *memcg_find_max_usage(struct mem_cgroup *last)
++{
++	struct mem_cgroup *iter, *max_memcg = NULL;
++	struct cgroup_subsys_state *css;
++	unsigned long usage, max_usage = 0;
++
++	rcu_read_lock();
++	css_for_each_descendant_pre(css, &root_mem_cgroup->css) {
++		iter = mem_cgroup_from_css(css);
++
++		if (!iter->memcg_priority || iter == root_mem_cgroup ||
++			iter == last)
++			continue;
++
++		usage = mem_cgroup_usage(iter, false);
++		if (usage > max_usage) {
++			max_usage = usage;
++			max_memcg = iter;
++		}
++	}
++	rcu_read_unlock();
++
++	return max_memcg;
++}
++
++bool memcg_low_priority_scan_tasks(int (*fn)(struct task_struct *, void *),
++				   void *arg)
++{
++	struct mem_cgroup *max, *last = NULL;
++	struct oom_control *oc = arg;
++	struct css_task_iter it;
++	struct task_struct *task;
++	int ret = 0;
++	bool retry = true;
++
++retry:
++	max = memcg_find_max_usage(last);
++	if (!max)
++		return false;
++
++	css_task_iter_start(&max->css, 0, &it);
++	while (!ret && (task = css_task_iter_next(&it))) {
++		if (test_tsk_thread_flag(task, TIF_MEMDIE)) {
++			pr_info("task %s is dying.\n", task->comm);
++			continue;
++		}
++
++		ret = fn(task, arg);
++	}
++	css_task_iter_end(&it);
++
++	if (ret)
++		return false;
++
++	if (!oc->chosen && retry) {
++		last = max;
++		retry = false;
++		goto retry;
++	}
++
++	if (oc->chosen)
++		pr_info("The bad task [%d:%s] is from low-priority memcg.\n",
++				oc->chosen->pid, oc->chosen->comm);
++
++	return oc->chosen ? true : false;
++}
++
++void memcg_print_bad_task(void *arg, int ret)
++{
++	struct oom_control *oc = arg;
++
++	if (!ret && oc->chosen) {
++		struct mem_cgroup *memcg;
++
++		memcg = mem_cgroup_from_task(oc->chosen);
++		if (memcg->memcg_priority)
++			pr_info("The bad task [%d:%s] is from low-priority memcg.\n",
++				oc->chosen->pid, oc->chosen->comm);
++	}
++}
++#endif
++
+ #ifdef CONFIG_NUMA
+ 
+ #define LRU_ALL_FILE (BIT(LRU_INACTIVE_FILE) | BIT(LRU_ACTIVE_FILE))
+@@ -5057,6 +5173,13 @@ static struct cftype mem_cgroup_legacy_files[] = {
+ 	{
+ 		.name = "pressure_level",
+ 	},
++#ifdef CONFIG_MEMCG_QOS
++	{
++		.name = "qos_level",
++		.read_s64 = memcg_qos_read,
++		.write_s64 = memcg_qos_write,
++	},
++#endif
+ #ifdef CONFIG_NUMA
+ 	{
+ 		.name = "numa_stat",
+@@ -5413,6 +5536,10 @@ static int mem_cgroup_css_online(struct cgroup_subsys_state *css)
+ 		return -ENOMEM;
+ 	}
+ 
++#ifdef CONFIG_MEMCG_QOS
++	memcg_qos_init(memcg);
++#endif
++
+ 	/* Online state pins memcg ID, memcg ID pins CSS */
+ 	refcount_set(&memcg->id.ref, 1);
+ 	css_get(css);
+diff --git a/mm/oom_kill.c b/mm/oom_kill.c
+index 8b84661a6410..275c2bdb20d2 100644
+--- a/mm/oom_kill.c
++++ b/mm/oom_kill.c
+@@ -305,6 +305,49 @@ static enum oom_constraint constrained_alloc(struct oom_control *oc)
+ 	return CONSTRAINT_NONE;
+ }
+ 
++#ifdef CONFIG_MEMCG_QOS
++/**
++ * We choose the task in low-priority memcg firstly. For the same state, we
++ * choose the task with the highest number of 'points'.
++ */
++static bool oom_next_task(struct task_struct *task, struct oom_control *oc,
++			unsigned long points)
++{
++	struct mem_cgroup *cur_memcg;
++	struct mem_cgroup *oc_memcg;
++
++
++	if (!points)
++		return true;
++
++	if (!oc->chosen)
++		return false;
++
++	oc_memcg = mem_cgroup_from_task(oc->chosen);
++	cur_memcg = mem_cgroup_from_task(task);
++
++	if (cur_memcg->memcg_priority == oc_memcg->memcg_priority) {
++		if (points < oc->chosen_points)
++			return true;
++		return false;
++	}
++	/* if oc is low-priority, so skip the task */
++	if (oc_memcg->memcg_priority)
++		return true;
++
++	return false;
++}
++#else
++static inline bool oom_next_task(struct task_struct *task,
++				struct oom_control *oc, unsigned long points)
++{
++	if (!points || points < oc->chosen_points)
++		return true;
++
++	return false;
++}
++#endif
++
+ static int oom_evaluate_task(struct task_struct *task, void *arg)
+ {
+ 	struct oom_control *oc = arg;
+@@ -339,7 +382,7 @@ static int oom_evaluate_task(struct task_struct *task, void *arg)
+ 	}
+ 
+ 	points = oom_badness(task, oc->totalpages);
+-	if (points == LONG_MIN || points < oc->chosen_points)
++	if (oom_next_task(task, oc, points))
+ 		goto next;
+ 
+ select:
+@@ -370,6 +413,10 @@ static void select_bad_process(struct oom_control *oc)
+ 	else {
+ 		struct task_struct *p;
+ 
++#ifdef CONFIG_MEMCG_QOS
++		if (memcg_low_priority_scan_tasks(oom_evaluate_task, oc))
++			return;
++#endif
+ 		rcu_read_lock();
+ 		for_each_process(p)
+ 			if (oom_evaluate_task(p, oc))
+-- 
+2.26.2
+

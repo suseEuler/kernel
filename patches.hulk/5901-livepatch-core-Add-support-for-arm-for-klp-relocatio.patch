@@ -1,0 +1,97 @@
+From 33fed73a34b27c650c94bc85e040158ecc4bf725 Mon Sep 17 00:00:00 2001
+From: Dong Kai <dongkai11@huawei.com>
+Date: Sat, 29 May 2021 14:42:49 +0800
+Subject: [PATCH] livepatch/core: Add support for arm for klp relocation
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 33fed73a34b27c650c94bc85e040158ecc4bf725
+
+
+hulk inclusion
+category: feature
+bugzilla: 51923
+CVE: NA
+
+---------------------------
+
+In the older version of livepatch implementation without ftrace on
+arm, it use klp_relocs and do special relocation for klp syms. The
+kpatch-build front-tools use kpatch version to generate klp_relocs.
+
+After commit 7c8e2bdd5f0d ("livepatch: Apply vmlinux-specific KLP
+relocations early") and commit 425595a7fc20 ("livepatch: reuse module
+loader code to write relocations"), the mainline klp relocation flow
+is always using ".klp.rela." section and kpatch-build front-tools use
+klp version to generate klp module.
+
+The default klp_apply_section_relocs is only for 64bit and modules
+with rela support. Because CONFIG_MODULES_USE_ELF_REL is set in arm,
+so we modify klp relocation to support 32bit and modules using rel.
+Also the kpatch-build front-tools should adapter to support this.
+
+Signed-off-by: Dong Kai <dongkai11@huawei.com>
+
+Signed-off-by: Ye Weihua <yeweihua4@huawei.com>
+Reviewed-by: Yang Jihong <yangjihong1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/livepatch/core.c | 18 +++++++++++++++---
+ 1 file changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/livepatch/core.c b/kernel/livepatch/core.c
+index 0a7fbd1468a8..b1b80b1c6d3e 100644
+--- a/kernel/livepatch/core.c
++++ b/kernel/livepatch/core.c
+@@ -258,14 +258,18 @@ static int klp_find_object_symbol(const char *objname, const char *name,
+ 	return -EINVAL;
+ }
+ 
+-static int klp_resolve_symbols(Elf64_Shdr *sechdrs, const char *strtab,
++static int klp_resolve_symbols(Elf_Shdr *sechdrs, const char *strtab,
+ 			       unsigned int symndx, Elf_Shdr *relasec,
+ 			       const char *sec_objname)
+ {
+ 	int i, cnt, ret;
+ 	char sym_objname[MODULE_NAME_LEN];
+ 	char sym_name[KSYM_NAME_LEN];
++#ifdef CONFIG_MODULES_USE_ELF_RELA
+ 	Elf_Rela *relas;
++#else
++	Elf_Rel *relas;
++#endif
+ 	Elf_Sym *sym;
+ 	unsigned long sympos, addr;
+ 	bool sym_vmlinux;
+@@ -283,10 +287,14 @@ static int klp_resolve_symbols(Elf64_Shdr *sechdrs, const char *strtab,
+ 	 */
+ 	BUILD_BUG_ON(MODULE_NAME_LEN < 56 || KSYM_NAME_LEN != 128);
+ 
++#ifdef CONFIG_MODULES_USE_ELF_RELA
+ 	relas = (Elf_Rela *) relasec->sh_addr;
++#else
++	relas = (Elf_Rel *) relasec->sh_addr;
++#endif
+ 	/* For each rela in this klp relocation section */
+-	for (i = 0; i < relasec->sh_size / sizeof(Elf_Rela); i++) {
+-		sym = (Elf64_Sym *)sechdrs[symndx].sh_addr + ELF_R_SYM(relas[i].r_info);
++	for (i = 0; i < relasec->sh_size / sizeof(*relas); i++) {
++		sym = (Elf_Sym *)sechdrs[symndx].sh_addr + ELF_R_SYM(relas[i].r_info);
+ 		if (sym->st_shndx != SHN_LIVEPATCH) {
+ 			pr_err("symbol %s is not marked as a livepatch symbol\n",
+ 			       strtab + sym->st_name);
+@@ -381,7 +389,11 @@ int klp_apply_section_relocs(struct module *pmod, Elf_Shdr *sechdrs,
+ 	if (ret)
+ 		return ret;
+ 
++#ifdef CONFIG_MODULES_USE_ELF_RELA
+ 	return apply_relocate_add(sechdrs, strtab, symndx, secndx, pmod);
++#else
++	return apply_relocate(sechdrs, strtab, symndx, secndx, pmod);
++#endif
+ }
+ 
+ /*
+-- 
+2.26.2
+

@@ -1,0 +1,172 @@
+From b6769834aac1d467fa1c71277d15688efcbb4d76 Mon Sep 17 00:00:00 2001
+From: Alex Shi <alex.shi@linux.alibaba.com>
+Date: Tue, 15 Dec 2020 12:33:33 -0800
+Subject: [PATCH] mm/thp: narrow lru locking
+Git-commit: b6769834aac1d467fa1c71277d15688efcbb4d76
+Patch-mainline: v5.11-rc1
+References: bsn#12
+
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+lru_lock and page cache xa_lock have no obvious reason to be taken one
+way round or the other: until now, lru_lock has been taken before page
+cache xa_lock, when splitting a THP; but nothing else takes them
+together.  Reverse that ordering: let's narrow the lru locking - but
+leave local_irq_disable to block interrupts throughout, like before.
+
+Hugh Dickins point: split_huge_page_to_list() was already silly, to be
+using the _irqsave variant: it's just been taking sleeping locks, so
+would already be broken if entered with interrupts enabled.  So we can
+save passing flags argument down to __split_huge_page().
+
+Why change the lock ordering here? That was hard to decide.  One reason:
+when this series reaches per-memcg lru locking, it relies on the THP's
+memcg to be stable when taking the lru_lock: that is now done after the
+THP's refcount has been frozen, which ensures page memcg cannot change.
+
+Another reason: previously, lock_page_memcg()'s move_lock was presumed
+to nest inside lru_lock; but now lru_lock must nest inside (page cache
+lock inside) move_lock, so it becomes possible to use lock_page_memcg()
+to stabilize page memcg before taking its lru_lock.  That is not the
+mechanism used in this series, but it is an option we want to keep open.
+
+[hughd@google.com: rewrite commit log]
+
+Link: https://lkml.kernel.org/r/1604566549-62481-5-git-send-email-alex.shi@linux.alibaba.com
+Signed-off-by: Alex Shi <alex.shi@linux.alibaba.com>
+Reviewed-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Acked-by: Hugh Dickins <hughd@google.com>
+Cc: Kirill A. Shutemov <kirill@shutemov.name>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Alexander Duyck <alexander.duyck@gmail.com>
+Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+Cc: "Chen, Rong A" <rong.a.chen@intel.com>
+Cc: Daniel Jordan <daniel.m.jordan@oracle.com>
+Cc: "Huang, Ying" <ying.huang@intel.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Cc: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mika Penttilä <mika.penttila@nextfour.com>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Shakeel Butt <shakeelb@google.com>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Wei Yang <richard.weiyang@gmail.com>
+Cc: Yang Shi <yang.shi@linux.alibaba.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+[jyang: fix fuzz in bulk 7,8,9]
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ mm/huge_memory.c | 25 +++++++++++++------------
+ 1 file changed, 13 insertions(+), 12 deletions(-)
+
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index e8ccf8979648..a59333aa4020 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -2446,7 +2446,7 @@ static void __split_huge_page_tail(struct page *head, int tail,
+ }
+ 
+ static void __split_huge_page(struct page *page, struct list_head *list,
+-		pgoff_t end, unsigned long flags)
++		pgoff_t end)
+ {
+ 	struct page *head = compound_head(page);
+ 	pg_data_t *pgdat = page_pgdat(head);
+@@ -2456,8 +2456,6 @@ static void __split_huge_page(struct page *page, struct list_head *list,
+ 	unsigned int nr = thp_nr_pages(head);
+ 	int i;
+ 
+-	lruvec = mem_cgroup_page_lruvec(head, pgdat);
+-
+ 	/* complete memcg works before add pages to LRU */
+ 	split_page_memcg(head, nr);
+ 
+@@ -2469,6 +2467,11 @@ static void __split_huge_page(struct page *page, struct list_head *list,
+ 		xa_lock(&swap_cache->i_pages);
+ 	}
+ 
++	/* prevent PageLRU to go away from under us, and freeze lru stats */
++	spin_lock(&pgdat->lru_lock);
++
++	lruvec = mem_cgroup_page_lruvec(head, pgdat);
++
+ 	for (i = nr - 1; i >= 1; i--) {
+ 		__split_huge_page_tail(head, i, lruvec, list);
+ 		/* Some pages can be beyond i_size: drop them from page cache */
+@@ -2488,6 +2491,8 @@ static void __split_huge_page(struct page *page, struct list_head *list,
+ 	}
+ 
+ 	ClearPageCompound(head);
++	spin_unlock(&pgdat->lru_lock);
++	/* Caller disabled irqs, so they are still disabled here */
+ 
+ 	split_page_owner(head, nr);
+ 
+@@ -2505,8 +2510,7 @@ static void __split_huge_page(struct page *page, struct list_head *list,
+ 		page_ref_add(head, 2);
+ 		xa_unlock(&head->mapping->i_pages);
+ 	}
+-
+-	spin_unlock_irqrestore(&pgdat->lru_lock, flags);
++	local_irq_enable();
+ 
+ 	remap_page(head, nr);
+ 
+@@ -2652,12 +2656,10 @@ bool can_split_huge_page(struct page *page, int *pextra_pins)
+ int split_huge_page_to_list(struct page *page, struct list_head *list)
+ {
+ 	struct page *head = compound_head(page);
+-	struct pglist_data *pgdata = NODE_DATA(page_to_nid(head));
+ 	struct deferred_split *ds_queue = get_deferred_split_queue(head);
+ 	struct anon_vma *anon_vma = NULL;
+ 	struct address_space *mapping = NULL;
+ 	int extra_pins, ret;
+-	unsigned long flags;
+ 	pgoff_t end;
+ 
+ 	VM_BUG_ON_PAGE(is_huge_zero_page(head), head);
+@@ -2718,9 +2720,8 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
+ 
+ 	unmap_page(head);
+ 
+-	/* prevent PageLRU to go away from under us, and freeze lru stats */
+-	spin_lock_irqsave(&pgdata->lru_lock, flags);
+-
++	/* block interrupt reentry in xa_lock and spinlock */
++	local_irq_disable();
+ 	if (mapping) {
+ 		XA_STATE(xas, &mapping->i_pages, page_index(head));
+ 
+@@ -2750,7 +2751,7 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
+ 				__dec_node_page_state(head, NR_FILE_THPS);
+ 		}
+ 
+-		__split_huge_page(page, list, end, flags);
++		__split_huge_page(page, list, end);
+ 		ret = 0;
+ 	} else {
+ 		spin_unlock(&ds_queue->split_queue_lock);
+@@ -2764,7 +2765,7 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
+ fail:
+ 		if (mapping)
+ 			xa_unlock(&mapping->i_pages);
+-		spin_unlock_irqrestore(&pgdata->lru_lock, flags);
++		local_irq_enable();
+ 		remap_page(head, thp_nr_pages(head));
+ 		ret = -EBUSY;
+ 	}
+-- 
+2.31.1
+

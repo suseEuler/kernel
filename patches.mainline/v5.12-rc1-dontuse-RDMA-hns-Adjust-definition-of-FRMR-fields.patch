@@ -1,0 +1,173 @@
+From bf656b029f88ca4b00e2b84c752813f2cb306174 Mon Sep 17 00:00:00 2001
+From: Yixing Liu <liuyixing1@huawei.com>
+Date: Wed, 10 Feb 2021 10:33:44 +0800
+Subject: [PATCH] RDMA/hns: Adjust definition of FRMR fields
+Git-commit: bf656b029f88ca4b00e2b84c752813f2cb306174
+Patch-mainline: v5.12-rc2
+References: bsn#12
+openEuler-commit: 5f5f4692c266823721a0191e123096f05c5f7baa
+
+FRMR is not well-supported on HIP08, it is re-designed for HIP09 and the
+position of related fields is changed. Then the ULPs should be forbidden
+to use FRMR on older hardwares.
+
+Link: https://lore.kernel.org/r/1612924424-28217-1-git-send-email-liweihang@huawei.com
+Signed-off-by: Yixing Liu <liuyixing1@huawei.com>
+Signed-off-by: Weihang Li <liweihang@huawei.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.c |   45 ++++++++++++++++-------------
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.h |   12 +++----
+ drivers/infiniband/hw/hns/hns_roce_main.c  |    3 +
+ 3 files changed, 34 insertions(+), 26 deletions(-)
+
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+@@ -99,16 +99,16 @@ static void set_frmr_seg(struct hns_roce
+ 	u64 pbl_ba;
+ 
+ 	/* use ib_access_flags */
+-	roce_set_bit(rc_sq_wqe->byte_4, V2_RC_FRMR_WQE_BYTE_4_BIND_EN_S,
+-		     wr->access & IB_ACCESS_MW_BIND ? 1 : 0);
+-	roce_set_bit(rc_sq_wqe->byte_4, V2_RC_FRMR_WQE_BYTE_4_ATOMIC_S,
+-		     wr->access & IB_ACCESS_REMOTE_ATOMIC ? 1 : 0);
+-	roce_set_bit(rc_sq_wqe->byte_4, V2_RC_FRMR_WQE_BYTE_4_RR_S,
+-		     wr->access & IB_ACCESS_REMOTE_READ ? 1 : 0);
+-	roce_set_bit(rc_sq_wqe->byte_4, V2_RC_FRMR_WQE_BYTE_4_RW_S,
+-		     wr->access & IB_ACCESS_REMOTE_WRITE ? 1 : 0);
+-	roce_set_bit(rc_sq_wqe->byte_4, V2_RC_FRMR_WQE_BYTE_4_LW_S,
+-		     wr->access & IB_ACCESS_LOCAL_WRITE ? 1 : 0);
++	roce_set_bit(fseg->byte_40, V2_RC_FRMR_WQE_BYTE_40_BIND_EN_S,
++		     !!(wr->access & IB_ACCESS_MW_BIND));
++	roce_set_bit(fseg->byte_40, V2_RC_FRMR_WQE_BYTE_40_ATOMIC_S,
++		     !!(wr->access & IB_ACCESS_REMOTE_ATOMIC));
++	roce_set_bit(fseg->byte_40, V2_RC_FRMR_WQE_BYTE_40_RR_S,
++		     !!(wr->access & IB_ACCESS_REMOTE_READ));
++	roce_set_bit(fseg->byte_40, V2_RC_FRMR_WQE_BYTE_40_RW_S,
++		     !!(wr->access & IB_ACCESS_REMOTE_WRITE));
++	roce_set_bit(fseg->byte_40, V2_RC_FRMR_WQE_BYTE_40_LW_S,
++		     !!(wr->access & IB_ACCESS_LOCAL_WRITE));
+ 
+ 	/* Data structure reuse may lead to confusion */
+ 	pbl_ba = mr->pbl_mtr.hem_cfg.root_ba;
+@@ -121,12 +121,10 @@ static void set_frmr_seg(struct hns_roce
+ 	rc_sq_wqe->va = cpu_to_le64(wr->mr->iova);
+ 
+ 	fseg->pbl_size = cpu_to_le32(mr->npages);
+-	roce_set_field(fseg->mode_buf_pg_sz,
+-		       V2_RC_FRMR_WQE_BYTE_40_PBL_BUF_PG_SZ_M,
++	roce_set_field(fseg->byte_40, V2_RC_FRMR_WQE_BYTE_40_PBL_BUF_PG_SZ_M,
+ 		       V2_RC_FRMR_WQE_BYTE_40_PBL_BUF_PG_SZ_S,
+ 		       to_hr_hw_page_shift(mr->pbl_mtr.hem_cfg.buf_pg_shift));
+-	roce_set_bit(fseg->mode_buf_pg_sz,
+-		     V2_RC_FRMR_WQE_BYTE_40_BLK_MODE_S, 0);
++	roce_set_bit(fseg->byte_40, V2_RC_FRMR_WQE_BYTE_40_BLK_MODE_S, 0);
+ }
+ 
+ static void set_atomic_seg(const struct ib_send_wr *wr,
+@@ -522,10 +520,12 @@ static inline int set_ud_wqe(struct hns_
+ 	return 0;
+ }
+ 
+-static int set_rc_opcode(struct hns_roce_v2_rc_send_wqe *rc_sq_wqe,
++static int set_rc_opcode(struct hns_roce_dev *hr_dev,
++			 struct hns_roce_v2_rc_send_wqe *rc_sq_wqe,
+ 			 const struct ib_send_wr *wr)
+ {
+ 	u32 ib_op = wr->opcode;
++	int ret = 0;
+ 
+ 	rc_sq_wqe->immtdata = get_immtdata(wr);
+ 
+@@ -545,7 +545,10 @@ static int set_rc_opcode(struct hns_roce
+ 		rc_sq_wqe->va = cpu_to_le64(atomic_wr(wr)->remote_addr);
+ 		break;
+ 	case IB_WR_REG_MR:
+-		set_frmr_seg(rc_sq_wqe, reg_wr(wr));
++		if (hr_dev->pci_dev->revision >= PCI_REVISION_ID_HIP09)
++			set_frmr_seg(rc_sq_wqe, reg_wr(wr));
++		else
++			ret = -EOPNOTSUPP;
+ 		break;
+ 	case IB_WR_LOCAL_INV:
+ 		roce_set_bit(rc_sq_wqe->byte_4, V2_RC_SEND_WQE_BYTE_4_SO_S, 1);
+@@ -554,19 +557,23 @@ static int set_rc_opcode(struct hns_roce
+ 		rc_sq_wqe->inv_key = cpu_to_le32(wr->ex.invalidate_rkey);
+ 		break;
+ 	default:
+-		return -EINVAL;
++		ret = -EINVAL;
+ 	}
+ 
++	if (unlikely(ret))
++		return ret;
++
+ 	roce_set_field(rc_sq_wqe->byte_4, V2_RC_SEND_WQE_BYTE_4_OPCODE_M,
+ 		       V2_RC_SEND_WQE_BYTE_4_OPCODE_S, to_hr_opcode(ib_op));
+ 
+-	return 0;
++	return ret;
+ }
+ static inline int set_rc_wqe(struct hns_roce_qp *qp,
+ 			     const struct ib_send_wr *wr,
+ 			     void *wqe, unsigned int *sge_idx,
+ 			     unsigned int owner_bit)
+ {
++	struct hns_roce_dev *hr_dev = to_hr_dev(qp->ibqp.device);
+ 	struct hns_roce_v2_rc_send_wqe *rc_sq_wqe = wqe;
+ 	unsigned int curr_idx = *sge_idx;
+ 	unsigned int valid_num_sge;
+@@ -577,7 +584,7 @@ static inline int set_rc_wqe(struct hns_
+ 
+ 	rc_sq_wqe->msg_len = cpu_to_le32(msg_len);
+ 
+-	ret = set_rc_opcode(rc_sq_wqe, wr);
++	ret = set_rc_opcode(hr_dev, rc_sq_wqe, wr);
+ 	if (WARN_ON(ret))
+ 		return ret;
+ 
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.h
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.h
+@@ -1255,15 +1255,15 @@ struct hns_roce_v2_rc_send_wqe {
+ 
+ #define V2_RC_SEND_WQE_BYTE_4_INLINE_S 12
+ 
+-#define V2_RC_FRMR_WQE_BYTE_4_BIND_EN_S 19
++#define V2_RC_FRMR_WQE_BYTE_40_BIND_EN_S 10
+ 
+-#define V2_RC_FRMR_WQE_BYTE_4_ATOMIC_S 20
++#define V2_RC_FRMR_WQE_BYTE_40_ATOMIC_S 11
+ 
+-#define V2_RC_FRMR_WQE_BYTE_4_RR_S 21
++#define V2_RC_FRMR_WQE_BYTE_40_RR_S 12
+ 
+-#define V2_RC_FRMR_WQE_BYTE_4_RW_S 22
++#define V2_RC_FRMR_WQE_BYTE_40_RW_S 13
+ 
+-#define V2_RC_FRMR_WQE_BYTE_4_LW_S 23
++#define V2_RC_FRMR_WQE_BYTE_40_LW_S 14
+ 
+ #define V2_RC_SEND_WQE_BYTE_4_FLAG_S 31
+ 
+@@ -1280,7 +1280,7 @@ struct hns_roce_v2_rc_send_wqe {
+ 
+ struct hns_roce_wqe_frmr_seg {
+ 	__le32	pbl_size;
+-	__le32	mode_buf_pg_sz;
++	__le32	byte_40;
+ };
+ 
+ #define V2_RC_FRMR_WQE_BYTE_40_PBL_BUF_PG_SZ_S	4
+--- a/drivers/infiniband/hw/hns/hns_roce_main.c
++++ b/drivers/infiniband/hw/hns/hns_roce_main.c
+@@ -201,7 +201,8 @@ static int hns_roce_query_device(struct
+ 		props->max_srq_sge = hr_dev->caps.max_srq_sges;
+ 	}
+ 
+-	if (hr_dev->caps.flags & HNS_ROCE_CAP_FLAG_FRMR) {
++	if (hr_dev->caps.flags & HNS_ROCE_CAP_FLAG_FRMR &&
++	    hr_dev->pci_dev->revision >= PCI_REVISION_ID_HIP09) {
+ 		props->device_cap_flags |= IB_DEVICE_MEM_MGT_EXTENSIONS;
+ 		props->max_fast_reg_page_list_len = HNS_ROCE_FRMR_MAX_PA;
+ 	}

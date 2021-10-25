@@ -1,0 +1,130 @@
+From fd2fdf9dc85ad3eafd137d8cc9fc68a82ac60022 Mon Sep 17 00:00:00 2001
+From: Roberto Sassu <roberto.sassu@huawei.com>
+Date: Wed, 3 Mar 2021 08:43:55 +0100
+Subject: [PATCH] ima: Generalize ima_write_policy() and raise uploaded data
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: fd2fdf9dc85ad3eafd137d8cc9fc68a82ac60022
+
+ size limit
+
+hulk inclusion
+category: feature
+feature: IMA Digest Lists extension
+bugzilla: 46797
+
+-------------------------------------------------
+
+ima_write_policy() is being used to load a new policy from user space. This
+function can be reused to load different types of data.
+
+This patch renames ima_write_policy() to ima_write_data() and executes the
+appropriate actions depending on the opened file in securityfs.
+
+Also, this patch raises the uploaded data size limit to 64M, to accept
+files (e.g. digest lists) larger than a policy. The same limit is used for
+the SELinux policy.
+
+Signed-off-by: Roberto Sassu <roberto.sassu@huawei.com>
+Signed-off-by: Tianxing Zhang <zhangtianxing3@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ security/integrity/ima/ima_fs.c | 50 ++++++++++++++++++++-------------
+ 1 file changed, 31 insertions(+), 19 deletions(-)
+
+diff --git a/security/integrity/ima/ima_fs.c b/security/integrity/ima/ima_fs.c
+index 444394f4b8d9..28120dec7911 100644
+--- a/security/integrity/ima/ima_fs.c
++++ b/security/integrity/ima/ima_fs.c
+@@ -336,26 +336,32 @@ static ssize_t ima_read_file(char *path, struct dentry *dentry)
+ 		return pathlen;
+ }
+ 
+-static ssize_t ima_write_policy(struct file *file, const char __user *buf,
+-				size_t datalen, loff_t *ppos)
++static ssize_t ima_write_data(struct file *file, const char __user *buf,
++			      size_t datalen, loff_t *ppos)
+ {
+ 	char *data;
+ 	ssize_t result;
+ 	struct dentry *dentry = file_dentry(file);
+ 
+-	if (datalen >= PAGE_SIZE)
+-		datalen = PAGE_SIZE - 1;
+-
+ 	/* No partial writes. */
+ 	result = -EINVAL;
+ 	if (*ppos != 0)
+ 		goto out;
+ 
+-	data = memdup_user_nul(buf, datalen);
+-	if (IS_ERR(data)) {
+-		result = PTR_ERR(data);
++	result = -EFBIG;
++	if (datalen > 64 * 1024 * 1024 - 1)
+ 		goto out;
+-	}
++
++	result = -ENOMEM;
++	data = vmalloc(datalen + 1);
++	if (!data)
++		goto out;
++
++	result = -EFAULT;
++	if (copy_from_user(data, buf, datalen) != 0)
++		goto out_free;
++
++	data[datalen] = '\0';
+ 
+ 	result = mutex_lock_interruptible(&ima_write_mutex);
+ 	if (result < 0)
+@@ -363,20 +369,26 @@ static ssize_t ima_write_policy(struct file *file, const char __user *buf,
+ 
+ 	if (data[0] == '/') {
+ 		result = ima_read_file(data, dentry);
+-	} else if (ima_appraise & IMA_APPRAISE_POLICY) {
+-		pr_err("signed policy file (specified as an absolute pathname) required\n");
+-		integrity_audit_msg(AUDIT_INTEGRITY_STATUS, NULL, NULL,
+-				    "policy_update", "signed policy required",
+-				    1, 0);
+-		result = -EACCES;
++	} else if (dentry == ima_policy) {
++		if (ima_appraise & IMA_APPRAISE_POLICY) {
++			pr_err("signed policy file (specified "
++			       "as an absolute pathname) required\n");
++			integrity_audit_msg(AUDIT_INTEGRITY_STATUS, NULL, NULL,
++					    "policy_update",
++					    "signed policy required", 1, 0);
++			result = -EACCES;
++		} else {
++			result = ima_parse_add_rule(data);
++		}
+ 	} else {
+-		result = ima_parse_add_rule(data);
++		pr_err("Unknown data type\n");
++		result = -EINVAL;
+ 	}
+ 	mutex_unlock(&ima_write_mutex);
+ out_free:
+-	kfree(data);
++	vfree(data);
+ out:
+-	if (result < 0)
++	if (dentry == ima_policy && result < 0)
+ 		valid_policy = 0;
+ 
+ 	return result;
+@@ -462,7 +474,7 @@ static int ima_release_policy(struct inode *inode, struct file *file)
+ 
+ static const struct file_operations ima_measure_policy_ops = {
+ 	.open = ima_open_policy,
+-	.write = ima_write_policy,
++	.write = ima_write_data,
+ 	.read = seq_read,
+ 	.release = ima_release_policy,
+ 	.llseek = generic_file_llseek,
+-- 
+2.26.2
+

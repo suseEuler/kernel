@@ -1,0 +1,139 @@
+From 1121828a0c213caa55ddd5ee23ee78e99cbdd33e Mon Sep 17 00:00:00 2001
+From: Mike Kravetz <mike.kravetz@oracle.com>
+Date: Tue, 4 May 2021 18:34:59 -0700
+Subject: [PATCH] hugetlb: call update_and_free_page without hugetlb_lock
+Git-commit: 1121828a0c213caa55ddd5ee23ee78e99cbdd33e
+Patch-mainline: v5.13-rc1
+References: bsn#12
+
+
+With the introduction of remove_hugetlb_page(), there is no need for
+update_and_free_page to hold the hugetlb lock.  Change all callers to
+drop the lock before calling.
+
+With additional code modifications, this will allow loops which decrease
+the huge page pool to drop the hugetlb_lock with each page to reduce
+long hold times.
+
+The ugly unlock/lock cycle in free_pool_huge_page will be removed in a
+subsequent patch which restructures free_pool_huge_page.
+
+Link: https://lkml.kernel.org/r/20210409205254.242291-6-mike.kravetz@oracle.com
+Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Reviewed-by: Muchun Song <songmuchun@bytedance.com>
+Reviewed-by: Miaohe Lin <linmiaohe@huawei.com>
+Reviewed-by: Oscar Salvador <osalvador@suse.de>
+Cc: "Aneesh Kumar K . V" <aneesh.kumar@linux.ibm.com>
+Cc: Barry Song <song.bao.hua@hisilicon.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Hillf Danton <hdanton@sina.com>
+Cc: HORIGUCHI NAOYA <naoya.horiguchi@nec.com>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Mina Almasry <almasrymina@google.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Roman Gushchin <guro@fb.com>
+Cc: Shakeel Butt <shakeelb@google.com>
+Cc: Waiman Long <longman@redhat.com>
+Cc: Will Deacon <will@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ mm/hugetlb.c | 31 ++++++++++++++++++++++++++-----
+ 1 file changed, 26 insertions(+), 5 deletions(-)
+
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 9a263a1c200e..5425936a4590 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -1451,16 +1451,18 @@ static void __free_huge_page(struct page *page)
+ 
+ 	if (HPageTemporary(page)) {
+ 		remove_hugetlb_page(h, page, false);
++		spin_unlock(&hugetlb_lock);
+ 		update_and_free_page(h, page);
+ 	} else if (h->surplus_huge_pages_node[nid]) {
+ 		/* remove the page from active list */
+ 		remove_hugetlb_page(h, page, true);
++		spin_unlock(&hugetlb_lock);
+ 		update_and_free_page(h, page);
+ 	} else {
+ 		arch_clear_hugepage_flags(page);
+ 		enqueue_huge_page(h, page);
++		spin_unlock(&hugetlb_lock);
+ 	}
+-	spin_unlock(&hugetlb_lock);
+ }
+ 
+ /*
+@@ -1741,7 +1743,13 @@ static int free_pool_huge_page(struct hstate *h, nodemask_t *nodes_allowed,
+ 				list_entry(h->hugepage_freelists[node].next,
+ 					  struct page, lru);
+ 			remove_hugetlb_page(h, page, acct_surplus);
++			/*
++			 * unlock/lock around update_and_free_page is temporary
++			 * and will be removed with subsequent patch.
++			 */
++			spin_unlock(&hugetlb_lock);
+ 			update_and_free_page(h, page);
++			spin_lock(&hugetlb_lock);
+ 			ret = 1;
+ 			break;
+ 		}
+@@ -1810,8 +1818,9 @@ int dissolve_free_huge_page(struct page *page)
+ 		}
+ 		remove_hugetlb_page(h, page, false);
+ 		h->max_huge_pages--;
++		spin_unlock(&hugetlb_lock);
+ 		update_and_free_page(h, head);
+-		rc = 0;
++		return 0;
+ 	}
+ out:
+ 	spin_unlock(&hugetlb_lock);
+@@ -2563,22 +2572,34 @@ static void try_to_free_low(struct hstate *h, unsigned long count,
+ 						nodemask_t *nodes_allowed)
+ {
+ 	int i;
++	struct page *page, *next;
++	LIST_HEAD(page_list);
+ 
+ 	if (hstate_is_gigantic(h))
+ 		return;
+ 
++	/*
++	 * Collect pages to be freed on a list, and free after dropping lock
++	 */
+ 	for_each_node_mask(i, *nodes_allowed) {
+-		struct page *page, *next;
+ 		struct list_head *freel = &h->hugepage_freelists[i];
+ 		list_for_each_entry_safe(page, next, freel, lru) {
+ 			if (count >= h->nr_huge_pages)
+-				return;
++				goto out;
+ 			if (PageHighMem(page))
+ 				continue;
+ 			remove_hugetlb_page(h, page, false);
+-			update_and_free_page(h, page);
++			list_add(&page->lru, &page_list);
+ 		}
+ 	}
++
++out:
++	spin_unlock(&hugetlb_lock);
++	list_for_each_entry_safe(page, next, &page_list, lru) {
++		update_and_free_page(h, page);
++		cond_resched();
++	}
++	spin_lock(&hugetlb_lock);
+ }
+ #else
+ static inline void try_to_free_low(struct hstate *h, unsigned long count,
+-- 
+2.31.1
+

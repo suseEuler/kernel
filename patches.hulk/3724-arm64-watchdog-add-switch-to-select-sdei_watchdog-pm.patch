@@ -1,0 +1,219 @@
+From c7e03fb97fd2cfc439080387ea755846bc138a7f Mon Sep 17 00:00:00 2001
+From: Jingyi Wang <wangjingyi11@huawei.com>
+Date: Tue, 23 Feb 2021 20:16:37 +0800
+Subject: [PATCH] arm64: watchdog: add switch to select
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: c7e03fb97fd2cfc439080387ea755846bc138a7f
+
+ sdei_watchdog/pmu_watchdog
+
+hulk inclusion
+category: feature
+bugzilla: 49592
+CVE: NA
+
+-------------------------------------------------
+
+On aarch64, we can compile both SDEI_WATCHODG and PMU_WATCHDOG code
+instead of choosing one.  SDEI_WATCHDOG is used by default, and if
+SDEI_WATCHDOG is disabled by kernel parameter "disable_sdei_nmi_watchdog",
+PMU_WATCHDOG is used instead.
+
+Signed-off-by: Jingyi Wang <wangjingyi11@huawei.com>
+Signed-off-by: Wei Li <liwei391@huawei.com>
+Reviewed-by: Hanjun Guo <guohanjun@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ arch/arm64/kernel/watchdog_sdei.c | 23 +++++++++++++++++------
+ include/linux/nmi.h               | 11 +++++++++++
+ kernel/watchdog.c                 | 28 +++++++++++++++++++++-------
+ lib/Kconfig.debug                 |  7 ++-----
+ 4 files changed, 51 insertions(+), 18 deletions(-)
+
+--- a/arch/arm64/kernel/watchdog_sdei.c
++++ b/arch/arm64/kernel/watchdog_sdei.c
+@@ -25,7 +25,7 @@ static bool disable_sdei_nmi_watchdog;
+ static bool sdei_watchdog_registered;
+ static DEFINE_PER_CPU(ktime_t, last_check_time);
+ 
+-int watchdog_nmi_enable(unsigned int cpu)
++int watchdog_sdei_enable(unsigned int cpu)
+ {
+ 	int ret;
+ 
+@@ -49,7 +49,7 @@ int watchdog_nmi_enable(unsigned int cpu
+ 	return 0;
+ }
+ 
+-void watchdog_nmi_disable(unsigned int cpu)
++void watchdog_sdei_disable(unsigned int cpu)
+ {
+ 	int ret;
+ 
+@@ -111,13 +111,10 @@ void sdei_watchdog_clear_eoi(void)
+ 		sdei_api_clear_eoi(SDEI_NMI_WATCHDOG_HWIRQ);
+ }
+ 
+-int __init watchdog_nmi_probe(void)
++int __init watchdog_sdei_probe(void)
+ {
+ 	int ret;
+ 
+-	if (disable_sdei_nmi_watchdog)
+-		return -EINVAL;
+-
+ 	if (!is_hyp_mode_available()) {
+ 		pr_err("Disable SDEI NMI Watchdog in VM\n");
+ 		return -EINVAL;
+@@ -154,3 +151,17 @@ int __init watchdog_nmi_probe(void)
+ 
+ 	return 0;
+ }
++
++static struct watchdog_operations arch_watchdog_ops = {
++	.watchdog_nmi_stop = &watchdog_nmi_stop,
++	.watchdog_nmi_start = &watchdog_nmi_start,
++	.watchdog_nmi_probe = &watchdog_sdei_probe,
++	.watchdog_nmi_enable = &watchdog_sdei_enable,
++	.watchdog_nmi_disable = &watchdog_sdei_disable,
++};
++
++void watchdog_ops_init(void)
++{
++	if (!disable_sdei_nmi_watchdog)
++		nmi_watchdog_ops = arch_watchdog_ops;
++}
+--- a/include/linux/nmi.h
++++ b/include/linux/nmi.h
+@@ -122,6 +122,17 @@ int watchdog_nmi_probe(void);
+ int watchdog_nmi_enable(unsigned int cpu);
+ void watchdog_nmi_disable(unsigned int cpu);
+ 
++struct watchdog_operations {
++	void (*watchdog_nmi_stop)(void);
++	void (*watchdog_nmi_start)(void);
++	int (*watchdog_nmi_probe)(void);
++	int (*watchdog_nmi_enable)(unsigned int cpu);
++	void (*watchdog_nmi_disable)(unsigned int cpu);
++};
++
++extern struct watchdog_operations nmi_watchdog_ops;
++void watchdog_ops_init(void);
++
+ /**
+  * touch_nmi_watchdog - restart NMI watchdog timeout.
+  *
+--- a/kernel/watchdog.c
++++ b/kernel/watchdog.c
+@@ -48,6 +48,14 @@ static int __read_mostly nmi_watchdog_av
+ struct cpumask watchdog_cpumask __read_mostly;
+ unsigned long *watchdog_cpumask_bits = cpumask_bits(&watchdog_cpumask);
+ 
++struct watchdog_operations nmi_watchdog_ops = {
++	.watchdog_nmi_stop = &watchdog_nmi_stop,
++	.watchdog_nmi_start = &watchdog_nmi_start,
++	.watchdog_nmi_probe = &watchdog_nmi_probe,
++	.watchdog_nmi_enable = &watchdog_nmi_enable,
++	.watchdog_nmi_disable = &watchdog_nmi_disable,
++};
++
+ #ifdef CONFIG_HARDLOCKUP_DETECTOR
+ 
+ # ifdef CONFIG_SMP
+@@ -453,7 +461,7 @@ static void watchdog_enable(unsigned int
+ 	update_touch_ts();
+ 	/* Enable the perf event */
+ 	if (watchdog_enabled & NMI_WATCHDOG_ENABLED)
+-		watchdog_nmi_enable(cpu);
++		nmi_watchdog_ops.watchdog_nmi_enable(cpu);
+ }
+ 
+ static void watchdog_disable(unsigned int cpu)
+@@ -467,7 +475,7 @@ static void watchdog_disable(unsigned in
+ 	 * between disabling the timer and disabling the perf event causes
+ 	 * the perf NMI to detect a false positive.
+ 	 */
+-	watchdog_nmi_disable(cpu);
++	nmi_watchdog_ops.watchdog_nmi_disable(cpu);
+ 	hrtimer_cancel(hrtimer);
+ 	wait_for_completion(this_cpu_ptr(&softlockup_completion));
+ }
+@@ -523,7 +531,7 @@ int lockup_detector_offline_cpu(unsigned
+ static void lockup_detector_reconfigure(void)
+ {
+ 	cpus_read_lock();
+-	watchdog_nmi_stop();
++	nmi_watchdog_ops.watchdog_nmi_stop();
+ 
+ 	softlockup_stop_all();
+ 	set_sample_period();
+@@ -531,7 +539,7 @@ static void lockup_detector_reconfigure(
+ 	if (watchdog_enabled && watchdog_thresh)
+ 		softlockup_start_all();
+ 
+-	watchdog_nmi_start();
++	nmi_watchdog_ops.watchdog_nmi_start();
+ 	cpus_read_unlock();
+ 	/*
+ 	 * Must be called outside the cpus locked section to prevent
+@@ -569,9 +577,9 @@ static __init void lockup_detector_setup
+ static void lockup_detector_reconfigure(void)
+ {
+ 	cpus_read_lock();
+-	watchdog_nmi_stop();
++	nmi_watchdog_ops.watchdog_nmi_stop();
+ 	lockup_detector_update_enable();
+-	watchdog_nmi_start();
++	nmi_watchdog_ops.watchdog_nmi_start();
+ 	cpus_read_unlock();
+ }
+ static inline void lockup_detector_setup(void)
+@@ -729,15 +737,21 @@ int proc_watchdog_cpumask(struct ctl_tab
+ }
+ #endif /* CONFIG_SYSCTL */
+ 
++void __weak watchdog_ops_init(void)
++{
++}
++
+ void __init lockup_detector_init(void)
+ {
++	watchdog_ops_init();
++
+ 	if (tick_nohz_full_enabled())
+ 		pr_info("Disabling watchdog on nohz_full cores by default\n");
+ 
+ 	cpumask_copy(&watchdog_cpumask,
+ 		     housekeeping_cpumask(HK_FLAG_TIMER));
+ 
+-	if (!watchdog_nmi_probe())
++	if (!nmi_watchdog_ops.watchdog_nmi_probe())
+ 		nmi_watchdog_available = true;
+ 	lockup_detector_setup();
+ }
+--- a/lib/Kconfig.debug
++++ b/lib/Kconfig.debug
+@@ -965,11 +965,8 @@ config HARDLOCKUP_DETECTOR_PERF
+ 	bool
+ 	select SOFTLOCKUP_DETECTOR
+ 
+-choice
+-	prompt "aarch64 NMI watchdog method"
++menu "ARM64 NMI watchdog configuration"
+ 	depends on ARM64
+-	help
+-	  Watchdog implementation method configuration.
+ 
+ config SDEI_WATCHDOG
+ 	bool "SDEI NMI Watchdog support"
+@@ -982,7 +979,7 @@ config PMU_WATCHDOG
+ 	depends on PERF_EVENTS && HAVE_PERF_EVENTS_NMI
+ 	select HAVE_HARDLOCKUP_DETECTOR_PERF
+ 
+-endchoice
++endmenu # "ARM64 NMI watchdog configuration"
+ 
+ #
+ # Enables a timestamp based low pass filter to compensate for perf based

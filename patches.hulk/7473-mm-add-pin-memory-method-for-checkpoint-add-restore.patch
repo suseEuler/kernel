@@ -1,0 +1,1951 @@
+From 7dc4c73d88f345745c2dddf4ca4c69b0c0abf5fd Mon Sep 17 00:00:00 2001
+From: Jingxian He <hejingxian@huawei.com>
+Date: Tue, 27 Jul 2021 22:02:15 +0800
+Subject: [PATCH] mm: add pin memory method for checkpoint add restore
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 7dc4c73d88f345745c2dddf4ca4c69b0c0abf5fd
+
+
+hulk inclusion
+category: feature
+bugzilla: 48159
+CVE: N/A
+
+------------------------------
+
+We can use the checkpoint and restore in userspace(criu) method to dump
+and restore tasks when updating the kernel.
+Currently, criu needs dump all memory data of tasks to files.
+When the memory size is very large(larger than 1G),
+the cost time of the dumping data will be very long(more than 1 min).
+
+By pin the memory data of tasks and collect the corresponding physical pages
+mapping info in checkpoint process, we can remap the physical pages to
+restore tasks after upgrading the kernel. This pin memory method can
+restore the task data within one second.
+
+The pin memory area info is saved in the reserved memblock,
+which can keep usable in the kernel update process.
+
+The pin memory driver provides the following ioctl command for criu:
+1) SET_PIN_MEM_AREA:
+Set pin memory area, which can be remap to the restore task.
+2) CLEAR_PIN_MEM_AREA:
+Clear the pin memory area info,
+which enable user reset the pin data.
+3) REMAP_PIN_MEM_AREA:
+Remap the pages of the pin memory to the restore task.
+
+Signed-off-by: Jingxian He <hejingxian@huawei.com>
+Reviewed-by: Chen Wandun <chenwandun@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+[jyang: replace transparent_hugepage_enabled with transparent_hugepage_active]
+[jyang: refer to euler OLK-5.10 2b7635c66c302bb0afd424dd36d766c648ae1c8b]
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ arch/arm64/kernel/setup.c  |   10 +
+ arch/arm64/mm/init.c       |   57 ++
+ drivers/char/Kconfig       |    7 +
+ drivers/char/Makefile      |    1 +
+ drivers/char/pin_memory.c  |  209 +++++++
+ fs/proc/task_mmu.c         |  138 +++++
+ include/linux/crash_core.h |    5 +
+ include/linux/pin_mem.h    |   93 +++
+ kernel/crash_core.c        |   11 +
+ mm/Kconfig                 |    8 +
+ mm/Makefile                |    1 +
+ mm/huge_memory.c           |   63 +++
+ mm/memory.c                |   65 +++
+ mm/pin_mem.c               | 1091 ++++++++++++++++++++++++++++++++++++
+ 14 files changed, 1759 insertions(+)
+ create mode 100644 drivers/char/pin_memory.c
+ create mode 100644 include/linux/pin_mem.h
+ create mode 100644 mm/pin_mem.c
+
+--- a/arch/arm64/kernel/setup.c
++++ b/arch/arm64/kernel/setup.c
+@@ -30,6 +30,9 @@
+ #include <linux/psci.h>
+ #include <linux/sched/task.h>
+ #include <linux/mm.h>
++#ifdef CONFIG_PIN_MEMORY
++#include <linux/pin_mem.h>
++#endif
+ 
+ #include <asm/acpi.h>
+ #include <asm/fixmap.h>
+@@ -271,12 +274,19 @@ static void __init request_standard_reso
+ 		    crashk_res.end <= res->end)
+ 			request_resource(res, &crashk_res);
+ #endif
++
+ #ifdef CONFIG_QUICK_KEXEC
+ 		if (quick_kexec_res.end &&
+ 		    quick_kexec_res.start >= res->start &&
+ 		    quick_kexec_res.end <= res->end)
+ 			request_resource(res, &quick_kexec_res);
+ #endif
++
++#ifdef CONFIG_PIN_MEMORY
++		if (pin_memory_resource.end && pin_memory_resource.start >= res->start &&
++			pin_memory_resource.end <= res->end)
++			request_resource(res, &pin_memory_resource);
++#endif
+ 	}
+ 
+ #ifdef CONFIG_ARM64_PMEM_RESERVE
+--- a/arch/arm64/mm/init.c
++++ b/arch/arm64/mm/init.c
+@@ -30,6 +30,9 @@
+ #include <linux/crash_dump.h>
+ #include <linux/hugetlb.h>
+ #include <linux/acpi_iort.h>
++#ifdef CONFIG_PIN_MEMORY
++#include <linux/pin_mem.h>
++#endif
+ 
+ #include <asm/boot.h>
+ #include <asm/fixmap.h>
+@@ -54,6 +57,52 @@ s64 memstart_addr __ro_after_init = -1;
+ EXPORT_SYMBOL(memstart_addr);
+ phys_addr_t start_at, mem_size;
+ 
++#ifdef CONFIG_PIN_MEMORY
++struct resource pin_memory_resource = {
++	.name = "Pin memory",
++	.start = 0,
++	.end = 0,
++	.flags = IORESOURCE_MEM,
++	.desc = IORES_DESC_RESERVED
++};
++
++static void __init reserve_pin_memory_res(void)
++{
++	unsigned long long mem_start, mem_len;
++	int ret;
++
++	ret = parse_pin_memory(boot_command_line, memblock_phys_mem_size(),
++		&mem_len, &mem_start);
++	if (ret || !mem_len)
++		return;
++
++	mem_len = PAGE_ALIGN(mem_len);
++
++	if (!memblock_is_region_memory(mem_start, mem_len)) {
++		pr_warn("cannot reserve for pin memory: region is not memory!\n");
++		return;
++	}
++
++	if (memblock_is_region_reserved(mem_start, mem_len)) {
++		pr_warn("cannot reserve for pin memory: region overlaps reserved memory!\n");
++		return;
++	}
++
++	if (!IS_ALIGNED(mem_start, SZ_2M)) {
++		pr_warn("cannot reserve for pin memory: base address is not 2MB aligned\n");
++		return;
++	}
++
++	memblock_reserve(mem_start, mem_len);
++	pin_memory_resource.start = mem_start;
++	pin_memory_resource.end = mem_start + mem_len - 1;
++}
++#else
++static void __init reserve_pin_memory_res(void)
++{
++}
++#endif /* CONFIG_PIN_MEMORY */
++
+ /*
+  * If the corresponding config options are enabled, we create both ZONE_DMA
+  * and ZONE_DMA32. By default ZONE_DMA covers the 32-bit addressable memory
+@@ -626,6 +675,8 @@ void __init bootmem_init(void)
+ 	reserve_pmem();
+ #endif
+ 
++	reserve_pin_memory_res();
++
+ 	memblock_dump_all();
+ }
+ 
+@@ -715,6 +766,12 @@ void __init mem_init(void)
+ 	/* this will put all unused low memory onto the freelists */
+ 	memblock_free_all();
+ 
++#ifdef CONFIG_PIN_MEMORY
++	/* pre alloc the pages for pin memory */
++	init_reserve_page_map((unsigned long)pin_memory_resource.start,
++		(unsigned long)(pin_memory_resource.end - pin_memory_resource.start));
++#endif
++
+ 	mem_init_print_info(NULL);
+ 
+ 	/*
+--- a/drivers/char/Kconfig
++++ b/drivers/char/Kconfig
+@@ -471,6 +471,13 @@ config ADI
+ 	  and SSM (Silicon Secured Memory).  Intended consumers of this
+ 	  driver include crash and makedumpfile.
+ 
++config PIN_MEMORY_DEV
++	tristate "/dev/pinmem character device"
++	depends on PIN_MEMORY
++	default m
++	help
++	  pin memory driver
++
+ endmenu
+ 
+ config RANDOM_TRUST_CPU
+--- a/drivers/char/Makefile
++++ b/drivers/char/Makefile
+@@ -47,3 +47,4 @@ obj-$(CONFIG_PS3_FLASH)		+= ps3flash.o
+ obj-$(CONFIG_XILLYBUS)		+= xillybus/
+ obj-$(CONFIG_POWERNV_OP_PANEL)	+= powernv-op-panel.o
+ obj-$(CONFIG_ADI)		+= adi.o
++obj-$(CONFIG_PIN_MEMORY_DEV)	+= pin_memory.o
+--- /dev/null
++++ b/drivers/char/pin_memory.c
+@@ -0,0 +1,209 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright @ Huawei Technologies Co., Ltd. 2020-2020. ALL rights reserved.
++ * Description: Euler pin memory driver
++ */
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/kprobes.h>
++#include <linux/spinlock.h>
++#include <linux/workqueue.h>
++#include <linux/sched.h>
++#include <linux/mm.h>
++#include <linux/init.h>
++#include <linux/miscdevice.h>
++#include <linux/fs.h>
++#include <linux/mm_types.h>
++#include <linux/processor.h>
++#include <uapi/asm-generic/ioctl.h>
++#include <uapi/asm-generic/mman-common.h>
++#include <uapi/asm/setup.h>
++#include <linux/pin_mem.h>
++#include <linux/sched/mm.h>
++
++#define MAX_PIN_MEM_AREA_NUM  16
++struct _pin_mem_area {
++	unsigned long virt_start;
++	unsigned long virt_end;
++};
++
++struct pin_mem_area_set {
++	unsigned int pid;
++	unsigned int area_num;
++	struct _pin_mem_area mem_area[MAX_PIN_MEM_AREA_NUM];
++};
++
++#define PIN_MEM_MAGIC 0x59
++#define _SET_PIN_MEM_AREA    1
++#define _CLEAR_PIN_MEM_AREA  2
++#define _REMAP_PIN_MEM_AREA  3
++#define _FINISH_PIN_MEM_DUMP 4
++#define _INIT_PAGEMAP_READ   5
++#define _PIN_MEM_IOC_MAX_NR  5
++#define SET_PIN_MEM_AREA        _IOW(PIN_MEM_MAGIC, _SET_PIN_MEM_AREA, struct pin_mem_area_set)
++#define CLEAR_PIN_MEM_AREA      _IOW(PIN_MEM_MAGIC, _CLEAR_PIN_MEM_AREA, int)
++#define REMAP_PIN_MEM_AREA      _IOW(PIN_MEM_MAGIC, _REMAP_PIN_MEM_AREA, int)
++#define FINISH_PIN_MEM_DUMP     _IOW(PIN_MEM_MAGIC, _FINISH_PIN_MEM_DUMP, int)
++#define INIT_PAGEMAP_READ       _IOW(PIN_MEM_MAGIC, _INIT_PAGEMAP_READ, int)
++static int set_pin_mem(struct pin_mem_area_set *pmas)
++{
++	int i;
++	int ret = 0;
++	struct _pin_mem_area *pma;
++	struct mm_struct *mm;
++	struct task_struct *task;
++	struct pid *pid_s;
++
++	pid_s = find_get_pid(pmas->pid);
++	if (!pid_s) {
++		pr_warn("Get pid struct fail:%d.\n", pmas->pid);
++		return -EFAULT;
++	}
++	rcu_read_lock();
++	task = pid_task(pid_s, PIDTYPE_PID);
++	if (!task) {
++		pr_warn("Get task struct fail:%d.\n", pmas->pid);
++		goto fail;
++	}
++	mm = get_task_mm(task);
++	for (i = 0; i < pmas->area_num; i++) {
++		pma = &(pmas->mem_area[i]);
++		ret = pin_mem_area(task, mm, pma->virt_start, pma->virt_end);
++		if (ret) {
++			mmput(mm);
++			goto fail;
++		}
++	}
++	mmput(mm);
++	rcu_read_unlock();
++	put_pid(pid_s);
++	return ret;
++
++fail:
++	rcu_read_unlock();
++	put_pid(pid_s);
++	return -EFAULT;
++}
++
++static int set_pin_mem_area(unsigned long arg)
++{
++	struct pin_mem_area_set pmas;
++	void __user *buf = (void __user *)arg;
++
++	if (copy_from_user(&pmas, buf, sizeof(pmas)))
++		return -EINVAL;
++	if (pmas.area_num > MAX_PIN_MEM_AREA_NUM) {
++		pr_warn("Input area_num is too large.\n");
++		return -EINVAL;
++	}
++
++	return set_pin_mem(&pmas);
++}
++
++static int pin_mem_remap(unsigned long arg)
++{
++	int pid;
++	struct task_struct *task;
++	struct mm_struct *mm;
++	vm_fault_t ret;
++	void __user *buf = (void __user *)arg;
++	struct pid *pid_s;
++
++	if (copy_from_user(&pid, buf, sizeof(int)))
++		return -EINVAL;
++
++	pid_s = find_get_pid(pid);
++	if (!pid_s) {
++		pr_warn("Get pid struct fail:%d.\n", pid);
++		return -EINVAL;
++	}
++	rcu_read_lock();
++	task = pid_task(pid_s, PIDTYPE_PID);
++	if (!task) {
++		pr_warn("Get task struct fail:%d.\n", pid);
++		goto fault;
++	}
++	mm = get_task_mm(task);
++	ret = do_mem_remap(pid, mm);
++	if (ret) {
++		pr_warn("Handle pin memory remap fail.\n");
++		mmput(mm);
++		goto fault;
++	}
++	mmput(mm);
++	rcu_read_unlock();
++	put_pid(pid_s);
++	return 0;
++
++fault:
++	rcu_read_unlock();
++	put_pid(pid_s);
++	return -EFAULT;
++}
++
++static long pin_memory_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++{
++	long ret = 0;
++
++	if (_IOC_TYPE(cmd) != PIN_MEM_MAGIC)
++		return -EINVAL;
++	if (_IOC_NR(cmd) > _PIN_MEM_IOC_MAX_NR)
++		return -EINVAL;
++
++	switch (cmd) {
++	case SET_PIN_MEM_AREA:
++		ret = set_pin_mem_area(arg);
++		break;
++	case CLEAR_PIN_MEM_AREA:
++		clear_pin_memory_record();
++		break;
++	case REMAP_PIN_MEM_AREA:
++		ret = pin_mem_remap(arg);
++		break;
++	case FINISH_PIN_MEM_DUMP:
++		ret = finish_pin_mem_dump();
++		break;
++	case INIT_PAGEMAP_READ:
++		ret = init_pagemap_read();
++		break;
++	default:
++		return -EINVAL;
++	}
++	return ret;
++}
++
++static const struct file_operations pin_memory_fops = {
++	.owner	= THIS_MODULE,
++	.unlocked_ioctl = pin_memory_ioctl,
++	.compat_ioctl   = pin_memory_ioctl,
++};
++
++static struct miscdevice pin_memory_miscdev = {
++	.minor	= MISC_DYNAMIC_MINOR,
++	.name	= "pinmem",
++	.fops	= &pin_memory_fops,
++};
++
++static int pin_memory_init(void)
++{
++	int err = misc_register(&pin_memory_miscdev);
++
++	if (!err)
++		pr_info("pin_memory init\n");
++	else
++		pr_warn("pin_memory init failed!\n");
++	return err;
++}
++
++static void pin_memory_exit(void)
++{
++	misc_deregister(&pin_memory_miscdev);
++	pr_info("pin_memory ko exists!\n");
++}
++
++module_init(pin_memory_init);
++module_exit(pin_memory_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Euler");
++MODULE_DESCRIPTION("pin memory");
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -1665,6 +1665,144 @@ out:
+ 	return ret;
+ }
+ 
++#ifdef CONFIG_PIN_MEMORY
++static int get_pagemap_pmd_range(pmd_t *pmdp, unsigned long addr, unsigned long end,
++			     struct mm_walk *walk)
++{
++	struct vm_area_struct *vma = walk->vma;
++	struct pagemapread *pm = walk->private;
++	spinlock_t *ptl;
++	pte_t *pte, *orig_pte;
++	int err = 0;
++	pagemap_entry_t pme;
++
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
++	ptl = pmd_trans_huge_lock(pmdp, vma);
++	if (ptl) {
++		u64 flags = 0, frame = 0;
++		pmd_t pmd = *pmdp;
++		struct page *page = NULL;
++
++		if (pmd_present(pmd)) {
++			page = pmd_page(pmd);
++			flags |= PM_PRESENT;
++			frame = pmd_pfn(pmd) +
++				((addr & ~PMD_MASK) >> PAGE_SHIFT);
++		}
++#ifdef CONFIG_ARCH_ENABLE_THP_MIGRATION
++		else if (is_swap_pmd(pmd)) {
++			swp_entry_t entry = pmd_to_swp_entry(pmd);
++			unsigned long offset;
++
++			offset = swp_offset(entry) +
++				((addr & ~PMD_MASK) >> PAGE_SHIFT);
++			frame = swp_type(entry) |
++				(offset << MAX_SWAPFILES_SHIFT);
++
++			flags |= PM_SWAP;
++			if (pmd_swp_soft_dirty(pmd))
++				flags |= PM_SOFT_DIRTY;
++			VM_BUG_ON(!is_pmd_migration_entry(pmd));
++			page = migration_entry_to_page(entry);
++		}
++#endif
++		pme = make_pme(frame, flags);
++		err = add_to_pagemap(addr, &pme, pm);
++		spin_unlock(ptl);
++		return err;
++	}
++
++	if (pmd_trans_unstable(pmdp))
++		return 0;
++#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
++
++	orig_pte = pte = pte_offset_map_lock(walk->mm, pmdp, addr, &ptl);
++	for (; addr < end; pte++, addr += PAGE_SIZE) {
++		pme = pte_to_pagemap_entry(pm, vma, addr, *pte);
++		err = add_to_pagemap(addr, &pme, pm);
++		if (err)
++			break;
++	}
++	pte_unmap_unlock(orig_pte, ptl);
++	return err;
++}
++
++static const struct mm_walk_ops pin_pagemap_ops = {
++	.pmd_entry	= get_pagemap_pmd_range,
++	.pte_hole	= pagemap_pte_hole,
++	.hugetlb_entry	= pagemap_hugetlb_range,
++};
++
++void *create_pagemap_walk(void)
++{
++	struct pagemapread *pm;
++	struct mm_walk *pagemap_walk;
++
++	pagemap_walk = kzalloc(sizeof(struct mm_walk), GFP_KERNEL);
++	if (!pagemap_walk)
++		return NULL;
++	pm = kmalloc(sizeof(struct pagemapread), GFP_KERNEL);
++	if (!pm)
++		goto out_free_walk;
++
++	pm->show_pfn = true;
++	pm->len = (PAGEMAP_WALK_SIZE >> PAGE_SHIFT) + 1;
++	pm->buffer = kmalloc_array(pm->len, PM_ENTRY_BYTES, GFP_KERNEL);
++	if (!pm->buffer)
++		goto out_free;
++
++	pagemap_walk->ops = &pin_pagemap_ops;
++	pagemap_walk->private = pm;
++	return (void *)pagemap_walk;
++out_free:
++	kfree(pm);
++out_free_walk:
++	kfree(pagemap_walk);
++	return NULL;
++}
++
++void free_pagemap_walk(void *mem_walk)
++{
++	struct pagemapread *pm;
++	struct mm_walk *pagemap_walk = (struct mm_walk *)mem_walk;
++
++	if (!pagemap_walk)
++		return;
++	if (pagemap_walk->private) {
++		pm = (struct pagemapread *)pagemap_walk->private;
++		kfree(pm->buffer);
++		kfree(pm);
++		pagemap_walk->private = NULL;
++	}
++	kfree(pagemap_walk);
++}
++
++int pagemap_get(struct mm_struct *mm, void *mem_walk,
++			unsigned long start_vaddr, unsigned long end_vaddr,
++			unsigned long *pte_entry, unsigned int *count)
++{
++	int i, ret;
++	struct pagemapread *pm;
++	unsigned long end;
++	struct mm_walk *pagemap_walk = (struct mm_walk *)mem_walk;
++
++	if (!pte_entry || !mm || !pagemap_walk)
++		return -EFAULT;
++
++	pm = (struct pagemapread *)pagemap_walk->private;
++	pagemap_walk->mm = mm;
++	pm->pos = 0;
++	end = (start_vaddr + PAGEMAP_WALK_SIZE) & PAGEMAP_WALK_MASK;
++	if (end > end_vaddr)
++		end = end_vaddr;
++	ret = walk_page_range(mm, start_vaddr, end, pagemap_walk->ops, pm);
++	*count = pm->pos;
++	for (i = 0; i < pm->pos; i++)
++		pte_entry[i] = pm->buffer[i].pme;
++	return ret;
++}
++#endif
++
+ static int pagemap_open(struct inode *inode, struct file *file)
+ {
+ 	struct mm_struct *mm;
+--- a/include/linux/crash_core.h
++++ b/include/linux/crash_core.h
+@@ -87,4 +87,9 @@ int parse_crashkernel_high(char *cmdline
+ int parse_crashkernel_low(char *cmdline, unsigned long long system_ram,
+ 		unsigned long long *crash_size, unsigned long long *crash_base);
+ 
++#ifdef CONFIG_PIN_MEMORY
++int __init parse_pin_memory(char *cmdline, unsigned long long system_ram,
++	unsigned long long *pin_size, unsigned long long *pin_base);
++#endif
++
+ #endif /* LINUX_CRASH_CORE_H */
+--- /dev/null
++++ b/include/linux/pin_mem.h
+@@ -0,0 +1,93 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ *  Copyright (C) 2020. Huawei Technologies Co., Ltd. All rights reserved.
++ *  Provide the pin memory method for check point and restore task.
++ */
++#ifndef _LINUX_PIN_MEMORY_H
++#define _LINUX_PIN_MEMORY_H
++
++#ifdef CONFIG_PIN_MEMORY
++#include <linux/errno.h>
++#include <linux/mm_types.h>
++#include <linux/err.h>
++#ifdef CONFIG_ARM64
++#include <linux/ioport.h>
++#endif
++
++#define PAGE_BUDDY_MAPCOUNT_VALUE  (~PG_buddy)
++
++#define COLLECT_PAGES_FINISH         0
++#define COLLECT_PAGES_NEED_CONTINUE  1
++#define COLLECT_PAGES_FAIL           -1
++
++#define COMPOUND_PAD_MASK  0xffffffff
++#define COMPOUND_PAD_START  0x88
++#define COMPOUND_PAD_DELTA  0x40
++#define LIST_POISON4 0xdead000000000400
++#define PAGE_FLAGS_CHECK_RESERVED  (1UL << PG_reserved)
++#define SHA256_DIGEST_SIZE  32
++#define next_pme(pme)  ((unsigned long *)((pme) + 1) + (pme)->nr_pages)
++#define PIN_MEM_DUMP_MAGIC  0xfeab000000001acd
++#define PM_PFRAME_BITS		55
++#define PM_PFRAME_MASK		GENMASK_ULL(PM_PFRAME_BITS - 1, 0)
++#define PM_PRESENT		BIT_ULL(63)
++#define PM_SWAP			BIT_ULL(62)
++#define IS_PTE_PRESENT(entry) (((entry) & PM_PFRAME_MASK) && ((entry) & PM_PRESENT))
++#define NEXT_PIN_ADDR(next, end_addr) (((next) + HPAGE_PMD_SIZE) > (end_addr) ? \
++			(end_addr) : ((next) + HPAGE_PMD_SIZE))
++
++struct page_map_entry {
++	unsigned long virt_addr;
++	unsigned int nr_pages;
++	unsigned int is_huge_page;
++	unsigned long redirect_start;
++	unsigned long phy_addr_array[0];
++};
++
++struct page_map_info {
++	int pid;
++	int pid_reserved;
++	unsigned int entry_num;
++	int disable_free_page;
++	struct page_map_entry *pme;
++};
++
++struct pin_mem_dump_info {
++	char sha_digest[SHA256_DIGEST_SIZE];
++	unsigned long magic;
++	unsigned int pin_pid_num;
++	struct page_map_info pmi_array[0];
++};
++
++struct redirect_info {
++	unsigned int redirect_pages;
++	unsigned int redirect_index[0];
++};
++
++extern struct page_map_info *get_page_map_info_by_pid(int pid);
++extern struct page_map_info *create_page_map_info_by_pid(int pid);
++extern vm_fault_t do_mem_remap(int pid, struct mm_struct *mm);
++extern vm_fault_t do_anon_page_remap(struct vm_area_struct *vma, unsigned long address,
++	pmd_t *pmd, struct page *page);
++extern void clear_pin_memory_record(void);
++extern int pin_mem_area(struct task_struct *task, struct mm_struct *mm,
++		unsigned long start_addr, unsigned long end_addr);
++extern vm_fault_t do_anon_huge_page_remap(struct vm_area_struct *vma, unsigned long address,
++		pmd_t *pmd, struct page *page);
++extern int finish_pin_mem_dump(void);
++
++extern void *create_pagemap_walk(void);
++extern void free_pagemap_walk(void *mem_walk);
++extern int pagemap_get(struct mm_struct *mm, void *mem_walk,
++			unsigned long start_vaddr, unsigned long end_vaddr,
++			unsigned long *pte_entry, unsigned int *count);
++
++extern int init_pagemap_read(void);
++/* reserve space for pin memory*/
++#ifdef CONFIG_ARM64
++extern struct resource pin_memory_resource;
++#endif
++extern void init_reserve_page_map(unsigned long map_addr, unsigned long map_size);
++
++#endif /* CONFIG_PIN_MEMORY */
++#endif /* _LINUX_PIN_MEMORY_H */
+--- a/kernel/crash_core.c
++++ b/kernel/crash_core.c
+@@ -462,6 +462,17 @@ void __init reserve_crashkernel(void)
+ }
+ #endif /* CONFIG_ARCH_WANT_RESERVE_CRASH_KERNEL */
+ 
++#ifdef CONFIG_PIN_MEMORY
++int __init parse_pin_memory(char *cmdline,
++		unsigned long long system_ram,
++		unsigned long long *pin_size,
++		unsigned long long *pin_base)
++{
++	return __parse_crashkernel(cmdline, system_ram, pin_size, pin_base,
++		"pinmemory=", NULL);
++}
++#endif
++
+ Elf_Word *append_elf_note(Elf_Word *buf, char *name, unsigned int type,
+ 			  void *data, size_t data_len)
+ {
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -908,4 +908,12 @@ config MAPPING_DIRTY_HELPERS
+ 
+ source "mm/damon/Kconfig"
+ 
++config PIN_MEMORY
++	bool "Support for pin memory"
++	depends on MMU && ARM64
++	help
++	  Say y here to enable the pin memory feature for checkpoint
++	  and restore. We can pin the memory data of tasks and collect
++	  the corresponding physical pages mapping info in checkpoint,
++	  and remap the physical pages to restore tasks in restore.
+ endmenu
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -124,3 +124,4 @@ obj-$(CONFIG_MAPPING_DIRTY_HELPERS) += m
+ obj-$(CONFIG_PTDUMP_CORE) += ptdump.o
+ obj-$(CONFIG_PAGE_REPORTING) += page_reporting.o
+ obj-$(CONFIG_HAVE_BOOTMEM_INFO_NODE) += bootmem_info.o
++obj-$(CONFIG_PIN_MEMORY) += pin_mem.o
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -3028,3 +3028,66 @@ void remove_migration_pmd(struct page_vm
+ 	update_mmu_cache_pmd(vma, address, pvmw->pmd);
+ }
+ #endif
++
++#ifdef CONFIG_PIN_MEMORY
++vm_fault_t do_anon_huge_page_remap(struct vm_area_struct *vma, unsigned long address,
++		pmd_t *pmd, struct page *page)
++{
++	gfp_t gfp;
++	pgtable_t pgtable;
++	spinlock_t *ptl;
++	pmd_t entry;
++	vm_fault_t ret = 0;
++
++	if (unlikely(anon_vma_prepare(vma)))
++		return VM_FAULT_OOM;
++	if (unlikely(khugepaged_enter(vma, vma->vm_flags)))
++		return VM_FAULT_OOM;
++	gfp = alloc_hugepage_direct_gfpmask(vma);
++
++	prep_transhuge_page(page);
++	if (mem_cgroup_charge(page, vma->vm_mm, gfp)) {
++		put_page(page);
++		count_vm_event(THP_FAULT_FALLBACK);
++		count_vm_event(THP_FAULT_FALLBACK_CHARGE);
++		return VM_FAULT_FALLBACK;
++	}
++	cgroup_throttle_swaprate(page, gfp);
++
++	pgtable = pte_alloc_one(vma->vm_mm);
++	if (unlikely(!pgtable)) {
++		ret = VM_FAULT_OOM;
++		goto release;
++	}
++	__SetPageUptodate(page);
++	ptl = pmd_lock(vma->vm_mm, pmd);
++	if (unlikely(!pmd_none(*pmd))) {
++		goto unlock_release;
++	} else {
++		ret = check_stable_address_space(vma->vm_mm);
++		if (ret)
++			goto unlock_release;
++		entry = mk_huge_pmd(page, vma->vm_page_prot);
++		entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
++		page_add_new_anon_rmap(page, vma, address, true);
++		lru_cache_add_inactive_or_unevictable(page, vma);
++		pgtable_trans_huge_deposit(vma->vm_mm, pmd, pgtable);
++		set_pmd_at(vma->vm_mm, address, pmd, entry);
++		add_mm_counter(vma->vm_mm, MM_ANONPAGES, HPAGE_PMD_NR);
++		mm_inc_nr_ptes(vma->vm_mm);
++		spin_unlock(ptl);
++		count_vm_event(THP_FAULT_ALLOC);
++		count_memcg_event_mm(vma->vm_mm, THP_FAULT_ALLOC);
++	}
++
++	return 0;
++
++unlock_release:
++	spin_unlock(ptl);
++release:
++	if (pgtable)
++		pte_free(vma->vm_mm, pgtable);
++	put_page(page);
++	return ret;
++}
++#endif
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -5360,3 +5360,68 @@ void ptlock_free(struct page *page)
+ 	kmem_cache_free(page_ptl_cachep, page->ptl);
+ }
+ #endif
++
++#ifdef CONFIG_PIN_MEMORY
++vm_fault_t do_anon_page_remap(struct vm_area_struct *vma, unsigned long address,
++	pmd_t *pmd, struct page *page)
++{
++	pte_t entry;
++	spinlock_t *ptl;
++	pte_t *pte;
++	vm_fault_t ret = 0;
++
++	if (pte_alloc(vma->vm_mm, pmd))
++		return VM_FAULT_OOM;
++
++	/* See the comment in pte_alloc_one_map() */
++	if (unlikely(pmd_trans_unstable(pmd)))
++		return 0;
++
++	/* Allocate our own private page. */
++	if (unlikely(anon_vma_prepare(vma)))
++		goto oom;
++
++	if (mem_cgroup_charge(page, vma->vm_mm, GFP_KERNEL))
++		goto oom_free_page;
++
++	/*
++	 * The memory barrier inside __SetPageUptodate makes sure that
++	 * preceding stores to the page contents become visible before
++	 * the set_pte_at() write.
++	 */
++	__SetPageUptodate(page);
++
++	entry = mk_pte(page, vma->vm_page_prot);
++	if (vma->vm_flags & VM_WRITE)
++		entry = pte_mkwrite(pte_mkdirty(entry));
++	pte = pte_offset_map_lock(vma->vm_mm, pmd, address,
++		&ptl);
++	if (!pte_none(*pte)) {
++		ret = VM_FAULT_FALLBACK;
++		goto release;
++	}
++
++	ret = check_stable_address_space(vma->vm_mm);
++	if (ret)
++		goto release;
++	inc_mm_counter_fast(vma->vm_mm, MM_ANONPAGES);
++	page_add_new_anon_rmap(page, vma, address, false);
++	lru_cache_add_inactive_or_unevictable(page, vma);
++
++	set_pte_at(vma->vm_mm, address, pte, entry);
++	/* No need to invalidate - it was non-present before */
++	update_mmu_cache(vma, address, pte);
++
++unlock:
++	pte_unmap_unlock(pte, ptl);
++	return ret;
++
++release:
++	put_page(page);
++	goto unlock;
++oom_free_page:
++	put_page(page);
++oom:
++	return VM_FAULT_OOM;
++}
++#endif
+--- /dev/null
++++ b/mm/pin_mem.c
+@@ -0,0 +1,1091 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ *  Copyright (C) 2020. Huawei Technologies Co., Ltd. All rights reserved.
++ *  Provide the pin memory method for check point and restore task.
++ */
++#ifdef CONFIG_PIN_MEMORY
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/time.h>
++#include <linux/sched/cputime.h>
++#include <linux/tick.h>
++#include <linux/mm.h>
++#include <linux/pin_mem.h>
++#include <linux/idr.h>
++#include <linux/page-isolation.h>
++#include <linux/sched/mm.h>
++#include <linux/ctype.h>
++#include <linux/highmem.h>
++#include <crypto/sha2.h>
++
++#define MAX_PIN_PID_NUM  128
++#define DEFAULT_REDIRECT_SPACE_SIZE  0x100000
++
++static DEFINE_SPINLOCK(page_map_entry_lock);
++static DEFINE_MUTEX(pin_mem_mutex);
++static struct pin_mem_dump_info *pin_mem_dump_start;
++static unsigned int pin_pid_num;
++static unsigned int *pin_pid_num_addr;
++static struct page_map_entry *__page_map_entry_start;
++static unsigned long page_map_entry_end;
++static struct page_map_info *user_space_reserve_start;
++static struct page_map_entry *page_map_entry_start;
++
++unsigned int max_pin_pid_num __read_mostly;
++unsigned long redirect_space_size __read_mostly;
++static unsigned long redirect_space_start;
++static void *pin_mem_pagewalk;
++static unsigned long *pagemap_buffer;
++static int reserve_user_map_pages_fail;
++
++static int __init setup_max_pin_pid_num(char *str)
++{
++	int ret;
++
++	if (!str)
++		return 0;
++
++	ret = kstrtouint(str, 10, &max_pin_pid_num);
++	if (ret) {
++		pr_warn("Unable to parse max pin pid num.\n");
++	} else {
++		if (max_pin_pid_num > MAX_PIN_PID_NUM) {
++			max_pin_pid_num = 0;
++			pr_warn("Input max_pin_pid_num is too large.\n");
++		}
++	}
++	return ret;
++}
++early_param("max_pin_pid_num", setup_max_pin_pid_num);
++
++static int __init setup_redirect_space_size(char *str)
++{
++	if (!str)
++		return 0;
++
++	redirect_space_size = memparse(str, NULL);
++	if (!redirect_space_size) {
++		pr_warn("Unable to parse redirect space size, use the default value.\n");
++		redirect_space_size = DEFAULT_REDIRECT_SPACE_SIZE;
++	}
++	return 0;
++}
++early_param("redirect_space_size", setup_redirect_space_size);
++
++static struct page_map_info *create_page_map_info(int pid)
++{
++	struct page_map_info *new;
++
++	if (!user_space_reserve_start)
++		return NULL;
++
++	if (pin_pid_num >= max_pin_pid_num) {
++		pr_warn("Pin pid num too large than max_pin_pid_num, fail create: %d!", pid);
++		return NULL;
++	}
++	new = (struct page_map_info *)(user_space_reserve_start + pin_pid_num);
++	new->pid = pid;
++	new->pme = NULL;
++	new->entry_num = 0;
++	new->pid_reserved = false;
++	new->disable_free_page = false;
++	(*pin_pid_num_addr)++;
++	pin_pid_num++;
++	return new;
++}
++
++struct page_map_info *create_page_map_info_by_pid(int pid)
++{
++	unsigned long flags;
++	struct page_map_info *ret;
++
++	spin_lock_irqsave(&page_map_entry_lock, flags);
++	ret = create_page_map_info(pid);
++	spin_unlock_irqrestore(&page_map_entry_lock, flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(create_page_map_info_by_pid);
++
++static struct page_map_info *get_page_map_info(int pid)
++{
++	int i;
++
++	if (!user_space_reserve_start)
++		return NULL;
++
++	for (i = 0; i < pin_pid_num; i++) {
++		if (user_space_reserve_start[i].pid == pid)
++			return &(user_space_reserve_start[i]);
++	}
++	return NULL;
++}
++
++struct page_map_info *get_page_map_info_by_pid(int pid)
++{
++	unsigned long flags;
++	struct page_map_info *ret;
++
++	spin_lock_irqsave(&page_map_entry_lock, flags);
++	ret = get_page_map_info(pid);
++	spin_unlock_irqrestore(&page_map_entry_lock, flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(get_page_map_info_by_pid);
++
++static struct page *find_head_page(struct page *page)
++{
++	struct page *p = page;
++
++	while (!PageBuddy(p)) {
++		if (PageLRU(p))
++			return NULL;
++		p--;
++	}
++	return p;
++}
++
++static void spilt_page_area_left(struct zone *zone, struct free_area *area, struct page *page,
++	unsigned long size, int order)
++{
++	unsigned long cur_size = 1 << order;
++	unsigned long total_size = 0;
++
++	while (size && cur_size > size) {
++		cur_size >>= 1;
++		order--;
++		area--;
++		if (cur_size <= size) {
++			list_add(&page[total_size].lru, &area->free_list[MIGRATE_MOVABLE]);
++			atomic_set(&(page[total_size]._mapcount), PAGE_BUDDY_MAPCOUNT_VALUE);
++			set_page_private(&page[total_size], order);
++			set_pageblock_migratetype(&page[total_size], MIGRATE_MOVABLE);
++			area->nr_free++;
++			total_size += cur_size;
++			size -= cur_size;
++		}
++	}
++}
++
++static void spilt_page_area_right(struct zone *zone, struct free_area *area, struct page *page,
++		unsigned long size, int order)
++{
++	unsigned long cur_size = 1 << order;
++	struct page *right_page, *head_page;
++
++	right_page = page + size;
++	while (size && cur_size > size) {
++		cur_size >>= 1;
++		order--;
++		area--;
++		if (cur_size <= size) {
++			head_page = right_page - cur_size;
++			list_add(&head_page->lru, &area->free_list[MIGRATE_MOVABLE]);
++			atomic_set(&(head_page->_mapcount), PAGE_BUDDY_MAPCOUNT_VALUE);
++			set_page_private(head_page, order);
++			set_pageblock_migratetype(head_page, MIGRATE_MOVABLE);
++			area->nr_free++;
++			size -= cur_size;
++			right_page = head_page;
++		}
++	}
++}
++
++void reserve_page_from_buddy(unsigned long nr_pages, struct page *page)
++{
++	unsigned int current_order;
++	struct page *page_end;
++	struct free_area *area;
++	struct zone *zone;
++	struct page *head_page;
++
++	head_page = find_head_page(page);
++	if (!head_page) {
++		pr_warn("Find page head fail.");
++		return;
++	}
++
++	current_order = head_page->private;
++	page_end = head_page + (1 << current_order);
++	zone = page_zone(head_page);
++	area = &(zone->free_area[current_order]);
++	list_del(&head_page->lru);
++	atomic_set(&head_page->_mapcount, -1);
++	set_page_private(head_page, 0);
++	area->nr_free--;
++
++	if (head_page != page)
++		spilt_page_area_left(zone, area, head_page,
++			(unsigned long)(page - head_page), current_order);
++	page = page + nr_pages;
++	if (page < page_end) {
++		spilt_page_area_right(zone, area, page,
++			(unsigned long)(page_end - page), current_order);
++	} else if (page > page_end) {
++		pr_warn("Find page end smaller than page.");
++	}
++}
++
++static inline void reserve_user_normal_pages(struct page *page)
++{
++	atomic_inc(&page->_refcount);
++	reserve_page_from_buddy(1, page);
++}
++
++static void init_huge_pmd_pages(struct page *head_page)
++{
++	int i = 0;
++	struct page *page = head_page;
++	unsigned long compound_pad = COMPOUND_PAD_START;
++
++	__set_bit(PG_head, &page->flags);
++	__set_bit(PG_active, &page->flags);
++	atomic_set(&page->_refcount, 1);
++	page++;
++	i++;
++	page->compound_head = (unsigned long)head_page + 1;
++	page->compound_dtor = HUGETLB_PAGE_DTOR + 1;
++	page->compound_order = HPAGE_PMD_ORDER;
++	page++;
++	i++;
++	page->compound_head = (unsigned long)head_page + 1;
++	i++;
++
++	INIT_LIST_HEAD(&(page->deferred_list));
++	for (; i < HPAGE_PMD_NR; i++) {
++		page = head_page + i;
++		page->compound_head = (unsigned long)head_page + 1;
++		compound_pad += COMPOUND_PAD_DELTA;
++	}
++}
++
++static inline void reserve_user_huge_pmd_pages(struct page *page)
++{
++	atomic_inc(&page->_refcount);
++	reserve_page_from_buddy((1 << HPAGE_PMD_ORDER), page);
++	init_huge_pmd_pages(page);
++}
++
++void free_user_map_pages(unsigned int pid_index, unsigned int entry_index, unsigned int page_index)
++{
++	unsigned int i, j, index, order;
++	struct page_map_info *pmi;
++	struct page_map_entry *pme;
++	struct page *page;
++	unsigned long phy_addr;
++
++	for (index = 0; index < pid_index; index++) {
++		pmi = &(user_space_reserve_start[index]);
++		pme = pmi->pme;
++		for (i = 0; i < pmi->entry_num; i++) {
++			for (j = 0; j < pme->nr_pages; j++) {
++				order = pme->is_huge_page ? HPAGE_PMD_ORDER : 0;
++				phy_addr = pme->phy_addr_array[j];
++				if (phy_addr) {
++					page = phys_to_page(phy_addr);
++					if (!(page->flags & PAGE_FLAGS_CHECK_RESERVED)) {
++						__free_pages(page, order);
++						pme->phy_addr_array[j] = 0;
++					}
++				}
++			}
++			pme = (struct page_map_entry *)next_pme(pme);
++		}
++	}
++
++	pmi = &(user_space_reserve_start[index]);
++	pme = pmi->pme;
++	for (i = 0; i < entry_index; i++) {
++		for (j = 0; j < pme->nr_pages; j++) {
++			order = pme->is_huge_page ? HPAGE_PMD_ORDER : 0;
++			phy_addr = pme->phy_addr_array[j];
++			if (phy_addr) {
++				page = phys_to_page(phy_addr);
++				if (!(page->flags & PAGE_FLAGS_CHECK_RESERVED)) {
++					__free_pages(page, order);
++					pme->phy_addr_array[j] = 0;
++				}
++			}
++		}
++		pme = (struct page_map_entry *)next_pme(pme);
++	}
++
++	for (j = 0; j < page_index; j++) {
++		order = pme->is_huge_page ? HPAGE_PMD_ORDER : 0;
++		phy_addr = pme->phy_addr_array[j];
++		if (phy_addr) {
++			page = phys_to_page(phy_addr);
++			if (!(page->flags & PAGE_FLAGS_CHECK_RESERVED)) {
++				__free_pages(page, order);
++				pme->phy_addr_array[j] = 0;
++			}
++		}
++	}
++}
++
++bool check_redirect_end_valid(struct redirect_info *redirect_start,
++			unsigned long max_redirect_page_num)
++{
++	unsigned long redirect_end;
++
++	redirect_end = ((unsigned long)(redirect_start + 1) +
++		max_redirect_page_num * sizeof(unsigned int));
++	if (redirect_end > redirect_space_start + redirect_space_size)
++		return false;
++	return true;
++}
++
++static void reserve_user_space_map_pages(void)
++{
++	struct page_map_info *pmi;
++	struct page_map_entry *pme;
++	unsigned int i, j, index;
++	struct page *page;
++	unsigned long flags;
++	unsigned long phy_addr;
++	unsigned long redirect_pages = 0;
++	struct redirect_info *redirect_start = (struct redirect_info *)redirect_space_start;
++
++	if (!user_space_reserve_start || !redirect_start)
++		return;
++	spin_lock_irqsave(&page_map_entry_lock, flags);
++	for (index = 0; index < pin_pid_num; index++) {
++		pmi = &(user_space_reserve_start[index]);
++		pme = pmi->pme;
++		for (i = 0; i < pmi->entry_num; i++) {
++			redirect_pages = 0;
++			if (!check_redirect_end_valid(redirect_start, pme->nr_pages))
++				redirect_start = NULL;
++
++			for (j = 0; j < pme->nr_pages; j++) {
++				phy_addr = pme->phy_addr_array[j];
++				if (!phy_addr)
++					continue;
++				page = phys_to_page(phy_addr);
++				if (atomic_read(&page->_refcount)) {
++					if ((page->flags & PAGE_FLAGS_CHECK_RESERVED)
++						&& !pme->redirect_start)
++						pme->redirect_start =
++							(unsigned long)redirect_start;
++
++					if (redirect_start &&
++						(page->flags & PAGE_FLAGS_CHECK_RESERVED)) {
++						redirect_start->redirect_index[redirect_pages] = j;
++						redirect_pages++;
++						continue;
++					} else {
++						reserve_user_map_pages_fail = 1;
++						pr_warn("Page %pK refcount %d large than zero, no need reserve.\n",
++						page, atomic_read(&page->_refcount));
++						goto free_pages;
++					}
++				}
++
++				if (!pme->is_huge_page)
++					reserve_user_normal_pages(page);
++				else
++					reserve_user_huge_pmd_pages(page);
++			}
++			pme = (struct page_map_entry *)next_pme(pme);
++			if (redirect_pages && redirect_start) {
++				redirect_start->redirect_pages = redirect_pages;
++				redirect_start = (struct redirect_info *)(
++					(unsigned long)(redirect_start + 1) +
++					redirect_start->redirect_pages * sizeof(unsigned int));
++			}
++		}
++	}
++	spin_unlock_irqrestore(&page_map_entry_lock, flags);
++	return;
++
++free_pages:
++	free_user_map_pages(index, i, j);
++	spin_unlock_irqrestore(&page_map_entry_lock, flags);
++}
++
++
++int calculate_pin_mem_digest(struct pin_mem_dump_info *pmdi, char *digest)
++{
++	int i;
++	struct sha256_state sctx;
++
++	if (!digest)
++		digest = pmdi->sha_digest;
++	sha256_init(&sctx);
++	sha256_update(&sctx, (unsigned char *)(&(pmdi->magic)),
++		sizeof(struct pin_mem_dump_info) - SHA256_DIGEST_SIZE);
++	for (i = 0; i < pmdi->pin_pid_num; i++) {
++		sha256_update(&sctx, (unsigned char *)(&(pmdi->pmi_array[i])),
++			sizeof(struct page_map_info));
++	}
++	sha256_final(&sctx, digest);
++	return 0;
++}
++
++static int check_sha_digest(struct pin_mem_dump_info *pmdi)
++{
++	int ret = 0;
++	char digest[SHA256_DIGEST_SIZE] = {0};
++
++	ret = calculate_pin_mem_digest(pmdi, digest);
++	if (ret) {
++		pr_warn("calculate pin mem digest fail:%d\n", ret);
++		return ret;
++	}
++	if (memcmp(pmdi->sha_digest, digest, SHA256_DIGEST_SIZE)) {
++		pr_warn("pin mem dump info sha256 digest match error!\n");
++		return -EFAULT;
++	}
++	return ret;
++}
++
++/*
++ * The whole page map entry collect process must be Sequentially.
++ * The user_space_reserve_start points to the first page map info for
++ * the first dump task. And the page_map_entry_start points to
++ * the first page map entry of the first dump vma.
++ */
++static void init_page_map_info(struct pin_mem_dump_info *pmdi, unsigned long map_len)
++{
++	if (pin_mem_dump_start || !max_pin_pid_num) {
++		pr_warn("pin page map already init or max_pin_pid_num not set.\n");
++		return;
++	}
++	if (map_len < sizeof(struct pin_mem_dump_info) +
++		max_pin_pid_num * sizeof(struct page_map_info) + redirect_space_size) {
++		pr_warn("pin memory reserved memblock too small.\n");
++		return;
++	}
++	if ((pmdi->magic != PIN_MEM_DUMP_MAGIC) || (pmdi->pin_pid_num > max_pin_pid_num) ||
++		check_sha_digest(pmdi))
++		memset(pmdi, 0, sizeof(struct pin_mem_dump_info));
++
++	pin_mem_dump_start = pmdi;
++	pin_pid_num = pmdi->pin_pid_num;
++	pr_info("pin_pid_num: %d\n", pin_pid_num);
++	pin_pid_num_addr = &(pmdi->pin_pid_num);
++	user_space_reserve_start =
++		(struct page_map_info *)pmdi->pmi_array;
++	page_map_entry_start =
++		(struct page_map_entry *)(user_space_reserve_start + max_pin_pid_num);
++	__page_map_entry_start = page_map_entry_start;
++	page_map_entry_end = (unsigned long)pmdi + map_len - redirect_space_size;
++	redirect_space_start = page_map_entry_end;
++
++	if (pin_pid_num > 0)
++		reserve_user_space_map_pages();
++}
++
++int finish_pin_mem_dump(void)
++{
++	int ret;
++
++	if (!pin_mem_dump_start)
++		return -EFAULT;
++	pin_mem_dump_start->magic = PIN_MEM_DUMP_MAGIC;
++	memset(pin_mem_dump_start->sha_digest, 0, SHA256_DIGEST_SIZE);
++	ret = calculate_pin_mem_digest(pin_mem_dump_start, NULL);
++	if (ret) {
++		pr_warn("calculate pin mem digest fail:%d\n", ret);
++		return ret;
++	}
++	return ret;
++}
++EXPORT_SYMBOL_GPL(finish_pin_mem_dump);
++
++int collect_pmd_huge_pages(struct task_struct *task,
++	unsigned long start_addr, unsigned long end_addr, struct page_map_entry *pme)
++{
++	int ret, i, res;
++	int index = 0;
++	unsigned long start = start_addr;
++	struct page *temp_page;
++	unsigned long *pte_entry = pagemap_buffer;
++	unsigned int count;
++	struct mm_struct *mm = task->mm;
++
++	while (start < end_addr) {
++		temp_page = NULL;
++		count = 0;
++		ret = pagemap_get(mm, pin_mem_pagewalk,
++			start, start + HPAGE_PMD_SIZE, pte_entry, &count);
++		if (ret || !count) {
++			pr_warn("Get huge page fail: %d.", ret);
++			return COLLECT_PAGES_FAIL;
++		}
++
++		/* For huge page, get one map entry per time. */
++		if ((pte_entry[0] & PM_SWAP) && (count == 1)) {
++			res = get_user_pages_remote(task->mm, start, 1,
++				FOLL_TOUCH | FOLL_GET, &temp_page, NULL, NULL);
++			if (!res) {
++				pr_warn("Swap in huge page fail.\n");
++				return COLLECT_PAGES_FAIL;
++			}
++			pme->phy_addr_array[index] = page_to_phys(temp_page);
++			start += HPAGE_PMD_SIZE;
++			index++;
++			continue;
++		}
++
++		if (IS_PTE_PRESENT(pte_entry[0])) {
++			temp_page = pfn_to_page(pte_entry[0] & PM_PFRAME_MASK);
++			if (PageHead(temp_page)) {
++				atomic_inc(&((temp_page)->_refcount));
++				start += HPAGE_PMD_SIZE;
++				pme->phy_addr_array[index] = page_to_phys(temp_page);
++				index++;
++			} else {
++				/* If the page is not compound head, goto collect normal pages. */
++				pme->nr_pages = index;
++				return COLLECT_PAGES_NEED_CONTINUE;
++			}
++		} else {
++			for (i = 1; i < count; i++) {
++				if (pte_entry[i] & PM_PFRAME_MASK) {
++					pme->nr_pages = index;
++					return COLLECT_PAGES_NEED_CONTINUE;
++				}
++			}
++			start += HPAGE_PMD_SIZE;
++			pme->phy_addr_array[index] = 0;
++			index++;
++		}
++	}
++	pme->nr_pages = index;
++	return COLLECT_PAGES_FINISH;
++}
++
++int collect_normal_pages(struct task_struct *task,
++	unsigned long start_addr, unsigned long end_addr, struct page_map_entry *pme)
++{
++	int ret, res;
++	unsigned long next;
++	unsigned long i, nr_pages;
++	struct page *tmp_page;
++	unsigned long *phy_addr_array = pme->phy_addr_array;
++	unsigned int count;
++	unsigned long *pte_entry = pagemap_buffer;
++	struct mm_struct *mm = task->mm;
++
++	next = (start_addr & HPAGE_PMD_MASK) + HPAGE_PMD_SIZE;
++	next = (next > end_addr) ? end_addr : next;
++	pme->nr_pages = 0;
++	while (start_addr < next) {
++		count = 0;
++		nr_pages = (PAGE_ALIGN(next) - start_addr) / PAGE_SIZE;
++		ret = pagemap_get(mm, pin_mem_pagewalk,
++			start_addr, next, pte_entry, &count);
++		if (ret || !count) {
++			pr_warn("Get user page fail: %d, count: %u.\n",
++				ret, count);
++			return COLLECT_PAGES_FAIL;
++		}
++
++		if (IS_PTE_PRESENT(pte_entry[0])) {
++			tmp_page = pfn_to_page(pte_entry[0] & PM_PFRAME_MASK);
++			/* If the page is compound head, goto collect huge pages. */
++			if (PageHead(tmp_page))
++				return COLLECT_PAGES_NEED_CONTINUE;
++			if (PageTail(tmp_page)) {
++				start_addr = next;
++				pme->virt_addr = start_addr;
++				next = NEXT_PIN_ADDR(next, end_addr);
++				continue;
++			}
++		}
++
++		for (i = 0; i < count; i++) {
++			if (pte_entry[i] & PM_SWAP) {
++				res = get_user_pages_remote(task->mm, start_addr + i * PAGE_SIZE,
++					1, FOLL_TOUCH | FOLL_GET, &tmp_page, NULL, NULL);
++				if (!res) {
++					pr_warn("Swap in page fail.\n");
++					return COLLECT_PAGES_FAIL;
++				}
++				phy_addr_array[i] = page_to_phys(tmp_page);
++				continue;
++			}
++			if (!IS_PTE_PRESENT(pte_entry[i])) {
++				phy_addr_array[i] = 0;
++				continue;
++			}
++			tmp_page = pfn_to_page(pte_entry[i] & PM_PFRAME_MASK);
++			atomic_inc(&(tmp_page->_refcount));
++			phy_addr_array[i] = ((pte_entry[i] & PM_PFRAME_MASK) << PAGE_SHIFT);
++		}
++		pme->nr_pages += count;
++		phy_addr_array += count;
++		start_addr = next;
++		next = NEXT_PIN_ADDR(next, end_addr);
++	}
++	return COLLECT_PAGES_FINISH;
++}
++
++void free_pin_pages(struct page_map_entry *pme)
++{
++	unsigned long i;
++	struct page *tmp_page;
++
++	if (!pme)
++		return;
++	for (i = 0; i < pme->nr_pages; i++) {
++		if (pme->phy_addr_array[i]) {
++			tmp_page = phys_to_page(pme->phy_addr_array[i]);
++			atomic_dec(&(tmp_page->_refcount));
++			pme->phy_addr_array[i] = 0;
++		}
++	}
++}
++
++int init_pagemap_read(void)
++{
++	int ret = -ENOMEM;
++
++	if (pin_mem_pagewalk)
++		return 0;
++
++	mutex_lock(&pin_mem_mutex);
++	pin_mem_pagewalk = create_pagemap_walk();
++	if (!pin_mem_pagewalk)
++		goto out;
++	pagemap_buffer = kmalloc(((PMD_SIZE >> PAGE_SHIFT) + 1) *
++		sizeof(unsigned long), GFP_KERNEL);
++	if (!pagemap_buffer)
++		goto free;
++
++	ret = 0;
++out:
++	mutex_unlock(&pin_mem_mutex);
++	return ret;
++free:
++	free_pagemap_walk(pin_mem_pagewalk);
++	pin_mem_pagewalk = NULL;
++	goto out;
++}
++EXPORT_SYMBOL_GPL(init_pagemap_read);
++
++/* Users make sure that the pin memory belongs to anonymous vma. */
++int pin_mem_area(struct task_struct *task, struct mm_struct *mm,
++		unsigned long start_addr, unsigned long end_addr)
++{
++	int pid, ret;
++	int is_huge_page = false;
++	unsigned int page_size;
++	unsigned long nr_pages, flags;
++	struct page_map_entry *pme = NULL;
++	struct page_map_info *pmi;
++	struct vm_area_struct *vma;
++	unsigned long i;
++	struct page *tmp_page;
++
++	if (!page_map_entry_start
++		|| !task || !mm
++		|| start_addr >= end_addr || !pin_mem_pagewalk)
++		return -EFAULT;
++
++	pid = task->pid;
++	spin_lock_irqsave(&page_map_entry_lock, flags);
++	nr_pages = ((end_addr - start_addr) / PAGE_SIZE);
++	if ((unsigned long)page_map_entry_start +
++		nr_pages * sizeof(unsigned long) +
++		sizeof(struct page_map_entry) >= page_map_entry_end) {
++		pr_warn("Page map entry use up!\n");
++		ret = -ENOMEM;
++		goto finish;
++	}
++
++	vma = find_extend_vma(mm, start_addr);
++	if (!vma) {
++		pr_warn("Find no match vma!\n");
++		ret = -EFAULT;
++		goto finish;
++	}
++	if (start_addr == (start_addr & HPAGE_PMD_MASK) &&
++		transparent_hugepage_active(vma)) {
++		page_size = HPAGE_PMD_SIZE;
++		is_huge_page = true;
++	} else {
++		page_size = PAGE_SIZE;
++	}
++
++	pme = page_map_entry_start;
++	pme->virt_addr = start_addr;
++	pme->redirect_start = 0;
++	pme->is_huge_page = is_huge_page;
++	memset(pme->phy_addr_array, 0, nr_pages * sizeof(unsigned long));
++
++	down_read(&mm->mmap_lock);
++	if (!is_huge_page) {
++		ret = collect_normal_pages(task, start_addr, end_addr, pme);
++		if (ret != COLLECT_PAGES_FAIL && !pme->nr_pages) {
++			if (ret == COLLECT_PAGES_FINISH) {
++				ret = 0;
++				up_read(&mm->mmap_lock);
++				goto finish;
++			}
++			pme->is_huge_page = true;
++			page_size = HPAGE_PMD_SIZE;
++			ret = collect_pmd_huge_pages(task, pme->virt_addr, end_addr, pme);
++		}
++	} else {
++		ret = collect_pmd_huge_pages(task, start_addr, end_addr, pme);
++		if (ret != COLLECT_PAGES_FAIL && !pme->nr_pages) {
++			if (ret == COLLECT_PAGES_FINISH) {
++				ret = 0;
++				up_read(&mm->mmap_lock);
++				goto finish;
++			}
++			pme->is_huge_page = false;
++			page_size = PAGE_SIZE;
++			ret = collect_normal_pages(task, pme->virt_addr, end_addr, pme);
++		}
++	}
++	up_read(&mm->mmap_lock);
++	if (ret == COLLECT_PAGES_FAIL) {
++		ret = -EFAULT;
++		goto finish;
++	}
++
++	/* check for zero pages */
++	for (i = 0; i < pme->nr_pages; i++) {
++		tmp_page = phys_to_page(pme->phy_addr_array[i]);
++		if (!pme->is_huge_page) {
++			if (page_to_pfn(tmp_page) == my_zero_pfn(pme->virt_addr + i * PAGE_SIZE))
++				pme->phy_addr_array[i] = 0;
++		} else if (is_huge_zero_page(tmp_page))
++			pme->phy_addr_array[i] = 0;
++	}
++
++	page_map_entry_start = (struct page_map_entry *)(next_pme(pme));
++	pmi = get_page_map_info(pid);
++	if (!pmi)
++		pmi = create_page_map_info(pid);
++	if (!pmi) {
++		pr_warn("Create page map info fail for pid: %d!\n", pid);
++		ret = -EFAULT;
++		goto finish;
++	}
++	if (!pmi->pme)
++		pmi->pme = pme;
++	pmi->entry_num++;
++	spin_unlock_irqrestore(&page_map_entry_lock, flags);
++
++	if (ret == COLLECT_PAGES_NEED_CONTINUE)
++		ret = pin_mem_area(task, mm, pme->virt_addr + pme->nr_pages * page_size, end_addr);
++	return ret;
++
++finish:
++	if (ret)
++		free_pin_pages(pme);
++	spin_unlock_irqrestore(&page_map_entry_lock, flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(pin_mem_area);
++
++vm_fault_t remap_normal_pages(struct mm_struct *mm, struct vm_area_struct *vma,
++		struct page_map_entry *pme)
++{
++	int ret;
++	unsigned int j, i;
++	pgd_t *pgd;
++	p4d_t *p4d;
++	pmd_t *pmd;
++	pud_t *pud;
++	struct page *page, *new;
++	unsigned long address;
++	unsigned long phy_addr;
++	unsigned int redirect_pages = 0;
++	struct redirect_info *redirect_start;
++
++	redirect_start = (struct redirect_info *)pme->redirect_start;
++	for (j = 0; j < pme->nr_pages; j++) {
++		address = pme->virt_addr + j * PAGE_SIZE;
++		phy_addr = pme->phy_addr_array[j];
++		if (!phy_addr)
++			continue;
++
++		page = phys_to_page(phy_addr);
++		if (page_to_pfn(page) == my_zero_pfn(address)) {
++			pme->phy_addr_array[j] = 0;
++			continue;
++		}
++		pme->phy_addr_array[j] = 0;
++
++		if (redirect_start && (redirect_pages < redirect_start->redirect_pages) &&
++			(j == redirect_start->redirect_index[redirect_pages])) {
++			new = alloc_zeroed_user_highpage_movable(vma, address);
++			if (!new) {
++				pr_warn("Redirect alloc page fail\n");
++				continue;
++			}
++			copy_page(page_to_virt(new), phys_to_virt(phy_addr));
++			page = new;
++			redirect_pages++;
++		}
++
++		page->mapping = NULL;
++		pgd = pgd_offset(mm, address);
++		ret = VM_FAULT_OOM;
++		p4d = p4d_alloc(mm, pgd, address);
++		if (!p4d)
++			goto free;
++		pud = pud_alloc(mm, p4d, address);
++		if (!pud)
++			goto free;
++		pmd = pmd_alloc(mm, pud, address);
++		if (!pmd)
++			goto free;
++		ret = do_anon_page_remap(vma, address, pmd, page);
++		if (ret)
++			goto free;
++	}
++	return 0;
++
++free:
++	for (i = j; i < pme->nr_pages; i++) {
++		phy_addr = pme->phy_addr_array[i];
++		if (phy_addr) {
++			__free_page(phys_to_page(phy_addr));
++			pme->phy_addr_array[i] = 0;
++		}
++	}
++	return ret;
++}
++
++static inline gfp_t get_hugepage_gfpmask(struct vm_area_struct *vma)
++{
++	const bool vma_madvised = !!(vma->vm_flags & VM_HUGEPAGE);
++
++	if (test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_DIRECT_FLAG, &transparent_hugepage_flags))
++		return GFP_TRANSHUGE | (vma_madvised ? 0 : __GFP_NORETRY);
++	if (test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_KSWAPD_FLAG, &transparent_hugepage_flags))
++		return GFP_TRANSHUGE_LIGHT | __GFP_KSWAPD_RECLAIM;
++	if (test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_KSWAPD_OR_MADV_FLAG, &transparent_hugepage_flags))
++		return GFP_TRANSHUGE_LIGHT | (vma_madvised ? __GFP_DIRECT_RECLAIM :
++							     __GFP_KSWAPD_RECLAIM);
++	if (test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_REQ_MADV_FLAG, &transparent_hugepage_flags))
++		return GFP_TRANSHUGE_LIGHT | (vma_madvised ? __GFP_DIRECT_RECLAIM :
++							     0);
++	return GFP_TRANSHUGE_LIGHT;
++}
++
++vm_fault_t remap_huge_pmd_pages(struct mm_struct *mm, struct vm_area_struct *vma,
++		struct page_map_entry *pme)
++{
++	int ret;
++	unsigned int j, i;
++	pgd_t *pgd;
++	p4d_t *p4d;
++	pmd_t *pmd;
++	pud_t *pud;
++	gfp_t gfp;
++	struct page *page, *new;
++	unsigned long address;
++	unsigned long phy_addr;
++	unsigned int redirect_pages = 0;
++	struct redirect_info *redirect_start;
++
++	redirect_start = (struct redirect_info *)pme->redirect_start;
++	for (j = 0; j < pme->nr_pages; j++) {
++		address = pme->virt_addr + j * HPAGE_PMD_SIZE;
++		phy_addr = pme->phy_addr_array[j];
++		if (!phy_addr)
++			continue;
++
++		page = phys_to_page(phy_addr);
++		if (is_huge_zero_page(page)) {
++			pme->phy_addr_array[j] = 0;
++			continue;
++		}
++		pme->phy_addr_array[j] = 0;
++
++		if (redirect_start && (redirect_pages < redirect_start->redirect_pages) &&
++			(j == redirect_start->redirect_index[redirect_pages])) {
++			gfp = get_hugepage_gfpmask(vma);
++			new = alloc_hugepage_vma(gfp, vma, address, HPAGE_PMD_ORDER);
++			if (!new) {
++				pr_warn("Redirect alloc huge page fail\n");
++				continue;
++			}
++			memcpy(page_to_virt(new), phys_to_virt(phy_addr), HPAGE_PMD_SIZE);
++			page = new;
++			redirect_pages++;
++		}
++
++		pgd = pgd_offset(mm, address);
++		ret = VM_FAULT_OOM;
++		p4d = p4d_alloc(mm, pgd, address);
++		if (!p4d)
++			goto free;
++		pud = pud_alloc(mm, p4d, address);
++		if (!pud)
++			goto free;
++		pmd = pmd_alloc(mm, pud, address);
++		if (!pmd)
++			goto free;
++		ret = do_anon_huge_page_remap(vma, address, pmd, page);
++		if (ret)
++			goto free;
++	}
++	return 0;
++
++free:
++	for (i = j; i < pme->nr_pages; i++) {
++		phy_addr = pme->phy_addr_array[i];
++		if (phy_addr) {
++			page = phys_to_page(phy_addr);
++			if (!(page->flags & PAGE_FLAGS_CHECK_RESERVED)) {
++				__free_pages(page, HPAGE_PMD_ORDER);
++				pme->phy_addr_array[i] = 0;
++			}
++		}
++	}
++	return ret;
++}
++
++static void free_unmap_pages(struct page_map_info *pmi,
++			struct page_map_entry *pme,
++			unsigned int index)
++{
++	unsigned int i, j;
++	unsigned long phy_addr;
++	unsigned int order;
++	struct page *page;
++
++	pme = (struct page_map_entry *)(next_pme(pme));
++	for (i = index; i < pmi->entry_num; i++) {
++		for (j = 0; j < pme->nr_pages; j++) {
++			phy_addr = pme->phy_addr_array[i];
++			if (phy_addr) {
++				page = phys_to_page(phy_addr);
++				order = pme->is_huge_page ? HPAGE_PMD_ORDER : 0;
++				if (!(page->flags & PAGE_FLAGS_CHECK_RESERVED)) {
++					__free_pages(page, order);
++					pme->phy_addr_array[i] = 0;
++				}
++			}
++		}
++		pme = (struct page_map_entry *)(next_pme(pme));
++	}
++}
++
++vm_fault_t do_mem_remap(int pid, struct mm_struct *mm)
++{
++	unsigned int i = 0;
++	vm_fault_t ret = 0;
++	struct vm_area_struct *vma;
++	struct page_map_info *pmi;
++	struct page_map_entry *pme;
++	unsigned long flags;
++
++	if (reserve_user_map_pages_fail || !mm)
++		return -EFAULT;
++
++	spin_lock_irqsave(&page_map_entry_lock, flags);
++	pmi = get_page_map_info(pid);
++	if (pmi)
++		pmi->disable_free_page = true;
++	spin_unlock_irqrestore(&page_map_entry_lock, flags);
++	if (!pmi)
++		return -EFAULT;
++
++	down_write(&mm->mmap_lock);
++	pme = pmi->pme;
++	vma = mm->mmap;
++	while ((i < pmi->entry_num) && (vma != NULL)) {
++		if (pme->virt_addr >= vma->vm_start && pme->virt_addr < vma->vm_end) {
++			i++;
++			if (!vma_is_anonymous(vma)) {
++				pme = (struct page_map_entry *)(next_pme(pme));
++				continue;
++			}
++			if (!pme->is_huge_page) {
++				ret = remap_normal_pages(mm, vma, pme);
++				if (ret < 0)
++					goto free;
++			} else {
++				ret = remap_huge_pmd_pages(mm, vma, pme);
++				if (ret < 0)
++					goto free;
++			}
++			pme = (struct page_map_entry *)(next_pme(pme));
++		} else {
++			vma = vma->vm_next;
++		}
++	}
++	up_write(&mm->mmap_lock);
++	return 0;
++
++free:
++	free_unmap_pages(pmi, pme, i);
++	up_write(&mm->mmap_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(do_mem_remap);
++
++#if defined(CONFIG_ARM64)
++void init_reserve_page_map(unsigned long map_addr, unsigned long map_size)
++{
++	void *addr;
++
++	if (!map_addr || !map_size)
++		return;
++	addr = phys_to_virt(map_addr);
++	init_page_map_info((struct pin_mem_dump_info *)addr, map_size);
++}
++#else
++void init_reserve_page_map(unsigned long map_addr, unsigned long map_size)
++{
++}
++#endif
++
++static void free_all_reserved_pages(void)
++{
++	unsigned int i, j, index, order;
++	struct page_map_info *pmi;
++	struct page_map_entry *pme;
++	struct page *page;
++	unsigned long phy_addr;
++
++	if (!user_space_reserve_start || reserve_user_map_pages_fail)
++		return;
++
++	for (index = 0; index < pin_pid_num; index++) {
++		pmi = &(user_space_reserve_start[index]);
++		if (pmi->disable_free_page)
++			continue;
++		pme = pmi->pme;
++		for (i = 0; i < pmi->entry_num; i++) {
++			for (j = 0; j < pme->nr_pages; j++) {
++				order = pme->is_huge_page ? HPAGE_PMD_ORDER : 0;
++				phy_addr = pme->phy_addr_array[j];
++				if (phy_addr) {
++					page = phys_to_page(phy_addr);
++					if (!(page->flags & PAGE_FLAGS_CHECK_RESERVED)) {
++						__free_pages(page, order);
++						pme->phy_addr_array[j] = 0;
++					}
++				}
++			}
++			pme = (struct page_map_entry *)next_pme(pme);
++		}
++	}
++}
++
++/* Clear all pin memory record. */
++void clear_pin_memory_record(void)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&page_map_entry_lock, flags);
++	free_all_reserved_pages();
++	if (pin_pid_num_addr) {
++		*pin_pid_num_addr = 0;
++		pin_pid_num = 0;
++		page_map_entry_start = __page_map_entry_start;
++	}
++	spin_unlock_irqrestore(&page_map_entry_lock, flags);
++}
++EXPORT_SYMBOL_GPL(clear_pin_memory_record);
++
++#endif /* CONFIG_PIN_MEMORY */

@@ -1,0 +1,149 @@
+From 8ef169edfd4cd3c08b6604ae3958a717b4eb6de3 Mon Sep 17 00:00:00 2001
+From: Cheng Jian <cj.chengjian@huawei.com>
+Date: Sat, 29 May 2021 14:43:04 +0800
+Subject: [PATCH] livepatch/ppc64: Support use func_descr for new_func
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 8ef169edfd4cd3c08b6604ae3958a717b4eb6de3
+
+
+hulk inclusion
+category: feature
+bugzilla: 51924
+CVE: NA
+
+---------------------------
+
+The ppc64 ABI V1 function pointer points to the function descriptor,
+which we use in the sample demo.
+
+        $cat /proc/kallsyms | grep  livepatch_cmdline_proc_show
+        80000000000d4830 d livepatch_cmdline_proc_show  [livepatch_sample]      -=> func descr
+        80000000000d40c0 t .livepatch_cmdline_proc_show [livepatch_sample]      -=> func addr
+
+However, the livepatch module made by kpatch just passes the address of
+the function to kernel(saved in func->new_func), so the kernel needs to
+obtain the toc address and combine the function descriptors to implement
+long jump.
+
+Signed-off-by: Cheng Jian <cj.chengjian@huawei.com>
+Reviewed-By: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: yangerkun <yangerkun@huawei.com>
+
+Signed-off-by: Dong Kai <dongkai11@huawei.com>
+
+Signed-off-by: Ye Weihua <yeweihua4@huawei.com>
+Reviewed-by: Kuohai Xu <xukuohai@huawei.com>
+Reviewed-by: Yang Jihong <yangjihong1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/powerpc/kernel/livepatch_64.c | 43 +++++++++++++++++++++++++++++-
+ include/linux/livepatch.h          |  4 +++
+ kernel/livepatch/core.c            |  9 +++++++
+ 3 files changed, 55 insertions(+), 1 deletion(-)
+
+diff --git a/arch/powerpc/kernel/livepatch_64.c b/arch/powerpc/kernel/livepatch_64.c
+index f9481057b2bb..cd3c8f3b163b 100644
+--- a/arch/powerpc/kernel/livepatch_64.c
++++ b/arch/powerpc/kernel/livepatch_64.c
+@@ -96,7 +96,7 @@ static int klp_check_activeness_func(struct stackframe *frame, void *data)
+ 				func_addr = (unsigned long)func->old_func;
+ 				func_size = func->old_size;
+ 			} else {
+-				func_addr = (unsigned long)func->new_func;
++				func_addr = ppc_function_entry(func->new_func);
+ 				func_size = func->new_size;
+ 			}
+ 			func_name = func->old_name;
+@@ -322,4 +322,45 @@ int arch_klp_func_can_patch(struct klp_func *func)
+ 	}
+ 	return 0;
+ }
++
++int arch_klp_init_func(struct klp_object *obj, struct klp_func *func)
++{
++#ifdef PPC64_ELF_ABI_v1
++	unsigned long new_addr = (unsigned long)func->new_func;
++
++	/*
++	 * ABI v1 address is address of the OPD entry,
++	 * which contains address of fn. ABI v2 An address
++	 * is simply the address of the function.
++	 *
++	 * The function descriptor is in the data section. So
++	 * If new_addr is in the code segment, we think it is
++	 * a function address, if addr isn't in the code segment,
++	 * we consider it to be a function descriptor.
++	 */
++	if (!is_module_text_address(new_addr)) {
++		new_addr = (unsigned long)ppc_function_entry((void *)new_addr);
++		if (!kallsyms_lookup_size_offset((unsigned long)new_addr,
++			&func->new_size, NULL))
++			return -ENOENT;
++	}
++
++	func->this_mod = __module_text_address(new_addr);
++	if (!func->this_mod)
++		return -EINVAL;
++
++	func->new_func_descr.entry = new_addr;
++	func->new_func_descr.toc = func->this_mod->arch.toc;
++
++	func->new_func = (void *)&func->new_func_descr;
++#endif
++
++	if (obj->name)
++		func->old_mod = obj->mod;
++	else
++		func->old_mod = NULL;
++
++
++	return 0;
++}
+ #endif
+diff --git a/include/linux/livepatch.h b/include/linux/livepatch.h
+index c4bc08a3f7f0..d4ce76f642b2 100644
+--- a/include/linux/livepatch.h
++++ b/include/linux/livepatch.h
+@@ -80,6 +80,10 @@ struct klp_func {
+ #endif
+ #if defined(CONFIG_LIVEPATCH_WO_FTRACE) && defined(CONFIG_PPC64)
+ 	struct module *old_mod;
++#ifdef PPC64_ELF_ABI_v1
++	struct module *this_mod;
++	func_descr_t new_func_descr;
++#endif
+ #endif
+ };
+ 
+diff --git a/kernel/livepatch/core.c b/kernel/livepatch/core.c
+index 2b1842aac2f8..6736c1e8af01 100644
+--- a/kernel/livepatch/core.c
++++ b/kernel/livepatch/core.c
+@@ -895,6 +895,11 @@ int __weak arch_klp_func_can_patch(struct klp_func *func)
+ {
+ 	return 0;
+ }
++
++int __weak arch_klp_init_func(struct klp_object *obj, struct klp_func *func)
++{
++	return 0;
++}
+ #endif
+ 
+ static int klp_init_func(struct klp_object *obj, struct klp_func *func)
+@@ -929,6 +934,10 @@ static int klp_init_func(struct klp_object *obj, struct klp_func *func)
+ 	ret = arch_klp_func_can_patch(func);
+ 	if (ret)
+ 		return ret;
++
++	ret = arch_klp_init_func(obj, func);
++	if (ret)
++		return ret;
+ #endif
+ #ifdef CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY
+ 	func->transition = false;
+-- 
+2.26.2
+

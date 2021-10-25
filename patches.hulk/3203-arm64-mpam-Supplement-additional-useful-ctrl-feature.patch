@@ -1,0 +1,612 @@
+From 228fa64a0d38924d9c470dc8cf4d51ed6b06584d Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Fri, 26 Feb 2021 20:22:45 +0800
+Subject: [PATCH] arm64/mpam: Supplement additional useful ctrl features for
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 228fa64a0d38924d9c470dc8cf4d51ed6b06584d
+
+ mount options
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+Based on 61fa56e1dd8a ("arm64/mpam: Add resctrl_ctrl_feature structure to manage
+ctrl features"), we add several ctrl features and supply corresponding
+mount options, including mbPbm, mbMax, mbMin, mbPrio, caMax, caPrio, caPbm,
+if MPAM system supports relevant features, we can mount resctrl like this:
+
+e.g.
+   > mount -t resctrl resctrl /sys/fs/resctrl -o mbMax,mbMin,caPrio
+   > cd /sys/fs/resctrl && cat schemata
+     L3:0=0x7fff;1=0x7fff;2=0x7fff;3=0x7fff #default select cpbm as basic ctrl feature
+     L3PRI:0=3;1=3;2=3;3=3
+     MBMAX:0=100;1=100;2=100;3=100
+     MBMIN:0=0;1=0;2=0;3=0
+
+   > mount -t resctrl resctrl /sys/fs/resctrl
+   > cd /sys/fs/resctrl && cat schemata
+     L3:0=0x7fff;1=0x7fff;2=0x7fff;3=0x7fff #default select cpbm as basic ctrl feature
+     MB:0=100;1=100;2=100;3=100  #default select mbw max as basic ctrl feature
+
+   > mount -t resctrl resctrl /sys/fs/resctrl -o caMax
+   > cd /sys/fs/resctrl && cat schemata
+     L3:0=33554432;1=33554432;2=33554432;3=33554432 #use cmax ctrl feature
+     MB:0=100;1=100;2=100;3=100  #default select mbw max as basic ctrl feature
+
+For Cache MSCs, basic ctrl features include cmax(Cache Maximum Capacity)
+and cpbm(Cache protion bitmap) partition, if mount options are not specified,
+default cpbm will be selected.
+
+For Memory MSCs, basic ctrl features include max(Memory Bandwidth Maximum)
+and pbm(Memory Bandwidth Portion Bitmap) partition, if mount options are
+not specified, default max will be selected.
+
+Above mount options also can be used accompany with cdp options.
+
+e.g.
+   > mount -t resctrl resctrl /sys/fs/resctrl -o caMax,caPrio,cdpl3
+   > cd /sys/fs/resctrl && cat schemata
+     L3CODE:0=33554432;1=33554432;2=33554432;3=33554432 #code use cmax ctrl feature
+     L3DATA:0=33554432;1=33554432;2=33554432;3=33554432 #data use cmax ctrl feature
+     L3CODEPRI:0=3;1=3;2=3;3=3 #code use intpriority ctrl feature
+     L3DATAPRI:0=3;1=3;2=3;3=3 #data use intpriority ctrl feature
+     MB:0=100;1=100;2=100;3=100  #default select mbw max as basic ctrl feature
+
+By combining these mount parameters can we use MPAM more powerfully.
+
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/resctrl.h       |  18 ++--
+ arch/arm64/kernel/mpam/mpam_device.c   |  33 ++++++-
+ arch/arm64/kernel/mpam/mpam_internal.h |   3 +
+ arch/arm64/kernel/mpam/mpam_resctrl.c  | 120 ++++++++++++++++++++++---
+ arch/arm64/kernel/mpam/mpam_setup.c    |  84 ++++++++++++-----
+ 5 files changed, 218 insertions(+), 40 deletions(-)
+
+diff --git a/arch/arm64/include/asm/resctrl.h b/arch/arm64/include/asm/resctrl.h
+index c9afacd9b66c..22e848bf295e 100644
+--- a/arch/arm64/include/asm/resctrl.h
++++ b/arch/arm64/include/asm/resctrl.h
+@@ -27,12 +27,15 @@ enum rdt_event_id {
+ 	QOS_L3_MBM_LOCAL_EVENT_ID       = 0x03,
+ 
+ 	QOS_CAT_CPBM_EVENT_ID           = 0x04,
+-	QOS_CAT_INTPRI_EVENT_ID         = 0x05,
+-	QOS_CAT_DSPRI_EVENT_ID          = 0x06,
+-	QOS_MBA_MAX_EVENT_ID            = 0x07,
+-	QOS_MBA_INTPRI_EVENT_ID         = 0x08,
+-	QOS_MBA_DSPRI_EVENT_ID          = 0x09,
+-	QOS_MBA_HDL_EVENT_ID            = 0x0a,
++	QOS_CAT_CMAX_EVENT_ID           = 0x05,
++	QOS_CAT_INTPRI_EVENT_ID         = 0x06,
++	QOS_CAT_DSPRI_EVENT_ID          = 0x07,
++	QOS_MBA_MAX_EVENT_ID            = 0x08,
++	QOS_MBA_MIN_EVENT_ID            = 0x09,
++	QOS_MBA_PBM_EVENT_ID            = 0x0a,
++	QOS_MBA_INTPRI_EVENT_ID         = 0x0b,
++	QOS_MBA_DSPRI_EVENT_ID          = 0x0c,
++	QOS_MBA_HDL_EVENT_ID            = 0x0d,
+ 	/* Must be the last */
+ 	RESCTRL_NUM_EVENT_IDS,
+ };
+@@ -165,6 +168,9 @@ enum resctrl_ctrl_type {
+ 	SCHEMA_COMM = 0,
+ 	SCHEMA_PRI,
+ 	SCHEMA_HDL,
++	SCHEMA_PBM,
++	SCHEMA_MAX,
++	SCHEMA_MIN,
+ 	SCHEMA_NUM_CTRL_TYPE
+ };
+ 
+diff --git a/arch/arm64/kernel/mpam/mpam_device.c b/arch/arm64/kernel/mpam/mpam_device.c
+index 384d880b3248..1aca24f570d3 100644
+--- a/arch/arm64/kernel/mpam/mpam_device.c
++++ b/arch/arm64/kernel/mpam/mpam_device.c
+@@ -1132,6 +1132,11 @@ u16 mpam_sysprops_num_pmg(void)
+ 	return mpam_sysprops.max_pmg + 1;
+ }
+ 
++u32 mpam_sysprops_llc_size(void)
++{
++	return mpam_sysprops.mpam_llc_size;
++}
++
+ static u32 mpam_device_read_csu_mon(struct mpam_device *dev,
+ 			struct sync_args *args)
+ {
+@@ -1307,7 +1312,7 @@ mpam_device_config(struct mpam_device *dev, struct sd_closid *closid,
+ 	u16 cmax = GENMASK(dev->cmax_wd, 0);
+ 	u32 pri_val = 0;
+ 	u16 intpri, dspri, max_intpri, max_dspri;
+-	u32 mbw_pbm, mbw_max;
++	u32 mbw_pbm, mbw_max, mbw_min;
+ 	/*
+ 	 * if dev supports narrowing, narrowing first and then apply this slave's
+ 	 * configuration.
+@@ -1356,6 +1361,13 @@ mpam_device_config(struct mpam_device *dev, struct sd_closid *closid,
+ 		}
+ 	}
+ 
++	if (mpam_has_feature(mpam_feat_mbw_min, dev->features)) {
++		if (cfg && mpam_has_feature(mpam_feat_mbw_min, cfg->valid)) {
++			mbw_min = MBW_MAX_SET(cfg->mbw_min, dev->bwa_wd);
++			mpam_write_reg(dev, MPAMCFG_MBW_MIN, mbw_min);
++		}
++	}
++
+ 	if (mpam_has_feature(mpam_feat_intpri_part, dev->features) ||
+ 		mpam_has_feature(mpam_feat_dspri_part, dev->features)) {
+ 		if (mpam_has_feature(mpam_feat_intpri_part, cfg->valid) &&
+@@ -1586,6 +1598,11 @@ static void mpam_component_read_mpamcfg(void *_ctx)
+ 				break;
+ 			val = mpam_read_reg(dev, MPAMCFG_CPBM);
+ 			break;
++		case QOS_CAT_CMAX_EVENT_ID:
++			if (!mpam_has_feature(mpam_feat_ccap_part, dev->features))
++				break;
++			val = mpam_read_reg(dev, MPAMCFG_CMAX);
++			break;
+ 		case QOS_MBA_MAX_EVENT_ID:
+ 			if (!mpam_has_feature(mpam_feat_mbw_max, dev->features))
+ 				break;
+@@ -1593,6 +1610,20 @@ static void mpam_component_read_mpamcfg(void *_ctx)
+ 			range = MBW_MAX_BWA_FRACT(dev->bwa_wd);
+ 			val = MBW_MAX_GET(val, dev->bwa_wd) * (MAX_MBA_BW - 1) / range;
+ 			break;
++		case QOS_MBA_MIN_EVENT_ID:
++			if (!mpam_has_feature(mpam_feat_mbw_min, dev->features))
++				break;
++			val = mpam_read_reg(dev, MPAMCFG_MBW_MIN);
++			range = MBW_MAX_BWA_FRACT(dev->bwa_wd);
++			val = MBW_MAX_GET(val, dev->bwa_wd) * (MAX_MBA_BW - 1) / range;
++			break;
++		case QOS_MBA_PBM_EVENT_ID:
++			if (!mpam_has_feature(mpam_feat_mbw_part, dev->features))
++				break;
++			val = mpam_read_reg(dev, MPAMCFG_MBW_PBM);
++			range = dev->mbw_pbm_bits;
++			val = val * MAX_MBA_BW / range;
++			break;
+ 		case QOS_MBA_HDL_EVENT_ID:
+ 			if (!mpam_has_feature(mpam_feat_mbw_max, dev->features))
+ 				break;
+diff --git a/arch/arm64/kernel/mpam/mpam_internal.h b/arch/arm64/kernel/mpam/mpam_internal.h
+index 40dcc02f4e57..cfaef82428aa 100644
+--- a/arch/arm64/kernel/mpam/mpam_internal.h
++++ b/arch/arm64/kernel/mpam/mpam_internal.h
+@@ -225,8 +225,10 @@ struct mpam_config {
+ 	mpam_features_t valid;
+ 
+ 	u32             cpbm;
++	u32             cmax;
+ 	u32             mbw_pbm;
+ 	u16             mbw_max;
++	u16             mbw_min;
+ 
+ 	/*
+ 	 *  dspri is downstream priority, intpri is internal priority.
+@@ -311,6 +313,7 @@ void mpam_component_get_config(struct mpam_component *comp,
+ 
+ u16 mpam_sysprops_num_partid(void);
+ u16 mpam_sysprops_num_pmg(void);
++u32 mpam_sysprops_llc_size(void);
+ 
+ void mpam_class_list_lock_held(void);
+ 
+diff --git a/arch/arm64/kernel/mpam/mpam_resctrl.c b/arch/arm64/kernel/mpam/mpam_resctrl.c
+index d0ead288ed31..ca9704222797 100644
+--- a/arch/arm64/kernel/mpam/mpam_resctrl.c
++++ b/arch/arm64/kernel/mpam/mpam_resctrl.c
+@@ -141,6 +141,7 @@ struct raw_resctrl_resource raw_resctrl_resources_all[] = {
+ 				.base = 16,
+ 				.evt = QOS_CAT_CPBM_EVENT_ID,
+ 				.capable = 1,
++				.ctrl_suffix = "",
+ 			},
+ 			[SCHEMA_PRI] = {
+ 				.type = SCHEMA_PRI,
+@@ -148,6 +149,23 @@ struct raw_resctrl_resource raw_resctrl_resources_all[] = {
+ 				.name = "caPrio",
+ 				.base = 10,
+ 				.evt = QOS_CAT_INTPRI_EVENT_ID,
++				.ctrl_suffix = "PRI",
++			},
++			[SCHEMA_PBM] = {
++				.type = SCHEMA_PBM,
++				.flags = SCHEMA_COMM,
++				.name = "caPbm",
++				.base = 16,
++				.evt = QOS_CAT_CPBM_EVENT_ID,
++				.ctrl_suffix = "PBM",
++			},
++			[SCHEMA_MAX] = {
++				.type = SCHEMA_MAX,
++				.flags = SCHEMA_COMM,
++				.name = "caMax",
++				.base = 10,
++				.evt = QOS_CAT_CMAX_EVENT_ID,
++				.ctrl_suffix = "MAX",
+ 			},
+ 		},
+ 	},
+@@ -167,6 +185,7 @@ struct raw_resctrl_resource raw_resctrl_resources_all[] = {
+ 				.base = 16,
+ 				.evt = QOS_CAT_CPBM_EVENT_ID,
+ 				.capable = 1,
++				.ctrl_suffix = "",
+ 			},
+ 			[SCHEMA_PRI] = {
+ 				.type = SCHEMA_PRI,
+@@ -174,6 +193,23 @@ struct raw_resctrl_resource raw_resctrl_resources_all[] = {
+ 				.name = "caPrio",
+ 				.base = 10,
+ 				.evt = QOS_CAT_INTPRI_EVENT_ID,
++				.ctrl_suffix = "PRI",
++			},
++			[SCHEMA_PBM] = {
++				.type = SCHEMA_PBM,
++				.flags = SCHEMA_COMM,
++				.name = "caPbm",
++				.base = 16,
++				.evt = QOS_CAT_CPBM_EVENT_ID,
++				.ctrl_suffix = "PBM",
++			},
++			[SCHEMA_MAX] = {
++				.type = SCHEMA_MAX,
++				.flags = SCHEMA_COMM,
++				.name = "caMax",
++				.base = 10,
++				.evt = QOS_CAT_CMAX_EVENT_ID,
++				.ctrl_suffix = "MAX",
+ 			},
+ 		},
+ 	},
+@@ -193,6 +229,7 @@ struct raw_resctrl_resource raw_resctrl_resources_all[] = {
+ 				.base = 10,
+ 				.evt = QOS_MBA_MAX_EVENT_ID,
+ 				.capable = 1,
++				.ctrl_suffix = "",
+ 			},
+ 			[SCHEMA_PRI] = {
+ 				.type = SCHEMA_PRI,
+@@ -200,6 +237,7 @@ struct raw_resctrl_resource raw_resctrl_resources_all[] = {
+ 				.name = "mbPrio",
+ 				.base = 10,
+ 				.evt = QOS_MBA_INTPRI_EVENT_ID,
++				.ctrl_suffix = "PRI",
+ 			},
+ 			[SCHEMA_HDL] = {
+ 				.type = SCHEMA_HDL,
+@@ -207,6 +245,31 @@ struct raw_resctrl_resource raw_resctrl_resources_all[] = {
+ 				.name = "mbHdl",
+ 				.base = 10,
+ 				.evt = QOS_MBA_HDL_EVENT_ID,
++				.ctrl_suffix = "HDL",
++			},
++			[SCHEMA_PBM] = {
++				.type = SCHEMA_PBM,
++				.flags = SCHEMA_COMM,
++				.name = "mbPbm",
++				.base = 16,
++				.evt = QOS_MBA_PBM_EVENT_ID,
++				.ctrl_suffix = "PBM",
++			},
++			[SCHEMA_MAX] = {
++				.type = SCHEMA_MAX,
++				.flags = SCHEMA_COMM,
++				.name = "mbMax",
++				.base = 10,
++				.evt = QOS_MBA_MAX_EVENT_ID,
++				.ctrl_suffix = "MAX",
++			},
++			[SCHEMA_MIN] = {
++				.type = SCHEMA_MIN,
++				.flags = SCHEMA_COMM,
++				.name = "mbMin",
++				.base = 10,
++				.evt = QOS_MBA_MIN_EVENT_ID,
++				.ctrl_suffix = "MIN",
+ 			},
+ 		},
+ 	},
+@@ -265,6 +328,8 @@ parse_bw(char *buf, struct resctrl_resource *r,
+ 
+ 	switch (rr->ctrl_features[type].evt) {
+ 	case QOS_MBA_MAX_EVENT_ID:
++	case QOS_MBA_MIN_EVENT_ID:
++	case QOS_MBA_PBM_EVENT_ID:
+ 		if (kstrtoul(buf, rr->ctrl_features[type].base, &data))
+ 			return -EINVAL;
+ 		data = (data < r->mbw.min_bw) ? r->mbw.min_bw : data;
+@@ -337,6 +402,8 @@ static u64 mbw_rdmsr(struct resctrl_resource *r, struct rdt_domain *d,
+ 
+ 	switch (rr->ctrl_features[para->type].evt) {
+ 	case QOS_MBA_MAX_EVENT_ID:
++	case QOS_MBA_MIN_EVENT_ID:
++	case QOS_MBA_PBM_EVENT_ID:
+ 		result = roundup(result, r->mbw.bw_gran);
+ 		break;
+ 	default:
+@@ -1062,14 +1129,21 @@ static int extend_ctrl_enable(char *tok)
+ 		if (!r->alloc_capable)
+ 			continue;
+ 		rr = r->res;
+-		for_each_ctrl_type(type) {
++		for_each_extend_ctrl_type(type) {
+ 			feature = &rr->ctrl_features[type];
++			if (!feature->capable || !feature->name)
++				continue;
+ 			if (strcmp(feature->name, tok))
+ 				continue;
+-			if (rr->ctrl_features[type].capable) {
+-				rr->ctrl_features[type].enabled = true;
+-				match = true;
+-			}
++
++			rr->ctrl_features[type].enabled = true;
++			/*
++			 * If we chose to enable a feature also embraces
++			 * SCHEMA_COMM, SCHEMA_COMM will not be selected.
++			 */
++			if (feature->flags == SCHEMA_COMM)
++				rr->ctrl_features[SCHEMA_COMM].enabled = false;;
++			match = true;
+ 		}
+ 	}
+ 
+@@ -1083,11 +1157,15 @@ static void extend_ctrl_disable(void)
+ {
+ 	struct raw_resctrl_resource *rr;
+ 	struct mpam_resctrl_res *res;
++	struct resctrl_ctrl_feature *feature;
++	enum resctrl_ctrl_type type;
+ 
+ 	for_each_supported_resctrl_exports(res) {
+ 		rr = res->resctrl_res.res;
+-		rr->ctrl_features[SCHEMA_PRI].enabled = false;
+-		rr->ctrl_features[SCHEMA_HDL].enabled = false;
++		for_each_extend_ctrl_type(type) {
++			feature = &rr->ctrl_features[type];
++			feature->enabled = false;
++		}
+ 	}
+ }
+ 
+@@ -1099,6 +1177,7 @@ int parse_rdtgroupfs_options(char *data)
+ 
+ 	disable_cdp();
+ 	extend_ctrl_disable();
++	basic_ctrl_enable();
+ 
+ 	while ((token = strsep(&o, ",")) != NULL) {
+ 		if (!*token) {
+@@ -1121,8 +1200,6 @@ int parse_rdtgroupfs_options(char *data)
+ 		}
+ 	}
+ 
+-	basic_ctrl_enable();
+-
+ 	return 0;
+ 
+ out:
+@@ -2003,22 +2080,43 @@ mpam_update_from_resctrl_cfg(struct mpam_resctrl_res *res,
+ 	u64 range;
+ 
+ 	switch (evt) {
++	case QOS_MBA_PBM_EVENT_ID:
++		/* .. the number of bits we can set */
++		range = res->class->mbw_pbm_bits;
++		mpam_cfg->mbw_pbm =
++				(resctrl_cfg * range) / MAX_MBA_BW;
++		mpam_set_feature(mpam_feat_mbw_part, &mpam_cfg->valid);
++		break;
+ 	case QOS_MBA_MAX_EVENT_ID:
+-		/* .. the number of fractions we can represent */
+ 		range = MBW_MAX_BWA_FRACT(res->class->bwa_wd);
+ 		mpam_cfg->mbw_max = (resctrl_cfg * range) / (MAX_MBA_BW - 1);
+ 		mpam_cfg->mbw_max =
+ 			(mpam_cfg->mbw_max > range) ? range : mpam_cfg->mbw_max;
+ 		mpam_set_feature(mpam_feat_mbw_max, &mpam_cfg->valid);
+ 		break;
++	case QOS_MBA_MIN_EVENT_ID:
++		range = MBW_MAX_BWA_FRACT(res->class->bwa_wd);
++		mpam_cfg->mbw_min = (resctrl_cfg * range) / (MAX_MBA_BW - 1);
++		mpam_cfg->mbw_min =
++			(mpam_cfg->mbw_min > range) ? range : mpam_cfg->mbw_min;
++		mpam_set_feature(mpam_feat_mbw_min, &mpam_cfg->valid);
++		break;
+ 	case QOS_MBA_HDL_EVENT_ID:
+ 		mpam_cfg->hdl = resctrl_cfg;
+ 		mpam_set_feature(mpam_feat_part_hdl, &mpam_cfg->valid);
+ 		break;
++	case QOS_MBA_INTPRI_EVENT_ID:
++		mpam_cfg->intpri = resctrl_cfg;
++		mpam_set_feature(mpam_feat_intpri_part, &mpam_cfg->valid);
++		break;
+ 	case QOS_CAT_CPBM_EVENT_ID:
+ 		mpam_cfg->cpbm = resctrl_cfg;
+ 		mpam_set_feature(mpam_feat_cpor_part, &mpam_cfg->valid);
+ 		break;
++	case QOS_CAT_CMAX_EVENT_ID:
++		mpam_cfg->cmax = resctrl_cfg;
++		mpam_set_feature(mpam_feat_ccap_part, &mpam_cfg->valid);
++		break;
+ 	case QOS_CAT_INTPRI_EVENT_ID:
+ 		mpam_cfg->intpri = resctrl_cfg;
+ 		mpam_set_feature(mpam_feat_intpri_part, &mpam_cfg->valid);
+@@ -2074,7 +2172,7 @@ mpam_resctrl_update_component_cfg(struct resctrl_resource *r,
+ 
+ 		resctrl_cfg = d->ctrl_val[type][intpartid];
+ 		mpam_update_from_resctrl_cfg(res, resctrl_cfg,
+-			type, slave_mpam_cfg);
++			rr->ctrl_features[type].evt, slave_mpam_cfg);
+ 	}
+ }
+ 
+diff --git a/arch/arm64/kernel/mpam/mpam_setup.c b/arch/arm64/kernel/mpam/mpam_setup.c
+index 7cc0df890c7a..606ce0b08a2a 100644
+--- a/arch/arm64/kernel/mpam/mpam_setup.c
++++ b/arch/arm64/kernel/mpam/mpam_setup.c
+@@ -346,18 +346,17 @@ static int mpam_resctrl_resource_init(struct mpam_resctrl_res *res)
+ 		r->res = rr;
+ 
+ 		if (mpam_has_feature(mpam_feat_mbw_part, class->features)) {
+-			res->resctrl_mba_uses_mbw_part = true;
+-
+ 			/*
+ 			 * The maximum throttling is the number of bits we can
+ 			 * unset in the bitmap. We never clear all of them,
+ 			 * so the minimum is one bit, as a percentage.
+ 			 */
+ 			r->mbw.min_bw = MAX_MBA_BW / class->mbw_pbm_bits;
+-		} else {
+-			/* we're using mpam_feat_mbw_max's */
+-			res->resctrl_mba_uses_mbw_part = false;
++			rr->ctrl_features[SCHEMA_PBM].max_wd = MAX_MBA_BW + 1;
++			rr->ctrl_features[SCHEMA_PBM].capable = true;
++		}
+ 
++		if (mpam_has_feature(mpam_feat_mbw_max, class->features)) {
+ 			/*
+ 			 * The maximum throttling is the number of fractions we
+ 			 * can represent with the implemented bits. We never
+@@ -366,22 +365,36 @@ static int mpam_resctrl_resource_init(struct mpam_resctrl_res *res)
+ 			r->mbw.min_bw = MAX_MBA_BW /
+ 				((1ULL << class->bwa_wd) - 1);
+ 			/* the largest mbw_max is 100 */
+-			rr->ctrl_features[SCHEMA_COMM].default_ctrl = MAX_MBA_BW;
+-			rr->ctrl_features[SCHEMA_COMM].max_wd = MAX_MBA_BW + 1;
+-			rr->ctrl_features[SCHEMA_COMM].capable = true;
++			rr->ctrl_features[SCHEMA_MAX].default_ctrl = MAX_MBA_BW;
++			rr->ctrl_features[SCHEMA_MAX].max_wd = MAX_MBA_BW + 1;
++			rr->ctrl_features[SCHEMA_MAX].capable = true;
++
++			/* default set max stride MAX as COMMON ctrl feature */
++			rr->ctrl_features[SCHEMA_COMM].default_ctrl =
++				rr->ctrl_features[SCHEMA_MAX].default_ctrl;
++			rr->ctrl_features[SCHEMA_COMM].max_wd =
++				rr->ctrl_features[SCHEMA_MAX].max_wd;
++			rr->ctrl_features[SCHEMA_COMM].capable =
++				rr->ctrl_features[SCHEMA_MAX].capable;
++		}
++
++		if (mpam_has_feature(mpam_feat_mbw_min, class->features)) {
++			rr->ctrl_features[SCHEMA_MIN].max_wd = MAX_MBA_BW + 1;
++			rr->ctrl_features[SCHEMA_MIN].capable = true;
+ 		}
+ 
++		/*
++		 * Export priority setting, which represents the max level of
++		 * control we can export. this default priority from hardware,
++		 * no clever here, no need to define additional default value.
++		 */
+ 		if (mpam_has_feature(mpam_feat_intpri_part, class->features)) {
+-			/*
+-			 * Export internal priority setting, which represents the
+-			 * max level of control we can export to resctrl. this default
+-			 * priority is from hardware, no clever here.
+-			 */
+ 			rr->ctrl_features[SCHEMA_PRI].max_wd = 1 << class->intpri_wd;
+ 			rr->ctrl_features[SCHEMA_PRI].default_ctrl = class->hwdef_intpri;
+ 			rr->ctrl_features[SCHEMA_PRI].capable = true;
+ 		}
+ 
++
+ 		/* Just in case we have an excessive number of bits */
+ 		if (!r->mbw.min_bw)
+ 			r->mbw.min_bw = 1;
+@@ -413,18 +426,26 @@ static int mpam_resctrl_resource_init(struct mpam_resctrl_res *res)
+ 
+ 		if (mpam_has_feature(mpam_feat_cpor_part, class->features)) {
+ 			r->cache.cbm_len = class->cpbm_wd;
+-			rr->ctrl_features[SCHEMA_COMM].default_ctrl = GENMASK(class->cpbm_wd - 1, 0);
+-			rr->ctrl_features[SCHEMA_COMM].max_wd =
+-				rr->ctrl_features[SCHEMA_COMM].default_ctrl + 1;
+-			rr->ctrl_features[SCHEMA_COMM].capable = true;
++			rr->ctrl_features[SCHEMA_PBM].default_ctrl = GENMASK(class->cpbm_wd - 1, 0);
++			rr->ctrl_features[SCHEMA_PBM].max_wd =
++				rr->ctrl_features[SCHEMA_PBM].default_ctrl + 1;
++			rr->ctrl_features[SCHEMA_PBM].capable = true;
+ 			/*
+ 			 * Which bits are shared with other ...things...
+ 			 * Unknown devices use partid-0 which uses all the bitmap
+ 			 * fields. Until we configured the SMMU and GIC not to do this
+ 			 * 'all the bits' is the correct answer here.
+ 			 */
+-			r->cache.shareable_bits = rr->ctrl_features[SCHEMA_COMM].default_ctrl;
++			r->cache.shareable_bits = rr->ctrl_features[SCHEMA_PBM].default_ctrl;
+ 			r->cache.min_cbm_bits = 1;
++
++			/* default set CPBM as COMMON ctrl feature */
++			rr->ctrl_features[SCHEMA_COMM].default_ctrl =
++				rr->ctrl_features[SCHEMA_PBM].default_ctrl;
++			rr->ctrl_features[SCHEMA_COMM].max_wd =
++				rr->ctrl_features[SCHEMA_PBM].max_wd;
++			rr->ctrl_features[SCHEMA_COMM].capable =
++				rr->ctrl_features[SCHEMA_PBM].capable;
+ 		}
+ 
+ 		if (mpam_has_feature(mpam_feat_intpri_part, class->features)) {
+@@ -437,6 +458,12 @@ static int mpam_resctrl_resource_init(struct mpam_resctrl_res *res)
+ 			rr->ctrl_features[SCHEMA_PRI].default_ctrl = class->hwdef_intpri;
+ 			rr->ctrl_features[SCHEMA_PRI].capable = true;
+ 		}
++
++		if (mpam_has_feature(mpam_feat_ccap_part, class->features)) {
++			rr->ctrl_features[SCHEMA_MAX].max_wd = mpam_sysprops_llc_size() + 1;
++			rr->ctrl_features[SCHEMA_MAX].capable = true;
++		}
++
+ 		/*
+ 		 * Only this resource is allocable can it be picked from
+ 		 * mpam_resctrl_pick_caches(). So directly set following
+@@ -464,10 +491,11 @@ static int mpam_resctrl_resource_init(struct mpam_resctrl_res *res)
+ 
+ 		if (mpam_has_feature(mpam_feat_cpor_part, class->features)) {
+ 			r->cache.cbm_len = class->cpbm_wd;
+-			rr->ctrl_features[SCHEMA_COMM].default_ctrl = GENMASK(class->cpbm_wd - 1, 0);
+-			rr->ctrl_features[SCHEMA_COMM].max_wd =
+-				rr->ctrl_features[SCHEMA_COMM].default_ctrl + 1;
+-			rr->ctrl_features[SCHEMA_COMM].capable = true;
++			rr->ctrl_features[SCHEMA_PBM].default_ctrl =
++				GENMASK(class->cpbm_wd - 1, 0);
++			rr->ctrl_features[SCHEMA_PBM].max_wd =
++				rr->ctrl_features[SCHEMA_PBM].default_ctrl + 1;
++			rr->ctrl_features[SCHEMA_PBM].capable = true;
+ 			/*
+ 			 * Which bits are shared with other ...things...
+ 			 * Unknown devices use partid-0 which uses all the bitmap
+@@ -475,6 +503,18 @@ static int mpam_resctrl_resource_init(struct mpam_resctrl_res *res)
+ 			 * 'all the bits' is the correct answer here.
+ 			 */
+ 			r->cache.shareable_bits = rr->ctrl_features[SCHEMA_COMM].default_ctrl;
++			/* default set max stride MAX as COMMON ctrl feature */
++			rr->ctrl_features[SCHEMA_COMM].default_ctrl =
++				rr->ctrl_features[SCHEMA_PBM].default_ctrl;
++			rr->ctrl_features[SCHEMA_COMM].max_wd =
++				rr->ctrl_features[SCHEMA_PBM].max_wd;
++			rr->ctrl_features[SCHEMA_COMM].capable =
++				rr->ctrl_features[SCHEMA_PBM].capable;
++		}
++
++		if (mpam_has_feature(mpam_feat_ccap_part, class->features)) {
++			rr->ctrl_features[SCHEMA_MAX].max_wd = ~0;
++			rr->ctrl_features[SCHEMA_MAX].capable = true;
+ 		}
+ 
+ 		if (mpam_has_feature(mpam_feat_intpri_part, class->features)) {
+-- 
+2.26.2
+

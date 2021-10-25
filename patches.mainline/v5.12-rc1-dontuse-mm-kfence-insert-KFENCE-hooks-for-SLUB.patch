@@ -1,0 +1,294 @@
+From b89fb5ef0ce611b5db8eb9d3a5a7fcaab2cbe9e4 Mon Sep 17 00:00:00 2001
+From: Alexander Potapenko <glider@google.com>
+Date: Thu, 25 Feb 2021 17:19:16 -0800
+Subject: [PATCH] mm, kfence: insert KFENCE hooks for SLUB
+Git-commit: b89fb5ef0ce611b5db8eb9d3a5a7fcaab2cbe9e4
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+Inserts KFENCE hooks into the SLUB allocator.
+
+To pass the originally requested size to KFENCE, add an argument
+'orig_size' to slab_alloc*(). The additional argument is required to
+preserve the requested original size for kmalloc() allocations, which
+uses size classes (e.g. an allocation of 272 bytes will return an object
+of size 512). Therefore, kmem_cache::size does not represent the
+kmalloc-caller's requested size, and we must introduce the argument
+'orig_size' to propagate the originally requested size to KFENCE.
+
+Without the originally requested size, we would not be able to detect
+out-of-bounds accesses for objects placed at the end of a KFENCE object
+page if that object is not equal to the kmalloc-size class it was
+bucketed into.
+
+When KFENCE is disabled, there is no additional overhead, since
+slab_alloc*() functions are __always_inline.
+
+Link: https://lkml.kernel.org/r/20201103175841.3495947-6-elver@google.com
+Signed-off-by: Marco Elver <elver@google.com>
+Signed-off-by: Alexander Potapenko <glider@google.com>
+Reviewed-by: Dmitry Vyukov <dvyukov@google.com>
+Reviewed-by: Jann Horn <jannh@google.com>
+Co-developed-by: Marco Elver <elver@google.com>
+Cc: Andrey Konovalov <andreyknvl@google.com>
+Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Christopher Lameter <cl@linux.com>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Eric Dumazet <edumazet@google.com>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Hillf Danton <hdanton@sina.com>
+Cc: "H. Peter Anvin" <hpa@zytor.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Joern Engel <joern@purestorage.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Cc: Kees Cook <keescook@chromium.org>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Paul E. McKenney <paulmck@kernel.org>
+Cc: Pekka Enberg <penberg@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: SeongJae Park <sjpark@amazon.de>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Will Deacon <will@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+[jyang: fixby euler OLK-5.10 commit 47961d3bbbb6cc0601d90c96c710cfcd729cb69e]
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ include/linux/slub_def.h |  3 ++
+ mm/kfence/core.c         |  2 ++
+ mm/slub.c                | 60 ++++++++++++++++++++++++++++++----------
+ 3 files changed, 51 insertions(+), 14 deletions(-)
+
+--- a/include/linux/slub_def.h
++++ b/include/linux/slub_def.h
+@@ -7,6 +7,7 @@
+  *
+  * (C) 2007 SGI, Christoph Lameter
+  */
++#include <linux/kfence.h>
+ #include <linux/kobject.h>
+ #include <linux/reciprocal_div.h>
+ 
+@@ -185,6 +186,8 @@ static inline unsigned int __obj_to_inde
+ static inline unsigned int obj_to_index(const struct kmem_cache *cache,
+ 					const struct page *page, void *obj)
+ {
++	if (is_kfence_address(obj))
++		return 0;
+ 	return __obj_to_index(cache, page_address(page), obj);
+ }
+ 
+--- a/mm/kfence/core.c
++++ b/mm/kfence/core.c
+@@ -317,6 +317,8 @@ static void *kfence_guarded_alloc(struct
+ 	/* Set required struct page fields. */
+ 	page = virt_to_page(meta->addr);
+ 	page->slab_cache = cache;
++	if (IS_ENABLED(CONFIG_SLUB))
++		page->objects = 1;
+ 	if (IS_ENABLED(CONFIG_SLAB))
+ 		page->s_mem = addr;
+ 
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -28,6 +28,7 @@
+ #include <linux/ctype.h>
+ #include <linux/debugobjects.h>
+ #include <linux/kallsyms.h>
++#include <linux/kfence.h>
+ #include <linux/memory.h>
+ #include <linux/math64.h>
+ #include <linux/fault-inject.h>
+@@ -1560,6 +1561,11 @@ static inline bool slab_free_freelist_ho
+ 	void *old_tail = *tail ? *tail : *head;
+ 	int rsize;
+ 
++	if (is_kfence_address(next)) {
++		slab_free_hook(s, next);
++		return true;
++	}
++
+ 	/* Head and tail of the reconstructed freelist */
+ 	*head = NULL;
+ 	*tail = NULL;
+@@ -2807,7 +2813,7 @@ static __always_inline void maybe_wipe_o
+  * Otherwise we can simply pick the next object from the lockless free list.
+  */
+ static __always_inline void *slab_alloc_node(struct kmem_cache *s,
+-		gfp_t gfpflags, int node, unsigned long addr)
++		gfp_t gfpflags, int node, unsigned long addr, size_t orig_size)
+ {
+ 	void *object;
+ 	struct kmem_cache_cpu *c;
+@@ -2818,6 +2824,11 @@ static __always_inline void *slab_alloc_
+ 	s = slab_pre_alloc_hook(s, &objcg, 1, gfpflags);
+ 	if (!s)
+ 		return NULL;
++
++	object = kfence_alloc(s, orig_size, gfpflags);
++	if (unlikely(object))
++		goto out;
++
+ redo:
+ 	/*
+ 	 * Must read kmem_cache cpu data via this cpu ptr. Preemption is
+@@ -2890,20 +2901,21 @@ redo:
+ 	if (unlikely(slab_want_init_on_alloc(gfpflags, s)) && object)
+ 		memset(object, 0, s->object_size);
+ 
++out:
+ 	slab_post_alloc_hook(s, objcg, gfpflags, 1, &object);
+ 
+ 	return object;
+ }
+ 
+ static __always_inline void *slab_alloc(struct kmem_cache *s,
+-		gfp_t gfpflags, unsigned long addr)
++		gfp_t gfpflags, unsigned long addr, size_t orig_size)
+ {
+-	return slab_alloc_node(s, gfpflags, NUMA_NO_NODE, addr);
++	return slab_alloc_node(s, gfpflags, NUMA_NO_NODE, addr, orig_size);
+ }
+ 
+ void *kmem_cache_alloc(struct kmem_cache *s, gfp_t gfpflags)
+ {
+-	void *ret = slab_alloc(s, gfpflags, _RET_IP_);
++	void *ret = slab_alloc(s, gfpflags, _RET_IP_, s->object_size);
+ 
+ 	trace_kmem_cache_alloc(_RET_IP_, ret, s->object_size,
+ 				s->size, gfpflags);
+@@ -2915,7 +2927,7 @@ EXPORT_SYMBOL(kmem_cache_alloc);
+ #ifdef CONFIG_TRACING
+ void *kmem_cache_alloc_trace(struct kmem_cache *s, gfp_t gfpflags, size_t size)
+ {
+-	void *ret = slab_alloc(s, gfpflags, _RET_IP_);
++	void *ret = slab_alloc(s, gfpflags, _RET_IP_, size);
+ 	trace_kmalloc(_RET_IP_, ret, size, s->size, gfpflags);
+ 	ret = kasan_kmalloc(s, ret, size, gfpflags);
+ 	return ret;
+@@ -2926,7 +2938,7 @@ EXPORT_SYMBOL(kmem_cache_alloc_trace);
+ #ifdef CONFIG_NUMA
+ void *kmem_cache_alloc_node(struct kmem_cache *s, gfp_t gfpflags, int node)
+ {
+-	void *ret = slab_alloc_node(s, gfpflags, node, _RET_IP_);
++	void *ret = slab_alloc_node(s, gfpflags, node, _RET_IP_, s->object_size);
+ 
+ 	trace_kmem_cache_alloc_node(_RET_IP_, ret,
+ 				    s->object_size, s->size, gfpflags, node);
+@@ -2940,7 +2952,7 @@ void *kmem_cache_alloc_node_trace(struct
+ 				    gfp_t gfpflags,
+ 				    int node, size_t size)
+ {
+-	void *ret = slab_alloc_node(s, gfpflags, node, _RET_IP_);
++	void *ret = slab_alloc_node(s, gfpflags, node, _RET_IP_, size);
+ 
+ 	trace_kmalloc_node(_RET_IP_, ret,
+ 			   size, s->size, gfpflags, node);
+@@ -2974,6 +2986,9 @@ static void __slab_free(struct kmem_cach
+ 
+ 	stat(s, FREE_SLOWPATH);
+ 
++	if (kfence_free(head))
++		return;
++
+ 	if (kmem_cache_debug(s) &&
+ 	    !free_debug_processing(s, page, head, tail, cnt, addr))
+ 		return;
+@@ -3220,6 +3235,13 @@ int build_detached_freelist(struct kmem_
+ 		df->s = cache_from_obj(s, object); /* Support for memcg */
+ 	}
+ 
++	if (is_kfence_address(object)) {
++		slab_free_hook(df->s, object);
++		__kfence_free(object);
++		p[size] = NULL; /* mark object processed */
++		return size;
++	}
++
+ 	/* Start new detached freelist */
+ 	df->page = page;
+ 	set_freepointer(df->s, object, NULL);
+@@ -3295,8 +3317,14 @@ int kmem_cache_alloc_bulk(struct kmem_ca
+ 	c = this_cpu_ptr(s->cpu_slab);
+ 
+ 	for (i = 0; i < size; i++) {
+-		void *object = c->freelist;
++		void *object = kfence_alloc(s, s->object_size, flags);
+ 
++		if (unlikely(object)) {
++			p[i] = object;
++			continue;
++		}
++
++		object = c->freelist;
+ 		if (unlikely(!object)) {
+ 			/*
+ 			 * We may have removed an object from c->freelist using
+@@ -3961,7 +3989,7 @@ void *__kmalloc(size_t size, gfp_t flags
+ 	if (unlikely(ZERO_OR_NULL_PTR(s)))
+ 		return s;
+ 
+-	ret = slab_alloc(s, flags, _RET_IP_);
++	ret = slab_alloc(s, flags, _RET_IP_, size);
+ 
+ 	trace_kmalloc(_RET_IP_, ret, size, s->size, flags);
+ 
+@@ -4009,7 +4037,7 @@ void *__kmalloc_node(size_t size, gfp_t
+ 	if (unlikely(ZERO_OR_NULL_PTR(s)))
+ 		return s;
+ 
+-	ret = slab_alloc_node(s, flags, node, _RET_IP_);
++	ret = slab_alloc_node(s, flags, node, _RET_IP_, size);
+ 
+ 	trace_kmalloc_node(_RET_IP_, ret, size, s->size, flags, node);
+ 
+@@ -4035,6 +4063,7 @@ void __check_heap_object(const void *ptr
+ 	struct kmem_cache *s;
+ 	unsigned int offset;
+ 	size_t object_size;
++	bool is_kfence = is_kfence_address(ptr);
+ 
+ 	ptr = kasan_reset_tag(ptr);
+ 
+@@ -4047,10 +4076,13 @@ void __check_heap_object(const void *ptr
+ 			       to_user, 0, n);
+ 
+ 	/* Find offset within object. */
+-	offset = (ptr - page_address(page)) % s->size;
++	if (is_kfence)
++		offset = ptr - kfence_object_start(ptr);
++	else
++		offset = (ptr - page_address(page)) % s->size;
+ 
+ 	/* Adjust for redzone and reject if within the redzone. */
+-	if (kmem_cache_debug_flags(s, SLAB_RED_ZONE)) {
++	if (!is_kfence && kmem_cache_debug_flags(s, SLAB_RED_ZONE)) {
+ 		if (offset < s->red_left_pad)
+ 			usercopy_abort("SLUB object in left red zone",
+ 				       s->name, to_user, offset, n);
+@@ -4467,7 +4499,7 @@ void *__kmalloc_track_caller(size_t size
+ 	if (unlikely(ZERO_OR_NULL_PTR(s)))
+ 		return s;
+ 
+-	ret = slab_alloc(s, gfpflags, caller);
++	ret = slab_alloc(s, gfpflags, caller, size);
+ 
+ 	/* Honor the call site pointer we received. */
+ 	trace_kmalloc(caller, ret, size, s->size, gfpflags);
+@@ -4498,7 +4530,7 @@ void *__kmalloc_node_track_caller(size_t
+ 	if (unlikely(ZERO_OR_NULL_PTR(s)))
+ 		return s;
+ 
+-	ret = slab_alloc_node(s, gfpflags, node, caller);
++	ret = slab_alloc_node(s, gfpflags, node, caller, size);
+ 
+ 	/* Honor the call site pointer we received. */
+ 	trace_kmalloc_node(caller, ret, size, s->size, gfpflags, node);

@@ -1,0 +1,238 @@
+From 76ca647ba0dccfc5856f8dd8bc73e02ef9da948b Mon Sep 17 00:00:00 2001
+From: Roberto Sassu <roberto.sassu@huawei.com>
+Date: Wed, 3 Mar 2021 08:44:22 +0100
+Subject: [PATCH] ima: Allow direct upload of digest lists to securityfs
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 76ca647ba0dccfc5856f8dd8bc73e02ef9da948b
+
+
+hulk inclusion
+category: feature
+feature: IMA Digest Lists extension
+bugzilla: 46797
+
+-------------------------------------------------
+
+This patch allows direct upload of digest lists by user space parsers.
+This operation is possible if the digest of the process's executable is
+found in the digest lists and its type is COMPACT_PARSER.
+
+ima_check_measured_appraised() is called at the end of ima_file_check() to
+verify that everything accessed by the user space parsers (except for
+directories and securityfs) has been processed by IMA. If a digest list
+was not processed by an IMA submodule, digest list lookup is disabled for
+that submodule.
+
+Signed-off-by: Roberto Sassu <roberto.sassu@huawei.com>
+Signed-off-by: Tianxing Zhang <zhangtianxing3@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ security/integrity/ima/ima_appraise.c    |  2 +-
+ security/integrity/ima/ima_digest_list.c | 56 ++++++++++++++++++++++++
+ security/integrity/ima/ima_digest_list.h | 18 ++++++++
+ security/integrity/ima/ima_fs.c          | 22 ++++++++++
+ security/integrity/ima/ima_main.c        | 10 +++--
+ 5 files changed, 104 insertions(+), 4 deletions(-)
+
+diff --git a/security/integrity/ima/ima_appraise.c b/security/integrity/ima/ima_appraise.c
+index 0799d4de9e2d..3fb378017f9d 100644
+--- a/security/integrity/ima/ima_appraise.c
++++ b/security/integrity/ima/ima_appraise.c
+@@ -438,7 +438,7 @@ int ima_appraise_measurement(enum ima_hooks func,
+ 		/* Allow access to digest lists without metadata, only if they
+ 		 * are signed or found in a digest list (immutable)
+ 		 */
+-		if (func == DIGEST_LIST_CHECK) {
++		if (func == DIGEST_LIST_CHECK || ima_current_is_parser()) {
+ 			if (xattr_value->type == EVM_IMA_XATTR_DIGSIG)
+ 				break;
+ 			if (found_digest &&
+diff --git a/security/integrity/ima/ima_digest_list.c b/security/integrity/ima/ima_digest_list.c
+index ad0c97815772..9eb1950dea58 100644
+--- a/security/integrity/ima/ima_digest_list.c
++++ b/security/integrity/ima/ima_digest_list.c
+@@ -20,6 +20,8 @@
+ #include <linux/file.h>
+ #include <linux/namei.h>
+ #include <linux/xattr.h>
++#include <linux/sched/mm.h>
++#include <linux/magic.h>
+ 
+ #include "ima.h"
+ #include "ima_digest_list.h"
+@@ -216,6 +218,10 @@ void ima_check_measured_appraised(struct file *file)
+ 	if (!ima_digest_list_actions)
+ 		return;
+ 
++	if (file_inode(file)->i_sb->s_magic == SECURITYFS_MAGIC ||
++	    S_ISDIR(file_inode(file)->i_mode))
++		return;
++
+ 	iint = integrity_iint_find(file_inode(file));
+ 	if (!iint) {
+ 		pr_err("%s not processed, disabling digest lists lookup\n",
+@@ -342,3 +348,53 @@ void __init ima_load_digest_lists(void)
+ out:
+ 	path_put(&path);
+ }
++
++/****************
++ * Parser check *
++ ****************/
++bool ima_check_current_is_parser(void)
++{
++	struct integrity_iint_cache *parser_iint;
++	struct file *parser_file;
++	struct mm_struct *mm;
++
++	mm = get_task_mm(current);
++	if (!mm)
++		return false;
++
++	parser_file = get_mm_exe_file(mm);
++	mmput(mm);
++
++	if (!parser_file)
++		return false;
++
++	parser_iint = integrity_iint_find(file_inode(parser_file));
++	fput(parser_file);
++
++	if (!parser_iint)
++		return false;
++
++	/* flag cannot be cleared due to write protection of executables */
++	if (!(parser_iint->flags & IMA_COLLECTED))
++		return false;
++
++	return ima_lookup_digest(parser_iint->ima_hash->digest,
++				 parser_iint->ima_hash->algo, COMPACT_PARSER);
++}
++
++struct task_struct *parser_task;
++
++void ima_set_parser(void)
++{
++	parser_task = current;
++}
++
++void ima_unset_parser(void)
++{
++	parser_task = NULL;
++}
++
++bool ima_current_is_parser(void)
++{
++	return (current == parser_task);
++}
+diff --git a/security/integrity/ima/ima_digest_list.h b/security/integrity/ima/ima_digest_list.h
+index 5bd2388ff95e..4a8b0e000ad3 100644
+--- a/security/integrity/ima/ima_digest_list.h
++++ b/security/integrity/ima/ima_digest_list.h
+@@ -24,6 +24,10 @@ extern struct ima_h_table ima_digests_htable;
+ 
+ int ima_parse_compact_list(loff_t size, void *buf, int op);
+ void ima_check_measured_appraised(struct file *file);
++bool ima_check_current_is_parser(void);
++void ima_set_parser(void);
++void ima_unset_parser(void);
++bool ima_current_is_parser(void);
+ #else
+ static inline int ima_parse_compact_list(loff_t size, void *buf, int op)
+ {
+@@ -32,5 +36,19 @@ static inline int ima_parse_compact_list(loff_t size, void *buf, int op)
+ static inline void ima_check_measured_appraised(struct file *file)
+ {
+ }
++static inline bool ima_check_current_is_parser(void)
++{
++	return false;
++}
++static inline void ima_set_parser(void)
++{
++}
++static inline void ima_unset_parser(void)
++{
++}
++static inline bool ima_current_is_parser(void)
++{
++	return false;
++}
+ #endif /*CONFIG_IMA_DIGEST_LIST*/
+ #endif /*LINUX_IMA_DIGEST_LIST_H*/
+diff --git a/security/integrity/ima/ima_fs.c b/security/integrity/ima/ima_fs.c
+index 153c7cf5e94f..3a22b970be8d 100644
+--- a/security/integrity/ima/ima_fs.c
++++ b/security/integrity/ima/ima_fs.c
+@@ -390,6 +390,20 @@ static ssize_t ima_write_data(struct file *file, const char __user *buf,
+ 		} else {
+ 			result = ima_parse_add_rule(data);
+ 		}
++	} else if (dentry == digest_list_data) {
++		if (!ima_current_is_parser()) {
++			result = -EACCES;
++		} else {
++			result = ima_parse_compact_list(datalen, data,
++							DIGEST_LIST_OP_ADD);
++		}
++	} else if (dentry == digest_list_data_del) {
++		if (!ima_current_is_parser()) {
++			result = -EACCES;
++		} else {
++			result = ima_parse_compact_list(datalen, data,
++							DIGEST_LIST_OP_DEL);
++		}
+ 	} else {
+ 		pr_err("Unknown data type\n");
+ 		result = -EINVAL;
+@@ -461,6 +475,11 @@ static int ima_open_data_upload(struct inode *inode, struct file *filp)
+ 	}
+ 	if (test_and_set_bit(flag, &ima_fs_flags))
+ 		return -EBUSY;
++
++	if (dentry == digest_list_data || dentry == digest_list_data_del)
++		if (ima_check_current_is_parser())
++			ima_set_parser();
++
+ 	return 0;
+ }
+ 
+@@ -480,6 +499,9 @@ static int ima_release_data_upload(struct inode *inode, struct file *file)
+ 	if ((file->f_flags & O_ACCMODE) == O_RDONLY)
+ 		return seq_release(inode, file);
+ 
++	if (dentry == digest_list_data || dentry == digest_list_data_del)
++		ima_unset_parser();
++
+ 	if (dentry != ima_policy) {
+ 		clear_bit(flag, &ima_fs_flags);
+ 		return 0;
+diff --git a/security/integrity/ima/ima_main.c b/security/integrity/ima/ima_main.c
+index bc62d94e390d..f3242727634a 100644
+--- a/security/integrity/ima/ima_main.c
++++ b/security/integrity/ima/ima_main.c
+@@ -565,11 +565,15 @@ int ima_bprm_check(struct linux_binprm *bprm)
+ int ima_file_check(struct file *file, int mask)
+ {
+ 	u32 secid;
++	int rc;
+ 
+ 	security_task_getsecid(current, &secid);
+-	return process_measurement(file, current_cred(), secid, NULL, 0,
+-				   mask & (MAY_READ | MAY_WRITE | MAY_EXEC |
+-					   MAY_APPEND), FILE_CHECK);
++	rc = process_measurement(file, current_cred(), secid, NULL, 0,
++				 mask & (MAY_READ | MAY_WRITE | MAY_EXEC |
++					 MAY_APPEND), FILE_CHECK);
++	if (ima_current_is_parser() && !rc)
++		ima_check_measured_appraised(file);
++	return rc;
+ }
+ EXPORT_SYMBOL_GPL(ima_file_check);
+ 
+-- 
+2.26.2
+

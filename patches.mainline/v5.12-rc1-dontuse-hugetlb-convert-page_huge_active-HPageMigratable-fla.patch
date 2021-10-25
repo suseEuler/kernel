@@ -1,0 +1,236 @@
+From 8f251a3d5ce3bdea73bd045ed35db64f32e0d0d9 Mon Sep 17 00:00:00 2001
+From: Mike Kravetz <mike.kravetz@oracle.com>
+Date: Wed, 24 Feb 2021 12:08:56 -0800
+Subject: [PATCH] hugetlb: convert page_huge_active() HPageMigratable flag
+Git-commit: 8f251a3d5ce3bdea73bd045ed35db64f32e0d0d9
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+Use the new hugetlb page specific flag HPageMigratable to replace the
+page_huge_active interfaces.  By it's name, page_huge_active implied that
+a huge page was on the active list.  However, that is not really what code
+checking the flag wanted to know.  It really wanted to determine if the
+huge page could be migrated.  This happens when the page is actually added
+to the page cache and/or task page table.  This is the reasoning behind
+the name change.
+
+The VM_BUG_ON_PAGE() calls in the *_huge_active() interfaces are not
+really necessary as we KNOW the page is a hugetlb page.  Therefore, they
+are removed.
+
+The routine page_huge_active checked for PageHeadHuge before testing the
+active bit.  This is unnecessary in the case where we hold a reference or
+lock and know it is a hugetlb head page.  page_huge_active is also called
+without holding a reference or lock (scan_movable_pages), and can race
+with code freeing the page.  The extra check in page_huge_active shortened
+the race window, but did not prevent the race.  Offline code calling
+scan_movable_pages already deals with these races, so removing the check
+is acceptable.  Add comment to racy code.
+
+[songmuchun@bytedance.com: remove set_page_huge_active() declaration from include/linux/hugetlb.h]
+  Link: https://lkml.kernel.org/r/CAMZfGtUda+KoAZscU0718TN61cSFwp4zy=y2oZ=+6Z2TAZZwng@mail.gmail.com
+
+Link: https://lkml.kernel.org/r/20210122195231.324857-3-mike.kravetz@oracle.com
+Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+Reviewed-by: Oscar Salvador <osalvador@suse.de>
+Reviewed-by: Muchun Song <songmuchun@bytedance.com>
+Reviewed-by: Miaohe Lin <linmiaohe@huawei.com>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ fs/hugetlbfs/inode.c       |    2 +-
+ include/linux/hugetlb.h    |    7 +++++--
+ include/linux/page-flags.h |    6 ------
+ mm/hugetlb.c               |   45 +++++++++++----------------------------------
+ mm/memory_hotplug.c        |    9 ++++++++-
+ 5 files changed, 25 insertions(+), 44 deletions(-)
+
+--- a/fs/hugetlbfs/inode.c
++++ b/fs/hugetlbfs/inode.c
+@@ -740,7 +740,7 @@ static long hugetlbfs_fallocate(struct f
+ 
+ 		mutex_unlock(&hugetlb_fault_mutex_table[hash]);
+ 
+-		set_page_huge_active(page);
++		SetHPageMigratable(page);
+ 		/*
+ 		 * unlock_page because locked by add_to_page_cache()
+ 		 * put_page() due to reference from alloc_huge_page()
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -480,9 +480,13 @@ unsigned long hugetlb_get_unmapped_area(
+  * HPG_restore_reserve - Set when a hugetlb page consumes a reservation at
+  *	allocation time.  Cleared when page is fully instantiated.  Free
+  *	routine checks flag to restore a reservation on error paths.
++ * HPG_migratable  - Set after a newly allocated page is added to the page
++ *	cache and/or page tables.  Indicates the page is a candidate for
++ *	migration.
+  */
+ enum hugetlb_page_flags {
+ 	HPG_restore_reserve = 0,
++	HPG_migratable,
+ 	__NR_HPAGEFLAGS,
+ };
+ 
+@@ -525,6 +529,7 @@ static inline void ClearHPage##uname(str
+  * Create functions associated with hugetlb page flags
+  */
+ HPAGEFLAG(RestoreReserve, restore_reserve)
++HPAGEFLAG(Migratable, migratable)
+ 
+ #ifdef CONFIG_HUGETLB_PAGE
+ 
+@@ -832,8 +837,6 @@ static inline void huge_ptep_modify_prot
+ }
+ #endif
+ 
+-void set_page_huge_active(struct page *page);
+-
+ #else	/* CONFIG_HUGETLB_PAGE */
+ struct hstate {};
+ 
+--- a/include/linux/page-flags.h
++++ b/include/linux/page-flags.h
+@@ -594,15 +594,9 @@ static inline void ClearPageCompound(str
+ #ifdef CONFIG_HUGETLB_PAGE
+ int PageHuge(struct page *page);
+ int PageHeadHuge(struct page *page);
+-bool page_huge_active(struct page *page);
+ #else
+ TESTPAGEFLAG_FALSE(Huge)
+ TESTPAGEFLAG_FALSE(HeadHuge)
+-
+-static inline bool page_huge_active(struct page *page)
+-{
+-	return 0;
+-}
+ #endif
+ 
+ 
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -1381,30 +1381,6 @@ struct hstate *size_to_hstate(unsigned l
+ }
+ 
+ /*
+- * Test to determine whether the hugepage is "active/in-use" (i.e. being linked
+- * to hstate->hugepage_activelist.)
+- *
+- * This function can be called for tail pages, but never returns true for them.
+- */
+-bool page_huge_active(struct page *page)
+-{
+-	return PageHeadHuge(page) && PagePrivate(&page[1]);
+-}
+-
+-/* never called for tail page */
+-void set_page_huge_active(struct page *page)
+-{
+-	VM_BUG_ON_PAGE(!PageHeadHuge(page), page);
+-	SetPagePrivate(&page[1]);
+-}
+-
+-static void clear_page_huge_active(struct page *page)
+-{
+-	VM_BUG_ON_PAGE(!PageHeadHuge(page), page);
+-	ClearPagePrivate(&page[1]);
+-}
+-
+-/*
+  * Internal hugetlb specific page flag. Do not use outside of the hugetlb
+  * code
+  */
+@@ -1465,7 +1441,7 @@ static void __free_huge_page(struct page
+ 	}
+ 
+ 	spin_lock(&hugetlb_lock);
+-	clear_page_huge_active(page);
++	ClearHPageMigratable(page);
+ 	hugetlb_cgroup_uncharge_page(hstate_index(h),
+ 				     pages_per_huge_page(h), page);
+ 	hugetlb_cgroup_uncharge_page_rsvd(hstate_index(h),
+@@ -4239,7 +4215,7 @@ retry_avoidcopy:
+ 				make_huge_pte(vma, new_page, 1));
+ 		page_remove_rmap(old_page, true);
+ 		hugepage_add_new_anon_rmap(new_page, vma, haddr);
+-		set_page_huge_active(new_page);
++		SetHPageMigratable(new_page);
+ 		/* Make the old page be freed below */
+ 		new_page = old_page;
+ 	}
+@@ -4476,12 +4452,12 @@ retry:
+ 	spin_unlock(ptl);
+ 
+ 	/*
+-	 * Only make newly allocated pages active.  Existing pages found
+-	 * in the pagecache could be !page_huge_active() if they have been
+-	 * isolated for migration.
++	 * Only set HPageMigratable in newly allocated pages.  Existing pages
++	 * found in the pagecache may not have HPageMigratableset if they have
++	 * been isolated for migration.
+ 	 */
+ 	if (new_page)
+-		set_page_huge_active(page);
++		SetHPageMigratable(page);
+ 
+ 	unlock_page(page);
+ out:
+@@ -4802,7 +4778,7 @@ int hugetlb_mcopy_atomic_pte(struct mm_s
+ 	update_mmu_cache(dst_vma, dst_addr, dst_pte);
+ 
+ 	spin_unlock(ptl);
+-	set_page_huge_active(page);
++	SetHPageMigratable(page);
+ 	if (vm_shared)
+ 		unlock_page(page);
+ 	ret = 0;
+@@ -5641,12 +5617,13 @@ bool isolate_huge_page(struct page *page
+ 	bool ret = true;
+ 
+ 	spin_lock(&hugetlb_lock);
+-	if (!PageHeadHuge(page) || !page_huge_active(page) ||
++	if (!PageHeadHuge(page) ||
++	    !HPageMigratable(page) ||
+ 	    !get_page_unless_zero(page)) {
+ 		ret = false;
+ 		goto unlock;
+ 	}
+-	clear_page_huge_active(page);
++	ClearHPageMigratable(page);
+ 	list_move_tail(&page->lru, list);
+ unlock:
+ 	spin_unlock(&hugetlb_lock);
+@@ -5657,7 +5634,7 @@ void putback_active_hugepage(struct page
+ {
+ 	VM_BUG_ON_PAGE(!PageHead(page), page);
+ 	spin_lock(&hugetlb_lock);
+-	set_page_huge_active(page);
++	SetHPageMigratable(page);
+ 	list_move_tail(&page->lru, &(page_hstate(page))->hugepage_activelist);
+ 	spin_unlock(&hugetlb_lock);
+ 	put_page(page);
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@ -1261,7 +1261,14 @@ static int scan_movable_pages(unsigned l
+ 		if (!PageHuge(page))
+ 			continue;
+ 		head = compound_head(page);
+-		if (page_huge_active(head))
++		/*
++		 * This test is racy as we hold no reference or lock.  The
++		 * hugetlb page could have been free'ed and head is no longer
++		 * a hugetlb page before the following check.  In such unlikely
++		 * cases false positives and negatives are possible.  Calling
++		 * code must deal with these scenarios.
++		 */
++		if (HPageMigratable(head))
+ 			goto found;
+ 		skip = compound_nr(head) - (page - head);
+ 		pfn += skip - 1;

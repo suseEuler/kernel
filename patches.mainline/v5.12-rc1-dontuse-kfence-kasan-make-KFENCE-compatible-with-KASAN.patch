@@ -1,0 +1,148 @@
+From 2b8305260fb37fc20e13f71e13073304d0a031c8 Mon Sep 17 00:00:00 2001
+From: Alexander Potapenko <glider@google.com>
+Date: Thu, 25 Feb 2021 17:19:21 -0800
+Subject: [PATCH] kfence, kasan: make KFENCE compatible with KASAN
+Git-commit: 2b8305260fb37fc20e13f71e13073304d0a031c8
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+Make KFENCE compatible with KASAN. Currently this helps test KFENCE
+itself, where KASAN can catch potential corruptions to KFENCE state, or
+other corruptions that may be a result of freepointer corruptions in the
+main allocators.
+
+[akpm@linux-foundation.org: merge fixup]
+[andreyknvl@google.com: untag addresses for KFENCE]
+  Link: https://lkml.kernel.org/r/9dc196006921b191d25d10f6e611316db7da2efc.1611946152.git.andreyknvl@google.com
+
+Link: https://lkml.kernel.org/r/20201103175841.3495947-7-elver@google.com
+Signed-off-by: Marco Elver <elver@google.com>
+Signed-off-by: Alexander Potapenko <glider@google.com>
+Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+Reviewed-by: Dmitry Vyukov <dvyukov@google.com>
+Reviewed-by: Jann Horn <jannh@google.com>
+Co-developed-by: Marco Elver <elver@google.com>
+Cc: Andrey Konovalov <andreyknvl@google.com>
+Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Christopher Lameter <cl@linux.com>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Eric Dumazet <edumazet@google.com>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Hillf Danton <hdanton@sina.com>
+Cc: "H. Peter Anvin" <hpa@zytor.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Joern Engel <joern@purestorage.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Cc: Kees Cook <keescook@chromium.org>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Paul E. McKenney <paulmck@kernel.org>
+Cc: Pekka Enberg <penberg@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: SeongJae Park <sjpark@amazon.de>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Will Deacon <will@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+[jyang: fixby euler OLK-5.10 commit 662741a038cbe2e0243865b3b4c40b03b2d1c0fa]
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ lib/Kconfig.kfence |  2 +-
+ mm/kasan/common.c  | 18 ++++++++++++++++++
+ mm/kasan/generic.c |  3 ++-
+ 3 files changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/lib/Kconfig.kfence b/lib/Kconfig.kfence
+index b88ac9d6b2e6..edfecb5d6165 100644
+--- a/lib/Kconfig.kfence
++++ b/lib/Kconfig.kfence
+@@ -5,7 +5,7 @@ config HAVE_ARCH_KFENCE
+ 
+ menuconfig KFENCE
+ 	bool "KFENCE: low-overhead sampling-based memory safety error detector"
+-	depends on HAVE_ARCH_KFENCE && !KASAN && (SLAB || SLUB)
++	depends on HAVE_ARCH_KFENCE && (SLAB || SLUB)
+ 	select STACKTRACE
+ 	help
+ 	  KFENCE is a low-overhead sampling-based detector of heap out-of-bounds
+diff --git a/mm/kasan/common.c b/mm/kasan/common.c
+index b18189ef3a92..af1768c4fee5 100644
+--- a/mm/kasan/common.c
++++ b/mm/kasan/common.c
+@@ -124,6 +124,10 @@ void kasan_poison_shadow(const void *address, size_t size, u8 value)
+ 	 */
+ 	address = reset_tag(address);
+ 
++	/* Skip KFENCE memory if called explicitly outside of sl*b. */
++	if (is_kfence_address(address))
++		return;
++
+ 	shadow_start = kasan_mem_to_shadow(address);
+ 	shadow_end = kasan_mem_to_shadow(address + size);
+ 
+@@ -141,6 +145,14 @@ void kasan_unpoison_shadow(const void *address, size_t size)
+ 	 */
+ 	address = reset_tag(address);
+ 
++	/*
++	 * Skip KFENCE memory if called explicitly outside of sl*b. Also note
++	 * that calls to ksize(), where size is not a multiple of machine-word
++	 * size, would otherwise poison the invalid portion of the word.
++	 */
++	if (is_kfence_address(address))
++		return;
++
+ 	kasan_poison_shadow(address, size, tag);
+ 
+ 	if (size & KASAN_SHADOW_MASK) {
+@@ -396,6 +408,9 @@ static bool __kasan_slab_free(struct kmem_cache *cache, void *object,
+ 	tagged_object = object;
+ 	object = reset_tag(object);
+ 
++	if (is_kfence_address(object))
++		return false;
++
+ 	if (unlikely(nearest_obj(cache, virt_to_head_page(object), object) !=
+ 	    object)) {
+ 		kasan_report_invalid_free(tagged_object, ip);
+@@ -444,6 +459,9 @@ static void *__kasan_kmalloc(struct kmem_cache *cache, const void *object,
+ 	if (unlikely(object == NULL))
+ 		return NULL;
+ 
++	if (is_kfence_address(kasan_reset_tag(object)))
++		return (void *)object;
++
+ 	redzone_start = round_up((unsigned long)(object + size),
+ 				KASAN_SHADOW_SCALE_SIZE);
+ 	redzone_end = round_up((unsigned long)object + cache->object_size,
+diff --git a/mm/kasan/generic.c b/mm/kasan/generic.c
+index 3f17a1218055..2e55e0f82f39 100644
+--- a/mm/kasan/generic.c
++++ b/mm/kasan/generic.c
+@@ -21,6 +21,7 @@
+ #include <linux/init.h>
+ #include <linux/kasan.h>
+ #include <linux/kernel.h>
++#include <linux/kfence.h>
+ #include <linux/kmemleak.h>
+ #include <linux/linkage.h>
+ #include <linux/memblock.h>
+@@ -332,7 +333,7 @@ void kasan_record_aux_stack(void *addr)
+ 	struct kasan_alloc_meta *alloc_info;
+ 	void *object;
+ 
+-	if (!(page && PageSlab(page)))
++	if (is_kfence_address(addr) || !(page && PageSlab(page)))
+ 		return;
+ 
+ 	cache = page->slab_cache;
+-- 
+2.31.1
+

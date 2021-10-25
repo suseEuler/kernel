@@ -1,0 +1,164 @@
+From 8a6445f77d58c8a2029f7045f5d89f16bbfe7926 Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Fri, 26 Feb 2021 20:21:57 +0800
+Subject: [PATCH] arm64/mpam: Allocate mpam component configuration arrays
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 8a6445f77d58c8a2029f7045f5d89f16bbfe7926
+
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+To bridge resctrl resources and mpam devices, we need somewhere
+to store the configuration information.
+
+We allocate a configuration array for each mpam component, which
+gets configuration from intermediate structure of resctrl and write
+to mpam devices(MSCs).
+
+This config element's categories can be classified as cache ctrl
+feature (CPBM and CMAX) and memory ctrl feature (MAX and PBM),
+meanwhile some extended features are also supported, including
+priority, and hardlimit choice,
+
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/kernel/mpam/mpam_device.c   | 24 ++++++++++++++++++++
+ arch/arm64/kernel/mpam/mpam_device.h   |  4 ++++
+ arch/arm64/kernel/mpam/mpam_internal.h | 31 ++++++++++++++++++++++++++
+ 3 files changed, 59 insertions(+)
+
+diff --git a/arch/arm64/kernel/mpam/mpam_device.c b/arch/arm64/kernel/mpam/mpam_device.c
+index c98cc134ff9a..34a7234ab983 100644
+--- a/arch/arm64/kernel/mpam/mpam_device.c
++++ b/arch/arm64/kernel/mpam/mpam_device.c
+@@ -358,6 +358,25 @@ static void mpam_enable_squash_features(void)
+ 	}
+ }
+ 
++static int mpam_allocate_config(void)
++{
++	struct mpam_class *class;
++	struct mpam_component *comp;
++
++	lockdep_assert_held(&mpam_devices_lock);
++
++	list_for_each_entry(class, &mpam_classes, classes_list) {
++		list_for_each_entry(comp, &class->components, class_list) {
++			comp->cfg = kcalloc(mpam_sysprops_num_partid(), sizeof(*comp->cfg),
++				GFP_KERNEL);
++			if (!comp->cfg)
++				return -ENOMEM;
++		}
++	}
++
++	return 0;
++}
++
+ /*
+  * Enable mpam once all devices have been probed.
+  * Scheduled by mpam_discovery_complete() once all devices have been created.
+@@ -365,6 +384,7 @@ static void mpam_enable_squash_features(void)
+  */
+ static void __init mpam_enable(struct work_struct *work)
+ {
++	int err;
+ 	unsigned long flags;
+ 	struct mpam_device *dev;
+ 	bool all_devices_probed = true;
+@@ -387,6 +407,9 @@ static void __init mpam_enable(struct work_struct *work)
+ 
+ 	mutex_lock(&mpam_devices_lock);
+ 	mpam_enable_squash_features();
++	err = mpam_allocate_config();
++	if (err)
++		return;
+ 	mutex_unlock(&mpam_devices_lock);
+ }
+ 
+@@ -511,6 +534,7 @@ static void mpam_class_destroy(struct mpam_class *class)
+ 	list_for_each_entry_safe(comp, tmp, &class->components, class_list) {
+ 		mpam_devices_destroy(comp);
+ 		list_del(&comp->class_list);
++		kfree(comp->cfg);
+ 		kfree(comp);
+ 	}
+ }
+diff --git a/arch/arm64/kernel/mpam/mpam_device.h b/arch/arm64/kernel/mpam/mpam_device.h
+index 05f8431c71fc..a98c34742374 100644
+--- a/arch/arm64/kernel/mpam/mpam_device.h
++++ b/arch/arm64/kernel/mpam/mpam_device.h
+@@ -7,6 +7,8 @@
+ #include <linux/types.h>
+ #include "mpam_internal.h"
+ 
++struct mpam_config;
++
+ /*
+  * Size of the memory mapped registers: 4K of feature page
+  * then 2x 4K bitmap registers
+@@ -74,6 +76,8 @@ struct mpam_component {
+ 
+ 	struct cpumask          fw_affinity;
+ 
++	struct mpam_config		*cfg;
++
+ 	/* member of mpam_class:components */
+ 	struct list_head        class_list;
+ };
+diff --git a/arch/arm64/kernel/mpam/mpam_internal.h b/arch/arm64/kernel/mpam/mpam_internal.h
+index 2579d111d7df..53df10e84554 100644
+--- a/arch/arm64/kernel/mpam/mpam_internal.h
++++ b/arch/arm64/kernel/mpam/mpam_internal.h
+@@ -4,6 +4,37 @@
+ 
+ typedef u32 mpam_features_t;
+ 
++/*
++ * MPAM component config Structure
++ */
++struct mpam_config {
++
++	/*
++	 * The biggest config we could pass around is 4K, but resctrl's max
++	 * cbm is u32, so we only need the full-size config during reset.
++	 * Just in case a cache with a >u32 bitmap is exported for another
++	 * reason, we need to track which bits of the configuration are valid.
++	 */
++	mpam_features_t valid;
++
++	u32             cpbm;
++	u32             mbw_pbm;
++	u16             mbw_max;
++
++	/*
++	 *  dspri is downstream priority, intpri is internal priority.
++	 */
++	u16             dspri;
++	u16             intpri;
++
++	/*
++	 * hardlimit or not
++	 */
++	bool            hdl;
++
++	u32             intpartid;
++};
++
+ /* Bits for mpam_features_t */
+ enum mpam_device_features {
+ 	mpam_feat_ccap_part = 0,
+-- 
+2.26.2
+

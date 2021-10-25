@@ -1,0 +1,431 @@
+From 44513976e11e1014579d1ea86d961f71520c8b53 Mon Sep 17 00:00:00 2001
+From: James Morse <james.morse@arm.com>
+Date: Fri, 26 Feb 2021 20:22:34 +0800
+Subject: [PATCH] arm64/mpam: Enabling registering and logging error interrupts
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 44513976e11e1014579d1ea86d961f71520c8b53
+
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+The MPAM MSC error interrupt tells us how we misconfigured the MSC.
+We don't expect to to this. If the interrupt fires, print a
+summary, and mark MPAM as broken. Eventually we will try and cleanly
+teardown when we see this.
+
+Now we can register from a helper mpam_register_device_irq() to
+register overflow and error interrupt from mpam device, When devices
+come and go we want to make sure the error irq is enabled. We disable
+the error irq when cpus are taken offline in case the component remains
+online even when the associated CPUs are offline.
+
+Code of this patch are borrowed from james <james.morse@arm.com>.
+
+[Wang ShaoBo: few version adaptation changes]
+
+Signed-off-by: James Morse <james.morse@arm.com>
+Link: http://www.linux-arm.org/git?p=linux-jm.git;a=patch;h=6d1ceca3eb5953fc16a524c9aad933519aa3f64c
+Link: http://www.linux-arm.org/git?p=linux-jm.git;a=patch;h=81d178c198165fd557431d6879135d2e03ea92c0
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/mpam_resource.h |  10 +-
+ arch/arm64/kernel/mpam/mpam_device.c   | 164 ++++++++++++++++++++++++-
+ arch/arm64/kernel/mpam/mpam_device.h   |   6 +
+ arch/arm64/kernel/mpam/mpam_internal.h |  10 ++
+ drivers/acpi/arm64/mpam.c              |  10 +-
+ include/linux/arm_mpam.h               |  51 ++++++++
+ 6 files changed, 246 insertions(+), 5 deletions(-)
+
+diff --git a/arch/arm64/include/asm/mpam_resource.h b/arch/arm64/include/asm/mpam_resource.h
+index c88675356a24..4833a38a773c 100644
+--- a/arch/arm64/include/asm/mpam_resource.h
++++ b/arch/arm64/include/asm/mpam_resource.h
+@@ -102,9 +102,17 @@
+  */
+ #define MPAMCFG_PART_SEL_INTERNAL   BIT(16)
+ 
+-/* MPAM_ESR */
++/* MPAMF_ESR - MPAM Error Status Register */
++#define MPAMF_ESR_PARTID_OR_MON GENMASK(15, 0)
++#define MPAMF_ESR_PMG           GENMASK(23, 16)
++#define MPAMF_ESR_ERRCODE       GENMASK(27, 24)
++#define MPAMF_ESR_ERRCODE_SHIFT 24
++#define MPAMF_ESR_OVRWR         BIT(31)
+ #define MPAMF_ESR_ERRCODE_MASK  ((BIT(4) - 1) << 24)
+ 
++/* MPAMF_ECR - MPAM Error Control Register */
++#define MPAMF_ECR_INTEN         BIT(0)
++
+ /*
+  * Size of the memory mapped registers: 4K of feature page then 2 x 4K
+  * bitmap registers
+diff --git a/arch/arm64/kernel/mpam/mpam_device.c b/arch/arm64/kernel/mpam/mpam_device.c
+index 5ea5e6682911..a1e6564401ba 100644
+--- a/arch/arm64/kernel/mpam/mpam_device.c
++++ b/arch/arm64/kernel/mpam/mpam_device.c
+@@ -406,6 +406,129 @@ static int mpam_allocate_config(void)
+ 	return 0;
+ }
+ 
++static const char *mpam_msc_err_str[_MPAM_NUM_ERRCODE] = {
++	[MPAM_ERRCODE_NONE] = "No Error",
++	[MPAM_ERRCODE_PARTID_SEL_RANGE] = "Out of range PARTID selected",
++	[MPAM_ERRCODE_REQ_PARTID_RANGE] = "Out of range PARTID requested",
++	[MPAM_ERRCODE_REQ_PMG_RANGE] = "Out of range PMG requested",
++	[MPAM_ERRCODE_MONITOR_RANGE] = "Out of range Monitor selected",
++	[MPAM_ERRCODE_MSMONCFG_ID_RANGE] = "Out of range Monitor:PARTID or PMG written",
++
++	/* These two are about PARTID narrowing, which we don't support */
++	[MPAM_ERRCODE_INTPARTID_RANGE] = "Out or range Internal-PARTID written",
++	[MPAM_ERRCODE_UNEXPECTED_INTERNAL] = "Internal-PARTID set but not expected",
++};
++
++
++static irqreturn_t mpam_handle_error_irq(int irq, void *data)
++{
++	u32 device_esr;
++	u16 device_errcode;
++	struct mpam_device *dev = data;
++
++	spin_lock(&dev->lock);
++	device_esr = mpam_read_reg(dev, MPAMF_ESR);
++	spin_unlock(&dev->lock);
++
++	device_errcode = (device_esr & MPAMF_ESR_ERRCODE) >> MPAMF_ESR_ERRCODE_SHIFT;
++	if (device_errcode == MPAM_ERRCODE_NONE)
++		return IRQ_NONE;
++
++	/* No-one expects MPAM errors! */
++	if (device_errcode <= _MPAM_NUM_ERRCODE)
++		pr_err_ratelimited("unexpected error '%s' [esr:%x]\n",
++					mpam_msc_err_str[device_errcode],
++					device_esr);
++	else
++		pr_err_ratelimited("unexpected error %d [esr:%x]\n",
++					device_errcode, device_esr);
++
++	if (!cmpxchg(&mpam_broken, -EINTR, 0))
++		schedule_work(&mpam_failed_work);
++
++	/* A write of 0 to MPAMF_ESR.ERRCODE clears level interrupts */
++	spin_lock(&dev->lock);
++	mpam_write_reg(dev, MPAMF_ESR, 0);
++	spin_unlock(&dev->lock);
++
++	return IRQ_HANDLED;
++}
++/* register and enable all device error interrupts */
++static void mpam_enable_irqs(void)
++{
++	struct mpam_device *dev;
++	int rc, irq, request_flags;
++	unsigned long irq_save_flags;
++
++	list_for_each_entry(dev, &mpam_all_devices, glbl_list) {
++		spin_lock_irqsave(&dev->lock, irq_save_flags);
++		irq = dev->error_irq;
++		request_flags = dev->error_irq_flags;
++		spin_unlock_irqrestore(&dev->lock, irq_save_flags);
++
++		if (request_flags & MPAM_IRQ_MODE_LEVEL) {
++			struct cpumask tmp;
++			bool inaccessible_cpus;
++
++			request_flags = IRQF_TRIGGER_LOW | IRQF_SHARED;
++
++			/*
++			 * If the MSC is not accessible from any CPU the IRQ
++			 * may be migrated to, we won't be able to clear it.
++			 * ~dev->fw_affinity is all the CPUs that can't access
++			 * the MSC. 'and' cpu_possible_mask tells us whether we
++			 * care.
++			 */
++			spin_lock_irqsave(&dev->lock, irq_save_flags);
++			inaccessible_cpus = cpumask_andnot(&tmp,
++							cpu_possible_mask,
++							&dev->fw_affinity);
++			spin_unlock_irqrestore(&dev->lock, irq_save_flags);
++
++			if (inaccessible_cpus) {
++				pr_err_once("NOT registering MPAM error level-irq that isn't globally reachable");
++				continue;
++			}
++		} else {
++			request_flags = IRQF_TRIGGER_RISING | IRQF_SHARED;
++		}
++
++		rc = request_irq(irq, mpam_handle_error_irq, request_flags,
++				"MPAM ERR IRQ", dev);
++		if (rc) {
++			pr_err_ratelimited("Failed to register irq %u\n", irq);
++			continue;
++		}
++
++		/*
++		 * temporary: the interrupt will only be enabled when cpus
++		 * subsequently come online after mpam_enable().
++		 */
++		spin_lock_irqsave(&dev->lock, irq_save_flags);
++		dev->enable_error_irq = true;
++		spin_unlock_irqrestore(&dev->lock, irq_save_flags);
++	}
++}
++
++static void mpam_disable_irqs(void)
++{
++	int irq;
++	bool do_unregister;
++	struct mpam_device *dev;
++	unsigned long irq_save_flags;
++
++	list_for_each_entry(dev, &mpam_all_devices, glbl_list) {
++		spin_lock_irqsave(&dev->lock, irq_save_flags);
++		irq = dev->error_irq;
++		do_unregister = dev->enable_error_irq;
++		dev->enable_error_irq = false;
++		spin_unlock_irqrestore(&dev->lock, irq_save_flags);
++
++		if (do_unregister)
++			free_irq(irq, dev);
++	}
++}
++
+ /*
+  * Enable mpam once all devices have been probed.
+  * Scheduled by mpam_discovery_complete() once all devices have been created.
+@@ -441,6 +564,8 @@ static void __init mpam_enable(struct work_struct *work)
+ 		return;
+ 	mutex_unlock(&mpam_devices_lock);
+ 
++	mpam_enable_irqs();
++
+ 	/*
+ 	 * mpam_enable() runs in parallel with cpuhp callbacks bringing other
+ 	 * CPUs online, as we eagerly schedule the work. To give resctrl a
+@@ -484,6 +609,8 @@ static void mpam_failed(struct work_struct *work)
+ 	if (mpam_cpuhp_state) {
+ 		cpuhp_remove_state(mpam_cpuhp_state);
+ 		mpam_cpuhp_state = 0;
++
++		mpam_disable_irqs();
+ 	}
+ 	mutex_unlock(&mpam_cpuhp_lock);
+ }
+@@ -679,6 +806,28 @@ __mpam_device_create(u8 level_idx, enum mpam_class_types type,
+ 	return dev;
+ }
+ 
++void __init mpam_device_set_error_irq(struct mpam_device *dev, u32 irq,
++					u32 flags)
++{
++	unsigned long irq_save_flags;
++
++	spin_lock_irqsave(&dev->lock, irq_save_flags);
++	dev->error_irq = irq;
++	dev->error_irq_flags = flags & MPAM_IRQ_FLAGS_MASK;
++	spin_unlock_irqrestore(&dev->lock, irq_save_flags);
++}
++
++void __init mpam_device_set_overflow_irq(struct mpam_device *dev, u32 irq,
++					u32 flags)
++{
++	unsigned long irq_save_flags;
++
++	spin_lock_irqsave(&dev->lock, irq_save_flags);
++	dev->overflow_irq = irq;
++	dev->overflow_irq_flags = flags & MPAM_IRQ_FLAGS_MASK;
++	spin_unlock_irqrestore(&dev->lock, irq_save_flags);
++}
++
+ static int mpam_cpus_have_feature(void)
+ {
+ 	if (!cpus_have_const_cap(ARM64_HAS_MPAM))
+@@ -803,6 +952,9 @@ static void mpam_reset_device(struct mpam_component *comp,
+ 
+ 	lockdep_assert_held(&dev->lock);
+ 
++	if (dev->enable_error_irq)
++		mpam_write_reg(dev, MPAMF_ECR, MPAMF_ECR_INTEN);
++
+ 	if (!mpam_has_feature(mpam_feat_part_nrw, dev->features)) {
+ 		for (partid = 0; partid < dev->num_partid; partid++)
+ 			mpam_reset_device_config(comp, dev, partid);
+@@ -914,12 +1066,22 @@ static int mpam_cpu_online(unsigned int cpu)
+ 
+ static int mpam_cpu_offline(unsigned int cpu)
+ {
++	unsigned long flags;
+ 	struct mpam_device *dev;
+ 
+ 	mutex_lock(&mpam_devices_lock);
+-	list_for_each_entry(dev, &mpam_all_devices, glbl_list)
++	list_for_each_entry(dev, &mpam_all_devices, glbl_list) {
++		if (!cpumask_test_cpu(cpu, &dev->online_affinity))
++			continue;
+ 		cpumask_clear_cpu(cpu, &dev->online_affinity);
+ 
++		if (cpumask_empty(&dev->online_affinity)) {
++			spin_lock_irqsave(&dev->lock, flags);
++			mpam_write_reg(dev, MPAMF_ECR, 0);
++			spin_unlock_irqrestore(&dev->lock, flags);
++		}
++	}
++
+ 	mutex_unlock(&mpam_devices_lock);
+ 
+ 	if (resctrl_registered)
+diff --git a/arch/arm64/kernel/mpam/mpam_device.h b/arch/arm64/kernel/mpam/mpam_device.h
+index fc5f7c292b6f..f3ebd3f8b23d 100644
+--- a/arch/arm64/kernel/mpam/mpam_device.h
++++ b/arch/arm64/kernel/mpam/mpam_device.h
+@@ -58,6 +58,12 @@ struct mpam_device {
+ 	/* for reset device MPAMCFG_PRI */
+ 	u16         hwdef_intpri;
+ 	u16         hwdef_dspri;
++
++	bool        enable_error_irq;
++	u32         error_irq;
++	u32         error_irq_flags;
++	u32         overflow_irq;
++	u32         overflow_irq_flags;
+ };
+ 
+ /*
+diff --git a/arch/arm64/kernel/mpam/mpam_internal.h b/arch/arm64/kernel/mpam/mpam_internal.h
+index 0ca58712a8ca..974a0b0784fa 100644
+--- a/arch/arm64/kernel/mpam/mpam_internal.h
++++ b/arch/arm64/kernel/mpam/mpam_internal.h
+@@ -20,6 +20,16 @@ extern struct list_head mpam_classes;
+ 
+ #define MAX_MBA_BW  100u
+ 
++#define MPAM_ERRCODE_NONE                       0
++#define MPAM_ERRCODE_PARTID_SEL_RANGE           1
++#define MPAM_ERRCODE_REQ_PARTID_RANGE           2
++#define MPAM_ERRCODE_MSMONCFG_ID_RANGE          3
++#define MPAM_ERRCODE_REQ_PMG_RANGE              4
++#define MPAM_ERRCODE_MONITOR_RANGE              5
++#define MPAM_ERRCODE_INTPARTID_RANGE            6
++#define MPAM_ERRCODE_UNEXPECTED_INTERNAL        7
++#define _MPAM_NUM_ERRCODE                       8
++
+ struct mpam_resctrl_dom {
+ 	struct mpam_component   *comp;
+ 
+diff --git a/drivers/acpi/arm64/mpam.c b/drivers/acpi/arm64/mpam.c
+index 10e4769d5227..6c238f5a5c5a 100644
+--- a/drivers/acpi/arm64/mpam.c
++++ b/drivers/acpi/arm64/mpam.c
+@@ -93,7 +93,7 @@ static int acpi_mpam_label_memory_component_id(u8 proximity_domain,
+ 
+ static int __init acpi_mpam_parse_memory(struct acpi_mpam_header *h)
+ {
+-	int ret = 0;
++	int ret;
+ 	u32 component_id;
+ 	struct mpam_device *dev;
+ 	struct acpi_mpam_node_memory *node = (struct acpi_mpam_node_memory *)h;
+@@ -112,7 +112,9 @@ static int __init acpi_mpam_parse_memory(struct acpi_mpam_header *h)
+ 		return -EINVAL;
+ 	}
+ 
+-	return ret;
++	return mpam_register_device_irq(dev,
++		node->header.overflow_interrupt, node->header.overflow_flags,
++		node->header.error_interrupt, node->header.error_interrupt_flags);
+ }
+ 
+ static int __init acpi_mpam_parse_cache(struct acpi_mpam_header *h,
+@@ -178,7 +180,9 @@ static int __init acpi_mpam_parse_cache(struct acpi_mpam_header *h,
+ 		return -EINVAL;
+ 	}
+ 
+-	return ret;
++	return mpam_register_device_irq(dev,
++		node->header.overflow_interrupt, node->header.overflow_flags,
++		node->header.error_interrupt, node->header.error_interrupt_flags);
+ }
+ 
+ static int __init acpi_mpam_parse_table(struct acpi_table_header *table,
+diff --git a/include/linux/arm_mpam.h b/include/linux/arm_mpam.h
+index 18da2090ccd5..5c061e5383ad 100644
+--- a/include/linux/arm_mpam.h
++++ b/include/linux/arm_mpam.h
+@@ -2,6 +2,7 @@
+ #ifndef __LINUX_ARM_MPAM_H
+ #define __LINUX_ARM_MPAM_H
+ 
++#include <linux/acpi.h>
+ #include <linux/err.h>
+ #include <linux/cpumask.h>
+ #include <linux/types.h>
+@@ -64,4 +65,54 @@ enum mpam_enable_type {
+ 
+ extern enum mpam_enable_type mpam_enabled;
+ 
++#define MPAM_IRQ_MODE_LEVEL    0x1
++#define MPAM_IRQ_FLAGS_MASK    0x7f
++
++#define mpam_irq_flags_to_acpi(x) ((x & MPAM_IRQ_MODE_LEVEL) ?  \
++			ACPI_LEVEL_SENSITIVE : ACPI_EDGE_SENSITIVE)
++
++void __init mpam_device_set_error_irq(struct mpam_device *dev, u32 irq,
++			u32 flags);
++void __init mpam_device_set_overflow_irq(struct mpam_device *dev, u32 irq,
++			u32 flags);
++
++static inline int __init mpam_register_device_irq(struct mpam_device *dev,
++			u32 overflow_interrupt, u32 overflow_flags,
++			u32 error_interrupt, u32 error_flags)
++{
++	int irq, trigger;
++	int ret = 0;
++	u8 irq_flags;
++
++	if (overflow_interrupt) {
++		irq_flags = overflow_flags & MPAM_IRQ_FLAGS_MASK;
++		trigger = mpam_irq_flags_to_acpi(irq_flags);
++
++		irq = acpi_register_gsi(NULL, overflow_interrupt, trigger,
++				ACPI_ACTIVE_HIGH);
++		if (irq < 0) {
++			pr_err_once("Failed to register overflow interrupt with ACPI\n");
++			return ret;
++		}
++
++		mpam_device_set_overflow_irq(dev, irq, irq_flags);
++	}
++
++	if (error_interrupt) {
++		irq_flags = error_flags & MPAM_IRQ_FLAGS_MASK;
++		trigger = mpam_irq_flags_to_acpi(irq_flags);
++
++		irq = acpi_register_gsi(NULL, error_interrupt, trigger,
++				ACPI_ACTIVE_HIGH);
++		if (irq < 0) {
++			pr_err_once("Failed to register error interrupt with ACPI\n");
++			return ret;
++		}
++
++		mpam_device_set_error_irq(dev, irq, irq_flags);
++	}
++
++	return ret;
++}
++
+ #endif
+-- 
+2.26.2
+

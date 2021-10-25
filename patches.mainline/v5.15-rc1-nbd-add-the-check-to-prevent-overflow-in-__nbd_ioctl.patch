@@ -1,0 +1,65 @@
+From bd59e23b4906402a308a83f904ad386c6c8e3e44 Mon Sep 17 00:00:00 2001
+From: Baokun Li <libaokun1@huawei.com>
+Date: Mon, 15 Nov 2021 19:35:48 +0800
+Subject: [PATCH] nbd: add the check to prevent overflow in __nbd_ioctl()
+Git-commit: fad7cd3310db3099f95dd34312c77740fbc455e5
+Patch-mainline: v5.15-rc1
+References: bsn#12
+openEuler-commit: bd59e23b4906402a308a83f904ad386c6c8e3e44
+
+If user specify a large enough value of NBD blocks option, it may trigger
+signed integer overflow which may lead to nbd->config->bytesize becomes a
+large or small value, zero in particular.
+
+UBSAN: Undefined behaviour in drivers/block/nbd.c:325:31
+signed integer overflow:
+1024 * 4611686155866341414 cannot be represented in type 'long long int'
+[...]
+Call trace:
+[...]
+ handle_overflow+0x188/0x1dc lib/ubsan.c:192
+ __ubsan_handle_mul_overflow+0x34/0x44 lib/ubsan.c:213
+ nbd_size_set drivers/block/nbd.c:325 [inline]
+ __nbd_ioctl drivers/block/nbd.c:1342 [inline]
+ nbd_ioctl+0x998/0xa10 drivers/block/nbd.c:1395
+ __blkdev_driver_ioctl block/ioctl.c:311 [inline]
+[...]
+
+Although it is not a big deal, still silence the UBSAN by limit
+the input value.
+
+Reported-by: Hulk Robot <hulkci@huawei.com>
+Signed-off-by: Baokun Li <libaokun1@huawei.com>
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Link: https://lore.kernel.org/r/20210804021212.990223-1-libaokun1@huawei.com
+[axboe: dropped unlikely()]
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/block/nbd.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/block/nbd.c b/drivers/block/nbd.c
+index 59c452fff835..8a841d5f422d 100644
+--- a/drivers/block/nbd.c
++++ b/drivers/block/nbd.c
+@@ -1385,6 +1385,7 @@ static int __nbd_ioctl(struct block_device *bdev, struct nbd_device *nbd,
+ 		       unsigned int cmd, unsigned long arg)
+ {
+ 	struct nbd_config *config = nbd->config;
++	loff_t bytesize;
+ 
+ 	switch (cmd) {
+ 	case NBD_DISCONNECT:
+@@ -1407,6 +1408,8 @@ static int __nbd_ioctl(struct block_device *bdev, struct nbd_device *nbd,
+ 			     div_s64(arg, config->blksize));
+ 		return 0;
+ 	case NBD_SET_SIZE_BLOCKS:
++		if (check_mul_overflow((loff_t)arg, config->blksize, &bytesize))
++			return -EINVAL;
+ 		nbd_size_set(nbd, config->blksize, arg);
+ 		return 0;
+ 	case NBD_SET_TIMEOUT:
+-- 
+2.26.2
+

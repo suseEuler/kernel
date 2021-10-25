@@ -1,0 +1,170 @@
+From c638072107f52ec35f292c97b6f3df9b9f2ed87d Mon Sep 17 00:00:00 2001
+From: SeongJae Park <sj@kernel.org>
+Date: Fri, 5 Nov 2021 13:47:03 -0700
+Subject: [PATCH] Docs/DAMON: document physical memory monitoring support
+Git-commit: c638072107f52ec35f292c97b6f3df9b9f2ed87d
+Patch-mainline: v5.16-rc1
+References: bsn#1
+
+
+This updates the DAMON documents for the physical memory address space
+monitoring support.
+
+Link: https://lkml.kernel.org/r/20211012205711.29216-8-sj@kernel.org
+Signed-off-by: SeongJae Park <sj@kernel.org>
+Cc: Amit Shah <amit@kernel.org>
+Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Cc: Brendan Higgins <brendanhiggins@google.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: David Rienjes <rientjes@google.com>
+Cc: David Woodhouse <dwmw@amazon.com>
+Cc: Greg Thelen <gthelen@google.com>
+Cc: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Leonard Foerster <foersleo@amazon.de>
+Cc: Marco Elver <elver@google.com>
+Cc: Markus Boehme <markubo@amazon.de>
+Cc: Shakeel Butt <shakeelb@google.com>
+Cc: Shuah Khan <shuah@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ Documentation/admin-guide/mm/damon/usage.rst | 25 +++++++++++++----
+ Documentation/vm/damon/design.rst            | 29 ++++++++++++--------
+ Documentation/vm/damon/faq.rst               |  5 ++--
+ 3 files changed, 40 insertions(+), 19 deletions(-)
+
+diff --git a/Documentation/admin-guide/mm/damon/usage.rst b/Documentation/admin-guide/mm/damon/usage.rst
+index f7d5cfbb50c2..ed96bbf0daff 100644
+--- a/Documentation/admin-guide/mm/damon/usage.rst
++++ b/Documentation/admin-guide/mm/damon/usage.rst
+@@ -10,15 +10,16 @@ DAMON provides below three interfaces for different users.
+   This is for privileged people such as system administrators who want a
+   just-working human-friendly interface.  Using this, users can use the DAMON’s
+   major features in a human-friendly way.  It may not be highly tuned for
+-  special cases, though.  It supports only virtual address spaces monitoring.
++  special cases, though.  It supports both virtual and physical address spaces
++  monitoring.
+ - *debugfs interface.*
+   This is for privileged user space programmers who want more optimized use of
+   DAMON.  Using this, users can use DAMON’s major features by reading
+   from and writing to special debugfs files.  Therefore, you can write and use
+   your personalized DAMON debugfs wrapper programs that reads/writes the
+   debugfs files instead of you.  The DAMON user space tool is also a reference
+-  implementation of such programs.  It supports only virtual address spaces
+-  monitoring.
++  implementation of such programs.  It supports both virtual and physical
++  address spaces monitoring.
+ - *Kernel Space Programming Interface.*
+   This is for kernel space programmers.  Using this, users can utilize every
+   feature of DAMON most flexibly and efficiently by writing kernel space
+@@ -72,20 +73,34 @@ check it again::
+     # cat target_ids
+     42 4242
+ 
++Users can also monitor the physical memory address space of the system by
++writing a special keyword, "``paddr\n``" to the file.  Because physical address
++space monitoring doesn't support multiple targets, reading the file will show a
++fake value, ``42``, as below::
++
++    # cd <debugfs>/damon
++    # echo paddr > target_ids
++    # cat target_ids
++    42
++
+ Note that setting the target ids doesn't start the monitoring.
+ 
+ 
+ Initial Monitoring Target Regions
+ ---------------------------------
+ 
+-In case of the debugfs based monitoring, DAMON automatically sets and updates
+-the monitoring target regions so that entire memory mappings of target
++In case of the virtual address space monitoring, DAMON automatically sets and
++updates the monitoring target regions so that entire memory mappings of target
+ processes can be covered.  However, users can want to limit the monitoring
+ region to specific address ranges, such as the heap, the stack, or specific
+ file-mapped area.  Or, some users can know the initial access pattern of their
+ workloads and therefore want to set optimal initial regions for the 'adaptive
+ regions adjustment'.
+ 
++In contrast, DAMON do not automatically sets and updates the monitoring target
++regions in case of physical memory monitoring.  Therefore, users should set the
++monitoring target regions by themselves.
++
+ In such cases, users can explicitly set the initial monitoring target regions
+ as they want, by writing proper values to the ``init_regions`` file.  Each line
+ of the input should represent one region in below form.::
+diff --git a/Documentation/vm/damon/design.rst b/Documentation/vm/damon/design.rst
+index b05159c295f4..210f0f50efd8 100644
+--- a/Documentation/vm/damon/design.rst
++++ b/Documentation/vm/damon/design.rst
+@@ -35,13 +35,17 @@ two parts:
+ 1. Identification of the monitoring target address range for the address space.
+ 2. Access check of specific address range in the target space.
+ 
+-DAMON currently provides the implementation of the primitives for only the
+-virtual address spaces. Below two subsections describe how it works.
++DAMON currently provides the implementations of the primitives for the physical
++and virtual address spaces. Below two subsections describe how those work.
+ 
+ 
+ VMA-based Target Address Range Construction
+ -------------------------------------------
+ 
++This is only for the virtual address space primitives implementation.  That for
++the physical address space simply asks users to manually set the monitoring
++target address ranges.
++
+ Only small parts in the super-huge virtual address space of the processes are
+ mapped to the physical memory and accessed.  Thus, tracking the unmapped
+ address regions is just wasteful.  However, because DAMON can deal with some
+@@ -71,15 +75,18 @@ to make a reasonable trade-off.  Below shows this in detail::
+ PTE Accessed-bit Based Access Check
+ -----------------------------------
+ 
+-The implementation for the virtual address space uses PTE Accessed-bit for
+-basic access checks.  It finds the relevant PTE Accessed bit from the address
+-by walking the page table for the target task of the address.  In this way, the
+-implementation finds and clears the bit for next sampling target address and
+-checks whether the bit set again after one sampling period.  This could disturb
+-other kernel subsystems using the Accessed bits, namely Idle page tracking and
+-the reclaim logic.  To avoid such disturbances, DAMON makes it mutually
+-exclusive with Idle page tracking and uses ``PG_idle`` and ``PG_young`` page
+-flags to solve the conflict with the reclaim logic, as Idle page tracking does.
++Both of the implementations for physical and virtual address spaces use PTE
++Accessed-bit for basic access checks.  Only one difference is the way of
++finding the relevant PTE Accessed bit(s) from the address.  While the
++implementation for the virtual address walks the page table for the target task
++of the address, the implementation for the physical address walks every page
++table having a mapping to the address.  In this way, the implementations find
++and clear the bit(s) for next sampling target address and checks whether the
++bit(s) set again after one sampling period.  This could disturb other kernel
++subsystems using the Accessed bits, namely Idle page tracking and the reclaim
++logic.  To avoid such disturbances, DAMON makes it mutually exclusive with Idle
++page tracking and uses ``PG_idle`` and ``PG_young`` page flags to solve the
++conflict with the reclaim logic, as Idle page tracking does.
+ 
+ 
+ Address Space Independent Core Mechanisms
+diff --git a/Documentation/vm/damon/faq.rst b/Documentation/vm/damon/faq.rst
+index cb3d8b585a8b..11aea40eb328 100644
+--- a/Documentation/vm/damon/faq.rst
++++ b/Documentation/vm/damon/faq.rst
+@@ -36,10 +36,9 @@ constructions and actual access checks can be implemented and configured on the
+ DAMON core by the users.  In this way, DAMON users can monitor any address
+ space with any access check technique.
+ 
+-Nonetheless, DAMON provides vma tracking and PTE Accessed bit check based
++Nonetheless, DAMON provides vma/rmap tracking and PTE Accessed bit check based
+ implementations of the address space dependent functions for the virtual memory
+-by default, for a reference and convenient use.  In near future, we will
+-provide those for physical memory address space.
++and the physical memory by default, for a reference and convenient use.
+ 
+ 
+ Can I simply monitor page granularity?
+-- 
+2.26.2
+

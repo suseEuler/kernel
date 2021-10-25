@@ -1,0 +1,217 @@
+From bf24b8a80a083fce5c08ad45cb582ce9aa6c4827 Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Fri, 26 Feb 2021 20:22:15 +0800
+Subject: [PATCH] arm64/mpam: resctrl: Update closid alloc and free process
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: bf24b8a80a083fce5c08ad45cb582ce9aa6c4827
+
+ with bitmap
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+Replace u32 bitmask with bitmap for closid allocation, it's because closid
+may be too large to use 32 bits.
+
+This also support cdp, when cdp is enabled, closid will be assigned twice
+once time, giving closid to code LxCache and closid+1 to data LxDATA, so
+do free process.
+
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/mpam.h         |  7 +--
+ arch/arm64/include/asm/resctrl.h      | 14 +++++-
+ arch/arm64/kernel/mpam/mpam_resctrl.c | 62 +++++++++++++++++++++------
+ fs/resctrlfs.c                        |  4 +-
+ 4 files changed, 65 insertions(+), 22 deletions(-)
+
+diff --git a/arch/arm64/include/asm/mpam.h b/arch/arm64/include/asm/mpam.h
+index b0bab6153db8..d4cb6672f7b9 100644
+--- a/arch/arm64/include/asm/mpam.h
++++ b/arch/arm64/include/asm/mpam.h
+@@ -168,10 +168,7 @@ do {   \
+ 		__result = as_hw_t(__name, __closid); \
+ } while (0)
+ 
+-static inline bool is_resctrl_cdp_enabled(void)
+-{
+-	return 0;
+-}
++bool is_resctrl_cdp_enabled(void);
+ 
+ #define hw_alloc_times_validate(__name, __times, __flag) \
+ do {   \
+@@ -269,7 +266,7 @@ int resctrl_group_mondata_show(struct seq_file *m, void *arg);
+ void rmdir_mondata_subdir_allrdtgrp(struct resctrl_resource *r,
+ 				    unsigned int dom_id);
+ 
+-void closid_init(void);
++int closid_init(void);
+ int closid_alloc(void);
+ void closid_free(int closid);
+ 
+diff --git a/arch/arm64/include/asm/resctrl.h b/arch/arm64/include/asm/resctrl.h
+index f44feeb6b496..408b4a02d7c7 100644
+--- a/arch/arm64/include/asm/resctrl.h
++++ b/arch/arm64/include/asm/resctrl.h
+@@ -91,10 +91,18 @@ static inline void free_mon_id(u32 id)
+ }
+ 
+ void pmg_init(void);
+-static inline void resctrl_id_init(void)
++static inline int resctrl_id_init(void)
+ {
+-	closid_init();
++	int ret;
++
++	ret = closid_init();
++	if (ret)
++		goto out;
++
+ 	pmg_init();
++
++out:
++	return ret;
+ }
+ 
+ static inline int resctrl_id_alloc(void)
+@@ -136,4 +144,6 @@ int resctrl_group_init_alloc(struct rdtgroup *rdtgrp);
+ struct resctrl_resource *
+ mpam_resctrl_get_resource(enum resctrl_resource_level level);
+ 
++#define RESCTRL_MAX_CLOSID 32
++
+ #endif /* _ASM_ARM64_RESCTRL_H */
+diff --git a/arch/arm64/kernel/mpam/mpam_resctrl.c b/arch/arm64/kernel/mpam/mpam_resctrl.c
+index 053656c2fcaf..d316c605b4b8 100644
+--- a/arch/arm64/kernel/mpam/mpam_resctrl.c
++++ b/arch/arm64/kernel/mpam/mpam_resctrl.c
+@@ -102,6 +102,11 @@ void mpam_resctrl_clear_default_cpu(unsigned int cpu)
+ 	cpumask_clear_cpu(cpu, &resctrl_group_default.cpu_mask);
+ }
+ 
++bool is_resctrl_cdp_enabled(void)
++{
++	return !!resctrl_cdp_enabled;
++}
++
+ static void
+ mpam_resctrl_update_component_cfg(struct resctrl_resource *r,
+ 	struct rdt_domain *d, struct list_head *opt_list, u32 partid);
+@@ -443,8 +448,8 @@ static int common_wrmon(struct rdt_domain *d, struct rdtgroup *g, bool enable)
+ }
+ 
+ /*
+- * Trivial allocator for CLOSIDs. Since h/w only supports a small number,
+- * we can keep a bitmap of free CLOSIDs in a single integer.
++ * Notifing resctrl_id_init() should be called after calling parse_
++ * resctrl_group_fs_options() to guarantee resctrl_cdp_enabled() active.
+  *
+  * Using a global CLOSID across all resources has some advantages and
+  * some drawbacks:
+@@ -457,35 +462,64 @@ static int common_wrmon(struct rdt_domain *d, struct rdtgroup *g, bool enable)
+  * - Our choices on how to configure each resource become progressively more
+  *   limited as the number of resources grows.
+  */
+-static int closid_free_map;
+ 
+-void closid_init(void)
++static unsigned long *closid_free_map;
++static int num_closid;
++
++int closid_init(void)
+ {
+-	int num_closid = INT_MAX;
++	int pos;
++	u32 times, flag;
++
++	if (closid_free_map)
++		kfree(closid_free_map);
+ 
+ 	num_closid = mpam_sysprops_num_partid();
++	num_closid = min(num_closid, RESCTRL_MAX_CLOSID);
++
++	hw_alloc_times_validate(clos, times, flag);
++
++	if (flag)
++		num_closid = rounddown(num_closid, 2);
++
++	closid_free_map = bitmap_zalloc(num_closid, GFP_KERNEL);
++	if (!closid_free_map)
++		return -ENOMEM;
+ 
+-	closid_free_map = BIT_MASK(num_closid) - 1;
++	bitmap_set(closid_free_map, 0, num_closid);
+ 
+ 	/* CLOSID 0 is always reserved for the default group */
+-	closid_free_map &= ~1;
+-}
++	pos = find_first_bit(closid_free_map, num_closid);
++	bitmap_clear(closid_free_map, pos, times);
+ 
++	return 0;
++}
++/*
++ * If cdp enabled, allocate two closid once time, then return first
++ * allocated id.
++ */
+ int closid_alloc(void)
+ {
+-	u32 closid = ffs(closid_free_map);
++	int pos;
++	u32 times, flag;
++
++	hw_alloc_times_validate(clos, times, flag);
+ 
+-	if (closid == 0)
++	pos = find_first_bit(closid_free_map, num_closid);
++	if (pos == num_closid)
+ 		return -ENOSPC;
+-	closid--;
+-	closid_free_map &= ~(1 << closid);
+ 
+-	return closid;
++	bitmap_clear(closid_free_map, pos, times);
++
++	return pos;
+ }
+ 
+ void closid_free(int closid)
+ {
+-	closid_free_map |= 1 << closid;
++	u32 times, flag;
++
++	hw_alloc_times_validate(clos, times, flag);
++	bitmap_set(closid_free_map, closid, times);
+ }
+ 
+ /*
+diff --git a/fs/resctrlfs.c b/fs/resctrlfs.c
+index 3704fbabb908..309cc4d85151 100644
+--- a/fs/resctrlfs.c
++++ b/fs/resctrlfs.c
+@@ -341,7 +341,9 @@ static int resctrl_get_tree(struct fs_context *fc)
+ 	if (ret)
+ 		goto out;
+ #endif
+-	resctrl_id_init();
++	ret = resctrl_id_init();
++	if (ret)
++		goto out;
+ 
+ 	ret = resctrl_group_create_info_dir(resctrl_group_default.kn);
+ 	if (ret)
+-- 
+2.26.2
+

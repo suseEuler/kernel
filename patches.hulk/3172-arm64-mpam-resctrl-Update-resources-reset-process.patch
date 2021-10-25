@@ -1,0 +1,155 @@
+From dfb6f61f2222dfa81f19a5fc3c032b874a2d8de4 Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Fri, 26 Feb 2021 20:22:14 +0800
+Subject: [PATCH] arm64/mpam: resctrl: Update resources reset process
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: dfb6f61f2222dfa81f19a5fc3c032b874a2d8de4
+
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+resctrl_resource_reset() would be excuted if resctrl sysfs umount, this
+help to reset all settings stored in related structures (such as mpam_cfg)
+and put MSCs back to default state.
+
+This is similar to 6ab0b81f2c18 ("arm64/mpam: Fix unreset resources when mkdir
+ctrl group or umount resctrl") but using helpers from mpam devices module.
+
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/kernel/mpam/mpam_device.c   | 16 +++++++
+ arch/arm64/kernel/mpam/mpam_internal.h |  2 +
+ arch/arm64/kernel/mpam/mpam_resctrl.c  | 58 +++++++++++++++++---------
+ 3 files changed, 57 insertions(+), 19 deletions(-)
+
+diff --git a/arch/arm64/kernel/mpam/mpam_device.c b/arch/arm64/kernel/mpam/mpam_device.c
+index 923ebcf97b73..7315936f6826 100644
+--- a/arch/arm64/kernel/mpam/mpam_device.c
++++ b/arch/arm64/kernel/mpam/mpam_device.c
+@@ -1292,6 +1292,22 @@ int mpam_component_config(struct mpam_component *comp, struct sync_args *args)
+ 	return do_device_sync(comp, &sync_ctx);
+ }
+ 
++/*
++ * Reset every component, configuring every partid unrestricted.
++ */
++void mpam_reset_devices(void)
++{
++	struct mpam_class *class;
++	struct mpam_component *comp;
++
++	mutex_lock(&mpam_devices_lock);
++	list_for_each_entry(class, &mpam_classes, classes_list) {
++		list_for_each_entry(comp, &class->components, class_list)
++			mpam_component_config(comp, NULL);
++	}
++	mutex_unlock(&mpam_devices_lock);
++}
++
+ static inline void
+ mpam_device_sync_mon_prepare(struct mpam_component *comp,
+ 		struct mpam_device_sync *sync_ctx, struct sync_args *args)
+diff --git a/arch/arm64/kernel/mpam/mpam_internal.h b/arch/arm64/kernel/mpam/mpam_internal.h
+index 8ab019fd8938..1a31d563bc41 100644
+--- a/arch/arm64/kernel/mpam/mpam_internal.h
++++ b/arch/arm64/kernel/mpam/mpam_internal.h
+@@ -159,6 +159,8 @@ static inline bool mpam_has_part_sel(mpam_features_t supported)
+ int mpam_component_config(struct mpam_component *comp,
+ 			struct sync_args *args);
+ 
++void mpam_reset_devices(void);
++
+ int mpam_component_mon(struct mpam_component *comp,
+ 			struct sync_args *args, u64 *result);
+ 
+diff --git a/arch/arm64/kernel/mpam/mpam_resctrl.c b/arch/arm64/kernel/mpam/mpam_resctrl.c
+index 26e9b1cd3d6f..053656c2fcaf 100644
+--- a/arch/arm64/kernel/mpam/mpam_resctrl.c
++++ b/arch/arm64/kernel/mpam/mpam_resctrl.c
+@@ -526,25 +526,6 @@ void post_resctrl_mount(void)
+ 		static_branch_enable_cpuslocked(&resctrl_enable_key);
+ }
+ 
+-static int reset_all_ctrls(struct resctrl_resource *r)
+-{
+-	return 0;
+-}
+-
+-void resctrl_resource_reset(void)
+-{
+-	struct mpam_resctrl_res *res;
+-	struct resctrl_resource *r;
+-
+-	/*Put everything back to default values. */
+-	for_each_supported_resctrl_exports(res) {
+-		r = &res->resctrl_res;
+-
+-		if (r->alloc_enabled)
+-			reset_all_ctrls(r);
+-	}
+-}
+-
+ void release_rdtgroupfs_options(void)
+ {
+ }
+@@ -1498,6 +1479,45 @@ mpam_resctrl_update_component_cfg(struct resctrl_resource *r,
+ 	mpam_update_from_resctrl_cfg(res, resctrl_cfg, mpam_cfg);
+ }
+ 
++static void mpam_reset_cfg(struct mpam_resctrl_res *res,
++		struct mpam_resctrl_dom *dom, struct rdt_domain *d)
++
++{
++	int i;
++	struct resctrl_resource *r = &res->resctrl_res;
++
++	for (i = 0; i != mpam_sysprops_num_partid(); i++) {
++		mpam_update_from_resctrl_cfg(res, r->default_ctrl,
++			&dom->comp->cfg[i]);
++		d->ctrl_val[i] = r->default_ctrl;
++	}
++}
++
++void resctrl_resource_reset(void)
++{
++	struct mpam_resctrl_res *res;
++	struct mpam_resctrl_dom *dom;
++	struct rdt_domain *d;
++
++	for_each_supported_resctrl_exports(res) {
++		if (!res->resctrl_res.alloc_capable)
++			continue;
++
++		list_for_each_entry(d, &res->resctrl_res.domains, list) {
++			dom = container_of(d, struct mpam_resctrl_dom,
++					resctrl_dom);
++			mpam_reset_cfg(res, dom, d);
++		}
++	}
++
++	mpam_reset_devices();
++
++	/*
++	 * reset CDP configuration used in recreating schema list nodes.
++	 */
++	resctrl_cdp_enabled = false;
++}
++
+ u16 mpam_resctrl_max_mon_num(void)
+ {
+ 	struct mpam_resctrl_res *res;
+-- 
+2.26.2
+

@@ -1,0 +1,140 @@
+From 8d83a69d9250722c1cc82a8c3884dcda281d068e Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Fri, 26 Feb 2021 20:21:39 +0800
+Subject: [PATCH] mpam : fix monitor's disorder from
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 8d83a69d9250722c1cc82a8c3884dcda281d068e
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+overwriting MSMON_CFG_x_FLT/MSMON_CFG_x_CTL would disturb the monitor when it is
+running, fix that by judging if the MSMON_CFG_MBWU_FLT/ MSMON_CFG_CSU_CTL register's
+value has been set before setting it.
+
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/mpam_resource.h |  5 +++
+ arch/arm64/kernel/mpam.c               | 49 ++++++++++++++++++--------
+ 2 files changed, 39 insertions(+), 15 deletions(-)
+
+diff --git a/arch/arm64/include/asm/mpam_resource.h b/arch/arm64/include/asm/mpam_resource.h
+index 630362eb91b1..0ae205d250bc 100644
+--- a/arch/arm64/include/asm/mpam_resource.h
++++ b/arch/arm64/include/asm/mpam_resource.h
+@@ -75,6 +75,8 @@
+ #define MSMON_MATCH_PMG		BIT(17)
+ #define MSMON_MATCH_PARTID	BIT(16)
+ 
++#define MSMON_CFG_CTL_EN        BIT(31)
++
+ #define MSMON_CFG_FLT_SET(r, p)		((r) << 16|(p))
+ 
+ #define MBWU_SUBTYPE_DEFAULT		(3 << 20)
+@@ -82,6 +84,9 @@
+ 
+ #define MSMON_CFG_CSU_CTL_SET(m)	(BIT(31)|(m))
+ 
++#define MSMON_CFG_CSU_TYPE  0x43
++#define MSMON_CFG_MBWU_TYPE 0x42
++
+ /* [FIXME] hard code for hardlim */
+ #define MBW_MAX_SET(v)		(MBW_MAX_HARDLIM|((v) << (16 - BWA_WD)))
+ #define MBW_MAX_GET(v)		(((v) & MBW_MAX_MASK) >> (16 - BWA_WD))
+diff --git a/arch/arm64/kernel/mpam.c b/arch/arm64/kernel/mpam.c
+index 07a7dc65c42e..0067e21a65b0 100644
+--- a/arch/arm64/kernel/mpam.c
++++ b/arch/arm64/kernel/mpam.c
+@@ -245,44 +245,63 @@ static u64 csu_read(struct rdt_domain *d, struct rdtgroup *g)
+ 
+ static int mbwu_write(struct rdt_domain *d, struct rdtgroup *g, bool enable)
+ {
+-	u32 mon, pmg, partid, flt, ctl = 0;
++	u32 mon, partid, pmg, ctl, flt, cur_ctl, cur_flt;
+ 
+ 	mon = g->mon.mon;
+ 	mpam_writel(mon, d->base + MSMON_CFG_MON_SEL);
+ 	if (enable) {
+-		pmg = g->mon.rmid;
+ 		partid = g->closid;
++		pmg = g->mon.rmid;
++		ctl = MSMON_MATCH_PARTID|MSMON_MATCH_PMG;
+ 		flt = MSMON_CFG_FLT_SET(pmg, partid);
+-		ctl = MSMON_CFG_MBWU_CTL_SET(MSMON_MATCH_PMG|MSMON_MATCH_PARTID);
+-
+-		mpam_writel(flt, d->base + MSMON_CFG_MBWU_FLT);
++		cur_flt = mpam_readl(d->base + MSMON_CFG_MBWU_FLT);
++		cur_ctl = mpam_readl(d->base + MSMON_CFG_MBWU_CTL);
++
++		if (cur_ctl != (ctl | MSMON_CFG_CTL_EN | MSMON_CFG_MBWU_TYPE) ||
++		    cur_flt != flt) {
++			mpam_writel(flt, d->base + MSMON_CFG_MBWU_FLT);
++			mpam_writel(ctl, d->base + MSMON_CFG_MBWU_CTL);
++			mpam_writel(0, d->base + MSMON_MBWU);
++			ctl |= MSMON_CFG_CTL_EN;
++			mpam_writel(ctl, d->base + MSMON_CFG_MBWU_CTL);
++		}
++	} else {
++		ctl = 0;
++		mpam_writel(ctl, d->base + MSMON_CFG_MBWU_CTL);
+ 	}
+ 
+-	mpam_writel(ctl, d->base + MSMON_CFG_MBWU_CTL);
+-
+ 	return 0;
+ }
+ 
+ static int csu_write(struct rdt_domain *d, struct rdtgroup *g, bool enable)
+ {
+-	u32 mon, pmg, partid, flt, ctl = 0;
++	u32 mon, partid, pmg, ctl, flt, cur_ctl, cur_flt;
+ 
+ 	mon = g->mon.mon;
+ 	mpam_writel(mon, d->base + MSMON_CFG_MON_SEL);
+ 	if (enable) {
+-		pmg = g->mon.rmid;
+ 		partid = g->closid;
++		pmg = g->mon.rmid;
++		ctl = MSMON_MATCH_PARTID|MSMON_MATCH_PMG;
+ 		flt = MSMON_CFG_FLT_SET(pmg, partid);
+-		ctl = MSMON_CFG_CSU_CTL_SET(MSMON_MATCH_PMG|MSMON_MATCH_PARTID);
+-
+-		mpam_writel(flt, d->base + MSMON_CFG_CSU_FLT);
++		cur_flt = mpam_readl(d->base + MSMON_CFG_CSU_FLT);
++		cur_ctl = mpam_readl(d->base + MSMON_CFG_CSU_CTL);
++
++		if (cur_ctl != (ctl | MSMON_CFG_CTL_EN | MSMON_CFG_CSU_TYPE) ||
++		    cur_flt != flt) {
++			mpam_writel(flt, d->base + MSMON_CFG_CSU_FLT);
++			mpam_writel(ctl, d->base + MSMON_CFG_CSU_CTL);
++			mpam_writel(0, d->base + MSMON_CSU);
++			ctl |= MSMON_CFG_CTL_EN;
++			mpam_writel(ctl, d->base + MSMON_CFG_CSU_CTL);
++		}
++	} else {
++		ctl = 0;
++		mpam_writel(ctl, d->base + MSMON_CFG_CSU_CTL);
+ 	}
+ 
+-	mpam_writel(ctl, d->base + MSMON_CFG_CSU_CTL);
+-
+ 	return 0;
+ }
+-
+ /*
+  * Trivial allocator for CLOSIDs. Since h/w only supports a small number,
+  * we can keep a bitmap of free CLOSIDs in a single integer.
+-- 
+2.26.2
+

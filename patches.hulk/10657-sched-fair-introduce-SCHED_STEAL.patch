@@ -1,0 +1,470 @@
+From 87d0e1288eacad1e20bd318c7ffd527f8abdf63f Mon Sep 17 00:00:00 2001
+From: Cheng Jian <cj.chengjian@huawei.com>
+Date: Thu, 11 Nov 2021 16:28:50 +0800
+Subject: [PATCH] sched/fair: introduce SCHED_STEAL
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 87d0e1288eacad1e20bd318c7ffd527f8abdf63f
+
+
+hulk inclusion
+category: feature
+bugzilla: 38261, https://gitee.com/openeuler/kernel/issues/I49XPZ
+CVE: NA
+
+---------------------------
+
+Introduce CONFIG_SCHED_STEAL to limit the impact of steal task.
+
+1). If turn off CONFIG_SCHED_STEAL, then all the changes will not
+exist, for we use some empty functions, so this depends on compiler
+optimization.
+
+2). enable CONFIG_SCHED_STEAL, but disable STEAL and schedstats, it
+will introduce some impact whith schedstat check. but this has little
+effect on performance. This will be our default choice.
+
+Signed-off-by: Cheng Jian <cj.chengjian@huawei.com>
+Reviewed-by: Hanjun Guo <guohanjun@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Reviewed-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Reviewed-by: Chen Hui <judy.chenhui@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Kai Liu <kai.liu@suse.com>
+---
+ include/linux/sched/topology.h |  2 ++
+ init/Kconfig                   | 15 +++++++++++++++
+ kernel/sched/core.c            |  4 ++++
+ kernel/sched/fair.c            | 30 ++++++++++++++++++++++++------
+ kernel/sched/features.h        |  2 ++
+ kernel/sched/sched.h           |  9 +++++++++
+ kernel/sched/stats.c           |  6 ++++++
+ kernel/sched/stats.h           | 11 +++++++++--
+ kernel/sched/topology.c        | 22 +++++++++++++++++++++-
+ 9 files changed, 92 insertions(+), 9 deletions(-)
+
+--- a/include/linux/sched/topology.h
++++ b/include/linux/sched/topology.h
+@@ -74,7 +74,9 @@ struct sched_domain_shared {
+ 	atomic_t	ref;
+ 	atomic_t	nr_busy_cpus;
+ 	int		has_idle_cores;
++#ifdef CONFIG_SCHED_STEAL
+ 	struct sparsemask *cfs_overload_cpus;
++#endif
+ };
+ 
+ struct sched_domain {
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1228,6 +1228,21 @@ config NET_NS
+ 
+ endif # NAMESPACES
+ 
++config SCHED_STEAL
++	bool "Steal tasks to improve CPU utilization"
++	depends on SMP
++	default n
++	help
++	  When a CPU has no more CFS tasks to run, and idle_balance() fails
++	  to find a task, then attempt to steal a task from an overloaded
++	  CPU in the same LLC. Maintain and use a bitmap of overloaded CPUs
++	  to efficiently identify candidates.  To minimize search time, steal
++	  the first migratable task that is found when the bitmap is traversed.
++	  For fairness, search for migratable tasks on an overloaded CPU in
++	  order of next to run.
++
++	  If unsure, say N here.
++
+ config CHECKPOINT_RESTORE
+ 	bool "Checkpoint/restore support"
+ 	select PROC_CHILDREN
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -3151,6 +3151,7 @@ int sysctl_numa_balancing(struct ctl_tab
+ DEFINE_STATIC_KEY_FALSE(sched_schedstats);
+ static bool __initdata __sched_schedstats = false;
+ 
++#ifdef CONFIG_SCHED_STEAL
+ unsigned long schedstat_skid;
+ 
+ static void compute_skid(void)
+@@ -3174,6 +3175,9 @@ static void compute_skid(void)
+ 		schedstat_skid = 0;
+ 	pr_info("schedstat_skid = %lu\n", schedstat_skid);
+ }
++#else
++static inline void compute_skid(void) {}
++#endif
+ 
+ static void set_schedstats(bool enabled)
+ {
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -21,7 +21,9 @@
+  *  Copyright (C) 2007 Red Hat, Inc., Peter Zijlstra
+  */
+ #include "sched.h"
++#ifdef CONFIG_SCHED_STEAL
+ #include "sparsemask.h"
++#endif
+ 
+ /*
+  * Targeted preemption latency for CPU-bound tasks:
+@@ -4163,6 +4165,8 @@ static inline void rq_idle_stamp_clear(s
+ 	rq->idle_stamp = 0;
+ }
+ 
++#ifdef CONFIG_SCHED_STEAL
++
+ static inline bool steal_enabled(void)
+ {
+ #ifdef CONFIG_NUMA
+@@ -4187,7 +4191,7 @@ static void overload_clear(struct rq *rq
+ 	if (overload_cpus)
+ 		sparsemask_clear_elem(overload_cpus, rq->cpu);
+ 	rcu_read_unlock();
+-	schedstat_end_time(rq->find_time, time);
++	schedstat_end_time(rq, time);
+ }
+ 
+ static void overload_set(struct rq *rq)
+@@ -4204,10 +4208,15 @@ static void overload_set(struct rq *rq)
+ 	if (overload_cpus)
+ 		sparsemask_set_elem(overload_cpus, rq->cpu);
+ 	rcu_read_unlock();
+-	schedstat_end_time(rq->find_time, time);
++	schedstat_end_time(rq, time);
+ }
+ 
+ static int try_steal(struct rq *this_rq, struct rq_flags *rf);
++#else
++static inline int try_steal(struct rq *this_rq, struct rq_flags *rf) { return 0; }
++static inline void overload_clear(struct rq *rq) {}
++static inline void overload_set(struct rq *rq) {}
++#endif
+ 
+ #else /* CONFIG_SMP */
+ 
+@@ -6422,6 +6431,7 @@ static inline bool asym_fits_capacity(in
+ 	return true;
+ }
+ 
++#ifdef CONFIG_SCHED_STEAL
+ #define SET_STAT(STAT)							\
+ 	do {								\
+ 		if (schedstat_enabled()) {				\
+@@ -6431,6 +6441,9 @@ static inline bool asym_fits_capacity(in
+ 				__schedstat_inc(rq->STAT);		\
+ 		}							\
+ 	} while (0)
++#else
++#define SET_STAT(STAT)
++#endif
+ 
+ /*
+  * Try and locate an idle core/thread in the LLC cache domain.
+@@ -6925,13 +6938,15 @@ fail:
+ static int
+ select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_flags)
+ {
+-	unsigned long time = schedstat_start_time();
++	unsigned long time;
+ 	struct sched_domain *tmp, *sd = NULL;
+ 	int cpu = smp_processor_id();
+ 	int new_cpu = prev_cpu;
+ 	int want_affine = 0;
+ 	int sync = (wake_flags & WF_SYNC) && !(current->flags & PF_EXITING);
+ 
++	time = schedstat_start_time();
++
+ 	if (sd_flag & SD_BALANCE_WAKE) {
+ 		record_wakee(p);
+ 
+@@ -6978,7 +6993,7 @@ select_task_rq_fair(struct task_struct *
+ 			current->recent_used_cpu = cpu;
+ 	}
+ 	rcu_read_unlock();
+-	schedstat_end_time(cpu_rq(cpu)->find_time, time);
++	schedstat_end_time(cpu_rq(cpu), time);
+ 
+ 	return new_cpu;
+ }
+@@ -7509,12 +7524,11 @@ idle:
+ 	new_tasks = newidle_balance(rq, rf);
+ 	if (new_tasks == 0)
+ 		new_tasks = try_steal(rq, rf);
++	schedstat_end_time(rq, time);
+ 
+ 	if (new_tasks)
+ 		rq_idle_stamp_clear(rq);
+ 
+-	schedstat_end_time(rq->find_time, time);
+-
+ 
+ 	/*
+ 	 * Because try_steal() and idle_balance() release (and re-acquire)
+@@ -7997,6 +8011,7 @@ int can_migrate_task(struct task_struct
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_SCHED_STEAL
+ /*
+  * Return true if task @p can migrate from @rq to @dst_rq in the same LLC.
+  * No need to test for co-locality, and no need to test task_hot(), as sharing
+@@ -8024,6 +8039,7 @@ can_migrate_task_llc(struct task_struct
+ 
+ 	return true;
+ }
++#endif
+ 
+ /*
+  * detach_task() -- detach the task for the migration from @src_rq to @dst_cpu.
+@@ -11146,6 +11162,7 @@ void trigger_load_balance(struct rq *rq)
+ 	nohz_balancer_kick(rq);
+ }
+ 
++#ifdef CONFIG_SCHED_STEAL
+ /*
+  * Search the runnable tasks in @cfs_rq in order of next to run, and find
+  * the first one that can be migrated to @dst_rq.  @cfs_rq is locked on entry.
+@@ -11294,6 +11311,7 @@ out:
+ 		schedstat_inc(dst_rq->steal_fail);
+ 	return stolen;
+ }
++#endif
+ 
+ static void rq_online_fair(struct rq *rq)
+ {
+--- a/kernel/sched/features.h
++++ b/kernel/sched/features.h
+@@ -56,11 +56,13 @@ SCHED_FEAT(TTWU_QUEUE, true)
+  */
+ SCHED_FEAT(SIS_PROP, true)
+ 
++#ifdef CONFIG_SCHED_STEAL
+ /*
+  * Steal a CFS task from another CPU when going idle.
+  * Improves CPU utilization.
+  */
+ SCHED_FEAT(STEAL, false)
++#endif
+ 
+ /*
+  * Issue a WARN when we do multiple update_rq_clock() calls
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -86,7 +86,9 @@
+ 
+ struct rq;
+ struct cpuidle_state;
++#ifdef CONFIG_SCHED_STEAL
+ struct sparsemask;
++#endif
+ 
+ /* task_struct::on_rq states: */
+ #define TASK_ON_RQ_QUEUED	1
+@@ -939,7 +941,9 @@ struct rq {
+ 	struct cfs_rq		cfs;
+ 	struct rt_rq		rt;
+ 	struct dl_rq		dl;
++#ifdef CONFIG_SCHED_STEAL
+ 	struct sparsemask	*cfs_overload_cpus;
++#endif
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 	/* list of leaf cfs_rq on this CPU: */
+@@ -1053,6 +1057,7 @@ struct rq {
+ 	unsigned int		ttwu_count;
+ 	unsigned int		ttwu_local;
+ 
++#ifdef CONFIG_SCHED_STEAL
+ 	/* Idle search stats */
+ 	unsigned int		found_idle_cpu_capacity;
+ 	unsigned int		found_idle_cpu;
+@@ -1061,6 +1066,7 @@ struct rq {
+ 	unsigned long		find_time;
+ 	unsigned int		steal;
+ 	unsigned int		steal_fail;
++#endif /* CONFIG_SCHED_STEAL */
+ #endif
+ 
+ #ifdef CONFIG_CPU_IDLE
+@@ -1094,6 +1100,7 @@ static inline int cpu_of(struct rq *rq)
+ #endif
+ }
+ 
++
+ #ifdef CONFIG_SCHED_SMT
+ extern void __update_idle_core(struct rq *rq);
+ 
+@@ -1356,7 +1363,9 @@ this_rq_lock_irq(struct rq_flags *rf)
+ }
+ 
+ #ifdef CONFIG_NUMA
++#ifdef CONFIG_SCHED_STEAL
+ extern struct static_key_true sched_steal_allow;
++#endif
+ 
+ enum numa_topology_type {
+ 	NUMA_DIRECT,
+--- a/kernel/sched/stats.c
++++ b/kernel/sched/stats.c
+@@ -10,7 +10,11 @@
+  * Bump this up when changing the output format or the meaning of an existing
+  * format, so that tools can adapt (or abort)
+  */
++#ifdef CONFIG_SCHED_STEAL
+ #define SCHEDSTAT_VERSION 16
++#else
++#define SCHEDSTAT_VERSION 15
++#endif
+ 
+ static int show_schedstat(struct seq_file *seq, void *v)
+ {
+@@ -37,6 +41,7 @@ static int show_schedstat(struct seq_fil
+ 		    rq->rq_cpu_time,
+ 		    rq->rq_sched_info.run_delay, rq->rq_sched_info.pcount);
+ 
++#ifdef CONFIG_SCHED_STEAL
+ 		seq_printf(seq, " %u %u %u %u %lu %u %u",
+ 			   rq->found_idle_cpu_easy,
+ 			   rq->found_idle_cpu_capacity,
+@@ -45,6 +50,7 @@ static int show_schedstat(struct seq_fil
+ 			   rq->find_time,
+ 			   rq->steal,
+ 			   rq->steal_fail);
++#endif /* CONFIG_SCHED_STEAL */
+ 
+ 		seq_printf(seq, "\n");
+ 
+--- a/kernel/sched/stats.h
++++ b/kernel/sched/stats.h
+@@ -39,8 +39,9 @@ rq_sched_info_dequeued(struct rq *rq, un
+ #define   schedstat_set(var, val)	do { if (schedstat_enabled()) { var = (val); } } while (0)
+ #define   schedstat_val(var)		(var)
+ #define   schedstat_val_or_zero(var)	((schedstat_enabled()) ? (var) : 0)
++#ifdef CONFIG_SCHED_STEAL
+ #define   schedstat_start_time()	schedstat_val_or_zero(local_clock())
+-#define   schedstat_end_time(stat, time)			\
++#define   __schedstat_end_time(stat, time)			\
+ 	do {							\
+ 		unsigned long endtime;				\
+ 								\
+@@ -49,7 +50,13 @@ rq_sched_info_dequeued(struct rq *rq, un
+ 			schedstat_add((stat), endtime);		\
+ 		}						\
+ 	} while (0)
++#define   schedstat_end_time(rq, time)				\
++	__schedstat_end_time(((rq)->find_time), time)
+ extern unsigned long schedstat_skid;
++#else /* !CONFIG_SCHED_STEAL */
++# define   schedstat_start_time()	0
++# define   schedstat_end_time(rq, t)	do { } while (0)
++#endif /* CONFIG_SCHED_STEAL */
+ 
+ #else /* !CONFIG_SCHEDSTATS: */
+ static inline void rq_sched_info_arrive  (struct rq *rq, unsigned long long delta) { }
+@@ -65,7 +72,7 @@ static inline void rq_sched_info_depart
+ # define   schedstat_val(var)		0
+ # define   schedstat_val_or_zero(var)	0
+ # define   schedstat_start_time()	0
+-# define   schedstat_end_time(stat, t)	do { } while (0)
++# define   schedstat_end_time(rq, t)	do { } while (0)
+ #endif /* CONFIG_SCHEDSTATS */
+ 
+ #ifdef CONFIG_PSI
+--- a/kernel/sched/topology.c
++++ b/kernel/sched/topology.c
+@@ -3,7 +3,9 @@
+  * Scheduler topology setup/handling methods
+  */
+ #include "sched.h"
++#ifdef CONFIG_SCHED_STEAL
+ #include "sparsemask.h"
++#endif
+ 
+ DEFINE_MUTEX(sched_domains_mutex);
+ 
+@@ -11,11 +13,17 @@ DEFINE_MUTEX(sched_domains_mutex);
+ static cpumask_var_t sched_domains_tmpmask;
+ static cpumask_var_t sched_domains_tmpmask2;
+ 
++#ifdef CONFIG_SCHED_STEAL
+ struct s_data;
+ static int sd_llc_alloc(struct sched_domain *sd);
+ static void sd_llc_free(struct sched_domain *sd);
+ static int sd_llc_alloc_all(const struct cpumask *cpu_map, struct s_data *d);
+ static void sd_llc_free_all(const struct cpumask *cpu_map);
++#else
++static inline void sd_llc_free(struct sched_domain *sd) {}
++static inline int sd_llc_alloc_all(const struct cpumask *cpu_map, struct s_data *d) { return 0; }
++static inline void sd_llc_free_all(const struct cpumask *cpu_map) {}
++#endif
+ 
+ #ifdef CONFIG_SCHED_DEBUG
+ 
+@@ -647,9 +655,11 @@ DEFINE_STATIC_KEY_FALSE(sched_asym_cpuca
+ 
+ static void update_top_cache_domain(int cpu)
+ {
++#ifdef CONFIG_SCHED_STEAL
++	struct rq *rq = cpu_rq(cpu);
+ 	struct sparsemask *cfs_overload_cpus = NULL;
++#endif
+ 	struct sched_domain_shared *sds = NULL;
+-	struct rq *rq = cpu_rq(cpu);
+ 	struct sched_domain *sd;
+ 	int id = cpu;
+ 	int size = 1;
+@@ -659,10 +669,14 @@ static void update_top_cache_domain(int
+ 		id = cpumask_first(sched_domain_span(sd));
+ 		size = cpumask_weight(sched_domain_span(sd));
+ 		sds = sd->shared;
++#ifdef CONFIG_SCHED_STEAL
+ 		cfs_overload_cpus = sds->cfs_overload_cpus;
++#endif
+ 	}
+ 
++#ifdef CONFIG_SCHED_STEAL
+ 	rcu_assign_pointer(rq->cfs_overload_cpus, cfs_overload_cpus);
++#endif
+ 	rcu_assign_pointer(per_cpu(sd_llc, cpu), sd);
+ 	per_cpu(sd_llc_size, cpu) = size;
+ 	per_cpu(sd_llc_id, cpu) = id;
+@@ -1630,6 +1644,7 @@ static void init_numa_topology_type(void
+ 
+ #define NR_DISTANCE_VALUES (1 << DISTANCE_BITS)
+ 
++#ifdef CONFIG_SCHED_STEAL
+ DEFINE_STATIC_KEY_TRUE(sched_steal_allow);
+ static int sched_steal_node_limit;
+ #define SCHED_STEAL_NODE_LIMIT_DEFAULT 2
+@@ -1653,6 +1668,9 @@ static void check_node_limit(void)
+ 		pr_debug("Suppressing sched STEAL. To enable, reboot with sched_steal_node_limit=%d", n);
+ 	}
+ }
++#else
++static inline void check_node_limit(void) { }
++#endif /* CONFIG_SCHED_STEAL */
+ 
+ void sched_init_numa(void)
+ {
+@@ -1949,6 +1967,7 @@ static void __sdt_free(const struct cpum
+ 	}
+ }
+ 
++#ifdef CONFIG_SCHED_STEAL
+ static int sd_llc_alloc(struct sched_domain *sd)
+ {
+ 	struct sched_domain_shared *sds = sd->shared;
+@@ -2020,6 +2039,7 @@ static void sd_llc_free_all(const struct
+ 		}
+ 	}
+ }
++#endif
+ 
+ static struct sched_domain *build_sched_domain(struct sched_domain_topology_level *tl,
+ 		const struct cpumask *cpu_map, struct sched_domain_attr *attr,

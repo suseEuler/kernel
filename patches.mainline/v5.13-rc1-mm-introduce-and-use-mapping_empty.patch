@@ -1,0 +1,154 @@
+From 7716506adac4664793a9d6d3dfa31ffddfa98714 Mon Sep 17 00:00:00 2001
+From: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+Date: Tue, 4 May 2021 18:32:45 -0700
+Subject: [PATCH] mm: introduce and use mapping_empty()
+Git-commit: 7716506adac4664793a9d6d3dfa31ffddfa98714
+Patch-mainline: v5.13-rc1
+References: bsn#12
+
+
+Patch series "Remove nrexceptional tracking", v2.
+
+We actually use nrexceptional for very little these days.  It's a minor
+pain to keep in sync with nrpages, but the pain becomes much bigger with
+the THP patches because we don't know how many indices a shadow entry
+occupies.  It's easier to just remove it than keep it accurate.
+
+Also, we save 8 bytes per inode which is nothing to sneeze at; on my
+laptop, it would improve shmem_inode_cache from 22 to 23 objects per
+16kB, and inode_cache from 26 to 27 objects.  Combined, that saves
+a megabyte of memory from a combined usage of 25MB for both caches.
+Unfortunately, ext4 doesn't cross a magic boundary, so it doesn't save
+any memory for ext4.
+
+This patch (of 4):
+
+Instead of checking the two counters (nrpages and nrexceptional), we can
+just check whether i_pages is empty.
+
+Link: https://lkml.kernel.org/r/20201026151849.24232-1-willy@infradead.org
+Link: https://lkml.kernel.org/r/20201026151849.24232-2-willy@infradead.org
+Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Tested-by: Vishal Verma <vishal.l.verma@intel.com>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ fs/block_dev.c          |  2 +-
+ fs/dax.c                |  2 +-
+ fs/gfs2/glock.c         |  3 +--
+ include/linux/pagemap.h |  5 +++++
+ mm/truncate.c           | 18 +++---------------
+ 5 files changed, 11 insertions(+), 19 deletions(-)
+
+diff --git a/fs/block_dev.c b/fs/block_dev.c
+index a5244e08b6c8..9114e0a0e7b4 100644
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@ -79,7 +79,7 @@ static void kill_bdev(struct block_device *bdev)
+ {
+ 	struct address_space *mapping = bdev->bd_inode->i_mapping;
+ 
+-	if (mapping->nrpages == 0 && mapping->nrexceptional == 0)
++	if (mapping_empty(mapping))
+ 		return;
+ 
+ 	invalidate_bh_lrus();
+diff --git a/fs/dax.c b/fs/dax.c
+index b3d27fdc6775..999f3f22aea3 100644
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@ -965,7 +965,7 @@ int dax_writeback_mapping_range(struct address_space *mapping,
+ 	if (WARN_ON_ONCE(inode->i_blkbits != PAGE_SHIFT))
+ 		return -EIO;
+ 
+-	if (!mapping->nrexceptional || wbc->sync_mode != WB_SYNC_ALL)
++	if (mapping_empty(mapping) || wbc->sync_mode != WB_SYNC_ALL)
+ 		return 0;
+ 
+ 	trace_dax_writeback_range(inode, xas.xa_index, end_index);
+diff --git a/fs/gfs2/glock.c b/fs/gfs2/glock.c
+index 84c38103aa06..ea7fc5c641c7 100644
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@ -273,8 +273,7 @@ static void __gfs2_glock_put(struct gfs2_glock *gl)
+ 	if (mapping) {
+ 		truncate_inode_pages_final(mapping);
+ 		if (!gfs2_withdrawn(sdp))
+-			GLOCK_BUG_ON(gl, mapping->nrpages ||
+-				     mapping->nrexceptional);
++			GLOCK_BUG_ON(gl, !mapping_empty(mapping));
+ 	}
+ 	trace_gfs2_glock_put(gl);
+ 	sdp->sd_lockstruct.ls_ops->lm_put_lock(gl);
+diff --git a/include/linux/pagemap.h b/include/linux/pagemap.h
+index 469fa7ffcf96..a4bd41128bf3 100644
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@ -18,6 +18,11 @@
+ 
+ struct pagevec;
+ 
++static inline bool mapping_empty(struct address_space *mapping)
++{
++	return xa_empty(&mapping->i_pages);
++}
++
+ /*
+  * Bits in mapping->flags.
+  */
+diff --git a/mm/truncate.c b/mm/truncate.c
+index 455944264663..adb8d4107988 100644
+--- a/mm/truncate.c
++++ b/mm/truncate.c
+@@ -295,7 +295,7 @@ void truncate_inode_pages_range(struct address_space *mapping,
+ 	pgoff_t		index;
+ 	int		i;
+ 
+-	if (mapping->nrpages == 0 && mapping->nrexceptional == 0)
++	if (mapping_empty(mapping))
+ 		goto out;
+ 
+ 	/* Offsets within partial pages */
+@@ -440,9 +440,6 @@ EXPORT_SYMBOL(truncate_inode_pages);
+  */
+ void truncate_inode_pages_final(struct address_space *mapping)
+ {
+-	unsigned long nrexceptional;
+-	unsigned long nrpages;
+-
+ 	/*
+ 	 * Page reclaim can not participate in regular inode lifetime
+ 	 * management (can't call iput()) and thus can race with the
+@@ -452,16 +449,7 @@ void truncate_inode_pages_final(struct address_space *mapping)
+ 	 */
+ 	mapping_set_exiting(mapping);
+ 
+-	/*
+-	 * When reclaim installs eviction entries, it increases
+-	 * nrexceptional first, then decreases nrpages.  Make sure we see
+-	 * this in the right order or we might miss an entry.
+-	 */
+-	nrpages = mapping->nrpages;
+-	smp_rmb();
+-	nrexceptional = mapping->nrexceptional;
+-
+-	if (nrpages || nrexceptional) {
++	if (!mapping_empty(mapping)) {
+ 		/*
+ 		 * As truncation uses a lockless tree lookup, cycle
+ 		 * the tree lock to make sure any ongoing tree
+@@ -633,7 +621,7 @@ int invalidate_inode_pages2_range(struct address_space *mapping,
+ 	int ret2 = 0;
+ 	int did_range_unmap = 0;
+ 
+-	if (mapping->nrpages == 0 && mapping->nrexceptional == 0)
++	if (mapping_empty(mapping))
+ 		goto out;
+ 
+ 	pagevec_init(&pvec);
+-- 
+2.31.1
+

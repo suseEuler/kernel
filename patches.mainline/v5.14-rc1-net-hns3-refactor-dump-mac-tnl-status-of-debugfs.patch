@@ -1,0 +1,136 @@
+From 7b07ab06e6b00b4421a4dfd732e98b359e0bad91 Mon Sep 17 00:00:00 2001
+From: Jiaran Zhang <zhangjiaran@huawei.com>
+Date: Thu, 20 May 2021 10:21:42 +0800
+Subject: [PATCH] net: hns3: refactor dump mac tnl status of debugfs
+Git-commit: 7b07ab06e6b00b4421a4dfd732e98b359e0bad91
+Patch-mainline: v5.14-rc1
+References: bsn#12
+
+
+Currently, the debugfs command for dump mac tnl status is
+implemented by "echo xxxx > cmd", and record the information
+in dmesg. It's unnecessary and heavy. To improve it, create
+a single file "mac_tnl_status" for it, and query it by command
+"cat mac_tnl_status", return the result to userspace, rather
+than record in dmesg.
+
+The display style is below:
+$ cat mac_tnl_status
+Recently generated mac tnl interruption:
+[0111204.175437] status = 0x30
+[0154120.329912] status = 0x30
+
+Signed-off-by: Jiaran Zhang <zhangjiaran@huawei.com>
+Signed-off-by: Huazhong Tan <tanhuazhong@huawei.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ drivers/net/ethernet/hisilicon/hns3/hnae3.h   |  1 +
+ .../ethernet/hisilicon/hns3/hns3_debugfs.c    | 12 ++++++----
+ .../hisilicon/hns3/hns3pf/hclge_debugfs.c     | 23 +++++++++++++------
+ 3 files changed, 24 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hnae3.h b/drivers/net/ethernet/hisilicon/hns3/hnae3.h
+index 9af1d64e45df..ed06431c290c 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hnae3.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hnae3.h
+@@ -287,6 +287,7 @@ enum hnae3_dbg_cmd {
+ 	HNAE3_DBG_CMD_RX_QUEUE_INFO,
+ 	HNAE3_DBG_CMD_TX_QUEUE_INFO,
+ 	HNAE3_DBG_CMD_FD_TCAM,
++	HNAE3_DBG_CMD_MAC_TNL_STATUS,
+ 	HNAE3_DBG_CMD_UNKNOWN,
+ };
+ 
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3_debugfs.c b/drivers/net/ethernet/hisilicon/hns3/hns3_debugfs.c
+index 599b405e754d..04c19a0c0e39 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3_debugfs.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3_debugfs.c
+@@ -190,6 +190,13 @@ static struct hns3_dbg_cmd_info hns3_dbg_cmd[] = {
+ 		.buf_len = HNS3_DBG_READ_LEN_128KB,
+ 		.init = hns3_dbg_common_file_init,
+ 	},
++	{
++		.name = "mac_tnl_status",
++		.cmd = HNAE3_DBG_CMD_MAC_TNL_STATUS,
++		.dentry = HNS3_DBG_DENTRY_COMMON,
++		.buf_len = HNS3_DBG_READ_LEN,
++		.init = hns3_dbg_common_file_init,
++	},
+ 	{
+ 		.name = "bios_common",
+ 		.cmd = HNAE3_DBG_CMD_REG_BIOS_COMMON,
+@@ -762,11 +769,6 @@ static int hns3_dbg_tx_bd_info(struct hns3_dbg_data *d, char *buf, int len)
+ static void hns3_dbg_help(struct hnae3_handle *h)
+ {
+ 	dev_info(&h->pdev->dev, "available commands\n");
+-
+-	if (!hns3_is_phys_func(h->pdev))
+-		return;
+-
+-	dev_info(&h->pdev->dev, "dump mac tnl status\n");
+ }
+ 
+ static void
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_debugfs.c b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_debugfs.c
+index 2b7acf620739..fe7ceab85459 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_debugfs.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_debugfs.c
+@@ -1807,21 +1807,28 @@ static int hclge_dbg_dump_loopback(struct hclge_dev *hdev, char *buf, int len)
+ /* hclge_dbg_dump_mac_tnl_status: print message about mac tnl interrupt
+  * @hdev: pointer to struct hclge_dev
+  */
+-static void hclge_dbg_dump_mac_tnl_status(struct hclge_dev *hdev)
++static int
++hclge_dbg_dump_mac_tnl_status(struct hclge_dev *hdev, char *buf, int len)
+ {
+ #define HCLGE_BILLION_NANO_SECONDS 1000000000
+ 
+ 	struct hclge_mac_tnl_stats stats;
+ 	unsigned long rem_nsec;
++	int pos = 0;
+ 
+-	dev_info(&hdev->pdev->dev, "Recently generated mac tnl interruption:\n");
++	pos += scnprintf(buf + pos, len - pos,
++			 "Recently generated mac tnl interruption:\n");
+ 
+ 	while (kfifo_get(&hdev->mac_tnl_log, &stats)) {
+ 		rem_nsec = do_div(stats.time, HCLGE_BILLION_NANO_SECONDS);
+-		dev_info(&hdev->pdev->dev, "[%07lu.%03lu] status = 0x%x\n",
+-			 (unsigned long)stats.time, rem_nsec / 1000,
+-			 stats.status);
++
++		pos += scnprintf(buf + pos, len - pos,
++				 "[%07lu.%03lu] status = 0x%x\n",
++				 (unsigned long)stats.time, rem_nsec / 1000,
++				 stats.status);
+ 	}
++
++	return 0;
+ }
+ 
+ 
+@@ -1895,8 +1902,6 @@ int hclge_dbg_run_cmd(struct hnae3_handle *handle, const char *cmd_buf)
+ 
+ 	if (strncmp(cmd_buf, "dump serv info", 14) == 0) {
+ 		hclge_dbg_dump_serv_info(hdev);
+-	} else if (strncmp(cmd_buf, "dump mac tnl status", 19) == 0) {
+-		hclge_dbg_dump_mac_tnl_status(hdev);
+ 	} else {
+ 		dev_info(&hdev->pdev->dev, "unknown command\n");
+ 		return -EINVAL;
+@@ -2026,6 +2031,10 @@ static const struct hclge_dbg_func hclge_dbg_cmd_func[] = {
+ 		.cmd = HNAE3_DBG_CMD_FD_TCAM,
+ 		.dbg_dump = hclge_dbg_dump_fd_tcam,
+ 	},
++	{
++		.cmd = HNAE3_DBG_CMD_MAC_TNL_STATUS,
++		.dbg_dump = hclge_dbg_dump_mac_tnl_status,
++	},
+ };
+ 
+ int hclge_dbg_read_cmd(struct hnae3_handle *handle, enum hnae3_dbg_cmd cmd,
+-- 
+2.31.1
+

@@ -1,0 +1,209 @@
+From cd79d861016e2f4a104e53c36339654cc4531b66 Mon Sep 17 00:00:00 2001
+From: Cheng Jian <cj.chengjian@huawei.com>
+Date: Sat, 29 May 2021 14:42:42 +0800
+Subject: [PATCH] livepatch/core: Support jump_label
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: cd79d861016e2f4a104e53c36339654cc4531b66
+
+
+hulk inclusion
+category: feature
+bugzilla: 51921
+CVE: NA
+
+-----------------------------------------------
+
+The kpatch-build processes the __jump_table special section,
+and only the jump_lable used by the changed functions will be
+included in __jump_table section, and the livepatch should
+process the tracepoint again after the dynamic relocation.
+
+NOTE: adding new tracepoints definition is not supported.
+
+Signed-off-by: Cheng Jian <cj.chengjian@huawei.com>
+Reviewed-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Signed-off-by: Dong Kai <dongkai11@huawei.com>
+
+Signed-off-by: Ye Weihua <yeweihua4@huawei.com>
+Reviewed-by: Yang Jihong <yangjihong1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/jump_label.h |  6 ++++++
+ include/linux/module.h     | 36 ++++++++++++++++++++++++++++++++++++
+ kernel/jump_label.c        | 16 ++++++++++++++++
+ kernel/livepatch/core.c    |  6 ++++++
+ kernel/module.c            |  5 ++++-
+ 5 files changed, 68 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/jump_label.h b/include/linux/jump_label.h
+index 32809624d422..7e1dce5670fc 100644
+--- a/include/linux/jump_label.h
++++ b/include/linux/jump_label.h
+@@ -229,6 +229,7 @@ extern void static_key_enable(struct static_key *key);
+ extern void static_key_disable(struct static_key *key);
+ extern void static_key_enable_cpuslocked(struct static_key *key);
+ extern void static_key_disable_cpuslocked(struct static_key *key);
++extern int jump_label_register(struct module *mod);
+ 
+ /*
+  * We should be using ATOMIC_INIT() for initializing .enabled, but
+@@ -301,6 +302,11 @@ static inline int jump_label_apply_nops(struct module *mod)
+ 	return 0;
+ }
+ 
++static inline int jump_label_register(struct module *mod)
++{
++	return 0;
++}
++
+ static inline void static_key_enable(struct static_key *key)
+ {
+ 	STATIC_KEY_CHECK_USE(key);
+diff --git a/include/linux/module.h b/include/linux/module.h
+index 6264617bab4d..7937f3394514 100644
+--- a/include/linux/module.h
++++ b/include/linux/module.h
+@@ -350,6 +350,12 @@ struct mod_kallsyms {
+ };
+ 
+ #ifdef CONFIG_LIVEPATCH
++enum MODULE_KLP_REL_STATE {
++	MODULE_KLP_REL_NONE = 0,
++	MODULE_KLP_REL_UNDO,
++	MODULE_KLP_REL_DONE,
++};
++
+ struct klp_modinfo {
+ 	Elf_Ehdr hdr;
+ 	Elf_Shdr *sechdrs;
+@@ -510,6 +516,19 @@ struct module {
+ 
+ 	/* Elf information */
+ 	struct klp_modinfo *klp_info;
++	/*
++	 * livepatch should relocate the key of jump_label by
++	 * using klp_apply_section_relocs. So it's necessary to
++	 * do jump_label_apply_nops() and jump_label_add_module()
++	 * later after livepatch relocation finised.
++	 *
++	 * for normal module :
++	 *	always MODULE_KLP_REL_DONE.
++	 * for livepatch module :
++	 *	init as MODULE_KLP_REL_UNDO,
++	 *	set to MODULE_KLP_REL_DONE when relocate completed.
++	 */
++	enum MODULE_KLP_REL_STATE klp_rel_state;
+ #endif
+ 
+ #ifdef CONFIG_MODULE_UNLOAD
+@@ -680,11 +699,28 @@ static inline bool is_livepatch_module(struct module *mod)
+ {
+ 	return mod->klp;
+ }
++
++static inline void set_mod_klp_rel_state(struct module *mod,
++			enum MODULE_KLP_REL_STATE state)
++{
++	mod->klp_rel_state = state;
++}
++
++static inline bool mod_klp_rel_completed(struct module *mod)
++{
++	return mod->klp_rel_state == MODULE_KLP_REL_NONE ||
++		mod->klp_rel_state == MODULE_KLP_REL_DONE;
++}
+ #else /* !CONFIG_LIVEPATCH */
+ static inline bool is_livepatch_module(struct module *mod)
+ {
+ 	return false;
+ }
++
++static inline bool mod_klp_rel_completed(struct module *mod)
++{
++	return true;
++}
+ #endif /* CONFIG_LIVEPATCH */
+ 
+ bool is_module_sig_enforced(void);
+diff --git a/kernel/jump_label.c b/kernel/jump_label.c
+index a0c325664190..7dd54db7c27e 100644
+--- a/kernel/jump_label.c
++++ b/kernel/jump_label.c
+@@ -607,6 +607,9 @@ void jump_label_apply_nops(struct module *mod)
+ 	struct jump_entry *iter_stop = iter_start + mod->num_jump_entries;
+ 	struct jump_entry *iter;
+ 
++	if (unlikely(!mod_klp_rel_completed(mod)))
++		return;
++
+ 	/* if the module doesn't have jump label entries, just return */
+ 	if (iter_start == iter_stop)
+ 		return;
+@@ -626,6 +629,9 @@ static int jump_label_add_module(struct module *mod)
+ 	struct static_key *key = NULL;
+ 	struct static_key_mod *jlm, *jlm2;
+ 
++	if (unlikely(!mod_klp_rel_completed(mod)))
++		return 0;
++
+ 	/* if the module doesn't have jump label entries, just return */
+ 	if (iter_start == iter_stop)
+ 		return 0;
+@@ -763,6 +769,16 @@ static struct notifier_block jump_label_module_nb = {
+ 	.priority = 1, /* higher than tracepoints */
+ };
+ 
++int jump_label_register(struct module *mod)
++{
++	int ret;
++
++	ret = jump_label_module_notify(&jump_label_module_nb,
++			MODULE_STATE_COMING, mod);
++
++	return notifier_to_errno(ret);
++}
++
+ static __init int jump_label_init_module(void)
+ {
+ 	return register_module_notifier(&jump_label_module_nb);
+diff --git a/kernel/livepatch/core.c b/kernel/livepatch/core.c
+index b47d4d28b369..699def19b4c8 100644
+--- a/kernel/livepatch/core.c
++++ b/kernel/livepatch/core.c
+@@ -1108,6 +1108,12 @@ static int klp_init_patch(struct klp_patch *patch)
+ 			goto out;
+ 	}
+ 
++	set_mod_klp_rel_state(patch->mod, MODULE_KLP_REL_DONE);
++	jump_label_apply_nops(patch->mod);
++	ret = jump_label_register(patch->mod);
++	if (ret)
++		goto out;
++
+ #ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
+ 	klp_for_each_object(patch, obj)
+ 		klp_load_hook(obj);
+diff --git a/kernel/module.c b/kernel/module.c
+index 908d46abe165..b87b333b7bde 100644
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@ -3089,7 +3089,10 @@ static int check_modinfo_livepatch(struct module *mod, struct load_info *info)
+ 		add_taint_module(mod, TAINT_LIVEPATCH, LOCKDEP_STILL_OK);
+ 		pr_notice_once("%s: tainting kernel with TAINT_LIVEPATCH\n",
+ 			       mod->name);
+-	}
++
++		set_mod_klp_rel_state(mod, MODULE_KLP_REL_UNDO);
++	} else
++		set_mod_klp_rel_state(mod, MODULE_KLP_REL_NONE);
+ 
+ 	return 0;
+ }
+-- 
+2.26.2
+

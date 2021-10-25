@@ -1,0 +1,117 @@
+From 88c0fab4c867b070f06ee652bc09527088d65986 Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Fri, 26 Feb 2021 20:22:29 +0800
+Subject: [PATCH] arm64/mpam: Restore extend ctrls' max width for checking
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 88c0fab4c867b070f06ee652bc09527088d65986
+
+ schemata input
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+Use an array for storing extend ctrls' max width, on purpose, checking
+each input value from schemata.
+
+Note the useful value of each ctrls' max width is at least 1, 0 means
+meaningless, and greater than 1 means the choices can be selected.
+
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/mpam.h         |  3 +--
+ arch/arm64/kernel/mpam/mpam_ctrlmon.c |  6 ++----
+ arch/arm64/kernel/mpam/mpam_resctrl.c |  3 +--
+ arch/arm64/kernel/mpam/mpam_setup.c   | 12 +++++++-----
+ 4 files changed, 11 insertions(+), 13 deletions(-)
+
+diff --git a/arch/arm64/include/asm/mpam.h b/arch/arm64/include/asm/mpam.h
+index 6641180b4c3a..2e327ee2f560 100644
+--- a/arch/arm64/include/asm/mpam.h
++++ b/arch/arm64/include/asm/mpam.h
+@@ -315,8 +315,7 @@ struct raw_resctrl_resource {
+ 	u16                 num_intpartid;
+ 	u16                 num_pmg;
+ 
+-	u16                 pri_wd;
+-	u16                 hdl_wd;
++	u16                 extend_ctrls_wd[SCHEMA_NUM_CTRL_TYPE];
+ 
+ 	void (*msr_update)(struct resctrl_resource *r, struct rdt_domain *d,
+ 				struct msr_param *para);
+diff --git a/arch/arm64/kernel/mpam/mpam_ctrlmon.c b/arch/arm64/kernel/mpam/mpam_ctrlmon.c
+index b7dc8226a008..db2d49b37469 100644
+--- a/arch/arm64/kernel/mpam/mpam_ctrlmon.c
++++ b/arch/arm64/kernel/mpam/mpam_ctrlmon.c
+@@ -83,10 +83,8 @@ static int add_schema(enum resctrl_conf_type t, struct resctrl_resource *r)
+ 	rr = r->res;
+ 	INIT_LIST_HEAD(&s->schema_ctrl_list);
+ 	for_each_extend_ctrl_type(type) {
+-		if ((type == SCHEMA_PRI && !rr->pri_wd) ||
+-			(type == SCHEMA_HDL && !rr->hdl_wd) ||
+-			!resctrl_ctrl_extend_bits_match(r->ctrl_extend_bits,
+-			type))
++		if (!resctrl_ctrl_extend_bits_match(r->ctrl_extend_bits, type) ||
++			!rr->extend_ctrls_wd[type])
+ 			continue;
+ 
+ 		sc = kzalloc(sizeof(*sc), GFP_KERNEL);
+diff --git a/arch/arm64/kernel/mpam/mpam_resctrl.c b/arch/arm64/kernel/mpam/mpam_resctrl.c
+index 7b986b9c74c4..218768cd5acf 100644
+--- a/arch/arm64/kernel/mpam/mpam_resctrl.c
++++ b/arch/arm64/kernel/mpam/mpam_resctrl.c
+@@ -734,8 +734,7 @@ static int extend_ctrl_enable(enum resctrl_ctrl_type type)
+ 	for_each_supported_resctrl_exports(res) {
+ 		r = &res->resctrl_res;
+ 		rr = r->res;
+-		if ((type == SCHEMA_PRI && rr->pri_wd) ||
+-			(type == SCHEMA_HDL && rr->hdl_wd)) {
++		if (rr->extend_ctrls_wd[type]) {
+ 			resctrl_ctrl_extend_bits_set(&r->ctrl_extend_bits, type);
+ 			match = true;
+ 		}
+diff --git a/arch/arm64/kernel/mpam/mpam_setup.c b/arch/arm64/kernel/mpam/mpam_setup.c
+index 36a4c8fe87da..a1f8e69e6c27 100644
+--- a/arch/arm64/kernel/mpam/mpam_setup.c
++++ b/arch/arm64/kernel/mpam/mpam_setup.c
+@@ -392,8 +392,8 @@ static int mpam_resctrl_resource_init(struct mpam_resctrl_res *res)
+ 		r->mon_capable = true;
+ 		r->mon_enabled = true;
+ 		/* Export memory bandwidth hardlimit, default active hardlimit */
+-		rr->hdl_wd = 2;
+-		r->default_ctrl[SCHEMA_HDL] = rr->hdl_wd - 1;
++		rr->extend_ctrls_wd[SCHEMA_HDL] = 2;
++		r->default_ctrl[SCHEMA_HDL] = 1;
+ 	} else if (class == mpam_resctrl_exports[RDT_RESOURCE_L3].class) {
+ 		r->rid = RDT_RESOURCE_L3;
+ 		rr = mpam_get_raw_resctrl_resource(RDT_RESOURCE_L3);
+@@ -466,11 +466,13 @@ static int mpam_resctrl_resource_init(struct mpam_resctrl_res *res)
+ 		rr->num_pmg = class->num_pmg;
+ 
+ 		/*
+-		 * Export priority setting, default priority from hardware,
+-		 * no clever here, we don't need to define another default
++		 * Export priority setting, extend_ctrls_wd represents the
++		 * max level of control we can export. this default priority
++		 * is just from hardware, no need to define another default
+ 		 * value.
+ 		 */
+-		rr->pri_wd = max(class->intpri_wd, class->dspri_wd);
++		rr->extend_ctrls_wd[SCHEMA_PRI] = 1 << max(class->intpri_wd,
++			class->dspri_wd);
+ 		r->default_ctrl[SCHEMA_PRI] = max(class->hwdef_intpri,
+ 			class->hwdef_dspri);
+ 	}
+-- 
+2.26.2
+

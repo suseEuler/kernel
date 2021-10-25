@@ -1,0 +1,198 @@
+From 174f675d7ba8a10c18740dab8bc44cd8b15ef534 Mon Sep 17 00:00:00 2001
+From: James Morse <james.morse@arm.com>
+Date: Fri, 26 Feb 2021 20:22:00 +0800
+Subject: [PATCH] arm64/mpam: resctrl: Re-synchronise resctrl's view of online
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 174f675d7ba8a10c18740dab8bc44cd8b15ef534
+
+ CPUs
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+So far we probe devices as they become accessible. Each time we probe
+a new device, we eagerly schedule mpam_enable(). Once all the
+devices have been probed mpam_enable() will poke resctrl.
+
+At this point, resctrl has an inconcistent view of which CPUs are online,
+as we only update the the classes that we picked, and we only
+did that after there were enough CPUs online to have probed all
+the devices.
+
+Instead of having some complicated re-sync logic, unregister
+the cpuhp callbacks, register resctrl, then re-register them.
+As we know all the devices have been probed, no-one can find a new
+one to cause mpam_enable() to be re-scheduled.
+
+[Wang ShaoBo: many version adaptation changes]
+
+Signed-off-by: James Morse <james.morse@arm.com>
+Link: http://www.linux-arm.org/git?p=linux-jm.git;a=patch;h=e81ea2f3ca64d8e46a05195cb126a03f4ca846ef
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/kernel/mpam/mpam_device.c   | 22 +++++++++++++++++++++-
+ arch/arm64/kernel/mpam/mpam_internal.h |  6 ++++++
+ arch/arm64/kernel/mpam/mpam_resctrl.c  | 22 ++++++++++++++--------
+ arch/arm64/kernel/mpam/mpam_setup.c    | 10 ++++++++++
+ 4 files changed, 51 insertions(+), 9 deletions(-)
+
+diff --git a/arch/arm64/kernel/mpam/mpam_device.c b/arch/arm64/kernel/mpam/mpam_device.c
+index b6a00ee24ec3..a5011c145421 100644
+--- a/arch/arm64/kernel/mpam/mpam_device.c
++++ b/arch/arm64/kernel/mpam/mpam_device.c
+@@ -53,6 +53,7 @@ LIST_HEAD(mpam_classes);
+ static DEFINE_MUTEX(mpam_cpuhp_lock);
+ static int mpam_cpuhp_state;
+ 
++static bool resctrl_registered;
+ 
+ static inline int mpam_cpu_online(unsigned int cpu);
+ static inline int mpam_cpu_offline(unsigned int cpu);
+@@ -431,11 +432,24 @@ static void __init mpam_enable(struct work_struct *work)
+ 		return;
+ 	}
+ 	cpuhp_remove_state(mpam_cpuhp_state);
+-	mutex_unlock(&mpam_cpuhp_lock);
+ 
+ 	mutex_lock(&mpam_devices_lock);
+ 	err = mpam_resctrl_setup();
++	if (!err) {
++		err = mpam_resctrl_init();
++		if (!err)
++			resctrl_registered = true;
++	}
++	if (err)
++		pr_err("Failed to setup/init resctrl\n");
+ 	mutex_unlock(&mpam_devices_lock);
++
++	mpam_cpuhp_state = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN,
++						"mpam:online", mpam_cpu_online,
++						mpam_cpu_offline);
++	if (mpam_cpuhp_state <= 0)
++		pr_err("Failed to re-register 'dyn' cpuhp callbacks");
++	mutex_unlock(&mpam_cpuhp_lock);
+ }
+ 
+ static void mpam_failed(struct work_struct *work)
+@@ -868,6 +882,9 @@ static int mpam_cpu_online(unsigned int cpu)
+ 		return err;
+ 	}
+ 
++	if (resctrl_registered)
++		mpam_resctrl_cpu_online(cpu);
++
+ 	return 0;
+ }
+ 
+@@ -881,6 +898,9 @@ static int mpam_cpu_offline(unsigned int cpu)
+ 
+ 	mutex_unlock(&mpam_devices_lock);
+ 
++	if (resctrl_registered)
++		mpam_resctrl_cpu_offline(cpu);
++
+ 	return 0;
+ }
+ 
+diff --git a/arch/arm64/kernel/mpam/mpam_internal.h b/arch/arm64/kernel/mpam/mpam_internal.h
+index be4109c19de9..106a67ef687a 100644
+--- a/arch/arm64/kernel/mpam/mpam_internal.h
++++ b/arch/arm64/kernel/mpam/mpam_internal.h
+@@ -121,9 +121,15 @@ u16 mpam_sysprops_num_pmg(void);
+ 
+ void mpam_class_list_lock_held(void);
+ 
++int mpam_resctrl_cpu_online(unsigned int cpu);
++
++int mpam_resctrl_cpu_offline(unsigned int cpu);
++
+ int mpam_resctrl_setup(void);
+ 
+ struct raw_resctrl_resource *
+ mpam_get_raw_resctrl_resource(u32 level);
+ 
++int __init mpam_resctrl_init(void);
++
+ #endif
+diff --git a/arch/arm64/kernel/mpam/mpam_resctrl.c b/arch/arm64/kernel/mpam/mpam_resctrl.c
+index e63c8409a65b..d15b6b827118 100644
+--- a/arch/arm64/kernel/mpam/mpam_resctrl.c
++++ b/arch/arm64/kernel/mpam/mpam_resctrl.c
+@@ -1399,8 +1399,6 @@ static int __init mpam_init(void)
+ 	rdt_alloc_capable = 1;
+ 	rdt_mon_capable = 1;
+ 
+-	mpam_init_padding();
+-
+ 	ret = mpam_nodes_init();
+ 	if (ret) {
+ 		pr_err("internal error: bad cpu list\n");
+@@ -1418,12 +1416,7 @@ static int __init mpam_init(void)
+ 		goto out;
+ 	}
+ 
+-	register_resctrl_specific_files(res_specific_files, ARRAY_SIZE(res_specific_files));
+-
+-	seq_buf_init(&last_cmd_status, last_cmd_status_buf,
+-		     sizeof(last_cmd_status_buf));
+-
+-	ret = resctrl_group_init();
++	ret = mpam_resctrl_init();
+ 	if (ret) {
+ 		cpuhp_remove_state(state);
+ 		goto out;
+@@ -1444,6 +1437,19 @@ static int __init mpam_init(void)
+ 	return ret;
+ }
+ 
++int __init mpam_resctrl_init(void)
++{
++	mpam_init_padding();
++
++	register_resctrl_specific_files(res_specific_files,
++			ARRAY_SIZE(res_specific_files));
++
++	seq_buf_init(&last_cmd_status, last_cmd_status_buf,
++			sizeof(last_cmd_status_buf));
++
++	return resctrl_group_init();
++}
++
+ /*
+  * __intel_rdt_sched_in() - Writes the task's CLOSid/RMID to IA32_PQR_MSR
+  *
+diff --git a/arch/arm64/kernel/mpam/mpam_setup.c b/arch/arm64/kernel/mpam/mpam_setup.c
+index a80584cbe61b..c0746a9058b7 100644
+--- a/arch/arm64/kernel/mpam/mpam_setup.c
++++ b/arch/arm64/kernel/mpam/mpam_setup.c
+@@ -41,6 +41,16 @@
+ struct mpam_resctrl_res mpam_resctrl_exports[RDT_NUM_RESOURCES];
+ struct mpam_resctrl_res mpam_resctrl_events[RESCTRL_NUM_EVENT_IDS];
+ 
++int mpam_resctrl_cpu_online(unsigned int cpu)
++{
++	return 0;
++}
++
++int mpam_resctrl_cpu_offline(unsigned int cpu)
++{
++	return 0;
++}
++
+ /* Test whether we can export MPAM_CLASS_CACHE:{2,3}? */
+ static void mpam_resctrl_pick_caches(void)
+ {
+-- 
+2.26.2
+

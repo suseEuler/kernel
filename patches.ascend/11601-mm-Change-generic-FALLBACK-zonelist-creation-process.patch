@@ -1,0 +1,113 @@
+From 5f3874491253f40dd09fb0d2a94d48ceb3a802f2 Mon Sep 17 00:00:00 2001
+From: Anshuman Khandual <khandual@linux.vnet.ibm.com>
+Date: Mon, 29 Nov 2021 16:28:42 +0800
+Subject: [PATCH] mm: Change generic FALLBACK zonelist creation process
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 5f3874491253f40dd09fb0d2a94d48ceb3a802f2
+
+
+ascend inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4JMLR
+CVE: NA
+-------------------
+
+Kernel allocation to CDM node has already been prevented by putting it's
+entire memory in ZONE_MOVABLE. But the CDM nodes must also be isolated
+from implicit allocations happening on the system.
+
+Any isolation seeking CDM node requires isolation from implicit memory
+allocations from user space but at the same time there should also have
+an explicit way to do the memory allocation.
+
+Platform node's both zonelists are fundamental to where the memory comes
+from when there is an allocation request. In order to achieve these two
+objectives as stated above, zonelists building process has to change as
+both zonelists (i.e FALLBACK and NOFALLBACK) gives access to the node's
+memory zones during any kind of memory allocation. The following changes
+are implemented in this regard.
+
+* CDM node's zones are not part of any other node's FALLBACK zonelist
+* CDM node's FALLBACK list contains it's own memory zones followed by
+  all system RAM zones in regular order as before
+* CDM node's zones are part of it's own NOFALLBACK zonelist
+
+These above changes ensure the following which in turn isolates the CDM
+nodes as desired.
+
+* There wont be any implicit memory allocation ending up in the CDM node
+* Only __GFP_THISNODE marked allocations will come from the CDM node
+* CDM node memory can be allocated through mbind(MPOL_BIND) interface
+* System RAM memory will be used as fallback option in regular order in
+  case the CDM memory is insufficient during targted allocation request
+
+Sample zonelist configuration:
+
+[NODE (0)]						RAM
+        ZONELIST_FALLBACK (0xc00000000140da00)
+                (0) (node 0) (DMA     0xc00000000140c000)
+                (1) (node 1) (DMA     0xc000000100000000)
+        ZONELIST_NOFALLBACK (0xc000000001411a10)
+                (0) (node 0) (DMA     0xc00000000140c000)
+[NODE (1)]						RAM
+        ZONELIST_FALLBACK (0xc000000100001a00)
+                (0) (node 1) (DMA     0xc000000100000000)
+                (1) (node 0) (DMA     0xc00000000140c000)
+        ZONELIST_NOFALLBACK (0xc000000100005a10)
+                (0) (node 1) (DMA     0xc000000100000000)
+[NODE (2)]						CDM
+        ZONELIST_FALLBACK (0xc000000001427700)
+                (0) (node 2) (Movable 0xc000000001427080)
+                (1) (node 0) (DMA     0xc00000000140c000)
+                (2) (node 1) (DMA     0xc000000100000000)
+        ZONELIST_NOFALLBACK (0xc00000000142b710)
+                (0) (node 2) (Movable 0xc000000001427080)
+[NODE (3)]						CDM
+        ZONELIST_FALLBACK (0xc000000001431400)
+                (0) (node 3) (Movable 0xc000000001430d80)
+                (1) (node 0) (DMA     0xc00000000140c000)
+                (2) (node 1) (DMA     0xc000000100000000)
+        ZONELIST_NOFALLBACK (0xc000000001435410)
+                (0) (node 3) (Movable 0xc000000001430d80)
+[NODE (4)]						CDM
+        ZONELIST_FALLBACK (0xc00000000143b100)
+                (0) (node 4) (Movable 0xc00000000143aa80)
+                (1) (node 0) (DMA     0xc00000000140c000)
+                (2) (node 1) (DMA     0xc000000100000000)
+        ZONELIST_NOFALLBACK (0xc00000000143f110)
+                (0) (node 4) (Movable 0xc00000000143aa80)
+
+Signed-off-by: Anshuman Khandual <khandual@linux.vnet.ibm.com>
+Signed-off-by: Lijun Fang <fanglijun3@huawei.com>
+Reviewed-by: Weilong Chen <chenweilong@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/page_alloc.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 308b570cdcec..9bf6ce119d6d 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -5981,6 +5981,16 @@ static void build_zonelists(pg_data_t *pgdat)
+ 
+ 	memset(node_order, 0, sizeof(node_order));
+ 	while ((node = find_next_best_node(local_node, &used_mask)) >= 0) {
++#ifdef CONFIG_COHERENT_DEVICE
++		/*
++		 * CDM node's own zones should not be part of any other
++		 * node's fallback zonelist but only it's own fallback
++		 * zonelist.
++		 */
++		if (is_cdm_node(node) && (pgdat->node_id != node))
++			continue;
++#endif
++
+ 		/*
+ 		 * We don't want to pressure a particular node.
+ 		 * So adding penalty to the first node in same
+-- 
+2.26.2
+

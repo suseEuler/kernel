@@ -1,0 +1,174 @@
+From e8a5fda242ef2502868668ce1bcafed71be565a6 Mon Sep 17 00:00:00 2001
+From: Cheng Jian <cj.chengjian@huawei.com>
+Date: Sat, 29 May 2021 14:43:08 +0800
+Subject: [PATCH] livepatch/ppc64: Make sure caller function in stack
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: e8a5fda242ef2502868668ce1bcafed71be565a6
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 34578/46793/51924
+CVE: NA
+
+-------------------------------------------------------------------------
+
+When we make a livepatch, since we did not save the stack frame
+according to the call requirementsthen, we can't see that the
+caller function in the stack after the patch is activated.
+
+At this time, if we also patch the caller function, because it's
+is not seen in the stack, then this patch can be enabled normally
+without being checked by the stack check.
+
+This is very dangerous. If there are other processes running or
+sleeping in the context of the first patched callee function, then
+after the caller function is patched, we have changed the first few
+instructions of the caller to bstub to jump directly, so the context
+of the process will be destroyed, after he returns to the caller,
+the wrong instruction will be executed.
+
+The following problems can occur in our testcase:
+	Unrecoverable FP Unavailable Exception 800 at 80000000000c80d8
+	Oops: Unrecoverable FP Unavailable Exception, sig: 6 [#1]
+	PREEMPT SMP NR_CPUS=4 QEMU e500
+	Modules linked in: level2_delay_patch(O) delay_patch(O) delay(O)
+	CPU: 1 PID: 328 Comm: cat Tainted: G           O  K 4.4.222 #334
+	task: c0000000f02da100 task.stack: c00000007a52c000
+	NIP: 80000000000c80d8 LR: 80000000000c80d8 CTR: c0000000003cef10
+	REGS: c00000007a52eea0 TRAP: 0800   Tainted: G O  K  (4.4.222)
+	MSR: 0000000080009000 <EE,ME>  CR: 28022882  XER: 00000000
+	NIP [80000000000c80d8] .foo_show+0x18/0x48 [delay]
+	LR [80000000000c80d8] .foo_show+0x18/0x48 [delay]
+	Call Trace:
+	[c00000007a52f120] [c00000007e015af8] 0xc00000007e015af8(unreliable)
+	[c00000007a52f1a0] [c00000000032d11c].kobj_attr_show+0x2c/0x50
+	[c00000007a52f210] [c000000000230b74].sysfs_kf_seq_show+0xf4/0x1d0
+	[c00000007a52f2b0] [c00000000022ea2c].kernfs_seq_show+0x3c/0x50
+	[c00000007a52f320] [c0000000001c1f88].seq_read+0x118/0x5c0
+	[c00000007a52f420] [c00000000022fa04].kernfs_fop_read+0x194/0x240
+	[c00000007a52f4c0] [c00000000018e27c].do_loop_readv_writev+0xac/0x100
+	[c00000007a52f560] [c00000000018f284].do_readv_writev+0x2a4/0x2f0
+	[c00000007a52f6d0] [c0000000001cf3cc].default_file_splice_read+0x22c/0x490
+	[c00000007a52fa60] [c0000000001cd704].do_splice_to+0x94/0xe0
+	[c00000007a52fb00] [c0000000001cd814].splice_direct_to_actor+0xc4/0x320
+	[c00000007a52fbd0] [c0000000001cdb14].do_splice_direct+0xa4/0x120
+	[c00000007a52fc90] [c00000000018f9fc].do_sendfile+0x27c/0x440
+	[c00000007a52fd80] [c0000000001910f4].compat_SyS_sendfile64+0xe4/0x140
+	[c00000007a52fe30] [c00000000000058c]system_call+0x40/0xc8
+	Instruction dump:
+	ebe1fff8 7c0803a6 4e800020 60000000 60000000 60000000 3d62ffff 396b7bf0
+	e98b0018 7d8903a6 4e800420 73747563 <c0000000> f030a948 7fe3fb78 38a00001
+	---[ end trace 07a14bdffccc341f ]---
+
+We solve this problem by disguising the stack frame, so that the caller
+function will appear in the stack, which can be detected by the stack
+check, so that when the patch is enabled, it will be found
+
+Ather this patch, when enable the second livepatch, we will find the
+caller on the stack.
+
+	livepatch_64: func .foo_show is in use!
+	livepatch_64: PID: 328 Comm: cat
+	Call Trace:
+	[c00000007a596bd0] [c00000007a596cd0] 0xc00000007a596cd0(unreliable)
+	[c00000007a596da0] [c000000000008b20].__switch_to+0x70/0xa0
+	[c00000007a596e20] [c000000000557a5c].__schedule+0x2fc/0x830
+	[c00000007a596ed0] [c0000000005581b8] .schedule+0x38/0xc0
+	[c00000007a596f40] [c00000000055c7e8].schedule_timeout+0x148/0x210
+	[c00000007a597030] [80000000000ff054].new_stack_func+0x54/0x90 [delay_patch]
+	[c00000007a5970b0] [c0000000f025d67c] 0xc0000000f025d67c
+	[c00000007a597120] [80000000000c80d8] .foo_show+0x18/0x48 [delay]
+	[c00000007a5971a0] [c00000000032d11c].kobj_attr_show+0x2c/0x50
+	[c00000007a597210] [c000000000230b74].sysfs_kf_seq_show+0xf4/0x1d0
+	[c00000007a5972b0] [c00000000022ea2c].kernfs_seq_show+0x3c/0x50
+	[c00000007a597320] [c0000000001c1f88].seq_read+0x118/0x5c0
+	[c00000007a597420] [c00000000022fa04].kernfs_fop_read+0x194/0x240
+	[c00000007a5974c0] [c00000000018e27c].do_loop_readv_writev+0xac/0x100
+	[c00000007a597560] [c00000000018f284].do_readv_writev+0x2a4/0x2f0
+	[c00000007a5976d0] [c0000000001cf3cc].default_file_splice_read+0x22c/0x490
+	[c00000007a597a60] [c0000000001cd704].do_splice_to+0x94/0xe0
+	[c00000007a597b00] [c0000000001cd814].splice_direct_to_actor+0xc4/0x320
+	[c00000007a597bd0] [c0000000001cdb14].do_splice_direct+0xa4/0x120
+	[c00000007a597c90] [c00000000018f9fc].do_sendfile+0x27c/0x440
+	[c00000007a597d80] [c0000000001910f4].compat_SyS_sendfile64+0xe4/0x140
+	[c00000007a597e30] [c00000000000058c]system_call+0x40/0xc8
+
+Signed-off-by: Cheng Jian <cj.chengjian@huawei.com>
+Reviewed-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: yangerkun <yangerkun@huawei.com>
+
+Signed-off-by: Dong Kai <dongkai11@huawei.com>
+
+Signed-off-by: Ye Weihua <yeweihua4@huawei.com>
+Reviewed-by: Yang Jihong <yangjihong1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/powerpc/include/asm/livepatch.h | 2 +-
+ arch/powerpc/kernel/entry_64.S       | 6 ++++--
+ arch/powerpc/kernel/module_64.c      | 8 ++++----
+ 3 files changed, 9 insertions(+), 7 deletions(-)
+
+diff --git a/arch/powerpc/include/asm/livepatch.h b/arch/powerpc/include/asm/livepatch.h
+index 0e7ae89f7a1b..5e5161ceac13 100644
+--- a/arch/powerpc/include/asm/livepatch.h
++++ b/arch/powerpc/include/asm/livepatch.h
+@@ -53,7 +53,7 @@ struct ppc64_klp_bstub_entry {
+ 
+ #ifdef PPC64_ELF_ABI_v1
+ struct ppc64_klp_btramp_entry {
+-	u32 jump[16];
++	u32 jump[18];
+ 	u32 magic;
+ 	union {
+ 		struct ppc64_opd_entry funcdata;
+diff --git a/arch/powerpc/kernel/entry_64.S b/arch/powerpc/kernel/entry_64.S
+index 759fcb2eb529..71ff3a4f10a6 100644
+--- a/arch/powerpc/kernel/entry_64.S
++++ b/arch/powerpc/kernel/entry_64.S
+@@ -1035,8 +1035,9 @@ _GLOBAL(livepatch_branch_stub_end)
+ 	 */
+ _GLOBAL(livepatch_branch_trampoline)
+ 	mflr	r0
+-	std	r0, 32(r1)
++	std	r0, 16(r1)
+ 	std	r2, 24(r1)
++	stdu    r1, -STACK_FRAME_OVERHEAD(r1)
+ 
+ 	/* Load func descr address to R11 */
+ 	lis	r11, 0		/* saved_entry@highest */
+@@ -1058,8 +1059,9 @@ _GLOBAL(livepatch_branch_trampoline)
+ 	 * caller A. We are free to use r11, r12 and we can use r2 until we
+ 	 * restore it.
+ 	 */
++	addi	r1, r1, STACK_FRAME_OVERHEAD
+ 	ld	r2, 24(r1)
+-	ld	r0, 32(r1)
++	ld	r0, 16(r1)
+ 	mtlr	r0
+ 
+ 	/* Return to original caller of live patched function */
+diff --git a/arch/powerpc/kernel/module_64.c b/arch/powerpc/kernel/module_64.c
+index 9024f2b4fc02..7a143ab7d433 100644
+--- a/arch/powerpc/kernel/module_64.c
++++ b/arch/powerpc/kernel/module_64.c
+@@ -869,10 +869,10 @@ static void livepatch_create_btramp(struct ppc64_klp_btramp_entry *entry,
+ 
+ 		memcpy(entry->jump, (u32 *)tramp_start, tramp_size);
+ 
+-		entry->jump[3] |= PPC_LIVEPATCH_HIGHEST(reladdr);
+-		entry->jump[4] |= PPC_LIVEPATCH_HIGHER(reladdr);
+-		entry->jump[6] |= PPC_LIVEPATCH_HIGH(reladdr);
+-		entry->jump[7] |= PPC_LIVEPATCH_LOW(reladdr);
++		entry->jump[4] |= PPC_LIVEPATCH_HIGHEST(reladdr);
++		entry->jump[5] |= PPC_LIVEPATCH_HIGHER(reladdr);
++		entry->jump[7] |= PPC_LIVEPATCH_HIGH(reladdr);
++		entry->jump[8] |= PPC_LIVEPATCH_LOW(reladdr);
+ 
+ 		entry->magic = BRANCH_TRAMPOLINE_MAGIC;
+ 	}
+-- 
+2.26.2
+

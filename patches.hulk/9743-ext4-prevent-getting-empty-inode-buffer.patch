@@ -1,0 +1,120 @@
+From a3e3ff2d020c91728912bd45843cf66f0aed0ee1 Mon Sep 17 00:00:00 2001
+From: Zhang Yi <yi.zhang@huawei.com>
+Date: Tue, 19 Oct 2021 18:04:03 +0800
+Subject: [PATCH] ext4: prevent getting empty inode buffer
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: a3e3ff2d020c91728912bd45843cf66f0aed0ee1
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 174653 https://gitee.com/openeuler/kernel/issues/I4DDEL
+---------------------------
+
+In ext4_get_inode_loc(), we may skip IO and get an zero && uptodate
+inode buffer when the inode monopolize an inode block for performance
+reason. For most cases, ext4_mark_iloc_dirty() will fill the inode
+buffer to make it fine, but we could miss this call if something bad
+happened. Finally, __ext4_get_inode_loc_noinmem() may probably get an
+empty inode buffer and trigger ext4 error.
+
+For example, if we remove a nonexistent xattr on inode A,
+ext4_xattr_set_handle() will return ENODATA before invoking
+ext4_mark_iloc_dirty(), it will left an uptodate but zero buffer. We
+will get checksum error message in ext4_iget() when getting inode again.
+
+  EXT4-fs error (device sda): ext4_lookup:1784: inode #131074: comm cat: iget: checksum invalid
+
+Even worse, if we allocate another inode B at the same inode block, it
+will corrupt the inode A on disk when write back inode B.
+
+So this patch initialize the inode buffer by filling the in-mem inode
+contents if we skip read I/O, ensure that the buffer is really uptodate.
+
+Signed-off-by: Zhang Yi <yi.zhang@huawei.com>
+Reviewed-by: Yang Erkun <yangerkun@huawei.com>
+Signed-off-by: Chen Jun <chenjun102@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/ext4/inode.c | 24 ++++++++++++++----------
+ 1 file changed, 14 insertions(+), 10 deletions(-)
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index d76ebbebd455..a054f07a63a6 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -4445,12 +4445,12 @@ static int ext4_fill_raw_inode(struct inode *inode, struct ext4_inode *raw_inode
+ 
+ /*
+  * ext4_get_inode_loc returns with an extra refcount against the inode's
+- * underlying buffer_head on success. If 'in_mem' is true, we have all
+- * data in memory that is needed to recreate the on-disk version of this
+- * inode.
++ * underlying buffer_head on success. If we pass 'inode' and it does not
++ * have in-inode xattr, we have all inode data in memory that is needed
++ * to recreate the on-disk version of this inode.
+  */
+ static int __ext4_get_inode_loc(struct super_block *sb, unsigned long ino,
+-				struct ext4_iloc *iloc, int in_mem,
++				struct inode *inode, struct ext4_iloc *iloc,
+ 				ext4_fsblk_t *ret_block)
+ {
+ 	struct ext4_group_desc	*gdp;
+@@ -4495,7 +4495,7 @@ static int __ext4_get_inode_loc(struct super_block *sb, unsigned long ino,
+ 		 * is the only valid inode in the block, we need not read the
+ 		 * block.
+ 		 */
+-		if (in_mem) {
++		if (inode && !ext4_test_inode_state(inode, EXT4_STATE_XATTR)) {
+ 			struct buffer_head *bitmap_bh;
+ 			int i, start;
+ 
+@@ -4523,8 +4523,13 @@ static int __ext4_get_inode_loc(struct super_block *sb, unsigned long ino,
+ 			}
+ 			brelse(bitmap_bh);
+ 			if (i == start + inodes_per_block) {
++				struct ext4_inode *raw_inode =
++					(struct ext4_inode *) (bh->b_data + iloc->offset);
++
+ 				/* all other inodes are free, so skip I/O */
+ 				memset(bh->b_data, 0, bh->b_size);
++				if (!ext4_test_inode_state(inode, EXT4_STATE_NEW))
++					ext4_fill_raw_inode(inode, raw_inode);
+ 				set_buffer_uptodate(bh);
+ 				unlock_buffer(bh);
+ 				goto has_buffer;
+@@ -4586,7 +4591,7 @@ static int __ext4_get_inode_loc_noinmem(struct inode *inode,
+ 	ext4_fsblk_t err_blk;
+ 	int ret;
+ 
+-	ret = __ext4_get_inode_loc(inode->i_sb, inode->i_ino, iloc, 0,
++	ret = __ext4_get_inode_loc(inode->i_sb, inode->i_ino, NULL, iloc,
+ 					&err_blk);
+ 
+ 	if (ret == -EIO)
+@@ -4601,9 +4606,8 @@ int ext4_get_inode_loc(struct inode *inode, struct ext4_iloc *iloc)
+ 	ext4_fsblk_t err_blk;
+ 	int ret;
+ 
+-	/* We have all inode data except xattrs in memory here. */
+-	ret = __ext4_get_inode_loc(inode->i_sb, inode->i_ino, iloc,
+-		!ext4_test_inode_state(inode, EXT4_STATE_XATTR), &err_blk);
++	ret = __ext4_get_inode_loc(inode->i_sb, inode->i_ino, inode, iloc,
++					&err_blk);
+ 
+ 	if (ret == -EIO)
+ 		ext4_error_inode_block(inode, err_blk, EIO,
+@@ -4616,7 +4620,7 @@ int ext4_get_inode_loc(struct inode *inode, struct ext4_iloc *iloc)
+ int ext4_get_fc_inode_loc(struct super_block *sb, unsigned long ino,
+ 			  struct ext4_iloc *iloc)
+ {
+-	return __ext4_get_inode_loc(sb, ino, iloc, 0, NULL);
++	return __ext4_get_inode_loc(sb, ino, NULL, iloc, NULL);
+ }
+ 
+ static bool ext4_should_enable_dax(struct inode *inode)
+-- 
+2.26.2
+

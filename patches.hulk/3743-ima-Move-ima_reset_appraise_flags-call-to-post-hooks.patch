@@ -1,0 +1,161 @@
+From d3df8e706df9dfeb6be277bac8e14093924244a0 Mon Sep 17 00:00:00 2001
+From: Roberto Sassu <roberto.sassu@huawei.com>
+Date: Wed, 3 Mar 2021 08:43:40 +0100
+Subject: [PATCH] ima: Move ima_reset_appraise_flags() call to post hooks
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: d3df8e706df9dfeb6be277bac8e14093924244a0
+
+
+hulk inclusion
+category: feature
+feature: IMA Digest Lists extension
+bugzilla: 46797
+
+---------------------------
+
+ima_inode_setxattr() and ima_inode_removexattr() hooks are called before an
+operation is performed. Thus, ima_reset_appraise_flags() should not be
+called there, as flags might be unnecessarily reset if the operation is
+denied.
+
+This patch introduces the post hooks ima_inode_post_setxattr() and
+ima_inode_post_removexattr(), and adds the call to
+ima_reset_appraise_flags() in the new functions.
+
+Signed-off-by: Roberto Sassu <roberto.sassu@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/xattr.c                            |  2 ++
+ include/linux/ima.h                   | 18 ++++++++++++++++++
+ security/integrity/ima/ima_appraise.c | 25 ++++++++++++++++++++++---
+ security/security.c                   |  1 +
+ 4 files changed, 43 insertions(+), 3 deletions(-)
+
+diff --git a/fs/xattr.c b/fs/xattr.c
+index cd7a563e8bcd..149b8cf5f99f 100644
+--- a/fs/xattr.c
++++ b/fs/xattr.c
+@@ -16,6 +16,7 @@
+ #include <linux/namei.h>
+ #include <linux/security.h>
+ #include <linux/evm.h>
++#include <linux/ima.h>
+ #include <linux/syscalls.h>
+ #include <linux/export.h>
+ #include <linux/fsnotify.h>
+@@ -474,6 +475,7 @@ __vfs_removexattr_locked(struct dentry *dentry, const char *name,
+ 
+ 	if (!error) {
+ 		fsnotify_xattr(dentry);
++		ima_inode_post_removexattr(dentry, name);
+ 		evm_inode_post_removexattr(dentry, name);
+ 	}
+ 
+diff --git a/include/linux/ima.h b/include/linux/ima.h
+index 8fa7bcfb2da2..f7a088b2579e 100644
+--- a/include/linux/ima.h
++++ b/include/linux/ima.h
+@@ -144,7 +144,13 @@ extern bool is_ima_appraise_enabled(void);
+ extern void ima_inode_post_setattr(struct dentry *dentry);
+ extern int ima_inode_setxattr(struct dentry *dentry, const char *xattr_name,
+ 		       const void *xattr_value, size_t xattr_value_len);
++extern void ima_inode_post_setxattr(struct dentry *dentry,
++				    const char *xattr_name,
++				    const void *xattr_value,
++				    size_t xattr_value_len);
+ extern int ima_inode_removexattr(struct dentry *dentry, const char *xattr_name);
++extern void ima_inode_post_removexattr(struct dentry *dentry,
++				       const char *xattr_name);
+ #else
+ static inline bool is_ima_appraise_enabled(void)
+ {
+@@ -164,11 +170,23 @@ static inline int ima_inode_setxattr(struct dentry *dentry,
+ 	return 0;
+ }
+ 
++static inline void ima_inode_post_setxattr(struct dentry *dentry,
++					   const char *xattr_name,
++					   const void *xattr_value,
++					   size_t xattr_value_len)
++{
++}
++
+ static inline int ima_inode_removexattr(struct dentry *dentry,
+ 					const char *xattr_name)
+ {
+ 	return 0;
+ }
++
++static inline void ima_inode_post_removexattr(struct dentry *dentry,
++					      const char *xattr_name)
++{
++}
+ #endif /* CONFIG_IMA_APPRAISE */
+ 
+ #if defined(CONFIG_IMA_APPRAISE) && defined(CONFIG_INTEGRITY_TRUSTED_KEYRING)
+diff --git a/security/integrity/ima/ima_appraise.c b/security/integrity/ima/ima_appraise.c
+index 3dd8c2e4314e..1a11006a5332 100644
+--- a/security/integrity/ima/ima_appraise.c
++++ b/security/integrity/ima/ima_appraise.c
+@@ -569,21 +569,40 @@ int ima_inode_setxattr(struct dentry *dentry, const char *xattr_name,
+ 	if (result == 1) {
+ 		if (!xattr_value_len || (xvalue->type >= IMA_XATTR_LAST))
+ 			return -EINVAL;
+-		ima_reset_appraise_flags(d_backing_inode(dentry),
+-			xvalue->type == EVM_IMA_XATTR_DIGSIG);
+ 		result = 0;
+ 	}
+ 	return result;
+ }
+ 
++void ima_inode_post_setxattr(struct dentry *dentry, const char *xattr_name,
++			     const void *xattr_value, size_t xattr_value_len)
++{
++	const struct evm_ima_xattr_data *xvalue = xattr_value;
++	int result;
++
++	result = ima_protect_xattr(dentry, xattr_name, xattr_value,
++				   xattr_value_len);
++	if (result == 1)
++		ima_reset_appraise_flags(d_backing_inode(dentry),
++			xvalue->type == EVM_IMA_XATTR_DIGSIG);
++}
++
+ int ima_inode_removexattr(struct dentry *dentry, const char *xattr_name)
+ {
+ 	int result;
+ 
+ 	result = ima_protect_xattr(dentry, xattr_name, NULL, 0);
+ 	if (result == 1) {
+-		ima_reset_appraise_flags(d_backing_inode(dentry), 0);
+ 		result = 0;
+ 	}
+ 	return result;
+ }
++
++void ima_inode_post_removexattr(struct dentry *dentry, const char *xattr_name)
++{
++	int result;
++
++	result = ima_protect_xattr(dentry, xattr_name, NULL, 0);
++	if (result == 1)
++		ima_reset_appraise_flags(d_backing_inode(dentry), 0);
++}
+diff --git a/security/security.c b/security/security.c
+index a28045dc9e7f..0c95a714168c 100644
+--- a/security/security.c
++++ b/security/security.c
+@@ -1309,6 +1309,7 @@ void security_inode_post_setxattr(struct dentry *dentry, const char *name,
+ 	if (unlikely(IS_PRIVATE(d_backing_inode(dentry))))
+ 		return;
+ 	call_void_hook(inode_post_setxattr, dentry, name, value, size, flags);
++	ima_inode_post_setxattr(dentry, name, value, size);
+ 	evm_inode_post_setxattr(dentry, name, value, size);
+ }
+ 
+-- 
+2.26.2
+

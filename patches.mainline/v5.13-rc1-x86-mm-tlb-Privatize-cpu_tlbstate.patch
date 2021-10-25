@@ -1,0 +1,188 @@
+From 2f4305b19fe6a2a261d76c21856c5598f7d878fe Mon Sep 17 00:00:00 2001
+From: Nadav Amit <namit@vmware.com>
+Date: Sat, 20 Feb 2021 15:17:08 -0800
+Subject: [PATCH] x86/mm/tlb: Privatize cpu_tlbstate
+Git-commit: 2f4305b19fe6a2a261d76c21856c5598f7d878fe
+Patch-mainline: v5.13-rc1
+References: bsn#12
+
+
+cpu_tlbstate is mostly private and only the variable is_lazy is shared.
+This causes some false-sharing when TLB flushes are performed.
+
+Break cpu_tlbstate intro cpu_tlbstate and cpu_tlbstate_shared, and mark
+each one accordingly.
+
+Signed-off-by: Nadav Amit <namit@vmware.com>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Reviewed-by: Dave Hansen <dave.hansen@linux.intel.com>
+Link: https://lore.kernel.org/r/20210220231712.2475218-6-namit@vmware.com
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ arch/x86/include/asm/tlbflush.h | 39 ++++++++++++++++++---------------
+ arch/x86/kernel/alternative.c   |  2 +-
+ arch/x86/mm/init.c              |  2 +-
+ arch/x86/mm/tlb.c               | 17 ++++++++------
+ 4 files changed, 33 insertions(+), 27 deletions(-)
+
+diff --git a/arch/x86/include/asm/tlbflush.h b/arch/x86/include/asm/tlbflush.h
+index 3c6681def912..fa952eadbc2e 100644
+--- a/arch/x86/include/asm/tlbflush.h
++++ b/arch/x86/include/asm/tlbflush.h
+@@ -89,23 +89,6 @@ struct tlb_state {
+ 	u16 loaded_mm_asid;
+ 	u16 next_asid;
+ 
+-	/*
+-	 * We can be in one of several states:
+-	 *
+-	 *  - Actively using an mm.  Our CPU's bit will be set in
+-	 *    mm_cpumask(loaded_mm) and is_lazy == false;
+-	 *
+-	 *  - Not using a real mm.  loaded_mm == &init_mm.  Our CPU's bit
+-	 *    will not be set in mm_cpumask(&init_mm) and is_lazy == false.
+-	 *
+-	 *  - Lazily using a real mm.  loaded_mm != &init_mm, our bit
+-	 *    is set in mm_cpumask(loaded_mm), but is_lazy == true.
+-	 *    We're heuristically guessing that the CR3 load we
+-	 *    skipped more than makes up for the overhead added by
+-	 *    lazy mode.
+-	 */
+-	bool is_lazy;
+-
+ 	/*
+ 	 * If set we changed the page tables in such a way that we
+ 	 * needed an invalidation of all contexts (aka. PCIDs / ASIDs).
+@@ -151,7 +134,27 @@ struct tlb_state {
+ 	 */
+ 	struct tlb_context ctxs[TLB_NR_DYN_ASIDS];
+ };
+-DECLARE_PER_CPU_SHARED_ALIGNED(struct tlb_state, cpu_tlbstate);
++DECLARE_PER_CPU_ALIGNED(struct tlb_state, cpu_tlbstate);
++
++struct tlb_state_shared {
++	/*
++	 * We can be in one of several states:
++	 *
++	 *  - Actively using an mm.  Our CPU's bit will be set in
++	 *    mm_cpumask(loaded_mm) and is_lazy == false;
++	 *
++	 *  - Not using a real mm.  loaded_mm == &init_mm.  Our CPU's bit
++	 *    will not be set in mm_cpumask(&init_mm) and is_lazy == false.
++	 *
++	 *  - Lazily using a real mm.  loaded_mm != &init_mm, our bit
++	 *    is set in mm_cpumask(loaded_mm), but is_lazy == true.
++	 *    We're heuristically guessing that the CR3 load we
++	 *    skipped more than makes up for the overhead added by
++	 *    lazy mode.
++	 */
++	bool is_lazy;
++};
++DECLARE_PER_CPU_SHARED_ALIGNED(struct tlb_state_shared, cpu_tlbstate_shared);
+ 
+ bool nmi_uaccess_okay(void);
+ #define nmi_uaccess_okay nmi_uaccess_okay
+diff --git a/arch/x86/kernel/alternative.c b/arch/x86/kernel/alternative.c
+index 8d778e46725d..94649f86d653 100644
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@ -813,7 +813,7 @@ static inline temp_mm_state_t use_temporary_mm(struct mm_struct *mm)
+ 	 * with a stale address space WITHOUT being in lazy mode after
+ 	 * restoring the previous mm.
+ 	 */
+-	if (this_cpu_read(cpu_tlbstate.is_lazy))
++	if (this_cpu_read(cpu_tlbstate_shared.is_lazy))
+ 		leave_mm(smp_processor_id());
+ 
+ 	temp_state.mm = this_cpu_read(cpu_tlbstate.loaded_mm);
+diff --git a/arch/x86/mm/init.c b/arch/x86/mm/init.c
+index dd694fb93916..ed2e36748758 100644
+--- a/arch/x86/mm/init.c
++++ b/arch/x86/mm/init.c
+@@ -1017,7 +1017,7 @@ void __init zone_sizes_init(void)
+ 	free_area_init(max_zone_pfns);
+ }
+ 
+-__visible DEFINE_PER_CPU_SHARED_ALIGNED(struct tlb_state, cpu_tlbstate) = {
++__visible DEFINE_PER_CPU_ALIGNED(struct tlb_state, cpu_tlbstate) = {
+ 	.loaded_mm = &init_mm,
+ 	.next_asid = 1,
+ 	.cr4 = ~0UL,	/* fail hard if we screw up cr4 shadow initialization */
+diff --git a/arch/x86/mm/tlb.c b/arch/x86/mm/tlb.c
+index 8db87cd92e6b..345a0aff5de4 100644
+--- a/arch/x86/mm/tlb.c
++++ b/arch/x86/mm/tlb.c
+@@ -300,7 +300,7 @@ void leave_mm(int cpu)
+ 		return;
+ 
+ 	/* Warn if we're not lazy. */
+-	WARN_ON(!this_cpu_read(cpu_tlbstate.is_lazy));
++	WARN_ON(!this_cpu_read(cpu_tlbstate_shared.is_lazy));
+ 
+ 	switch_mm(NULL, &init_mm, NULL);
+ }
+@@ -424,7 +424,7 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
+ {
+ 	struct mm_struct *real_prev = this_cpu_read(cpu_tlbstate.loaded_mm);
+ 	u16 prev_asid = this_cpu_read(cpu_tlbstate.loaded_mm_asid);
+-	bool was_lazy = this_cpu_read(cpu_tlbstate.is_lazy);
++	bool was_lazy = this_cpu_read(cpu_tlbstate_shared.is_lazy);
+ 	unsigned cpu = smp_processor_id();
+ 	u64 next_tlb_gen;
+ 	bool need_flush;
+@@ -469,7 +469,7 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
+ 		__flush_tlb_all();
+ 	}
+ #endif
+-	this_cpu_write(cpu_tlbstate.is_lazy, false);
++	this_cpu_write(cpu_tlbstate_shared.is_lazy, false);
+ 
+ 	/*
+ 	 * The membarrier system call requires a full memory barrier and
+@@ -490,7 +490,7 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
+ 		/*
+ 		 * Even in lazy TLB mode, the CPU should stay set in the
+ 		 * mm_cpumask. The TLB shootdown code can figure out from
+-		 * cpu_tlbstate.is_lazy whether or not to send an IPI.
++		 * cpu_tlbstate_shared.is_lazy whether or not to send an IPI.
+ 		 */
+ 		if (WARN_ON_ONCE(real_prev != &init_mm &&
+ 				 !cpumask_test_cpu(cpu, mm_cpumask(next))))
+@@ -598,7 +598,7 @@ void enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk)
+ 	if (this_cpu_read(cpu_tlbstate.loaded_mm) == &init_mm)
+ 		return;
+ 
+-	this_cpu_write(cpu_tlbstate.is_lazy, true);
++	this_cpu_write(cpu_tlbstate_shared.is_lazy, true);
+ }
+ 
+ /*
+@@ -690,7 +690,7 @@ static void flush_tlb_func(void *info)
+ 	VM_WARN_ON(this_cpu_read(cpu_tlbstate.ctxs[loaded_mm_asid].ctx_id) !=
+ 		   loaded_mm->context.ctx_id);
+ 
+-	if (this_cpu_read(cpu_tlbstate.is_lazy)) {
++	if (this_cpu_read(cpu_tlbstate_shared.is_lazy)) {
+ 		/*
+ 		 * We're in lazy mode.  We need to at least flush our
+ 		 * paging-structure cache to avoid speculatively reading
+@@ -790,11 +790,14 @@ static void flush_tlb_func(void *info)
+ 
+ static bool tlb_is_not_lazy(int cpu)
+ {
+-	return !per_cpu(cpu_tlbstate.is_lazy, cpu);
++	return !per_cpu(cpu_tlbstate_shared.is_lazy, cpu);
+ }
+ 
+ static DEFINE_PER_CPU(cpumask_t, flush_tlb_mask);
+ 
++DEFINE_PER_CPU_SHARED_ALIGNED(struct tlb_state_shared, cpu_tlbstate_shared);
++EXPORT_PER_CPU_SYMBOL(cpu_tlbstate_shared);
++
+ STATIC_NOPV void native_flush_tlb_multi(const struct cpumask *cpumask,
+ 					 const struct flush_tlb_info *info)
+ {
+-- 
+2.31.1
+

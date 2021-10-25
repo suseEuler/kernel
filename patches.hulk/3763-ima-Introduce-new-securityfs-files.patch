@@ -1,0 +1,165 @@
+From a27b9771355dce037a24bab6f336c9d9ad6bc91e Mon Sep 17 00:00:00 2001
+From: Roberto Sassu <roberto.sassu@huawei.com>
+Date: Wed, 3 Mar 2021 08:44:00 +0100
+Subject: [PATCH] ima: Introduce new securityfs files
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: a27b9771355dce037a24bab6f336c9d9ad6bc91e
+
+
+hulk inclusion
+category: feature
+feature: IMA Digest Lists extension
+bugzilla: 46797
+
+-------------------------------------------------
+
+This patch introduces three new files in the securityfs filesystem.
+digest_list_data: loads a digest list from the specified path and adds the
+digests to the hash table; digest_list_data_del: does the same but removes
+the digests from the hash table; digests_count: shows the current number of
+digests stored in the hash table.
+
+Signed-off-by: Roberto Sassu <roberto.sassu@huawei.com>
+Signed-off-by: Tianxing Zhang <zhangtianxing3@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/kernel_read_file.h |  1 +
+ security/integrity/ima/ima_fs.c  | 49 ++++++++++++++++++++++++++++++++
+ 2 files changed, 50 insertions(+)
+
+diff --git a/include/linux/kernel_read_file.h b/include/linux/kernel_read_file.h
+index 575ffa1031d3..f4180b5c6cda 100644
+--- a/include/linux/kernel_read_file.h
++++ b/include/linux/kernel_read_file.h
+@@ -13,6 +13,7 @@
+ 	id(KEXEC_IMAGE, kexec-image)		\
+ 	id(KEXEC_INITRAMFS, kexec-initramfs)	\
+ 	id(POLICY, security-policy)		\
++	id(DIGEST_LIST, digest-list)		\
+ 	id(X509_CERTIFICATE, x509-certificate)	\
+ 	id(MAX_ID, )
+ 
+diff --git a/security/integrity/ima/ima_fs.c b/security/integrity/ima/ima_fs.c
+index 7ccc32ef2c06..153c7cf5e94f 100644
+--- a/security/integrity/ima/ima_fs.c
++++ b/security/integrity/ima/ima_fs.c
+@@ -24,6 +24,7 @@
+ #include <linux/file.h>
+ 
+ #include "ima.h"
++#include "ima_digest_list.h"
+ 
+ static DEFINE_MUTEX(ima_write_mutex);
+ 
+@@ -34,6 +35,9 @@ static struct dentry *ascii_runtime_measurements;
+ static struct dentry *runtime_measurements_count;
+ static struct dentry *violations;
+ static struct dentry *ima_policy;
++static struct dentry *digests_count;
++static struct dentry *digest_list_data;
++static struct dentry *digest_list_data_del;
+ 
+ bool ima_canonical_fmt;
+ static int __init default_canonical_fmt_setup(char *str)
+@@ -58,6 +62,10 @@ static ssize_t ima_show_htable_value(struct file *filp, char __user *buf,
+ 		val = &ima_htable.violations;
+ 	else if (filp->f_path.dentry == runtime_measurements_count)
+ 		val = &ima_htable.len;
++#ifdef CONFIG_IMA_DIGEST_LIST
++	else if (filp->f_path.dentry == digests_count)
++		val = &ima_digests_htable.len;
++#endif
+ 
+ 	len = scnprintf(tmpbuf, sizeof(tmpbuf), "%li\n", atomic_long_read(val));
+ 	return simple_read_from_buffer(buf, count, ppos, tmpbuf, len);
+@@ -273,6 +281,7 @@ static ssize_t ima_read_file(char *path, struct dentry *dentry)
+ 	size_t size;
+ 	struct file *file;
+ 	enum kernel_read_file_id file_id = READING_POLICY;
++	int op = DIGEST_LIST_OP_ADD;
+ 	int rc, pathlen = strlen(path);
+ 
+ 	char *p;
+@@ -281,6 +290,9 @@ static ssize_t ima_read_file(char *path, struct dentry *dentry)
+ 	datap = path;
+ 	strsep(&datap, "\n");
+ 
++	if (dentry == digest_list_data || dentry == digest_list_data_del)
++		file_id = READING_DIGEST_LIST;
++
+ 	file = filp_open(path, O_RDONLY, 0);
+ 	if (IS_ERR(file)) {
+ 		pr_err("Unable to open file: %s (%ld)", path, PTR_ERR(file));
+@@ -305,6 +317,18 @@ static ssize_t ima_read_file(char *path, struct dentry *dentry)
+ 
+ 			pr_debug("rule: %s\n", p);
+ 			rc = ima_parse_add_rule(p);
++		} else if (dentry == digest_list_data ||
++			   dentry == digest_list_data_del) {
++			/*
++			 * Disable usage of digest lists if not measured
++			 * or appraised.
++			 */
++			ima_check_measured_appraised(file);
++
++			if (dentry == digest_list_data_del)
++				op = DIGEST_LIST_OP_DEL;
++
++			rc = ima_parse_compact_list(size, data, op);
+ 		}
+ 
+ 		if (rc < 0)
+@@ -382,6 +406,7 @@ static ssize_t ima_write_data(struct file *file, const char __user *buf,
+ 
+ enum ima_fs_flags {
+ 	IMA_POLICY_BUSY,
++	IMA_DIGEST_LIST_DATA_BUSY,
+ 	IMA_FS_BUSY,
+ };
+ 
+@@ -391,6 +416,8 @@ static enum ima_fs_flags ima_get_dentry_flag(struct dentry *dentry)
+ 
+ 	if (dentry == ima_policy)
+ 		flag = IMA_POLICY_BUSY;
++	else if (dentry == digest_list_data || dentry == digest_list_data_del)
++		flag = IMA_DIGEST_LIST_DATA_BUSY;
+ 
+ 	return flag;
+ }
+@@ -538,8 +565,30 @@ int __init ima_fs_init(void)
+ 	if (IS_ERR(ima_policy))
+ 		goto out;
+ 
++#ifdef CONFIG_IMA_DIGEST_LIST
++	digests_count = securityfs_create_file("digests_count",
++					       S_IRUSR | S_IRGRP, ima_dir,
++					       NULL, &ima_htable_value_ops);
++	if (IS_ERR(digests_count))
++		goto out;
++
++	digest_list_data = securityfs_create_file("digest_list_data", S_IWUSR,
++						  ima_dir, NULL,
++						  &ima_data_upload_ops);
++	if (IS_ERR(digest_list_data))
++		goto out;
++
++	digest_list_data_del = securityfs_create_file("digest_list_data_del",
++						      S_IWUSR, ima_dir, NULL,
++						      &ima_data_upload_ops);
++	if (IS_ERR(digest_list_data_del))
++		goto out;
++#endif
+ 	return 0;
+ out:
++	securityfs_remove(digest_list_data_del);
++	securityfs_remove(digest_list_data);
++	securityfs_remove(digests_count);
+ 	securityfs_remove(violations);
+ 	securityfs_remove(runtime_measurements_count);
+ 	securityfs_remove(ascii_runtime_measurements);
+-- 
+2.26.2
+

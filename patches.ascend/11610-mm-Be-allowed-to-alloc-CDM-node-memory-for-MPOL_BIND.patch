@@ -1,0 +1,182 @@
+From c1434668e6772fe76c0a9e4f0a3312eff2c3130c Mon Sep 17 00:00:00 2001
+From: Lijun Fang <fanglijun3@huawei.com>
+Date: Mon, 29 Nov 2021 16:28:51 +0800
+Subject: [PATCH] mm: Be allowed to alloc CDM node memory for MPOL_BIND
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: c1434668e6772fe76c0a9e4f0a3312eff2c3130c
+
+
+ascend inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4JMLR
+CVE: NA
+-----------------
+
+CDM nodes should not be part of mems_allowed, However,
+It must be allowed to alloc from CDM node, when mpol->mode was MPOL_BIND.
+
+Signed-off-by: Lijun Fang <fanglijun3@huawei.com>
+Reviewed-by: Weilong Chen <chenweilong@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/mm.h |  8 ++++----
+ mm/hugetlb.c       | 16 ++++++++++++----
+ mm/internal.h      |  3 +++
+ mm/mempolicy.c     |  6 +++++-
+ mm/page_alloc.c    | 12 ++++++++++--
+ 5 files changed, 34 insertions(+), 11 deletions(-)
+
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 07ea9972c4a9..3780281c8112 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -283,10 +283,6 @@ extern unsigned int kobjsize(const void *objp);
+ #define VM_NORESERVE	0x00200000	/* should the VM suppress accounting */
+ #define VM_HUGETLB	0x00400000	/* Huge TLB Page VM */
+ 
+-#ifdef CONFIG_COHERENT_DEVICE
+-#define VM_CDM		0x00800000	/* Contains coherent device memory */
+-#endif
+-
+ #define VM_SYNC		0x00800000	/* Synchronous page faults */
+ #define VM_ARCH_1	0x01000000	/* Architecture-specific flag */
+ #define VM_WIPEONFORK	0x02000000	/* Wipe VMA contents in child. */
+@@ -303,6 +299,10 @@ extern unsigned int kobjsize(const void *objp);
+ #define VM_NOHUGEPAGE	0x40000000	/* MADV_NOHUGEPAGE marked this vma */
+ #define VM_MERGEABLE	0x80000000	/* KSM may merge identical pages */
+ 
++#ifdef CONFIG_COHERENT_DEVICE
++#define VM_CDM		0x100000000	/* Contains coherent device memory */
++#endif
++
+ #ifdef CONFIG_USERSWAP
+ /* bit[32:36] is the protection key of intel, so use a large value for VM_USWAP */
+ #define VM_USWAP      0x2000000000000000
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index f553b71f2518..1bbe763dce73 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -1091,13 +1091,20 @@ static struct page *dequeue_huge_page_node_exact(struct hstate *h, int nid)
+ }
+ 
+ static struct page *dequeue_huge_page_nodemask(struct hstate *h, gfp_t gfp_mask, int nid,
+-		nodemask_t *nmask)
++		nodemask_t *nmask, struct mempolicy *mpol)
+ {
+ 	unsigned int cpuset_mems_cookie;
+ 	struct zonelist *zonelist;
+ 	struct zone *zone;
+ 	struct zoneref *z;
+ 	int node = NUMA_NO_NODE;
++	bool mbind_cdmnode = false;
++
++#ifdef CONFIG_COHERENT_DEVICE
++	if (is_cdm_node(nid) && ((mpol != NULL && mpol->mode == MPOL_BIND) ||
++							(gfp_mask & __GFP_THISNODE)))
++		mbind_cdmnode = true;
++#endif
+ 
+ 	zonelist = node_zonelist(nid, gfp_mask);
+ 
+@@ -1106,7 +1113,8 @@ static struct page *dequeue_huge_page_nodemask(struct hstate *h, gfp_t gfp_mask,
+ 	for_each_zone_zonelist_nodemask(zone, z, zonelist, gfp_zone(gfp_mask), nmask) {
+ 		struct page *page;
+ 
+-		if (!cpuset_zone_allowed(zone, gfp_mask))
++		if (!cpuset_zone_allowed(zone, gfp_mask) &&
++		    mbind_cdmnode == false)
+ 			continue;
+ 		/*
+ 		 * no need to ask again on the same node. Pool is node rather than
+@@ -1152,7 +1160,7 @@ static struct page *dequeue_huge_page_vma(struct hstate *h,
+ 
+ 	gfp_mask = htlb_alloc_mask(h);
+ 	nid = huge_node(vma, address, gfp_mask, &mpol, &nodemask);
+-	page = dequeue_huge_page_nodemask(h, gfp_mask, nid, nodemask);
++	page = dequeue_huge_page_nodemask(h, gfp_mask, nid, nodemask, mpol);
+ 	if (page && !avoid_reserve && vma_has_reserves(vma, chg)) {
+ 		SetHPageRestoreReserve(page);
+ 		h->resv_huge_pages--;
+@@ -2032,7 +2040,7 @@ struct page *alloc_huge_page_nodemask(struct hstate *h, int preferred_nid,
+ 	if (h->free_huge_pages - h->resv_huge_pages > 0) {
+ 		struct page *page;
+ 
+-		page = dequeue_huge_page_nodemask(h, gfp_mask, preferred_nid, nmask);
++		page = dequeue_huge_page_nodemask(h, gfp_mask, preferred_nid, nmask, NULL);
+ 		if (page) {
+ 			spin_unlock_irq(&hugetlb_lock);
+ 			return page;
+diff --git a/mm/internal.h b/mm/internal.h
+index eb39a9b93db3..9451ba9bbcf3 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -593,6 +593,9 @@ unsigned int reclaim_clean_pages_from_list(struct zone *zone,
+ #else
+ #define ALLOC_NOFRAGMENT	  0x0
+ #endif
++#ifdef CONFIG_COHERENT_DEVICE
++#define ALLOC_CDM		0x200
++#endif
+ #define ALLOC_KSWAPD		0x800 /* allow waking of kswapd, __GFP_KSWAPD_RECLAIM set */
+ 
+ enum ttu_flags;
+diff --git a/mm/mempolicy.c b/mm/mempolicy.c
+index 41b2f0174f02..d63181ae4c98 100644
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@ -274,6 +274,9 @@ static int mpol_set_nodemask(struct mempolicy *pol,
+ 	nodes_and(nsc->mask1,
+ 		  cpuset_current_mems_allowed, node_states[N_MEMORY]);
+ 
++#ifdef CONFIG_COHERENT_DEVICE
++	nodes_or(nsc->mask1, cdmmask, nsc->mask1);
++#endif
+ 	VM_BUG_ON(!nodes);
+ 	if (pol->mode == MPOL_PREFERRED && nodes_empty(*nodes))
+ 		nodes = NULL;	/* explicit local allocation */
+@@ -1915,7 +1918,8 @@ nodemask_t *policy_nodemask(gfp_t gfp, struct mempolicy *policy)
+ 	/* Lower zones don't get a nodemask applied for MPOL_BIND */
+ 	if (unlikely(policy->mode == MPOL_BIND) &&
+ 			apply_policy_zone(policy, gfp_zone(gfp)) &&
+-			cpuset_nodemask_valid_mems_allowed(&policy->v.nodes))
++			(cpuset_nodemask_valid_mems_allowed(&policy->v.nodes) ||
++			nodemask_has_cdm(policy->v.nodes)))
+ 		return &policy->v.nodes;
+ 
+ 	return NULL;
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 4bfb52cb677f..62c94ea31e17 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -3829,7 +3829,11 @@ get_page_from_freelist(gfp_t gfp_mask, unsigned int order, int alloc_flags,
+ 
+ 		if (cpusets_enabled() &&
+ 			(alloc_flags & ALLOC_CPUSET) &&
+-			!__cpuset_zone_allowed(zone, gfp_mask))
++			!__cpuset_zone_allowed(zone, gfp_mask)
++#ifdef CONFIG_COHERENT_DEVICE
++			&& !(alloc_flags & ALLOC_CDM)
++#endif
++		)
+ 				continue;
+ 		/*
+ 		 * When allocating a page cache page for writing, we
+@@ -4908,8 +4912,12 @@ static inline bool prepare_alloc_pages(gfp_t gfp_mask, unsigned int order,
+ 		 */
+ 		if (!in_interrupt() && !ac->nodemask)
+ 			ac->nodemask = &cpuset_current_mems_allowed;
+-		else
++		else {
+ 			*alloc_flags |= ALLOC_CPUSET;
++#ifdef CONFIG_COHERENT_DEVICE
++			*alloc_flags |= ALLOC_CDM;
++#endif
++		}
+ 	}
+ 
+ 	fs_reclaim_acquire(gfp_mask);
+-- 
+2.26.2
+

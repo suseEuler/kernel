@@ -1,0 +1,137 @@
+From 93155c7ad21dc851fa66017d11af03923fb80662 Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Fri, 26 Feb 2021 20:22:05 +0800
+Subject: [PATCH] arm64/mpam: Add helper for getting MSCs' configuration
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 93155c7ad21dc851fa66017d11af03923fb80662
+
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+resctrl sysfs need to show MSCs' configuration applied, we can get this
+intermediate data from mpam config structure live in each component
+straightforwardly, but for safety we look at the exact value of those
+registers in any cases, althought it will spend a few time.
+
+We add independent helper separated from do_device_sync() according to
+James' implementation, purposely reading single device for one component,
+it is because all devices in one component will be uniformly configured
+in one configuration process, so reading single device is sufficient for
+getting each component's configuration.
+
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/kernel/mpam/mpam_device.c   | 73 ++++++++++++++++++++++++++
+ arch/arm64/kernel/mpam/mpam_internal.h |  3 ++
+ 2 files changed, 76 insertions(+)
+
+diff --git a/arch/arm64/kernel/mpam/mpam_device.c b/arch/arm64/kernel/mpam/mpam_device.c
+index e2d2947f930f..923ebcf97b73 100644
+--- a/arch/arm64/kernel/mpam/mpam_device.c
++++ b/arch/arm64/kernel/mpam/mpam_device.c
+@@ -1318,3 +1318,76 @@ int mpam_component_mon(struct mpam_component *comp,
+ 
+ 	return ret;
+ }
++
++static void mpam_component_read_mpamcfg(void *_ctx)
++{
++	unsigned long flags;
++	struct mpam_device *dev;
++	struct mpam_device_sync *ctx = (struct mpam_device_sync *)_ctx;
++	struct mpam_component *comp = ctx->comp;
++	struct sync_args *args = ctx->args;
++	u64 val;
++	u16 reg;
++	u32 partid;
++
++	if (!args)
++		return;
++
++	reg = args->reg;
++	/*
++	 * args->partid is possible reqpartid or intpartid,
++	 * if narrow enabled, it should be intpartid.
++	 */
++	partid = args->partid;
++
++	list_for_each_entry(dev, &comp->devices, comp_list) {
++		if (!cpumask_test_cpu(smp_processor_id(),
++			&dev->online_affinity))
++			continue;
++
++		spin_lock_irqsave(&dev->lock, flags);
++		if (mpam_has_feature(mpam_feat_part_nrw, dev->features))
++			partid = PART_SEL_SET_INTERNAL(partid);
++		mpam_write_reg(dev, MPAMCFG_PART_SEL, partid);
++		wmb();
++		val = mpam_read_reg(dev, reg);
++		atomic64_add(val, &ctx->cfg_value);
++		spin_unlock_irqrestore(&dev->lock, flags);
++
++		break;
++	}
++}
++
++/*
++ * reading first device of the this component is enough
++ * for getting configuration.
++ */
++static void
++mpam_component_get_config_local(struct mpam_component *comp,
++				struct sync_args *args, u32 *result)
++{
++	int cpu;
++	struct mpam_device *dev;
++	struct mpam_device_sync sync_ctx;
++
++	sync_ctx.args = args;
++	sync_ctx.comp = comp;
++	atomic64_set(&sync_ctx.cfg_value, 0);
++
++	dev = list_first_entry_or_null(&comp->devices,
++				struct mpam_device, comp_list);
++	if (WARN_ON(!dev))
++		return;
++
++	cpu = cpumask_any(&dev->online_affinity);
++	smp_call_function_single(cpu, mpam_component_read_mpamcfg, &sync_ctx, 1);
++
++	if (result)
++		*result = atomic64_read(&sync_ctx.cfg_value);
++}
++
++void mpam_component_get_config(struct mpam_component *comp,
++			struct sync_args *args, u32 *result)
++{
++	mpam_component_get_config_local(comp, args, result);
++}
+diff --git a/arch/arm64/kernel/mpam/mpam_internal.h b/arch/arm64/kernel/mpam/mpam_internal.h
+index 9f6af1e11777..ea8be8c861c0 100644
+--- a/arch/arm64/kernel/mpam/mpam_internal.h
++++ b/arch/arm64/kernel/mpam/mpam_internal.h
+@@ -162,6 +162,9 @@ int mpam_component_config(struct mpam_component *comp,
+ int mpam_component_mon(struct mpam_component *comp,
+ 			struct sync_args *args, u64 *result);
+ 
++void mpam_component_get_config(struct mpam_component *comp,
++			struct sync_args *args, u32 *result);
++
+ u16 mpam_sysprops_num_partid(void);
+ u16 mpam_sysprops_num_pmg(void);
+ 
+-- 
+2.26.2
+

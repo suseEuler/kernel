@@ -1,0 +1,204 @@
+From cb4789b0d19ff231ce9f73376a023341300aed96 Mon Sep 17 00:00:00 2001
+From: Jean-Philippe Brucker <jean-philippe@linaro.org>
+Date: Fri, 6 Nov 2020 16:50:47 +0100
+Subject: [PATCH] iommu/ioasid: Add ioasid references
+Git-commit: cb4789b0d19ff231ce9f73376a023341300aed96
+Patch-mainline: v5.11-rc1
+References: bsn#12
+
+
+Let IOASID users take references to existing ioasids with ioasid_get().
+ioasid_put() drops a reference and only frees the ioasid when its
+reference number is zero. It returns true if the ioasid was freed.
+For drivers that don't call ioasid_get(), ioasid_put() is the same as
+ioasid_free().
+
+Signed-off-by: Jean-Philippe Brucker <jean-philippe@linaro.org>
+Reviewed-by: Eric Auger <eric.auger@redhat.com>
+Reviewed-by: Lu Baolu <baolu.lu@linux.intel.com>
+Link: https://lore.kernel.org/r/20201106155048.997886-2-jean-philippe@linaro.org
+Signed-off-by: Will Deacon <will@kernel.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ drivers/iommu/intel/iommu.c |  4 ++--
+ drivers/iommu/intel/svm.c   |  6 +++---
+ drivers/iommu/ioasid.c      | 38 +++++++++++++++++++++++++++++++++----
+ include/linux/ioasid.h      | 10 ++++++++--
+ 4 files changed, 47 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/iommu/intel/iommu.c b/drivers/iommu/intel/iommu.c
+index 1b1ca63e6bbe..8b26223979a2 100644
+--- a/drivers/iommu/intel/iommu.c
++++ b/drivers/iommu/intel/iommu.c
+@@ -5198,7 +5198,7 @@ static void auxiliary_unlink_device(struct dmar_domain *domain,
+ 	domain->auxd_refcnt--;
+ 
+ 	if (!domain->auxd_refcnt && domain->default_pasid > 0)
+-		ioasid_free(domain->default_pasid);
++		ioasid_put(domain->default_pasid);
+ }
+ 
+ static int aux_domain_add_dev(struct dmar_domain *domain,
+@@ -5259,7 +5259,7 @@ static int aux_domain_add_dev(struct dmar_domain *domain,
+ 	spin_unlock(&iommu->lock);
+ 	spin_unlock_irqrestore(&device_domain_lock, flags);
+ 	if (!domain->auxd_refcnt && domain->default_pasid > 0)
+-		ioasid_free(domain->default_pasid);
++		ioasid_put(domain->default_pasid);
+ 
+ 	return ret;
+ }
+diff --git a/drivers/iommu/intel/svm.c b/drivers/iommu/intel/svm.c
+index 3242ebd0bca3..4fa248b98031 100644
+--- a/drivers/iommu/intel/svm.c
++++ b/drivers/iommu/intel/svm.c
+@@ -598,7 +598,7 @@ intel_svm_bind_mm(struct device *dev, unsigned int flags,
+ 		if (mm) {
+ 			ret = mmu_notifier_register(&svm->notifier, mm);
+ 			if (ret) {
+-				ioasid_free(svm->pasid);
++				ioasid_put(svm->pasid);
+ 				kfree(svm);
+ 				kfree(sdev);
+ 				goto out;
+@@ -616,7 +616,7 @@ intel_svm_bind_mm(struct device *dev, unsigned int flags,
+ 		if (ret) {
+ 			if (mm)
+ 				mmu_notifier_unregister(&svm->notifier, mm);
+-			ioasid_free(svm->pasid);
++			ioasid_put(svm->pasid);
+ 			kfree(svm);
+ 			kfree(sdev);
+ 			goto out;
+@@ -689,7 +689,7 @@ static int intel_svm_unbind_mm(struct device *dev, u32 pasid)
+ 			kfree_rcu(sdev, rcu);
+ 
+ 			if (list_empty(&svm->devs)) {
+-				ioasid_free(svm->pasid);
++				ioasid_put(svm->pasid);
+ 				if (svm->mm) {
+ 					mmu_notifier_unregister(&svm->notifier, svm->mm);
+ 					/* Clear mm's pasid. */
+diff --git a/drivers/iommu/ioasid.c b/drivers/iommu/ioasid.c
+index 0f8dd377aada..50ee27bbd04e 100644
+--- a/drivers/iommu/ioasid.c
++++ b/drivers/iommu/ioasid.c
+@@ -2,7 +2,7 @@
+ /*
+  * I/O Address Space ID allocator. There is one global IOASID space, split into
+  * subsets. Users create a subset with DECLARE_IOASID_SET, then allocate and
+- * free IOASIDs with ioasid_alloc and ioasid_free.
++ * free IOASIDs with ioasid_alloc and ioasid_put.
+  */
+ #include <linux/ioasid.h>
+ #include <linux/module.h>
+@@ -15,6 +15,7 @@ struct ioasid_data {
+ 	struct ioasid_set *set;
+ 	void *private;
+ 	struct rcu_head rcu;
++	refcount_t refs;
+ };
+ 
+ /*
+@@ -314,6 +315,7 @@ ioasid_t ioasid_alloc(struct ioasid_set *set, ioasid_t min, ioasid_t max,
+ 
+ 	data->set = set;
+ 	data->private = private;
++	refcount_set(&data->refs, 1);
+ 
+ 	/*
+ 	 * Custom allocator needs allocator data to perform platform specific
+@@ -346,11 +348,34 @@ ioasid_t ioasid_alloc(struct ioasid_set *set, ioasid_t min, ioasid_t max,
+ EXPORT_SYMBOL_GPL(ioasid_alloc);
+ 
+ /**
+- * ioasid_free - Free an IOASID
++ * ioasid_get - obtain a reference to the IOASID
++ */
++void ioasid_get(ioasid_t ioasid)
++{
++	struct ioasid_data *ioasid_data;
++
++	spin_lock(&ioasid_allocator_lock);
++	ioasid_data = xa_load(&active_allocator->xa, ioasid);
++	if (ioasid_data)
++		refcount_inc(&ioasid_data->refs);
++	else
++		WARN_ON(1);
++	spin_unlock(&ioasid_allocator_lock);
++}
++EXPORT_SYMBOL_GPL(ioasid_get);
++
++/**
++ * ioasid_put - Release a reference to an ioasid
+  * @ioasid: the ID to remove
++ *
++ * Put a reference to the IOASID, free it when the number of references drops to
++ * zero.
++ *
++ * Return: %true if the IOASID was freed, %false otherwise.
+  */
+-void ioasid_free(ioasid_t ioasid)
++bool ioasid_put(ioasid_t ioasid)
+ {
++	bool free = false;
+ 	struct ioasid_data *ioasid_data;
+ 
+ 	spin_lock(&ioasid_allocator_lock);
+@@ -360,6 +385,10 @@ void ioasid_free(ioasid_t ioasid)
+ 		goto exit_unlock;
+ 	}
+ 
++	free = refcount_dec_and_test(&ioasid_data->refs);
++	if (!free)
++		goto exit_unlock;
++
+ 	active_allocator->ops->free(ioasid, active_allocator->ops->pdata);
+ 	/* Custom allocator needs additional steps to free the xa element */
+ 	if (active_allocator->flags & IOASID_ALLOCATOR_CUSTOM) {
+@@ -369,8 +398,9 @@ void ioasid_free(ioasid_t ioasid)
+ 
+ exit_unlock:
+ 	spin_unlock(&ioasid_allocator_lock);
++	return free;
+ }
+-EXPORT_SYMBOL_GPL(ioasid_free);
++EXPORT_SYMBOL_GPL(ioasid_put);
+ 
+ /**
+  * ioasid_find - Find IOASID data
+diff --git a/include/linux/ioasid.h b/include/linux/ioasid.h
+index 6f000d7a0ddc..e9dacd4b9f6b 100644
+--- a/include/linux/ioasid.h
++++ b/include/linux/ioasid.h
+@@ -34,7 +34,8 @@ struct ioasid_allocator_ops {
+ #if IS_ENABLED(CONFIG_IOASID)
+ ioasid_t ioasid_alloc(struct ioasid_set *set, ioasid_t min, ioasid_t max,
+ 		      void *private);
+-void ioasid_free(ioasid_t ioasid);
++void ioasid_get(ioasid_t ioasid);
++bool ioasid_put(ioasid_t ioasid);
+ void *ioasid_find(struct ioasid_set *set, ioasid_t ioasid,
+ 		  bool (*getter)(void *));
+ int ioasid_register_allocator(struct ioasid_allocator_ops *allocator);
+@@ -48,10 +49,15 @@ static inline ioasid_t ioasid_alloc(struct ioasid_set *set, ioasid_t min,
+ 	return INVALID_IOASID;
+ }
+ 
+-static inline void ioasid_free(ioasid_t ioasid)
++static inline void ioasid_get(ioasid_t ioasid)
+ {
+ }
+ 
++static inline bool ioasid_put(ioasid_t ioasid)
++{
++	return false;
++}
++
+ static inline void *ioasid_find(struct ioasid_set *set, ioasid_t ioasid,
+ 				bool (*getter)(void *))
+ {
+-- 
+2.31.1
+

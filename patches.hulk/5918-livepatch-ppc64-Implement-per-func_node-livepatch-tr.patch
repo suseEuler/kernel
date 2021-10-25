@@ -1,0 +1,579 @@
+From 4234a6b65d768be2cbc5bc5a253daff1d85c4dfa Mon Sep 17 00:00:00 2001
+From: Cheng Jian <cj.chengjian@huawei.com>
+Date: Sat, 29 May 2021 14:43:06 +0800
+Subject: [PATCH] livepatch/ppc64: Implement per func_node livepatch trampoline
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 4234a6b65d768be2cbc5bc5a253daff1d85c4dfa
+
+
+hulk inclusion
+category: feature
+bugzilla: 51924
+CVE: NA
+
+---------------------------
+
+We call from old func to new func, when return form new func, we
+need to restore R2. The previous module relocation was by adding
+an extra nop space after the call (bxxx) instruction to restore R2,
+but it is impossible to use extra space here, because we will not
+return after calling new func, so we need to use a trampoline space.
+
+We will call new func in trampoline and then restore R2 when we return.
+Please note that we can also use old func as trampoline as a solution,
+but we are afraid that old func often does not have that much space to
+store trampoline instruction fragments.
+
+The trampoline can be implemented as global. However we need to
+implement a trampoline for each function and improve its stack
+check.
+
+Our call chain to the new function looks like this:
+
+CALLER
+        old_func        |       old_func
+                        |       -=> trampoline
+                        |               -=> new_func
+
+So we can't simply check that new_func, old_func and trampoline are
+both possible on the stack.
+
+Signed-off-by: Cheng Jian <cj.chengjian@huawei.com>
+Reviewed-By: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: yangerkun <yangerkun@huawei.com>
+
+Signed-off-by: Dong Kai <dongkai11@huawei.com>
+
+Signed-off-by: Ye Weihua <yeweihua4@huawei.com>
+Reviewed-by: Kuohai Xu <xukuohai@huawei.com>
+Reviewed-by: Yang Jihong <yangjihong1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/powerpc/include/asm/livepatch.h |  47 +++++++++
+ arch/powerpc/include/asm/module.h    |   7 --
+ arch/powerpc/kernel/entry_64.S       |  71 +++++++++++++
+ arch/powerpc/kernel/livepatch_64.c   | 144 +++++++++++++++++++++------
+ arch/powerpc/kernel/module_64.c      |  97 +++++++++++++++---
+ 5 files changed, 317 insertions(+), 49 deletions(-)
+
+diff --git a/arch/powerpc/include/asm/livepatch.h b/arch/powerpc/include/asm/livepatch.h
+index 85eed16fad20..0e7ae89f7a1b 100644
+--- a/arch/powerpc/include/asm/livepatch.h
++++ b/arch/powerpc/include/asm/livepatch.h
+@@ -36,6 +36,53 @@ struct klp_func;
+ 
+ int arch_klp_patch_func(struct klp_func *func);
+ void arch_klp_unpatch_func(struct klp_func *func);
++
++#ifdef CONFIG_PPC64
++/*
++ * use the livepatch stub to jump to the trampoline.
++ * It is similar to stub, but does not need to save
++ * and load R2.
++ * struct ppc64_klp_bstub_entry
++ */
++struct ppc64_klp_bstub_entry {
++	u32 jump[5];
++	u32 magic;
++	/* address for livepatch trampoline  */
++	u64 trampoline;
++};
++
++#ifdef PPC64_ELF_ABI_v1
++struct ppc64_klp_btramp_entry {
++	u32 jump[16];
++	u32 magic;
++	union {
++		struct ppc64_opd_entry funcdata;
++		unsigned long saved_entry[2];
++	};
++};
++#endif /* PPC64_ELF_ABI_v1 */
++
++#define PPC64_INSN_SIZE	4
++#define LJMP_INSN_SIZE	(sizeof(struct ppc64_klp_bstub_entry) / PPC64_INSN_SIZE)
++
++/* STUB_MAGIC 0x73747562 "stub" */
++#define BRANCH_STUB_MAGIC	0x73747563 /* stub + 1	*/
++#define BRANCH_TRAMPOLINE_MAGIC 0x73747564 /* stub + 2	*/
++
++extern void livepatch_branch_stub(void);
++extern void livepatch_branch_stub_end(void);
++
++#ifdef PPC64_ELF_ABI_v1
++extern void livepatch_branch_trampoline(void);
++extern void livepatch_branch_trampoline_end(void);
++#endif /* PPC64_ELF_ABI_v1 */
++
++int livepatch_create_branch(unsigned long pc,
++			    unsigned long trampoline,
++			    unsigned long addr,
++			    struct module *me);
++#endif	/* CONFIG_PPC64 */
++
+ #endif /* CONFIG_LIVEPATCH_FTRACE */
+ 
+ #ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
+diff --git a/arch/powerpc/include/asm/module.h b/arch/powerpc/include/asm/module.h
+index 993ff68c1308..3d9febabdcdc 100644
+--- a/arch/powerpc/include/asm/module.h
++++ b/arch/powerpc/include/asm/module.h
+@@ -86,12 +86,5 @@ static inline int module_finalize_ftrace(struct module *mod, const Elf_Shdr *sec
+ }
+ #endif
+ 
+-#ifdef CONFIG_LIVEPATCH_WO_FTRACE
+-struct ppc64_stub_entry;
+-int livepatch_create_stub(struct ppc64_stub_entry *entry,
+-			  unsigned long addr,
+-			  struct module *me);
+-#endif
+-
+ #endif /* __KERNEL__ */
+ #endif	/* _ASM_POWERPC_MODULE_H */
+diff --git a/arch/powerpc/kernel/entry_64.S b/arch/powerpc/kernel/entry_64.S
+index 2831b0aa92b1..759fcb2eb529 100644
+--- a/arch/powerpc/kernel/entry_64.S
++++ b/arch/powerpc/kernel/entry_64.S
+@@ -997,3 +997,74 @@ _GLOBAL(enter_prom)
+ 	ld	r0,16(r1)
+ 	mtlr    r0
+         blr
++
++#ifdef CONFIG_LIVEPATCH_WO_FTRACE
++	/*
++	 * Livepatch function branch stub.
++	 * see struct ppc64_klp_bstub_entry
++	 * use it jump to livepatch trampoline
++	 */
++_GLOBAL(livepatch_branch_stub)
++	addis   r11,r2, 0		/* <high> */
++	addi    r11,r11, 0		/* <low>  */
++	ld      r12,24(r11)
++	mtctr   r12
++	bctr
++_GLOBAL(livepatch_branch_stub_end)
++	nop				/* for magic */
++
++#ifdef PPC64_ELF_ABI_v1
++	/*
++	 * This function runs in the livepatch context, between two functions.
++	 * As such it can only clobber registers which are volatile and used in
++	 * function linkage.
++	 *
++	 * We get here when a function A, calls another function B, but B has
++	 * been live patched with a new function C.
++	 *
++	 * On entry:
++	 *  - we have no stack frame and can not allocate one
++	 *  - LR points back to the original caller (in A)
++	 *  - CTR used to hold the new NIP for call
++	 *  - r0, r11 & r12 are free
++	 *	-- r11 point back to the bstub data which store (func descr)
++	 *	----  0(saved_entry) : new function address
++	 *	---- 8(r0) : new R2(toc) for new function
++	 *	-- tag livepatch stack with r11
++	 *	-- save temporary variables with r12
++	 */
++_GLOBAL(livepatch_branch_trampoline)
++	mflr	r0
++	std	r0, 32(r1)
++	std	r2, 24(r1)
++
++	/* Load func descr address to R11 */
++	lis	r11, 0		/* saved_entry@highest */
++	ori	r11,r11,0	/* saved_entry@higher */
++	rldicr r11,r11,32,31
++	oris	r11,r11,0	/* saved_entry@high */
++	ori	r11,r11,0	/* saved_entry@low */
++
++	/* Call NEW_FUNC */
++	ld	r12, 0(r11)	/* load new func address to R12 */
++#ifdef PPC64_ELF_ABI_v1
++	ld	r2,  8(r11)	/* set up new R2 */
++#endif
++	mtctr   r12		/* load R12(new func address) to CTR */
++	bctrl			/* call new func */
++
++	/*
++	 * Now we are returning from the patched function to the original
++	 * caller A. We are free to use r11, r12 and we can use r2 until we
++	 * restore it.
++	 */
++	ld	r2, 24(r1)
++	ld	r0, 32(r1)
++	mtlr	r0
++
++	/* Return to original caller of live patched function */
++	blr
++_GLOBAL(livepatch_branch_trampoline_end)
++	nop
++#endif
++#endif /* CONFIG_LIVEPATCH_WO_FTRACE */
+diff --git a/arch/powerpc/kernel/livepatch_64.c b/arch/powerpc/kernel/livepatch_64.c
+index 3975061d9185..6d426ded2801 100644
+--- a/arch/powerpc/kernel/livepatch_64.c
++++ b/arch/powerpc/kernel/livepatch_64.c
+@@ -33,27 +33,6 @@
+ #include <asm/code-patching.h>
+ #include <asm/elf.h>
+ 
+-/*
+- * see struct ppc64_stub_entry
+- *
+- * u32 jump[7] :
+- *	addis   r11,r2, <high>
+- *	addi    r11,r11, <low>
+- *	; Save current r2 value in magic place on the stack
+- *	std     r2,R2_STACK_OFFSET(r1)
+- *	ld      r12,32(r11)
+- *	; Set up new r2 from function descriptor, only for ABI V1
+- *	ld      r2,40(r11)
+- *	mtctr   r12
+- *	bctr
+- * u32 unused  :
+- *	XXXX;	no changed here
+- * func_desc_t funcdata :
+- *	ulong	funcaddr;
+- *	ulong	r2;
+- */
+-#define LJMP_INSN_SIZE	12
+-
+ #if defined(CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY) || \
+     defined(CONFIG_LIVEPATCH_WO_FTRACE)
+ struct klp_func_node {
+@@ -61,6 +40,11 @@ struct klp_func_node {
+ 	struct list_head func_stack;
+ 	void *old_func;
+ 	u32	old_insns[LJMP_INSN_SIZE];
++#ifdef PPC64_ELF_ABI_v1
++	struct ppc64_klp_btramp_entry trampoline;
++#else
++	unsigned long   trampoline;
++#endif
+ };
+ 
+ static LIST_HEAD(klp_func_list);
+@@ -82,6 +66,7 @@ static struct klp_func_node *klp_find_func_node(void *old_func)
+ struct stackframe {
+ 	unsigned long sp;
+ 	unsigned long pc;
++	unsigned long nip;
+ };
+ 
+ struct walk_stackframe_args {
+@@ -102,6 +87,31 @@ static inline int klp_compare_address(unsigned long pc,
+ 	return 0;
+ }
+ 
++static inline int klp_check_activeness_func_addr(
++		struct stackframe *frame,
++		unsigned long func_addr,
++		unsigned long func_size,
++		const char *func_name)
++{
++	int ret;
++
++	/* Check PC first */
++	ret = klp_compare_address(frame->pc, func_addr,
++			func_size, func_name);
++	if (ret)
++		return ret;
++
++	/* Check NIP when the exception stack switching */
++	if (frame->nip != 0) {
++		ret = klp_compare_address(frame->nip, func_addr,
++				func_size, func_name);
++		if (ret)
++			return ret;
++	}
++
++	return ret;
++}
++
+ static int klp_check_activeness_func(struct stackframe *frame, void *data)
+ {
+ 	struct walk_stackframe_args *args = data;
+@@ -117,12 +127,14 @@ static int klp_check_activeness_func(struct stackframe *frame, void *data)
+ 
+ 	for (obj = patch->objs; obj->funcs; obj++) {
+ 		for (func = obj->funcs; func->old_name; func++) {
++			func_node = klp_find_func_node(func->old_func);
++
++			/* Check func address in stack */
+ 			if (args->enable) {
+ 				/*
+ 				 * When enable, checking the currently
+ 				 * active functions.
+ 				 */
+-				func_node = klp_find_func_node(func->old_func);
+ 				if (!func_node ||
+ 				    list_empty(&func_node->func_stack)) {
+ 					/*
+@@ -155,10 +167,40 @@ static int klp_check_activeness_func(struct stackframe *frame, void *data)
+ 				func_size = func->new_size;
+ 			}
+ 			func_name = func->old_name;
+-			args->ret = klp_compare_address(frame->pc, func_addr,
+-					func_size, func_name);
++			args->ret = klp_check_activeness_func_addr(frame,
++					func_addr, func_size, func_name);
+ 			if (args->ret)
+ 				return args->ret;
++
++#ifdef PPC64_ELF_ABI_v1
++			/*
++			 * Check trampoline in stack
++			 * new_func callchain:
++			 *	old_func
++			 *	-=> trampoline
++			 *	    -=> new_func
++			 * so, we should check all the func in the callchain
++			 */
++			if (func_addr != (unsigned long)func->old_func) {
++				func_addr = (unsigned long)func->old_func;
++				func_size = func->old_size;
++				args->ret = klp_check_activeness_func_addr(frame,
++					func_addr, func_size, "OLD_FUNC");
++				if (args->ret)
++					return args->ret;
++
++				if (func_node == NULL ||
++				    func_node->trampoline.magic != BRANCH_TRAMPOLINE_MAGIC)
++					continue;
++
++				func_addr = (unsigned long)&func_node->trampoline;
++				func_size = sizeof(struct ppc64_klp_btramp_entry);
++				args->ret = klp_check_activeness_func_addr(frame,
++						func_addr, func_size, "trampoline");
++				if (args->ret)
++					return args->ret;
++			}
++#endif
+ 		}
+ 	}
+ 
+@@ -173,7 +215,29 @@ static int unwind_frame(struct task_struct *tsk, struct stackframe *frame)
+ 	if (!validate_sp(frame->sp, tsk, STACK_FRAME_OVERHEAD))
+ 		return -1;
+ 
++	if (frame->nip != 0)
++		frame->nip = 0;
++
+ 	stack = (unsigned long *)frame->sp;
++
++	/*
++	 * When switching to the exception stack,
++	 * we save the NIP in pt_regs
++	 *
++	 * See if this is an exception frame.
++	 * We look for the "regshere" marker in the current frame.
++	 */
++	if (validate_sp(frame->sp, tsk, STACK_INT_FRAME_SIZE)
++	    && stack[STACK_FRAME_MARKER] == STACK_FRAME_REGS_MARKER) {
++		struct pt_regs *regs = (struct pt_regs *)
++			(frame->sp + STACK_FRAME_OVERHEAD);
++		frame->nip = regs->nip;
++		pr_debug("--- interrupt: task = %d/%s, trap %lx at NIP=x%lx/%pS, LR=0x%lx/%pS\n",
++			tsk->pid, tsk->comm, regs->trap,
++			regs->nip, (void *)regs->nip,
++			regs->link, (void *)regs->link);
++	}
++
+ 	frame->sp = stack[0];
+ 	frame->pc = stack[STACK_FRAME_LR_SAVE];
+ #ifdef CONFIG_FUNCTION_GRAPH_TRACE
+@@ -244,12 +308,16 @@ int klp_check_calltrace(struct klp_patch *patch, int enable)
+ 
+ 		frame.sp = (unsigned long)stack;
+ 		frame.pc = stack[STACK_FRAME_LR_SAVE];
++		frame.nip = 0;
+ 		klp_walk_stackframe(&frame, klp_check_activeness_func,
+ 				t, &args);
+ 		if (args.ret) {
+ 			ret = args.ret;
++			pr_debug("%s FAILED when %s\n", __func__,
++				 enable ? "enabling" : "disabling");
+ 			pr_info("PID: %d Comm: %.20s\n", t->pid, t->comm);
+ 			show_stack(t, NULL, KERN_INFO);
++
+ 			goto out;
+ 		}
+ 	}
+@@ -293,10 +361,18 @@ int arch_klp_patch_func(struct klp_func *func)
+ 	pc = (unsigned long)func->old_func;
+ 	new_addr = (unsigned long)func->new_func;
+ 
+-	ret = livepatch_create_stub((struct ppc64_stub_entry *)pc,
+-			new_addr, func->old_mod, true);
++	ret = livepatch_create_branch(pc, (unsigned long)&func_node->trampoline,
++				      new_addr, func->old_mod);
+ 	if (ret)
+ 		goto ERR_OUT;
++	flush_icache_range((unsigned long)pc,
++			(unsigned long)pc + LJMP_INSN_SIZE * PPC64_INSN_SIZE);
++
++	pr_debug("[%s %d] old = 0x%lx/0x%lx/%pS, new = 0x%lx/0x%lx/%pS\n",
++		 __func__, __LINE__,
++		 pc, ppc_function_entry((void *)pc), (void *)pc,
++		 new_addr, ppc_function_entry((void *)new_addr),
++		 (void *)ppc_function_entry((void *)new_addr));
+ 
+ 	return 0;
+ 
+@@ -331,15 +407,27 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 		for (i = 0; i < LJMP_INSN_SIZE; i++)
+ 			patch_instruction((struct ppc_inst *)((u32 *)pc + i),
+ 					  ppc_inst(insns[i]));
++
++		pr_debug("[%s %d] restore insns at 0x%lx\n", __func__, __LINE__, pc);
+ 	} else {
+ 		list_del_rcu(&func->stack_node);
+ 		next_func = list_first_or_null_rcu(&func_node->func_stack,
+ 					struct klp_func, stack_node);
+ 		new_addr = (unsigned long)next_func->new_func;
+ 
+-		livepatch_create_stub((struct ppc64_stub_entry *)pc,
+-			new_addr, func->old_mod, NULL);
++		livepatch_create_branch(pc, (unsigned long)&func_node->trampoline,
++			new_addr, func->old_mod);
++
++		pr_debug("[%s %d] old = 0x%lx/0x%lx/%pS, new = 0x%lx/0x%lx/%pS\n",
++			__func__, __LINE__,
++			pc, ppc_function_entry((void *)pc), (void *)pc,
++			new_addr, ppc_function_entry((void *)new_addr),
++			(void *)ppc_function_entry((void *)new_addr));
++
+ 	}
++
++	flush_icache_range((unsigned long)pc,
++			(unsigned long)pc + LJMP_INSN_SIZE * PPC64_INSN_SIZE);
+ }
+ 
+ /* return 0 if the func can be patched */
+diff --git a/arch/powerpc/kernel/module_64.c b/arch/powerpc/kernel/module_64.c
+index 7ade837f9468..9024f2b4fc02 100644
+--- a/arch/powerpc/kernel/module_64.c
++++ b/arch/powerpc/kernel/module_64.c
+@@ -807,33 +807,102 @@ int module_finalize_ftrace(struct module *mod, const Elf_Shdr *sechdrs)
+ #include <asm/livepatch.h>
+ #include <asm/cacheflush.h>
+ 
++#define PPC_LIVEPATCH_BITMASK(v, n)	(((v) >> (n)) & 0xffff)
++#define PPC_LIVEPATCH_HIGHEST(v)	PPC_LIVEPATCH_BITMASK(v, 48)
++#define PPC_LIVEPATCH_HIGHER(v)		PPC_LIVEPATCH_BITMASK(v, 32)
++#define PPC_LIVEPATCH_HIGH(v)		PPC_LIVEPATCH_BITMASK(v, 16)
++#define PPC_LIVEPATCH_LOW(v)		PPC_LIVEPATCH_BITMASK(v, 0)
++
+ /*
+- * Patch stub to reference function and correct r2 value.
+- * see create_stub
++ * Patch jump stub to reference trampoline
++ * without saved the old R2 and load the new R2.
+  */
+-int livepatch_create_stub(struct ppc64_stub_entry *entry,
+-			  unsigned long addr,
+-			  struct module *me)
++static int livepatch_create_bstub(struct ppc64_klp_bstub_entry *entry,
++				  unsigned long addr,
++				  struct module *me)
+ {
+ 	long reladdr;
+-	unsigned long my_r2 = me ? me->arch.toc : kernel_toc_addr();
+-
+-	memcpy(entry->jump, ppc64_stub_insns, sizeof(ppc64_stub_insns));
++	unsigned long my_r2;
++	unsigned long stub_start, stub_end, stub_size;
+ 
+ 	/* Stub uses address relative to r2. */
++	my_r2 = me ? me->arch.toc : kernel_toc_addr();
+ 	reladdr = (unsigned long)entry - my_r2;
+ 	if (reladdr > 0x7FFFFFFF || reladdr < -(0x80000000L)) {
+-		pr_err("%s: Address %p of stub out of range of %p.\n",
+-		       me->name, (void *)reladdr, (void *)my_r2);
++		pr_err("%s: Address %p of jump stub out of range of %p.\n",
++		       me ? me->name : "kernel",
++		       (void *)reladdr, (void *)my_r2);
+ 		return 0;
+ 	}
+ 
+-	pr_debug("Stub %p get data from reladdr 0x%lx\n", entry, reladdr);
++	if (entry->magic != BRANCH_STUB_MAGIC) {
++		stub_start = ppc_function_entry((void *)livepatch_branch_stub);
++		stub_end = ppc_function_entry((void *)livepatch_branch_stub_end);
++		stub_size = stub_end - stub_start;
++		memcpy(entry->jump, (u32 *)stub_start, stub_size);
+ 
+-	entry->jump[0] |= PPC_HA(reladdr);
+-	entry->jump[1] |= PPC_LO(reladdr);
+-	entry->funcdata = func_desc(addr);
++		entry->jump[0] |= PPC_HA(reladdr);
++		entry->jump[1] |= PPC_LO(reladdr);
++		entry->magic = BRANCH_STUB_MAGIC;
++	}
++	entry->trampoline = addr;
++
++	pr_debug("Create livepatch branch stub 0x%px with reladdr 0x%lx r2 0x%lx to trampoline 0x%lx\n",
++		(void *)entry, reladdr, my_r2, addr);
+ 
+ 	return 1;
+ }
++
++#ifdef PPC64_ELF_ABI_v1
++static void livepatch_create_btramp(struct ppc64_klp_btramp_entry *entry,
++			      unsigned long addr,
++			      struct module *me)
++{
++	unsigned long reladdr, tramp_start, tramp_end, tramp_size;
++
++	tramp_start = ppc_function_entry((void *)livepatch_branch_trampoline);
++	tramp_end = ppc_function_entry((void *)livepatch_branch_trampoline_end);
++	tramp_size = tramp_end - tramp_start;
++
++	if (entry->magic != BRANCH_TRAMPOLINE_MAGIC) {
++		reladdr = (unsigned long)entry->saved_entry;
++
++		memcpy(entry->jump, (u32 *)tramp_start, tramp_size);
++
++		entry->jump[3] |= PPC_LIVEPATCH_HIGHEST(reladdr);
++		entry->jump[4] |= PPC_LIVEPATCH_HIGHER(reladdr);
++		entry->jump[6] |= PPC_LIVEPATCH_HIGH(reladdr);
++		entry->jump[7] |= PPC_LIVEPATCH_LOW(reladdr);
++
++		entry->magic = BRANCH_TRAMPOLINE_MAGIC;
++	}
++	entry->funcdata = func_desc(addr);
++
++	flush_icache_range((unsigned long)entry, (unsigned long)entry + tramp_size);
++
++	pr_debug("Create livepatch trampoline 0x%px+%lu/0x%lx to 0x%lx/0x%lx/%pS\n",
++		(void *)entry, tramp_size, (unsigned long)entry->saved_entry,
++		addr, ppc_function_entry((void *)addr),
++		(void *)ppc_function_entry((void *)addr));
++}
++#endif
++
++int livepatch_create_branch(unsigned long pc,
++			    unsigned long trampoline,
++			    unsigned long addr,
++			    struct module *me)
++{
++#ifdef PPC64_ELF_ABI_v1
++	/* Create trampoline to addr(new func) */
++	livepatch_create_btramp((struct ppc64_klp_btramp_entry *)trampoline, addr, me);
++#else
++	trampoline = addr;
++#endif
++
++	/* Create stub to trampoline */
++	if (!livepatch_create_bstub((struct ppc64_klp_bstub_entry *)pc, trampoline, me))
++		return -EINVAL;
++
++	return 0;
++}
+ #endif
+-- 
+2.26.2
+

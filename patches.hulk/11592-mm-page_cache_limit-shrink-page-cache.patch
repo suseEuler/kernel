@@ -1,0 +1,209 @@
+From 7be2f4c4fdd7938f161ff6e43a0c60d9c9412a62 Mon Sep 17 00:00:00 2001
+From: Chen Wandun <chenwandun@huawei.com>
+Date: Mon, 29 Nov 2021 16:28:33 +0800
+Subject: [PATCH] mm/page_cache_limit: shrink page cache
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 7be2f4c4fdd7938f161ff6e43a0c60d9c9412a62
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4HOXK
+
+------------------------------------------
+
+Add basic shrink page logical. Slab pages and anonymous page
+will not be reclaim, besides reclaim behavior follows the
+following ruls:
+
+1. reclaim pages that dont need unmap first
+2. reclaim pages that nedd unmap second
+3. reclaim dirty page at last
+
+Signed-off-by: Chen Wandun <chenwandun@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/page_cache_limit.h |  9 ++++++
+ mm/page_cache_limit.c            | 27 +++++++++++++---
+ mm/vmscan.c                      | 53 ++++++++++++++++++++++++++++++--
+ 3 files changed, 83 insertions(+), 6 deletions(-)
+
+diff --git a/include/linux/page_cache_limit.h b/include/linux/page_cache_limit.h
+index 98f12734114b..e4ef5919cb92 100644
+--- a/include/linux/page_cache_limit.h
++++ b/include/linux/page_cache_limit.h
+@@ -2,12 +2,21 @@
+ #define _PAGECACHE_H
+ 
+ #ifdef CONFIG_SHRINK_PAGECACHE
++enum page_cache_reclaim_flag {
++	PAGE_CACHE_RECLAIM_NO_UNMAP,
++	PAGE_CACHE_RECLAIM_UNMAP,
++	PAGE_CACHE_RECLAIM_WRITEPAGE,
++	PAGE_CACHE_RECLAIM_NR_FLAGS,
++};
++
+ extern int pagecache_reclaim_enable;
+ extern int pagecache_limit_ratio;
+ extern int pagecache_reclaim_ratio;
+ 
+ int proc_page_cache_limit(struct ctl_table *table, int write,
+ 		void __user *buffer, size_t *lenp, loff_t *ppos);
++unsigned long __shrink_node_page_cache(int nid, gfp_t mask,
++		unsigned long nr_to_reclaim, enum page_cache_reclaim_flag flag);
+ #else
+ #endif
+ 
+diff --git a/mm/page_cache_limit.c b/mm/page_cache_limit.c
+index 33164e19cfa2..1581334429e1 100644
+--- a/mm/page_cache_limit.c
++++ b/mm/page_cache_limit.c
+@@ -4,6 +4,8 @@
+ #include <linux/kthread.h>
+ #include <linux/module.h>
+ #include <linux/err.h>
++#include <linux/swap.h>
++#include <linux/page_cache_limit.h>
+ 
+ int pagecache_reclaim_enable;
+ int pagecache_limit_ratio;
+@@ -142,14 +144,31 @@ static unsigned long node_nr_page_reclaim(int nid)
+ 	return nr_to_reclaim;
+ }
+ 
+-static void shrink_node_page_cache(int nid)
++static void shrink_node_page_cache(int nid, gfp_t mask)
+ {
++	int i;
+ 	unsigned long nr_to_reclaim;
++	unsigned long nr_reclaimed;
++	enum page_cache_reclaim_flag flag;
+ 
+ 	nr_to_reclaim = node_nr_page_reclaim(nid);
++	if (nr_to_reclaim <= 0)
++		return;
++
++	flag = 0;
++	for (i = PAGE_CACHE_RECLAIM_NO_UNMAP;
++			i < PAGE_CACHE_RECLAIM_NR_FLAGS; i++) {
++		nr_reclaimed = __shrink_node_page_cache(nid, mask, nr_to_reclaim, flag);
++		nr_to_reclaim -= nr_reclaimed;
++
++		if (nr_to_reclaim <= 0)
++			break;
++
++		flag |= i;
++	}
+ }
+ 
+-static void shrink_page_cache(void)
++static void shrink_page_cache(gfp_t mask)
+ {
+ 	int nid;
+ 
+@@ -157,7 +176,7 @@ static void shrink_page_cache(void)
+ 		return;
+ 
+ 	for_each_node_state(nid, N_MEMORY)
+-		shrink_node_page_cache(nid);
++		shrink_node_page_cache(nid, mask);
+ }
+ 
+ static DECLARE_COMPLETION(setup_done);
+@@ -173,7 +192,7 @@ static int pagecache_limitd(void *arg)
+ 	set_freezable();
+ 	for (;;) {
+ 		try_to_freeze();
+-		shrink_page_cache();
++		shrink_page_cache(GFP_KERNEL | __GFP_HIGHMEM);
+ 
+ 		prepare_to_wait(pagecache_limitd_wait_queue[nid], &wait,
+ 				TASK_INTERRUPTIBLE);
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 718840df14e1..732356256b26 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -64,6 +64,10 @@
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/vmscan.h>
+ 
++#ifdef CONFIG_SHRINK_PAGECACHE
++#include <linux/page_cache_limit.h>
++#endif
++
+ struct scan_control {
+ 	/* How many pages shrink_list() should reclaim */
+ 	unsigned long nr_to_reclaim;
+@@ -124,6 +128,9 @@ struct scan_control {
+ 	/* The file pages on the current node are dangerously low */
+ 	unsigned int file_is_tiny:1;
+ 
++	/* can't shrink slab pages */
++	unsigned int no_shrink_slab:1;
++
+ 	/* Allocation order */
+ 	s8 order;
+ 
+@@ -2873,8 +2880,9 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
+ 
+ 		shrink_lruvec(lruvec, sc);
+ 
+-		shrink_slab(sc->gfp_mask, pgdat->node_id, memcg,
+-			    sc->priority);
++		if (!sc->no_shrink_slab)
++			shrink_slab(sc->gfp_mask, pgdat->node_id, memcg,
++				    sc->priority);
+ 
+ 		/* Record the group's reclaim efficiency */
+ 		vmpressure(sc->gfp_mask, memcg, false,
+@@ -4586,3 +4594,44 @@ struct page *get_page_from_vaddr(struct mm_struct *mm, unsigned long vaddr)
+ 	return page;
+ }
+ EXPORT_SYMBOL_GPL(get_page_from_vaddr);
++
++#ifdef CONFIG_SHRINK_PAGECACHE
++/*
++ * return the number of reclaimed pages
++ */
++unsigned long __shrink_node_page_cache(int nid, gfp_t mask, unsigned long nr_to_reclaim,
++			     enum page_cache_reclaim_flag reclaim_flag)
++{
++	struct scan_control sc = {
++		.nr_to_reclaim = nr_to_reclaim,
++		.gfp_mask = mask,
++		.may_swap = 0,
++		.may_unmap = reclaim_flag | PAGE_CACHE_RECLAIM_UNMAP,
++		.may_writepage = reclaim_flag | PAGE_CACHE_RECLAIM_WRITEPAGE,
++		.target_mem_cgroup = NULL,
++		.priority = DEF_PRIORITY,
++		.reclaim_idx = MAX_NR_ZONES,
++		.no_shrink_slab = 1,
++	};
++
++	struct zonelist *zonelist = node_zonelist(nid, __GFP_THISNODE);
++	struct reclaim_state *old_rs = current->reclaim_state;
++	unsigned long nr_reclaimed;
++	unsigned int noreclaim_flag;
++
++	if (!(mask & __GFP_RECLAIM))
++		return 0;
++
++	noreclaim_flag = memalloc_noreclaim_save();
++	fs_reclaim_acquire(sc.gfp_mask);
++	current->reclaim_state = NULL;
++
++	nr_reclaimed = do_try_to_free_pages(zonelist, &sc);
++
++	current->reclaim_state = old_rs;
++	fs_reclaim_release(sc.gfp_mask);
++	memalloc_noreclaim_restore(noreclaim_flag);
++
++	return nr_reclaimed;
++}
++#endif
+-- 
+2.26.2
+

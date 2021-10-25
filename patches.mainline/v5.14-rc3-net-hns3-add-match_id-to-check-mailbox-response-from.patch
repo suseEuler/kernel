@@ -1,0 +1,104 @@
+From 4671042f1ef0d37137884811afcc4ae67685ce07 Mon Sep 17 00:00:00 2001
+From: Peng Li <lipeng321@huawei.com>
+Date: Mon, 19 Jul 2021 17:13:06 +0800
+Subject: [PATCH] net: hns3: add match_id to check mailbox response from PF to
+Git-commit: 4671042f1ef0d37137884811afcc4ae67685ce07
+Patch-mainline: v5.14-rc3
+References: bsn#12
+
+ VF
+
+When VF need response from PF, VF will wait (1us - 1s) to receive
+the response, or it will wait timeout and the VF action fails.
+If VF do not receive response in 1st action because timeout,
+the 2nd action may receive response for the 1st action, and get
+incorrect response data.VF must reciveve the right response from
+PF,or it will cause unexpected error.
+
+This patch adds match_id to check mailbox response from PF to VF,
+to make sure VF get the right response:
+1. The message sent from VF was labelled with match_id which was a
+unique 16-bit non-zero value.
+2. The response sent from PF will label with match_id which got from
+the request.
+3. The VF uses the match_id to match request and response message.
+
+This scheme depends on PF driver supports match_id, if PF driver doesn't
+support then VF will uses the original scheme.
+
+Signed-off-by: Peng Li <lipeng321@huawei.com>
+Signed-off-by: Guangbin Huang <huangguangbin2@huawei.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ .../net/ethernet/hisilicon/hns3/hclge_mbx.h   |  1 +
+ .../hisilicon/hns3/hns3vf/hclgevf_mbx.c       | 19 +++++++++++++++++++
+ 2 files changed, 20 insertions(+)
+
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hclge_mbx.h b/drivers/net/ethernet/hisilicon/hns3/hclge_mbx.h
+index 56b573e47072..aa86a81c8f4a 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hclge_mbx.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hclge_mbx.h
+@@ -98,6 +98,7 @@ struct hclgevf_mbx_resp_status {
+ 	u32 origin_mbx_msg;
+ 	bool received_resp;
+ 	int resp_status;
++	u16 match_id;
+ 	u8 additional_info[HCLGE_MBX_MAX_RESP_DATA_SIZE];
+ };
+ 
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_mbx.c b/drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_mbx.c
+index 9b17735b9f4c..772b2f8acd2e 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_mbx.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_mbx.c
+@@ -13,6 +13,7 @@ static int hclgevf_resp_to_errno(u16 resp_code)
+ 	return resp_code ? -resp_code : 0;
+ }
+ 
++#define HCLGEVF_MBX_MATCH_ID_START	1
+ static void hclgevf_reset_mbx_resp_status(struct hclgevf_dev *hdev)
+ {
+ 	/* this function should be called with mbx_resp.mbx_mutex held
+@@ -21,6 +22,10 @@ static void hclgevf_reset_mbx_resp_status(struct hclgevf_dev *hdev)
+ 	hdev->mbx_resp.received_resp  = false;
+ 	hdev->mbx_resp.origin_mbx_msg = 0;
+ 	hdev->mbx_resp.resp_status    = 0;
++	hdev->mbx_resp.match_id++;
++	/* Update match_id and ensure the value of match_id is not zero */
++	if (hdev->mbx_resp.match_id == 0)
++		hdev->mbx_resp.match_id = HCLGEVF_MBX_MATCH_ID_START;
+ 	memset(hdev->mbx_resp.additional_info, 0, HCLGE_MBX_MAX_RESP_DATA_SIZE);
+ }
+ 
+@@ -115,6 +120,7 @@ int hclgevf_send_mbx_msg(struct hclgevf_dev *hdev,
+ 	if (need_resp) {
+ 		mutex_lock(&hdev->mbx_resp.mbx_mutex);
+ 		hclgevf_reset_mbx_resp_status(hdev);
++		req->match_id = hdev->mbx_resp.match_id;
+ 		status = hclgevf_cmd_send(&hdev->hw, &desc, 1);
+ 		if (status) {
+ 			dev_err(&hdev->pdev->dev,
+@@ -211,6 +217,19 @@ void hclgevf_mbx_handler(struct hclgevf_dev *hdev)
+ 				resp->additional_info[i] = *temp;
+ 				temp++;
+ 			}
++
++			/* If match_id is not zero, it means PF support
++			 * match_id. If the match_id is right, VF get the
++			 * right response, otherwise ignore the response.
++			 * Driver will clear hdev->mbx_resp when send
++			 * next message which need response.
++			 */
++			if (req->match_id) {
++				if (req->match_id == resp->match_id)
++					resp->received_resp = true;
++			} else {
++				resp->received_resp = true;
++			}
+ 			break;
+ 		case HCLGE_MBX_LINK_STAT_CHANGE:
+ 		case HCLGE_MBX_ASSERTING_RESET:
+-- 
+2.31.1
+

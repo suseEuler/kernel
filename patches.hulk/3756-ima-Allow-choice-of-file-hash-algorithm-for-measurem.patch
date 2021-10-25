@@ -1,0 +1,214 @@
+From 6214e186942621cb72c20ed00f17b05ec9fa23f5 Mon Sep 17 00:00:00 2001
+From: Roberto Sassu <roberto.sassu@huawei.com>
+Date: Wed, 3 Mar 2021 08:43:53 +0100
+Subject: [PATCH] ima: Allow choice of file hash algorithm for measurement and
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 6214e186942621cb72c20ed00f17b05ec9fa23f5
+
+ audit
+
+hulk inclusion
+category: feature
+feature: IMA Digest Lists extension
+bugzilla: 46797
+
+-------------------------------------------------
+
+IMA reads the hash algorithm from security.ima, if exists, so that a
+signature can be verified with the correct file digest.
+
+This patch moves ima_read_xattr() and ima_get_hash_algo() to ima_main.c, so
+that the file digest in the measurement list or in the audit logs can be
+compared with a reference value calculated with a specific hash algorithm.
+
+In addition, this patch also allows the usage of security.ima with type
+EVM_IMA_XATTR_DIGSIG and signature length zero, so that the xattr can be
+used just to specify the hash algorithm.
+
+Signed-off-by: Roberto Sassu <roberto.sassu@huawei.com>
+Signed-off-by: Tianxing Zhang <zhangtianxing3@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ security/integrity/ima/ima.h          | 17 --------
+ security/integrity/ima/ima_appraise.c | 56 ++-------------------------
+ security/integrity/ima/ima_main.c     | 52 +++++++++++++++++++++++++
+ 3 files changed, 56 insertions(+), 69 deletions(-)
+
+diff --git a/security/integrity/ima/ima.h b/security/integrity/ima/ima.h
+index 7c3947ad3773..9431c380075d 100644
+--- a/security/integrity/ima/ima.h
++++ b/security/integrity/ima/ima.h
+@@ -312,11 +312,6 @@ int ima_must_appraise(struct inode *inode, int mask, enum ima_hooks func);
+ void ima_update_xattr(struct integrity_iint_cache *iint, struct file *file);
+ enum integrity_status ima_get_cache_status(struct integrity_iint_cache *iint,
+ 					   enum ima_hooks func);
+-enum hash_algo ima_get_hash_algo(struct evm_ima_xattr_data *xattr_value,
+-				 int xattr_len);
+-int ima_read_xattr(struct dentry *dentry,
+-		   struct evm_ima_xattr_data **xattr_value);
+-
+ #else
+ static inline int ima_check_blacklist(struct integrity_iint_cache *iint,
+ 				      const struct modsig *modsig, int pcr)
+@@ -353,18 +348,6 @@ static inline enum integrity_status ima_get_cache_status(struct integrity_iint_c
+ 	return INTEGRITY_UNKNOWN;
+ }
+ 
+-static inline enum hash_algo
+-ima_get_hash_algo(struct evm_ima_xattr_data *xattr_value, int xattr_len)
+-{
+-	return ima_hash_algo;
+-}
+-
+-static inline int ima_read_xattr(struct dentry *dentry,
+-				 struct evm_ima_xattr_data **xattr_value)
+-{
+-	return 0;
+-}
+-
+ #endif /* CONFIG_IMA_APPRAISE */
+ 
+ #ifdef CONFIG_IMA_APPRAISE_MODSIG
+diff --git a/security/integrity/ima/ima_appraise.c b/security/integrity/ima/ima_appraise.c
+index c6c9807178d2..2e3e4c51b7aa 100644
+--- a/security/integrity/ima/ima_appraise.c
++++ b/security/integrity/ima/ima_appraise.c
+@@ -169,58 +169,6 @@ static void ima_cache_flags(struct integrity_iint_cache *iint,
+ 	}
+ }
+ 
+-enum hash_algo ima_get_hash_algo(struct evm_ima_xattr_data *xattr_value,
+-				 int xattr_len)
+-{
+-	struct signature_v2_hdr *sig;
+-	enum hash_algo ret;
+-
+-	if (!xattr_value || xattr_len < 2)
+-		/* return default hash algo */
+-		return ima_hash_algo;
+-
+-	switch (xattr_value->type) {
+-	case EVM_IMA_XATTR_DIGSIG:
+-		sig = (typeof(sig))xattr_value;
+-		if (sig->version != 2 || xattr_len <= sizeof(*sig))
+-			return ima_hash_algo;
+-		return sig->hash_algo;
+-		break;
+-	case IMA_XATTR_DIGEST_NG:
+-		/* first byte contains algorithm id */
+-		ret = xattr_value->data[0];
+-		if (ret < HASH_ALGO__LAST)
+-			return ret;
+-		break;
+-	case IMA_XATTR_DIGEST:
+-		/* this is for backward compatibility */
+-		if (xattr_len == 21) {
+-			unsigned int zero = 0;
+-			if (!memcmp(&xattr_value->data[16], &zero, 4))
+-				return HASH_ALGO_MD5;
+-			else
+-				return HASH_ALGO_SHA1;
+-		} else if (xattr_len == 17)
+-			return HASH_ALGO_MD5;
+-		break;
+-	}
+-
+-	/* return default hash algo */
+-	return ima_hash_algo;
+-}
+-
+-int ima_read_xattr(struct dentry *dentry,
+-		   struct evm_ima_xattr_data **xattr_value)
+-{
+-	ssize_t ret;
+-
+-	ret = vfs_getxattr_alloc(dentry, XATTR_NAME_IMA, (char **)xattr_value,
+-				 0, GFP_NOFS);
+-	if (ret == -EOPNOTSUPP)
+-		ret = 0;
+-	return ret;
+-}
+-
+ /*
+  * xattr_verify - verify xattr digest or signature
+  *
+@@ -387,6 +335,10 @@ int ima_appraise_measurement(enum ima_hooks func,
+ 	if (!(inode->i_opflags & IOP_XATTR) && !try_modsig)
+ 		return INTEGRITY_UNKNOWN;
+ 
++	if (xattr_value && xattr_value->type == EVM_IMA_XATTR_DIGSIG &&
++	    xattr_len == sizeof(struct signature_v2_hdr))
++		rc = -ENODATA;
++
+ 	/* If reading the xattr failed and there's no modsig, error out. */
+ 	if (rc <= 0 && !try_modsig) {
+ 		if (rc && rc != -ENODATA)
+diff --git a/security/integrity/ima/ima_main.c b/security/integrity/ima/ima_main.c
+index 2d1af8899cab..66e39dba6dfb 100644
+--- a/security/integrity/ima/ima_main.c
++++ b/security/integrity/ima/ima_main.c
+@@ -147,6 +147,58 @@ static void ima_rdwr_violation_check(struct file *file,
+ 				  "invalid_pcr", "open_writers");
+ }
+ 
++static enum hash_algo ima_get_hash_algo(struct evm_ima_xattr_data *xattr_value,
++					int xattr_len)
++{
++	struct signature_v2_hdr *sig;
++	enum hash_algo ret;
++
++	if (!xattr_value || xattr_len < 2)
++		/* return default hash algo */
++		return ima_hash_algo;
++
++	switch (xattr_value->type) {
++	case EVM_IMA_XATTR_DIGSIG:
++		sig = (typeof(sig))xattr_value;
++		if (sig->version != 2 || xattr_len < sizeof(*sig))
++			return ima_hash_algo;
++		return sig->hash_algo;
++		break;
++	case IMA_XATTR_DIGEST_NG:
++		/* first byte contains algorithm id */
++		ret = xattr_value->data[0];
++		if (ret < HASH_ALGO__LAST)
++			return ret;
++		break;
++	case IMA_XATTR_DIGEST:
++		/* this is for backward compatibility */
++		if (xattr_len == 21) {
++			unsigned int zero = 0;
++			if (!memcmp(&xattr_value->data[16], &zero, 4))
++				return HASH_ALGO_MD5;
++			else
++				return HASH_ALGO_SHA1;
++		} else if (xattr_len == 17)
++			return HASH_ALGO_MD5;
++		break;
++	}
++
++	/* return default hash algo */
++	return ima_hash_algo;
++}
++
++static int ima_read_xattr(struct dentry *dentry,
++			  struct evm_ima_xattr_data **xattr_value)
++{
++	ssize_t ret;
++
++	ret = vfs_getxattr_alloc(dentry, XATTR_NAME_IMA, (char **)xattr_value,
++				 0, GFP_NOFS);
++	if (ret == -EOPNOTSUPP)
++		ret = 0;
++	return ret;
++}
++
+ static void ima_check_last_writer(struct integrity_iint_cache *iint,
+ 				  struct inode *inode, struct file *file)
+ {
+-- 
+2.26.2
+

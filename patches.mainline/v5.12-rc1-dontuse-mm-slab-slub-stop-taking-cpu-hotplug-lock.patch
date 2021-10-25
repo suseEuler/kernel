@@ -1,0 +1,114 @@
+From 59450bbc12bee1c4e5dd25e6aa5d6a45a7bd6e81 Mon Sep 17 00:00:00 2001
+From: Vlastimil Babka <vbabka@suse.cz>
+Date: Wed, 24 Feb 2021 12:01:15 -0800
+Subject: [PATCH] mm, slab, slub: stop taking cpu hotplug lock
+Git-commit: 59450bbc12bee1c4e5dd25e6aa5d6a45a7bd6e81
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+SLAB has been using get/put_online_cpus() around creating, destroying and
+shrinking kmem caches since 95402b382901 ("cpu-hotplug: replace
+per-subsystem mutexes with get_online_cpus()") in 2008, which is supposed
+to be replacing a private mutex (cache_chain_mutex, called slab_mutex
+today) with system-wide mechanism, but in case of SLAB it's in fact used
+in addition to the existing mutex, without explanation why.
+
+SLUB appears to have avoided the cpu hotplug lock initially, but gained it
+due to common code unification, such as 20cea9683ecc ("mm, sl[aou]b: Move
+kmem_cache_create mutex handling to common code").
+
+Regardless of the history, checking if the hotplug lock is actually needed
+today suggests that it's not, and therefore it's better to avoid this
+system-wide lock and the ordering this imposes wrt other locks (such as
+slab_mutex).
+
+Specifically, in SLAB we have for_each_online_cpu() in do_tune_cpucache()
+protected by slab_mutex, and cpu hotplug callbacks that also take the
+slab_mutex, which is also taken by the common slab function that currently
+also take the hotplug lock.  Thus the slab_mutex protection should be
+sufficient.  Also per-cpu array caches are allocated for each possible
+cpu, so not affected by their online/offline state.
+
+In SLUB we have for_each_online_cpu() in functions that show statistics
+and are already unprotected today, as racing with hotplug is not harmful.
+Otherwise SLUB relies on percpu allocator.  The slub_cpu_dead() hotplug
+callback takes the slab_mutex.
+
+To sum up, this patch removes get/put_online_cpus() calls from slab as it
+should be safe without further adjustments.
+
+Link: https://lkml.kernel.org/r/20210113131634.3671-4-vbabka@suse.cz
+Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Pekka Enberg <penberg@kernel.org>
+Cc: Qian Cai <cai@redhat.com>
+Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ mm/slab_common.c | 10 ----------
+ 1 file changed, 10 deletions(-)
+
+diff --git a/mm/slab_common.c b/mm/slab_common.c
+index d73bea53f759..9633fa1bbbfd 100644
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@ -309,8 +309,6 @@ kmem_cache_create_usercopy(const char *name,
+ 	const char *cache_name;
+ 	int err;
+ 
+-	get_online_cpus();
+-
+ 	mutex_lock(&slab_mutex);
+ 
+ 	err = kmem_cache_sanity_check(name, size);
+@@ -359,8 +357,6 @@ kmem_cache_create_usercopy(const char *name,
+ out_unlock:
+ 	mutex_unlock(&slab_mutex);
+ 
+-	put_online_cpus();
+-
+ 	if (err) {
+ 		if (flags & SLAB_PANIC)
+ 			panic("kmem_cache_create: Failed to create slab '%s'. Error %d\n",
+@@ -484,8 +480,6 @@ void kmem_cache_destroy(struct kmem_cache *s)
+ 	if (unlikely(!s))
+ 		return;
+ 
+-	get_online_cpus();
+-
+ 	mutex_lock(&slab_mutex);
+ 
+ 	s->refcount--;
+@@ -500,8 +494,6 @@ void kmem_cache_destroy(struct kmem_cache *s)
+ 	}
+ out_unlock:
+ 	mutex_unlock(&slab_mutex);
+-
+-	put_online_cpus();
+ }
+ EXPORT_SYMBOL(kmem_cache_destroy);
+ 
+@@ -518,12 +510,10 @@ int kmem_cache_shrink(struct kmem_cache *cachep)
+ {
+ 	int ret;
+ 
+-	get_online_cpus();
+ 
+ 	kasan_cache_shrink(cachep);
+ 	ret = __kmem_cache_shrink(cachep);
+ 
+-	put_online_cpus();
+ 	return ret;
+ }
+ EXPORT_SYMBOL(kmem_cache_shrink);
+-- 
+2.31.1
+

@@ -1,0 +1,86 @@
+From 51d113c3be09ff5b916576b1109daf413549cacc Mon Sep 17 00:00:00 2001
+From: Jean-Philippe Brucker <jean-philippe@linaro.org>
+Date: Fri, 22 Jan 2021 16:10:55 +0100
+Subject: [PATCH] iommu/arm-smmu-v3: Make BTM optional for SVA
+Git-commit: 51d113c3be09ff5b916576b1109daf413549cacc
+Patch-mainline: v5.12-rc2
+References: bsn#12
+openEuler-commit: 8399b0bdd02a24e4f2617570bdb3cf6c06729df2
+
+When BTM isn't supported by the SMMU, send invalidations on the
+command queue.
+
+Reviewed-by: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+Signed-off-by: Jean-Philippe Brucker <jean-philippe@linaro.org>
+Link: https://lore.kernel.org/r/20210122151054.2833521-3-jean-philippe@linaro.org
+Signed-off-by: Will Deacon <will@kernel.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3-sva.c |   10 +++++++---
+ drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c     |   15 +++++++++++++++
+ drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h     |    3 +++
+ 3 files changed, 25 insertions(+), 3 deletions(-)
+
+--- a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3-sva.c
++++ b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3-sva.c
+@@ -182,9 +182,13 @@ static void arm_smmu_mm_invalidate_range
+ 					 unsigned long start, unsigned long end)
+ {
+ 	struct arm_smmu_mmu_notifier *smmu_mn = mn_to_smmu(mn);
++	struct arm_smmu_domain *smmu_domain = smmu_mn->domain;
++	size_t size = end - start + 1;
+ 
+-	arm_smmu_atc_inv_domain(smmu_mn->domain, mm->pasid, start,
+-				end - start + 1);
++	if (!(smmu_domain->smmu->features & ARM_SMMU_FEAT_BTM))
++		arm_smmu_tlb_inv_range_asid(start, size, smmu_mn->cd->asid,
++					    PAGE_SIZE, false, smmu_domain);
++	arm_smmu_atc_inv_domain(smmu_domain, mm->pasid, start, size);
+ }
+ 
+ static void arm_smmu_mm_release(struct mmu_notifier *mn, struct mm_struct *mm)
+@@ -391,7 +395,7 @@ bool arm_smmu_sva_supported(struct arm_s
+ 	unsigned long reg, fld;
+ 	unsigned long oas;
+ 	unsigned long asid_bits;
+-	u32 feat_mask = ARM_SMMU_FEAT_BTM | ARM_SMMU_FEAT_COHERENCY;
++	u32 feat_mask = ARM_SMMU_FEAT_COHERENCY;
+ 
+ 	if (vabits_actual == 52)
+ 		feat_mask |= ARM_SMMU_FEAT_VAX;
+--- a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
++++ b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+@@ -1743,6 +1743,21 @@ static void arm_smmu_tlb_inv_range_domai
+ 	arm_smmu_atc_inv_domain(smmu_domain, 0, iova, size);
+ }
+ 
++void arm_smmu_tlb_inv_range_asid(unsigned long iova, size_t size, int asid,
++				 size_t granule, bool leaf,
++				 struct arm_smmu_domain *smmu_domain)
++{
++	struct arm_smmu_cmdq_ent cmd = {
++		.opcode	= CMDQ_OP_TLBI_NH_VA,
++		.tlbi = {
++			.asid	= asid,
++			.leaf	= leaf,
++		},
++	};
++
++	__arm_smmu_tlb_inv_range(&cmd, iova, size, granule, smmu_domain);
++}
++
+ static void arm_smmu_tlb_inv_page_nosync(struct iommu_iotlb_gather *gather,
+ 					 unsigned long iova, size_t granule,
+ 					 void *cookie)
+--- a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h
++++ b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h
+@@ -694,6 +694,9 @@ extern struct arm_smmu_ctx_desc quiet_cd
+ int arm_smmu_write_ctx_desc(struct arm_smmu_domain *smmu_domain, int ssid,
+ 			    struct arm_smmu_ctx_desc *cd);
+ void arm_smmu_tlb_inv_asid(struct arm_smmu_device *smmu, u16 asid);
++void arm_smmu_tlb_inv_range_asid(unsigned long iova, size_t size, int asid,
++				 size_t granule, bool leaf,
++				 struct arm_smmu_domain *smmu_domain);
+ bool arm_smmu_free_asid(struct arm_smmu_ctx_desc *cd);
+ int arm_smmu_atc_inv_domain(struct arm_smmu_domain *smmu_domain, int ssid,
+ 			    unsigned long iova, size_t size);

@@ -1,0 +1,125 @@
+From c07aea3ef4d4076f18f567b98ed01e082e02ed51 Mon Sep 17 00:00:00 2001
+From: Matteo Croce <mcroce@microsoft.com>
+Date: Mon, 7 Jun 2021 21:02:36 +0200
+Subject: [PATCH] mm: add a signature in struct page
+Git-commit: c07aea3ef4d4076f18f567b98ed01e082e02ed51
+Patch-mainline: v5.14-rc1
+References: bsn#12
+
+
+This is needed by the page_pool to avoid recycling a page not allocated
+via page_pool.
+
+The page->signature field is aliased to page->lru.next and
+page->compound_head, but it can't be set by mistake because the
+signature value is a bad pointer, and can't trigger a false positive
+in PageTail() because the last bit is 0.
+
+Co-developed-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Signed-off-by: Matteo Croce <mcroce@microsoft.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Chenxi Mao <chenxi.mao@suse.com>
+---
+ include/linux/mm.h       | 11 ++++++-----
+ include/linux/mm_types.h |  7 +++++++
+ include/linux/poison.h   |  3 +++
+ net/core/page_pool.c     |  6 ++++++
+ 4 files changed, 22 insertions(+), 5 deletions(-)
+
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -1577,10 +1577,11 @@ struct address_space *page_mapping_file(
+ static inline bool page_is_pfmemalloc(const struct page *page)
+ {
+ 	/*
+-	 * Page index cannot be this large so this must be
+-	 * a pfmemalloc page.
++	 * lru.next has bit 1 set if the page is allocated from the
++	 * pfmemalloc reserves.  Callers may simply overwrite it if
++	 * they do not need to preserve that information.
+ 	 */
+-	return page->index == -1UL;
++	return (uintptr_t)page->lru.next & BIT(1);
+ }
+ 
+ /*
+@@ -1589,12 +1590,12 @@ static inline bool page_is_pfmemalloc(co
+  */
+ static inline void set_page_pfmemalloc(struct page *page)
+ {
+-	page->index = -1UL;
++	page->lru.next = (void *)BIT(1);
+ }
+ 
+ static inline void clear_page_pfmemalloc(struct page *page)
+ {
+-	page->index = 0;
++	page->lru.next = NULL;
+ }
+ 
+ /*
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -97,6 +97,13 @@ struct page {
+ 		};
+ 		struct {	/* page_pool used by netstack */
+ 			/**
++			 * @pp_magic: magic value to avoid recycling non
++			 * page_pool allocated pages.
++			 */
++			unsigned long pp_magic;
++			struct page_pool *pp;
++			unsigned long _pp_mapping_pad;
++			/**
+ 			 * @dma_addr: might require a 64-bit value on
+ 			 * 32-bit architectures.
+ 			 */
+--- a/include/linux/poison.h
++++ b/include/linux/poison.h
+@@ -82,4 +82,7 @@
+ /********** security/ **********/
+ #define KEY_DESTROY		0xbd
+ 
++/********** net/core/page_pool.c **********/
++#define PP_SIGNATURE		(0x40 + POISON_POINTER_DELTA)
++
+ #endif
+--- a/net/core/page_pool.c
++++ b/net/core/page_pool.c
+@@ -17,6 +17,7 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/page-flags.h>
+ #include <linux/mm.h> /* for __put_page() */
++#include <linux/poison.h>
+ 
+ #include <trace/events/page_pool.h>
+ 
+@@ -220,6 +221,9 @@ static struct page *__page_pool_alloc_pa
+ 		put_page(page);
+ 		return NULL;
+ 	}
++
++	page->pp_magic |= PP_SIGNATURE;
++
+ 	/* Track how many pages are held 'in-flight' */
+ 	pool->pages_state_hold_cnt++;
+ 
+@@ -263,6 +267,7 @@ static struct page *__page_pool_alloc_pa
+ 			put_page(page);
+ 			continue;
+ 		}
++		page->pp_magic |= PP_SIGNATURE;
+ 		pool->alloc.cache[pool->alloc.count++] = page;
+ 		/* Track how many pages are held 'in-flight' */
+ 		pool->pages_state_hold_cnt++;
+@@ -341,6 +346,8 @@ void page_pool_release_page(struct page_
+ 			     DMA_ATTR_SKIP_CPU_SYNC);
+ 	page_pool_set_dma_addr(page, 0);
+ skip_dma_unmap:
++	page->pp_magic = 0;
++
+ 	/* This may be the last page returned, releasing the pool, so
+ 	 * it is not safe to reference pool afterwards.
+ 	 */

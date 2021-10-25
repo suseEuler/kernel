@@ -1,0 +1,149 @@
+From 5ddc35530fd0bb88ee400965418d2a7798a5417e Mon Sep 17 00:00:00 2001
+From: Roberto Sassu <roberto.sassu@huawei.com>
+Date: Wed, 3 Mar 2021 08:44:08 +0100
+Subject: [PATCH] ima: Introduce appraise_exec_tcb policy
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 5ddc35530fd0bb88ee400965418d2a7798a5417e
+
+
+hulk inclusion
+category: feature
+feature: IMA Digest Lists extension
+bugzilla: 46797
+
+-------------------------------------------------
+
+This patch introduces a new hard-coded policy to appraise executable code:
+
+appraise func=MODULE_CHECK appraise_type=imasig
+appraise func=FIRMWARE_CHECK appraise_type=imasig
+appraise func=KEXEC_KERNEL_CHECK appraise_type=imasig
+appraise func=POLICY_CHECK appraise_type=imasig
+appraise func=DIGEST_LIST_CHECK appraise_type=imasig
+dont_appraise fsmagic=0x9fa0
+dont_appraise fsmagic=0x62656572
+dont_appraise fsmagic=0x64626720
+dont_appraise fsmagic=0x858458f6
+dont_appraise fsmagic=0x1cd1
+dont_appraise fsmagic=0x42494e4d
+dont_appraise fsmagic=0x73636673
+dont_appraise fsmagic=0xf97cff8c
+dont_appraise fsmagic=0x43415d53
+dont_appraise fsmagic=0x6e736673
+dont_appraise fsmagic=0xde5e81e4
+dont_appraise fsmagic=0x27e0eb
+dont_appraise fsmagic=0x63677270
+appraise func=BPRM_CHECK appraise_type=imasig
+appraise func=MMAP_CHECK appraise_type=imasig
+
+The new policy can be selected by specifying ima_policy=appraise_exec_tcb
+in the kernel command line.
+
+Signed-off-by: Roberto Sassu <roberto.sassu@huawei.com>
+Signed-off-by: Tianxing Zhang <zhangtianxing3@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ .../admin-guide/kernel-parameters.txt         |  5 ++++
+ security/integrity/ima/ima_policy.c           | 28 +++++++++++++++++--
+ 2 files changed, 31 insertions(+), 2 deletions(-)
+
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index 31bfdebd4e75..74a9cd4c09d9 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -1793,6 +1793,11 @@
+ 			of files (eg. kexec kernel image, kernel modules,
+ 			firmware, policy, etc) based on file signatures.
+ 
++			The "appraise_exec_tcb" includes the "secure_boot"
++			policy and additionally includes all programs exec'd and
++			files mmap'd for exec. Files in the tmpfs filesystem are
++			not excluded from appraisal.
++
+ 			The "fail_securely" policy forces file signature
+ 			verification failure also on privileged mounted
+ 			filesystems with the SB_I_UNVERIFIABLE_SIGNATURE
+diff --git a/security/integrity/ima/ima_policy.c b/security/integrity/ima/ima_policy.c
+index 8cebf077d4ab..4cc6edc475b7 100644
+--- a/security/integrity/ima/ima_policy.c
++++ b/security/integrity/ima/ima_policy.c
+@@ -175,6 +175,13 @@ static struct ima_rule_entry default_appraise_rules[] __ro_after_init = {
+ #endif
+ };
+ 
++static struct ima_rule_entry appraise_exec_rules[] __ro_after_init = {
++	{.action = APPRAISE, .func = BPRM_CHECK,
++	 .flags = IMA_FUNC | IMA_DIGSIG_REQUIRED},
++	{.action = APPRAISE, .func = MMAP_CHECK,
++	 .flags = IMA_FUNC | IMA_DIGSIG_REQUIRED},
++};
++
+ static struct ima_rule_entry build_appraise_rules[] __ro_after_init = {
+ #ifdef CONFIG_IMA_APPRAISE_REQUIRE_MODULE_SIGS
+ 	{.action = APPRAISE, .func = MODULE_CHECK,
+@@ -228,6 +235,7 @@ static int __init default_measure_policy_setup(char *str)
+ __setup("ima_tcb", default_measure_policy_setup);
+ 
+ static bool ima_use_appraise_tcb __initdata;
++static bool ima_use_appraise_exec_tcb __initdata;
+ static bool ima_use_secure_boot __initdata;
+ static bool ima_fail_unverifiable_sigs __ro_after_init;
+ static int __init policy_setup(char *str)
+@@ -243,6 +251,8 @@ static int __init policy_setup(char *str)
+ 			ima_policy = EXEC_TCB;
+ 		else if (strcmp(p, "appraise_tcb") == 0)
+ 			ima_use_appraise_tcb = true;
++		else if (strcmp(p, "appraise_exec_tcb") == 0)
++			ima_use_appraise_exec_tcb = true;
+ 		else if (strcmp(p, "secure_boot") == 0)
+ 			ima_use_secure_boot = true;
+ 		else if (strcmp(p, "fail_securely") == 0)
+@@ -731,6 +741,15 @@ static void __init add_rules(struct ima_rule_entry *entries, int count,
+ 					continue;
+ 		}
+ 
++		if (ima_use_appraise_exec_tcb) {
++			if (entries == default_appraise_rules) {
++				if (entries[i].action != DONT_APPRAISE)
++					continue;
++				if ((entries[i].flags & IMA_FSMAGIC) &&
++				    entries[i].fsmagic == TMPFS_MAGIC)
++					continue;
++			}
++		}
+ 		if (policy_rule & IMA_DEFAULT_POLICY)
+ 			list_add_tail(&entries[i].list, &ima_default_rules);
+ 
+@@ -844,7 +863,7 @@ void __init ima_init_policy(void)
+ 	 * Insert the builtin "secure_boot" policy rules requiring file
+ 	 * signatures, prior to other appraise rules.
+ 	 */
+-	if (ima_use_secure_boot)
++	if (ima_use_secure_boot || ima_use_appraise_exec_tcb)
+ 		add_rules(secure_boot_rules, ARRAY_SIZE(secure_boot_rules),
+ 			  IMA_DEFAULT_POLICY);
+ 
+@@ -864,11 +883,16 @@ void __init ima_init_policy(void)
+ 				  IMA_DEFAULT_POLICY | IMA_CUSTOM_POLICY);
+ 	}
+ 
+-	if (ima_use_appraise_tcb)
++	if (ima_use_appraise_tcb || ima_use_appraise_exec_tcb)
+ 		add_rules(default_appraise_rules,
+ 			  ARRAY_SIZE(default_appraise_rules),
+ 			  IMA_DEFAULT_POLICY);
+ 
++	if (ima_use_appraise_exec_tcb)
++		add_rules(appraise_exec_rules,
++			  ARRAY_SIZE(appraise_exec_rules),
++			  IMA_DEFAULT_POLICY);
++
+ 	ima_update_policy_flag();
+ }
+ 
+-- 
+2.26.2
+

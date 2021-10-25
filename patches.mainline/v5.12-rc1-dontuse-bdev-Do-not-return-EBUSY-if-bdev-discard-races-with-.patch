@@ -1,0 +1,59 @@
+From 767630c63bb23acf022adb265574996ca39a4645 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Thu, 7 Jan 2021 16:40:34 +0100
+Subject: [PATCH] bdev: Do not return EBUSY if bdev discard races with write
+Git-commit: 767630c63bb23acf022adb265574996ca39a4645
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+blkdev_fallocate() tries to detect whether a discard raced with an
+overlapping write by calling invalidate_inode_pages2_range(). However
+this check can give both false negatives (when writing using direct IO
+or when writeback already writes out the written pagecache range) and
+false positives (when write is not actually overlapping but ends in the
+same page when blocksize < pagesize). This actually causes issues for
+qemu which is getting confused by EBUSY errors.
+
+Fix the problem by removing this conflicting write detection since it is
+inherently racy and thus of little use anyway.
+
+Reported-by: Maxim Levitsky <mlevitsk@redhat.com>
+CC: "Darrick J. Wong" <darrick.wong@oracle.com>
+Link: https://lore.kernel.org/qemu-devel/20201111153913.41840-1-mlevitsk@redhat.com
+Signed-off-by: Jan Kara <jack@suse.cz>
+Reviewed-by: Maxim Levitsky <mlevitsk@redhat.com>
+Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ fs/block_dev.c | 10 ++++------
+ 1 file changed, 4 insertions(+), 6 deletions(-)
+
+diff --git a/fs/block_dev.c b/fs/block_dev.c
+index 6f5bd9950baf..289c3dd923a4 100644
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@ -1801,13 +1801,11 @@ static long blkdev_fallocate(struct file *file, int mode, loff_t start,
+ 		return error;
+ 
+ 	/*
+-	 * Invalidate again; if someone wandered in and dirtied a page,
+-	 * the caller will be given -EBUSY.  The third argument is
+-	 * inclusive, so the rounding here is safe.
++	 * Invalidate the page cache again; if someone wandered in and dirtied
++	 * a page, we just discard it - userspace has no way of knowing whether
++	 * the write happened before or after discard completing...
+ 	 */
+-	return invalidate_inode_pages2_range(bdev->bd_inode->i_mapping,
+-					     start >> PAGE_SHIFT,
+-					     end >> PAGE_SHIFT);
++	return truncate_bdev_range(bdev, file->f_mode, start, end);
+ }
+ 
+ const struct file_operations def_blk_fops = {
+-- 
+2.31.1
+

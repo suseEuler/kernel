@@ -1,0 +1,186 @@
+From 90cbac0e995dd92f7bcf82f74aa50250bf194a4a Mon Sep 17 00:00:00 2001
+From: Christophe Leroy <christophe.leroy@csgroup.eu>
+Date: Thu, 4 Mar 2021 14:35:09 +0000
+Subject: [PATCH] powerpc: Enable KFENCE for PPC32
+Git-commit: 90cbac0e995dd92f7bcf82f74aa50250bf194a4a
+Patch-mainline: v5.13-rc1
+References: bsn#12
+
+
+Add architecture specific implementation details for KFENCE and enable
+KFENCE for the ppc32 architecture. In particular, this implements the
+required interface in <asm/kfence.h>.
+
+KFENCE requires that attributes for pages from its memory pool can
+individually be set. Therefore, force the Read/Write linear map to be
+mapped at page granularity.
+
+Signed-off-by: Christophe Leroy <christophe.leroy@csgroup.eu>
+Acked-by: Marco Elver <elver@google.com>
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/8dfe1bd2abde26337c1d8c1ad0acfcc82185e0d5.1614868445.git.christophe.leroy@csgroup.eu
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Chenxi Mao <chenxi.mao@suse.com>
+---
+ arch/powerpc/Kconfig              | 13 ++++++------
+ arch/powerpc/include/asm/kfence.h | 33 +++++++++++++++++++++++++++++++
+ arch/powerpc/mm/book3s32/mmu.c    |  2 +-
+ arch/powerpc/mm/fault.c           |  7 ++++++-
+ arch/powerpc/mm/init_32.c         |  3 +++
+ arch/powerpc/mm/mmu_decl.h        |  5 +++++
+ arch/powerpc/mm/nohash/8xx.c      |  4 ++--
+ 7 files changed, 57 insertions(+), 10 deletions(-)
+ create mode 100644 arch/powerpc/include/asm/kfence.h
+
+--- a/arch/powerpc/Kconfig
++++ b/arch/powerpc/Kconfig
+@@ -183,6 +183,7 @@ config PPC
+ 	select HAVE_ARCH_KASAN			if PPC32 && PPC_PAGE_SHIFT <= 14
+ 	select HAVE_ARCH_KASAN_VMALLOC		if PPC32 && PPC_PAGE_SHIFT <= 14
+ 	select HAVE_ARCH_KGDB
++	select HAVE_ARCH_KFENCE			if PPC32
+ 	select HAVE_ARCH_MMAP_RND_BITS
+ 	select HAVE_ARCH_MMAP_RND_COMPAT_BITS	if COMPAT
+ 	select HAVE_ARCH_NVRAM_OPS
+@@ -795,7 +796,7 @@ config THREAD_SHIFT
+ config DATA_SHIFT_BOOL
+ 	bool "Set custom data alignment"
+ 	depends on ADVANCED_OPTIONS
+-	depends on STRICT_KERNEL_RWX || DEBUG_PAGEALLOC
++	depends on STRICT_KERNEL_RWX || DEBUG_PAGEALLOC || KFENCE
+ 	depends on PPC_BOOK3S_32 || (PPC_8xx && !PIN_TLB_DATA && \
+ 				     (!PIN_TLB_TEXT || !STRICT_KERNEL_RWX))
+ 	help
+@@ -808,13 +809,13 @@ config DATA_SHIFT_BOOL
+ config DATA_SHIFT
+ 	int "Data shift" if DATA_SHIFT_BOOL
+ 	default 24 if STRICT_KERNEL_RWX && PPC64
+-	range 17 28 if (STRICT_KERNEL_RWX || DEBUG_PAGEALLOC) && PPC_BOOK3S_32
+-	range 19 23 if (STRICT_KERNEL_RWX || DEBUG_PAGEALLOC) && PPC_8xx
++	range 17 28 if (STRICT_KERNEL_RWX || DEBUG_PAGEALLOC || KFENCE) && PPC_BOOK3S_32
++	range 19 23 if (STRICT_KERNEL_RWX || DEBUG_PAGEALLOC || KFENCE) && PPC_8xx
+ 	default 22 if STRICT_KERNEL_RWX && PPC_BOOK3S_32
+-	default 18 if DEBUG_PAGEALLOC && PPC_BOOK3S_32
++	default 18 if (DEBUG_PAGEALLOC || KFENCE) && PPC_BOOK3S_32
+ 	default 23 if STRICT_KERNEL_RWX && PPC_8xx
+-	default 23 if DEBUG_PAGEALLOC && PPC_8xx && PIN_TLB_DATA
+-	default 19 if DEBUG_PAGEALLOC && PPC_8xx
++	default 23 if (DEBUG_PAGEALLOC || KFENCE) && PPC_8xx && PIN_TLB_DATA
++	default 19 if (DEBUG_PAGEALLOC || KFENCE) && PPC_8xx
+ 	default PPC_PAGE_SHIFT
+ 	help
+ 	  On Book3S 32 (603+), DBATs are used to map kernel text and rodata RO.
+--- /dev/null
++++ b/arch/powerpc/include/asm/kfence.h
+@@ -0,0 +1,33 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * powerpc KFENCE support.
++ *
++ * Copyright (C) 2020 CS GROUP France
++ */
++
++#ifndef __ASM_POWERPC_KFENCE_H
++#define __ASM_POWERPC_KFENCE_H
++
++#include <linux/mm.h>
++#include <asm/pgtable.h>
++
++static inline bool arch_kfence_init_pool(void)
++{
++	return true;
++}
++
++static inline bool kfence_protect_page(unsigned long addr, bool protect)
++{
++	pte_t *kpte = virt_to_kpte(addr);
++
++	if (protect) {
++		pte_update(&init_mm, addr, kpte, _PAGE_PRESENT, 0, 0);
++		flush_tlb_kernel_range(addr, addr + PAGE_SIZE);
++	} else {
++		pte_update(&init_mm, addr, kpte, 0, _PAGE_PRESENT, 0);
++	}
++
++	return true;
++}
++
++#endif /* __ASM_POWERPC_KFENCE_H */
+--- a/arch/powerpc/mm/book3s32/mmu.c
++++ b/arch/powerpc/mm/book3s32/mmu.c
+@@ -158,7 +158,7 @@ unsigned long __init mmu_mapin_ram(unsig
+ 	unsigned long border = (unsigned long)__init_begin - PAGE_OFFSET;
+ 
+ 
+-	if (debug_pagealloc_enabled() || __map_without_bats) {
++	if (debug_pagealloc_enabled_or_kfence() || __map_without_bats) {
+ 		pr_debug_once("Read-Write memory mapped without BATs\n");
+ 		if (base >= border)
+ 			return base;
+--- a/arch/powerpc/mm/fault.c
++++ b/arch/powerpc/mm/fault.c
+@@ -32,6 +32,7 @@
+ #include <linux/context_tracking.h>
+ #include <linux/hugetlb.h>
+ #include <linux/uaccess.h>
++#include <linux/kfence.h>
+ 
+ #include <asm/firmware.h>
+ #include <asm/page.h>
+@@ -417,8 +418,12 @@ static int __do_page_fault(struct pt_reg
+ 	 * take a page fault to a kernel address or a page fault to a user
+ 	 * address outside of dedicated places
+ 	 */
+-	if (unlikely(!is_user && bad_kernel_fault(regs, error_code, address, is_write)))
++	if (unlikely(!is_user && bad_kernel_fault(regs, error_code, address, is_write))) {
++		if (kfence_handle_page_fault(address, is_write, regs))
++			return 0;
++
+ 		return SIGSEGV;
++	}
+ 
+ 	/*
+ 	 * If we're in an interrupt, have no user context or are running
+--- a/arch/powerpc/mm/init_32.c
++++ b/arch/powerpc/mm/init_32.c
+@@ -97,6 +97,9 @@ static void __init MMU_setup(void)
+ 	if (IS_ENABLED(CONFIG_PPC_8xx))
+ 		return;
+ 
++	if (IS_ENABLED(CONFIG_KFENCE))
++		__map_without_ltlbs = 1;
++
+ 	if (debug_pagealloc_enabled())
+ 		__map_without_ltlbs = 1;
+ 
+--- a/arch/powerpc/mm/mmu_decl.h
++++ b/arch/powerpc/mm/mmu_decl.h
+@@ -191,3 +191,8 @@ void ptdump_check_wx(void);
+ #else
+ static inline void ptdump_check_wx(void) { }
+ #endif
++
++static inline bool debug_pagealloc_enabled_or_kfence(void)
++{
++	return IS_ENABLED(CONFIG_KFENCE) || debug_pagealloc_enabled();
++}
+--- a/arch/powerpc/mm/nohash/8xx.c
++++ b/arch/powerpc/mm/nohash/8xx.c
+@@ -149,7 +149,7 @@ unsigned long __init mmu_mapin_ram(unsig
+ {
+ 	unsigned long etext8 = ALIGN(__pa(_etext), SZ_8M);
+ 	unsigned long sinittext = __pa(_sinittext);
+-	bool strict_boundary = strict_kernel_rwx_enabled() || debug_pagealloc_enabled();
++	bool strict_boundary = strict_kernel_rwx_enabled() || debug_pagealloc_enabled_or_kfence();
+ 	unsigned long boundary = strict_boundary ? sinittext : etext8;
+ 	unsigned long einittext8 = ALIGN(__pa(_einittext), SZ_8M);
+ 
+@@ -161,7 +161,7 @@ unsigned long __init mmu_mapin_ram(unsig
+ 		return 0;
+ 
+ 	mmu_mapin_ram_chunk(0, boundary, PAGE_KERNEL_TEXT, true);
+-	if (debug_pagealloc_enabled()) {
++	if (debug_pagealloc_enabled_or_kfence()) {
+ 		top = boundary;
+ 	} else {
+ 		mmu_mapin_ram_chunk(boundary, einittext8, PAGE_KERNEL_TEXT, true);

@@ -1,0 +1,249 @@
+From 05fe5418966c1558d193bbce59464032396a7777 Mon Sep 17 00:00:00 2001
+From: Yury Norov <ynorov@caviumnetworks.com>
+Date: Tue, 22 Dec 2020 06:40:52 +0000
+Subject: [PATCH] arm64: ilp32: introduce syscall table for ILP32
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 05fe5418966c1558d193bbce59464032396a7777
+
+
+maillist inclusion
+category: feature
+bugzilla: 46790
+CVE: NA
+
+Reference: https://github.com/norov/linux/commits/ilp32-5.2
+
+--------------------------------
+
+Depending on the personality of the task, syscalls has to be dispatched
+to either aarch64, aarch32 or aarch64/ilp32 syscall handlers. We add
+the support of ILP32 mode in this series, therefore introduce
+corresponding syscall table.
+
+Some system calls are wired to aarch32 syscall handlers, as listed in
+arch/arm64/kernel/sys_ilp32.c.
+
+For aarch64/ilp32, top halves of syscall arguments are meaningless
+anthough not zeroed by hardware. Do that in the delouse_pt_regs()
+routine to avoid passing garbage by userspace.
+
+Signed-off-by: Yury Norov <ynorov@caviumnetworks.com>
+Signed-off-by: Yury Norov <ynorov@marvell.com>
+
+ Conflicts:
+	arch/arm64/kernel/syscall.c
+
+Signed-off-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Acked-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Chen Jun <chenjun102@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/syscall.h     |  4 ++
+ arch/arm64/include/asm/unistd.h      |  7 ++-
+ arch/arm64/include/uapi/asm/unistd.h | 15 +++++-
+ arch/arm64/kernel/Makefile           |  2 +-
+ arch/arm64/kernel/sys_ilp32.c        | 76 ++++++++++++++++++++++++++++
+ arch/arm64/kernel/syscall.c          | 25 ++++++++-
+ 6 files changed, 125 insertions(+), 4 deletions(-)
+ create mode 100644 arch/arm64/kernel/sys_ilp32.c
+
+diff --git a/arch/arm64/include/asm/syscall.h b/arch/arm64/include/asm/syscall.h
+index 6b1741f24808..ebefdefffa3c 100644
+--- a/arch/arm64/include/asm/syscall.h
++++ b/arch/arm64/include/asm/syscall.h
+@@ -17,6 +17,10 @@ extern const syscall_fn_t sys_call_table[];
+ extern const syscall_fn_t a32_sys_call_table[];
+ #endif
+ 
++#ifdef CONFIG_ARM64_ILP32
++extern const syscall_fn_t ilp32_sys_call_table[];
++#endif
++
+ static inline int syscall_get_nr(struct task_struct *task,
+ 				 struct pt_regs *regs)
+ {
+diff --git a/arch/arm64/include/asm/unistd.h b/arch/arm64/include/asm/unistd.h
+index aa1450d41154..8db0b0df3dd4 100644
+--- a/arch/arm64/include/asm/unistd.h
++++ b/arch/arm64/include/asm/unistd.h
+@@ -2,8 +2,13 @@
+ /*
+  * Copyright (C) 2012 ARM Ltd.
+  */
+-#ifdef CONFIG_AARCH32_EL0
++
++#ifdef CONFIG_COMPAT
+ #define __ARCH_WANT_COMPAT_STAT64
++#define __ARCH_WANT_SYS_LLSEEK
++#endif
++
++#ifdef CONFIG_AARCH32_EL0
+ #define __ARCH_WANT_SYS_GETHOSTNAME
+ #define __ARCH_WANT_SYS_PAUSE
+ #define __ARCH_WANT_SYS_GETPGRP
+diff --git a/arch/arm64/include/uapi/asm/unistd.h b/arch/arm64/include/uapi/asm/unistd.h
+index f83a70e07df8..ae5cfa6b666e 100644
+--- a/arch/arm64/include/uapi/asm/unistd.h
++++ b/arch/arm64/include/uapi/asm/unistd.h
+@@ -15,9 +15,22 @@
+  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++/*
++ * AARCH32 interface for ILP32 syscalls.
++ */
++#if defined(__ILP32__) || defined(__SYSCALL_COMPAT)
++#define __ARCH_WANT_SYNC_FILE_RANGE2
++#endif
++
++/*
++ * AARCH64/ILP32 is introduced after the following syscalls were deprecated.
++ */
++#if !(defined(__ILP32__) || defined(__SYSCALL_COMPAT))
+ #define __ARCH_WANT_RENAMEAT
+-#define __ARCH_WANT_NEW_STAT
+ #define __ARCH_WANT_SET_GET_RLIMIT
++#endif
++
++#define __ARCH_WANT_NEW_STAT
+ #define __ARCH_WANT_TIME32_SYSCALLS
+ #define __ARCH_WANT_SYS_CLONE3
+ 
+diff --git a/arch/arm64/kernel/Makefile b/arch/arm64/kernel/Makefile
+index 79f5c37abe13..34c2dfcb8bea 100644
+--- a/arch/arm64/kernel/Makefile
++++ b/arch/arm64/kernel/Makefile
+@@ -29,7 +29,7 @@ obj-$(CONFIG_AARCH32_EL0)			+= binfmt_elf32.o sys32.o signal32.o			\
+ 					   sys_compat.o
+ obj-$(CONFIG_AARCH32_EL0)			+= sigreturn32.o
+ obj-$(CONFIG_KUSER_HELPERS)		+= kuser32.o
+-obj-$(CONFIG_ARM64_ILP32)		+= binfmt_ilp32.o
++obj-$(CONFIG_ARM64_ILP32)		+= binfmt_ilp32.o sys_ilp32.o
+ obj-$(CONFIG_COMPAT)		+= sys32_common.o
+ obj-$(CONFIG_FUNCTION_TRACER)		+= ftrace.o entry-ftrace.o
+ obj-$(CONFIG_MODULES)			+= module.o
+diff --git a/arch/arm64/kernel/sys_ilp32.c b/arch/arm64/kernel/sys_ilp32.c
+new file mode 100644
+index 000000000000..05eca957a18d
+--- /dev/null
++++ b/arch/arm64/kernel/sys_ilp32.c
+@@ -0,0 +1,76 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/*
++ * AArch64- ILP32 specific system calls implementation
++ * Copyright (C) 2018 Marvell.
++ */
++
++#define __SYSCALL_COMPAT
++
++#include <linux/compat.h>
++#include <linux/compiler.h>
++#include <linux/syscalls.h>
++
++#include <asm/syscall.h>
++
++/*
++ * AARCH32 requires 4-page alignment for shared memory,
++ * but AARCH64 - only 1 page. This is the only difference
++ * between compat and native sys_shmat(). So ILP32 just pick
++ * AARCH64 version.
++ */
++#define __arm64_compat_sys_shmat		__arm64_sys_shmat
++
++/*
++ * ILP32 needs special handling for some ptrace requests.
++ */
++#define __arm64_sys_ptrace			__arm64_compat_sys_ptrace
++
++/*
++ * Using AARCH32 interface for syscalls that take 64-bit
++ * parameters in registers.
++ */
++#define __arm64_compat_sys_fadvise64_64		__arm64_compat_sys_aarch32_fadvise64_64
++#define __arm64_compat_sys_fallocate		__arm64_compat_sys_aarch32_fallocate
++#define __arm64_compat_sys_ftruncate64		__arm64_compat_sys_aarch32_ftruncate64
++#define __arm64_compat_sys_pread64		__arm64_compat_sys_aarch32_pread64
++#define __arm64_compat_sys_pwrite64		__arm64_compat_sys_aarch32_pwrite64
++#define __arm64_compat_sys_readahead		__arm64_compat_sys_aarch32_readahead
++#define __arm64_compat_sys_sync_file_range2	__arm64_compat_sys_aarch32_sync_file_range2
++#define __arm64_compat_sys_truncate64		__arm64_compat_sys_aarch32_truncate64
++#define __arm64_sys_mmap2			__arm64_compat_sys_aarch32_mmap2
++
++/*
++ * Using AARCH32 interface for syscalls that take the size of
++ * struct statfs as an argument, as it's calculated differently
++ * in kernel and user spaces.
++ */
++#define __arm64_compat_sys_fstatfs64		__arm64_compat_sys_aarch32_fstatfs64
++#define __arm64_compat_sys_statfs64		__arm64_compat_sys_aarch32_statfs64
++
++/*
++ * Using old interface for IPC syscalls that should handle IPC_64 flag.
++ */
++#define __arm64_compat_sys_semctl		__arm64_compat_sys_old_semctl
++#define __arm64_compat_sys_msgctl		__arm64_compat_sys_old_msgctl
++#define __arm64_compat_sys_shmctl		__arm64_compat_sys_old_shmctl
++
++/*
++ * Wrappers to pass the pt_regs argument.
++ */
++#define sys_personality		sys_arm64_personality
++
++asmlinkage long sys_ni_syscall(const struct pt_regs *);
++#define __arm64_sys_ni_syscall	sys_ni_syscall
++
++#undef __SYSCALL
++#define __SYSCALL(nr, sym)	asmlinkage long __arm64_##sym(const struct pt_regs *);
++#include <asm/unistd.h>
++
++#undef __SYSCALL
++#define __SYSCALL(nr, sym)	[nr] = (syscall_fn_t)__arm64_##sym,
++
++const syscall_fn_t ilp32_sys_call_table[__NR_syscalls] = {
++	[0 ... __NR_syscalls - 1] = __arm64_sys_ni_syscall,
++#include <asm/unistd.h>
++};
+diff --git a/arch/arm64/kernel/syscall.c b/arch/arm64/kernel/syscall.c
+index 833b706e9222..e39cd7d1229f 100644
+--- a/arch/arm64/kernel/syscall.c
++++ b/arch/arm64/kernel/syscall.c
+@@ -198,10 +198,33 @@ static inline void sve_user_discard(void)
+ 	sve_user_disable();
+ }
+ 
++#ifdef CONFIG_ARM64_ILP32
++static inline void delouse_pt_regs(struct pt_regs *regs)
++{
++	regs->regs[0] &= UINT_MAX;
++	regs->regs[1] &= UINT_MAX;
++	regs->regs[2] &= UINT_MAX;
++	regs->regs[3] &= UINT_MAX;
++	regs->regs[4] &= UINT_MAX;
++	regs->regs[5] &= UINT_MAX;
++	regs->regs[6] &= UINT_MAX;
++	regs->regs[7] &= UINT_MAX;
++}
++#endif
++
+ void do_el0_svc(struct pt_regs *regs)
+ {
++	const syscall_fn_t *t = sys_call_table;
++
++#ifdef CONFIG_ARM64_ILP32
++	if (is_ilp32_compat_task()) {
++		t = ilp32_sys_call_table;
++		delouse_pt_regs(regs);
++	}
++#endif
++
+ 	sve_user_discard();
+-	el0_svc_common(regs, regs->regs[8], __NR_syscalls, sys_call_table);
++	el0_svc_common(regs, regs->regs[8], __NR_syscalls, t);
+ }
+ 
+ #ifdef CONFIG_AARCH32_EL0
+-- 
+2.26.2
+

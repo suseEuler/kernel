@@ -1,0 +1,105 @@
+From 72492082f9274dcb277553c7393d61cfd990572f Mon Sep 17 00:00:00 2001
+From: Alex Kogan <alex.kogan@oracle.com>
+Date: Tue, 6 Jul 2021 16:50:22 +0800
+Subject: [PATCH] locking/qspinlock: Introduce the shuffle reduction
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 72492082f9274dcb277553c7393d61cfd990572f
+
+ optimization into CNA
+
+maillist inclusion
+category: feature
+bugzilla: 169576
+CVE: NA
+
+Reference: https://lore.kernel.org/patchwork/patch/1406529/
+
+-------------------------------------------------
+
+This performance optimization chooses probabilistically to avoid moving
+threads from the main queue into the secondary one when the secondary queue
+is empty.
+
+It is helpful when the lock is only lightly contended. In particular, it
+makes CNA less eager to create a secondary queue, but does not introduce
+any extra delays for threads waiting in that queue once it is created.
+
+Signed-off-by: Alex Kogan <alex.kogan@oracle.com>
+Reviewed-by: Steve Sistare <steven.sistare@oracle.com>
+Reviewed-by: Waiman Long <longman@redhat.com>
+Signed-off-by: Wei Li <liwei391@huawei.com>
+Reviewed-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/locking/qspinlock_cna.h | 39 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+
+diff --git a/kernel/locking/qspinlock_cna.h b/kernel/locking/qspinlock_cna.h
+index ffc5c3301f0f..17d56c739e57 100644
+--- a/kernel/locking/qspinlock_cna.h
++++ b/kernel/locking/qspinlock_cna.h
+@@ -7,6 +7,7 @@
+ #include <linux/sched/clock.h>
+ #include <linux/moduleparam.h>
+ #include <linux/sched/rt.h>
++#include <linux/random.h>
+ 
+ /*
+  * Implement a NUMA-aware version of MCS (aka CNA, or compact NUMA-aware lock).
+@@ -76,6 +77,34 @@ static inline bool intra_node_threshold_reached(struct cna_node *cn)
+ 	return current_time > threshold;
+ }
+ 
++/*
++ * Controls the probability for enabling the ordering of the main queue
++ * when the secondary queue is empty. The chosen value reduces the amount
++ * of unnecessary shuffling of threads between the two waiting queues
++ * when the contention is low, while responding fast enough and enabling
++ * the shuffling when the contention is high.
++ */
++#define SHUFFLE_REDUCTION_PROB_ARG  (7)
++
++/* Per-CPU pseudo-random number seed */
++static DEFINE_PER_CPU(u32, seed);
++
++/*
++ * Return false with probability 1 / 2^@num_bits.
++ * Intuitively, the larger @num_bits the less likely false is to be returned.
++ * @num_bits must be a number between 0 and 31.
++ */
++static bool probably(unsigned int num_bits)
++{
++	u32 s;
++
++	s = this_cpu_read(seed);
++	s = next_pseudo_random32(s);
++	this_cpu_write(seed, s);
++
++	return s & ((1 << num_bits) - 1);
++}
++
+ static void __init cna_init_nodes_per_cpu(unsigned int cpu)
+ {
+ 	struct mcs_spinlock *base = per_cpu_ptr(&qnodes[0].mcs, cpu);
+@@ -276,6 +305,16 @@ static __always_inline u32 cna_wait_head_or_lock(struct qspinlock *lock,
+ {
+ 	struct cna_node *cn = (struct cna_node *)node;
+ 
++	if (node->locked <= 1 && probably(SHUFFLE_REDUCTION_PROB_ARG)) {
++		/*
++		 * When the secondary queue is empty, skip the calls to
++		 * cna_order_queue() below with high probability. This optimization
++		 * reduces the overhead of unnecessary shuffling of threads
++		 * between waiting queues when the lock is only lightly contended.
++		 */
++		return 0;
++	}
++
+ 	if (!cn->start_time || !intra_node_threshold_reached(cn)) {
+ 		/*
+ 		 * We are at the head of the wait queue, no need to use
+-- 
+2.26.2
+

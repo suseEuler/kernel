@@ -1,0 +1,114 @@
+From d5d44e7e3507b0ad868f68e0c5bca6a57afa1b8b Mon Sep 17 00:00:00 2001
+From: Linus Walleij <linus.walleij@linaro.org>
+Date: Sun, 25 Oct 2020 23:50:09 +0100
+Subject: [PATCH] ARM: 9013/2: Disable KASan instrumentation for some code
+Git-commit: d5d44e7e3507b0ad868f68e0c5bca6a57afa1b8b
+Patch-mainline: v5.11-rc1
+References: bsn#12
+
+
+Disable instrumentation for arch/arm/boot/compressed/*
+since that code is executed before the kernel has even
+set up its mappings and definately out of scope for
+KASan.
+
+Disable instrumentation of arch/arm/vdso/* because that code
+is not linked with the kernel image, so the KASan management
+code would fail to link.
+
+Disable instrumentation of arch/arm/mm/physaddr.c. See commit
+ec6d06efb0ba ("arm64: Add support for CONFIG_DEBUG_VIRTUAL")
+for more details.
+
+Disable kasan check in the function unwind_pop_register because
+it does not matter that kasan checks failed when unwind_pop_register()
+reads the stack memory of a task.
+
+Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: kasan-dev@googlegroups.com
+Reviewed-by: Ard Biesheuvel <ardb@kernel.org>
+Tested-by: Ard Biesheuvel <ardb@kernel.org> # QEMU/KVM/mach-virt/LPAE/8G
+Tested-by: Florian Fainelli <f.fainelli@gmail.com> # Brahma SoCs
+Tested-by: Ahmad Fatoum <a.fatoum@pengutronix.de> # i.MX6Q
+Reported-by: Florian Fainelli <f.fainelli@gmail.com>
+Reported-by: Marc Zyngier <marc.zyngier@arm.com>
+Signed-off-by: Abbott Liu <liuwenliang@huawei.com>
+Signed-off-by: Florian Fainelli <f.fainelli@gmail.com>
+Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+Signed-off-by: Russell King <rmk+kernel@armlinux.org.uk>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ arch/arm/boot/compressed/Makefile | 1 +
+ arch/arm/kernel/unwind.c          | 6 +++++-
+ arch/arm/mm/Makefile              | 2 ++
+ arch/arm/vdso/Makefile            | 2 ++
+ 4 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm/boot/compressed/Makefile b/arch/arm/boot/compressed/Makefile
+index 47f001ca5499..a815b1ae990d 100644
+--- a/arch/arm/boot/compressed/Makefile
++++ b/arch/arm/boot/compressed/Makefile
+@@ -24,6 +24,7 @@ OBJS		+= hyp-stub.o
+ endif
+ 
+ GCOV_PROFILE		:= n
++KASAN_SANITIZE		:= n
+ 
+ # Prevents link failures: __sanitizer_cov_trace_pc() is not linked in.
+ KCOV_INSTRUMENT		:= n
+diff --git a/arch/arm/kernel/unwind.c b/arch/arm/kernel/unwind.c
+index d2bd0df2318d..f35eb584a18a 100644
+--- a/arch/arm/kernel/unwind.c
++++ b/arch/arm/kernel/unwind.c
+@@ -236,7 +236,11 @@ static int unwind_pop_register(struct unwind_ctrl_block *ctrl,
+ 		if (*vsp >= (unsigned long *)ctrl->sp_high)
+ 			return -URC_FAILURE;
+ 
+-	ctrl->vrs[reg] = *(*vsp)++;
++	/* Use READ_ONCE_NOCHECK here to avoid this memory access
++	 * from being tracked by KASAN.
++	 */
++	ctrl->vrs[reg] = READ_ONCE_NOCHECK(*(*vsp));
++	(*vsp)++;
+ 	return URC_OK;
+ }
+ 
+diff --git a/arch/arm/mm/Makefile b/arch/arm/mm/Makefile
+index 7cb1699fbfc4..99699c32d8a5 100644
+--- a/arch/arm/mm/Makefile
++++ b/arch/arm/mm/Makefile
+@@ -7,6 +7,7 @@ obj-y				:= extable.o fault.o init.o iomap.o
+ obj-y				+= dma-mapping$(MMUEXT).o
+ obj-$(CONFIG_MMU)		+= fault-armv.o flush.o idmap.o ioremap.o \
+ 				   mmap.o pgd.o mmu.o pageattr.o
++KASAN_SANITIZE_mmu.o		:= n
+ 
+ ifneq ($(CONFIG_MMU),y)
+ obj-y				+= nommu.o
+@@ -16,6 +17,7 @@ endif
+ obj-$(CONFIG_ARM_PTDUMP_CORE)	+= dump.o
+ obj-$(CONFIG_ARM_PTDUMP_DEBUGFS)	+= ptdump_debugfs.o
+ obj-$(CONFIG_MODULES)		+= proc-syms.o
++KASAN_SANITIZE_physaddr.o	:= n
+ obj-$(CONFIG_DEBUG_VIRTUAL)	+= physaddr.o
+ 
+ obj-$(CONFIG_ALIGNMENT_TRAP)	+= alignment.o
+diff --git a/arch/arm/vdso/Makefile b/arch/arm/vdso/Makefile
+index 150ce6e6a5d3..b558bee0e1f6 100644
+--- a/arch/arm/vdso/Makefile
++++ b/arch/arm/vdso/Makefile
+@@ -42,6 +42,8 @@ GCOV_PROFILE := n
+ # Prevents link failures: __sanitizer_cov_trace_pc() is not linked in.
+ KCOV_INSTRUMENT := n
+ 
++KASAN_SANITIZE := n
++
+ # Force dependency
+ $(obj)/vdso.o : $(obj)/vdso.so
+ 
+-- 
+2.31.1
+

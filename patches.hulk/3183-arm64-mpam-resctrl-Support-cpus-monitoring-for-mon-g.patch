@@ -1,0 +1,88 @@
+From 31cffdeb4734d7abc8e0e7f48d08bc5e68276772 Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Fri, 26 Feb 2021 20:22:25 +0800
+Subject: [PATCH] arm64/mpam: resctrl: Support cpus' monitoring for mon group
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 31cffdeb4734d7abc8e0e7f48d08bc5e68276772
+
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+So far each mon group is tagged by sd_closid, we can monitor data by
+switching cpus' sd_closid.reqpartid and pmg, and ensuring consistent
+configuration for mon groups by following it's parent ctrl group through
+sd_closid.intpartid.
+
+Most of this code is borrowed from Intel-RDT.
+
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/kernel/mpam/mpam_resctrl.c | 40 +++++++++++++++++++++++++--
+ 1 file changed, 38 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm64/kernel/mpam/mpam_resctrl.c b/arch/arm64/kernel/mpam/mpam_resctrl.c
+index 626511b64bf4..6abd682f1fa5 100644
+--- a/arch/arm64/kernel/mpam/mpam_resctrl.c
++++ b/arch/arm64/kernel/mpam/mpam_resctrl.c
+@@ -967,8 +967,44 @@ static int resctrl_num_mon_show(struct kernfs_open_file *of,
+ int cpus_mon_write(struct rdtgroup *rdtgrp, cpumask_var_t newmask,
+ 		   cpumask_var_t tmpmask)
+ {
+-	pr_info("unsupported on mon_groups, please use ctrlmon groups\n");
+-	return -EINVAL;
++	struct rdtgroup *prgrp = rdtgrp->mon.parent, *crgrp;
++	struct list_head *head;
++
++	/* Check whether cpus belong to parent ctrl group */
++	cpumask_andnot(tmpmask, newmask, &prgrp->cpu_mask);
++	if (cpumask_weight(tmpmask)) {
++		rdt_last_cmd_puts("can only add CPUs to mongroup that belong to parent\n");
++		return -EINVAL;
++	}
++
++	/* Check whether cpus are dropped from this group */
++	cpumask_andnot(tmpmask, &rdtgrp->cpu_mask, newmask);
++	if (cpumask_weight(tmpmask)) {
++		/* Give any dropped cpus to parent rdtgroup */
++		cpumask_or(&prgrp->cpu_mask, &prgrp->cpu_mask, tmpmask);
++		update_closid_rmid(tmpmask, prgrp);
++	}
++
++	/*
++	 * If we added cpus, remove them from previous group that owned them
++	 * and update per-cpu rmid
++	 */
++	cpumask_andnot(tmpmask, newmask, &rdtgrp->cpu_mask);
++	if (cpumask_weight(tmpmask)) {
++		head = &prgrp->mon.crdtgrp_list;
++		list_for_each_entry(crgrp, head, mon.crdtgrp_list) {
++			if (crgrp == rdtgrp)
++				continue;
++			cpumask_andnot(&crgrp->cpu_mask, &crgrp->cpu_mask,
++				tmpmask);
++		}
++		update_closid_rmid(tmpmask, rdtgrp);
++	}
++
++	/* Done pushing/pulling - update this group with new mask */
++	cpumask_copy(&rdtgrp->cpu_mask, newmask);
++
++	return 0;
+ }
+ 
+ static ssize_t resctrl_group_cpus_write(struct kernfs_open_file *of,
+-- 
+2.26.2
+

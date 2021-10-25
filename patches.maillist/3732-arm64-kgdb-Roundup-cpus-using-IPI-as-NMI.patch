@@ -1,0 +1,98 @@
+From 976822f4c74c2a048b724e5d4adcdecf8f5f05c7 Mon Sep 17 00:00:00 2001
+From: Sumit Garg <sumit.garg@linaro.org>
+Date: Tue, 23 Feb 2021 20:39:13 +0800
+Subject: [PATCH] arm64: kgdb: Roundup cpus using IPI as NMI
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 976822f4c74c2a048b724e5d4adcdecf8f5f05c7
+
+
+maillist inclusion
+category: feature
+bugzilla: 49593
+CVE: NA
+Reference: https://www.spinics.net/lists/arm-kernel/msg851005.html
+
+-------------------------------------------------
+
+arm64 platforms with GICv3 or later supports pseudo NMIs which can be
+leveraged to roundup CPUs which are stuck in hard lockup state with
+interrupts disabled that wouldn't be possible with a normal IPI.
+
+So instead switch to roundup CPUs using IPI turned as NMI. And in
+case a particular arm64 platform doesn't supports pseudo NMIs,
+it will switch back to default kgdb CPUs roundup mechanism.
+
+Signed-off-by: Sumit Garg <sumit.garg@linaro.org>
+Signed-off-by: Wei Li <liwei391@huawei.com>
+Reviewed-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/kernel/ipi_nmi.c |  5 +++++
+ arch/arm64/kernel/kgdb.c    | 18 ++++++++++++++++++
+ 2 files changed, 23 insertions(+)
+
+diff --git a/arch/arm64/kernel/ipi_nmi.c b/arch/arm64/kernel/ipi_nmi.c
+index 597dcf7fb59c..898d69c37429 100644
+--- a/arch/arm64/kernel/ipi_nmi.c
++++ b/arch/arm64/kernel/ipi_nmi.c
+@@ -8,6 +8,7 @@
+ 
+ #include <linux/interrupt.h>
+ #include <linux/irq.h>
++#include <linux/kgdb.h>
+ #include <linux/nmi.h>
+ #include <linux/smp.h>
+ 
+@@ -45,10 +46,14 @@ bool arch_trigger_cpumask_backtrace(const cpumask_t *mask, bool exclude_self)
+ static irqreturn_t ipi_nmi_handler(int irq, void *data)
+ {
+ 	irqreturn_t ret = IRQ_NONE;
++	unsigned int cpu = smp_processor_id();
+ 
+ 	if (nmi_cpu_backtrace(get_irq_regs()))
+ 		ret = IRQ_HANDLED;
+ 
++	if (!kgdb_nmicallback(cpu, get_irq_regs()))
++		ret = IRQ_HANDLED;
++
+ 	return ret;
+ }
+ 
+diff --git a/arch/arm64/kernel/kgdb.c b/arch/arm64/kernel/kgdb.c
+index 1a157ca33262..371b1764ee36 100644
+--- a/arch/arm64/kernel/kgdb.c
++++ b/arch/arm64/kernel/kgdb.c
+@@ -17,6 +17,7 @@
+ 
+ #include <asm/debug-monitors.h>
+ #include <asm/insn.h>
++#include <asm/nmi.h>
+ #include <asm/traps.h>
+ 
+ struct dbg_reg_def_t dbg_reg_def[DBG_MAX_REG_NUM] = {
+@@ -353,3 +354,20 @@ int kgdb_arch_remove_breakpoint(struct kgdb_bkpt *bpt)
+ 	return aarch64_insn_write((void *)bpt->bpt_addr,
+ 			*(u32 *)bpt->saved_instr);
+ }
++
++void kgdb_roundup_cpus(void)
++{
++	struct cpumask mask;
++
++	if (!arm64_supports_nmi()) {
++		kgdb_smp_call_nmi_hook();
++		return;
++	}
++
++	cpumask_copy(&mask, cpu_online_mask);
++	cpumask_clear_cpu(raw_smp_processor_id(), &mask);
++	if (cpumask_empty(&mask))
++		return;
++
++	arm64_send_nmi(&mask);
++}
+-- 
+2.26.2
+

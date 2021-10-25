@@ -1,0 +1,172 @@
+From 29a68c21649dddb69228b86bb94b9246e73d77b0 Mon Sep 17 00:00:00 2001
+From: chenjiajun <chenjiajun8@huawei.com>
+Date: Wed, 23 Dec 2020 09:37:15 +0800
+Subject: [PATCH] kvm: debugfs: aarch64 export cpu time related items to
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 29a68c21649dddb69228b86bb94b9246e73d77b0
+
+ debugfs
+
+virt inclusion
+category: feature
+bugzilla: 46853
+CVE: NA
+
+This patch export cpu time related items to vcpu_stat.
+Contain:
+	steal, st_max, utime, stime, gtime
+
+The definitions of these items are:
+steal: cpu time VCPU waits for PCPU while it is servicing another VCPU
+st_max: max scheduling delay
+utime: cpu time in userspace
+stime: cpu time in sys
+gtime: cpu time in guest
+
+Through these items, user can get many cpu usage info of vcpu, such as:
+CPU Usage of Guest =  gtime_delta / delta_cputime
+CPU Usage of Hyp = (utime_delta - gtime_delta + stime_delta) / delta_cputime
+CPU Usage of Steal = steal_delta / delta_cputime
+Max Scheduling Delay = st_max
+
+Signed-off-by: liangpeng <liangpeng10@huawei.com>
+Signed-off-by: chenjiajun <chenjiajun8@huawei.com>
+Reviewed-by: Xiangyou Xie <xiexiangyou@huawei.com>
+Acked-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Chen Jun <chenjun102@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/kvm_host.h |  5 +++++
+ arch/arm64/kvm/arm.c              | 23 +++++++++++++++++++++++
+ arch/arm64/kvm/guest.c            |  5 +++++
+ include/linux/kvm_host.h          |  2 ++
+ virt/kvm/kvm_main.c               |  5 +++++
+ 5 files changed, 40 insertions(+)
+
+diff --git a/arch/arm64/include/asm/kvm_host.h b/arch/arm64/include/asm/kvm_host.h
+index d23c55e69d1c..e771fae29ef0 100644
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@ -483,6 +483,11 @@ struct kvm_vcpu_stat {
+ 	u64 smc_exit_stat;
+ 	u64 sve_exit_stat;
+ 	u64 debug_exit_stat;
++	u64 steal;
++	u64 st_max;
++	u64 utime;
++	u64 stime;
++	u64 gtime;
+ };
+ 
+ int kvm_vcpu_preferred_target(struct kvm_vcpu_init *init);
+diff --git a/arch/arm64/kvm/arm.c b/arch/arm64/kvm/arm.c
+index c0ffb019ca8b..bf77c2f51f65 100644
+--- a/arch/arm64/kvm/arm.c
++++ b/arch/arm64/kvm/arm.c
+@@ -343,6 +343,20 @@ void kvm_arch_vcpu_unblocking(struct kvm_vcpu *vcpu)
+ 	preempt_enable();
+ }
+ 
++void kvm_arch_vcpu_stat_reset(struct kvm_vcpu_stat *vcpu_stat)
++{
++	vcpu_stat->st_max = 0;
++}
++
++static void update_steal_time(struct kvm_vcpu *vcpu)
++{
++	u64 delta;
++
++	delta = current->sched_info.run_delay - vcpu->stat.steal;
++	vcpu->stat.steal = current->sched_info.run_delay;
++	vcpu->stat.st_max = max(vcpu->stat.st_max, delta);
++}
++
+ void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+ {
+ 	struct kvm_s2_mmu *mmu;
+@@ -376,6 +390,7 @@ void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+ 	else
+ 		vcpu_set_wfx_traps(vcpu);
+ 
++	update_steal_time(vcpu);
+ 	if (vcpu_has_ptrauth(vcpu))
+ 		vcpu_ptrauth_disable(vcpu);
+ }
+@@ -649,6 +664,13 @@ static void check_vcpu_requests(struct kvm_vcpu *vcpu)
+ 	}
+ }
+ 
++static void update_vcpu_stat_time(struct kvm_vcpu_stat *vcpu_stat)
++{
++	vcpu_stat->utime = current->utime;
++	vcpu_stat->stime = current->stime;
++	vcpu_stat->gtime = current->gtime;
++}
++
+ /**
+  * kvm_arch_vcpu_ioctl_run - the main VCPU run function to execute guest code
+  * @vcpu:	The VCPU pointer
+@@ -844,6 +866,7 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
+ 		}
+ 
+ 		ret = handle_exit(vcpu, ret);
++		update_vcpu_stat_time(&vcpu->stat);
+ 	}
+ 
+ 	/* Tell userspace about in-kernel device output levels */
+diff --git a/arch/arm64/kvm/guest.c b/arch/arm64/kvm/guest.c
+index 0a9096ba41a4..9f678decc8e5 100644
+--- a/arch/arm64/kvm/guest.c
++++ b/arch/arm64/kvm/guest.c
+@@ -70,6 +70,11 @@ struct dfx_kvm_stats_debugfs_item dfx_debugfs_entries[] = {
+ 	DFX_STAT("smc_exit_stat", smc_exit_stat),
+ 	DFX_STAT("sve_exit_stat", sve_exit_stat),
+ 	DFX_STAT("debug_exit_stat", debug_exit_stat),
++	DFX_STAT("steal", steal),
++	DFX_STAT("st_max", st_max),
++	DFX_STAT("utime", utime),
++	DFX_STAT("stime", stime),
++	DFX_STAT("gtime", gtime),
+ 	{ NULL }
+ };
+ 
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index b0eddb2a0da4..9a88fad973c5 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -1481,6 +1481,8 @@ static inline int kvm_arch_vcpu_run_pid_change(struct kvm_vcpu *vcpu)
+ }
+ #endif /* CONFIG_HAVE_KVM_VCPU_RUN_PID_CHANGE */
+ 
++void kvm_arch_vcpu_stat_reset(struct kvm_vcpu_stat *vcpu_stat);
++
+ typedef int (*kvm_vm_thread_fn_t)(struct kvm *kvm, uintptr_t data);
+ 
+ int kvm_vm_create_worker_thread(struct kvm *kvm, kvm_vm_thread_fn_t thread_fn,
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 001571199aac..8581f3a14da9 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -4616,6 +4616,10 @@ static int vcpu_stat_clear(void *_offset, u64 val)
+ DEFINE_SIMPLE_ATTRIBUTE(vcpu_stat_fops, vcpu_stat_get, vcpu_stat_clear,
+ 			"%llu\n");
+ 
++void __attribute__((weak)) kvm_arch_vcpu_stat_reset(struct kvm_vcpu_stat *vcpu_stat)
++{
++}
++
+ #define DFX_MAX_VCPU		1024
+ #define DFX_MAX_VCPU_STAT_SIZE	1024
+ 
+@@ -4646,6 +4650,7 @@ static int __dfx_vcpu_stats_get(struct seq_file *p, void *v)
+ 				break;
+ 			memcpy(vcpu_stats + index, &vcpu->stat,
+ 			       sizeof(struct kvm_vcpu_stat));
++			kvm_arch_vcpu_stat_reset(&vcpu->stat);
+ 			++index;
+ 		}
+ 	mutex_unlock(&kvm_lock);
+-- 
+2.26.2
+

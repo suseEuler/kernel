@@ -1,0 +1,119 @@
+From 225dda6b2d08d509871e70f83998a80d22457baf Mon Sep 17 00:00:00 2001
+From: Anshuman Khandual <khandual@linux.vnet.ibm.com>
+Date: Mon, 29 Nov 2021 16:28:44 +0800
+Subject: [PATCH] mm: Tag VMA with VM_CDM flag explicitly during
+ mbind(MPOL_BIND) and page fault
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 225dda6b2d08d509871e70f83998a80d22457baf
+
+
+ascend inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4JMLR
+CVE: NA
+-------------------
+
+Mark all the applicable VMAs with VM_CDM explicitly during mbind(MPOL_BIND)
+call if the user provided nodemask has a CDM node.
+
+Mark the corresponding VMA with VM_CDM flag if the allocated page happens
+to be from a CDM node. This can be expensive from performance stand point.
+There are multiple checks to avoid an expensive page_to_nid lookup but it
+can be optimized further.
+
+Signed-off-by: Anshuman Khandual <khandual@linux.vnet.ibm.com>
+Signed-off-by: Lijun Fang <fanglijun3@huawei.com>
+Reviewed-by: Weilong Chen <chenweilong@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/mm.h |  5 +++++
+ mm/mempolicy.c     | 41 +++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 46 insertions(+)
+
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 656f524ba7d3..07ea9972c4a9 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -282,6 +282,11 @@ extern unsigned int kobjsize(const void *objp);
+ #define VM_ACCOUNT	0x00100000	/* Is a VM accounted object */
+ #define VM_NORESERVE	0x00200000	/* should the VM suppress accounting */
+ #define VM_HUGETLB	0x00400000	/* Huge TLB Page VM */
++
++#ifdef CONFIG_COHERENT_DEVICE
++#define VM_CDM		0x00800000	/* Contains coherent device memory */
++#endif
++
+ #define VM_SYNC		0x00800000	/* Synchronous page faults */
+ #define VM_ARCH_1	0x01000000	/* Architecture-specific flag */
+ #define VM_WIPEONFORK	0x02000000	/* Wipe VMA contents in child. */
+diff --git a/mm/mempolicy.c b/mm/mempolicy.c
+index a4c07466d65f..6b6a5f7ce211 100644
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@ -190,6 +190,42 @@ static void mpol_relative_nodemask(nodemask_t *ret, const nodemask_t *orig,
+ 	nodes_onto(*ret, tmp, *rel);
+ }
+ 
++#ifdef CONFIG_COHERENT_DEVICE
++static inline void set_vm_cdm(struct vm_area_struct *vma)
++{
++	vma->vm_flags |= VM_CDM;
++}
++
++static inline void clr_vm_cdm(struct vm_area_struct *vma)
++{
++	vma->vm_flags &= ~VM_CDM;
++}
++
++static void mark_vma_cdm(nodemask_t *nmask,
++		struct page *page, struct vm_area_struct *vma)
++{
++	if (!page || !vma)
++		return;
++
++	if (vma->vm_flags & VM_CDM)
++		return;
++
++	if (nmask && !nodemask_has_cdm(*nmask))
++		return;
++
++	if (is_cdm_node(page_to_nid(page)))
++		vma->vm_flags |= VM_CDM;
++}
++#else
++static inline void set_vm_cdm(struct vm_area_struct *vma) { }
++static inline void clr_vm_cdm(struct vm_area_struct *vma) { }
++
++static void mark_vma_cdm(nodemask_t *nmask,
++		struct page *page, struct vm_area_struct *vma)
++{
++}
++#endif
++
+ static int mpol_new_interleave(struct mempolicy *pol, const nodemask_t *nodes)
+ {
+ 	if (nodes_empty(*nodes))
+@@ -822,6 +858,10 @@ static int mbind_range(struct mm_struct *mm, unsigned long start,
+ 		vmstart = max(start, vma->vm_start);
+ 		vmend   = min(end, vma->vm_end);
+ 
++		if (new_pol && (new_pol->mode == MPOL_BIND) &&
++				nodemask_has_cdm(new_pol->v.nodes))
++			set_vm_cdm(vma);
++
+ 		if (mpol_equal(vma_policy(vma), new_pol))
+ 			continue;
+ 
+@@ -2224,6 +2264,7 @@ struct page *alloc_pages_vma(gfp_t gfp, int order, struct vm_area_struct *vma,
+ 	nmask = policy_nodemask(gfp, pol);
+ 	preferred_nid = policy_node(gfp, pol, node);
+ 	page = __alloc_pages(gfp, order, preferred_nid, nmask);
++	mark_vma_cdm(nmask, page, vma);
+ 	mpol_cond_put(pol);
+ out:
+ 	return page;
+-- 
+2.26.2
+

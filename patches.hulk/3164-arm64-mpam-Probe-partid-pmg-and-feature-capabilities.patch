@@ -1,0 +1,174 @@
+From 3f26004852becaae5ec576c2831dd65569e5f2f9 Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Fri, 26 Feb 2021 20:22:06 +0800
+Subject: [PATCH] arm64/mpam: Probe partid,pmg and feature capabilities' ranges
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 3f26004852becaae5ec576c2831dd65569e5f2f9
+
+ from classes
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+So far partid and pmg has been probed by mpam classes, so do feature
+capabilities of each resources, for resctrl intermediate processing
+layer, those information placed in classes should be restored in
+internal resctrl resource structure.
+
+For simplicity, capabilities related are unifiedly controlled by
+integer input, also should its' width probed from mpam classes.
+currently we only give priority width and hardlimit width fields
+in resctrl resource structure, in order to adapt more features,
+part of this would be re-covered.
+
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/mpam.h         | 11 +++++++----
+ arch/arm64/kernel/mpam/mpam_ctrlmon.c |  4 +---
+ arch/arm64/kernel/mpam/mpam_resctrl.c |  2 +-
+ arch/arm64/kernel/mpam/mpam_setup.c   | 19 ++++++++++++++++---
+ 4 files changed, 25 insertions(+), 11 deletions(-)
+
+diff --git a/arch/arm64/include/asm/mpam.h b/arch/arm64/include/asm/mpam.h
+index 97e259703933..a70133fff450 100644
+--- a/arch/arm64/include/asm/mpam.h
++++ b/arch/arm64/include/asm/mpam.h
+@@ -263,7 +263,6 @@ struct msr_param {
+  * @name:		Name to use in "schemata" file
+  * @num_closid:		Number of CLOSIDs available
+  * @cache_level:	Which cache level defines scope of this resource
+- * @default_ctrl:	Specifies default cache cbm or memory B/W percent.
+  * @msr_base:		Base MSR address for CBMs
+  * @msr_update:		Function pointer to update QOS MSRs
+  * @data_width:		Character width of data when displaying
+@@ -278,15 +277,19 @@ struct msr_param {
+  */
+ 
+ struct raw_resctrl_resource {
+-	int			num_partid;
+-	u32			default_ctrl;
++	u16                 num_partid;
++	u16                 num_intpartid;
++	u16                 num_pmg;
++
++	u16                 pri_wd;
++	u16                 hdl_wd;
++
+ 	void (*msr_update)	(struct rdt_domain *d, int partid);
+ 	u64  (*msr_read)	(struct rdt_domain *d, int partid);
+ 	int			data_width;
+ 	const char		*format_str;
+ 	int (*parse_ctrlval)	(char *buf, struct raw_resctrl_resource *r,
+ 				 struct rdt_domain *d);
+-	int			num_pmg;
+ 	int			num_mon;
+ 	u64 (*mon_read)		(struct rdt_domain *d, struct rdtgroup *g);
+ 	int (*mon_write)	(struct rdt_domain *d, struct rdtgroup *g, bool enable);
+diff --git a/arch/arm64/kernel/mpam/mpam_ctrlmon.c b/arch/arm64/kernel/mpam/mpam_ctrlmon.c
+index 7de890c3932b..cf524e186c36 100644
+--- a/arch/arm64/kernel/mpam/mpam_ctrlmon.c
++++ b/arch/arm64/kernel/mpam/mpam_ctrlmon.c
+@@ -590,7 +590,6 @@ int resctrl_mkdir_ctrlmon_mondata(struct kernfs_node *parent_kn,
+ int rdtgroup_init_alloc(struct rdtgroup *rdtgrp)
+ {
+ 	struct resctrl_resource *r;
+-	struct raw_resctrl_resource *rr;
+ 	struct rdt_domain *d;
+ 	int ret;
+ 
+@@ -598,9 +597,8 @@ int rdtgroup_init_alloc(struct rdtgroup *rdtgrp)
+ 		if (!r->alloc_enabled)
+ 			continue;
+ 
+-		rr = (struct raw_resctrl_resource *)r->res;
+ 		list_for_each_entry(d, &r->domains, list) {
+-			d->new_ctrl = rr->default_ctrl;
++			d->new_ctrl = r->default_ctrl;
+ 			d->have_new_ctrl = true;
+ 		}
+ 
+diff --git a/arch/arm64/kernel/mpam/mpam_resctrl.c b/arch/arm64/kernel/mpam/mpam_resctrl.c
+index 48b24c390413..97129c4017cc 100644
+--- a/arch/arm64/kernel/mpam/mpam_resctrl.c
++++ b/arch/arm64/kernel/mpam/mpam_resctrl.c
+@@ -308,7 +308,7 @@ void closid_init(void)
+ 	for_each_resctrl_resource(r) {
+ 		if (r->alloc_enabled) {
+ 			rr = r->res;
+-			num_closid = min(num_closid, rr->num_partid);
++			num_closid = min(num_closid, (int)rr->num_partid);
+ 		}
+ 	}
+ 	closid_free_map = BIT_MASK(num_closid) - 1;
+diff --git a/arch/arm64/kernel/mpam/mpam_setup.c b/arch/arm64/kernel/mpam/mpam_setup.c
+index 38890f0b7f6a..87d4f1aacc5b 100644
+--- a/arch/arm64/kernel/mpam/mpam_setup.c
++++ b/arch/arm64/kernel/mpam/mpam_setup.c
+@@ -331,6 +331,7 @@ static int mpam_resctrl_resource_init(struct mpam_resctrl_res *res)
+ {
+ 	struct mpam_class *class = res->class;
+ 	struct resctrl_resource *r = &res->resctrl_res;
++	struct raw_resctrl_resource *rr = NULL;
+ 
+ 	if (class == mpam_resctrl_exports[RDT_RESOURCE_SMMU].class) {
+ 		return 0;
+@@ -339,7 +340,8 @@ static int mpam_resctrl_resource_init(struct mpam_resctrl_res *res)
+ 		r->name = "MB";
+ 		r->fflags = RFTYPE_RES_MC;
+ 		r->mbw.delay_linear = true;
+-		r->res = mpam_get_raw_resctrl_resource(RDT_RESOURCE_MC);
++		rr = mpam_get_raw_resctrl_resource(RDT_RESOURCE_MC);
++		r->res = rr;
+ 
+ 		if (mpam_has_feature(mpam_feat_mbw_part, class->features)) {
+ 			res->resctrl_mba_uses_mbw_part = true;
+@@ -382,7 +384,8 @@ static int mpam_resctrl_resource_init(struct mpam_resctrl_res *res)
+ 		r->mon_enabled = true;
+ 	} else if (class == mpam_resctrl_exports[RDT_RESOURCE_L3].class) {
+ 		r->rid = RDT_RESOURCE_L3;
+-		r->res = mpam_get_raw_resctrl_resource(RDT_RESOURCE_L3);
++		rr = mpam_get_raw_resctrl_resource(RDT_RESOURCE_L3);
++		r->res = rr;
+ 		r->fflags = RFTYPE_RES_CACHE;
+ 		r->name = "L3";
+ 
+@@ -413,7 +416,8 @@ static int mpam_resctrl_resource_init(struct mpam_resctrl_res *res)
+ 
+ 	} else if (class == mpam_resctrl_exports[RDT_RESOURCE_L2].class) {
+ 		r->rid = RDT_RESOURCE_L2;
+-		r->res = mpam_get_raw_resctrl_resource(RDT_RESOURCE_L2);
++		rr = mpam_get_raw_resctrl_resource(RDT_RESOURCE_L2);
++		r->res = rr;
+ 		r->fflags = RFTYPE_RES_CACHE;
+ 		r->name = "L2";
+ 
+@@ -442,6 +446,15 @@ static int mpam_resctrl_resource_init(struct mpam_resctrl_res *res)
+ 		r->mon_capable = false;
+ 	}
+ 
++	if (rr && class) {
++		rr->num_partid = class->num_partid;
++		rr->num_intpartid = class->num_intpartid;
++		rr->num_pmg = class->num_pmg;
++
++		rr->pri_wd = max(class->intpri_wd, class->dspri_wd);
++		rr->hdl_wd = 2;
++	}
++
+ 	return 0;
+ }
+ 
+-- 
+2.26.2
+

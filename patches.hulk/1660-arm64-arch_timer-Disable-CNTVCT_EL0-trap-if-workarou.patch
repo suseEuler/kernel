@@ -1,0 +1,151 @@
+From 609a81bea8496b5efb143eecee979f891841cba5 Mon Sep 17 00:00:00 2001
+From: Yang Yingliang <yangyingliang@huawei.com>
+Date: Thu, 4 Feb 2021 09:48:56 +0800
+Subject: [PATCH] arm64: arch_timer: Disable CNTVCT_EL0 trap if workaround is
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 609a81bea8496b5efb143eecee979f891841cba5
+
+ enabled
+
+hulk inclusion
+category: feature
+bugzilla: 47984
+CVE: NA
+
+--------------------------------------------------
+
+It costs very much time to read CNTVCT_EL0, if a cntvct workaround
+and CNTVCT_EL0 trap is enabled. To decrease the read time, we disable
+CNTVCT_EL0 trap, introduce vdso_fix and vdso_shift for doing cntvct
+workaround in VDSO.
+
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Reviewed-by: Hanjun Guo <guohanjun@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/clocksource/arm_arch_timer.c | 19 ++++++++++++++++---
+ include/linux/clocksource.h          |  2 ++
+ include/vdso/datapage.h              |  6 ++++--
+ kernel/time/vsyscall.c               |  8 ++++++++
+ 4 files changed, 30 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/clocksource/arm_arch_timer.c b/drivers/clocksource/arm_arch_timer.c
+index d0177824c518..4c017f94402d 100644
+--- a/drivers/clocksource/arm_arch_timer.c
++++ b/drivers/clocksource/arm_arch_timer.c
+@@ -74,6 +74,8 @@ static enum vdso_clock_mode vdso_default = VDSO_CLOCKMODE_ARCHTIMER;
+ #else
+ static enum vdso_clock_mode vdso_default = VDSO_CLOCKMODE_NONE;
+ #endif /* CONFIG_GENERIC_GETTIMEOFDAY */
++static bool vdso_fix;
++static u16 vdso_shift;
+ 
+ static cpumask_t evtstrm_available = CPU_MASK_NONE;
+ static bool evtstrm_enable = IS_ENABLED(CONFIG_ARM_ARCH_TIMER_EVTSTREAM);
+@@ -572,8 +574,17 @@ void arch_timer_enable_workaround(const struct arch_timer_erratum_workaround *wa
+ 	 * change both the default value and the vdso itself.
+ 	 */
+ 	if (wa->read_cntvct_el0) {
+-		clocksource_counter.vdso_clock_mode = VDSO_CLOCKMODE_NONE;
+-		vdso_default = VDSO_CLOCKMODE_NONE;
++		if (!strncmp(wa->desc, "HiSilicon erratum 161010101",
++			    strlen("HiSilicon erratum 161010101"))) {
++			vdso_fix = true;
++			vdso_shift = 5;
++		} else if (!strncmp(wa->desc, "Freescale erratum a005858",
++			    strlen("Freescale erratum a005858"))) {
++			vdso_fix = true;
++		} else {
++			clocksource_counter.vdso_clock_mode = VDSO_CLOCKMODE_NONE;
++			vdso_default = VDSO_CLOCKMODE_NONE;
++		}
+ 	} else if (wa->disable_compat_vdso && vdso_default != VDSO_CLOCKMODE_NONE) {
+ 		vdso_default = VDSO_CLOCKMODE_ARCHTIMER_NOCOMPAT;
+ 		clocksource_counter.vdso_clock_mode = vdso_default;
+@@ -859,7 +870,7 @@ static void arch_counter_set_user_access(void)
+ 	 * need to be workaround. The vdso may have been already
+ 	 * disabled though.
+ 	 */
+-	if (arch_timer_this_cpu_has_cntvct_wa())
++	if (arch_timer_this_cpu_has_cntvct_wa() && !vdso_fix)
+ 		pr_info("CPU%d: Trapping CNTVCT access\n", smp_processor_id());
+ 	else
+ 		cntkctl |= ARCH_TIMER_USR_VCT_ACCESS_EN;
+@@ -1015,6 +1026,8 @@ static void __init arch_counter_register(unsigned type)
+ 
+ 		arch_timer_read_counter = rd;
+ 		clocksource_counter.vdso_clock_mode = vdso_default;
++		clocksource_counter.vdso_fix = vdso_fix;
++		clocksource_counter.vdso_shift = vdso_shift;
+ 	} else {
+ 		arch_timer_read_counter = arch_counter_get_cntvct_mem;
+ 	}
+diff --git a/include/linux/clocksource.h b/include/linux/clocksource.h
+index 86d143db6523..fd4193a98c40 100644
+--- a/include/linux/clocksource.h
++++ b/include/linux/clocksource.h
+@@ -101,6 +101,8 @@ struct clocksource {
+ 	struct list_head	list;
+ 	int			rating;
+ 	enum vdso_clock_mode	vdso_clock_mode;
++	u16			vdso_fix;
++	u16			vdso_shift;
+ 	unsigned long		flags;
+ 
+ 	int			(*enable)(struct clocksource *cs);
+diff --git a/include/vdso/datapage.h b/include/vdso/datapage.h
+index 73eb622e7663..6bbca70342f3 100644
+--- a/include/vdso/datapage.h
++++ b/include/vdso/datapage.h
+@@ -69,7 +69,8 @@ struct vdso_timestamp {
+  * @tz_minuteswest:	minutes west of Greenwich
+  * @tz_dsttime:		type of DST correction
+  * @hrtimer_res:	hrtimer resolution
+- * @__unused:		unused
++ * @vdso_fix:		avoid the clock bug in VDSO
++ * @vdso_shift: 	count of bit to be ignored
+  * @arch_data:		architecture specific data (optional, defaults
+  *			to an empty struct)
+  *
+@@ -104,7 +105,8 @@ struct vdso_data {
+ 	s32			tz_minuteswest;
+ 	s32			tz_dsttime;
+ 	u32			hrtimer_res;
+-	u32			__unused;
++	u16			vdso_fix;
++	u16			vdso_shift;
+ 
+ 	struct arch_vdso_data	arch_data;
+ };
+diff --git a/kernel/time/vsyscall.c b/kernel/time/vsyscall.c
+index 88e6b8ed6ca5..fd290ce55ccf 100644
+--- a/kernel/time/vsyscall.c
++++ b/kernel/time/vsyscall.c
+@@ -74,14 +74,22 @@ void update_vsyscall(struct timekeeper *tk)
+ 	struct vdso_data *vdata = __arch_get_k_vdso_data();
+ 	struct vdso_timestamp *vdso_ts;
+ 	s32 clock_mode;
++	u16 vdso_fix;
++	u16 vdso_shift;
+ 	u64 nsec;
+ 
+ 	/* copy vsyscall data */
+ 	vdso_write_begin(vdata);
+ 
+ 	clock_mode = tk->tkr_mono.clock->vdso_clock_mode;
++	vdso_fix = tk->tkr_mono.clock->vdso_fix;
++	vdso_shift = tk->tkr_mono.clock->vdso_shift;
+ 	vdata[CS_HRES_COARSE].clock_mode	= clock_mode;
++	vdata[CS_HRES_COARSE].vdso_fix 		= vdso_fix;
++	vdata[CS_HRES_COARSE].vdso_shift 	= vdso_shift;
+ 	vdata[CS_RAW].clock_mode		= clock_mode;
++	vdata[CS_RAW].vdso_fix 			= vdso_fix;
++	vdata[CS_RAW].vdso_shift 		= vdso_shift;
+ 
+ 	/* CLOCK_REALTIME also required for time() */
+ 	vdso_ts		= &vdata[CS_HRES_COARSE].basetime[CLOCK_REALTIME];
+-- 
+2.26.2
+

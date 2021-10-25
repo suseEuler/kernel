@@ -1,0 +1,318 @@
+From a79afa78e625e4dbe0e07c70929d477ba3386e45 Mon Sep 17 00:00:00 2001
+From: Alexander Lobakin <alobakin@pm.me>
+Date: Tue, 2 Feb 2021 13:31:35 +0000
+Subject: [PATCH] net: use the new dev_page_is_reusable() instead of private
+Git-commit: a79afa78e625e4dbe0e07c70929d477ba3386e45
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+ versions
+
+Now we can remove a bunch of identical functions from the drivers and
+make them use common dev_page_is_reusable(). All {,un}likely() checks
+are omitted since it's already present in this helper.
+Also update some comments near the call sites.
+
+Suggested-by: David Rientjes <rientjes@google.com>
+Suggested-by: Jakub Kicinski <kuba@kernel.org>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Signed-off-by: Alexander Lobakin <alobakin@pm.me>
+Reviewed-by: Jesse Brandeburg <jesse.brandeburg@intel.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Chenxi Mao <chenxi.mao@suse.com>
+---
+ drivers/net/ethernet/hisilicon/hns3/hns3_enet.c | 17 ++++++-----------
+ drivers/net/ethernet/intel/fm10k/fm10k_main.c   | 13 ++++---------
+ drivers/net/ethernet/intel/i40e/i40e_txrx.c     | 15 +--------------
+ drivers/net/ethernet/intel/iavf/iavf_txrx.c     | 15 +--------------
+ drivers/net/ethernet/intel/ice/ice_txrx.c       | 13 ++-----------
+ drivers/net/ethernet/intel/igb/igb_main.c       |  9 ++-------
+ drivers/net/ethernet/intel/igc/igc_main.c       |  9 ++-------
+ drivers/net/ethernet/intel/ixgbe/ixgbe_main.c   |  9 ++-------
+ .../net/ethernet/intel/ixgbevf/ixgbevf_main.c   |  9 ++-------
+ drivers/net/ethernet/mellanox/mlx5/core/en_rx.c |  7 +------
+ 10 files changed, 23 insertions(+), 93 deletions(-)
+
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3_enet.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3_enet.c
+@@ -2848,12 +2848,6 @@ static bool hns3_nic_alloc_rx_buffers(st
+ 	return false;
+ }
+ 
+-static bool hns3_page_is_reusable(struct page *page)
+-{
+-	return page_to_nid(page) == numa_mem_id() &&
+-		!page_is_pfmemalloc(page);
+-}
+-
+ static bool hns3_can_reuse_page(struct hns3_desc_cb *cb)
+ {
+ 	return (page_count(cb->priv) - cb->pagecnt_bias) == 1;
+@@ -2871,10 +2865,11 @@ static void hns3_nic_reuse_page(struct s
+ 	skb_add_rx_frag(skb, i, desc_cb->priv, desc_cb->page_offset + pull_len,
+ 			size - pull_len, truesize);
+ 
+-	/* Avoid re-using remote pages, or the stack is still using the page
+-	 * when page_offset rollback to zero, flag default unreuse
++	/* Avoid re-using remote and pfmemalloc pages, or the stack is still
++	 * using the page when page_offset rollback to zero, flag default
++	 * unreuse
+ 	 */
+-	if (unlikely(!hns3_page_is_reusable(desc_cb->priv)) ||
++	if (!dev_page_is_reusable(desc_cb->priv) ||
+ 	    (!desc_cb->page_offset && !hns3_can_reuse_page(desc_cb))) {
+ 		__page_frag_cache_drain(desc_cb->priv, desc_cb->pagecnt_bias);
+ 		return;
+@@ -3132,8 +3127,8 @@ static int hns3_alloc_skb(struct hns3_en
+ 	if (length <= HNS3_RX_HEAD_SIZE) {
+ 		memcpy(__skb_put(skb, length), va, ALIGN(length, sizeof(long)));
+ 
+-		/* We can reuse buffer as-is, just make sure it is local */
+-		if (likely(hns3_page_is_reusable(desc_cb->priv)))
++		/* We can reuse buffer as-is, just make sure it is reusable */
++		if (dev_page_is_reusable(desc_cb->priv))
+ 			desc_cb->reuse_flag = 1;
+ 		else /* This page cannot be reused so discard it */
+ 			__page_frag_cache_drain(desc_cb->priv,
+--- a/drivers/net/ethernet/intel/fm10k/fm10k_main.c
++++ b/drivers/net/ethernet/intel/fm10k/fm10k_main.c
+@@ -194,17 +194,12 @@ static void fm10k_reuse_rx_page(struct f
+ 					 DMA_FROM_DEVICE);
+ }
+ 
+-static inline bool fm10k_page_is_reserved(struct page *page)
+-{
+-	return (page_to_nid(page) != numa_mem_id()) || page_is_pfmemalloc(page);
+-}
+-
+ static bool fm10k_can_reuse_rx_page(struct fm10k_rx_buffer *rx_buffer,
+ 				    struct page *page,
+ 				    unsigned int __maybe_unused truesize)
+ {
+-	/* avoid re-using remote pages */
+-	if (unlikely(fm10k_page_is_reserved(page)))
++	/* avoid re-using remote and pfmemalloc pages */
++	if (!dev_page_is_reusable(page))
+ 		return false;
+ 
+ #if (PAGE_SIZE < 8192)
+@@ -265,8 +260,8 @@ static bool fm10k_add_rx_frag(struct fm1
+ 	if (likely(size <= FM10K_RX_HDR_LEN)) {
+ 		memcpy(__skb_put(skb, size), va, ALIGN(size, sizeof(long)));
+ 
+-		/* page is not reserved, we can reuse buffer as-is */
+-		if (likely(!fm10k_page_is_reserved(page)))
++		/* page is reusable, we can reuse buffer as-is */
++		if (dev_page_is_reusable(page))
+ 			return true;
+ 
+ 		/* this page cannot be reused so discard it */
+--- a/drivers/net/ethernet/intel/i40e/i40e_txrx.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_txrx.c
+@@ -1829,19 +1829,6 @@ static bool i40e_cleanup_headers(struct
+ }
+ 
+ /**
+- * i40e_page_is_reusable - check if any reuse is possible
+- * @page: page struct to check
+- *
+- * A page is not reusable if it was allocated under low memory
+- * conditions, or it's not in the same NUMA node as this CPU.
+- */
+-static inline bool i40e_page_is_reusable(struct page *page)
+-{
+-	return (page_to_nid(page) == numa_mem_id()) &&
+-		!page_is_pfmemalloc(page);
+-}
+-
+-/**
+  * i40e_can_reuse_rx_page - Determine if this page can be reused by
+  * the adapter for another receive
+  *
+@@ -1876,7 +1863,7 @@ static bool i40e_can_reuse_rx_page(struc
+ 	struct page *page = rx_buffer->page;
+ 
+ 	/* Is any reuse possible? */
+-	if (unlikely(!i40e_page_is_reusable(page)))
++	if (!dev_page_is_reusable(page))
+ 		return false;
+ 
+ #if (PAGE_SIZE < 8192)
+--- a/drivers/net/ethernet/intel/iavf/iavf_txrx.c
++++ b/drivers/net/ethernet/intel/iavf/iavf_txrx.c
+@@ -1142,19 +1142,6 @@ static void iavf_reuse_rx_page(struct ia
+ }
+ 
+ /**
+- * iavf_page_is_reusable - check if any reuse is possible
+- * @page: page struct to check
+- *
+- * A page is not reusable if it was allocated under low memory
+- * conditions, or it's not in the same NUMA node as this CPU.
+- */
+-static inline bool iavf_page_is_reusable(struct page *page)
+-{
+-	return (page_to_nid(page) == numa_mem_id()) &&
+-		!page_is_pfmemalloc(page);
+-}
+-
+-/**
+  * iavf_can_reuse_rx_page - Determine if this page can be reused by
+  * the adapter for another receive
+  *
+@@ -1187,7 +1174,7 @@ static bool iavf_can_reuse_rx_page(struc
+ 	struct page *page = rx_buffer->page;
+ 
+ 	/* Is any reuse possible? */
+-	if (unlikely(!iavf_page_is_reusable(page)))
++	if (!dev_page_is_reusable(page))
+ 		return false;
+ 
+ #if (PAGE_SIZE < 8192)
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.c
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.c
+@@ -730,15 +730,6 @@ bool ice_alloc_rx_bufs(struct ice_ring *
+ }
+ 
+ /**
+- * ice_page_is_reserved - check if reuse is possible
+- * @page: page struct to check
+- */
+-static bool ice_page_is_reserved(struct page *page)
+-{
+-	return (page_to_nid(page) != numa_mem_id()) || page_is_pfmemalloc(page);
+-}
+-
+-/**
+  * ice_rx_buf_adjust_pg_offset - Prepare Rx buffer for reuse
+  * @rx_buf: Rx buffer to adjust
+  * @size: Size of adjustment
+@@ -776,8 +767,8 @@ ice_can_reuse_rx_page(struct ice_rx_buf
+ 	unsigned int pagecnt_bias = rx_buf->pagecnt_bias;
+ 	struct page *page = rx_buf->page;
+ 
+-	/* avoid re-using remote pages */
+-	if (unlikely(ice_page_is_reserved(page)))
++	/* avoid re-using remote and pfmemalloc pages */
++	if (!dev_page_is_reusable(page))
+ 		return false;
+ 
+ #if (PAGE_SIZE < 8192)
+--- a/drivers/net/ethernet/intel/igb/igb_main.c
++++ b/drivers/net/ethernet/intel/igb/igb_main.c
+@@ -8226,19 +8226,14 @@ static void igb_reuse_rx_page(struct igb
+ 	new_buff->pagecnt_bias	= old_buff->pagecnt_bias;
+ }
+ 
+-static inline bool igb_page_is_reserved(struct page *page)
+-{
+-	return (page_to_nid(page) != numa_mem_id()) || page_is_pfmemalloc(page);
+-}
+-
+ static bool igb_can_reuse_rx_page(struct igb_rx_buffer *rx_buffer,
+ 				  int rx_buf_pgcnt)
+ {
+ 	unsigned int pagecnt_bias = rx_buffer->pagecnt_bias;
+ 	struct page *page = rx_buffer->page;
+ 
+-	/* avoid re-using remote pages */
+-	if (unlikely(igb_page_is_reserved(page)))
++	/* avoid re-using remote and pfmemalloc pages */
++	if (!dev_page_is_reusable(page))
+ 		return false;
+ 
+ #if (PAGE_SIZE < 8192)
+--- a/drivers/net/ethernet/intel/igc/igc_main.c
++++ b/drivers/net/ethernet/intel/igc/igc_main.c
+@@ -1652,18 +1652,13 @@ static void igc_reuse_rx_page(struct igc
+ 	new_buff->pagecnt_bias	= old_buff->pagecnt_bias;
+ }
+ 
+-static inline bool igc_page_is_reserved(struct page *page)
+-{
+-	return (page_to_nid(page) != numa_mem_id()) || page_is_pfmemalloc(page);
+-}
+-
+ static bool igc_can_reuse_rx_page(struct igc_rx_buffer *rx_buffer)
+ {
+ 	unsigned int pagecnt_bias = rx_buffer->pagecnt_bias;
+ 	struct page *page = rx_buffer->page;
+ 
+-	/* avoid re-using remote pages */
+-	if (unlikely(igc_page_is_reserved(page)))
++	/* avoid re-using remote and pfmemalloc pages */
++	if (!dev_page_is_reusable(page))
+ 		return false;
+ 
+ #if (PAGE_SIZE < 8192)
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@ -1941,19 +1941,14 @@ static void ixgbe_reuse_rx_page(struct i
+ 	new_buff->pagecnt_bias	= old_buff->pagecnt_bias;
+ }
+ 
+-static inline bool ixgbe_page_is_reserved(struct page *page)
+-{
+-	return (page_to_nid(page) != numa_mem_id()) || page_is_pfmemalloc(page);
+-}
+-
+ static bool ixgbe_can_reuse_rx_page(struct ixgbe_rx_buffer *rx_buffer,
+ 				    int rx_buffer_pgcnt)
+ {
+ 	unsigned int pagecnt_bias = rx_buffer->pagecnt_bias;
+ 	struct page *page = rx_buffer->page;
+ 
+-	/* avoid re-using remote pages */
+-	if (unlikely(ixgbe_page_is_reserved(page)))
++	/* avoid re-using remote and pfmemalloc pages */
++	if (!dev_page_is_reusable(page))
+ 		return false;
+ 
+ #if (PAGE_SIZE < 8192)
+--- a/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c
++++ b/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c
+@@ -781,18 +781,13 @@ static void ixgbevf_reuse_rx_page(struct
+ 	new_buff->pagecnt_bias = old_buff->pagecnt_bias;
+ }
+ 
+-static inline bool ixgbevf_page_is_reserved(struct page *page)
+-{
+-	return (page_to_nid(page) != numa_mem_id()) || page_is_pfmemalloc(page);
+-}
+-
+ static bool ixgbevf_can_reuse_rx_page(struct ixgbevf_rx_buffer *rx_buffer)
+ {
+ 	unsigned int pagecnt_bias = rx_buffer->pagecnt_bias;
+ 	struct page *page = rx_buffer->page;
+ 
+-	/* avoid re-using remote pages */
+-	if (unlikely(ixgbevf_page_is_reserved(page)))
++	/* avoid re-using remote and pfmemalloc pages */
++	if (!dev_page_is_reusable(page))
+ 		return false;
+ 
+ #if (PAGE_SIZE < 8192)
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@ -213,11 +213,6 @@ static inline u32 mlx5e_decompress_cqes_
+ 	return mlx5e_decompress_cqes_cont(rq, wq, 1, budget_rem) - 1;
+ }
+ 
+-static inline bool mlx5e_page_is_reserved(struct page *page)
+-{
+-	return page_is_pfmemalloc(page) || page_to_nid(page) != numa_mem_id();
+-}
+-
+ static inline bool mlx5e_rx_cache_put(struct mlx5e_rq *rq,
+ 				      struct mlx5e_dma_info *dma_info)
+ {
+@@ -230,7 +225,7 @@ static inline bool mlx5e_rx_cache_put(st
+ 		return false;
+ 	}
+ 
+-	if (unlikely(mlx5e_page_is_reserved(dma_info->page))) {
++	if (!dev_page_is_reusable(dma_info->page)) {
+ 		stats->cache_waive++;
+ 		return false;
+ 	}

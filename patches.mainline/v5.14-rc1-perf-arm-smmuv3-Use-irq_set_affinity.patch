@@ -1,0 +1,89 @@
+From 2621054535955fb78ea96b76b279eb481f40fcef Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Tue, 18 May 2021 11:17:31 +0200
+Subject: [PATCH] perf/arm-smmuv3: Use irq_set_affinity()
+Git-commit: 2621054535955fb78ea96b76b279eb481f40fcef
+Patch-mainline: v5.14-rc1
+References: bsn#12
+
+
+The driver uses irq_set_affinity_hint() to set the affinity for the PMU
+interrupts, which relies on the undocumented side effect that this function
+actually sets the affinity under the hood.
+
+Setting an hint is clearly not a guarantee and for these PMU interrupts an
+affinity hint, which is supposed to guide userspace for setting affinity,
+is beyond pointless, because the affinity of these interrupts cannot be
+modified from user space.
+
+Aside of that the error checks are bogus because the only error which is
+returned from irq_set_affinity_hint() is when there is no irq descriptor
+for the interrupt number, but not when the affinity set fails. That's on
+purpose because the hint can point to an offline CPU.
+
+Replace the mindless abuse with irq_set_affinity().
+
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Cc: Will Deacon <will@kernel.org>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: linux-arm-kernel@lists.infradead.org
+Acked-by: Mark Rutland <mark.rutland@arm.com>
+Link: https://lore.kernel.org/r/20210518093118.603636289@linutronix.de
+Signed-off-by: Will Deacon <will@kernel.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ drivers/perf/arm_smmuv3_pmu.c | 10 +++-------
+ 1 file changed, 3 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/perf/arm_smmuv3_pmu.c b/drivers/perf/arm_smmuv3_pmu.c
+index ff6fab4bae30..7786ccc6d12f 100644
+--- a/drivers/perf/arm_smmuv3_pmu.c
++++ b/drivers/perf/arm_smmuv3_pmu.c
+@@ -628,7 +628,7 @@ static int smmu_pmu_offline_cpu(unsigned int cpu, struct hlist_node *node)
+ 
+ 	perf_pmu_migrate_context(&smmu_pmu->pmu, cpu, target);
+ 	smmu_pmu->on_cpu = target;
+-	WARN_ON(irq_set_affinity_hint(smmu_pmu->irq, cpumask_of(target)));
++	WARN_ON(irq_set_affinity(smmu_pmu->irq, cpumask_of(target)));
+ 
+ 	return 0;
+ }
+@@ -839,15 +839,14 @@ static int smmu_pmu_probe(struct platform_device *pdev)
+ 
+ 	/* Pick one CPU to be the preferred one to use */
+ 	smmu_pmu->on_cpu = raw_smp_processor_id();
+-	WARN_ON(irq_set_affinity_hint(smmu_pmu->irq,
+-				      cpumask_of(smmu_pmu->on_cpu)));
++	WARN_ON(irq_set_affinity(smmu_pmu->irq, cpumask_of(smmu_pmu->on_cpu)));
+ 
+ 	err = cpuhp_state_add_instance_nocalls(cpuhp_state_num,
+ 					       &smmu_pmu->node);
+ 	if (err) {
+ 		dev_err(dev, "Error %d registering hotplug, PMU @%pa\n",
+ 			err, &res_0->start);
+-		goto out_clear_affinity;
++		return err;
+ 	}
+ 
+ 	err = perf_pmu_register(&smmu_pmu->pmu, name, -1);
+@@ -866,8 +865,6 @@ static int smmu_pmu_probe(struct platform_device *pdev)
+ 
+ out_unregister:
+ 	cpuhp_state_remove_instance_nocalls(cpuhp_state_num, &smmu_pmu->node);
+-out_clear_affinity:
+-	irq_set_affinity_hint(smmu_pmu->irq, NULL);
+ 	return err;
+ }
+ 
+@@ -877,7 +874,6 @@ static int smmu_pmu_remove(struct platform_device *pdev)
+ 
+ 	perf_pmu_unregister(&smmu_pmu->pmu);
+ 	cpuhp_state_remove_instance_nocalls(cpuhp_state_num, &smmu_pmu->node);
+-	irq_set_affinity_hint(smmu_pmu->irq, NULL);
+ 
+ 	return 0;
+ }
+-- 
+2.31.1
+

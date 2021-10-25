@@ -1,0 +1,136 @@
+From 84ff5e275fb5b26d2b7dd8649e5994f95bba97f7 Mon Sep 17 00:00:00 2001
+From: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Date: Mon, 9 Aug 2021 20:18:18 +0800
+Subject: [PATCH] userfaultfd: fix BUG_ON() in userfaultfd_release()
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 84ff5e275fb5b26d2b7dd8649e5994f95bba97f7
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 175146
+CVE: NA
+
+------------------------------------
+
+Syzkaller caught the following BUG_ON:
+
+------------[ cut here ]------------
+kernel BUG at fs/userfaultfd.c:909!
+Internal error: Oops - BUG: 0 [#1] SMP
+Dumping ftrace buffer:
+   (ftrace buffer empty)
+Modules linked in:
+Process syz-executor.2 (pid: 1994, stack limit = 0x0000000048da525b)
+CPU: 0 PID: 1994 Comm: syz-executor.2 Not tainted 4.19.90+ #6
+Hardware name: linux,dummy-virt (DT)
+pstate: 80000005 (Nzcv daif -PAN -UAO)
+pc : userfaultfd_release+0x4f0/0x6a0 fs/userfaultfd.c:908
+lr : userfaultfd_release+0x4f0/0x6a0 fs/userfaultfd.c:908
+sp : ffff80017d247c80
+x29: ffff80017d247c90 x28: ffff80019b25f720
+x27: 2000000000100077 x26: ffff80017c28fe40
+x25: ffff80019b25f770 x24: ffff80019b25f7e0
+x23: ffff80019b25e378 x22: 1ffff0002fa48fa6
+x21: ffff80017f103200 x20: dfff200000000000
+x19: ffff80017c28fe40 x18: 0000000000000000
+x17: ffffffff00000001 x16: 0000000000000000
+x15: 0000000000000000 x14: 0000000000000000
+x13: 0000000000000000 x12: 0000000000000000
+x11: 0000000000000000 x10: 0000000000000000
+x9 : 1ffff0002fa48fa6 x8 : ffff10002fa48fa6
+x7 : ffff20000add39f0 x6 : 00000000f2000000
+x5 : 0000000000000000 x4 : ffff10002fa48f76
+x3 : ffff200008000000 x2 : ffff20000a61d000
+x1 : ffff800160aa9000 x0 : 0000000000000000
+Call trace:
+ userfaultfd_release+0x4f0/0x6a0 fs/userfaultfd.c:908
+ __fput+0x20c/0x688 fs/file_table.c:278
+ ____fput+0x24/0x30 fs/file_table.c:309
+ task_work_run+0x13c/0x2f8 kernel/task_work.c:135
+ tracehook_notify_resume include/linux/tracehook.h:193 [inline]
+ do_notify_resume+0x380/0x628 arch/arm64/kernel/signal.c:728
+ work_pending+0x8/0x10
+Code: 97ecb0e4 d4210000 17ffffc7 97ecb0e1 (d4210000)
+---[ end trace de790a3f637d9e60 ]---
+
+In userfaultfd_release(), we check if 'vm_userfaultfd_ctx' and
+'vm_flags&(VM_UFFD_MISSING|VM_UFFD_WP)' are not zero at the same time.
+If not, it is bug. But we lack checking for VM_USWAP flag. So add it to
+avoid the false BUG_ON(). This patch also fix several other issues.
+
+Fixes: c3e6287f88f5 ("userswap: support userswap via userfaultfd")
+Signed-off-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+
+ Conflicts:
+	fs/userfaultfd.c
+Signed-off-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/userfaultfd.c | 12 +++++++++---
+ mm/memory.c      |  1 -
+ 2 files changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/fs/userfaultfd.c b/fs/userfaultfd.c
+index b5b3cd07da20..a89281fc2b68 100644
+--- a/fs/userfaultfd.c
++++ b/fs/userfaultfd.c
+@@ -843,7 +843,7 @@ static int userfaultfd_release(struct inode *inode, struct file *file)
+ 	struct vm_area_struct *vma, *prev;
+ 	/* len == 0 means wake all */
+ 	struct userfaultfd_wake_range range = { .len = 0, };
+-	unsigned long new_flags;
++	unsigned long new_flags, userfault_flags;
+ 
+ 	WRITE_ONCE(ctx->released, true);
+ 
+@@ -861,14 +861,18 @@ static int userfaultfd_release(struct inode *inode, struct file *file)
+ 	mmap_write_lock(mm);
+ 	prev = NULL;
+ 	for (vma = mm->mmap; vma; vma = vma->vm_next) {
++		userfault_flags = VM_UFFD_MISSING | VM_UFFD_WP;
++#ifdef CONFIG_USERSWAP
++		userfault_flags |= VM_USWAP;
++#endif
+ 		cond_resched();
+ 		BUG_ON(!!vma->vm_userfaultfd_ctx.ctx ^
+-		       !!(vma->vm_flags & (VM_UFFD_MISSING | VM_UFFD_WP)));
++		       !!(vma->vm_flags & userfault_flags));
+ 		if (vma->vm_userfaultfd_ctx.ctx != ctx) {
+ 			prev = vma;
+ 			continue;
+ 		}
+-		new_flags = vma->vm_flags & ~(VM_UFFD_MISSING | VM_UFFD_WP);
++		new_flags = vma->vm_flags & ~userfault_flags;
+ 		prev = vma_merge(mm, prev, vma->vm_start, vma->vm_end,
+ 				 new_flags, vma->anon_vma,
+ 				 vma->vm_file, vma->vm_pgoff,
+@@ -1293,6 +1297,8 @@ static int userfaultfd_register(struct userfaultfd_ctx *ctx,
+ 	 */
+ 	if (uffdio_register.mode & UFFDIO_REGISTER_MODE_USWAP) {
+ 		uffdio_register.mode &= ~UFFDIO_REGISTER_MODE_USWAP;
++		if (!uffdio_register.mode)
++			goto out;
+ 		vm_flags |= VM_USWAP;
+ 		end = uffdio_register.range.start + uffdio_register.range.len - 1;
+ 		vma = find_vma(mm, uffdio_register.range.start);
+diff --git a/mm/memory.c b/mm/memory.c
+index 0be6fd3198a8..d15b9ccfc108 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -3317,7 +3317,6 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 					vmf->address, vma->vm_flags);
+ 			goto skip_uswap;
+ 		}
+-		BUG_ON(!(vma->vm_flags & VM_UFFD_MISSING));
+ 		ret = handle_userfault(vmf, VM_UFFD_MISSING | VM_USWAP);
+ 		return ret;
+ 	}
+-- 
+2.26.2
+

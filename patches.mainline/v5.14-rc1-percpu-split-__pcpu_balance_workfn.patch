@@ -1,0 +1,130 @@
+From 67c2669d69fb5ada0f3b5123fb6ebf6fef9faee5 Mon Sep 17 00:00:00 2001
+From: Roman Gushchin <guro@fb.com>
+Date: Wed, 7 Apr 2021 20:57:32 -0700
+Subject: [PATCH] percpu: split __pcpu_balance_workfn()
+Git-commit: 67c2669d69fb5ada0f3b5123fb6ebf6fef9faee5
+Patch-mainline: v5.14-rc1
+References: bsn#12
+
+
+__pcpu_balance_workfn() became fairly big and hard to follow, but in
+fact it consists of two fully independent parts, responsible for
+the destruction of excessive free chunks and population of necessarily
+amount of free pages.
+
+In order to simplify the code and prepare for adding of a new
+functionality, split it in two functions:
+
+  1) pcpu_balance_free,
+  2) pcpu_balance_populated.
+
+Move the taking/releasing of the pcpu_alloc_mutex to an upper level
+to keep the current synchronization in place.
+
+Signed-off-by: Roman Gushchin <guro@fb.com>
+Reviewed-by: Dennis Zhou <dennis@kernel.org>
+Signed-off-by: Dennis Zhou <dennis@kernel.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ mm/percpu.c | 46 +++++++++++++++++++++++++++++-----------------
+ 1 file changed, 29 insertions(+), 17 deletions(-)
+
+diff --git a/mm/percpu.c b/mm/percpu.c
+index 2c459a0ee5e6..61339b3d9337 100644
+--- a/mm/percpu.c
++++ b/mm/percpu.c
+@@ -1933,31 +1933,22 @@ void __percpu *__alloc_reserved_percpu(size_t size, size_t align)
+ }
+ 
+ /**
+- * __pcpu_balance_workfn - manage the amount of free chunks and populated pages
++ * pcpu_balance_free - manage the amount of free chunks
+  * @type: chunk type
+  *
+- * Reclaim all fully free chunks except for the first one.  This is also
+- * responsible for maintaining the pool of empty populated pages.  However,
+- * it is possible that this is called when physical memory is scarce causing
+- * OOM killer to be triggered.  We should avoid doing so until an actual
+- * allocation causes the failure as it is possible that requests can be
+- * serviced from already backed regions.
++ * Reclaim all fully free chunks except for the first one.
+  */
+-static void __pcpu_balance_workfn(enum pcpu_chunk_type type)
++static void pcpu_balance_free(enum pcpu_chunk_type type)
+ {
+-	/* gfp flags passed to underlying allocators */
+-	const gfp_t gfp = GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN;
+ 	LIST_HEAD(to_free);
+ 	struct list_head *pcpu_slot = pcpu_chunk_list(type);
+ 	struct list_head *free_head = &pcpu_slot[pcpu_nr_slots - 1];
+ 	struct pcpu_chunk *chunk, *next;
+-	int slot, nr_to_pop, ret;
+ 
+ 	/*
+ 	 * There's no reason to keep around multiple unused chunks and VM
+ 	 * areas can be scarce.  Destroy all free chunks except for one.
+ 	 */
+-	mutex_lock(&pcpu_alloc_mutex);
+ 	spin_lock_irq(&pcpu_lock);
+ 
+ 	list_for_each_entry_safe(chunk, next, free_head, list) {
+@@ -1985,6 +1976,25 @@ static void __pcpu_balance_workfn(enum pcpu_chunk_type type)
+ 		pcpu_destroy_chunk(chunk);
+ 		cond_resched();
+ 	}
++}
++
++/**
++ * pcpu_balance_populated - manage the amount of populated pages
++ * @type: chunk type
++ *
++ * Maintain a certain amount of populated pages to satisfy atomic allocations.
++ * It is possible that this is called when physical memory is scarce causing
++ * OOM killer to be triggered.  We should avoid doing so until an actual
++ * allocation causes the failure as it is possible that requests can be
++ * serviced from already backed regions.
++ */
++static void pcpu_balance_populated(enum pcpu_chunk_type type)
++{
++	/* gfp flags passed to underlying allocators */
++	const gfp_t gfp = GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN;
++	struct list_head *pcpu_slot = pcpu_chunk_list(type);
++	struct pcpu_chunk *chunk;
++	int slot, nr_to_pop, ret;
+ 
+ 	/*
+ 	 * Ensure there are certain number of free populated pages for
+@@ -2054,22 +2064,24 @@ static void __pcpu_balance_workfn(enum pcpu_chunk_type type)
+ 			goto retry_pop;
+ 		}
+ 	}
+-
+-	mutex_unlock(&pcpu_alloc_mutex);
+ }
+ 
+ /**
+  * pcpu_balance_workfn - manage the amount of free chunks and populated pages
+  * @work: unused
+  *
+- * Call __pcpu_balance_workfn() for each chunk type.
++ * Call pcpu_balance_free() and pcpu_balance_populated() for each chunk type.
+  */
+ static void pcpu_balance_workfn(struct work_struct *work)
+ {
+ 	enum pcpu_chunk_type type;
+ 
+-	for (type = 0; type < PCPU_NR_CHUNK_TYPES; type++)
+-		__pcpu_balance_workfn(type);
++	for (type = 0; type < PCPU_NR_CHUNK_TYPES; type++) {
++		mutex_lock(&pcpu_alloc_mutex);
++		pcpu_balance_free(type);
++		pcpu_balance_populated(type);
++		mutex_unlock(&pcpu_alloc_mutex);
++	}
+ }
+ 
+ /**
+-- 
+2.31.1
+

@@ -1,0 +1,327 @@
+From 2cf7960cc6e1b8118f2d8f15262659ce9906edd4 Mon Sep 17 00:00:00 2001
+From: James Morse <james.morse@arm.com>
+Date: Fri, 26 Feb 2021 20:21:53 +0800
+Subject: [PATCH] arm64/mpam: Probe the features resctrl supports
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 2cf7960cc6e1b8118f2d8f15262659ce9906edd4
+
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+Expand our probing support with the control and monitor types
+we can use with resctrl.
+
+[Wang Shaobo: version adaption changes, additional MSCs' narrow support]
+
+Signed-off-by: James Morse <james.morse@arm.com>
+Link: http://www.linux-arm.org/git?p=linux-jm.git;a=patch;h=12ec685952ba85b3ce6d52f4be7ca2ed601e8043
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/kernel/mpam/mpam_device.c   | 177 +++++++++++++++++++++++++
+ arch/arm64/kernel/mpam/mpam_device.h   |  15 +++
+ arch/arm64/kernel/mpam/mpam_internal.h |  51 +++++++
+ 3 files changed, 243 insertions(+)
+ create mode 100644 arch/arm64/kernel/mpam/mpam_internal.h
+
+diff --git a/arch/arm64/kernel/mpam/mpam_device.c b/arch/arm64/kernel/mpam/mpam_device.c
+index 36ee7bf9e862..cfbc2b25c950 100644
+--- a/arch/arm64/kernel/mpam/mpam_device.c
++++ b/arch/arm64/kernel/mpam/mpam_device.c
+@@ -32,6 +32,7 @@
+ #include <linux/cpu.h>
+ #include <linux/cacheinfo.h>
+ #include <asm/mpam.h>
++#include <asm/mpam_resource.h>
+ 
+ #include "mpam_device.h"
+ 
+@@ -70,8 +71,184 @@ static struct work_struct mpam_enable_work;
+ static int mpam_broken;
+ static struct work_struct mpam_failed_work;
+ 
++static inline u32 mpam_read_reg(struct mpam_device *dev, u16 reg)
++{
++	WARN_ON_ONCE(reg > SZ_MPAM_DEVICE);
++	assert_spin_locked(&dev->lock);
++
++	/*
++	 * If we touch a device that isn't accessible from this CPU we may get
++	 * an external-abort.
++	 */
++	WARN_ON_ONCE(preemptible());
++	WARN_ON_ONCE(!cpumask_test_cpu(smp_processor_id(), &dev->fw_affinity));
++
++	return readl_relaxed(dev->mapped_hwpage + reg);
++}
++
++static inline void mpam_write_reg(struct mpam_device *dev, u16 reg, u32 val)
++{
++	WARN_ON_ONCE(reg > SZ_MPAM_DEVICE);
++	assert_spin_locked(&dev->lock);
++
++	/*
++	 * If we touch a device that isn't accessible from this CPU we may get
++	 * an external-abort. If we're lucky, we corrupt another mpam:component.
++	 */
++	WARN_ON_ONCE(preemptible());
++	WARN_ON_ONCE(!cpumask_test_cpu(smp_processor_id(), &dev->fw_affinity));
++
++	writel_relaxed(val, dev->mapped_hwpage + reg);
++}
++
++static void
++mpam_probe_update_sysprops(u16 max_partid, u16 max_pmg)
++{
++	lockdep_assert_held(&mpam_devices_lock);
++
++	mpam_sysprops.max_partid =
++				(mpam_sysprops.max_partid < max_partid) ?
++				mpam_sysprops.max_partid : max_partid;
++	mpam_sysprops.max_pmg =
++				(mpam_sysprops.max_pmg < max_pmg) ?
++				mpam_sysprops.max_pmg : max_pmg;
++}
++
+ static int mpam_device_probe(struct mpam_device *dev)
+ {
++	u32 hwfeatures;
++	u16 max_intpartid = 0;
++	u16 max_partid, max_pmg;
++
++	if (mpam_read_reg(dev, MPAMF_AIDR) != MPAM_ARCHITECTURE_V1) {
++		pr_err_once("device at 0x%llx does not match MPAM architecture v1.0\n",
++			dev->hwpage_address);
++		return -EIO;
++	}
++
++	hwfeatures = mpam_read_reg(dev, MPAMF_IDR);
++	max_partid = hwfeatures & MPAMF_IDR_PARTID_MAX_MASK;
++	max_pmg = (hwfeatures & MPAMF_IDR_PMG_MAX_MASK) >> MPAMF_IDR_PMG_MAX_SHIFT;
++
++	dev->num_partid = max_partid + 1;
++	dev->num_pmg = max_pmg + 1;
++
++    /* Partid Narrowing*/
++	if (MPAMF_IDR_HAS_PARTID_NRW(hwfeatures)) {
++		u32 partid_nrw_features = mpam_read_reg(dev, MPAMF_PARTID_NRW_IDR);
++
++		max_intpartid = partid_nrw_features & MPAMF_PARTID_NRW_IDR_MASK;
++		dev->num_intpartid = max_intpartid + 1;
++		mpam_set_feature(mpam_feat_part_nrw, &dev->features);
++	}
++
++	mpam_probe_update_sysprops(max_partid, max_pmg);
++
++	/* Cache Capacity Partitioning */
++	if (MPAMF_IDR_HAS_CCAP_PART(hwfeatures)) {
++		u32 ccap_features = mpam_read_reg(dev, MPAMF_CCAP_IDR);
++
++		pr_debug("probe: probed CCAP_PART\n");
++
++		dev->cmax_wd = ccap_features & MPAMF_CCAP_IDR_CMAX_WD;
++		if (dev->cmax_wd)
++			mpam_set_feature(mpam_feat_ccap_part, &dev->features);
++	}
++
++	/* Cache Portion partitioning */
++	if (MPAMF_IDR_HAS_CPOR_PART(hwfeatures)) {
++		u32 cpor_features = mpam_read_reg(dev, MPAMF_CPOR_IDR);
++
++		pr_debug("probe: probed CPOR_PART\n");
++
++		dev->cpbm_wd = cpor_features & MPAMF_CPOR_IDR_CPBM_WD;
++		if (dev->cpbm_wd)
++			mpam_set_feature(mpam_feat_cpor_part, &dev->features);
++	}
++
++	/* Memory bandwidth partitioning */
++	if (MPAMF_IDR_HAS_MBW_PART(hwfeatures)) {
++		u32 mbw_features = mpam_read_reg(dev, MPAMF_MBW_IDR);
++
++		pr_debug("probe: probed MBW_PART\n");
++
++		/* portion bitmap resolution */
++		dev->mbw_pbm_bits = (mbw_features & MPAMF_MBW_IDR_BWPBM_WD) >>
++				MPAMF_MBW_IDR_BWPBM_WD_SHIFT;
++		if (dev->mbw_pbm_bits && (mbw_features &
++				MPAMF_MBW_IDR_HAS_PBM))
++			mpam_set_feature(mpam_feat_mbw_part, &dev->features);
++
++		dev->bwa_wd = (mbw_features & MPAMF_MBW_IDR_BWA_WD);
++		if (dev->bwa_wd && (mbw_features & MPAMF_MBW_IDR_HAS_MAX)) {
++			mpam_set_feature(mpam_feat_mbw_max, &dev->features);
++			/* we want to export MBW hardlimit support */
++			mpam_set_feature(mpam_feat_part_hdl, &dev->features);
++		}
++
++		if (dev->bwa_wd && (mbw_features & MPAMF_MBW_IDR_HAS_MIN))
++			mpam_set_feature(mpam_feat_mbw_min, &dev->features);
++
++		if (dev->bwa_wd && (mbw_features & MPAMF_MBW_IDR_HAS_PROP)) {
++			mpam_set_feature(mpam_feat_mbw_prop, &dev->features);
++			/* we want to export MBW hardlimit support */
++			mpam_set_feature(mpam_feat_part_hdl, &dev->features);
++		}
++	}
++
++	/* Priority partitioning */
++	if (MPAMF_IDR_HAS_PRI_PART(hwfeatures)) {
++		u32 pri_features = mpam_read_reg(dev, MPAMF_PRI_IDR);
++
++		pr_debug("probe: probed PRI_PART\n");
++
++		dev->intpri_wd = (pri_features & MPAMF_PRI_IDR_INTPRI_WD) >>
++				MPAMF_PRI_IDR_INTPRI_WD_SHIFT;
++		if (dev->intpri_wd && (pri_features &
++				MPAMF_PRI_IDR_HAS_INTPRI)) {
++			mpam_set_feature(mpam_feat_intpri_part, &dev->features);
++			if (pri_features & MPAMF_PRI_IDR_INTPRI_0_IS_LOW)
++				mpam_set_feature(mpam_feat_intpri_part_0_low,
++					&dev->features);
++		}
++
++		dev->dspri_wd = (pri_features & MPAMF_PRI_IDR_DSPRI_WD) >>
++				MPAMF_PRI_IDR_DSPRI_WD_SHIFT;
++		if (dev->dspri_wd && (pri_features & MPAMF_PRI_IDR_HAS_DSPRI)) {
++			mpam_set_feature(mpam_feat_dspri_part, &dev->features);
++			if (pri_features & MPAMF_PRI_IDR_DSPRI_0_IS_LOW)
++				mpam_set_feature(mpam_feat_dspri_part_0_low,
++					&dev->features);
++		}
++	}
++
++	/* Performance Monitoring */
++	if (MPAMF_IDR_HAS_MSMON(hwfeatures)) {
++		u32 msmon_features = mpam_read_reg(dev, MPAMF_MSMON_IDR);
++
++		pr_debug("probe: probed MSMON\n");
++
++		if (msmon_features & MPAMF_MSMON_IDR_MSMON_CSU) {
++			u32 csumonidr;
++
++			csumonidr = mpam_read_reg(dev, MPAMF_CSUMON_IDR);
++			dev->num_csu_mon = csumonidr & MPAMF_CSUMON_IDR_NUM_MON;
++			if (dev->num_csu_mon)
++				mpam_set_feature(mpam_feat_msmon_csu,
++					&dev->features);
++		}
++		if (msmon_features & MPAMF_MSMON_IDR_MSMON_MBWU) {
++			u32 mbwumonidr = mpam_read_reg(dev, MPAMF_MBWUMON_IDR);
++
++			dev->num_mbwu_mon = mbwumonidr &
++					MPAMF_MBWUMON_IDR_NUM_MON;
++			if (dev->num_mbwu_mon)
++				mpam_set_feature(mpam_feat_msmon_mbwu,
++					&dev->features);
++		}
++	}
++	dev->probed = true;
++
+ 	return 0;
+ }
+ 
+diff --git a/arch/arm64/kernel/mpam/mpam_device.h b/arch/arm64/kernel/mpam/mpam_device.h
+index 7b8d9ae5a548..d49f5be41443 100644
+--- a/arch/arm64/kernel/mpam/mpam_device.h
++++ b/arch/arm64/kernel/mpam/mpam_device.h
+@@ -5,6 +5,7 @@
+ #include <linux/err.h>
+ #include <linux/cpumask.h>
+ #include <linux/types.h>
++#include "mpam_internal.h"
+ 
+ /*
+  * Size of the memory mapped registers: 4K of feature page
+@@ -44,6 +45,20 @@ struct mpam_device {
+ 
+ 	phys_addr_t             hwpage_address;
+ 	void __iomem            *mapped_hwpage;
++
++	u32         features;
++
++	u16         cmax_wd;
++	u16         cpbm_wd;
++	u16         mbw_pbm_bits;
++	u16         bwa_wd;
++	u16         intpri_wd;
++	u16         dspri_wd;
++	u16         num_partid;
++	u16         num_intpartid;
++	u16         num_pmg;
++	u16         num_csu_mon;
++	u16         num_mbwu_mon;
+ };
+ 
+ /*
+diff --git a/arch/arm64/kernel/mpam/mpam_internal.h b/arch/arm64/kernel/mpam/mpam_internal.h
+new file mode 100644
+index 000000000000..24b26dc0e3d0
+--- /dev/null
++++ b/arch/arm64/kernel/mpam/mpam_internal.h
+@@ -0,0 +1,51 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _ASM_ARM64_MPAM_INTERNAL_H
++#define _ASM_ARM64_MPAM_INTERNAL_H
++
++typedef u32 mpam_features_t;
++
++/* Bits for mpam_features_t */
++enum mpam_device_features {
++	mpam_feat_ccap_part = 0,
++	mpam_feat_cpor_part,
++	mpam_feat_mbw_part,
++	mpam_feat_mbw_min,
++	mpam_feat_mbw_max,
++	mpam_feat_mbw_prop,
++	mpam_feat_intpri_part,
++	mpam_feat_intpri_part_0_low,
++	mpam_feat_dspri_part,
++	mpam_feat_dspri_part_0_low,
++	mpam_feat_msmon,
++	mpam_feat_msmon_csu,
++	mpam_feat_msmon_csu_capture,
++	mpam_feat_msmon_mbwu,
++	mpam_feat_msmon_mbwu_capture,
++	mpam_feat_msmon_capt,
++	mpam_feat_part_nrw,
++	/* this feature always enabled */
++	mpam_feat_part_hdl,
++	MPAM_FEATURE_LAST,
++};
++
++static inline bool mpam_has_feature(enum mpam_device_features feat,
++				mpam_features_t supported)
++{
++	return (1<<feat) & supported;
++}
++
++static inline void mpam_set_feature(enum mpam_device_features feat,
++				mpam_features_t *supported)
++{
++	*supported |= (1<<feat);
++}
++
++static inline void mpam_clear_feature(enum mpam_device_features feat,
++				mpam_features_t *supported)
++{
++	*supported &= ~(1<<feat);
++}
++
++#define MPAM_ARCHITECTURE_V1    0x10
++
++#endif
+-- 
+2.26.2
+

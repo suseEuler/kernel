@@ -1,0 +1,152 @@
+From 5244bba653fbe7d1d4592d48e8d318581b28c68b Mon Sep 17 00:00:00 2001
+From: Roberto Sassu <roberto.sassu@huawei.com>
+Date: Wed, 3 Mar 2021 08:43:59 +0100
+Subject: [PATCH] ima: Prevent usage of digest lists not measured or appraised
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 5244bba653fbe7d1d4592d48e8d318581b28c68b
+
+
+hulk inclusion
+category: feature
+feature: IMA Digest Lists extension
+bugzilla: 46797
+
+-------------------------------------------------
+
+Loading a digest list affects the behavior of IMA for subsequent
+operations. For example, if the digest of a file is found in a loaded
+digest list, the file won't be added to the measurement list (with PCR 11).
+If an administrator loaded the digest list before the IMA policy, he could
+hide from verifiers the fact that files in that digest list were accessed.
+
+To avoid this situation, this patch prevents usage of digest lists for an
+IMA submodule if that submodule didn't process it. If a digest list wasn't
+measured, the digest of measured files will not be searched in the digest
+list and regular measurement will be performed. The same mechanism applies
+for appraisal.
+
+Signed-off-by: Roberto Sassu <roberto.sassu@huawei.com>
+Signed-off-by: Tianxing Zhang <zhangtianxing3@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ security/integrity/ima/ima.h             |  1 +
+ security/integrity/ima/ima_digest_list.c | 48 ++++++++++++++++++++++++
+ security/integrity/ima/ima_digest_list.h |  4 ++
+ security/integrity/ima/ima_main.c        |  4 ++
+ 4 files changed, 57 insertions(+)
+
+diff --git a/security/integrity/ima/ima.h b/security/integrity/ima/ima.h
+index 9431c380075d..b48121ebd8cd 100644
+--- a/security/integrity/ima/ima.h
++++ b/security/integrity/ima/ima.h
+@@ -54,6 +54,7 @@ extern int ima_extra_slots __ro_after_init;
+ extern int ima_appraise;
+ extern struct tpm_chip *ima_tpm_chip;
+ extern const char boot_aggregate_name[];
++extern int ima_digest_list_actions;
+ 
+ /* IMA event related data */
+ struct ima_event_data {
+diff --git a/security/integrity/ima/ima_digest_list.c b/security/integrity/ima/ima_digest_list.c
+index 0dcc69954887..901990c8dfa8 100644
+--- a/security/integrity/ima/ima_digest_list.c
++++ b/security/integrity/ima/ima_digest_list.c
+@@ -113,6 +113,9 @@ int ima_parse_compact_list(loff_t size, void *buf, int op)
+ 	size_t digest_len;
+ 	int ret = 0, i;
+ 
++	if (!(ima_digest_list_actions & ima_policy_flag))
++		return -EACCES;
++
+ 	while (bufp < bufendp) {
+ 		if (bufp + sizeof(*hdr) > bufendp) {
+ 			pr_err("compact list, invalid data\n");
+@@ -174,3 +177,48 @@ int ima_parse_compact_list(loff_t size, void *buf, int op)
+ 
+ 	return bufp - buf;
+ }
++
++/***************************
++ * Digest list usage check *
++ ***************************/
++void ima_check_measured_appraised(struct file *file)
++{
++	struct integrity_iint_cache *iint;
++
++	if (!ima_digest_list_actions)
++		return;
++
++	iint = integrity_iint_find(file_inode(file));
++	if (!iint) {
++		pr_err("%s not processed, disabling digest lists lookup\n",
++		       file_dentry(file)->d_name.name);
++		ima_digest_list_actions = 0;
++		return;
++	}
++
++	mutex_lock(&iint->mutex);
++	if ((ima_digest_list_actions & IMA_MEASURE) &&
++	    !(iint->flags & IMA_MEASURED)) {
++		pr_err("%s not measured, disabling digest lists lookup "
++		       "for measurement\n", file_dentry(file)->d_name.name);
++		ima_digest_list_actions &= ~IMA_MEASURE;
++	}
++
++	if ((ima_digest_list_actions & IMA_APPRAISE) &&
++	    (!(iint->flags & IMA_APPRAISED) ||
++	    !test_bit(IMA_DIGSIG, &iint->atomic_flags))) {
++		pr_err("%s not appraised, disabling digest lists lookup "
++		       "for appraisal\n", file_dentry(file)->d_name.name);
++		ima_digest_list_actions &= ~IMA_APPRAISE;
++	}
++
++	mutex_unlock(&iint->mutex);
++}
++
++struct ima_digest *ima_digest_allow(struct ima_digest *digest, int action)
++{
++	if (!(ima_digest_list_actions & action))
++		return NULL;
++
++	return digest;
++}
+diff --git a/security/integrity/ima/ima_digest_list.h b/security/integrity/ima/ima_digest_list.h
+index ac6b0ee0aec6..5bd2388ff95e 100644
+--- a/security/integrity/ima/ima_digest_list.h
++++ b/security/integrity/ima/ima_digest_list.h
+@@ -23,10 +23,14 @@
+ extern struct ima_h_table ima_digests_htable;
+ 
+ int ima_parse_compact_list(loff_t size, void *buf, int op);
++void ima_check_measured_appraised(struct file *file);
+ #else
+ static inline int ima_parse_compact_list(loff_t size, void *buf, int op)
+ {
+ 	return -EOPNOTSUPP;
+ }
++static inline void ima_check_measured_appraised(struct file *file)
++{
++}
+ #endif /*CONFIG_IMA_DIGEST_LIST*/
+ #endif /*LINUX_IMA_DIGEST_LIST_H*/
+diff --git a/security/integrity/ima/ima_main.c b/security/integrity/ima/ima_main.c
+index 66e39dba6dfb..593daf26e96a 100644
+--- a/security/integrity/ima/ima_main.c
++++ b/security/integrity/ima/ima_main.c
+@@ -36,6 +36,10 @@ int ima_appraise;
+ #endif
+ 
+ int ima_hash_algo = HASH_ALGO_SHA1;
++
++/* Actions (measure/appraisal) for which digest lists can be used */
++int ima_digest_list_actions;
++
+ static int hash_setup_done;
+ 
+ static struct notifier_block ima_lsm_policy_notifier = {
+-- 
+2.26.2
+

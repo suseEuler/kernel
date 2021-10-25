@@ -1,0 +1,77 @@
+From 468ab8437a97a953895856c3709e48b3067da13c Mon Sep 17 00:00:00 2001
+From: Yang Shi <shy828301@gmail.com>
+Date: Tue, 4 May 2021 18:36:26 -0700
+Subject: [PATCH] mm: vmscan: add shrinker_info_protected() helper
+Git-commit: 468ab8437a97a953895856c3709e48b3067da13c
+Patch-mainline: v5.13-rc1
+References: bsn#12
+
+
+The shrinker_info is dereferenced in a couple of places via
+rcu_dereference_protected with different calling conventions, for
+example, using mem_cgroup_nodeinfo helper or dereferencing
+memcg->nodeinfo[nid]->shrinker_info.  And the later patch will add more
+dereference places.
+
+So extract the dereference into a helper to make the code more readable.
+No functional change.
+
+[akpm@linux-foundation.org: retain rcu_dereference_protected() in free_shrinker_info(), per Hugh]
+
+Link: https://lkml.kernel.org/r/20210311190845.9708-8-shy828301@gmail.com
+Signed-off-by: Yang Shi <shy828301@gmail.com>
+Acked-by: Roman Gushchin <guro@fb.com>
+Acked-by: Kirill Tkhai <ktkhai@virtuozzo.com>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Reviewed-by: Shakeel Butt <shakeelb@google.com>
+Cc: Dave Chinner <david@fromorbit.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ mm/vmscan.c | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 518084ce8757..400f4a657b27 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -192,6 +192,13 @@ static inline int shrinker_map_size(int nr_items)
+ 	return (DIV_ROUND_UP(nr_items, BITS_PER_LONG) * sizeof(unsigned long));
+ }
+ 
++static struct shrinker_info *shrinker_info_protected(struct mem_cgroup *memcg,
++						     int nid)
++{
++	return rcu_dereference_protected(memcg->nodeinfo[nid]->shrinker_info,
++					 lockdep_is_held(&shrinker_rwsem));
++}
++
+ static int expand_one_shrinker_info(struct mem_cgroup *memcg,
+ 				    int size, int old_size)
+ {
+@@ -201,7 +208,7 @@ static int expand_one_shrinker_info(struct mem_cgroup *memcg,
+ 
+ 	for_each_node(nid) {
+ 		pn = memcg->nodeinfo[nid];
+-		old = rcu_dereference_protected(pn->shrinker_info, true);
++		old = shrinker_info_protected(memcg, nid);
+ 		/* Not yet online memcg */
+ 		if (!old)
+ 			return 0;
+@@ -675,8 +682,7 @@ static unsigned long shrink_slab_memcg(gfp_t gfp_mask, int nid,
+ 	if (!down_read_trylock(&shrinker_rwsem))
+ 		return 0;
+ 
+-	info = rcu_dereference_protected(memcg->nodeinfo[nid]->shrinker_info,
+-					 true);
++	info = shrinker_info_protected(memcg, nid);
+ 	if (unlikely(!info))
+ 		goto unlock;
+ 
+-- 
+2.31.1
+

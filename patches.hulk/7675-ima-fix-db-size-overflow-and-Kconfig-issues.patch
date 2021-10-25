@@ -1,0 +1,214 @@
+From b2cf80ebad216bfa0efd738d40c63ff4d5f4ef18 Mon Sep 17 00:00:00 2001
+From: Zhang Tianxing <zhangtianxing3@huawei.com>
+Date: Tue, 28 Sep 2021 11:51:52 +0800
+Subject: [PATCH] ima: fix db size overflow and Kconfig issues
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: b2cf80ebad216bfa0efd738d40c63ff4d5f4ef18
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4BMOM
+CVE: NA
+
+-----------------------------------------------------------------
+
+This patch fixes some issues involved with IMA digest db size patches:
+- use CONFIG_IMA_DIGEST_LIST to seperate db size check in ima_fs.c
+- remove minimum digest db size limit in Kconfig
+- change ima_digest_db_size data type from size_t to int, to avoid
+  overflow
+- change ima_digest_db_size in ima_add_digest_data_entry and
+  ima_del_digest_data_entry
+- add some debug messages
+
+Fixes: 7c9d18bcaa ("ima: Add max size for IMA digest database")
+Signed-off-by: Zhang Tianxing <zhangtianxing3@huawei.com>
+Reviewed-by: zhujianwei <zhujianwei7@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/configs/openeuler_defconfig   |  1 -
+ arch/x86/configs/openeuler_defconfig     |  1 -
+ security/integrity/ima/Kconfig           |  5 +----
+ security/integrity/ima/ima.h             |  4 ++--
+ security/integrity/ima/ima_digest_list.c | 21 ++++++++++++++++-----
+ security/integrity/ima/ima_fs.c          | 14 +++++++++-----
+ 6 files changed, 28 insertions(+), 18 deletions(-)
+
+diff --git a/arch/arm64/configs/openeuler_defconfig b/arch/arm64/configs/openeuler_defconfig
+index fbaa20639d81..7325fd69e4f4 100644
+--- a/arch/arm64/configs/openeuler_defconfig
++++ b/arch/arm64/configs/openeuler_defconfig
+@@ -6432,7 +6432,6 @@ CONFIG_IMA_X509_PATH="/etc/keys/x509_ima.der"
+ # CONFIG_IMA_APPRAISE_SIGNED_INIT is not set
+ CONFIG_IMA_DIGEST_LIST=y
+ CONFIG_IMA_DIGEST_LISTS_DIR="/etc/ima/digest_lists"
+-# CONFIG_IMA_MIN_DIGEST_DB_SIZE is not set
+ CONFIG_IMA_STANDARD_DIGEST_DB_SIZE=y
+ # CONFIG_IMA_MAX_DIGEST_DB_SIZE is not set
+ # CONFIG_IMA_CUSTOM_DIGEST_DB_SIZE is not set
+diff --git a/arch/x86/configs/openeuler_defconfig b/arch/x86/configs/openeuler_defconfig
+index 471d5c5faabb..a25f9210c4be 100644
+--- a/arch/x86/configs/openeuler_defconfig
++++ b/arch/x86/configs/openeuler_defconfig
+@@ -7789,7 +7789,6 @@ CONFIG_IMA_X509_PATH="/etc/keys/x509_ima.der"
+ # CONFIG_IMA_APPRAISE_SIGNED_INIT is not set
+ CONFIG_IMA_DIGEST_LIST=y
+ CONFIG_IMA_DIGEST_LISTS_DIR="/etc/ima/digest_lists"
+-# CONFIG_IMA_MIN_DIGEST_DB_SIZE is not set
+ CONFIG_IMA_STANDARD_DIGEST_DB_SIZE=y
+ # CONFIG_IMA_MAX_DIGEST_DB_SIZE is not set
+ # CONFIG_IMA_CUSTOM_DIGEST_DB_SIZE is not set
+diff --git a/security/integrity/ima/Kconfig b/security/integrity/ima/Kconfig
+index c36156b3df5e..cf120fc71a7e 100644
+--- a/security/integrity/ima/Kconfig
++++ b/security/integrity/ima/Kconfig
+@@ -362,8 +362,6 @@ choice
+ 	  database. The compiled default limit can be overwritten using the
+ 	  kernel command line "ima_digest_db_size".
+ 
+-	config IMA_MIN_DIGEST_DB_SIZE
+-		bool "minimum"
+ 	config IMA_STANDARD_DIGEST_DB_SIZE
+ 		bool "standard (default)"
+ 	config IMA_MAX_DIGEST_DB_SIZE
+@@ -375,8 +373,7 @@ endchoice
+ config IMA_DIGEST_DB_MEGABYTES
+ 	int
+ 	depends on IMA_DIGEST_LIST
+-	range 8 64
+-	default 8 if IMA_MIN_DIGEST_DB_SIZE
++	range 0 64
+ 	default 16 if IMA_STANDARD_DIGEST_DB_SIZE
+ 	default 64 if IMA_MAX_DIGEST_DB_SIZE
+ 
+diff --git a/security/integrity/ima/ima.h b/security/integrity/ima/ima.h
+index acdc8ee6e53d..6ab515592c62 100644
+--- a/security/integrity/ima/ima.h
++++ b/security/integrity/ima/ima.h
+@@ -55,8 +55,8 @@ extern bool ima_plus_standard_pcr;
+ extern const char boot_aggregate_name[];
+ extern int ima_digest_list_actions;
+ #ifdef CONFIG_IMA_DIGEST_LIST
+-extern size_t ima_digest_db_max_size __ro_after_init;
+-extern size_t ima_digest_db_size;
++extern int ima_digest_db_max_size __ro_after_init;
++extern int ima_digest_db_size;
+ #endif
+ 
+ /* IMA policy setup data */
+diff --git a/security/integrity/ima/ima_digest_list.c b/security/integrity/ima/ima_digest_list.c
+index 3ffaffe8d064..5ed0c0768958 100644
+--- a/security/integrity/ima/ima_digest_list.c
++++ b/security/integrity/ima/ima_digest_list.c
+@@ -14,7 +14,6 @@
+  */
+ 
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+-#define MIN_DB_SIZE (8 * 1024 * 1024)
+ #define MAX_DB_SIZE (64 * 1024 * 1024)
+ #define DEFAULT_DB_SIZE (CONFIG_IMA_DIGEST_DB_MEGABYTES * 1024 * 1024)
+ 
+@@ -29,8 +28,8 @@
+ #include "ima.h"
+ #include "ima_digest_list.h"
+ 
+-size_t ima_digest_db_max_size __ro_after_init = DEFAULT_DB_SIZE;
+-size_t ima_digest_db_size;
++int ima_digest_db_max_size __ro_after_init = DEFAULT_DB_SIZE;
++int ima_digest_db_size;
+ 
+ struct ima_h_table ima_digests_htable = {
+ 	.len = ATOMIC_LONG_INIT(0),
+@@ -43,12 +42,13 @@ static int __init digest_db_max_size_setup(char *str)
+ 	char *retptr;
+ 
+ 	size = memparse(str, &retptr);
+-	if (size < MIN_DB_SIZE || size > MAX_DB_SIZE || *retptr != '\0') {
+-		pr_err("DB size should range from 8M to 64M\n");
++	if (size < 0 || size > MAX_DB_SIZE || *retptr != '\0') {
++		pr_err("digest DB size should range from 0M to 64M\n");
+ 		return 0;
+ 	}
+ 
+ 	ima_digest_db_max_size = size;
++	pr_info_once("parse reserve digest DB memory: %s\n", str);
+ 
+ 	return 1;
+ }
+@@ -121,6 +121,9 @@ static int ima_add_digest_data_entry(u8 *digest, enum hash_algo algo,
+ 	if (d == NULL)
+ 		return -ENOMEM;
+ 
++	ima_digest_db_size += sizeof(struct ima_digest);
++	ima_digest_db_size += digest_len;
++
+ 	d->algo = algo;
+ 	d->type = type;
+ 	d->modifiers = modifiers;
+@@ -144,6 +147,9 @@ static void ima_del_digest_data_entry(u8 *digest, enum hash_algo algo,
+ 	if (--d->count > 0)
+ 		return;
+ 
++	ima_digest_db_size -= sizeof(struct ima_digest);
++	ima_digest_db_size -= hash_digest_size[algo];
++
+ 	hlist_del_rcu(&d->hnext);
+ 	atomic_long_dec(&ima_digests_htable.len);
+ 	kfree(d);
+@@ -361,6 +367,11 @@ static int __init load_digest_list(struct dir_context *__ctx, const char *name,
+ 
+ 	size = ret;
+ 
++	if (size > ima_digest_db_max_size - ima_digest_db_size) {
++		pr_err_once("digest DB is full: %d\n", ima_digest_db_size);
++		goto out_fput;
++	}
++
+ 	ima_check_measured_appraised(file);
+ 
+ 	ret = ima_parse_compact_list(size, datap, DIGEST_LIST_OP_ADD);
+diff --git a/security/integrity/ima/ima_fs.c b/security/integrity/ima/ima_fs.c
+index dd0b0f431a23..00cd8095d346 100644
+--- a/security/integrity/ima/ima_fs.c
++++ b/security/integrity/ima/ima_fs.c
+@@ -380,12 +380,15 @@ static ssize_t ima_read_sfs_file(char *path, struct dentry *dentry,
+ 			rc = ima_parse_add_rule(p, ima_ns);
+ 		} else if (dentry == digest_list_data ||
+ 			   dentry == digest_list_data_del) {
++#ifdef CONFIG_IMA_DIGEST_LIST
+ 			/* Only check size when adding digest lists */
+ 			if (dentry == digest_list_data &&
+ 			    size > ima_digest_db_max_size - ima_digest_db_size) {
++				pr_err("digest DB is full: %d\n", ima_digest_db_size);
+ 				rc = -ENOMEM;
+ 				break;
+ 			}
++#endif
+ 			/*
+ 			 * Disable usage of digest lists if not measured
+ 			 * or appraised.
+@@ -400,12 +403,13 @@ static ssize_t ima_read_sfs_file(char *path, struct dentry *dentry,
+ 
+ 		if (rc < 0)
+ 			break;
++#ifdef CONFIG_IMA_DIGEST_LIST
++		else if (dentry == digest_list_data)
++			pr_debug("digest imported, current DB size: %d\n", ima_digest_db_size);
++		else if (dentry == digest_list_data_del)
++			pr_debug("digest deleted, current DB size: %d\n", ima_digest_db_size);
++#endif
+ 		size -= rc;
+-
+-		if (dentry == digest_list_data)
+-			ima_digest_db_size += rc;
+-		if (dentry == digest_list_data_del)
+-			ima_digest_db_size -= rc;
+ 	}
+ 
+ 	vfree(data);
+-- 
+2.26.2
+

@@ -1,0 +1,72 @@
+From 1d4b0166e36334c3f32686a336bb25dd904fce2b Mon Sep 17 00:00:00 2001
+From: Joao Martins <joao.m.martins@oracle.com>
+Date: Thu, 29 Apr 2021 22:55:53 -0700
+Subject: [PATCH] RDMA/umem: batch page unpin in __ib_umem_release()
+Git-commit: 1d4b0166e36334c3f32686a336bb25dd904fce2b
+Patch-mainline: v5.13-rc1
+References: bsn#12
+
+
+Use the newly added unpin_user_page_range_dirty_lock() for more quickly
+unpinning a consecutive range of pages represented as compound pages.
+This will also calculate number of pages to unpin (for the tail pages
+which matching head page) and thus batch the refcount update.
+
+Running a test program which calls memory range reg/unreg on a region 1G
+in size and measures cost of both operations together (in a guest using
+rxe) with THP and hugetlbfs:
+
+Before:
+  590 rounds in 5.003 sec: 8480.335 usec / round
+  6898 rounds in 60.001 sec: 8698.367 usec / round
+
+After:
+  2688 rounds in 5.002 sec: 1860.786 usec / round
+  32517 rounds in 60.001 sec: 1845.225 usec / round
+
+Link: https://lkml.kernel.org/r/20210212130843.13865-5-joao.m.martins@oracle.com
+Signed-off-by: Joao Martins <joao.m.martins@oracle.com>
+Acked-by: Jason Gunthorpe <jgg@nvidia.com>
+Cc: Christoph Hellwig <hch@infradead.org>
+Cc: Doug Ledford <dledford@redhat.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ drivers/infiniband/core/umem.c | 12 ++++++------
+ 1 file changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/infiniband/core/umem.c b/drivers/infiniband/core/umem.c
+index 2dde99a9ba07..9b607013e2a2 100644
+--- a/drivers/infiniband/core/umem.c
++++ b/drivers/infiniband/core/umem.c
+@@ -47,17 +47,17 @@
+ 
+ static void __ib_umem_release(struct ib_device *dev, struct ib_umem *umem, int dirty)
+ {
+-	struct sg_page_iter sg_iter;
+-	struct page *page;
++	bool make_dirty = umem->writable && dirty;
++	struct scatterlist *sg;
++	unsigned int i;
+ 
+ 	if (umem->nmap > 0)
+ 		ib_dma_unmap_sg(dev, umem->sg_head.sgl, umem->sg_nents,
+ 				DMA_BIDIRECTIONAL);
+ 
+-	for_each_sg_page(umem->sg_head.sgl, &sg_iter, umem->sg_nents, 0) {
+-		page = sg_page_iter_page(&sg_iter);
+-		unpin_user_pages_dirty_lock(&page, 1, umem->writable && dirty);
+-	}
++	for_each_sg(umem->sg_head.sgl, sg, umem->sg_nents, i)
++		unpin_user_page_range_dirty_lock(sg_page(sg),
++			DIV_ROUND_UP(sg->length, PAGE_SIZE), make_dirty);
+ 
+ 	sg_free_table(&umem->sg_head);
+ }
+-- 
+2.31.1
+

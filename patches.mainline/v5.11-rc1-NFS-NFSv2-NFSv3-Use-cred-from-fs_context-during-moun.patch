@@ -1,0 +1,70 @@
+From d18a9d3fa0f27a47706fb67f1ee0f4d971587c4e Mon Sep 17 00:00:00 2001
+From: Sargun Dhillon <sargun@sargun.me>
+Date: Thu, 12 Nov 2020 02:09:51 -0800
+Subject: [PATCH] NFS: NFSv2/NFSv3: Use cred from fs_context during mount
+Git-commit: d18a9d3fa0f27a47706fb67f1ee0f4d971587c4e
+Patch-mainline: v5.11-rc1
+References: bsn#12
+
+
+There was refactoring done to use the fs_context for mounting done in:
+62a55d088cd87: NFS: Additional refactoring for fs_context conversion
+
+This made it so that the net_ns is fetched from the fs_context (the netns
+that fsopen is called in). This change also makes it so that the credential
+fetched during fsopen is used as well as the net_ns.
+
+NFS has already had a number of changes to prepare it for user namespaces:
+1a58e8a0e5c1: NFS: Store the credential of the mount process in the nfs_server
+264d948ce7d0: NFS: Convert NFSv3 to use the container user namespace
+c207db2f5da5: NFS: Convert NFSv2 to use the container user namespace
+
+Previously, different credentials could be used for creation of the
+fs_context versus creation of the nfs_server, as FSCONFIG_CMD_CREATE did
+the actual credential check, and that's where current_creds() were fetched.
+This meant that the user namespace which fsopen was called in could be a
+non-init user namespace. This still requires that the user that calls
+FSCONFIG_CMD_CREATE has CAP_SYS_ADMIN in the init user ns.
+
+This roughly allows a privileged user to mount on behalf of an unprivileged
+usernamespace, by forking off and calling fsopen in the unprivileged user
+namespace. It can then pass back that fsfd to the privileged process which
+can configure the NFS mount, and then it can call FSCONFIG_CMD_CREATE
+before switching back into the mount namespace of the container, and finish
+up the mounting process and call fsmount and move_mount.
+
+Signed-off-by: Sargun Dhillon <sargun@sargun.me>
+Tested-by: Alban Crequy <alban.crequy@gmail.com>
+Fixes: 62a55d088cd8 ("NFS: Additional refactoring for fs_context conversion")
+Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ fs/nfs/client.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/fs/nfs/client.c b/fs/nfs/client.c
+index f6454ba53d05..ff5c4d0d6d13 100644
+--- a/fs/nfs/client.c
++++ b/fs/nfs/client.c
+@@ -571,7 +571,7 @@ static int nfs_start_lockd(struct nfs_server *server)
+ 					1 : 0,
+ 		.net		= clp->cl_net,
+ 		.nlmclnt_ops 	= clp->cl_nfs_mod->rpc_ops->nlmclnt_ops,
+-		.cred		= current_cred(),
++		.cred		= server->cred,
+ 	};
+ 
+ 	if (nlm_init.nfs_version > 3)
+@@ -985,7 +985,7 @@ struct nfs_server *nfs_create_server(struct fs_context *fc)
+ 	if (!server)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	server->cred = get_cred(current_cred());
++	server->cred = get_cred(fc->cred);
+ 
+ 	error = -ENOMEM;
+ 	fattr = nfs_alloc_fattr();
+-- 
+2.31.1
+

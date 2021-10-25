@@ -1,0 +1,171 @@
+From 81e7eb5bf08f36d34495a5898f6ef3fec05d9776 Mon Sep 17 00:00:00 2001
+From: "Martin K. Petersen" <martin.petersen@oracle.com>
+Date: Wed, 16 Dec 2020 22:43:44 -0500
+Subject: [PATCH] Revert "Revert "scsi: megaraid_sas: Added support for shared
+Git-commit: 81e7eb5bf08f36d34495a5898f6ef3fec05d9776
+Patch-mainline: v5.11-rc3
+References: bsn#12
+
+ host tagset for cpuhotplug""
+
+This reverts commit 1a0e1943d8798cb3241fb5edb9a836af1611b60a.
+
+Commit b3c6a5997541 ("block: Fix a lockdep complaint triggered by
+request queue flushing") has been reverted and commit fb01a2932e81 has
+been introduced in its place. Consequently, it is now safe to
+reinstate the megaraid_sas tagset changes that led to boot problems in
+5.10.
+
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ drivers/scsi/megaraid/megaraid_sas_base.c   | 39 +++++++++++++++++++++
+ drivers/scsi/megaraid/megaraid_sas_fusion.c | 29 ++++++++-------
+ 2 files changed, 55 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/scsi/megaraid/megaraid_sas_base.c b/drivers/scsi/megaraid/megaraid_sas_base.c
+index e158d3d62056..41cd66fc7d81 100644
+--- a/drivers/scsi/megaraid/megaraid_sas_base.c
++++ b/drivers/scsi/megaraid/megaraid_sas_base.c
+@@ -37,6 +37,7 @@
+ #include <linux/poll.h>
+ #include <linux/vmalloc.h>
+ #include <linux/irq_poll.h>
++#include <linux/blk-mq-pci.h>
+ 
+ #include <scsi/scsi.h>
+ #include <scsi/scsi_cmnd.h>
+@@ -113,6 +114,10 @@ unsigned int enable_sdev_max_qd;
+ module_param(enable_sdev_max_qd, int, 0444);
+ MODULE_PARM_DESC(enable_sdev_max_qd, "Enable sdev max qd as can_queue. Default: 0");
+ 
++int host_tagset_enable = 1;
++module_param(host_tagset_enable, int, 0444);
++MODULE_PARM_DESC(host_tagset_enable, "Shared host tagset enable/disable Default: enable(1)");
++
+ MODULE_LICENSE("GPL");
+ MODULE_VERSION(MEGASAS_VERSION);
+ MODULE_AUTHOR("megaraidlinux.pdl@broadcom.com");
+@@ -3119,6 +3124,19 @@ megasas_bios_param(struct scsi_device *sdev, struct block_device *bdev,
+ 	return 0;
+ }
+ 
++static int megasas_map_queues(struct Scsi_Host *shost)
++{
++	struct megasas_instance *instance;
++
++	instance = (struct megasas_instance *)shost->hostdata;
++
++	if (shost->nr_hw_queues == 1)
++		return 0;
++
++	return blk_mq_pci_map_queues(&shost->tag_set.map[HCTX_TYPE_DEFAULT],
++			instance->pdev, instance->low_latency_index_start);
++}
++
+ static void megasas_aen_polling(struct work_struct *work);
+ 
+ /**
+@@ -3427,6 +3445,7 @@ static struct scsi_host_template megasas_template = {
+ 	.eh_timed_out = megasas_reset_timer,
+ 	.shost_attrs = megaraid_host_attrs,
+ 	.bios_param = megasas_bios_param,
++	.map_queues = megasas_map_queues,
+ 	.change_queue_depth = scsi_change_queue_depth,
+ 	.max_segment_size = 0xffffffff,
+ };
+@@ -6808,6 +6827,26 @@ static int megasas_io_attach(struct megasas_instance *instance)
+ 	host->max_lun = MEGASAS_MAX_LUN;
+ 	host->max_cmd_len = 16;
+ 
++	/* Use shared host tagset only for fusion adaptors
++	 * if there are managed interrupts (smp affinity enabled case).
++	 * Single msix_vectors in kdump, so shared host tag is also disabled.
++	 */
++
++	host->host_tagset = 0;
++	host->nr_hw_queues = 1;
++
++	if ((instance->adapter_type != MFI_SERIES) &&
++		(instance->msix_vectors > instance->low_latency_index_start) &&
++		host_tagset_enable &&
++		instance->smp_affinity_enable) {
++		host->host_tagset = 1;
++		host->nr_hw_queues = instance->msix_vectors -
++			instance->low_latency_index_start;
++	}
++
++	dev_info(&instance->pdev->dev,
++		"Max firmware commands: %d shared with nr_hw_queues = %d\n",
++		instance->max_fw_cmds, host->nr_hw_queues);
+ 	/*
+ 	 * Notify the mid-layer about the new controller
+ 	 */
+diff --git a/drivers/scsi/megaraid/megaraid_sas_fusion.c b/drivers/scsi/megaraid/megaraid_sas_fusion.c
+index b0c01cf0428f..fd607287608e 100644
+--- a/drivers/scsi/megaraid/megaraid_sas_fusion.c
++++ b/drivers/scsi/megaraid/megaraid_sas_fusion.c
+@@ -359,24 +359,29 @@ megasas_get_msix_index(struct megasas_instance *instance,
+ {
+ 	int sdev_busy;
+ 
+-	/* nr_hw_queue = 1 for MegaRAID */
+-	struct blk_mq_hw_ctx *hctx =
+-		scmd->device->request_queue->queue_hw_ctx[0];
+-
+-	sdev_busy = atomic_read(&hctx->nr_active);
++	/* TBD - if sml remove device_busy in future, driver
++	 * should track counter in internal structure.
++	 */
++	sdev_busy = atomic_read(&scmd->device->device_busy);
+ 
+ 	if (instance->perf_mode == MR_BALANCED_PERF_MODE &&
+-	    sdev_busy > (data_arms * MR_DEVICE_HIGH_IOPS_DEPTH))
++	    sdev_busy > (data_arms * MR_DEVICE_HIGH_IOPS_DEPTH)) {
+ 		cmd->request_desc->SCSIIO.MSIxIndex =
+ 			mega_mod64((atomic64_add_return(1, &instance->high_iops_outstanding) /
+ 					MR_HIGH_IOPS_BATCH_COUNT), instance->low_latency_index_start);
+-	else if (instance->msix_load_balance)
++	} else if (instance->msix_load_balance) {
+ 		cmd->request_desc->SCSIIO.MSIxIndex =
+ 			(mega_mod64(atomic64_add_return(1, &instance->total_io_count),
+ 				instance->msix_vectors));
+-	else
++	} else if (instance->host->nr_hw_queues > 1) {
++		u32 tag = blk_mq_unique_tag(scmd->request);
++
++		cmd->request_desc->SCSIIO.MSIxIndex = blk_mq_unique_tag_to_hwq(tag) +
++			instance->low_latency_index_start;
++	} else {
+ 		cmd->request_desc->SCSIIO.MSIxIndex =
+ 			instance->reply_map[raw_smp_processor_id()];
++	}
+ }
+ 
+ /**
+@@ -956,9 +961,6 @@ megasas_alloc_cmds_fusion(struct megasas_instance *instance)
+ 	if (megasas_alloc_cmdlist_fusion(instance))
+ 		goto fail_exit;
+ 
+-	dev_info(&instance->pdev->dev, "Configured max firmware commands: %d\n",
+-		 instance->max_fw_cmds);
+-
+ 	/* The first 256 bytes (SMID 0) is not used. Don't add to the cmd list */
+ 	io_req_base = fusion->io_request_frames + MEGA_MPI2_RAID_DEFAULT_IO_FRAME_SIZE;
+ 	io_req_base_phys = fusion->io_request_frames_phys + MEGA_MPI2_RAID_DEFAULT_IO_FRAME_SIZE;
+@@ -1102,8 +1104,9 @@ megasas_ioc_init_fusion(struct megasas_instance *instance)
+ 		MR_HIGH_IOPS_QUEUE_COUNT) && cur_intr_coalescing)
+ 		instance->perf_mode = MR_BALANCED_PERF_MODE;
+ 
+-	dev_info(&instance->pdev->dev, "Performance mode :%s\n",
+-		MEGASAS_PERF_MODE_2STR(instance->perf_mode));
++	dev_info(&instance->pdev->dev, "Performance mode :%s (latency index = %d)\n",
++		MEGASAS_PERF_MODE_2STR(instance->perf_mode),
++		instance->low_latency_index_start);
+ 
+ 	instance->fw_sync_cache_support = (scratch_pad_1 &
+ 		MR_CAN_HANDLE_SYNC_CACHE_OFFSET) ? 1 : 0;
+-- 
+2.31.1
+

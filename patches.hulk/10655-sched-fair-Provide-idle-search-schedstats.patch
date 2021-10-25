@@ -1,0 +1,381 @@
+From e1f8c17831bb1e1e9365bfc372b1692d244d5f2b Mon Sep 17 00:00:00 2001
+From: Steve Sistare <steven.sistare@oracle.com>
+Date: Thu, 11 Nov 2021 16:28:48 +0800
+Subject: [PATCH] sched/fair: Provide idle search schedstats
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: e1f8c17831bb1e1e9365bfc372b1692d244d5f2b
+
+
+hulk inclusion
+category: feature
+bugzilla: 38261, https://gitee.com/openeuler/kernel/issues/I49XPZ
+CVE: NA
+
+---------------------------
+
+Add schedstats to measure the effectiveness of searching for idle CPUs
+and stealing tasks.  This is a temporary patch intended for use during
+development only.  SCHEDSTAT_VERSION is bumped to 16, and the following
+fields are added to the per-CPU statistics of /proc/schedstat:
+
+field 10: # of times select_idle_sibling "easily" found an idle CPU --
+          prev or target is idle.
+field 11: # of times select_idle_sibling searched and found an idle cpu.
+field 12: # of times select_idle_sibling searched and found an idle core.
+field 13: # of times select_idle_sibling failed to find anything idle.
+field 14: time in nanoseconds spent in functions that search for idle
+          CPUs and search for tasks to steal.
+field 15: # of times an idle CPU steals a task from another CPU.
+field 16: # of times try_steal finds overloaded CPUs but no task is
+           migratable.
+
+Signed-off-by: Steve Sistare <steven.sistare@oracle.com>
+Signed-off-by: Cheng Jian <cj.chengjian@huawei.com>
+Reviewed-by: Hanjun Guo <guohanjun@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Reviewed-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Reviewed-by: Chen Hui <judy.chenhui@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/sched/core.c  | 31 ++++++++++++++++++++++++++--
+ kernel/sched/fair.c  | 48 ++++++++++++++++++++++++++++++++++++++++----
+ kernel/sched/sched.h |  9 +++++++++
+ kernel/sched/stats.c | 11 +++++++++-
+ kernel/sched/stats.h | 13 ++++++++++++
+ 5 files changed, 105 insertions(+), 7 deletions(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 25121223987b..acccd222814a 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -3146,17 +3146,44 @@ int sysctl_numa_balancing(struct ctl_table *table, int write,
+ DEFINE_STATIC_KEY_FALSE(sched_schedstats);
+ static bool __initdata __sched_schedstats = false;
+ 
++unsigned long schedstat_skid;
++
++static void compute_skid(void)
++{
++	int i, n = 0;
++	s64 t;
++	int skid = 0;
++
++	for (i = 0; i < 100; i++) {
++		t = local_clock();
++		t = local_clock() - t;
++		if (t > 0 && t < 1000) {	/* only use sane samples */
++			skid += (int) t;
++			n++;
++		}
++	}
++
++	if (n > 0)
++		schedstat_skid = skid / n;
++	else
++		schedstat_skid = 0;
++	pr_info("schedstat_skid = %lu\n", schedstat_skid);
++}
++
+ static void set_schedstats(bool enabled)
+ {
+-	if (enabled)
++	if (enabled) {
++		compute_skid();
+ 		static_branch_enable(&sched_schedstats);
+-	else
++	} else {
+ 		static_branch_disable(&sched_schedstats);
++	}
+ }
+ 
+ void force_schedstat_enabled(void)
+ {
+ 	if (!schedstat_enabled()) {
++		compute_skid();
+ 		pr_info("kernel profiling enabled schedstats, disable via kernel.sched_schedstats.\n");
+ 		static_branch_enable(&sched_schedstats);
+ 	}
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 78d711aa8af6..c74adb65732c 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -4176,29 +4176,35 @@ static inline bool steal_enabled(void)
+ static void overload_clear(struct rq *rq)
+ {
+ 	struct sparsemask *overload_cpus;
++	unsigned long time;
+ 
+ 	if (!steal_enabled())
+ 		return;
+ 
++	time = schedstat_start_time();
+ 	rcu_read_lock();
+ 	overload_cpus = rcu_dereference(rq->cfs_overload_cpus);
+ 	if (overload_cpus)
+ 		sparsemask_clear_elem(overload_cpus, rq->cpu);
+ 	rcu_read_unlock();
++	schedstat_end_time(rq->find_time, time);
+ }
+ 
+ static void overload_set(struct rq *rq)
+ {
+ 	struct sparsemask *overload_cpus;
++	unsigned long time;
+ 
+ 	if (!steal_enabled())
+ 		return;
+ 
++	time = schedstat_start_time();
+ 	rcu_read_lock();
+ 	overload_cpus = rcu_dereference(rq->cfs_overload_cpus);
+ 	if (overload_cpus)
+ 		sparsemask_set_elem(overload_cpus, rq->cpu);
+ 	rcu_read_unlock();
++	schedstat_end_time(rq->find_time, time);
+ }
+ 
+ static int try_steal(struct rq *this_rq, struct rq_flags *rf);
+@@ -6416,6 +6422,16 @@ static inline bool asym_fits_capacity(int task_util, int cpu)
+ 	return true;
+ }
+ 
++#define SET_STAT(STAT)							\
++	do {								\
++		if (schedstat_enabled()) {				\
++			struct rq *rq = this_rq();			\
++									\
++			if (rq)						\
++				__schedstat_inc(rq->STAT);		\
++		}							\
++	} while (0)
++
+ /*
+  * Try and locate an idle core/thread in the LLC cache domain.
+  */
+@@ -6435,16 +6451,20 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 	}
+ 
+ 	if ((available_idle_cpu(target) || sched_idle_cpu(target)) &&
+-	    asym_fits_capacity(task_util, target))
++	    asym_fits_capacity(task_util, target)) {
++		SET_STAT(found_idle_cpu_easy);
+ 		return target;
++	}
+ 
+ 	/*
+ 	 * If the previous CPU is cache affine and idle, don't be stupid:
+ 	 */
+ 	if (prev != target && cpus_share_cache(prev, target) &&
+ 	    (available_idle_cpu(prev) || sched_idle_cpu(prev)) &&
+-	    asym_fits_capacity(task_util, prev))
++	    asym_fits_capacity(task_util, prev)) {
++		SET_STAT(found_idle_cpu_easy);
+ 		return prev;
++	}
+ 
+ 	/*
+ 	 * Allow a per-cpu kthread to stack with the wakee if the
+@@ -6457,6 +6477,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 	if (is_per_cpu_kthread(current) &&
+ 	    prev == smp_processor_id() &&
+ 	    this_rq()->nr_running <= 1) {
++		SET_STAT(found_idle_cpu_easy);
+ 		return prev;
+ 	}
+ 
+@@ -6472,6 +6493,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 		 * Replace recent_used_cpu with prev as it is a potential
+ 		 * candidate for the next wake:
+ 		 */
++		SET_STAT(found_idle_cpu_easy);
+ 		p->recent_used_cpu = prev;
+ 		return recent_used_cpu;
+ 	}
+@@ -6492,18 +6514,24 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 		 */
+ 		if (sd) {
+ 			i = select_idle_capacity(p, sd, target);
++			SET_STAT(found_idle_cpu_capacity);
+ 			return ((unsigned)i < nr_cpumask_bits) ? i : target;
+ 		}
+ 	}
+ 
+ 	sd = rcu_dereference(per_cpu(sd_llc, target));
+-	if (!sd)
++	if (!sd) {
++		SET_STAT(nofound_idle_cpu);
+ 		return target;
++	}
+ 
+ 	i = select_idle_cpu(p, sd, target);
+-	if ((unsigned)i < nr_cpumask_bits)
++	if ((unsigned)i < nr_cpumask_bits) {
++		SET_STAT(found_idle_cpu);
+ 		return i;
++	}
+ 
++	SET_STAT(nofound_idle_cpu);
+ 	return target;
+ }
+ 
+@@ -6897,6 +6925,7 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
+ static int
+ select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_flags)
+ {
++	unsigned long time = schedstat_start_time();
+ 	struct sched_domain *tmp, *sd = NULL;
+ 	int cpu = smp_processor_id();
+ 	int new_cpu = prev_cpu;
+@@ -6949,6 +6978,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_f
+ 			current->recent_used_cpu = cpu;
+ 	}
+ 	rcu_read_unlock();
++	schedstat_end_time(cpu_rq(cpu)->find_time, time);
+ 
+ 	return new_cpu;
+ }
+@@ -7342,6 +7372,7 @@ pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf
+ 	struct sched_entity *se;
+ 	struct task_struct *p;
+ 	int new_tasks;
++	unsigned long time;
+ 
+ again:
+ 	if (!sched_fair_runnable(rq))
+@@ -7467,6 +7498,8 @@ done: __maybe_unused;
+ 	if (!rf)
+ 		return NULL;
+ 
++	time = schedstat_start_time();
++
+ 	/*
+ 	 * We must set idle_stamp _before_ calling try_steal() or
+ 	 * idle_balance(), such that we measure the duration as idle time.
+@@ -7480,6 +7513,8 @@ done: __maybe_unused;
+ 	if (new_tasks)
+ 		rq_idle_stamp_clear(rq);
+ 
++	schedstat_end_time(rq->find_time, time);
++
+ 
+ 	/*
+ 	 * Because try_steal() and idle_balance() release (and re-acquire)
+@@ -11175,6 +11210,7 @@ static int steal_from(struct rq *dst_rq, struct rq_flags *dst_rf, bool *locked,
+ 		update_rq_clock(dst_rq);
+ 		attach_task(dst_rq, p);
+ 		stolen = 1;
++		schedstat_inc(dst_rq->steal);
+ 	}
+ 	local_irq_restore(rf.flags);
+ 
+@@ -11199,6 +11235,7 @@ static int try_steal(struct rq *dst_rq, struct rq_flags *dst_rf)
+ 	int dst_cpu = dst_rq->cpu;
+ 	bool locked = true;
+ 	int stolen = 0;
++	bool any_overload = false;
+ 	struct sparsemask *overload_cpus;
+ 
+ 	if (!steal_enabled())
+@@ -11241,6 +11278,7 @@ static int try_steal(struct rq *dst_rq, struct rq_flags *dst_rf)
+ 			stolen = 1;
+ 			goto out;
+ 		}
++		any_overload = true;
+ 	}
+ 
+ out:
+@@ -11252,6 +11290,8 @@ static int try_steal(struct rq *dst_rq, struct rq_flags *dst_rf)
+ 	stolen |= (dst_rq->cfs.h_nr_running > 0);
+ 	if (dst_rq->nr_running != dst_rq->cfs.h_nr_running)
+ 		stolen = -1;
++	if (!stolen && any_overload)
++		schedstat_inc(dst_rq->steal_fail);
+ 	return stolen;
+ }
+ 
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index b0f41c06a310..67e6d89ca7bc 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1052,6 +1052,15 @@ struct rq {
+ 	/* try_to_wake_up() stats */
+ 	unsigned int		ttwu_count;
+ 	unsigned int		ttwu_local;
++
++	/* Idle search stats */
++	unsigned int		found_idle_cpu_capacity;
++	unsigned int		found_idle_cpu;
++	unsigned int		found_idle_cpu_easy;
++	unsigned int		nofound_idle_cpu;
++	unsigned long		find_time;
++	unsigned int		steal;
++	unsigned int		steal_fail;
+ #endif
+ 
+ #ifdef CONFIG_CPU_IDLE
+diff --git a/kernel/sched/stats.c b/kernel/sched/stats.c
+index 750fb3c67eed..e4d1d9805d46 100644
+--- a/kernel/sched/stats.c
++++ b/kernel/sched/stats.c
+@@ -10,7 +10,7 @@
+  * Bump this up when changing the output format or the meaning of an existing
+  * format, so that tools can adapt (or abort)
+  */
+-#define SCHEDSTAT_VERSION 15
++#define SCHEDSTAT_VERSION 16
+ 
+ static int show_schedstat(struct seq_file *seq, void *v)
+ {
+@@ -37,6 +37,15 @@ static int show_schedstat(struct seq_file *seq, void *v)
+ 		    rq->rq_cpu_time,
+ 		    rq->rq_sched_info.run_delay, rq->rq_sched_info.pcount);
+ 
++		seq_printf(seq, " %u %u %u %u %lu %u %u",
++			   rq->found_idle_cpu_easy,
++			   rq->found_idle_cpu_capacity,
++			   rq->found_idle_cpu,
++			   rq->nofound_idle_cpu,
++			   rq->find_time,
++			   rq->steal,
++			   rq->steal_fail);
++
+ 		seq_printf(seq, "\n");
+ 
+ #ifdef CONFIG_SMP
+diff --git a/kernel/sched/stats.h b/kernel/sched/stats.h
+index 33d0daf83842..dc5ca31f5c2d 100644
+--- a/kernel/sched/stats.h
++++ b/kernel/sched/stats.h
+@@ -39,6 +39,17 @@ rq_sched_info_dequeued(struct rq *rq, unsigned long long delta)
+ #define   schedstat_set(var, val)	do { if (schedstat_enabled()) { var = (val); } } while (0)
+ #define   schedstat_val(var)		(var)
+ #define   schedstat_val_or_zero(var)	((schedstat_enabled()) ? (var) : 0)
++#define   schedstat_start_time()	schedstat_val_or_zero(local_clock())
++#define   schedstat_end_time(stat, time)			\
++	do {							\
++		unsigned long endtime;				\
++								\
++		if (schedstat_enabled() && (time)) {		\
++			endtime = local_clock() - (time) - schedstat_skid; \
++			schedstat_add((stat), endtime);		\
++		}						\
++	} while (0)
++extern unsigned long schedstat_skid;
+ 
+ #else /* !CONFIG_SCHEDSTATS: */
+ static inline void rq_sched_info_arrive  (struct rq *rq, unsigned long long delta) { }
+@@ -53,6 +64,8 @@ static inline void rq_sched_info_depart  (struct rq *rq, unsigned long long delt
+ # define   schedstat_set(var, val)	do { } while (0)
+ # define   schedstat_val(var)		0
+ # define   schedstat_val_or_zero(var)	0
++# define   schedstat_start_time()	0
++# define   schedstat_end_time(stat, t)	do { } while (0)
+ #endif /* CONFIG_SCHEDSTATS */
+ 
+ #ifdef CONFIG_PSI
+-- 
+2.26.2
+

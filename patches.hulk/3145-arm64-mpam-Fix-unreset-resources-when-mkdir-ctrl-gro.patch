@@ -1,0 +1,184 @@
+From 88520d2383ac21cf86567ee014d31b3d61e3750f Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Fri, 26 Feb 2021 20:21:47 +0800
+Subject: [PATCH] arm64/mpam: Fix unreset resources when mkdir ctrl group or
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 88520d2383ac21cf86567ee014d31b3d61e3750f
+
+ umount resctrl
+
+hulk inclusion
+category: bugfix
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+There are two problems related to schemata:
+
+1) When rmdir a group and then mkdir a new group under resctrl
+   root directory, the new group still inherits the schemata
+   configuration from old.
+   e.g.
+       > mount -t resctrl resctrl /sys/fs/resctrl
+       > cd /sys/fs/resctrl
+       > mkdir p1 && cd p1
+       > echo 'L3:0=7f' > schemata
+       > cd .. && rmdir p1 && mkdir p1 && cd p1
+       > cat schemata
+         L3:0=7f;1=7fff;2=7fff;3=7fff
+         MB:0=100;1=100;2=100;3=100
+
+2) It still exists when umount /sys/fs/resctrl and remount.
+   e.g.
+       > mount -t resctrl resctrl /sys/fs/resctrl
+       > cd /sys/fs/resctrl
+       > echo 'L3:0=7f' > schemata
+       > umount /sys/fs/resctrl
+       > mount -t resctrl resctrl /sys/fs/resctrl
+       > cat schemata
+         L3:0=7f;1=7fff;2=7fff;3=7fff
+         MB:0=100;1=100;2=100;3=100
+
+Firstly we make each resctrl resource obtains their corresponding
+default configuration. NOTE we use zero to initialize L3 default
+value instead of max cpbm bits, as zero configurarion equals to
+maximum configuration for L3 MSCs. And we use max-percentage masks
+of max bandwidth to generate maximum configuration for MB.
+
+Then we reset resources' configuration settings to default value
+and back MSCs to default state, when mkdir or umount happended.
+
+Fixes: caf75b6b2540 ("resctrlfs: mpam: init struct for mpam")
+Fixes: 916dd9321e3c ("resctrlfs: init support resctrlfs")
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/mpam_resource.h |  4 ++++
+ arch/arm64/include/asm/resctrl.h       |  2 ++
+ arch/arm64/kernel/mpam.c               | 17 ++++++++++++++++
+ arch/arm64/kernel/mpam_ctrlmon.c       | 28 ++++++++++++++++++++++++++
+ fs/resctrlfs.c                         |  5 +++++
+ 5 files changed, 56 insertions(+)
+
+diff --git a/arch/arm64/include/asm/mpam_resource.h b/arch/arm64/include/asm/mpam_resource.h
+index ab90596c9194..1a6904c22b9c 100644
+--- a/arch/arm64/include/asm/mpam_resource.h
++++ b/arch/arm64/include/asm/mpam_resource.h
+@@ -89,6 +89,10 @@
+ /* [FIXME] hard code for hardlim */
+ #define MBW_MAX_SET(v)		(MBW_MAX_HARDLIM|((v) << (16 - BWA_WD)))
+ #define MBW_MAX_GET(v)		(((v) & MBW_MAX_MASK) >> (16 - BWA_WD))
++
++/* hard code for mbw_max max-percentage's cresponding masks */
++#define MBA_MAX_WD 63u
++
+ /*
+  * emulate the mpam nodes
+  * These should be reported by ACPI MPAM Table.
+diff --git a/arch/arm64/include/asm/resctrl.h b/arch/arm64/include/asm/resctrl.h
+index 0a0a12b17ab3..fb5fa6c13843 100644
+--- a/arch/arm64/include/asm/resctrl.h
++++ b/arch/arm64/include/asm/resctrl.h
+@@ -65,4 +65,6 @@ int
+ mongroup_create_dir(struct kernfs_node *parent_kn, struct resctrl_group *prgrp,
+ 		    char *name, struct kernfs_node **dest_kn);
+ 
++int rdtgroup_init_alloc(struct rdtgroup *rdtgrp);
++
+ #endif /* _ASM_ARM64_RESCTRL_H */
+diff --git a/arch/arm64/kernel/mpam.c b/arch/arm64/kernel/mpam.c
+index 202e49a1d3f9..120795e2daba 100644
+--- a/arch/arm64/kernel/mpam.c
++++ b/arch/arm64/kernel/mpam.c
+@@ -86,6 +86,9 @@ static inline void mpam_node_assign_val(struct mpam_node *n,
+ 	n->addr = hwpage_address;
+ 	n->component_id = component_id;
+ 	n->cpus_list = "0";
++
++	if (n->type == MPAM_RESOURCE_MC)
++		n->default_ctrl = MBA_MAX_WD;
+ }
+ 
+ #define MPAM_NODE_NAME_SIZE (10)
+@@ -544,6 +547,20 @@ void post_resctrl_mount(void)
+ 
+ static int reset_all_ctrls(struct resctrl_resource *r)
+ {
++	struct raw_resctrl_resource *rr;
++	struct rdt_domain *d;
++	int partid;
++
++	rr = (struct raw_resctrl_resource *)r->res;
++	for (partid = 0; partid < rr->num_partid; partid++) {
++		list_for_each_entry(d, &r->domains, list) {
++			d->new_ctrl = rr->default_ctrl;
++			d->ctrl_val[partid] = rr->default_ctrl;
++			d->have_new_ctrl = true;
++			rr->msr_update(d, partid);
++		}
++	}
++
+ 	return 0;
+ }
+ 
+diff --git a/arch/arm64/kernel/mpam_ctrlmon.c b/arch/arm64/kernel/mpam_ctrlmon.c
+index b9f94955818e..2b94efc38eeb 100644
+--- a/arch/arm64/kernel/mpam_ctrlmon.c
++++ b/arch/arm64/kernel/mpam_ctrlmon.c
+@@ -585,3 +585,31 @@ int resctrl_mkdir_ctrlmon_mondata(struct kernfs_node *parent_kn,
+ 	}
+ 	return ret;
+ }
++
++/* Initialize the RDT group's allocations. */
++int rdtgroup_init_alloc(struct rdtgroup *rdtgrp)
++{
++	struct resctrl_resource *r;
++	struct raw_resctrl_resource *rr;
++	struct rdt_domain *d;
++	int ret;
++
++	for_each_resctrl_resource(r) {
++		if (!r->alloc_enabled)
++			continue;
++
++		rr = (struct raw_resctrl_resource *)r->res;
++		list_for_each_entry(d, &r->domains, list) {
++			d->new_ctrl = rr->default_ctrl;
++			d->have_new_ctrl = true;
++		}
++
++		ret = update_domains(r, rdtgrp);
++		if (ret < 0) {
++			rdt_last_cmd_puts("Failed to initialize allocations\n");
++			return ret;
++		}
++	}
++
++	return 0;
++}
+diff --git a/fs/resctrlfs.c b/fs/resctrlfs.c
+index dfab7eca1602..bc1a6cd011ac 100644
+--- a/fs/resctrlfs.c
++++ b/fs/resctrlfs.c
+@@ -708,6 +708,11 @@ static int resctrl_group_mkdir_ctrl_mon(struct kernfs_node *parent_kn,
+ 	ret = 0;
+ 
+ 	rdtgrp->closid = closid;
++
++	ret = rdtgroup_init_alloc(rdtgrp);
++	if (ret < 0)
++		goto out_id_free;
++
+ 	list_add(&rdtgrp->resctrl_group_list, &resctrl_all_groups);
+ 
+ 	if (resctrl_mon_capable) {
+-- 
+2.26.2
+

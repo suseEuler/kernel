@@ -1,0 +1,88 @@
+From 8f9513d89f0417d3ca0a99b5f63c84b4cf2ed5fa Mon Sep 17 00:00:00 2001
+From: Weihang Li <liweihang@huawei.com>
+Date: Fri, 28 May 2021 17:37:41 +0800
+Subject: [PATCH] RDMA/hns: Use refcount_t instead of atomic_t for QP reference counting
+Git-commit: 8f9513d89f0417d3ca0a99b5f63c84b4cf2ed5fa
+Patch-mainline: v5.14-rc1
+References: bsn#12
+openEuler-commit: 58b282628467034e59cc3b8614858d5ee2bd2978
+
+The refcount_t API will WARN on underflow and overflow of a reference
+counter, and avoid use-after-free risks.
+
+Link: https://lore.kernel.org/r/1622194663-2383-11-git-send-email-liweihang@huawei.com
+Signed-off-by: Weihang Li <liweihang@huawei.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/infiniband/hw/hns/hns_roce_device.h |    2 +-
+ drivers/infiniband/hw/hns/hns_roce_qp.c     |   12 ++++++------
+ 2 files changed, 7 insertions(+), 7 deletions(-)
+
+--- a/drivers/infiniband/hw/hns/hns_roce_device.h
++++ b/drivers/infiniband/hw/hns/hns_roce_device.h
+@@ -639,7 +639,7 @@ struct hns_roce_qp {
+ 
+ 	u32			xrcdn;
+ 
+-	atomic_t		refcount;
++	refcount_t		refcount;
+ 	struct completion	free;
+ 
+ 	struct hns_roce_sge	sge;
+--- a/drivers/infiniband/hw/hns/hns_roce_qp.c
++++ b/drivers/infiniband/hw/hns/hns_roce_qp.c
+@@ -65,7 +65,7 @@ static void flush_work_handle(struct wor
+ 	 * make sure we signal QP destroy leg that flush QP was completed
+ 	 * so that it can safely proceed ahead now and destroy QP
+ 	 */
+-	if (atomic_dec_and_test(&hr_qp->refcount))
++	if (refcount_dec_and_test(&hr_qp->refcount))
+ 		complete(&hr_qp->free);
+ }
+ 
+@@ -75,7 +75,7 @@ void init_flush_work(struct hns_roce_dev
+ 
+ 	flush_work->hr_dev = hr_dev;
+ 	INIT_WORK(&flush_work->work, flush_work_handle);
+-	atomic_inc(&hr_qp->refcount);
++	refcount_inc(&hr_qp->refcount);
+ 	queue_work(hr_dev->irq_workq, &flush_work->work);
+ }
+ 
+@@ -87,7 +87,7 @@ void hns_roce_qp_event(struct hns_roce_d
+ 	xa_lock(&hr_dev->qp_table_xa);
+ 	qp = __hns_roce_qp_lookup(hr_dev, qpn);
+ 	if (qp)
+-		atomic_inc(&qp->refcount);
++		refcount_inc(&qp->refcount);
+ 	xa_unlock(&hr_dev->qp_table_xa);
+ 
+ 	if (!qp) {
+@@ -108,7 +108,7 @@ void hns_roce_qp_event(struct hns_roce_d
+ 
+ 	qp->event(qp, (enum hns_roce_event)event_type);
+ 
+-	if (atomic_dec_and_test(&qp->refcount))
++	if (refcount_dec_and_test(&qp->refcount))
+ 		complete(&qp->free);
+ }
+ 
+@@ -1083,7 +1083,7 @@ static int hns_roce_create_qp_common(str
+ 
+ 	hr_qp->ibqp.qp_num = hr_qp->qpn;
+ 	hr_qp->event = hns_roce_ib_qp_event;
+-	atomic_set(&hr_qp->refcount, 1);
++	refcount_set(&hr_qp->refcount, 1);
+ 	init_completion(&hr_qp->free);
+ 
+ 	return 0;
+@@ -1106,7 +1106,7 @@ err_buf:
+ void hns_roce_qp_destroy(struct hns_roce_dev *hr_dev, struct hns_roce_qp *hr_qp,
+ 			 struct ib_udata *udata)
+ {
+-	if (atomic_dec_and_test(&hr_qp->refcount))
++	if (refcount_dec_and_test(&hr_qp->refcount))
+ 		complete(&hr_qp->free);
+ 	wait_for_completion(&hr_qp->free);
+ 

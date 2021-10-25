@@ -1,0 +1,353 @@
+From 86e35fae15bbfb198f80644cc183e639d35cd87d Mon Sep 17 00:00:00 2001
+From: Ye Weihua <yeweihua4@huawei.com>
+Date: Tue, 19 Oct 2021 18:03:44 +0800
+Subject: [PATCH] livepatch: checks only if the replaced instruction is on the
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 86e35fae15bbfb198f80644cc183e639d35cd87d
+
+ stack
+
+hulk inclusion
+category: feature
+bugzilla: 119440 https://gitee.com/openeuler/kernel/issues/I4DDEL
+
+--------------------------------
+
+When the CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY macro is turned
+on, the system checks whether the function to patch is on the stack
+under the stop_machine. If the function is on the stack, the livepatch
+cannot be patched and returns a busy signal.
+
+Hotspot functions are easily on the stack under the stop_machine
+condition. As a result, the livpatch success rate is low when the
+patch includes a hot function.
+
+For the repalced function, only the first seceral instructions are
+rewritten, and the rest of the instructions are the same as the
+original ones. Therefore, if the force flag is KLP_STACK_OPTIMIZE,
+only need to check whether the replaced instructions are on the
+stack.
+
+Signed-off-by: Ye Weihua <yeweihua4@huawei.com>
+Reviewed-by: Kuohai Xu <xukuohai@huawei.com>
+Signed-off-by: Chen Jun <chenjun102@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm/kernel/livepatch.c        | 29 ++++++++++++++++------
+ arch/arm64/kernel/livepatch.c      | 27 ++++++++++++++++-----
+ arch/powerpc/kernel/livepatch_32.c | 19 ++++++++++++---
+ arch/powerpc/kernel/livepatch_64.c | 39 ++++++++++++++++++++----------
+ arch/x86/kernel/livepatch.c        | 20 +++++++++++----
+ 5 files changed, 98 insertions(+), 36 deletions(-)
+
+diff --git a/arch/arm/kernel/livepatch.c b/arch/arm/kernel/livepatch.c
+index 1dc074e2a0d4..ce981b48fedb 100644
+--- a/arch/arm/kernel/livepatch.c
++++ b/arch/arm/kernel/livepatch.c
+@@ -31,16 +31,19 @@
+ #include <asm/insn.h>
+ #include <asm/patch.h>
+ 
+-#ifdef CONFIG_ARM_MODULE_PLTS
+-#define LJMP_INSN_SIZE	3
+-#endif
+-
+ #ifdef ARM_INSN_SIZE
+ #error "ARM_INSN_SIZE have been redefined, please check"
+ #else
+ #define ARM_INSN_SIZE	4
+ #endif
+ 
++#ifdef CONFIG_ARM_MODULE_PLTS
++#define LJMP_INSN_SIZE	3
++#define MAX_SIZE_TO_CHECK (LJMP_INSN_SIZE * ARM_INSN_SIZE)
++#else
++#define MAX_SIZE_TO_CHECK ARM_INSN_SIZE
++#endif
++
+ struct klp_func_node {
+ 	struct list_head node;
+ 	struct list_head func_stack;
+@@ -73,10 +76,20 @@ struct walk_stackframe_args {
+ 	int ret;
+ };
+ 
++static inline unsigned long klp_size_to_check(unsigned long func_size,
++		int force)
++{
++	unsigned long size = func_size;
++
++	if (force == KLP_STACK_OPTIMIZE && size > MAX_SIZE_TO_CHECK)
++		size = MAX_SIZE_TO_CHECK;
++	return size;
++}
++
+ static inline int klp_compare_address(unsigned long pc, unsigned long func_addr,
+-				unsigned long func_size, const char *func_name)
++		const char *func_name, unsigned long check_size)
+ {
+-	if (pc >= func_addr && pc < func_addr + func_size) {
++	if (pc >= func_addr && pc < func_addr + check_size) {
+ 		pr_err("func %s is in use!\n", func_name);
+ 		return -EBUSY;
+ 	}
+@@ -136,8 +149,8 @@ static int klp_check_activeness_func(struct stackframe *frame, void *data)
+ 				func_size = func->new_size;
+ 			}
+ 			func_name = func->old_name;
+-			args->ret = klp_compare_address(frame->pc, func_addr,
+-					func_size, func_name);
++			args->ret = klp_compare_address(frame->pc, func_addr, func_name,
++					klp_size_to_check(func_size, func->force));
+ 			if (args->ret)
+ 				return args->ret;
+ 		}
+diff --git a/arch/arm64/kernel/livepatch.c b/arch/arm64/kernel/livepatch.c
+index 10b7d9b99f62..4c4ff0620c4c 100644
+--- a/arch/arm64/kernel/livepatch.c
++++ b/arch/arm64/kernel/livepatch.c
+@@ -34,7 +34,11 @@
+ #include <linux/sched/debug.h>
+ #include <linux/kallsyms.h>
+ 
++#define LJMP_INSN_SIZE 4
++
+ #ifdef CONFIG_ARM64_MODULE_PLTS
++#define MAX_SIZE_TO_CHECK (LJMP_INSN_SIZE * sizeof(u32))
++
+ static inline bool offset_in_range(unsigned long pc, unsigned long addr,
+ 		long range)
+ {
+@@ -42,9 +46,10 @@ static inline bool offset_in_range(unsigned long pc, unsigned long addr,
+ 
+ 	return (offset >= -range && offset < range);
+ }
+-#endif
+ 
+-#define LJMP_INSN_SIZE 4
++#else
++#define MAX_SIZE_TO_CHECK sizeof(u32)
++#endif
+ 
+ struct klp_func_node {
+ 	struct list_head node;
+@@ -78,10 +83,20 @@ struct walk_stackframe_args {
+ 	int ret;
+ };
+ 
++static inline unsigned long klp_size_to_check(unsigned long func_size,
++		int force)
++{
++	unsigned long size = func_size;
++
++	if (force == KLP_STACK_OPTIMIZE && size > MAX_SIZE_TO_CHECK)
++		size = MAX_SIZE_TO_CHECK;
++	return size;
++}
++
+ static inline int klp_compare_address(unsigned long pc, unsigned long func_addr,
+-				unsigned long func_size, const char *func_name)
++		const char *func_name, unsigned long check_size)
+ {
+-	if (pc >= func_addr && pc < func_addr + func_size) {
++	if (pc >= func_addr && pc < func_addr + check_size) {
+ 		pr_err("func %s is in use!\n", func_name);
+ 		return -EBUSY;
+ 	}
+@@ -137,8 +152,8 @@ static bool klp_check_activeness_func(void *data, unsigned long pc)
+ 				func_size = func->new_size;
+ 			}
+ 			func_name = func->old_name;
+-			args->ret = klp_compare_address(pc, func_addr,
+-					func_size, func_name);
++			args->ret = klp_compare_address(pc, func_addr, func_name,
++					klp_size_to_check(func_size, func->force));
+ 			if (args->ret)
+ 				return false;
+ 		}
+diff --git a/arch/powerpc/kernel/livepatch_32.c b/arch/powerpc/kernel/livepatch_32.c
+index 1d41b8939799..db6dbe091281 100644
+--- a/arch/powerpc/kernel/livepatch_32.c
++++ b/arch/powerpc/kernel/livepatch_32.c
+@@ -32,6 +32,7 @@
+ #if defined (CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY) || \
+     defined (CONFIG_LIVEPATCH_WO_FTRACE)
+ #define LJMP_INSN_SIZE	4
++#define MAX_SIZE_TO_CHECK (LJMP_INSN_SIZE * sizeof(u32))
+ 
+ struct klp_func_node {
+ 	struct list_head node;
+@@ -67,10 +68,20 @@ struct walk_stackframe_args {
+ 	int ret;
+ };
+ 
++static inline unsigned long klp_size_to_check(unsigned long func_size,
++		int force)
++{
++	unsigned long size = func_size;
++
++	if (force == KLP_STACK_OPTIMIZE && size > MAX_SIZE_TO_CHECK)
++		size = MAX_SIZE_TO_CHECK;
++	return size;
++}
++
+ static inline int klp_compare_address(unsigned long pc, unsigned long func_addr,
+-				unsigned long func_size, const char *func_name)
++		const char *func_name, unsigned long check_size)
+ {
+-	if (pc >= func_addr && pc < func_addr + func_size) {
++	if (pc >= func_addr && pc < func_addr + check_size) {
+ 		pr_err("func %s is in use!\n", func_name);
+ 		return -EBUSY;
+ 	}
+@@ -130,8 +141,8 @@ static int klp_check_activeness_func(struct stackframe *frame, void *data)
+ 				func_size = func->new_size;
+ 			}
+ 			func_name = func->old_name;
+-			args->ret = klp_compare_address(frame->pc, func_addr,
+-					func_size, func_name);
++			args->ret = klp_compare_address(frame->pc, func_addr, func_name,
++					klp_size_to_check(func_size, func->force));
+ 			if (args->ret)
+ 				return args->ret;
+ 		}
+diff --git a/arch/powerpc/kernel/livepatch_64.c b/arch/powerpc/kernel/livepatch_64.c
+index 55cbb65ca708..f98f4ffc78f3 100644
+--- a/arch/powerpc/kernel/livepatch_64.c
++++ b/arch/powerpc/kernel/livepatch_64.c
+@@ -36,6 +36,8 @@
+ 
+ #if defined(CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY) || \
+     defined(CONFIG_LIVEPATCH_WO_FTRACE)
++#define MAX_SIZE_TO_CHECK (LJMP_INSN_SIZE * sizeof(u32))
++
+ struct klp_func_node {
+ 	struct list_head node;
+ 	struct list_head func_stack;
+@@ -76,12 +78,20 @@ struct walk_stackframe_args {
+ 	int ret;
+ };
+ 
+-static inline int klp_compare_address(unsigned long pc,
+-				      unsigned long func_addr,
+-				      unsigned long func_size,
+-				      const char *func_name)
++static inline unsigned long klp_size_to_check(unsigned long func_size,
++		int force)
++{
++	unsigned long size = func_size;
++
++	if (force == KLP_STACK_OPTIMIZE && size > MAX_SIZE_TO_CHECK)
++		size = MAX_SIZE_TO_CHECK;
++	return size;
++}
++
++static inline int klp_compare_address(unsigned long pc, unsigned long func_addr,
++		const char *func_name, unsigned long check_size)
+ {
+-	if (pc >= func_addr && pc < func_addr + func_size) {
++	if (pc >= func_addr && pc < func_addr + check_size) {
+ 		pr_err("func %s is in use!\n", func_name);
+ 		return -EBUSY;
+ 	}
+@@ -92,20 +102,21 @@ static inline int klp_check_activeness_func_addr(
+ 		struct stackframe *frame,
+ 		unsigned long func_addr,
+ 		unsigned long func_size,
+-		const char *func_name)
++		const char *func_name,
++		int force)
+ {
+ 	int ret;
+ 
+ 	/* Check PC first */
+-	ret = klp_compare_address(frame->pc, func_addr,
+-			func_size, func_name);
++	ret = klp_compare_address(frame->pc, func_addr, func_name,
++			klp_size_to_check(func_size, force));
+ 	if (ret)
+ 		return ret;
+ 
+ 	/* Check NIP when the exception stack switching */
+ 	if (frame->nip != 0) {
+-		ret = klp_compare_address(frame->nip, func_addr,
+-				func_size, func_name);
++		ret = klp_compare_address(frame->nip, func_addr, func_name,
++			klp_size_to_check(func_size, force));
+ 		if (ret)
+ 			return ret;
+ 	}
+@@ -171,7 +182,8 @@ static int klp_check_activeness_func(struct stackframe *frame, void *data)
+ 			}
+ 			func_name = func->old_name;
+ 			args->ret = klp_check_activeness_func_addr(frame,
+-					func_addr, func_size, func_name);
++					func_addr, func_size, func_name,
++					func->force);
+ 			if (args->ret)
+ 				return args->ret;
+ 
+@@ -188,7 +200,7 @@ static int klp_check_activeness_func(struct stackframe *frame, void *data)
+ 				func_addr = (unsigned long)func->old_func;
+ 				func_size = func->old_size;
+ 				args->ret = klp_check_activeness_func_addr(frame,
+-					func_addr, func_size, "OLD_FUNC");
++					func_addr, func_size, "OLD_FUNC", func->force);
+ 				if (args->ret)
+ 					return args->ret;
+ 
+@@ -199,7 +211,8 @@ static int klp_check_activeness_func(struct stackframe *frame, void *data)
+ 				func_addr = (unsigned long)&func_node->trampoline;
+ 				func_size = sizeof(struct ppc64_klp_btramp_entry);
+ 				args->ret = klp_check_activeness_func_addr(frame,
+-						func_addr, func_size, "trampoline");
++						func_addr, func_size, "trampoline",
++						func->force);
+ 				if (args->ret)
+ 					return args->ret;
+ 			}
+diff --git a/arch/x86/kernel/livepatch.c b/arch/x86/kernel/livepatch.c
+index 52bc0fc2bd6b..5be8b601f0c7 100644
+--- a/arch/x86/kernel/livepatch.c
++++ b/arch/x86/kernel/livepatch.c
+@@ -57,11 +57,21 @@ static struct klp_func_node *klp_find_func_node(void *old_func)
+ #endif
+ 
+ #ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
++static inline unsigned long klp_size_to_check(unsigned long func_size,
++		int force)
++{
++	unsigned long size = func_size;
++
++	if (force == KLP_STACK_OPTIMIZE && size > JMP_E9_INSN_SIZE)
++		size = JMP_E9_INSN_SIZE;
++	return size;
++}
++
+ static inline int klp_compare_address(unsigned long stack_addr,
+-		unsigned long func_addr, unsigned long func_size,
+-		const char *func_name)
++		unsigned long func_addr, const char *func_name,
++		unsigned long check_size)
+ {
+-	if (stack_addr >= func_addr && stack_addr < func_addr + func_size) {
++	if (stack_addr >= func_addr && stack_addr < func_addr + check_size) {
+ 		pr_err("func %s is in use!\n", func_name);
+ 		return -EBUSY;
+ 	}
+@@ -124,8 +134,8 @@ static int klp_check_stack_func(struct klp_func *func,
+ 		}
+ 		func_name = func->old_name;
+ 
+-		if (klp_compare_address(address, func_addr,
+-				func_size, func_name))
++		if (klp_compare_address(address, func_addr, func_name,
++				klp_size_to_check(func_size, func->force)))
+ 			return -EAGAIN;
+ 	}
+ 
+-- 
+2.26.2
+

@@ -1,0 +1,833 @@
+From 20106abf1e7479f8b2114b0f661531f8ed2ee597 Mon Sep 17 00:00:00 2001
+From: Ye Weihua <yeweihua4@huawei.com>
+Date: Mon, 15 Nov 2021 19:38:59 +0800
+Subject: [PATCH] livepatch: Check whole stack when CONFIG_PREEMPT is set
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 20106abf1e7479f8b2114b0f661531f8ed2ee597
+
+
+hulk inclusion
+category: feature
+bugzilla: 119440 https://gitee.com/openeuler/kernel/issues/I4DDEL
+
+--------------------------------
+
+The previous code does not consider the scenario where preemption
+is enabled. In the kernel with CONFIG_PREEMPT enabled, even if the
+function entry does not have a jump instruction, the function may
+be interrupted by an interrupt. If preemption is triggered when
+the interrupt is returned, the function is in the middle of the
+call stack of the thread.
+
+The stack depth optimization solution needs to be adjusted as
+follows:
+	1. For functions with jump instructions in the entry,
+	check the entire thread stack in any case.
+	2. For a function whose entry does not have a jump
+	instruction:
+		a. If CONFIG_PREEMPT is disabled, the function
+		entry code cannot be on any thread stack.
+		Therefore, no check is required.
+		b. If CONFIG_PREEMPT is turned on, check entire
+		thread stack.
+
+Signed-off-by: Ye Weihua <yeweihua4@huawei.com>
+Reviewed-by: Kuohai Xu <xukuohai@huawei.com>
+
+Signed-off-by: Chen Jun <chenjun102@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm/kernel/livepatch.c        | 66 +++++++++++++++-------------
+ arch/arm64/kernel/livepatch.c      | 66 +++++++++++++++-------------
+ arch/powerpc/kernel/livepatch_32.c | 66 +++++++++++++++-------------
+ arch/powerpc/kernel/livepatch_64.c | 70 ++++++++++++++++--------------
+ arch/x86/kernel/livepatch.c        | 69 ++++++++++++++---------------
+ 5 files changed, 180 insertions(+), 157 deletions(-)
+
+diff --git a/arch/arm/kernel/livepatch.c b/arch/arm/kernel/livepatch.c
+index 1ec326706a7b..e98c8e47a344 100644
+--- a/arch/arm/kernel/livepatch.c
++++ b/arch/arm/kernel/livepatch.c
+@@ -104,7 +104,7 @@ struct klp_func_list {
+ 
+ struct walk_stackframe_args {
+ 	int enable;
+-	struct klp_func_list *other_funcs;
++	struct klp_func_list *check_funcs;
+ 	int ret;
+ };
+ 
+@@ -167,16 +167,14 @@ static int add_func_to_list(struct klp_func_list **funcs, struct klp_func_list *
+ }
+ 
+ static int klp_check_activeness_func(struct klp_patch *patch, int enable,
+-		struct klp_func_list **nojump_funcs,
+-		struct klp_func_list **other_funcs)
++		struct klp_func_list **check_funcs)
+ {
+ 	int ret;
+ 	struct klp_object *obj;
+ 	struct klp_func_node *func_node;
+ 	struct klp_func *func;
+ 	unsigned long func_addr, func_size;
+-	struct klp_func_list *pnjump = NULL;
+-	struct klp_func_list *pother = NULL;
++	struct klp_func_list *pcheck = NULL;
+ 
+ 	for (obj = patch->objs; obj->funcs; obj++) {
+ 		for (func = obj->funcs; func->old_name; func++) {
+@@ -209,17 +207,23 @@ static int klp_check_activeness_func(struct klp_patch *patch, int enable,
+ 					func_addr = (unsigned long)prev->new_func;
+ 					func_size = prev->new_size;
+ 				}
+-				if ((func->force == KLP_STACK_OPTIMIZE) &&
+-					!check_jump_insn(func_addr))
+-					ret = add_func_to_list(nojump_funcs, &pnjump,
+-							func_addr, func_size,
+-							func->old_name, func->force);
+-				else
+-					ret = add_func_to_list(other_funcs, &pother,
++				/*
++				 * When preemption is disabled and the
++				 * replacement area does not contain a jump
++				 * instruction, the migration thread is
++				 * scheduled to run stop machine only after the
++				 * excution of intructions to be replaced is
++				 * complete.
++				 */
++				if (IS_ENABLED(CONFIG_PREEMPTION) ||
++				    (func->force == KLP_NORMAL_FORCE) ||
++				    check_jump_insn(func_addr)) {
++					ret = add_func_to_list(check_funcs, &pcheck,
+ 							func_addr, func_size,
+ 							func->old_name, func->force);
+-				if (ret)
+-					return ret;
++					if (ret)
++						return ret;
++				}
+ 			} else {
+ 				/*
+ 				 * When disable, check for the previously
+@@ -229,6 +233,14 @@ static int klp_check_activeness_func(struct klp_patch *patch, int enable,
+ 				func_node = klp_find_func_node(func->old_func);
+ 				if (!func_node)
+ 					return -EINVAL;
++#ifdef CONFIG_PREEMPTION
++				/*
++				 * No scheduling point in the replacement
++				 * instructions. Therefore, when preemption is
++				 * not enabled, atomic execution is performed
++				 * and these instructions will not appear on
++				 * the stack.
++				 */
+ 				if (list_is_singular(&func_node->func_stack)) {
+ 					func_addr = (unsigned long)func->old_func;
+ 					func_size = func->old_size;
+@@ -241,14 +253,15 @@ static int klp_check_activeness_func(struct klp_patch *patch, int enable,
+ 					func_addr = (unsigned long)prev->new_func;
+ 					func_size = prev->new_size;
+ 				}
+-				ret = add_func_to_list(other_funcs, &pother,
++				ret = add_func_to_list(check_funcs, &pcheck,
+ 						func_addr, func_size,
+ 						func->old_name, 0);
+ 				if (ret)
+ 					return ret;
++#endif
+ 				func_addr = (unsigned long)func->new_func;
+ 				func_size = func->new_size;
+-				ret = add_func_to_list(other_funcs, &pother,
++				ret = add_func_to_list(check_funcs, &pcheck,
+ 						func_addr, func_size,
+ 						func->old_name, 0);
+ 				if (ret)
+@@ -275,9 +288,9 @@ static bool check_func_list(struct klp_func_list *funcs, int *ret, unsigned long
+ static int klp_check_jump_func(struct stackframe *frame, void *data)
+ {
+ 	struct walk_stackframe_args *args = data;
+-	struct klp_func_list *other_funcs = args->other_funcs;
++	struct klp_func_list *check_funcs = args->check_funcs;
+ 
+-	return check_func_list(other_funcs, &args->ret, frame->pc);
++	return check_func_list(check_funcs, &args->ret, frame->pc);
+ }
+ 
+ static void free_list(struct klp_func_list **funcs)
+@@ -296,16 +309,15 @@ int klp_check_calltrace(struct klp_patch *patch, int enable)
+ 	struct task_struct *g, *t;
+ 	struct stackframe frame;
+ 	int ret = 0;
+-	struct klp_func_list *nojump_funcs = NULL;
+-	struct klp_func_list *other_funcs = NULL;
++	struct klp_func_list *check_funcs = NULL;
+ 	struct walk_stackframe_args args = {
+ 		.ret = 0
+ 	};
+ 
+-	ret = klp_check_activeness_func(patch, enable, &nojump_funcs, &other_funcs);
++	ret = klp_check_activeness_func(patch, enable, &check_funcs);
+ 	if (ret)
+ 		goto out;
+-	args.other_funcs = other_funcs;
++	args.check_funcs = check_funcs;
+ 
+ 	for_each_process_thread(g, t) {
+ 		if (t == current) {
+@@ -330,12 +342,7 @@ int klp_check_calltrace(struct klp_patch *patch, int enable)
+ 			frame.lr = 0;           /* recovered from the stack */
+ 			frame.pc = thread_saved_pc(t);
+ 		}
+-		if (!check_func_list(nojump_funcs, &ret, frame.pc)) {
+-			pr_info("PID: %d Comm: %.20s\n", t->pid, t->comm);
+-			show_stack(t, NULL, KERN_INFO);
+-			goto out;
+-		}
+-		if (other_funcs != NULL) {
++		if (check_funcs != NULL) {
+ 			walk_stackframe(&frame, klp_check_jump_func, &args);
+ 			if (args.ret) {
+ 				ret = args.ret;
+@@ -347,8 +354,7 @@ int klp_check_calltrace(struct klp_patch *patch, int enable)
+ 	}
+ 
+ out:
+-	free_list(&nojump_funcs);
+-	free_list(&other_funcs);
++	free_list(&check_funcs);
+ 	return ret;
+ }
+ #endif
+diff --git a/arch/arm64/kernel/livepatch.c b/arch/arm64/kernel/livepatch.c
+index 2ffbdfbe87de..e60841e975c6 100644
+--- a/arch/arm64/kernel/livepatch.c
++++ b/arch/arm64/kernel/livepatch.c
+@@ -99,7 +99,7 @@ struct klp_func_list {
+ 
+ struct walk_stackframe_args {
+ 	int enable;
+-	struct klp_func_list *other_funcs;
++	struct klp_func_list *check_funcs;
+ 	int ret;
+ };
+ 
+@@ -162,16 +162,14 @@ static int add_func_to_list(struct klp_func_list **funcs, struct klp_func_list *
+ }
+ 
+ static int klp_check_activeness_func(struct klp_patch *patch, int enable,
+-		struct klp_func_list **nojump_funcs,
+-		struct klp_func_list **other_funcs)
++		struct klp_func_list **check_funcs)
+ {
+ 	int ret;
+ 	struct klp_object *obj;
+ 	struct klp_func *func;
+ 	unsigned long func_addr, func_size;
+ 	struct klp_func_node *func_node;
+-	struct klp_func_list *pnjump = NULL;
+-	struct klp_func_list *pother = NULL;
++	struct klp_func_list *pcheck = NULL;
+ 
+ 	for (obj = patch->objs; obj->funcs; obj++) {
+ 		for (func = obj->funcs; func->old_name; func++) {
+@@ -200,17 +198,23 @@ static int klp_check_activeness_func(struct klp_patch *patch, int enable,
+ 					func_addr = (unsigned long)prev->new_func;
+ 					func_size = prev->new_size;
+ 				}
+-				if ((func->force == KLP_STACK_OPTIMIZE) &&
+-					!check_jump_insn(func_addr))
+-					ret = add_func_to_list(nojump_funcs, &pnjump,
+-							func_addr, func_size,
+-							func->old_name, func->force);
+-				else
+-					ret = add_func_to_list(other_funcs, &pother,
++				/*
++				 * When preemption is disabled and the
++				 * replacement area does not contain a jump
++				 * instruction, the migration thread is
++				 * scheduled to run stop machine only after the
++				 * excution of instructions to be replaced is
++				 * complete.
++				 */
++				if (IS_ENABLED(CONFIG_PREEMPTION) ||
++				    (func->force == KLP_NORMAL_FORCE) ||
++				    check_jump_insn(func_addr)) {
++					ret = add_func_to_list(check_funcs, &pcheck,
+ 							func_addr, func_size,
+ 							func->old_name, func->force);
+-				if (ret)
+-					return ret;
++					if (ret)
++						return ret;
++				}
+ 			} else {
+ 				/*
+ 				 * When disable, check for the previously
+@@ -221,6 +225,14 @@ static int klp_check_activeness_func(struct klp_patch *patch, int enable,
+ 				if (!func_node) {
+ 					return -EINVAL;
+ 				}
++#ifdef CONFIG_PREEMPTION
++				/*
++				 * No scheduling point in the replacement
++				 * instructions. Therefore, when preemption is
++				 * not enabled, atomic execution is performed
++				 * and these instructions will not appear on
++				 * the stack.
++				 */
+ 				if (list_is_singular(&func_node->func_stack)) {
+ 					func_addr = (unsigned long)func->old_func;
+ 					func_size = func->old_size;
+@@ -233,15 +245,16 @@ static int klp_check_activeness_func(struct klp_patch *patch, int enable,
+ 					func_addr = (unsigned long)prev->new_func;
+ 					func_size = prev->new_size;
+ 				}
+-				ret = add_func_to_list(other_funcs, &pother,
++				ret = add_func_to_list(check_funcs, &pcheck,
+ 						func_addr, func_size,
+ 						func->old_name, 0);
+ 				if (ret)
+ 					return ret;
++#endif
+ 
+ 				func_addr = (unsigned long)func->new_func;
+ 				func_size = func->new_size;
+-				ret = add_func_to_list(other_funcs, &pother,
++				ret = add_func_to_list(check_funcs, &pcheck,
+ 						func_addr, func_size,
+ 						func->old_name, 0);
+ 				if (ret)
+@@ -268,9 +281,9 @@ static bool check_func_list(struct klp_func_list *funcs, int *ret, unsigned long
+ static bool klp_check_jump_func(void *data, unsigned long pc)
+ {
+ 	struct walk_stackframe_args *args = data;
+-	struct klp_func_list *other_funcs = args->other_funcs;
++	struct klp_func_list *check_funcs = args->check_funcs;
+ 
+-	return check_func_list(other_funcs, &args->ret, pc);
++	return check_func_list(check_funcs, &args->ret, pc);
+ }
+ 
+ static void free_list(struct klp_func_list **funcs)
+@@ -289,17 +302,16 @@ int klp_check_calltrace(struct klp_patch *patch, int enable)
+ 	struct task_struct *g, *t;
+ 	struct stackframe frame;
+ 	int ret = 0;
+-	struct klp_func_list *nojump_funcs = NULL;
+-	struct klp_func_list *other_funcs = NULL;
++	struct klp_func_list *check_funcs = NULL;
+ 	struct walk_stackframe_args args = {
+ 		.enable = enable,
+ 		.ret = 0
+ 	};
+ 
+-	ret = klp_check_activeness_func(patch, enable, &nojump_funcs, &other_funcs);
++	ret = klp_check_activeness_func(patch, enable, &check_funcs);
+ 	if (ret)
+ 		goto out;
+-	args.other_funcs = other_funcs;
++	args.check_funcs = check_funcs;
+ 
+ 	for_each_process_thread(g, t) {
+ 		/*
+@@ -328,12 +340,7 @@ int klp_check_calltrace(struct klp_patch *patch, int enable)
+ 			frame.fp = thread_saved_fp(t);
+ 			frame.pc = thread_saved_pc(t);
+ 		}
+-		if (!check_func_list(nojump_funcs, &ret, frame.pc)) {
+-			pr_info("PID: %d Comm: %.20s\n", t->pid, t->comm);
+-			show_stack(t, NULL, KERN_INFO);
+-			goto out;
+-		}
+-		if (other_funcs != NULL) {
++		if (check_funcs != NULL) {
+ 			start_backtrace(&frame, frame.fp, frame.pc);
+ 			walk_stackframe(t, &frame, klp_check_jump_func, &args);
+ 			if (args.ret) {
+@@ -346,8 +353,7 @@ int klp_check_calltrace(struct klp_patch *patch, int enable)
+ 	}
+ 
+ out:
+-	free_list(&nojump_funcs);
+-	free_list(&other_funcs);
++	free_list(&check_funcs);
+ 	return ret;
+ }
+ #endif
+diff --git a/arch/powerpc/kernel/livepatch_32.c b/arch/powerpc/kernel/livepatch_32.c
+index ea153f52e9ad..13f3200bf52f 100644
+--- a/arch/powerpc/kernel/livepatch_32.c
++++ b/arch/powerpc/kernel/livepatch_32.c
+@@ -91,7 +91,7 @@ struct stackframe {
+ 
+ struct walk_stackframe_args {
+ 	int enable;
+-	struct klp_func_list *other_funcs;
++	struct klp_func_list *check_funcs;
+ 	int ret;
+ };
+ 
+@@ -154,16 +154,14 @@ static int add_func_to_list(struct klp_func_list **funcs, struct klp_func_list *
+ }
+ 
+ static int klp_check_activeness_func(struct klp_patch *patch, int enable,
+-		struct klp_func_list **nojump_funcs,
+-		struct klp_func_list **other_funcs)
++		struct klp_func_list **check_funcs)
+ {
+ 	int ret;
+ 	struct klp_object *obj;
+ 	struct klp_func *func;
+ 	unsigned long func_addr, func_size;
+ 	struct klp_func_node *func_node;
+-	struct klp_func_list *pnjump = NULL;
+-	struct klp_func_list *pother = NULL;
++	struct klp_func_list *pcheck = NULL;
+ 
+ 	for (obj = patch->objs; obj->funcs; obj++) {
+ 		for (func = obj->funcs; func->old_name; func++) {
+@@ -196,17 +194,23 @@ static int klp_check_activeness_func(struct klp_patch *patch, int enable,
+ 					func_addr = (unsigned long)prev->new_func;
+ 					func_size = prev->new_size;
+ 				}
+-				if ((func->force == KLP_STACK_OPTIMIZE) &&
+-					!check_jump_insn(func_addr))
+-					ret = add_func_to_list(nojump_funcs, &pnjump,
+-							func_addr, func_size,
+-							func->old_name, func->force);
+-				else
+-					ret = add_func_to_list(other_funcs, &pother,
++				/*
++				 * When preemtion is disabled and the
++				 * replacement area does not contain a jump
++				 * instruction, the migration thread is
++				 * scheduled to run stop machine only after the
++				 * excution of instructions to be replaced is
++				 * complete.
++				 */
++				if (IS_ENABLED(CONFIG_PREEMPTION) ||
++				    (func->force == KLP_NORMAL_FORCE) ||
++				    check_jump_insn(func_addr)) {
++					ret = add_func_to_list(check_funcs, &pcheck,
+ 							func_addr, func_size,
+ 							func->old_name, func->force);
+-				if (ret)
+-					return ret;
++					if (ret)
++						return ret;
++				}
+ 			} else {
+ 				/*
+ 				 * When disable, check for the previously
+@@ -216,6 +220,14 @@ static int klp_check_activeness_func(struct klp_patch *patch, int enable,
+ 				func_node = klp_find_func_node(func->old_func);
+ 				if (!func_node)
+ 					return -EINVAL;
++#ifdef CONFIG_PREEMPTION
++				/*
++				 * No scheduling point in the replacement
++				 * instructions. Therefore, when preemption is
++				 * not enabled, atomic execution is performed
++				 * and these instructions will not appear on
++				 * the stack.
++				 */
+ 				if (list_is_singular(&func_node->func_stack)) {
+ 					func_addr = (unsigned long)func->old_func;
+ 					func_size = func->old_size;
+@@ -228,13 +240,14 @@ static int klp_check_activeness_func(struct klp_patch *patch, int enable,
+ 					func_addr = (unsigned long)prev->new_func;
+ 					func_size = prev->new_size;
+ 				}
+-				ret = add_func_to_list(other_funcs, &pother, func_addr,
++				ret = add_func_to_list(check_funcs, &pcheck, func_addr,
+ 						func_size, func->old_name, 0);
+ 				if (ret)
+ 					return ret;
++#endif
+ 				func_addr = (unsigned long)func->new_func;
+ 				func_size = func->new_size;
+-				ret = add_func_to_list(other_funcs, &pother, func_addr,
++				ret = add_func_to_list(check_funcs, &pcheck, func_addr,
+ 						func_size, func->old_name, 0);
+ 				if (ret)
+ 					return ret;
+@@ -289,9 +302,9 @@ static bool check_func_list(struct klp_func_list *funcs, int *ret, unsigned long
+ static int klp_check_jump_func(struct stackframe *frame, void *data)
+ {
+ 	struct walk_stackframe_args *args = data;
+-	struct klp_func_list *other_funcs = args->other_funcs;
++	struct klp_func_list *check_funcs = args->check_funcs;
+ 
+-	if (!check_func_list(other_funcs, &args->ret, frame->pc)) {
++	if (!check_func_list(check_funcs, &args->ret, frame->pc)) {
+ 		return args->ret;
+ 	}
+ 	return 0;
+@@ -314,16 +327,15 @@ int klp_check_calltrace(struct klp_patch *patch, int enable)
+ 	struct stackframe frame;
+ 	unsigned long *stack;
+ 	int ret = 0;
+-	struct klp_func_list *nojump_funcs = NULL;
+-	struct klp_func_list *other_funcs = NULL;
++	struct klp_func_list *check_funcs = NULL;
+ 	struct walk_stackframe_args args = {
+ 		.ret = 0
+ 	};
+ 
+-	ret = klp_check_activeness_func(patch, enable, &nojump_funcs, &other_funcs);
++	ret = klp_check_activeness_func(patch, enable, &check_funcs);
+ 	if (ret)
+ 		goto out;
+-	args.other_funcs = other_funcs;
++	args.check_funcs = check_funcs;
+ 
+ 	for_each_process_thread(g, t) {
+ 		if (t == current) {
+@@ -362,12 +374,7 @@ int klp_check_calltrace(struct klp_patch *patch, int enable)
+ 
+ 		frame.sp = (unsigned long)stack;
+ 		frame.pc = stack[STACK_FRAME_LR_SAVE];
+-		if (!check_func_list(nojump_funcs, &ret, frame.pc)) {
+-			pr_info("PID: %d Comm: %.20s\n", t->pid, t->comm);
+-			show_stack(t, NULL, KERN_INFO);
+-			goto out;
+-		}
+-		if (other_funcs != NULL) {
++		if (check_funcs != NULL) {
+ 			klp_walk_stackframe(&frame, klp_check_jump_func, t, &args);
+ 			if (args.ret) {
+ 				ret = args.ret;
+@@ -379,8 +386,7 @@ int klp_check_calltrace(struct klp_patch *patch, int enable)
+ 	}
+ 
+ out:
+-	free_list(&nojump_funcs);
+-	free_list(&other_funcs);
++	free_list(&check_funcs);
+ 	return ret;
+ }
+ #endif
+diff --git a/arch/powerpc/kernel/livepatch_64.c b/arch/powerpc/kernel/livepatch_64.c
+index 09e8bb330606..77fbb5603137 100644
+--- a/arch/powerpc/kernel/livepatch_64.c
++++ b/arch/powerpc/kernel/livepatch_64.c
+@@ -101,7 +101,7 @@ struct stackframe {
+ 
+ struct walk_stackframe_args {
+ 	int enable;
+-	struct klp_func_list *other_funcs;
++	struct klp_func_list *check_funcs;
+ 	int ret;
+ };
+ 
+@@ -164,16 +164,14 @@ static int add_func_to_list(struct klp_func_list **funcs, struct klp_func_list *
+ }
+ 
+ static int klp_check_activeness_func(struct klp_patch *patch, int enable,
+-		struct klp_func_list **nojump_funcs,
+-		struct klp_func_list **other_funcs)
++		struct klp_func_list **check_funcs)
+ {
+ 	int ret;
+ 	struct klp_object *obj;
+ 	struct klp_func *func;
+ 	unsigned long func_addr, func_size;
+ 	struct klp_func_node *func_node = NULL;
+-	struct klp_func_list *pnjump = NULL;
+-	struct klp_func_list *pother = NULL;
++	struct klp_func_list *pcheck = NULL;
+ 
+ 	for (obj = patch->objs; obj->funcs; obj++) {
+ 		for (func = obj->funcs; func->old_name; func++) {
+@@ -209,17 +207,23 @@ static int klp_check_activeness_func(struct klp_patch *patch, int enable,
+ 						(void *)prev->new_func);
+ 					func_size = prev->new_size;
+ 				}
+-				if ((func->force == KLP_STACK_OPTIMIZE) &&
+-					!check_jump_insn(func_addr))
+-					ret = add_func_to_list(nojump_funcs, &pnjump,
+-							func_addr, func_size,
+-							func->old_name, func->force);
+-				else
+-					ret = add_func_to_list(other_funcs, &pother,
++				/*
++				 * When preemption is disabled and the
++				 * replacement area does not contain a jump
++				 * instruction, the migration thread is
++				 * scheduled to run stop machine only after the
++				 * excution of instructions to be repalced is
++				 * complete.
++				 */
++				if (IS_ENABLED(CONFIG_PREEMTION) ||
++				    (func->force == KLP_NORMAL_FORCE) ||
++				    check_jump_insn(func_addr)) {
++					ret = add_func_to_list(check_funcs, &pcheck,
+ 							func_addr, func_size,
+ 							func->old_name, func->force);
+-				if (ret)
+-					return ret;
++					if (ret)
++						return ret;
++				}
+ 			} else {
+ 				/*
+ 				 * When disable, check for the function itself
+@@ -228,7 +232,7 @@ static int klp_check_activeness_func(struct klp_patch *patch, int enable,
+ 				func_addr = ppc_function_entry(
+ 						(void *)func->new_func);
+ 				func_size = func->new_size;
+-				ret = add_func_to_list(other_funcs, &pother, func_addr,
++				ret = add_func_to_list(check_funcs, &pcheck, func_addr,
+ 						func_size, func->old_name, 0);
+ 				if (ret)
+ 					return ret;
+@@ -244,12 +248,21 @@ static int klp_check_activeness_func(struct klp_patch *patch, int enable,
+ 			 * so, we should check all the func in the callchain
+ 			 */
+ 			if (func_addr != (unsigned long)func->old_func) {
++#ifdef CONFIG_PREEMPTION
++				/*
++				 * No scheduling point in the replacement
++				 * instructions. Therefore, when preemption is
++				 * not enabled, atomic execution is performed
++				 * and these instructions will not appear on
++				 * the stack.
++				 */
+ 				func_addr = (unsigned long)func->old_func;
+ 				func_size = func->old_size;
+-				ret = add_func_to_list(other_funcs, &pother, func_addr,
++				ret = add_func_to_list(check_funcs, &pcheck, func_addr,
+ 						func_size, "OLD_FUNC", 0);
+ 				if (ret)
+ 					return ret;
++#endif
+ 
+ 				if (func_node == NULL ||
+ 				    func_node->trampoline.magic != BRANCH_TRAMPOLINE_MAGIC)
+@@ -257,7 +270,7 @@ static int klp_check_activeness_func(struct klp_patch *patch, int enable,
+ 
+ 				func_addr = (unsigned long)&func_node->trampoline;
+ 				func_size = sizeof(struct ppc64_klp_btramp_entry);
+-				ret = add_func_to_list(other_funcs, &pother, func_addr,
++				ret = add_func_to_list(check_funcs, &pcheck, func_addr,
+ 						func_size, "trampoline", 0);
+ 				if (ret)
+ 					return ret;
+@@ -343,9 +356,9 @@ static bool check_func_list(struct klp_func_list *funcs, int *ret, unsigned long
+ static int klp_check_jump_func(struct stackframe *frame, void *data)
+ {
+ 	struct walk_stackframe_args *args = data;
+-	struct klp_func_list *other_funcs = args->other_funcs;
++	struct klp_func_list *check_funcs = args->check_funcs;
+ 
+-	if (!check_func_list(other_funcs, &args->ret, frame->pc)) {
++	if (!check_func_list(check_funcs, &args->ret, frame->pc)) {
+ 		return args->ret;
+ 	}
+ 	return 0;
+@@ -368,14 +381,13 @@ int klp_check_calltrace(struct klp_patch *patch, int enable)
+ 	struct stackframe frame;
+ 	unsigned long *stack;
+ 	int ret = 0;
+-	struct klp_func_list *nojump_funcs = NULL;
+-	struct klp_func_list *other_funcs = NULL;
++	struct klp_func_list *check_funcs = NULL;
+ 	struct walk_stackframe_args args;
+ 
+-	ret = klp_check_activeness_func(patch, enable, &nojump_funcs, &other_funcs);
++	ret = klp_check_activeness_func(patch, enable, &check_funcs);
+ 	if (ret)
+ 		goto out;
+-	args.other_funcs = other_funcs;
++	args.check_funcs = check_funcs;
+ 	args.ret = 0;
+ 
+ 	for_each_process_thread(g, t) {
+@@ -418,14 +430,7 @@ int klp_check_calltrace(struct klp_patch *patch, int enable)
+ 		frame.sp = (unsigned long)stack;
+ 		frame.pc = stack[STACK_FRAME_LR_SAVE];
+ 		frame.nip = 0;
+-		if (!check_func_list(nojump_funcs, &ret, frame.pc)) {
+-			pr_debug("%s FAILED when %s\n", __func__,
+-				 enable ? "enabling" : "disabling");
+-			pr_info("PID: %d Comm: %.20s\n", t->pid, t->comm);
+-			show_stack(t, NULL, KERN_INFO);
+-			goto out;
+-		}
+-		if (other_funcs != NULL) {
++		if (check_funcs != NULL) {
+ 			klp_walk_stackframe(&frame, klp_check_jump_func, t, &args);
+ 			if (args.ret) {
+ 				ret = args.ret;
+@@ -439,8 +444,7 @@ int klp_check_calltrace(struct klp_patch *patch, int enable)
+ 	}
+ 
+ out:
+-	free_list(&nojump_funcs);
+-	free_list(&other_funcs);
++	free_list(&check_funcs);
+ 	return ret;
+ }
+ #endif
+diff --git a/arch/x86/kernel/livepatch.c b/arch/x86/kernel/livepatch.c
+index bca152b67818..386d224d5890 100644
+--- a/arch/x86/kernel/livepatch.c
++++ b/arch/x86/kernel/livepatch.c
+@@ -148,17 +148,14 @@ static int add_func_to_list(struct klp_func_list **funcs, struct klp_func_list *
+ }
+ 
+ static int klp_check_activeness_func(struct klp_patch *patch, int enable,
+-		struct klp_func_list **nojump_funcs,
+-		struct klp_func_list **other_funcs)
++		struct klp_func_list **check_funcs)
+ {
+ 	int ret;
+ 	struct klp_object *obj;
+ 	struct klp_func *func;
+ 	unsigned long func_addr, func_size;
+ 	struct klp_func_node *func_node = NULL;
+-	struct klp_func_list *pnojump = NULL;
+-	struct klp_func_list *pother = NULL;
+-
++	struct klp_func_list *pcheck = NULL;
+ 
+ 	for (obj = patch->objs; obj->funcs; obj++) {
+ 		for (func = obj->funcs; func->old_name; func++) {
+@@ -189,17 +186,23 @@ static int klp_check_activeness_func(struct klp_patch *patch, int enable,
+ 					func_addr = (unsigned long)prev->new_func;
+ 					func_size = prev->new_size;
+ 				}
+-				if ((func->force == KLP_STACK_OPTIMIZE) &&
+-					!check_jump_insn(func_addr))
+-					ret = add_func_to_list(nojump_funcs, &pnojump,
+-							func_addr, func_size,
+-							func->old_name, func->force);
+-				else
+-					ret = add_func_to_list(other_funcs, &pother,
++				/*
++				 * When preemtion is disabled and the
++				 * replacement area does not contain a jump
++				 * instruction, the migration thread is
++				 * scheduled to run stop machine only after the
++				 * excution of instructions to be replaced is
++				 * complete.
++				 */
++				if (IS_ENABLED(CONFIG_PREEMPTION) ||
++				    (func->force == KLP_NORMAL_FORCE) ||
++				    check_jump_insn(func_addr)) {
++					ret = add_func_to_list(check_funcs, &pcheck,
+ 							func_addr, func_size,
+ 							func->old_name, func->force);
+-				if (ret)
+-					return ret;
++					if (ret)
++						return ret;
++				}
+ 			} else {
+ 				/*
+ 				 * When disable, check for the function
+@@ -207,6 +210,14 @@ static int klp_check_activeness_func(struct klp_patch *patch, int enable,
+ 				 */
+ 				if (!func_node)
+ 					return -EINVAL;
++#ifdef CONFIG_PREEMPTION
++				/*
++				 * No scheduling point in the replacement
++				 * instructions. Therefore, when preemption is
++				 * not enabled, atomic execution is performed
++				 * and these instructions will not appear on
++				 * the stack.
++				 */
+ 				if (list_is_singular(&func_node->func_stack)) {
+ 					func_addr = (unsigned long)func->old_func;
+ 					func_size = func->old_size;
+@@ -219,14 +230,15 @@ static int klp_check_activeness_func(struct klp_patch *patch, int enable,
+ 					func_addr = (unsigned long)prev->new_func;
+ 					func_size = prev->new_size;
+ 				}
+-				ret = add_func_to_list(other_funcs, &pother, func_addr,
++				ret = add_func_to_list(check_funcs, &pcheck, func_addr,
+ 						func_size, func->old_name, 0);
+ 				if (ret)
+ 					return ret;
++#endif
+ 
+ 				func_addr = (unsigned long)func->new_func;
+ 				func_size = func->new_size;
+-				ret = add_func_to_list(other_funcs, &pother, func_addr,
++				ret = add_func_to_list(check_funcs, &pcheck, func_addr,
+ 						func_size, func->old_name, 0);
+ 				if (ret)
+ 					return ret;
+@@ -281,7 +293,7 @@ static bool check_func_list(struct klp_func_list *funcs, int *ret, unsigned long
+ }
+ 
+ static int klp_check_stack(void *trace_ptr, int trace_len,
+-		struct klp_func_list *other_funcs)
++		struct klp_func_list *check_funcs)
+ {
+ #ifdef CONFIG_ARCH_STACKWALK
+ 	unsigned long *trace = trace_ptr;
+@@ -298,7 +310,7 @@ static int klp_check_stack(void *trace_ptr, int trace_len,
+ 	for (i = 0; i < trace->nr_entries; i++) {
+ 		address = trace->entries[i];
+ #endif
+-		if (!check_func_list(other_funcs, &ret, address)) {
++		if (!check_func_list(check_funcs, &ret, address)) {
+ #ifdef CONFIG_ARCH_STACKWALK
+ 			klp_print_stack_trace(trace_ptr, trace_len);
+ #else
+@@ -326,8 +338,7 @@ int klp_check_calltrace(struct klp_patch *patch, int enable)
+ {
+ 	struct task_struct *g, *t;
+ 	int ret = 0;
+-	struct klp_func_list *nojump_funcs = NULL;
+-	struct klp_func_list *other_funcs = NULL;
++	struct klp_func_list *check_funcs = NULL;
+ 	static unsigned long trace_entries[MAX_STACK_ENTRIES];
+ #ifdef CONFIG_ARCH_STACKWALK
+ 	int trace_len;
+@@ -335,7 +346,7 @@ int klp_check_calltrace(struct klp_patch *patch, int enable)
+ 	struct stack_trace trace;
+ #endif
+ 
+-	ret = klp_check_activeness_func(patch, enable, &nojump_funcs, &other_funcs);
++	ret = klp_check_activeness_func(patch, enable, &check_funcs);
+ 	if (ret)
+ 		goto out;
+ 	for_each_process_thread(g, t) {
+@@ -362,26 +373,16 @@ int klp_check_calltrace(struct klp_patch *patch, int enable)
+ 			goto out;
+ 		}
+ #ifdef CONFIG_ARCH_STACKWALK
+-		if (!check_func_list(nojump_funcs, &ret, trace_entries[0])) {
+-			klp_print_stack_trace(&trace_entries, trace_len);
+-#else
+-		if (!check_func_list(nojump_funcs, &ret, trace->entries[0])) {
+-			klp_print_stack_trace(&trace, 0);
+-#endif
+-			goto out;
+-		}
+-#ifdef CONFIG_ARCH_STACKWALK
+-		ret = klp_check_stack(trace_entries, trace_len, other_funcs);
++		ret = klp_check_stack(trace_entries, trace_len, check_funcs);
+ #else
+-		ret = klp_check_stack(&trace, 0, other_funcs);
++		ret = klp_check_stack(&trace, 0, check_funcs);
+ #endif
+ 		if (ret)
+ 			goto out;
+ 	}
+ 
+ out:
+-	free_list(&nojump_funcs);
+-	free_list(&other_funcs);
++	free_list(&check_funcs);
+ 	return ret;
+ }
+ #endif
+-- 
+2.26.2
+

@@ -1,0 +1,61 @@
+From c76f48eb5c084b1e15c931ae8cc1826cd771d70d Mon Sep 17 00:00:00 2001
+From: Christoph Hellwig <hch@lst.de>
+Date: Tue, 6 Apr 2021 08:22:56 +0200
+Subject: [PATCH] block: take bd_mutex around delete_partitions in del_gendisk
+Git-commit: c76f48eb5c084b1e15c931ae8cc1826cd771d70d
+Patch-mainline: v5.13-rc1
+References: bsn#12
+openEuler-commit: 956ae9cd352330cffffdee5fb112fc2dbdd7c4c7
+
+There is nothing preventing an ioctl from trying do delete partition
+concurrenly with del_gendisk, so take open_mutex to serialize against
+that.
+
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Link: https://lore.kernel.org/r/20210406062303.811835-6-hch@lst.de
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ block/genhd.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/block/genhd.c b/block/genhd.c
+index b11b70a6bab5..7856e91ed470 100644
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -901,6 +901,7 @@ void del_gendisk(struct gendisk *disk)
+ {
+ 	struct disk_part_iter piter;
+ 	struct hd_struct *part;
++	struct block_device *bdev;
+ 
+ 	might_sleep();
+ 
+@@ -912,6 +913,13 @@ void del_gendisk(struct gendisk *disk)
+ 	 * disk is marked as dead (GENHD_FL_UP cleared).
+ 	 */
+ 	down_write(&disk->lookup_sem);
++	/*
++	 * If bdev is null, that means memory allocate fail. Then
++	 * add_partitions can also fail.
++	 */
++	bdev = bdget_disk(disk, 0);
++	if (bdev)
++		mutex_lock(&bdev->bd_mutex);
+ 	/* invalidate stuff */
+ 	disk_part_iter_init(&piter, disk,
+ 			     DISK_PITER_INCL_EMPTY | DISK_PITER_REVERSE);
+@@ -920,6 +928,10 @@ void del_gendisk(struct gendisk *disk)
+ 		delete_partition(part);
+ 	}
+ 	disk_part_iter_exit(&piter);
++	if (bdev) {
++		mutex_unlock(&bdev->bd_mutex);
++		bdput(bdev);
++	}
+ 
+ 	invalidate_partition(disk, 0);
+ 	set_capacity(disk, 0);
+-- 
+2.26.2
+

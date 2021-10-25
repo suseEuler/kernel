@@ -1,0 +1,137 @@
+From 0f993fe2b89db2342833856cc0597a309f278e55 Mon Sep 17 00:00:00 2001
+From: Jian Shen <shenjian15@huawei.com>
+Date: Thu, 10 Dec 2020 11:42:08 +0800
+Subject: [PATCH] net: hns3: add support for forwarding packet to queues of
+Git-commit: 0f993fe2b89db2342833856cc0597a309f278e55
+Patch-mainline: v5.11-rc1
+References: bsn#12
+
+ specified TC when flow director rule hit
+
+For some new device, it supports forwarding packet to queues
+of specified TC when flow director rule hit. So extend the
+command handle to support it.
+
+Signed-off-by: Jian Shen <shenjian15@huawei.com>
+Signed-off-by: Huazhong Tan <tanhuazhong@huawei.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ .../hisilicon/hns3/hns3pf/hclge_cmd.c         |  2 ++
+ .../hisilicon/hns3/hns3pf/hclge_cmd.h         |  3 +++
+ .../hisilicon/hns3/hns3pf/hclge_main.c        | 21 +++++++++++++++----
+ .../hisilicon/hns3/hns3pf/hclge_main.h        |  6 +++++-
+ 4 files changed, 27 insertions(+), 5 deletions(-)
+
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_cmd.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_cmd.c
+@@ -359,6 +359,8 @@ static void hclge_parse_capability(struc
+ 		set_bit(HNAE3_DEV_SUPPORT_HW_TX_CSUM_B, ae_dev->caps);
+ 	if (hnae3_get_bit(caps, HCLGE_CAP_UDP_TUNNEL_CSUM_B))
+ 		set_bit(HNAE3_DEV_SUPPORT_UDP_TUNNEL_CSUM_B, ae_dev->caps);
++	if (hnae3_get_bit(caps, HCLGE_CAP_FD_FORWARD_TC_B))
++		set_bit(HNAE3_DEV_SUPPORT_FD_FORWARD_TC_B, ae_dev->caps);
+ }
+ 
+ static enum hclge_cmd_status
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_cmd.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_cmd.h
+@@ -1055,6 +1055,9 @@ struct hclge_fd_tcam_config_3_cmd {
+ #define HCLGE_FD_AD_WR_RULE_ID_B	0
+ #define HCLGE_FD_AD_RULE_ID_S		1
+ #define HCLGE_FD_AD_RULE_ID_M		GENMASK(12, 1)
++#define HCLGE_FD_AD_TC_OVRD_B		16
++#define HCLGE_FD_AD_TC_SIZE_S		17
++#define HCLGE_FD_AD_TC_SIZE_M		GENMASK(20, 17)
+ 
+ struct hclge_fd_ad_config_cmd {
+ 	u8 stage;
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
+@@ -5119,6 +5119,7 @@ static int hclge_fd_tcam_config(struct h
+ static int hclge_fd_ad_config(struct hclge_dev *hdev, u8 stage, int loc,
+ 			      struct hclge_fd_ad_data *action)
+ {
++	struct hnae3_ae_dev *ae_dev = pci_get_drvdata(hdev->pdev);
+ 	struct hclge_fd_ad_config_cmd *req;
+ 	struct hclge_desc desc;
+ 	u64 ad_data = 0;
+@@ -5134,6 +5135,12 @@ static int hclge_fd_ad_config(struct hcl
+ 		      action->write_rule_id_to_bd);
+ 	hnae3_set_field(ad_data, HCLGE_FD_AD_RULE_ID_M, HCLGE_FD_AD_RULE_ID_S,
+ 			action->rule_id);
++	if (test_bit(HNAE3_DEV_SUPPORT_FD_FORWARD_TC_B, ae_dev->caps)) {
++		hnae3_set_bit(ad_data, HCLGE_FD_AD_TC_OVRD_B,
++			      action->override_tc);
++		hnae3_set_field(ad_data, HCLGE_FD_AD_TC_SIZE_M,
++				HCLGE_FD_AD_TC_SIZE_S, (u32)action->tc_size);
++	}
+ 	ad_data <<= 32;
+ 	hnae3_set_bit(ad_data, HCLGE_FD_AD_DROP_B, action->drop_packet);
+ 	hnae3_set_bit(ad_data, HCLGE_FD_AD_DIRECT_QID_B,
+@@ -5377,16 +5384,22 @@ static int hclge_config_key(struct hclge
+ static int hclge_config_action(struct hclge_dev *hdev, u8 stage,
+ 			       struct hclge_fd_rule *rule)
+ {
++	struct hclge_vport *vport = hdev->vport;
++	struct hnae3_knic_private_info *kinfo = &vport->nic.kinfo;
+ 	struct hclge_fd_ad_data ad_data;
+ 
++	memset(&ad_data, 0, sizeof(struct hclge_fd_ad_data));
+ 	ad_data.ad_id = rule->location;
+ 
+ 	if (rule->action == HCLGE_FD_ACTION_DROP_PACKET) {
+ 		ad_data.drop_packet = true;
+-		ad_data.forward_to_direct_queue = false;
+-		ad_data.queue_id = 0;
++	} else if (rule->action == HCLGE_FD_ACTION_SELECT_TC) {
++		ad_data.override_tc = true;
++		ad_data.queue_id =
++			kinfo->tc_info.tqp_offset[rule->tc];
++		ad_data.tc_size =
++			ilog2(kinfo->tc_info.tqp_count[rule->tc]);
+ 	} else {
+-		ad_data.drop_packet = false;
+ 		ad_data.forward_to_direct_queue = true;
+ 		ad_data.queue_id = rule->queue_id;
+ 	}
+@@ -5957,7 +5970,7 @@ static int hclge_add_fd_entry(struct hna
+ 			return -EINVAL;
+ 		}
+ 
+-		action = HCLGE_FD_ACTION_ACCEPT_PACKET;
++		action = HCLGE_FD_ACTION_SELECT_QUEUE;
+ 		q_index = ring;
+ 	}
+ 
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.h
+@@ -574,8 +574,9 @@ enum HCLGE_FD_PACKET_TYPE {
+ };
+ 
+ enum HCLGE_FD_ACTION {
+-	HCLGE_FD_ACTION_ACCEPT_PACKET,
++	HCLGE_FD_ACTION_SELECT_QUEUE,
+ 	HCLGE_FD_ACTION_DROP_PACKET,
++	HCLGE_FD_ACTION_SELECT_TC,
+ };
+ 
+ struct hclge_fd_key_cfg {
+@@ -621,6 +622,7 @@ struct hclge_fd_rule {
+ 	u32 unused_tuple;
+ 	u32 flow_type;
+ 	u8 action;
++	u8 tc;
+ 	u16 vf_id;
+ 	u16 queue_id;
+ 	u16 location;
+@@ -639,6 +641,8 @@ struct hclge_fd_ad_data {
+ 	u8 write_rule_id_to_bd;
+ 	u8 next_input_key;
+ 	u16 rule_id;
++	u16 tc_size;
++	u8 override_tc;
+ };
+ 
+ enum HCLGE_MAC_NODE_STATE {

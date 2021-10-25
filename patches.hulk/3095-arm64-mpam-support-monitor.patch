@@ -1,0 +1,218 @@
+From 7f42238eb87838610ce3deb9808099eaf62f8b76 Mon Sep 17 00:00:00 2001
+From: Xie XiuQi <xiexiuqi@huawei.com>
+Date: Fri, 26 Feb 2021 20:20:57 +0800
+Subject: [PATCH] arm64/mpam: support monitor
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 7f42238eb87838610ce3deb9808099eaf62f8b76
+
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+Signed-off-by: Xie XiuQi <xiexiuqi@huawei.com>
+Reviewed-by: Hanjun Guo <guohanjun@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/mpam.h          |  2 ++
+ arch/arm64/include/asm/mpam_resource.h | 10 ++++++++
+ arch/arm64/kernel/mpam.c               | 33 ++++++++++++++++++++++++++
+ arch/arm64/kernel/mpam_ctrlmon.c       | 14 +++++++++--
+ fs/resctrlfs.c                         |  3 +++
+ 5 files changed, 60 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm64/include/asm/mpam.h b/arch/arm64/include/asm/mpam.h
+index f9f1a961db57..65a115b69cfe 100644
+--- a/arch/arm64/include/asm/mpam.h
++++ b/arch/arm64/include/asm/mpam.h
+@@ -133,6 +133,7 @@ struct mongroup {
+ 	struct rdtgroup		*parent;
+ 	struct list_head	crdtgrp_list;
+ 	u32			rmid;
++	int			init;
+ };
+ 
+ /**
+@@ -329,6 +330,7 @@ struct raw_resctrl_resource {
+ 				 struct rdt_domain *d);
+ 	int			num_pmg;
+ 	u64 (*mon_read)		(struct rdt_domain *d, struct rdtgroup *g);
++	int (*mon_write)	(struct rdt_domain *d, struct rdtgroup *g, u32 match);
+ };
+ 
+ int parse_cbm(char *buf, struct raw_resctrl_resource *r, struct rdt_domain *d);
+diff --git a/arch/arm64/include/asm/mpam_resource.h b/arch/arm64/include/asm/mpam_resource.h
+index cd83322b8a43..b634209f21a5 100644
+--- a/arch/arm64/include/asm/mpam_resource.h
++++ b/arch/arm64/include/asm/mpam_resource.h
+@@ -58,6 +58,16 @@
+ #define MBW_MAX_MASK		0xFC00
+ #define MBW_MAX_HARDLIM		BIT(31)
+ 
++#define MSMON_MATCH_PMG		BIT(17)
++#define MSMON_MATCH_PARTID	BIT(16)
++
++#define MSMON_CFG_FLT_SET(r, p)		((r) << 16|(p))
++
++#define MBWU_SUBTYPE_DEFAULT		(3 << 20)
++#define MSMON_CFG_MBWU_CTL_SET(m)	(BIT(31)|MBWU_SUBTYPE_DEFAULT|(m))
++
++#define MSMON_CFG_CSU_CTL_SET(m)	(BIT(31)|(m))
++
+ /* [FIXME] hard code for hardlim */
+ #define MBW_MAX_SET(v)		(MBW_MAX_HARDLIM|((v) << (15 - BWA_WD)))
+ #define MBW_MAX_GET(v)		(((v) & MBW_MAX_MASK) >> (15 - BWA_WD))
+diff --git a/arch/arm64/kernel/mpam.c b/arch/arm64/kernel/mpam.c
+index eb488ab407eb..adce5d3508e1 100644
+--- a/arch/arm64/kernel/mpam.c
++++ b/arch/arm64/kernel/mpam.c
+@@ -168,6 +168,9 @@ u64 bw_rdmsr(struct rdt_domain *d, int partid);
+ static u64 mbwu_read(struct rdt_domain *d, struct rdtgroup *g);
+ static u64 csu_read(struct rdt_domain *d, struct rdtgroup *g);
+ 
++static int mbwu_write(struct rdt_domain *d, struct rdtgroup *g, u32 match);
++static int csu_write(struct rdt_domain *d, struct rdtgroup *g, u32 match);
++
+ #define domain_init(id) LIST_HEAD_INIT(resctrl_resources_all[id].domains)
+ 
+ struct raw_resctrl_resource raw_resctrl_resources_all[] = {
+@@ -177,6 +180,7 @@ struct raw_resctrl_resource raw_resctrl_resources_all[] = {
+ 		.parse_ctrlval		= parse_cbm,
+ 		.format_str		= "%d=%0*x",
+ 		.mon_read		= csu_read,
++		.mon_write		= csu_write,
+ 	},
+ 	[MPAM_RESOURCE_CACHE] = {
+ 		.msr_update		= cat_wrmsr,
+@@ -184,6 +188,7 @@ struct raw_resctrl_resource raw_resctrl_resources_all[] = {
+ 		.parse_ctrlval		= parse_cbm,
+ 		.format_str		= "%d=%0*x",
+ 		.mon_read		= csu_read,
++		.mon_write		= csu_write,
+ 	},
+ 	[MPAM_RESOURCE_MC] = {
+ 		.msr_update		= bw_wrmsr,
+@@ -191,6 +196,7 @@ struct raw_resctrl_resource raw_resctrl_resources_all[] = {
+ 		.parse_ctrlval		= parse_cbm,	/* [FIXME] add parse_bw() helper */
+ 		.format_str		= "%d=%0*x",
+ 		.mon_read		= mbwu_read,
++		.mon_write		= mbwu_write,
+ 	},
+ };
+ 
+@@ -274,6 +280,33 @@ static u64 csu_read(struct rdt_domain *d, struct rdtgroup *g)
+ 	return mpam_readl(d->base + MSMON_CSU);
+ }
+ 
++static int mbwu_write(struct rdt_domain *d, struct rdtgroup *g, u32 match)
++{
++	u32 pmg = g->mon.rmid;
++	u32 partid = g->closid;
++	u32 flt = MSMON_CFG_FLT_SET(pmg, partid);
++	u32 ctl = MSMON_CFG_MBWU_CTL_SET(match);
++
++	mpam_writel(pmg, d->base + MSMON_CFG_MON_SEL);
++	mpam_writel(flt, d->base + MSMON_CFG_MBWU_FLT);
++	mpam_writel(ctl, d->base + MSMON_CFG_MBWU_CTL);
++
++	return 0;
++}
++
++static int csu_write(struct rdt_domain *d, struct rdtgroup *g, u32 match)
++{
++	u32 pmg = g->mon.rmid;
++	u32 partid = g->closid;
++	u32 flt = MSMON_CFG_FLT_SET(pmg, partid);
++	u32 ctl = MSMON_CFG_CSU_CTL_SET(match);
++
++	mpam_writel(pmg, d->base + MSMON_CFG_MON_SEL);
++	mpam_writel(flt, d->base + MSMON_CFG_CSU_FLT);
++	mpam_writel(ctl, d->base + MSMON_CFG_CSU_CTL);
++
++	return 0;
++}
+ 
+ /*
+  * Trivial allocator for CLOSIDs. Since h/w only supports a small number,
+diff --git a/arch/arm64/kernel/mpam_ctrlmon.c b/arch/arm64/kernel/mpam_ctrlmon.c
+index 23ec86c3501d..70a4b57b4851 100644
+--- a/arch/arm64/kernel/mpam_ctrlmon.c
++++ b/arch/arm64/kernel/mpam_ctrlmon.c
+@@ -116,10 +116,11 @@ static int parse_line(char *line, struct resctrl_resource *r)
+ 	return -EINVAL;
+ }
+ 
+-static int update_domains(struct resctrl_resource *r, int partid)
++static int update_domains(struct resctrl_resource *r, struct rdtgroup *g)
+ {
+ 	struct raw_resctrl_resource *rr;
+ 	struct rdt_domain *d;
++	int partid = g->closid;
+ 
+ 	rr = (struct raw_resctrl_resource *)r->res;
+ 	list_for_each_entry(d, &r->domains, list) {
+@@ -127,6 +128,9 @@ static int update_domains(struct resctrl_resource *r, int partid)
+ 			d->ctrl_val[partid] = d->new_ctrl;
+ 			rr->msr_update(d, partid);
+ 		}
++
++		/* only match partid for monitoring this whole group */
++		rr->mon_write(d, g, MSMON_MATCH_PARTID);
+ 	}
+ 
+ 	return 0;
+@@ -197,7 +201,7 @@ ssize_t resctrl_group_schemata_write(struct kernfs_open_file *of,
+ 
+ 	for_each_resctrl_resource(r) {
+ 		if (r->alloc_enabled) {
+-			ret = update_domains(r, closid);
++			ret = update_domains(r, rdtgrp);
+ 			if (ret)
+ 				goto out;
+ 		}
+@@ -378,6 +382,7 @@ static int mkdir_mondata_subdir(struct kernfs_node *parent_kn,
+ 				struct resctrl_resource *r, struct resctrl_group *prgrp)
+ {
+ #if 1
++	struct raw_resctrl_resource *rr = (struct raw_resctrl_resource *)r->res;
+ 	union mon_data_bits md;
+ 	struct kernfs_node *kn;
+ 	char name[32];
+@@ -403,6 +408,11 @@ static int mkdir_mondata_subdir(struct kernfs_node *parent_kn,
+ 		return ret;
+ 	}
+ 
++
++	/* set mon id for mon_groups */
++	if (prgrp->type == RDTMON_GROUP)
++		rr->mon_write(d, prgrp, MSMON_MATCH_PMG);
++
+ 	return ret;
+ #if 0
+ 	/* create the directory */
+diff --git a/fs/resctrlfs.c b/fs/resctrlfs.c
+index 5b00f2bf22ff..d95118fdd57f 100644
+--- a/fs/resctrlfs.c
++++ b/fs/resctrlfs.c
+@@ -656,6 +656,9 @@ static int resctrl_group_mkdir_mon(struct kernfs_node *parent_kn,
+ 	 */
+ 	list_add_tail(&rdtgrp->mon.crdtgrp_list, &prgrp->mon.crdtgrp_list);
+ 
++	/* [FIXME] post_mkdir_mon */
++	// post_resctrl_group_mkdir_mon(struct resctrl_group *g);
++
+ 	resctrl_group_kn_unlock(prgrp_kn);
+ 	return ret;
+ }
+-- 
+2.26.2
+

@@ -1,0 +1,203 @@
+From d2f957c7de3a255c7128d2add470cfb939de5b6e Mon Sep 17 00:00:00 2001
+From: Roberto Sassu <roberto.sassu@huawei.com>
+Date: Wed, 3 Mar 2021 08:44:02 +0100
+Subject: [PATCH] ima: Load all digest lists from a directory at boot time
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: d2f957c7de3a255c7128d2add470cfb939de5b6e
+
+
+hulk inclusion
+category: feature
+feature: IMA Digest Lists extension
+bugzilla: 46797
+
+-------------------------------------------------
+
+Digest lists should be uploaded to IMA as soon as possible, otherwise file
+digests would appear in the measurement list or access would be denied if
+appraisal is in enforcing mode.
+
+This patch adds a call to ima_load_digest_lists() in integrity_load_keys(),
+so that the function is executed when rootfs becomes available, before
+files are accessed.
+
+ima_load_digest_lists() iterates in the directory specified as value of
+CONFIG_IMA_DIGEST_LISTS_DIR and uploads all digest lists to the kernel.
+
+Signed-off-by: Roberto Sassu <roberto.sassu@huawei.com>
+Signed-off-by: Tianxing Zhang <zhangtianxing3@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ security/integrity/iint.c                |  2 +
+ security/integrity/ima/Kconfig           |  8 ++
+ security/integrity/ima/ima_digest_list.c | 95 ++++++++++++++++++++++++
+ security/integrity/integrity.h           |  4 +
+ 4 files changed, 109 insertions(+)
+
+diff --git a/security/integrity/iint.c b/security/integrity/iint.c
+index c487e74a35fb..7bcca49cacb5 100644
+--- a/security/integrity/iint.c
++++ b/security/integrity/iint.c
+@@ -203,6 +203,8 @@ void __init integrity_load_keys(void)
+ 
+ 	if (!IS_ENABLED(CONFIG_IMA_LOAD_X509))
+ 		evm_load_x509();
++
++	ima_load_digest_lists();
+ }
+ 
+ static int __init integrity_fs_init(void)
+diff --git a/security/integrity/ima/Kconfig b/security/integrity/ima/Kconfig
+index 0b5781db7ee9..fa432e4f9684 100644
+--- a/security/integrity/ima/Kconfig
++++ b/security/integrity/ima/Kconfig
+@@ -344,3 +344,11 @@ config IMA_DIGEST_LIST
+ 	   of accessed files are found in one of those lists, no new entries are
+ 	   added to the measurement list, and access to the file is granted if
+ 	   appraisal is in enforcing mode.
++
++config IMA_DIGEST_LISTS_DIR
++	string "Path of the directory containing digest lists"
++	depends on IMA_DIGEST_LIST
++	default "/etc/ima/digest_lists"
++	help
++	   This option defines the path of the directory containing digest
++	   lists.
+diff --git a/security/integrity/ima/ima_digest_list.c b/security/integrity/ima/ima_digest_list.c
+index 901990c8dfa8..06cdee588cc5 100644
+--- a/security/integrity/ima/ima_digest_list.c
++++ b/security/integrity/ima/ima_digest_list.c
+@@ -17,6 +17,9 @@
+ 
+ #include <linux/vmalloc.h>
+ #include <linux/module.h>
++#include <linux/file.h>
++#include <linux/namei.h>
++#include <linux/xattr.h>
+ 
+ #include "ima.h"
+ #include "ima_digest_list.h"
+@@ -222,3 +225,95 @@ struct ima_digest *ima_digest_allow(struct ima_digest *digest, int action)
+ 
+ 	return digest;
+ }
++
++/**************************************
++ * Digest list loading at kernel init *
++ **************************************/
++struct readdir_callback {
++	struct dir_context ctx;
++	struct path *path;
++};
++
++static int __init load_digest_list(struct dir_context *__ctx, const char *name,
++				   int namelen, loff_t offset, u64 ino,
++				   unsigned int d_type)
++{
++	struct readdir_callback *ctx = container_of(__ctx, typeof(*ctx), ctx);
++	struct path *dir = ctx->path;
++	struct dentry *dentry;
++	struct file *file;
++	u8 *xattr_value = NULL;
++	void *datap = NULL;
++	loff_t size;
++	int ret;
++
++	if (!strcmp(name, ".") || !strcmp(name, ".."))
++		return 0;
++
++	dentry = lookup_one_len(name, dir->dentry, strlen(name));
++	if (IS_ERR(dentry))
++		return 0;
++
++	size = vfs_getxattr(dentry, XATTR_NAME_EVM, NULL, 0);
++	if (size < 0) {
++		size = vfs_getxattr_alloc(dentry, XATTR_NAME_IMA,
++					  (char **)&xattr_value, 0, GFP_NOFS);
++		if (size < 0 || xattr_value[0] != EVM_IMA_XATTR_DIGSIG)
++			goto out;
++	}
++
++	file = file_open_root(dir->dentry, dir->mnt, name, O_RDONLY, 0);
++	if (IS_ERR(file)) {
++		pr_err("Unable to open file: %s (%ld)", name, PTR_ERR(file));
++		goto out;
++	}
++
++	ret = kernel_read_file(file, 0, &datap, INT_MAX, NULL,
++			       READING_DIGEST_LIST);
++	if (ret < 0) {
++		pr_err("Unable to read file: %s (%d)", name, ret);
++		goto out_fput;
++	}
++
++	size = ret;
++
++	ima_check_measured_appraised(file);
++
++	ret = ima_parse_compact_list(size, datap, DIGEST_LIST_OP_ADD);
++	if (ret < 0)
++		pr_err("Unable to parse file: %s (%d)", name, ret);
++
++	vfree(datap);
++out_fput:
++	fput(file);
++out:
++	kfree(xattr_value);
++	return 0;
++}
++
++void __init ima_load_digest_lists(void)
++{
++	struct path path;
++	struct file *file;
++	int ret;
++	struct readdir_callback buf = {
++		.ctx.actor = load_digest_list,
++	};
++
++	if (!(ima_digest_list_actions & ima_policy_flag))
++		return;
++
++	ret = kern_path(CONFIG_IMA_DIGEST_LISTS_DIR, 0, &path);
++	if (ret)
++		return;
++
++	file = dentry_open(&path, O_RDONLY, current_cred());
++	if (IS_ERR(file))
++		goto out;
++
++	buf.path = &path;
++	iterate_dir(file, &buf.ctx);
++	fput(file);
++out:
++	path_put(&path);
++}
+diff --git a/security/integrity/integrity.h b/security/integrity/integrity.h
+index 2f0a179b2832..557b08705a61 100644
+--- a/security/integrity/integrity.h
++++ b/security/integrity/integrity.h
+@@ -163,6 +163,7 @@ static inline bool ima_digest_is_immutable(struct ima_digest *digest)
+ struct ima_digest *ima_lookup_digest(u8 *digest, enum hash_algo algo,
+ 				     enum compact_types type);
+ struct ima_digest *ima_digest_allow(struct ima_digest *digest, int action);
++void __init ima_load_digest_lists(void);
+ #else
+ static inline struct ima_digest *ima_lookup_digest(u8 *digest,
+ 						   enum hash_algo algo,
+@@ -175,6 +176,9 @@ static inline struct ima_digest *ima_digest_allow(struct ima_digest *digest,
+ {
+ 	return NULL;
+ }
++static inline void ima_load_digest_lists(void)
++{
++}
+ #endif
+ 
+ /* rbtree tree calls to lookup, insert, delete
+-- 
+2.26.2
+

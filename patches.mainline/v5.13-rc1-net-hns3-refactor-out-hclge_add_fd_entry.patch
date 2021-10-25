@@ -1,0 +1,110 @@
+From 5f2b1238b33c38478ddc55536b65277b30f5d456 Mon Sep 17 00:00:00 2001
+From: Jian Shen <shenjian15@huawei.com>
+Date: Mon, 22 Mar 2021 11:51:56 +0800
+Subject: [PATCH] net: hns3: refactor out hclge_add_fd_entry()
+Git-commit: 5f2b1238b33c38478ddc55536b65277b30f5d456
+Patch-mainline: v5.13-rc1
+References: bsn#12
+
+
+The process of function hclge_add_fd_entry() is complex and
+prolix. To make it more readable, extract the process of
+fs->ring_cookie to a single function.
+
+Signed-off-by: Jian Shen <shenjian15@huawei.com>
+Signed-off-by: Huazhong Tan <tanhuazhong@huawei.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ .../hisilicon/hns3/hns3pf/hclge_main.c        | 67 +++++++++++--------
+ 1 file changed, 40 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
+index a664383271c8..4929220d344a 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
+@@ -6126,6 +6126,42 @@ static bool hclge_is_cls_flower_active(struct hnae3_handle *handle)
+ 	return hdev->fd_active_type == HCLGE_FD_TC_FLOWER_ACTIVE;
+ }
+ 
++static int hclge_fd_parse_ring_cookie(struct hclge_dev *hdev, u64 ring_cookie,
++				      u16 *vport_id, u8 *action, u16 *queue_id)
++{
++	struct hclge_vport *vport = hdev->vport;
++
++	if (ring_cookie == RX_CLS_FLOW_DISC) {
++		*action = HCLGE_FD_ACTION_DROP_PACKET;
++	} else {
++		u32 ring = ethtool_get_flow_spec_ring(ring_cookie);
++		u8 vf = ethtool_get_flow_spec_ring_vf(ring_cookie);
++		u16 tqps;
++
++		if (vf > hdev->num_req_vfs) {
++			dev_err(&hdev->pdev->dev,
++				"Error: vf id (%u) > max vf num (%u)\n",
++				vf, hdev->num_req_vfs);
++			return -EINVAL;
++		}
++
++		*vport_id = vf ? hdev->vport[vf].vport_id : vport->vport_id;
++		tqps = hdev->vport[vf].nic.kinfo.num_tqps;
++
++		if (ring >= tqps) {
++			dev_err(&hdev->pdev->dev,
++				"Error: queue id (%u) > max tqp num (%u)\n",
++				ring, tqps - 1);
++			return -EINVAL;
++		}
++
++		*action = HCLGE_FD_ACTION_SELECT_QUEUE;
++		*queue_id = ring;
++	}
++
++	return 0;
++}
++
+ static int hclge_add_fd_entry(struct hnae3_handle *handle,
+ 			      struct ethtool_rxnfc *cmd)
+ {
+@@ -6162,33 +6198,10 @@ static int hclge_add_fd_entry(struct hnae3_handle *handle,
+ 	if (ret)
+ 		return ret;
+ 
+-	if (fs->ring_cookie == RX_CLS_FLOW_DISC) {
+-		action = HCLGE_FD_ACTION_DROP_PACKET;
+-	} else {
+-		u32 ring = ethtool_get_flow_spec_ring(fs->ring_cookie);
+-		u8 vf = ethtool_get_flow_spec_ring_vf(fs->ring_cookie);
+-		u16 tqps;
+-
+-		if (vf > hdev->num_req_vfs) {
+-			dev_err(&hdev->pdev->dev,
+-				"Error: vf id (%u) > max vf num (%u)\n",
+-				vf, hdev->num_req_vfs);
+-			return -EINVAL;
+-		}
+-
+-		dst_vport_id = vf ? hdev->vport[vf].vport_id : vport->vport_id;
+-		tqps = vf ? hdev->vport[vf].alloc_tqps : vport->alloc_tqps;
+-
+-		if (ring >= tqps) {
+-			dev_err(&hdev->pdev->dev,
+-				"Error: queue id (%u) > max tqp num (%u)\n",
+-				ring, tqps - 1);
+-			return -EINVAL;
+-		}
+-
+-		action = HCLGE_FD_ACTION_SELECT_QUEUE;
+-		q_index = ring;
+-	}
++	ret = hclge_fd_parse_ring_cookie(hdev, fs->ring_cookie, &dst_vport_id,
++					 &action, &q_index);
++	if (ret)
++		return ret;
+ 
+ 	rule = kzalloc(sizeof(*rule), GFP_KERNEL);
+ 	if (!rule)
+-- 
+2.31.1
+

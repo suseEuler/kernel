@@ -1,0 +1,182 @@
+From 32e6d104c6fe01713a039a98842e4d2f6bb505ec Mon Sep 17 00:00:00 2001
+From: Jian Shen <shenjian15@huawei.com>
+Date: Mon, 31 May 2021 10:38:43 +0800
+Subject: [PATCH] net: hns3: add query basic info support for VF
+Git-commit: 32e6d104c6fe01713a039a98842e4d2f6bb505ec
+Patch-mainline: v5.14-rc1
+References: bsn#12
+
+
+There are some features of VF depend on PF, so it's necessary
+for VF to know whether PF supports. For compatibility, modify
+the mailbox HCLGE_MBX_GET_TCINFO, extend its function, use to
+get the basic information of PF, including mailbox api version
+and PF capabilities.
+
+Signed-off-by: Jian Shen <shenjian15@huawei.com>
+Signed-off-by: Huazhong Tan <tanhuazhong@huawei.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ drivers/net/ethernet/hisilicon/hns3/hclge_mbx.h           |    9 +++
+ drivers/net/ethernet/hisilicon/hns3/hnae3.h               |    3 +
+ drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_mbx.c    |   19 +++++---
+ drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_main.c |   33 ++++++++------
+ drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_main.h |    1 
+ 5 files changed, 45 insertions(+), 20 deletions(-)
+
+--- a/drivers/net/ethernet/hisilicon/hns3/hclge_mbx.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hclge_mbx.h
+@@ -20,7 +20,7 @@ enum HCLGE_MBX_OPCODE {
+ 	HCLGE_MBX_API_NEGOTIATE,	/* (VF -> PF) negotiate API version */
+ 	HCLGE_MBX_GET_QINFO,		/* (VF -> PF) get queue config */
+ 	HCLGE_MBX_GET_QDEPTH,		/* (VF -> PF) get queue depth */
+-	HCLGE_MBX_GET_TCINFO,		/* (VF -> PF) get TC config */
++	HCLGE_MBX_GET_BASIC_INFO,	/* (VF -> PF) get basic info */
+ 	HCLGE_MBX_GET_RETA,		/* (VF -> PF) get RETA */
+ 	HCLGE_MBX_GET_RSS_KEY,		/* (VF -> PF) get RSS key */
+ 	HCLGE_MBX_GET_MAC_ADDR,		/* (VF -> PF) get MAC addr */
+@@ -85,6 +85,13 @@ struct hclge_ring_chain_param {
+ 	u8 int_gl_index;
+ };
+ 
++struct hclge_basic_info {
++	u8 hw_tc_map;
++	u8 rsv;
++	u16 mbx_api_version;
++	u32 pf_caps;
++};
++
+ struct hclgevf_mbx_resp_status {
+ 	struct mutex mbx_mutex; /* protects against contending sync cmd resp */
+ 	u32 origin_mbx_msg;
+--- a/drivers/net/ethernet/hisilicon/hns3/hnae3.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hnae3.h
+@@ -146,6 +146,9 @@ enum HNAE3_DEV_CAP_BITS {
+ #define hnae3_ae_dev_rxd_adv_layout_supported(ae_dev) \
+ 	test_bit(HNAE3_DEV_SUPPORT_RXD_ADV_LAYOUT_B, (ae_dev)->caps)
+ 
++enum HNAE3_PF_CAP_BITS {
++	HNAE3_PF_SUPPORT_VLAN_FLTR_MDF_B = 0,
++};
+ #define ring_ptr_move_fw(ring, p) \
+ 	((ring)->p = ((ring)->p + 1) % (ring)->desc_num)
+ #define ring_ptr_move_bw(ring, p) \
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_mbx.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_mbx.c
+@@ -392,16 +392,23 @@ static int hclge_set_vf_alive(struct hcl
+ 	return ret;
+ }
+ 
+-static void hclge_get_vf_tcinfo(struct hclge_vport *vport,
+-				struct hclge_respond_to_vf_msg *resp_msg)
++static void hclge_get_basic_info(struct hclge_vport *vport,
++				 struct hclge_respond_to_vf_msg *resp_msg)
+ {
+ 	struct hnae3_knic_private_info *kinfo = &vport->nic.kinfo;
++	struct hnae3_ae_dev *ae_dev = vport->back->ae_dev;
++	struct hclge_basic_info *basic_info;
+ 	unsigned int i;
+ 
++	basic_info = (struct hclge_basic_info *)resp_msg->data;
+ 	for (i = 0; i < kinfo->tc_info.num_tc; i++)
+-		resp_msg->data[0] |= BIT(i);
++		basic_info->hw_tc_map |= BIT(i);
+ 
+-	resp_msg->len = sizeof(u8);
++	if (test_bit(HNAE3_DEV_SUPPORT_VLAN_FLTR_MDF_B, ae_dev->caps))
++		hnae3_set_bit(basic_info->pf_caps,
++			      HNAE3_PF_SUPPORT_VLAN_FLTR_MDF_B, 1);
++
++	resp_msg->len = HCLGE_MBX_MAX_RESP_DATA_SIZE;
+ }
+ 
+ static void hclge_get_vf_queue_info(struct hclge_vport *vport,
+@@ -768,8 +775,8 @@ void hclge_mbx_handler(struct hclge_dev
+ 		case HCLGE_MBX_GET_QDEPTH:
+ 			hclge_get_vf_queue_depth(vport, &resp_msg);
+ 			break;
+-		case HCLGE_MBX_GET_TCINFO:
+-			hclge_get_vf_tcinfo(vport, &resp_msg);
++		case HCLGE_MBX_GET_BASIC_INFO:
++			hclge_get_basic_info(vport, &resp_msg);
+ 			break;
+ 		case HCLGE_MBX_GET_LINK_STATUS:
+ 			ret = hclge_push_vf_link_status(vport);
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_main.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_main.c
+@@ -243,23 +243,31 @@ static void hclgevf_build_send_msg(struc
+ 	}
+ }
+ 
+-static int hclgevf_get_tc_info(struct hclgevf_dev *hdev)
++static int hclgevf_get_basic_info(struct hclgevf_dev *hdev)
+ {
++	struct hnae3_ae_dev *ae_dev = hdev->ae_dev;
++	u8 resp_msg[HCLGE_MBX_MAX_RESP_DATA_SIZE];
++	struct hclge_basic_info *basic_info;
+ 	struct hclge_vf_to_pf_msg send_msg;
+-	u8 resp_msg;
++	unsigned long caps;
+ 	int status;
+ 
+-	hclgevf_build_send_msg(&send_msg, HCLGE_MBX_GET_TCINFO, 0);
+-	status = hclgevf_send_mbx_msg(hdev, &send_msg, true, &resp_msg,
++	hclgevf_build_send_msg(&send_msg, HCLGE_MBX_GET_BASIC_INFO, 0);
++	status = hclgevf_send_mbx_msg(hdev, &send_msg, true, resp_msg,
+ 				      sizeof(resp_msg));
+ 	if (status) {
+ 		dev_err(&hdev->pdev->dev,
+-			"VF request to get TC info from PF failed %d",
+-			status);
++			"failed to get basic info from pf, ret = %d", status);
+ 		return status;
+ 	}
+ 
+-	hdev->hw_tc_map = resp_msg;
++	basic_info = (struct hclge_basic_info *)resp_msg;
++
++	hdev->hw_tc_map = basic_info->hw_tc_map;
++	hdev->mbx_api_version = basic_info->mbx_api_version;
++	caps = basic_info->pf_caps;
++	if (test_bit(HNAE3_PF_SUPPORT_VLAN_FLTR_MDF_B, &caps))
++		set_bit(HNAE3_DEV_SUPPORT_VLAN_FLTR_MDF_B, ae_dev->caps);
+ 
+ 	return 0;
+ }
+@@ -2482,6 +2490,10 @@ static int hclgevf_configure(struct hclg
+ {
+ 	int ret;
+ 
++	ret = hclgevf_get_basic_info(hdev);
++	if (ret)
++		return ret;
++
+ 	/* get current port based vlan state from PF */
+ 	ret = hclgevf_get_port_base_vlan_filter_state(hdev);
+ 	if (ret)
+@@ -2497,12 +2509,7 @@ static int hclgevf_configure(struct hclg
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = hclgevf_get_pf_media_type(hdev);
+-	if (ret)
+-		return ret;
+-
+-	/* get tc configuration from PF */
+-	return hclgevf_get_tc_info(hdev);
++	return hclgevf_get_pf_media_type(hdev);
+ }
+ 
+ static int hclgevf_alloc_hdev(struct hnae3_ae_dev *ae_dev)
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_main.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_main.h
+@@ -287,6 +287,7 @@ struct hclgevf_dev {
+ 	struct semaphore reset_sem;	/* protect reset process */
+ 
+ 	u32 fw_version;
++	u16 mbx_api_version;
+ 	u16 num_tqps;		/* num task queue pairs of this VF */
+ 
+ 	u16 alloc_rss_size;	/* allocated RSS task queue */

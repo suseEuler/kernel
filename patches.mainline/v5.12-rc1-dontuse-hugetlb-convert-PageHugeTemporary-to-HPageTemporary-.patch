@@ -1,0 +1,143 @@
+From 9157c31186c358c5750dea50ac5705d61d7fc917 Mon Sep 17 00:00:00 2001
+From: Mike Kravetz <mike.kravetz@oracle.com>
+Date: Wed, 24 Feb 2021 12:09:00 -0800
+Subject: [PATCH] hugetlb: convert PageHugeTemporary() to HPageTemporary flag
+Git-commit: 9157c31186c358c5750dea50ac5705d61d7fc917
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+Use new hugetlb specific HPageTemporary flag to replace the
+PageHugeTemporary() interfaces.  PageHugeTemporary does contain a
+PageHuge() check.  However, this interface is only used within hugetlb
+code where we know we are dealing with a hugetlb page.  Therefore, the
+check can be eliminated.
+
+Link: https://lkml.kernel.org/r/20210122195231.324857-5-mike.kravetz@oracle.com
+Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+Reviewed-by: Oscar Salvador <osalvador@suse.de>
+Reviewed-by: Muchun Song <songmuchun@bytedance.com>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ include/linux/hugetlb.h |  6 ++++++
+ mm/hugetlb.c            | 36 +++++++-----------------------------
+ 2 files changed, 13 insertions(+), 29 deletions(-)
+
+diff --git a/include/linux/hugetlb.h b/include/linux/hugetlb.h
+index 77f2a032fe32..e97498a21010 100644
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -483,10 +483,15 @@ unsigned long hugetlb_get_unmapped_area(struct file *file, unsigned long addr,
+  * HPG_migratable  - Set after a newly allocated page is added to the page
+  *	cache and/or page tables.  Indicates the page is a candidate for
+  *	migration.
++ * HPG_temporary - - Set on a page that is temporarily allocated from the buddy
++ *	allocator.  Typically used for migration target pages when no pages
++ *	are available in the pool.  The hugetlb free page path will
++ *	immediately free pages with this flag set to the buddy allocator.
+  */
+ enum hugetlb_page_flags {
+ 	HPG_restore_reserve = 0,
+ 	HPG_migratable,
++	HPG_temporary,
+ 	__NR_HPAGEFLAGS,
+ };
+ 
+@@ -530,6 +535,7 @@ static inline void ClearHPage##uname(struct page *page)		\
+  */
+ HPAGEFLAG(RestoreReserve, restore_reserve)
+ HPAGEFLAG(Migratable, migratable)
++HPAGEFLAG(Temporary, temporary)
+ 
+ #ifdef CONFIG_HUGETLB_PAGE
+ 
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 727c09713627..4d7d4535a313 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -1364,28 +1364,6 @@ struct hstate *size_to_hstate(unsigned long size)
+ 	return NULL;
+ }
+ 
+-/*
+- * Internal hugetlb specific page flag. Do not use outside of the hugetlb
+- * code
+- */
+-static inline bool PageHugeTemporary(struct page *page)
+-{
+-	if (!PageHuge(page))
+-		return false;
+-
+-	return (unsigned long)page[2].mapping == -1U;
+-}
+-
+-static inline void SetPageHugeTemporary(struct page *page)
+-{
+-	page[2].mapping = (void *)-1U;
+-}
+-
+-static inline void ClearPageHugeTemporary(struct page *page)
+-{
+-	page[2].mapping = NULL;
+-}
+-
+ static void __free_huge_page(struct page *page)
+ {
+ 	/*
+@@ -1433,9 +1411,9 @@ static void __free_huge_page(struct page *page)
+ 	if (restore_reserve)
+ 		h->resv_huge_pages++;
+ 
+-	if (PageHugeTemporary(page)) {
++	if (HPageTemporary(page)) {
+ 		list_del(&page->lru);
+-		ClearPageHugeTemporary(page);
++		ClearHPageTemporary(page);
+ 		update_and_free_page(h, page);
+ 	} else if (h->surplus_huge_pages_node[nid]) {
+ 		/* remove the page from active list */
+@@ -1869,7 +1847,7 @@ static struct page *alloc_surplus_huge_page(struct hstate *h, gfp_t gfp_mask,
+ 	 * codeflow
+ 	 */
+ 	if (h->surplus_huge_pages >= h->nr_overcommit_huge_pages) {
+-		SetPageHugeTemporary(page);
++		SetHPageTemporary(page);
+ 		spin_unlock(&hugetlb_lock);
+ 		put_page(page);
+ 		return NULL;
+@@ -1900,7 +1878,7 @@ static struct page *alloc_migrate_huge_page(struct hstate *h, gfp_t gfp_mask,
+ 	 * We do not account these pages as surplus because they are only
+ 	 * temporary and will be released properly on the last reference
+ 	 */
+-	SetPageHugeTemporary(page);
++	SetHPageTemporary(page);
+ 
+ 	return page;
+ }
+@@ -5625,12 +5603,12 @@ void move_hugetlb_state(struct page *oldpage, struct page *newpage, int reason)
+ 	 * here as well otherwise the global surplus count will not match
+ 	 * the per-node's.
+ 	 */
+-	if (PageHugeTemporary(newpage)) {
++	if (HPageTemporary(newpage)) {
+ 		int old_nid = page_to_nid(oldpage);
+ 		int new_nid = page_to_nid(newpage);
+ 
+-		SetPageHugeTemporary(oldpage);
+-		ClearPageHugeTemporary(newpage);
++		SetHPageTemporary(oldpage);
++		ClearHPageTemporary(newpage);
+ 
+ 		spin_lock(&hugetlb_lock);
+ 		if (h->surplus_huge_pages_node[old_nid]) {
+-- 
+2.31.1
+

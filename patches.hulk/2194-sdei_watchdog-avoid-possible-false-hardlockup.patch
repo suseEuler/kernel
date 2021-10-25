@@ -1,0 +1,78 @@
+From 0fa83fd0f8f7267be1e31c824cedb9d112504785 Mon Sep 17 00:00:00 2001
+From: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Date: Sat, 20 Feb 2021 11:01:03 +0800
+Subject: [PATCH] sdei_watchdog: avoid possible false hardlockup
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 0fa83fd0f8f7267be1e31c824cedb9d112504785
+
+
+hulk inclusion
+category: feature
+bugzilla: 48046
+CVE: NA
+
+-------------------------------------------------------------------------
+
+Firmware may not trigger SDEI event as required frequency. SDEI event
+may be triggered too soon, which cause false hardlockup in kernel. Check
+the time stamp in sdei_watchdog_callbak and skip the hardlockup check if
+it is invoked too soon.
+
+Signed-off-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Hanjun Guo <guohanjun@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/kernel/watchdog_sdei.c | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/arch/arm64/kernel/watchdog_sdei.c b/arch/arm64/kernel/watchdog_sdei.c
+index 6352b589e02a..a499a14b23c1 100644
+--- a/arch/arm64/kernel/watchdog_sdei.c
++++ b/arch/arm64/kernel/watchdog_sdei.c
+@@ -23,6 +23,7 @@
+ static int sdei_watchdog_event_num;
+ static bool disable_sdei_nmi_watchdog;
+ static bool sdei_watchdog_registered;
++static DEFINE_PER_CPU(ktime_t, last_check_time);
+ 
+ int watchdog_nmi_enable(unsigned int cpu)
+ {
+@@ -35,6 +36,7 @@ int watchdog_nmi_enable(unsigned int cpu)
+ 	refresh_hld_last_timestamp();
+ #endif
+ 
++	__this_cpu_write(last_check_time, ktime_get_mono_fast_ns());
+ 	sdei_api_set_secure_timer_period(watchdog_thresh);
+ 
+ 	ret = sdei_api_event_enable(sdei_watchdog_event_num);
+@@ -63,6 +65,23 @@ void watchdog_nmi_disable(unsigned int cpu)
+ static int sdei_watchdog_callback(u32 event,
+ 		struct pt_regs *regs, void *arg)
+ {
++	ktime_t delta, now = ktime_get_mono_fast_ns();
++
++	delta = now - __this_cpu_read(last_check_time);
++	__this_cpu_write(last_check_time, now);
++
++	/*
++	 * Set delta to 4/5 of the actual watchdog threshold period so the
++	 * hrtimer is guaranteed to fire at least once within the real
++	 * watchdog threshold.
++	 */
++	if (delta < watchdog_thresh * (u64)NSEC_PER_SEC * 4 / 5) {
++		pr_err(FW_BUG "SDEI Watchdog event triggered too soon, "
++			"time to last check:%lld ns\n", delta);
++		WARN_ON(1);
++		return 0;
++	}
++
+ 	watchdog_hardlockup_check(regs);
+ 
+ 	return 0;
+-- 
+2.26.2
+

@@ -1,0 +1,183 @@
+From 13150149aa6ded1e6bbe0025beac6e12604dd87c Mon Sep 17 00:00:00 2001
+From: Ard Biesheuvel <ardb@kernel.org>
+Date: Tue, 2 Mar 2021 10:01:12 +0100
+Subject: [PATCH] arm64: fpsimd: run kernel mode NEON with softirqs disabled
+Git-commit: 13150149aa6ded1e6bbe0025beac6e12604dd87c
+Patch-mainline: v5.13-rc1
+References: bsn#12
+
+
+Kernel mode NEON can be used in task or softirq context, but only in
+a non-nesting manner, i.e., softirq context is only permitted if the
+interrupt was not taken at a point where the kernel was using the NEON
+in task context.
+
+This means all users of kernel mode NEON have to be aware of this
+limitation, and either need to provide scalar fallbacks that may be much
+slower (up to 20x for AES instructions) and potentially less safe, or
+use an asynchronous interface that defers processing to a later time
+when the NEON is guaranteed to be available.
+
+Given that grabbing and releasing the NEON is cheap, we can relax this
+restriction, by increasing the granularity of kernel mode NEON code, and
+always disabling softirq processing while the NEON is being used in task
+context.
+
+Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+Acked-by: Will Deacon <will@kernel.org>
+Link: https://lore.kernel.org/r/20210302090118.30666-4-ardb@kernel.org
+Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ arch/arm64/crypto/aes-modes.S      |    2 +-
+ arch/arm64/crypto/sha1-ce-core.S   |    2 +-
+ arch/arm64/crypto/sha2-ce-core.S   |    2 +-
+ arch/arm64/crypto/sha3-ce-core.S   |    4 ++--
+ arch/arm64/crypto/sha512-ce-core.S |    2 +-
+ arch/arm64/include/asm/assembler.h |   28 +++++++++++++++++++++-------
+ arch/arm64/kernel/asm-offsets.c    |    2 ++
+ arch/arm64/kernel/fpsimd.c         |    4 ++--
+ 8 files changed, 31 insertions(+), 15 deletions(-)
+
+--- a/arch/arm64/crypto/aes-modes.S
++++ b/arch/arm64/crypto/aes-modes.S
+@@ -641,7 +641,7 @@ AES_FUNC_START(aes_mac_update)
+ 	cbz		w5, .Lmacout
+ 	encrypt_block	v0, w2, x1, x7, w8
+ 	st1		{v0.16b}, [x4]			/* return dg */
+-	cond_yield	.Lmacout, x7
++	cond_yield	.Lmacout, x7, x8
+ 	b		.Lmacloop4x
+ .Lmac1x:
+ 	add		w3, w3, #4
+--- a/arch/arm64/crypto/sha1-ce-core.S
++++ b/arch/arm64/crypto/sha1-ce-core.S
+@@ -121,7 +121,7 @@ CPU_LE(	rev32		v11.16b, v11.16b	)
+ 	add		dgav.4s, dgav.4s, dg0v.4s
+ 
+ 	cbz		w2, 2f
+-	cond_yield	3f, x5
++	cond_yield	3f, x5, x6
+ 	b		0b
+ 
+ 	/*
+--- a/arch/arm64/crypto/sha2-ce-core.S
++++ b/arch/arm64/crypto/sha2-ce-core.S
+@@ -129,7 +129,7 @@ CPU_LE(	rev32		v19.16b, v19.16b	)
+ 
+ 	/* handled all input blocks? */
+ 	cbz		w2, 2f
+-	cond_yield	3f, x5
++	cond_yield	3f, x5, x6
+ 	b		0b
+ 
+ 	/*
+--- a/arch/arm64/crypto/sha3-ce-core.S
++++ b/arch/arm64/crypto/sha3-ce-core.S
+@@ -184,11 +184,11 @@ SYM_FUNC_START(sha3_ce_transform)
+ 	eor	 v0.16b,  v0.16b, v31.16b
+ 
+ 	cbnz	w8, 3b
+-	cond_yield 3f, x8
++	cond_yield 4f, x8, x9
+ 	cbnz	w2, 0b
+ 
+ 	/* save state */
+-3:	st1	{ v0.1d- v3.1d}, [x0], #32
++4:	st1	{ v0.1d- v3.1d}, [x0], #32
+ 	st1	{ v4.1d- v7.1d}, [x0], #32
+ 	st1	{ v8.1d-v11.1d}, [x0], #32
+ 	st1	{v12.1d-v15.1d}, [x0], #32
+--- a/arch/arm64/crypto/sha512-ce-core.S
++++ b/arch/arm64/crypto/sha512-ce-core.S
+@@ -195,7 +195,7 @@ CPU_LE(	rev64		v19.16b, v19.16b	)
+ 	add		v10.2d, v10.2d, v2.2d
+ 	add		v11.2d, v11.2d, v3.2d
+ 
+-	cond_yield	3f, x4
++	cond_yield	3f, x4, x5
+ 	/* handled all input blocks? */
+ 	cbnz		w2, 0b
+ 
+--- a/arch/arm64/include/asm/assembler.h
++++ b/arch/arm64/include/asm/assembler.h
+@@ -15,6 +15,7 @@
+ #include <asm-generic/export.h>
+ 
+ #include <asm/asm-offsets.h>
++#include <asm/alternative.h>
+ #include <asm/cpufeature.h>
+ #include <asm/cputype.h>
+ #include <asm/debug-monitors.h>
+@@ -754,19 +755,32 @@ USER(\label, ic	ivau, \tmp2)			// invali
+ 	.endm
+ 
+ 	/*
+-	 * Check whether preempt-disabled code should yield as soon as it
+-	 * is able. This is the case if re-enabling preemption a single
+-	 * time results in a preempt count of zero, and the TIF_NEED_RESCHED
+-	 * flag is set. (Note that the latter is stored negated in the
+-	 * top word of the thread_info::preempt_count field)
++	 * Check whether preempt/bh-disabled asm code should yield as soon as
++	 * it is able. This is the case if we are currently running in task
++	 * context, and either a softirq is pending, or the TIF_NEED_RESCHED
++	 * flag is set and re-enabling preemption a single time would result in
++	 * a preempt count of zero. (Note that the TIF_NEED_RESCHED flag is
++	 * stored negated in the top word of the thread_info::preempt_count
++	 * field)
+ 	 */
+-	.macro		cond_yield, lbl:req, tmp:req
+-#ifdef CONFIG_PREEMPTION
++	.macro		cond_yield, lbl:req, tmp:req, tmp2:req
+ 	get_current_task \tmp
+ 	ldr		\tmp, [\tmp, #TSK_TI_PREEMPT]
++	/*
++	 * If we are serving a softirq, there is no point in yielding: the
++	 * softirq will not be preempted no matter what we do, so we should
++	 * run to completion as quickly as we can.
++	 */
++	tbnz		\tmp, #SOFTIRQ_SHIFT, .Lnoyield_\@
++#ifdef CONFIG_PREEMPTION
+ 	sub		\tmp, \tmp, #PREEMPT_DISABLE_OFFSET
+ 	cbz		\tmp, \lbl
+ #endif
++	adr_l		\tmp, irq_stat + IRQ_CPUSTAT_SOFTIRQ_PENDING
++	this_cpu_offset	\tmp2
++	ldr		w\tmp, [\tmp, \tmp2]
++	cbnz		w\tmp, \lbl	// yield on pending softirq in task context
++.Lnoyield_\@:
+ 	.endm
+ 
+ /*
+--- a/arch/arm64/kernel/asm-offsets.c
++++ b/arch/arm64/kernel/asm-offsets.c
+@@ -93,6 +93,8 @@ int main(void)
+   DEFINE(DMA_FROM_DEVICE,	DMA_FROM_DEVICE);
+   BLANK();
+   DEFINE(PREEMPT_DISABLE_OFFSET, PREEMPT_DISABLE_OFFSET);
++  DEFINE(SOFTIRQ_SHIFT, SOFTIRQ_SHIFT);
++  DEFINE(IRQ_CPUSTAT_SOFTIRQ_PENDING, offsetof(irq_cpustat_t, __softirq_pending));
+   BLANK();
+   DEFINE(CPU_BOOT_STACK,	offsetof(struct secondary_data, stack));
+   DEFINE(CPU_BOOT_TASK,		offsetof(struct secondary_data, task));
+--- a/arch/arm64/kernel/fpsimd.c
++++ b/arch/arm64/kernel/fpsimd.c
+@@ -180,7 +180,7 @@ static void __get_cpu_fpsimd_context(voi
+  */
+ static void get_cpu_fpsimd_context(void)
+ {
+-	preempt_disable();
++	local_bh_disable();
+ 	__get_cpu_fpsimd_context();
+ }
+ 
+@@ -201,7 +201,7 @@ static void __put_cpu_fpsimd_context(voi
+ static void put_cpu_fpsimd_context(void)
+ {
+ 	__put_cpu_fpsimd_context();
+-	preempt_enable();
++	local_bh_enable();
+ }
+ 
+ static bool have_cpu_fpsimd_context(void)

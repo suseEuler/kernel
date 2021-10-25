@@ -1,0 +1,132 @@
+From 81aafb2b54b7b07c83188391fbcb8d93f99157df Mon Sep 17 00:00:00 2001
+From: Jean-Philippe Brucker <jean-philippe@linaro.org>
+Date: Sat, 29 May 2021 07:03:35 +0000
+Subject: [PATCH] DEBUG: iommu: Sanity-check of page requests
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 81aafb2b54b7b07c83188391fbcb8d93f99157df
+
+
+maillist inclusion
+category: feature
+bugzilla: 51855
+CVE: NA
+
+Reference: https://jpbrucker.net/git/linux/commit/?h=sva/2021-03-01&id=b81eda9426104cf59867c1ccf6b147fc0727e08b
+
+---------------------------------------------
+
+A bunch of sanity-checks. For development only, because it probably adds
+a large overhead to the fast path. The fault only comes from the IOMMU
+driver, which is obviously bug-free so this won't ever trigger.
+
+Signed-off-by: Jean-Philippe Brucker <jean-philippe@linaro.org>
+Signed-off-by: Lijun Fang <fanglijun3@huawei.com>
+Reviewed-by: Weilong Chen <chenweilong@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/iommu/iommu.c | 80 ++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 79 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/iommu/iommu.c b/drivers/iommu/iommu.c
+index ee885238a72e..86e3dbdfb7bd 100644
+--- a/drivers/iommu/iommu.c
++++ b/drivers/iommu/iommu.c
+@@ -1198,6 +1198,84 @@ int iommu_unregister_device_fault_handler(struct device *dev)
+ }
+ EXPORT_SYMBOL_GPL(iommu_unregister_device_fault_handler);
+ 
++/*
++ * A bunch of sanity-checks. For development only, because it probably adds a
++ * large overhead to the fast path. The fault only comes from the IOMMU driver,
++ * which is obviously bug-free.
++ */
++static bool iommu_fault_valid(struct iommu_fault *fault)
++{
++	u32 flags, perm;
++	size_t struct_end;
++
++	if (fault->padding)
++		return false;
++
++	switch (fault->type) {
++	case IOMMU_FAULT_PAGE_REQ:
++		struct_end = offsetofend(struct iommu_fault, prm.private_data);
++		flags = fault->prm.flags;
++		perm = fault->prm.perm;
++		if (flags & ~(IOMMU_FAULT_PAGE_REQUEST_PASID_VALID |
++			      IOMMU_FAULT_PAGE_REQUEST_LAST_PAGE |
++			      IOMMU_FAULT_PAGE_REQUEST_PRIV_DATA |
++			      IOMMU_FAULT_PAGE_RESPONSE_NEEDS_PASID))
++			return false;
++
++		if (!(flags & IOMMU_FAULT_PAGE_REQUEST_PASID_VALID) &&
++		    fault->prm.pasid)
++			return false;
++
++		if (!(flags & IOMMU_FAULT_PAGE_REQUEST_PRIV_DATA) &&
++		    (fault->prm.private_data[0] || fault->prm.private_data[1]))
++			return false;
++
++		if ((flags & IOMMU_FAULT_PAGE_RESPONSE_NEEDS_PASID) &&
++		    !(flags & IOMMU_FAULT_PAGE_REQUEST_PASID_VALID))
++			return false;
++		break;
++	case IOMMU_FAULT_DMA_UNRECOV:
++		struct_end = offsetofend(struct iommu_fault, event.fetch_addr);
++		flags = fault->event.flags;
++		perm = fault->event.perm;
++		if (flags & ~(IOMMU_FAULT_UNRECOV_PASID_VALID |
++					  IOMMU_FAULT_UNRECOV_ADDR_VALID |
++					  IOMMU_FAULT_UNRECOV_FETCH_ADDR_VALID))
++			return false;
++
++		if (!(flags & IOMMU_FAULT_UNRECOV_PASID_VALID) &&
++		    fault->event.pasid)
++			return false;
++
++		if (!(flags & IOMMU_FAULT_UNRECOV_FETCH_ADDR_VALID) &&
++		    fault->event.fetch_addr)
++			return false;
++
++		if (!(flags & IOMMU_FAULT_UNRECOV_FETCH_ADDR_VALID) &&
++		    fault->event.fetch_addr)
++			return false;
++
++		if (fault->event.reason > IOMMU_FAULT_REASON_OOR_ADDRESS)
++			return false;
++		break;
++	default:
++		return false;
++	}
++
++	if (perm & ~(IOMMU_FAULT_PERM_READ |
++		     IOMMU_FAULT_PERM_WRITE |
++		     IOMMU_FAULT_PERM_EXEC |
++		     IOMMU_FAULT_PERM_PRIV))
++		return false;
++
++	/* Check that bottom padding is zero */
++	if (!bitmap_empty((void *)fault + struct_end,
++			  8 * (sizeof(*fault) - struct_end)))
++		return false;
++
++	return true;
++}
++
+ /**
+  * iommu_report_device_fault() - Report fault event to device driver
+  * @dev: the device
+@@ -1218,7 +1296,7 @@ int iommu_report_device_fault(struct device *dev, struct iommu_fault_event *evt)
+ 	int ret = 0;
+ 	u64 exp;
+ 
+-	if (!param || !evt)
++	if (!param || !evt || WARN_ON_ONCE(!iommu_fault_valid(&evt->fault)))
+ 		return -EINVAL;
+ 
+ 	/* we only report device fault if there is a handler registered */
+-- 
+2.26.2
+

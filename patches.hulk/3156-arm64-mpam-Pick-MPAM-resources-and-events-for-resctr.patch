@@ -1,0 +1,482 @@
+From faf9a4c3d180c5a57596ed5f530fbc31c873d26b Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Fri, 26 Feb 2021 20:21:58 +0800
+Subject: [PATCH] arm64/mpam: Pick MPAM resources and events for resctrl_res
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: faf9a4c3d180c5a57596ed5f530fbc31c873d26b
+
+ exported
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+Pick available classes and exported as well-known caches and MBA():
+
+1) System with MPAM support may have a variety of control types at any
+   point of their system layout. We can only expose certain types of
+   control, and only if they exist at particular locations.
+
+   Start with the well-know caches. These have to be depth 2 or 3
+   and support MPAM's cache portion bitmap controls, with a number
+   of portions fewer that resctrl's limit.
+
+2) Picking which MPAM component we can expose via resctrl as MBA
+   (Memory Bandwidth Allocation) is tricky. The ABI is a percentage of
+   available bandwidth.
+
+   We can either do this with the memory bandwidth portion bitmaps, or
+   the memory bandwidth maximum control. If both are implemented we
+   prefer the bitmap.
+
+   We require and candidate for this resource type to support bandwidth
+   monitoring too.
+
+   For 'MBA's position in the toplogy, we want it to be at, or after,
+   the last level cache that is being exposed via resctrl. If there
+   are multiple candidates, we prefer the one closer to the outermost
+   exposed cache.
+
+Signed-off-by: James Morse <james.morse@arm.com>
+Link: http://www.linux-arm.org/git?p=linux-jm.git;a=patch;h=b6870246e25f8f6f9c7b275f0aaa50fc772094a6
+Link: http://www.linux-arm.org/git?p=linux-jm.git;a=patch;h=676d9aee8c2b27a17dd9cbebe5c9ecdd63c6281f
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/resctrl.h       |  19 +++
+ arch/arm64/kernel/mpam/Makefile        |   2 +-
+ arch/arm64/kernel/mpam/mpam_device.c   |  25 +++
+ arch/arm64/kernel/mpam/mpam_internal.h |  38 +++++
+ arch/arm64/kernel/mpam/mpam_mon.c      |   3 +-
+ arch/arm64/kernel/mpam/mpam_resctrl.c  |   2 +
+ arch/arm64/kernel/mpam/mpam_setup.c    | 223 +++++++++++++++++++++++++
+ include/linux/resctrlfs.h              |   2 +
+ 8 files changed, 312 insertions(+), 2 deletions(-)
+ create mode 100644 arch/arm64/kernel/mpam/mpam_setup.c
+
+diff --git a/arch/arm64/include/asm/resctrl.h b/arch/arm64/include/asm/resctrl.h
+index fb5fa6c13843..258baefc2360 100644
+--- a/arch/arm64/include/asm/resctrl.h
++++ b/arch/arm64/include/asm/resctrl.h
+@@ -8,6 +8,25 @@
+ #define resctrl_alloc_capable rdt_alloc_capable
+ #define resctrl_mon_capable rdt_mon_capable
+ 
++enum resctrl_resource_level {
++	RDT_RESOURCE_SMMU,
++	RDT_RESOURCE_L3,
++	RDT_RESOURCE_L2,
++	RDT_RESOURCE_MC,
++
++	/* Must be the last */
++	RDT_NUM_RESOURCES,
++};
++
++enum rdt_event_id {
++	QOS_L3_OCCUP_EVENT_ID           = 0x01,
++	QOS_L3_MBM_TOTAL_EVENT_ID       = 0x02,
++	QOS_L3_MBM_LOCAL_EVENT_ID       = 0x03,
++
++	/* Must be the last */
++	RESCTRL_NUM_EVENT_IDS,
++};
++
+ static inline int alloc_mon_id(void)
+ {
+ 
+diff --git a/arch/arm64/kernel/mpam/Makefile b/arch/arm64/kernel/mpam/Makefile
+index f69a7018d42b..23fe2d5095fb 100644
+--- a/arch/arm64/kernel/mpam/Makefile
++++ b/arch/arm64/kernel/mpam/Makefile
+@@ -1,3 +1,3 @@
+ # SPDX-License-Identifier: GPL-2.0
+ obj-$(CONFIG_MPAM)  += mpam_resctrl.o mpam_mon.o \
+-					mpam_ctrlmon.o mpam_device.o
++					mpam_ctrlmon.o mpam_device.o mpam_setup.o
+diff --git a/arch/arm64/kernel/mpam/mpam_device.c b/arch/arm64/kernel/mpam/mpam_device.c
+index 34a7234ab983..b6a00ee24ec3 100644
+--- a/arch/arm64/kernel/mpam/mpam_device.c
++++ b/arch/arm64/kernel/mpam/mpam_device.c
+@@ -33,6 +33,7 @@
+ #include <linux/cacheinfo.h>
+ #include <asm/mpam.h>
+ #include <asm/mpam_resource.h>
++#include <asm/mpam.h>
+ 
+ #include "mpam_device.h"
+ 
+@@ -71,6 +72,11 @@ static struct work_struct mpam_enable_work;
+ static int mpam_broken;
+ static struct work_struct mpam_failed_work;
+ 
++void mpam_class_list_lock_held(void)
++{
++	lockdep_assert_held(&mpam_devices_lock);
++}
++
+ static inline u32 mpam_read_reg(struct mpam_device *dev, u16 reg)
+ {
+ 	WARN_ON_ONCE(reg > SZ_MPAM_DEVICE);
+@@ -411,6 +417,25 @@ static void __init mpam_enable(struct work_struct *work)
+ 	if (err)
+ 		return;
+ 	mutex_unlock(&mpam_devices_lock);
++
++	/*
++	 * mpam_enable() runs in parallel with cpuhp callbacks bringing other
++	 * CPUs online, as we eagerly schedule the work. To give resctrl a
++	 * clean start, we make all cpus look offline, set resctrl_registered,
++	 * and then bring them back.
++	 */
++	mutex_lock(&mpam_cpuhp_lock);
++	if (!mpam_cpuhp_state) {
++		/* We raced with mpam_failed(). */
++		mutex_unlock(&mpam_cpuhp_lock);
++		return;
++	}
++	cpuhp_remove_state(mpam_cpuhp_state);
++	mutex_unlock(&mpam_cpuhp_lock);
++
++	mutex_lock(&mpam_devices_lock);
++	err = mpam_resctrl_setup();
++	mutex_unlock(&mpam_devices_lock);
+ }
+ 
+ static void mpam_failed(struct work_struct *work)
+diff --git a/arch/arm64/kernel/mpam/mpam_internal.h b/arch/arm64/kernel/mpam/mpam_internal.h
+index 53df10e84554..3115f934917d 100644
+--- a/arch/arm64/kernel/mpam/mpam_internal.h
++++ b/arch/arm64/kernel/mpam/mpam_internal.h
+@@ -2,8 +2,42 @@
+ #ifndef _ASM_ARM64_MPAM_INTERNAL_H
+ #define _ASM_ARM64_MPAM_INTERNAL_H
+ 
++#include <linux/resctrlfs.h>
++
+ typedef u32 mpam_features_t;
+ 
++struct mpam_component;
++struct rdt_domain;
++struct mpam_class;
++
++extern bool rdt_alloc_capable;
++extern bool rdt_mon_capable;
++
++extern struct list_head mpam_classes;
++
++struct mpam_resctrl_dom {
++	struct mpam_component   *comp;
++
++	struct rdt_domain   resctrl_dom;
++};
++
++struct mpam_resctrl_res {
++	struct mpam_class   *class;
++
++	bool resctrl_mba_uses_mbw_part;
++
++	struct resctrl_resource resctrl_res;
++};
++
++#define for_each_resctrl_exports(r) \
++		for (r = &mpam_resctrl_exports[0]; \
++			r < &mpam_resctrl_exports[0] + \
++			ARRAY_SIZE(mpam_resctrl_exports); r++)
++
++#define for_each_supported_resctrl_exports(r) \
++		for_each_resctrl_exports(r) \
++			if (r->class)
++
+ /*
+  * MPAM component config Structure
+  */
+@@ -82,4 +116,8 @@ static inline void mpam_clear_feature(enum mpam_device_features feat,
+ u16 mpam_sysprops_num_partid(void);
+ u16 mpam_sysprops_num_pmg(void);
+ 
++void mpam_class_list_lock_held(void);
++
++int mpam_resctrl_setup(void);
++
+ #endif
+diff --git a/arch/arm64/kernel/mpam/mpam_mon.c b/arch/arm64/kernel/mpam/mpam_mon.c
+index 18fa99df511f..cffafc8d7dde 100644
+--- a/arch/arm64/kernel/mpam/mpam_mon.c
++++ b/arch/arm64/kernel/mpam/mpam_mon.c
+@@ -26,9 +26,10 @@
+ #include <linux/module.h>
+ #include <linux/slab.h>
+ #include <linux/resctrlfs.h>
+-
+ #include <asm/resctrl.h>
+ 
++#include "mpam_internal.h"
++
+ /*
+  * Global boolean for rdt_monitor which is true if any
+  * resource monitoring is enabled.
+diff --git a/arch/arm64/kernel/mpam/mpam_resctrl.c b/arch/arm64/kernel/mpam/mpam_resctrl.c
+index bd39af1d4854..65b532dab004 100644
+--- a/arch/arm64/kernel/mpam/mpam_resctrl.c
++++ b/arch/arm64/kernel/mpam/mpam_resctrl.c
+@@ -39,6 +39,8 @@
+ #include <asm/resctrl.h>
+ #include <asm/io.h>
+ 
++#include "mpam_internal.h"
++
+ /* Mutex to protect rdtgroup access. */
+ DEFINE_MUTEX(resctrl_group_mutex);
+ 
+diff --git a/arch/arm64/kernel/mpam/mpam_setup.c b/arch/arm64/kernel/mpam/mpam_setup.c
+new file mode 100644
+index 000000000000..fd8c47570fa0
+--- /dev/null
++++ b/arch/arm64/kernel/mpam/mpam_setup.c
+@@ -0,0 +1,223 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Common code for ARM v8 MPAM
++ *
++ * Copyright (C) 2020-2021 Huawei Technologies Co., Ltd
++ *
++ * Author: Wang Shaobo <bobo.shaobowang@huawei.com>
++ *
++ * Code was partially borrowed from http://www.linux-arm.org/
++ * git?p=linux-jm.git;a=shortlog;h=refs/heads/mpam/snapshot/may.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * More information about MPAM be found in the Arm Architecture Reference
++ * Manual.
++ *
++ * https://static.docs.arm.com/ddi0598/a/DDI0598_MPAM_supp_armv8a.pdf
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/slab.h>
++#include <linux/err.h>
++#include <linux/resctrlfs.h>
++#include <asm/resctrl.h>
++
++#include "mpam_device.h"
++#include "mpam_internal.h"
++
++/*
++ * The classes we've picked to map to resctrl resources.
++ * Class pointer may be NULL.
++ */
++struct mpam_resctrl_res mpam_resctrl_exports[RDT_NUM_RESOURCES];
++struct mpam_resctrl_res mpam_resctrl_events[RESCTRL_NUM_EVENT_IDS];
++
++/* Test whether we can export MPAM_CLASS_CACHE:{2,3}? */
++static void mpam_resctrl_pick_caches(void)
++{
++	struct mpam_class *class;
++	struct mpam_resctrl_res *res;
++
++	mpam_class_list_lock_held();
++
++	list_for_each_entry(class, &mpam_classes, classes_list) {
++		if (class->type != MPAM_CLASS_CACHE)
++			continue;
++
++		if (class->level != 2 && class->level != 3)
++			continue;
++
++		if (!mpam_has_feature(mpam_feat_cpor_part, class->features) &&
++			!mpam_has_feature(mpam_feat_msmon_csu, class->features))
++			continue;
++
++		if (!mpam_has_feature(mpam_feat_msmon_csu, class->features) &&
++			mpam_sysprops_num_partid() <= 1)
++			continue;
++
++		if (class->cpbm_wd > RESCTRL_MAX_CBM)
++			continue;
++
++		if (class->level == 2) {
++			res = &mpam_resctrl_exports[RDT_RESOURCE_L2];
++			res->resctrl_res.name = "L2";
++		} else {
++			res = &mpam_resctrl_exports[RDT_RESOURCE_L3];
++			res->resctrl_res.name = "L3";
++		}
++		res->class = class;
++	}
++}
++
++/* Find what we can export as MBA */
++static void mpam_resctrl_pick_mba(void)
++{
++	u8 resctrl_llc;
++	struct mpam_class *class;
++	struct mpam_class *candidate = NULL;
++
++	mpam_class_list_lock_held();
++
++    /* At least two partitions ... */
++	if (mpam_sysprops_num_partid() <= 1)
++		return;
++
++	if (mpam_resctrl_exports[RDT_RESOURCE_L3].class)
++		resctrl_llc = 3;
++	else if (mpam_resctrl_exports[RDT_RESOURCE_L2].class)
++		resctrl_llc = 2;
++	else
++		resctrl_llc = 0;
++
++	list_for_each_entry(class, &mpam_classes, classes_list) {
++		if (class->type == MPAM_CLASS_UNKNOWN)
++			continue;
++
++		if (class->level < resctrl_llc)
++			continue;
++
++		/*
++		 * Once we support MBM counters, we should require the MBA
++		 * class to be at the same point in the hierarchy. Practically,
++		 * this means the MBA class must support MBWU. Until then
++		 * having something is better than nothing, but this may cause
++		 * the MBA resource to disappear over a kernel update on a
++		 * system that could support both, but not at the same time.
++		 */
++
++		/*
++		 * There are two ways we can generate delays for MBA, either
++		 * with the mbw portion bitmap, or the mbw max control.
++		 */
++		if (!mpam_has_feature(mpam_feat_mbw_part, class->features) &&
++			!mpam_has_feature(mpam_feat_mbw_max, class->features)) {
++			continue;
++		}
++
++		/* pick the class 'closest' to resctrl_llc */
++		if (!candidate || (class->level < candidate->level))
++			candidate = class;
++	}
++
++	if (candidate)
++		mpam_resctrl_exports[RDT_RESOURCE_MC].class = candidate;
++}
++
++static void mpam_resctrl_pick_event_l3_occup(void)
++{
++	/*
++	 * as the name suggests, resctrl can only use this if your cache is
++	 * called 'l3'.
++	 */
++	struct mpam_resctrl_res *res = &mpam_resctrl_exports[RDT_RESOURCE_L3];
++
++	if (!res->class)
++		return;
++
++	if (!mpam_has_feature(mpam_feat_msmon_csu, res->class->features))
++		return;
++
++	mpam_resctrl_events[QOS_L3_OCCUP_EVENT_ID] = *res;
++
++	rdt_mon_capable = true;
++	res->resctrl_res.mon_capable = true;
++	res->resctrl_res.mon_capable = true;
++}
++
++static void mpam_resctrl_pick_event_mbm_total(void)
++{
++	u64 num_counters;
++	struct mpam_resctrl_res *res;
++
++    /* We prefer to measure mbm_total on whatever we used as MBA... */
++	res = &mpam_resctrl_exports[RDT_RESOURCE_MC];
++	if (!res->class) {
++		/* ... but if there isn't one, the L3 cache works */
++		res = &mpam_resctrl_exports[RDT_RESOURCE_L3];
++		if (!res->class)
++			return;
++	}
++
++	/*
++	 * to measure bandwidth in a resctrl like way, we need to leave a
++	 * counter running all the time. As these are PMU-like, it is really
++	 * unlikely we have enough... To be useful, we'd need at least one per
++	 * closid.
++	 */
++	num_counters = mpam_sysprops_num_partid();
++
++	if (mpam_has_feature(mpam_feat_msmon_mbwu, res->class->features)) {
++		if (res->class->num_mbwu_mon >= num_counters) {
++			/*
++			 * We don't support this use of monitors, let the
++			 * world know this platform could make use of them
++			 * if we did!
++			 */
++		}
++	}
++}
++
++static void mpam_resctrl_pick_event_mbm_local(void)
++{
++	struct mpam_resctrl_res *res;
++
++	res = &mpam_resctrl_exports[RDT_RESOURCE_MC];
++	if (!res->class)
++		return;
++
++	if (mpam_has_feature(mpam_feat_msmon_mbwu, res->class->features)) {
++		res->resctrl_res.mon_capable = true;
++		mpam_resctrl_events[QOS_L3_MBM_LOCAL_EVENT_ID] = *res;
++	}
++}
++
++/* Called with the mpam classes lock held */
++int mpam_resctrl_setup(void)
++{
++	struct mpam_resctrl_res *res;
++	enum resctrl_resource_level level = 0;
++
++	for_each_resctrl_exports(res) {
++		INIT_LIST_HEAD(&res->resctrl_res.domains);
++		res->resctrl_res.rid = level;
++		level++;
++	}
++
++	mpam_resctrl_pick_caches();
++	mpam_resctrl_pick_mba();
++
++	mpam_resctrl_pick_event_l3_occup();
++	mpam_resctrl_pick_event_mbm_total();
++	mpam_resctrl_pick_event_mbm_local();
++
++	return 0;
++}
+diff --git a/include/linux/resctrlfs.h b/include/linux/resctrlfs.h
+index 38950927a6c3..b7a2ff9a7832 100644
+--- a/include/linux/resctrlfs.h
++++ b/include/linux/resctrlfs.h
+@@ -106,4 +106,6 @@ static inline struct resctrl_fs_context *resctrl_fc2context(struct fs_context *f
+ 
+ void post_resctrl_mount(void);
+ 
++#define RESCTRL_MAX_CBM 32
++
+ #endif /* _RESCTRLFS_H */
+-- 
+2.26.2
+

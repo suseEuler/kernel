@@ -1,0 +1,176 @@
+From a07fcc1fc081da9990da18818bafa276ddc227c0 Mon Sep 17 00:00:00 2001
+From: Eric Auger <eric.auger@redhat.com>
+Date: Mon, 19 Jul 2021 11:20:33 +0800
+Subject: [PATCH] iommu/smmuv3: Allow s1 and s2 configs to coexist
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: a07fcc1fc081da9990da18818bafa276ddc227c0
+
+
+virt inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I401IF
+CVE: NA
+
+------------------------------
+
+In true nested mode, both s1_cfg and s2_cfg will coexist.
+Let's remove the union and add a "set" field in each
+config structure telling whether the config is set and needs
+to be applied when writing the STE. In legacy nested mode,
+only the second stage is used. In true nested mode, both stages
+are used and the S1 config is "set" when the guest passes
+its pasid table.
+
+No functional change intended.
+
+Signed-off-by: Eric Auger <eric.auger@redhat.com>
+Signed-off-by: Kunkun Jiang<jiangkunkun@huawei.com>
+Reviewed-by: Keqian Zhu <zhukeqian1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c | 43 +++++++++++++--------
+ drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h |  8 ++--
+ 2 files changed, 31 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+index 979960cd46e8..ace49d5fe9a6 100644
+--- a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
++++ b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+@@ -1267,8 +1267,8 @@ static void arm_smmu_write_strtab_ent(struct arm_smmu_master *master, u32 sid,
+ 	u64 val = le64_to_cpu(dst[0]);
+ 	bool ste_live = false;
+ 	struct arm_smmu_device *smmu = NULL;
+-	struct arm_smmu_s1_cfg *s1_cfg = NULL;
+-	struct arm_smmu_s2_cfg *s2_cfg = NULL;
++	struct arm_smmu_s1_cfg *s1_cfg;
++	struct arm_smmu_s2_cfg *s2_cfg;
+ 	struct arm_smmu_domain *smmu_domain = NULL;
+ 	struct arm_smmu_cmdq_ent prefetch_cmd = {
+ 		.opcode		= CMDQ_OP_PREFETCH_CFG,
+@@ -1283,13 +1283,24 @@ static void arm_smmu_write_strtab_ent(struct arm_smmu_master *master, u32 sid,
+ 	}
+ 
+ 	if (smmu_domain) {
++		s1_cfg = &smmu_domain->s1_cfg;
++		s2_cfg = &smmu_domain->s2_cfg;
++
+ 		switch (smmu_domain->stage) {
+ 		case ARM_SMMU_DOMAIN_S1:
+-			s1_cfg = &smmu_domain->s1_cfg;
++			s1_cfg->set = true;
++			s2_cfg->set = false;
+ 			break;
+ 		case ARM_SMMU_DOMAIN_S2:
++			s1_cfg->set = false;
++			s2_cfg->set = true;
++			break;
+ 		case ARM_SMMU_DOMAIN_NESTED:
+-			s2_cfg = &smmu_domain->s2_cfg;
++			/*
++			 * Actual usage of stage 1 depends on nested mode:
++			 * legacy (2d stage only) or true nested mode
++			 */
++			s2_cfg->set = true;
+ 			break;
+ 		default:
+ 			break;
+@@ -1316,7 +1327,7 @@ static void arm_smmu_write_strtab_ent(struct arm_smmu_master *master, u32 sid,
+ 	val = STRTAB_STE_0_V;
+ 
+ 	/* Bypass/fault */
+-	if (!smmu_domain || !(s1_cfg || s2_cfg)) {
++	if (!smmu_domain || !(s1_cfg->set || s2_cfg->set)) {
+ 		if (!smmu_domain && disable_bypass)
+ 			val |= FIELD_PREP(STRTAB_STE_0_CFG, STRTAB_STE_0_CFG_ABORT);
+ 		else
+@@ -1335,7 +1346,7 @@ static void arm_smmu_write_strtab_ent(struct arm_smmu_master *master, u32 sid,
+ 		return;
+ 	}
+ 
+-	if (s1_cfg) {
++	if (s1_cfg->set) {
+ 		u64 strw = smmu->features & ARM_SMMU_FEAT_E2H ?
+ 			STRTAB_STE_1_STRW_EL2 : STRTAB_STE_1_STRW_NSEL1;
+ 
+@@ -1360,7 +1371,7 @@ static void arm_smmu_write_strtab_ent(struct arm_smmu_master *master, u32 sid,
+ 			FIELD_PREP(STRTAB_STE_0_S1FMT, s1_cfg->s1fmt);
+ 	}
+ 
+-	if (s2_cfg) {
++	if (s2_cfg->set) {
+ 		BUG_ON(ste_live);
+ 		dst[2] = cpu_to_le64(
+ 			 FIELD_PREP(STRTAB_STE_2_S2VMID, s2_cfg->vmid) |
+@@ -2158,26 +2169,26 @@ static void arm_smmu_domain_free(struct iommu_domain *domain)
+ {
+ 	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
+ 	struct arm_smmu_device *smmu = smmu_domain->smmu;
++	struct arm_smmu_s1_cfg *s1_cfg = &smmu_domain->s1_cfg;
++	struct arm_smmu_s2_cfg *s2_cfg = &smmu_domain->s2_cfg;
+ 
+ 	iommu_put_dma_cookie(domain);
+ 	free_io_pgtable_ops(smmu_domain->pgtbl_ops);
+ 
+ 	/* Free the CD and ASID, if we allocated them */
+-	if (smmu_domain->stage == ARM_SMMU_DOMAIN_S1) {
+-		struct arm_smmu_s1_cfg *cfg = &smmu_domain->s1_cfg;
+-
++	if (s1_cfg->set) {
+ 		/* Prevent SVA from touching the CD while we're freeing it */
+ 		mutex_lock(&arm_smmu_asid_lock);
+-		if (cfg->cdcfg.cdtab)
++		if (s1_cfg->cdcfg.cdtab)
+ 			arm_smmu_free_cd_tables(smmu_domain);
+-		arm_smmu_free_asid(&cfg->cd);
++		arm_smmu_free_asid(&s1_cfg->cd);
+ 		mutex_unlock(&arm_smmu_asid_lock);
+ 		if (smmu_domain->ssid)
+ 			ioasid_put(smmu_domain->ssid);
+-	} else {
+-		struct arm_smmu_s2_cfg *cfg = &smmu_domain->s2_cfg;
+-		if (cfg->vmid)
+-			arm_smmu_bitmap_free(smmu->vmid_map, cfg->vmid);
++	}
++	if (s2_cfg->set) {
++		if (s2_cfg->vmid)
++			arm_smmu_bitmap_free(smmu->vmid_map, s2_cfg->vmid);
+ 	}
+ 
+ 	kfree(smmu_domain);
+diff --git a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h
+index 8409499196d0..e4917dbfbefe 100644
+--- a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h
++++ b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h
+@@ -610,12 +610,14 @@ struct arm_smmu_s1_cfg {
+ 	struct arm_smmu_ctx_desc	cd;
+ 	u8				s1fmt;
+ 	u8				s1cdmax;
++	bool				set;
+ };
+ 
+ struct arm_smmu_s2_cfg {
+ 	u16				vmid;
+ 	u64				vttbr;
+ 	u64				vtcr;
++	bool				set;
+ };
+ 
+ struct arm_smmu_strtab_cfg {
+@@ -737,10 +739,8 @@ struct arm_smmu_domain {
+ 	atomic_t			nr_ats_masters;
+ 
+ 	enum arm_smmu_domain_stage	stage;
+-	union {
+-		struct arm_smmu_s1_cfg	s1_cfg;
+-		struct arm_smmu_s2_cfg	s2_cfg;
+-	};
++	struct arm_smmu_s1_cfg	s1_cfg;
++	struct arm_smmu_s2_cfg	s2_cfg;
+ 
+ 	struct iommu_domain		domain;
+ 
+-- 
+2.26.2
+

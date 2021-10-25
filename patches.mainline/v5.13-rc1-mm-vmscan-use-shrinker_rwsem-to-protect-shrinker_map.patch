@@ -1,0 +1,118 @@
+From d27cf2aa0d26a221982d04757cc32db97833ec29 Mon Sep 17 00:00:00 2001
+From: Yang Shi <shy828301@gmail.com>
+Date: Tue, 4 May 2021 18:36:14 -0700
+Subject: [PATCH] mm: vmscan: use shrinker_rwsem to protect shrinker_maps
+Git-commit: d27cf2aa0d26a221982d04757cc32db97833ec29
+Patch-mainline: v5.13-rc1
+References: bsn#12
+
+ allocation
+
+Since memcg_shrinker_map_size just can be changed under holding
+shrinker_rwsem exclusively, the read side can be protected by holding read
+lock, so it sounds superfluous to have a dedicated mutex.
+
+Kirill Tkhai suggested use write lock since:
+
+  * We want the assignment to shrinker_maps is visible for shrink_slab_memcg().
+  * The rcu_dereference_protected() dereferrencing in shrink_slab_memcg(), but
+    in case of we use READ lock in alloc_shrinker_maps(), the dereferrencing
+    is not actually protected.
+  * READ lock makes alloc_shrinker_info() racy against memory allocation fail.
+    alloc_shrinker_info()->free_shrinker_info() may free memory right after
+    shrink_slab_memcg() dereferenced it. You may say
+    shrink_slab_memcg()->mem_cgroup_online() protects us from it? Yes, sure,
+    but this is not the thing we want to remember in the future, since this
+    spreads modularity.
+
+And a test with heavy paging workload didn't show write lock makes things worse.
+
+Link: https://lkml.kernel.org/r/20210311190845.9708-4-shy828301@gmail.com
+Signed-off-by: Yang Shi <shy828301@gmail.com>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Acked-by: Kirill Tkhai <ktkhai@virtuozzo.com>
+Acked-by: Roman Gushchin <guro@fb.com>
+Reviewed-by: Shakeel Butt <shakeelb@google.com>
+Cc: Dave Chinner <david@fromorbit.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ mm/vmscan.c | 18 ++++++++----------
+ 1 file changed, 8 insertions(+), 10 deletions(-)
+
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index bead5ae1e7e2..d3fba55a0028 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -187,7 +187,6 @@ static DECLARE_RWSEM(shrinker_rwsem);
+ #ifdef CONFIG_MEMCG
+ 
+ static int memcg_shrinker_map_size;
+-static DEFINE_MUTEX(memcg_shrinker_map_mutex);
+ 
+ static void free_shrinker_map_rcu(struct rcu_head *head)
+ {
+@@ -201,8 +200,6 @@ static int expand_one_shrinker_map(struct mem_cgroup *memcg,
+ 	struct mem_cgroup_per_node *pn;
+ 	int nid;
+ 
+-	lockdep_assert_held(&memcg_shrinker_map_mutex);
+-
+ 	for_each_node(nid) {
+ 		pn = memcg->nodeinfo[nid];
+ 		old = rcu_dereference_protected(pn->shrinker_map, true);
+@@ -250,7 +247,7 @@ int alloc_shrinker_maps(struct mem_cgroup *memcg)
+ 	if (mem_cgroup_is_root(memcg))
+ 		return 0;
+ 
+-	mutex_lock(&memcg_shrinker_map_mutex);
++	down_write(&shrinker_rwsem);
+ 	size = memcg_shrinker_map_size;
+ 	for_each_node(nid) {
+ 		map = kvzalloc_node(sizeof(*map) + size, GFP_KERNEL, nid);
+@@ -261,7 +258,7 @@ int alloc_shrinker_maps(struct mem_cgroup *memcg)
+ 		}
+ 		rcu_assign_pointer(memcg->nodeinfo[nid]->shrinker_map, map);
+ 	}
+-	mutex_unlock(&memcg_shrinker_map_mutex);
++	up_write(&shrinker_rwsem);
+ 
+ 	return ret;
+ }
+@@ -276,9 +273,10 @@ static int expand_shrinker_maps(int new_id)
+ 	if (size <= old_size)
+ 		return 0;
+ 
+-	mutex_lock(&memcg_shrinker_map_mutex);
+ 	if (!root_mem_cgroup)
+-		goto unlock;
++		goto out;
++
++	lockdep_assert_held(&shrinker_rwsem);
+ 
+ 	memcg = mem_cgroup_iter(NULL, NULL, NULL);
+ 	do {
+@@ -287,13 +285,13 @@ static int expand_shrinker_maps(int new_id)
+ 		ret = expand_one_shrinker_map(memcg, size, old_size);
+ 		if (ret) {
+ 			mem_cgroup_iter_break(NULL, memcg);
+-			goto unlock;
++			goto out;
+ 		}
+ 	} while ((memcg = mem_cgroup_iter(NULL, memcg, NULL)) != NULL);
+-unlock:
++out:
+ 	if (!ret)
+ 		memcg_shrinker_map_size = size;
+-	mutex_unlock(&memcg_shrinker_map_mutex);
++
+ 	return ret;
+ }
+ 
+-- 
+2.31.1
+

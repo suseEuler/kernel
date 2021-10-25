@@ -1,0 +1,99 @@
+From cae569b387ff8d7928982dfaa9241ab6027a8264 Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Fri, 26 Feb 2021 20:22:44 +0800
+Subject: [PATCH] arm64/mpam: Set per-cpu's closid to none zero for cdp
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: cae569b387ff8d7928982dfaa9241ab6027a8264
+
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+Sometimes monitoring will have such anomalies:
+
+e.g.
+    > cd /sys/fs/resctrl/ && grep . mon_data/*
+      mon_data/mon_L3CODE_00:14336
+      mon_data/mon_L3CODE_01:344064
+      mon_data/mon_L3CODE_02:2048
+      mon_data/mon_L3CODE_03:27648
+      mon_data/mon_L3DATA_00:0  #L3DATA's monitoring data always be 0
+      mon_data/mon_L3DATA_01:0
+      mon_data/mon_L3DATA_02:0
+      mon_data/mon_L3DATA_03:0
+      mon_data/mon_MB_00:392
+      mon_data/mon_MB_01:552
+      mon_data/mon_MB_02:160
+      mon_data/mon_MB_03:0
+
+If cdp on, tasks in resctrl default group with closid=0 and rmid=0 don't
+know how to fill proper partid_i/pmg_i and partid_d/pmg_d into MPAMx_ELx
+sysregs by mpam_sched_in() called by __switch_to(), it's because current
+cpu's default closid and rmid are also equal to 0 and to make the operation
+modifying configuration passed.
+
+Update per cpu default closid of none-zero value, call update_closid_rmid()
+to update each cpu's mpam proper MPAMx_ELx sysregs for setting partid and
+pmg when mounting resctrl sysfs, it looks like a practical method.
+
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/resctrlfs.c | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/fs/resctrlfs.c b/fs/resctrlfs.c
+index 5f6aecf2db8c..0476c5a7cb16 100644
+--- a/fs/resctrlfs.c
++++ b/fs/resctrlfs.c
+@@ -324,6 +324,28 @@ static int mkdir_mondata_all(struct kernfs_node *parent_kn,
+ 	return ret;
+ }
+ 
++static void resctrl_cdp_update_cpus_state(struct resctrl_group *r)
++{
++	int cpu;
++
++	/*
++     * If cdp on, tasks in resctrl default group with closid=0
++	 * and rmid=0 don't know how to fill proper partid_i/pmg_i
++	 * and partid_d/pmg_d into MPAMx_ELx sysregs by mpam_sched_in()
++	 * called by __switch_to(), it's because current cpu's default
++	 * closid and rmid are also equal to 0 and to make the operation
++	 * modifying configuration passed. Update per cpu default closid
++	 * of none-zero value, call update_closid_rmid() to update each
++	 * cpu's mpam proper MPAMx_ELx sysregs for setting partid and
++	 * pmg when mounting resctrl sysfs, it looks like a practical
++	 * method.
++	 */
++	for_each_cpu(cpu, &r->cpu_mask)
++		per_cpu(pqr_state.default_closid, cpu) = ~0;
++
++	update_closid_rmid(&r->cpu_mask, NULL);
++}
++
+ static int resctrl_get_tree(struct fs_context *fc)
+ {
+ 	int ret;
+@@ -381,6 +403,8 @@ static int resctrl_get_tree(struct fs_context *fc)
+ 	if (ret < 0)
+ 		goto out_mondata;
+ 
++	resctrl_cdp_update_cpus_state(&resctrl_group_default);
++
+ 	post_resctrl_mount();
+ 
+ 	goto out;
+-- 
+2.26.2
+

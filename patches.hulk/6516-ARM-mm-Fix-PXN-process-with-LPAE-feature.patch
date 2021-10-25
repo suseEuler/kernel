@@ -1,0 +1,109 @@
+From 5ee71dc0f7603342f58ee68dd0f5bf0139fc0360 Mon Sep 17 00:00:00 2001
+From: Kefeng Wang <wangkefeng.wang@huawei.com>
+Date: Wed, 23 Jun 2021 15:41:09 +0800
+Subject: [PATCH] ARM: mm: Fix PXN process with LPAE feature
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 5ee71dc0f7603342f58ee68dd0f5bf0139fc0360
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 167379
+CVE: NA
+
+Reference: https://lore.kernel.org/linux-arm-kernel/20210610123556.171328-1-wangkefeng.wang@huawei.com/
+
+-------------------------------------------------
+
+When user code execution with privilege mode, it will lead to
+infinite loop in the page fault handler if ARM_LPAE enabled,
+
+The issue could be reproduced with
+  "echo EXEC_USERSPACE > /sys/kernel/debug/provoke-crash/DIRECT"
+
+As Permission fault shows in ARM spec,
+  IFSR format when using the Short-descriptor translation table format
+    Permission fault:       01101 First level      01111 Second level
+  IFSR format when using the Long-descriptor translation table format
+    Permission fault:       0011LL LL bits indicate levelb.
+
+Add is_permission_fault() function to check permission fault and die
+if permission fault occurred under instruction fault in do_page_fault().
+
+Fixes: 1d4d37159d01 ("ARM: 8235/1: Support for the PXN CPU feature on ARMv7")
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Chen Jun <chenjun102@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm/mm/fault.c | 20 +++++++++++++++++++-
+ arch/arm/mm/fault.h |  4 ++++
+ 2 files changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm/mm/fault.c b/arch/arm/mm/fault.c
+index 855db851ddfe..64df4c6cfb8d 100644
+--- a/arch/arm/mm/fault.c
++++ b/arch/arm/mm/fault.c
+@@ -207,6 +207,19 @@ void do_bad_area(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+ #define VM_FAULT_BADMAP		0x010000
+ #define VM_FAULT_BADACCESS	0x020000
+ 
++static inline bool is_permission_fault(unsigned int fsr)
++{
++	int fs = fsr_fs(fsr);
++#ifdef CONFIG_ARM_LPAE
++	if ((fs & FS_PERM_NOLL_MASK) == FS_PERM_NOLL)
++		return true;
++#else
++	if (fs == FS_L1_PERM || fs == FS_L2_PERM)
++		return true;
++#endif
++	return false;
++}
++
+ static vm_fault_t __kprobes
+ __do_page_fault(struct mm_struct *mm, unsigned long addr, unsigned int flags,
+ 		unsigned long vma_flags, struct pt_regs *regs)
+@@ -266,9 +279,14 @@ do_page_fault(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+ 		vm_flags = VM_WRITE;
+ 	}
+ 
+-	if (fsr & FSR_LNX_PF)
++	if (fsr & FSR_LNX_PF) {
+ 		vm_flags = VM_EXEC;
+ 
++		if (is_permission_fault(fsr) && !user_mode(regs))
++			die_kernel_fault("execution of memory",
++					 mm, addr, fsr, regs);
++	}
++
+ 	perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS, 1, regs, addr);
+ 
+ 	/*
+diff --git a/arch/arm/mm/fault.h b/arch/arm/mm/fault.h
+index 9ecc2097a87a..83b5ab32d7a4 100644
+--- a/arch/arm/mm/fault.h
++++ b/arch/arm/mm/fault.h
+@@ -14,6 +14,8 @@
+ 
+ #ifdef CONFIG_ARM_LPAE
+ #define FSR_FS_AEA		17
++#define FS_PERM_NOLL		0xC
++#define FS_PERM_NOLL_MASK	0x3C
+ 
+ static inline int fsr_fs(unsigned int fsr)
+ {
+@@ -21,6 +23,8 @@ static inline int fsr_fs(unsigned int fsr)
+ }
+ #else
+ #define FSR_FS_AEA		22
++#define FS_L1_PERM             0xD
++#define FS_L2_PERM             0xF
+ 
+ static inline int fsr_fs(unsigned int fsr)
+ {
+-- 
+2.26.2
+

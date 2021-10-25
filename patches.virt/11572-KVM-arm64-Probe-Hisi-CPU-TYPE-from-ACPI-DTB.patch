@@ -1,0 +1,198 @@
+From bb6ee10a6b4baedf554b4aad734352f4e6a7bd50 Mon Sep 17 00:00:00 2001
+From: Zenghui Yu <yuzenghui@huawei.com>
+Date: Fri, 26 Nov 2021 16:27:03 +0800
+Subject: [PATCH] KVM: arm64: Probe Hisi CPU TYPE from ACPI/DTB
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: bb6ee10a6b4baedf554b4aad734352f4e6a7bd50
+
+
+virt inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4IZOS
+CVE: NA
+
+----------------------------------------------------
+
+Parse ACPI/DTB to get where the hypervisor is running.
+
+Signed-off-by: Zenghui Yu <yuzenghui@huawei.com>
+Signed-off-by: Yanan Wang <wangyanan55@huawei.com>
+Reviewed-by: Zenghui Yu <yuzenghui@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/hisi_cpu_model.h | 19 ++++++
+ arch/arm64/include/asm/kvm_host.h       |  1 +
+ arch/arm64/kvm/Makefile                 |  1 +
+ arch/arm64/kvm/arm.c                    |  6 ++
+ arch/arm64/kvm/hisi_cpu_model.c         | 83 +++++++++++++++++++++++++
+ 5 files changed, 110 insertions(+)
+ create mode 100644 arch/arm64/include/asm/hisi_cpu_model.h
+ create mode 100644 arch/arm64/kvm/hisi_cpu_model.c
+
+diff --git a/arch/arm64/include/asm/hisi_cpu_model.h b/arch/arm64/include/asm/hisi_cpu_model.h
+new file mode 100644
+index 000000000000..f686a7591e8f
+--- /dev/null
++++ b/arch/arm64/include/asm/hisi_cpu_model.h
+@@ -0,0 +1,19 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Copyright(c) 2019 Huawei Technologies Co., Ltd
++ */
++
++#ifndef __HISI_CPU_MODEL_H__
++#define __HISI_CPU_MODEL_H__
++
++enum hisi_cpu_type {
++	HI_1612,
++	HI_1616,
++	HI_1620,
++	UNKNOWN_HI_TYPE
++};
++
++extern enum hisi_cpu_type hi_cpu_type;
++
++void probe_hisi_cpu_type(void);
++#endif /* __HISI_CPU_MODEL_H__ */
+diff --git a/arch/arm64/include/asm/kvm_host.h b/arch/arm64/include/asm/kvm_host.h
+index a2a61bb37b22..37aba086c179 100644
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@ -26,6 +26,7 @@
+ #include <asm/kvm.h>
+ #include <asm/kvm_asm.h>
+ #include <asm/thread_info.h>
++#include <asm/hisi_cpu_model.h>
+ 
+ #define __KVM_HAVE_ARCH_INTC_INITIALIZED
+ 
+diff --git a/arch/arm64/kvm/Makefile b/arch/arm64/kvm/Makefile
+index 02f25d63a6f9..928065a7bae9 100644
+--- a/arch/arm64/kvm/Makefile
++++ b/arch/arm64/kvm/Makefile
+@@ -17,6 +17,7 @@ kvm-y := $(KVM)/kvm_main.o $(KVM)/coalesced_mmio.o $(KVM)/eventfd.o \
+ 	 guest.o debug.o reset.o sys_regs.o \
+ 	 vgic-sys-reg-v3.o fpsimd.o pmu.o \
+ 	 aarch32.o arch_timer.o \
++	 hisi_cpu_model.o \
+ 	 vgic/vgic.o vgic/vgic-init.o \
+ 	 vgic/vgic-irqfd.o vgic/vgic-v2.o \
+ 	 vgic/vgic-v3.o vgic/vgic-v4.o \
+diff --git a/arch/arm64/kvm/arm.c b/arch/arm64/kvm/arm.c
+index d27aa51a163b..901691d5d24d 100644
+--- a/arch/arm64/kvm/arm.c
++++ b/arch/arm64/kvm/arm.c
+@@ -58,6 +58,9 @@ static DEFINE_SPINLOCK(kvm_vmid_lock);
+ 
+ static bool vgic_present;
+ 
++/* Hisi cpu type enum */
++enum hisi_cpu_type hi_cpu_type = UNKNOWN_HI_TYPE;
++
+ static DEFINE_PER_CPU(unsigned char, kvm_arm_hardware_enabled);
+ DEFINE_STATIC_KEY_FALSE(userspace_irqchip_in_use);
+ 
+@@ -1833,6 +1836,9 @@ int kvm_arch_init(void *opaque)
+ 		return -ENODEV;
+ 	}
+ 
++	/* Probe the Hisi CPU type */
++	probe_hisi_cpu_type();
++
+ 	in_hyp_mode = is_kernel_in_hyp_mode();
+ 
+ 	if (!in_hyp_mode && kvm_arch_requires_vhe()) {
+diff --git a/arch/arm64/kvm/hisi_cpu_model.c b/arch/arm64/kvm/hisi_cpu_model.c
+new file mode 100644
+index 000000000000..4d5a099bc27a
+--- /dev/null
++++ b/arch/arm64/kvm/hisi_cpu_model.c
+@@ -0,0 +1,83 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Copyright(c) 2019 Huawei Technologies Co., Ltd
++ */
++
++#include <linux/acpi.h>
++#include <linux/of.h>
++#include <linux/init.h>
++#include <linux/kvm_host.h>
++
++#ifdef CONFIG_ACPI
++
++/* ACPI Hisi oem table id str */
++const char *oem_str[] = {
++	"HIP06",	/* Hisi 1612 */
++	"HIP07",	/* Hisi 1616 */
++	"HIP08"		/* Hisi 1620 */
++};
++
++/*
++ * Get Hisi oem table id.
++ */
++static void acpi_get_hw_cpu_type(void)
++{
++	struct acpi_table_header *table;
++	acpi_status status;
++	int i, str_size = ARRAY_SIZE(oem_str);
++
++	/* Get oem table id from ACPI table header */
++	status = acpi_get_table(ACPI_SIG_DSDT, 0, &table);
++	if (ACPI_FAILURE(status)) {
++		pr_err("Failed to get ACPI table: %s\n",
++		       acpi_format_exception(status));
++		return;
++	}
++
++	for (i = 0; i < str_size; ++i) {
++		if (!strncmp(oem_str[i], table->oem_table_id, 5)) {
++			hi_cpu_type = i;
++			return;
++		}
++	}
++}
++
++#else
++static void acpi_get_hw_cpu_type(void) {}
++#endif
++
++/* of Hisi cpu model str */
++const char *of_model_str[] = {
++	"Hi1612",
++	"Hi1616"
++};
++
++static void of_get_hw_cpu_type(void)
++{
++	const char *cpu_type;
++	int ret, i, str_size = ARRAY_SIZE(of_model_str);
++
++	ret = of_property_read_string(of_root, "model", &cpu_type);
++	if (ret < 0) {
++		pr_err("Failed to get Hisi cpu model by OF.\n");
++		return;
++	}
++
++	for (i = 0; i < str_size; ++i) {
++		if (strstr(cpu_type, of_model_str[i])) {
++			hi_cpu_type = i;
++			return;
++		}
++	}
++}
++
++void probe_hisi_cpu_type(void)
++{
++	if (!acpi_disabled)
++		acpi_get_hw_cpu_type();
++	else
++		of_get_hw_cpu_type();
++
++	if (hi_cpu_type == UNKNOWN_HI_TYPE)
++		pr_warn("UNKNOWN Hisi cpu type.\n");
++}
+-- 
+2.26.2
+

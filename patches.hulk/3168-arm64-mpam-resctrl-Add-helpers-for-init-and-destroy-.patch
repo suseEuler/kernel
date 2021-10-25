@@ -1,0 +1,184 @@
+From 7f72b99b4241c7d04ea793a2699066fcf89d7556 Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Fri, 26 Feb 2021 20:22:10 +0800
+Subject: [PATCH] arm64/mpam: resctrl: Add helpers for init and destroy
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 7f72b99b4241c7d04ea793a2699066fcf89d7556
+
+ schemata list
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+Initialize schemata list when mount resctrl sysfs and destroy it when
+umount, each list node contains the value updated by schemata (in resctrl
+sysfs) row.
+
+Partial code is borrowed from 250656171d95 ("x86/resctrl: Stop using Lx
+CODE/DATA resources"), as it illustrates:
+
+  Now that CDP enable/disable is global, and the closid offset correction
+  is based on the configuration being applied, we are using different
+  hw_closid slots in the ctrl array for CODE/DATA schema. This lets
+  us merge them using the same Lx resource twice for CDP's CODE/DATA
+  schema. This keeps the illusion of separate caches in the resctrl code.
+
+  When CDP is enabled for a cache, create two schema generating the names
+  and setting the configuration type.
+
+  We can now remove the initialisation of the illusionary hw_resources:
+  'cdp_capable' just requires setting a flag, resctrl knows what to do
+  from there.
+
+Link: http://www.linux-arm.org/git?p=linux-jm.git;a=commit;h=250656171d95dea079cc661098a0984e7237aa25
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/resctrl.h      |  4 ++
+ arch/arm64/kernel/mpam/mpam_ctrlmon.c | 78 +++++++++++++++++++++++++++
+ fs/resctrlfs.c                        |  8 +++
+ 3 files changed, 90 insertions(+)
+
+diff --git a/arch/arm64/include/asm/resctrl.h b/arch/arm64/include/asm/resctrl.h
+index 2119204fa090..58cff955fbda 100644
+--- a/arch/arm64/include/asm/resctrl.h
++++ b/arch/arm64/include/asm/resctrl.h
+@@ -75,6 +75,10 @@ struct rdtgroup {
+ 	struct mongroup     mon;
+ };
+ 
++int schemata_list_init(void);
++
++void schemata_list_destroy(void);
++
+ static inline int alloc_mon_id(void)
+ {
+ 
+diff --git a/arch/arm64/kernel/mpam/mpam_ctrlmon.c b/arch/arm64/kernel/mpam/mpam_ctrlmon.c
+index e0407dbc5152..914294476ff9 100644
+--- a/arch/arm64/kernel/mpam/mpam_ctrlmon.c
++++ b/arch/arm64/kernel/mpam/mpam_ctrlmon.c
+@@ -36,6 +36,84 @@
+ #include <asm/resctrl.h>
+ #include "mpam_internal.h"
+ 
++/* schemata content list */
++LIST_HEAD(resctrl_all_schema);
++
++/* Init schemata content */
++static int add_schema(enum resctrl_conf_type t, struct resctrl_resource *r)
++{
++	char *suffix = "";
++	struct resctrl_schema *s;
++
++	s = kzalloc(sizeof(*s), GFP_KERNEL);
++	if (!s)
++		return -ENOMEM;
++
++	s->res = r;
++	s->conf_type = t;
++
++	switch (t) {
++	case CDP_CODE:
++		suffix = "CODE";
++		break;
++	case CDP_DATA:
++		suffix = "DATA";
++		break;
++	case CDP_BOTH:
++		suffix = "";
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	WARN_ON_ONCE(strlen(r->name) + strlen(suffix) + 1 > RESCTRL_NAME_LEN);
++	snprintf(s->name, sizeof(s->name), "%s%s", r->name, suffix);
++
++	INIT_LIST_HEAD(&s->list);
++	list_add_tail(&s->list, &resctrl_all_schema);
++
++	return 0;
++}
++
++int schemata_list_init(void)
++{
++	int ret;
++	struct mpam_resctrl_res *res;
++	struct resctrl_resource *r;
++
++	for_each_supported_resctrl_exports(res) {
++		r = &res->resctrl_res;
++		if (!r || !r->alloc_capable)
++			continue;
++
++		if (r->cdp_enable) {
++			ret = add_schema(CDP_CODE, r);
++			ret |= add_schema(CDP_DATA, r);
++		} else {
++			ret = add_schema(CDP_BOTH, r);
++		}
++		if (ret)
++			break;
++	}
++
++	return ret;
++}
++
++/*
++ * During resctrl_kill_sb(), the mba_sc state is reset before
++ * schemata_list_destroy() is called: unconditionally try to free the
++ * array.
++ */
++void schemata_list_destroy(void)
++{
++	struct resctrl_schema *s, *tmp;
++
++	list_for_each_entry_safe(s, tmp, &resctrl_all_schema, list) {
++		list_del(&s->list);
++		kfree(s);
++	}
++}
++
+ /*
+  * Check whether a cache bit mask is valid. The SDM says:
+  *	Please note that all (and only) contiguous '1' combinations
+diff --git a/fs/resctrlfs.c b/fs/resctrlfs.c
+index 8d567d09801e..5d3dfe7d5a95 100644
+--- a/fs/resctrlfs.c
++++ b/fs/resctrlfs.c
+@@ -336,6 +336,11 @@ static int resctrl_get_tree(struct fs_context *fc)
+ 	if (ret)
+ 		goto out;
+ 
++#ifdef CONFIG_ARM64
++	ret = schemata_list_init();
++	if (ret)
++		goto out;
++#endif
+ 	resctrl_id_init();
+ 
+ 	ret = resctrl_group_create_info_dir(resctrl_group_default.kn);
+@@ -498,6 +503,9 @@ static void resctrl_kill_sb(struct super_block *sb)
+ 	mutex_lock(&resctrl_group_mutex);
+ 
+ 	resctrl_resource_reset();
++#ifdef CONFIG_ARM64
++	schemata_list_destroy();
++#endif
+ 
+ 	rmdir_all_sub();
+ 	static_branch_disable_cpuslocked(&resctrl_alloc_enable_key);
+-- 
+2.26.2
+

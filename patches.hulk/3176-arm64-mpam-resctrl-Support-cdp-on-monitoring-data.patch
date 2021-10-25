@@ -1,0 +1,301 @@
+From e0077ba5d2665586fc6872d79202e56ff0ee5834 Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Fri, 26 Feb 2021 20:22:18 +0800
+Subject: [PATCH] arm64/mpam: resctrl: Support cdp on monitoring data
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: e0077ba5d2665586fc6872d79202e56ff0ee5834
+
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+commit 43be0de7be8f ("arm64/mpam: Support cdp on allocating monitors")
+allows us to allocate two monitor once, we apply this two monitors to
+different monitor sysfile under mon_data directory according to its'
+closid, as following illustrates.
+
+-- resctrl/
+         +-- schemata
+             L3CODE:0=xx  # closid
+             L3DATA:1=xx  # closid+1
+             MB:0=xx      # closid
+         +-- mon_data/
+                    +-- mon_L3CODE_00 # monitor
+                    +-- mon_L3DATA_00 # monitor+1
+                    +-- mon_MB_00     # monitor
+
+When monitoring happens, we read the private data of each monitor
+sysfile which contains closid, monitor and pmg, this is used for
+obtaining monitor data.
+
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/mpam.h         |  6 ++--
+ arch/arm64/kernel/mpam/mpam_ctrlmon.c | 47 ++++++++++++++++++---------
+ arch/arm64/kernel/mpam/mpam_resctrl.c | 45 ++++++++++++++++---------
+ 3 files changed, 65 insertions(+), 33 deletions(-)
+
+diff --git a/arch/arm64/include/asm/mpam.h b/arch/arm64/include/asm/mpam.h
+index b81aec481784..82b9887270a1 100644
+--- a/arch/arm64/include/asm/mpam.h
++++ b/arch/arm64/include/asm/mpam.h
+@@ -338,10 +338,11 @@ struct raw_resctrl_resource {
+ 			struct resctrl_staged_config *cfg, hw_closid_t closid);
+ 
+ 	u16                num_mon;
+-	u64 (*mon_read)(struct rdt_domain *d, struct rdtgroup *g);
+-	int (*mon_write)(struct rdt_domain *d, struct rdtgroup *g, bool enable);
++	u64 (*mon_read)(struct rdt_domain *d, void *md_priv);
++	int (*mon_write)(struct rdt_domain *d, void *md_priv, bool enable);
+ };
+ 
++/* 64bit arm64 specified */
+ union mon_data_bits {
+ 	void *priv;
+ 	struct {
+@@ -349,6 +350,7 @@ union mon_data_bits {
+ 		u8	domid;
+ 		u8	partid;
+ 		u8	pmg;
++		u8	mon;
+ 	} u;
+ };
+ 
+diff --git a/arch/arm64/kernel/mpam/mpam_ctrlmon.c b/arch/arm64/kernel/mpam/mpam_ctrlmon.c
+index 7915c252fe66..c4c801d47e98 100644
+--- a/arch/arm64/kernel/mpam/mpam_ctrlmon.c
++++ b/arch/arm64/kernel/mpam/mpam_ctrlmon.c
+@@ -421,7 +421,7 @@ int resctrl_group_mondata_show(struct seq_file *m, void *arg)
+ 		goto out;
+ 	}
+ 
+-	usage = rr->mon_read(d, rdtgrp);
++	usage = rr->mon_read(d, md.priv);
+ 	seq_printf(m, "%llu\n", usage);
+ 
+ out:
+@@ -450,22 +450,31 @@ static int resctrl_group_kn_set_ugid(struct kernfs_node *kn)
+ }
+ 
+ static int mkdir_mondata_subdir(struct kernfs_node *parent_kn,
+-				struct rdt_domain *d,
+-				struct resctrl_resource *r, struct resctrl_group *prgrp)
++			struct rdt_domain *d, struct resctrl_schema *s,
++			struct resctrl_group *prgrp)
++
+ {
+-	struct raw_resctrl_resource *rr = (struct raw_resctrl_resource *)r->res;
++	struct resctrl_resource *r;
++	struct raw_resctrl_resource *rr;
++	hw_closid_t hw_closid;
++	hw_monid_t hw_monid;
+ 	union mon_data_bits md;
+ 	struct kernfs_node *kn;
+ 	char name[32];
+ 	int ret = 0;
+ 
++	r = s->res;
++	rr = r->res;
+ 
+ 	md.u.rid = r->rid;
+ 	md.u.domid = d->id;
+-	md.u.partid = prgrp->closid;
++	resctrl_cdp_map(clos, prgrp->closid, s->conf_type, hw_closid);
++	md.u.partid = hw_closid_val(hw_closid);
++	resctrl_cdp_map(mon, prgrp->mon.mon, s->conf_type, hw_monid);
++	md.u.mon = hw_monid_val(hw_monid);
+ 	md.u.pmg = prgrp->mon.rmid;
+ 
+-	snprintf(name, sizeof(name), "mon_%s_%02d", r->name, d->id);
++	snprintf(name, sizeof(name), "mon_%s_%02d", s->name, d->id);
+ 	kn = __kernfs_create_file(parent_kn, name, 0444,
+ 				  GLOBAL_ROOT_UID, GLOBAL_ROOT_GID, 0,
+ 				  &kf_mondata_ops, md.priv, NULL, NULL);
+@@ -480,7 +489,7 @@ static int mkdir_mondata_subdir(struct kernfs_node *parent_kn,
+ 	}
+ 
+ 	/* Could we remove the MATCH_* param ? */
+-	rr->mon_write(d, prgrp, true);
++	rr->mon_write(d, md.priv, true);
+ 
+ 	return ret;
+ }
+@@ -595,14 +604,15 @@ int resctrl_group_ctrlmon_show(struct kernfs_open_file *of,
+ 
+ 
+ static int mkdir_mondata_subdir_alldom(struct kernfs_node *parent_kn,
+-				       struct resctrl_resource *r,
+-				       struct resctrl_group *prgrp)
++			struct resctrl_schema *s, struct resctrl_group *prgrp)
+ {
++	struct resctrl_resource *r;
+ 	struct rdt_domain *dom;
+ 	int ret;
+ 
++	r = s->res;
+ 	list_for_each_entry(dom, &r->domains, list) {
+-		ret = mkdir_mondata_subdir(parent_kn, dom, r, prgrp);
++		ret = mkdir_mondata_subdir(parent_kn, dom, s, prgrp);
+ 		if (ret)
+ 			return ret;
+ 	}
+@@ -668,7 +678,7 @@ int mkdir_mondata_all(struct kernfs_node *parent_kn,
+ 			     struct resctrl_group *prgrp,
+ 			     struct kernfs_node **dest_kn)
+ {
+-	struct mpam_resctrl_res *res;
++	struct resctrl_schema *s;
+ 	struct resctrl_resource *r;
+ 	struct kernfs_node *kn;
+ 	int ret;
+@@ -687,16 +697,23 @@ int mkdir_mondata_all(struct kernfs_node *parent_kn,
+ 	 * Create the subdirectories for each domain. Note that all events
+ 	 * in a domain like L3 are grouped into a resource whose domain is L3
+ 	 */
+-	for_each_supported_resctrl_exports(res) {
+-		r = &res->resctrl_res;
++	list_for_each_entry(s, &resctrl_all_schema, list) {
++		r = s->res;
+ 
+ 		if (r->mon_enabled) {
+ 			/* HHA does not support monitor by pmg */
++			struct raw_resctrl_resource *rr;
++
++			rr = r->res;
++			/*
++			 * num pmg of different resources varies, we just
++			 * skip creating those unqualified ones.
++			 */
+ 			if ((prgrp->type == RDTMON_GROUP) &&
+-			    (r->rid == RDT_RESOURCE_MC))
++				(prgrp->mon.rmid >= rr->num_pmg))
+ 				continue;
+ 
+-			ret = mkdir_mondata_subdir_alldom(kn, r, prgrp);
++			ret = mkdir_mondata_subdir_alldom(kn, s, prgrp);
+ 			if (ret)
+ 				goto out_destroy;
+ 		}
+diff --git a/arch/arm64/kernel/mpam/mpam_resctrl.c b/arch/arm64/kernel/mpam/mpam_resctrl.c
+index 8c74d69c6826..4b5c16adf15a 100644
+--- a/arch/arm64/kernel/mpam/mpam_resctrl.c
++++ b/arch/arm64/kernel/mpam/mpam_resctrl.c
+@@ -118,11 +118,10 @@ common_wrmsr(struct resctrl_resource *r, struct rdt_domain *d,
+ static u64 cache_rdmsr(struct rdt_domain *d, int partid);
+ static u64 mbw_rdmsr(struct rdt_domain *d, int partid);
+ 
+-static u64 cache_rdmon(struct rdt_domain *d, struct rdtgroup *g);
+-static u64 mbw_rdmon(struct rdt_domain *d, struct rdtgroup *g);
++static u64 cache_rdmon(struct rdt_domain *d, void *md_priv);
++static u64 mbw_rdmon(struct rdt_domain *d, void *md_priv);
+ 
+-static int common_wrmon(struct rdt_domain *d, struct rdtgroup *g,
+-			bool enable);
++static int common_wrmon(struct rdt_domain *d, void *md_priv, bool enable);
+ 
+ static inline bool is_mon_dyn(u32 mon)
+ {
+@@ -337,22 +336,27 @@ static u64 mbw_rdmsr(struct rdt_domain *d, int partid)
+  * use pmg as monitor id
+  * just use match_pardid only.
+  */
+-static u64 cache_rdmon(struct rdt_domain *d, struct rdtgroup *g)
++static u64 cache_rdmon(struct rdt_domain *d, void *md_priv)
+ {
+ 	int err;
+ 	u64 result;
++	union mon_data_bits md;
+ 	struct sync_args args;
+ 	struct mpam_resctrl_dom *dom;
+-	u32 mon = g->mon.mon;
++	u32 mon;
+ 	unsigned long timeout;
+ 
++	md.priv = md_priv;
++
++	mon = md.u.mon;
++
+ 	/* Indicates whether allocating a monitor dynamically*/
+ 	if (is_mon_dyn(mon))
+ 		mon = alloc_mon();
+ 
+-	args.partid = g->closid;
++	args.partid = md.u.partid;
+ 	args.mon = mon;
+-	args.pmg = g->mon.rmid;
++	args.pmg = md.u.pmg;
+ 	args.match_pmg = true;
+ 	args.eventid = QOS_L3_OCCUP_EVENT_ID;
+ 
+@@ -382,21 +386,26 @@ static u64 cache_rdmon(struct rdt_domain *d, struct rdtgroup *g)
+  * use pmg as monitor id
+  * just use match_pardid only.
+  */
+-static u64 mbw_rdmon(struct rdt_domain *d, struct rdtgroup *g)
++static u64 mbw_rdmon(struct rdt_domain *d, void *md_priv)
+ {
+ 	int err;
+ 	u64 result;
++	union mon_data_bits md;
+ 	struct sync_args args;
+ 	struct mpam_resctrl_dom *dom;
+-	u32 mon = g->mon.mon;
++	u32 mon;
+ 	unsigned long timeout;
+ 
++	md.priv = md_priv;
++
++	mon = md.u.mon;
++
+ 	if (is_mon_dyn(mon))
+ 		mon = alloc_mon();
+ 
+-	args.partid = g->closid;
++	args.partid = md.u.partid;
+ 	args.mon = mon;
+-	args.pmg = g->mon.rmid;
++	args.pmg = md.u.pmg;
+ 	args.match_pmg = true;
+ 	args.eventid = QOS_L3_MBM_LOCAL_EVENT_ID;
+ 
+@@ -422,18 +431,22 @@ static u64 mbw_rdmon(struct rdt_domain *d, struct rdtgroup *g)
+ 	return result;
+ }
+ 
+-static int common_wrmon(struct rdt_domain *d, struct rdtgroup *g, bool enable)
++static int
++common_wrmon(struct rdt_domain *d, void *md_priv, bool enable)
+ {
+ 	u64 result;
++	union mon_data_bits md;
+ 	struct sync_args args;
+ 	struct mpam_resctrl_dom *dom;
+ 
+ 	if (!enable)
+ 		return -EINVAL;
+ 
+-	args.partid = g->closid;
+-	args.mon = g->mon.mon;
+-	args.pmg = g->mon.rmid;
++	md.priv = md_priv;
++	args.partid = md.u.partid;
++	args.mon = md.u.mon;
++	args.pmg = md.u.pmg;
++
+ 	args.match_pmg = true;
+ 
+ 	dom = container_of(d, struct mpam_resctrl_dom, resctrl_dom);
+-- 
+2.26.2
+

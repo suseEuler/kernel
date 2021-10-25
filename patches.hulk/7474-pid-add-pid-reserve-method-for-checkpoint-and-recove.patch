@@ -1,0 +1,164 @@
+From 04860c5febb931c1ea8c0afd7ef91370356bf3c5 Mon Sep 17 00:00:00 2001
+From: Jingxian He <hejingxian@huawei.com>
+Date: Tue, 27 Jul 2021 22:02:16 +0800
+Subject: [PATCH] pid: add pid reserve method for checkpoint and recover
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 04860c5febb931c1ea8c0afd7ef91370356bf3c5
+
+
+hulk inclusion
+category: feature
+bugzilla: 48159
+CVE: N/A
+
+------------------------------
+
+We record the pid of dump tasks in the reserved memory,
+and reserve the pids before init task start.
+In the recover process, free the reserved pids and realloc them for use.
+
+Signed-off-by: Jingxian He <hejingxian@huawei.com>
+Reviewed-by: Chen Wandun <chenwandun@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/pin_mem.h |  6 +++++
+ kernel/pid.c            | 10 ++++++++
+ mm/Kconfig              | 10 ++++++++
+ mm/pin_mem.c            | 51 +++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 77 insertions(+)
+
+diff --git a/include/linux/pin_mem.h b/include/linux/pin_mem.h
+index b01cd05ace06..6c54482a42a1 100644
+--- a/include/linux/pin_mem.h
++++ b/include/linux/pin_mem.h
+@@ -89,5 +89,11 @@ extern struct resource pin_memory_resource;
+ #endif
+ extern void init_reserve_page_map(unsigned long map_addr, unsigned long map_size);
+ 
++#ifdef CONFIG_PID_RESERVE
++extern bool is_need_reserve_pids(void);
++extern void free_reserved_pid(struct idr *idr, int pid);
++extern void reserve_pids(struct idr *idr, int pid_max);
++#endif
++
+ #endif /* CONFIG_PIN_MEMORY */
+ #endif /* _LINUX_PIN_MEMORY_H */
+diff --git a/kernel/pid.c b/kernel/pid.c
+index 0b90596f9f12..be2ec1d26896 100644
+--- a/kernel/pid.c
++++ b/kernel/pid.c
+@@ -44,6 +44,9 @@
+ #include <linux/idr.h>
+ #include <net/sock.h>
+ #include <uapi/linux/pidfd.h>
++#ifdef CONFIG_PID_RESERVE
++#include <linux/pin_mem.h>
++#endif
+ 
+ struct pid init_struct_pid = {
+ 	.count		= REFCOUNT_INIT(1),
+@@ -209,6 +212,9 @@ struct pid *alloc_pid(struct pid_namespace *ns, pid_t *set_tid,
+ 		spin_lock_irq(&pidmap_lock);
+ 
+ 		if (tid) {
++#ifdef CONFIG_PID_RESERVE
++			free_reserved_pid(&tmp->idr, tid);
++#endif
+ 			nr = idr_alloc(&tmp->idr, NULL, tid,
+ 				       tid + 1, GFP_ATOMIC);
+ 			/*
+@@ -622,6 +628,10 @@ void __init pid_idr_init(void)
+ 
+ 	init_pid_ns.pid_cachep = KMEM_CACHE(pid,
+ 			SLAB_HWCACHE_ALIGN | SLAB_PANIC | SLAB_ACCOUNT);
++#ifdef CONFIG_PID_RESERVE
++	if (is_need_reserve_pids())
++		reserve_pids(&init_pid_ns.idr, pid_max);
++#endif
+ }
+ 
+ static struct file *__pidfd_fget(struct task_struct *task, int fd)
+diff --git a/mm/Kconfig b/mm/Kconfig
+index 15eebc24d703..8d1f074b615b 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -906,4 +906,14 @@ config PIN_MEMORY
+ 	  and restore. We can pin the memory data of tasks and collect
+ 	  the corresponding physical pages mapping info in checkpoint,
+ 	  and remap the physical pages to restore tasks in restore.
++
++config PID_RESERVE
++	bool "Support for reserve pid"
++	depends on PIN_MEMORY
++	help
++	  Say y here to enable the pid reserved feature for checkpoint.
++	  and restore.
++	  We record the pid of dump task in the reserve memory,
++	  and reserve the pids before init task start. In restore process,
++	  free the reserved pids and realloc them for use.
+ endmenu
+diff --git a/mm/pin_mem.c b/mm/pin_mem.c
+index df618ba1f5bb..3fd3638a89e3 100644
+--- a/mm/pin_mem.c
++++ b/mm/pin_mem.c
+@@ -1088,4 +1088,55 @@ void clear_pin_memory_record(void)
+ }
+ EXPORT_SYMBOL_GPL(clear_pin_memory_record);
+ 
++#ifdef CONFIG_PID_RESERVE
++struct idr *reserve_idr;
++
++/* test if there exist pin memory tasks */
++bool is_need_reserve_pids(void)
++{
++	return (pin_pid_num > 0);
++}
++
++void free_reserved_pid(struct idr *idr, int pid)
++{
++	unsigned int index;
++	struct page_map_info *pmi;
++
++	if (!max_pin_pid_num || idr != reserve_idr)
++		return;
++
++	for (index = 0; index < pin_pid_num; index++) {
++		pmi = &(user_space_reserve_start[index]);
++		if (pmi->pid == pid && pmi->pid_reserved) {
++			idr_remove(idr, pid);
++			return;
++		}
++	}
++}
++
++/* reserve pids for check point tasks which pinned memory */
++void reserve_pids(struct idr *idr, int pid_max)
++{
++	int alloc_pid;
++	unsigned int index;
++	struct page_map_info *pmi;
++
++	if (!max_pin_pid_num)
++		return;
++	reserve_idr = idr;
++	for (index = 0; index < pin_pid_num; index++) {
++		pmi = &(user_space_reserve_start[index]);
++		pmi->pid_reserved = true;
++		alloc_pid = idr_alloc(idr, NULL, pmi->pid, pid_max, GFP_ATOMIC);
++		if (alloc_pid != pmi->pid) {
++			if (alloc_pid > 0)
++				idr_remove(idr, alloc_pid);
++			pr_warn("Reserve pid (%d) fail, real pid is %d.\n", alloc_pid, pmi->pid);
++			pmi->pid_reserved = false;
++			continue;
++		}
++	}
++}
++#endif /* CONFIG_PID_RESERVE */
++
+ #endif /* CONFIG_PIN_MEMORY */
+-- 
+2.26.2
+

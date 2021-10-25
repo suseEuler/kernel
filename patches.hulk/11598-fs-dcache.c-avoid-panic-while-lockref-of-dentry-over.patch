@@ -1,0 +1,145 @@
+From 6a8c6793785d19a03d8d6cc1f6fefdb79924175b Mon Sep 17 00:00:00 2001
+From: yangerkun <yangerkun@huawei.com>
+Date: Mon, 29 Nov 2021 16:28:39 +0800
+Subject: [PATCH] fs/dcache.c: avoid panic while lockref of dentry overflow
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 6a8c6793785d19a03d8d6cc1f6fefdb79924175b
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 185799, https://gitee.com/openeuler/kernel/issues/I4JWYM
+CVE: NA
+
+---------------------------
+
+We use lockref for dentry reference without notice that so many negative
+dentry under one dir can lead to overflow of lockref. This can lead to
+system crash if we do this under root dir.
+
+Since there is not a perfect solution, we just limit max number of
+dentry count up to INT_MAX / 2. Also, it will cost a lot of time from
+INT_MAX / 2 to INT_MAX, so we no need to do this under protection of
+dentry lock.
+
+Also, we limit the FILES_MAX to INT_MAX / 2, since a lot open for
+same file can lead to overflow too.
+
+Changelog:
+v1->v2: add a function to do check / add a Macro to mean INT_MAX / 2
+
+Signed-off-by: yangerkun <yangerkun@huawei.com>
+Reviewed-by: Miao Xie <miaoxie@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+
+Conflicts:
+	fs/dcache.c
+Reviewed-by: Zhang Yi <yi.zhang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/dcache.c        | 32 ++++++++++++++++++++++++++++----
+ fs/filescontrol.c  |  2 +-
+ include/linux/fs.h |  3 +++
+ 3 files changed, 32 insertions(+), 5 deletions(-)
+
+diff --git a/fs/dcache.c b/fs/dcache.c
+index ea0485861d93..185d71a1c05b 100644
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -1774,6 +1774,18 @@ static struct dentry *__d_alloc(struct super_block *sb, const struct qstr *name)
+ 	return dentry;
+ }
+ 
++static inline bool d_forbid_overflow(struct dentry *dentry)
++{
++	if (unlikely(d_count(dentry) >= D_COUNT_MAX)) {
++		shrink_dcache_parent(dentry);
++
++		if (d_count(dentry) >= D_COUNT_MAX)
++			return false;
++	}
++
++	return true;
++}
++
+ /**
+  * d_alloc	-	allocate a dcache entry
+  * @parent: parent of entry to allocate
+@@ -1785,9 +1797,15 @@ static struct dentry *__d_alloc(struct super_block *sb, const struct qstr *name)
+  */
+ struct dentry *d_alloc(struct dentry * parent, const struct qstr *name)
+ {
+-	struct dentry *dentry = __d_alloc(parent->d_sb, name);
++	struct dentry *dentry = NULL;
++
++	if (unlikely(!d_forbid_overflow(parent)))
++		goto out;
++
++	dentry = __d_alloc(parent->d_sb, name);
+ 	if (!dentry)
+-		return NULL;
++		goto out;
++
+ 	spin_lock(&parent->d_lock);
+ 	/*
+ 	 * don't need child lock because it is not subject
+@@ -1797,7 +1815,7 @@ struct dentry *d_alloc(struct dentry * parent, const struct qstr *name)
+ 	dentry->d_parent = parent;
+ 	list_add(&dentry->d_child, &parent->d_subdirs);
+ 	spin_unlock(&parent->d_lock);
+-
++out:
+ 	return dentry;
+ }
+ EXPORT_SYMBOL(d_alloc);
+@@ -1810,11 +1828,17 @@ EXPORT_SYMBOL(d_alloc_anon);
+ 
+ struct dentry *d_alloc_cursor(struct dentry * parent)
+ {
+-	struct dentry *dentry = d_alloc_anon(parent->d_sb);
++	struct dentry *dentry = NULL;
++
++	if (unlikely(!d_forbid_overflow(parent)))
++		goto out;
++
++	dentry = d_alloc_anon(parent->d_sb);
+ 	if (dentry) {
+ 		dentry->d_flags |= DCACHE_DENTRY_CURSOR;
+ 		dentry->d_parent = dget(parent);
+ 	}
++out:
+ 	return dentry;
+ }
+ 
+diff --git a/fs/filescontrol.c b/fs/filescontrol.c
+index 4ad500f40025..fdd557a246be 100644
+--- a/fs/filescontrol.c
++++ b/fs/filescontrol.c
+@@ -27,7 +27,7 @@
+ #include <linux/sched/signal.h>
+ #include <linux/module.h>
+ 
+-#define FILES_MAX ULONG_MAX
++#define FILES_MAX D_COUNT_MAX
+ #define FILES_MAX_STR "max"
+ 
+ static bool no_acct;
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 8f6704a3f596..243a0987ca2b 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -44,6 +44,9 @@
+ #include <asm/byteorder.h>
+ #include <uapi/linux/fs.h>
+ 
++#define D_COUNT_MAX (INT_MAX / 2)
++
++
+ struct backing_dev_info;
+ struct bdi_writeback;
+ struct bio;
+-- 
+2.26.2
+

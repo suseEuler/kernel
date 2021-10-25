@@ -1,0 +1,84 @@
+From 445218beeea69d3a6172c1eb4b203db8540e1016 Mon Sep 17 00:00:00 2001
+From: yangerkun <yangerkun@huawei.com>
+Date: Mon, 15 Nov 2021 19:49:03 +0800
+Subject: [PATCH] ext4: check magic even the extent block bh is verified
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 445218beeea69d3a6172c1eb4b203db8540e1016
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 182952 https://gitee.com/openeuler/kernel/issues/I4DDEL
+
+---------------------------
+
+Our stress testing with IO error can trigger follow OOB with a very low
+probability.
+
+[59898.282466] BUG: KASAN: slab-out-of-bounds in ext4_find_extent+0x2e4/0x480
+...
+[59898.287162] Call Trace:
+[59898.287575]  dump_stack+0x8b/0xb9
+[59898.288070]  print_address_description+0x73/0x280
+[59898.289903]  ext4_find_extent+0x2e4/0x480
+[59898.290553]  ext4_ext_map_blocks+0x125/0x1470
+[59898.295481]  ext4_map_blocks+0x5ee/0x940
+[59898.315984]  ext4_mpage_readpages+0x63c/0xdb0
+[59898.320231]  read_pages+0xe6/0x370
+[59898.321589]  __do_page_cache_readahead+0x233/0x2a0
+[59898.321594]  ondemand_readahead+0x157/0x450
+[59898.321598]  generic_file_read_iter+0xcb2/0x1550
+[59898.328828]  __vfs_read+0x233/0x360
+[59898.328840]  vfs_read+0xa5/0x190
+[59898.330126]  ksys_read+0xa5/0x150
+[59898.331405]  do_syscall_64+0x6d/0x1f0
+[59898.331418]  entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+Digging deep and we found it's actually a xattr block which can happened
+with follow steps:
+
+1. extent update for file1 and will remove a leaf extent block(block A)
+2. we need update the idx extent block too
+3. block A has been allocated as a xattr block and will set verified
+3. io error happened for this idx block and will the buffer has been
+   released late
+4. extent find for file1 will read the idx block and see block A again
+5. since the buffer of block A is already verified, we will use it
+   directly, which can lead the upper OOB
+
+Same as __ext4_xattr_check_block, we can check magic even the buffer is
+verified to fix the problem.
+
+Signed-off-by: yangerkun <yangerkun@huawei.com>
+Reviewed-by: Zhang Yi <yi.zhang@huawei.com>
+
+Signed-off-by: Chen Jun <chenjun102@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/ext4/extents.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/fs/ext4/extents.c b/fs/ext4/extents.c
+index a77e25ca6867..74b69d83c198 100644
+--- a/fs/ext4/extents.c
++++ b/fs/ext4/extents.c
+@@ -545,6 +545,14 @@ __read_extent_tree_block(const char *function, unsigned int line,
+ 			goto errout;
+ 	}
+ 	if (buffer_verified(bh)) {
++		if (unlikely(ext_block_hdr(bh)->eh_magic != EXT4_EXT_MAGIC)) {
++			err = -EFSCORRUPTED;
++			ext4_error_inode(inode, function, line, 0,
++				"invalid magic for verified extent block %llu",
++				(unsigned long long)bh->b_blocknr);
++			goto errout;
++		}
++
+ 		if (!(flags & EXT4_EX_FORCE_CACHE))
+ 			return bh;
+ 	} else {
+-- 
+2.26.2
+

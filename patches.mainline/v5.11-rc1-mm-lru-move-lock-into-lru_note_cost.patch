@@ -1,0 +1,120 @@
+From 75cc3c9161cd95f43ebf6c6a938d4d98ab195bbd Mon Sep 17 00:00:00 2001
+From: Alex Shi <alex.shi@linux.alibaba.com>
+Date: Tue, 15 Dec 2020 14:20:50 -0800
+Subject: [PATCH] mm/lru: move lock into lru_note_cost
+Git-commit: 75cc3c9161cd95f43ebf6c6a938d4d98ab195bbd
+Patch-mainline: v5.11-rc1
+References: bsn#12
+
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+We have to move lru_lock into lru_note_cost, since it cycle up on memcg
+tree, for future per lruvec lru_lock replace.  It's a bit ugly and may
+cost a bit more locking, but benefit from multiple memcg locking could
+cover the lost.
+
+Link: https://lkml.kernel.org/r/1604566549-62481-11-git-send-email-alex.shi@linux.alibaba.com
+Signed-off-by: Alex Shi <alex.shi@linux.alibaba.com>
+Acked-by: Hugh Dickins <hughd@google.com>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Alexander Duyck <alexander.duyck@gmail.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+Cc: "Chen, Rong A" <rong.a.chen@intel.com>
+Cc: Daniel Jordan <daniel.m.jordan@oracle.com>
+Cc: "Huang, Ying" <ying.huang@intel.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Kirill A. Shutemov <kirill@shutemov.name>
+Cc: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mika Penttilä <mika.penttila@nextfour.com>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Shakeel Butt <shakeelb@google.com>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Wei Yang <richard.weiyang@gmail.com>
+Cc: Yang Shi <yang.shi@linux.alibaba.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ mm/swap.c       | 3 +++
+ mm/vmscan.c     | 4 +---
+ mm/workingset.c | 2 --
+ 3 files changed, 4 insertions(+), 5 deletions(-)
+
+diff --git a/mm/swap.c b/mm/swap.c
+index b4ca5b965838..c3187d04f9b2 100644
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@ -268,7 +268,9 @@ void lru_note_cost(struct lruvec *lruvec, bool file, unsigned int nr_pages)
+ {
+ 	do {
+ 		unsigned long lrusize;
++		struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+ 
++		spin_lock_irq(&pgdat->lru_lock);
+ 		/* Record cost event */
+ 		if (file)
+ 			lruvec->file_cost += nr_pages;
+@@ -292,6 +294,7 @@ void lru_note_cost(struct lruvec *lruvec, bool file, unsigned int nr_pages)
+ 			lruvec->file_cost /= 2;
+ 			lruvec->anon_cost /= 2;
+ 		}
++		spin_unlock_irq(&pgdat->lru_lock);
+ 	} while ((lruvec = parent_lruvec(lruvec)));
+ }
+ 
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 1c3df77972e8..f69601d39a6d 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -1971,19 +1971,17 @@ shrink_inactive_list(unsigned long nr_to_scan, struct lruvec *lruvec,
+ 	nr_reclaimed = shrink_page_list(&page_list, pgdat, sc, &stat, false);
+ 
+ 	spin_lock_irq(&pgdat->lru_lock);
+-
+ 	move_pages_to_lru(lruvec, &page_list);
+ 
+ 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
+-	lru_note_cost(lruvec, file, stat.nr_pageout);
+ 	item = current_is_kswapd() ? PGSTEAL_KSWAPD : PGSTEAL_DIRECT;
+ 	if (!cgroup_reclaim(sc))
+ 		__count_vm_events(item, nr_reclaimed);
+ 	__count_memcg_events(lruvec_memcg(lruvec), item, nr_reclaimed);
+ 	__count_vm_events(PGSTEAL_ANON + file, nr_reclaimed);
+-
+ 	spin_unlock_irq(&pgdat->lru_lock);
+ 
++	lru_note_cost(lruvec, file, stat.nr_pageout);
+ 	mem_cgroup_uncharge_list(&page_list);
+ 	free_unref_page_list(&page_list);
+ 
+diff --git a/mm/workingset.c b/mm/workingset.c
+index 25f75bbe80e0..94b512538d5a 100644
+--- a/mm/workingset.c
++++ b/mm/workingset.c
+@@ -381,9 +381,7 @@ void workingset_refault(struct page *page, void *shadow)
+ 	if (workingset) {
+ 		SetPageWorkingset(page);
+ 		/* XXX: Move to lru_cache_add() when it supports new vs putback */
+-		spin_lock_irq(&page_pgdat(page)->lru_lock);
+ 		lru_note_cost_page(page);
+-		spin_unlock_irq(&page_pgdat(page)->lru_lock);
+ 		inc_lruvec_state(lruvec, WORKINGSET_RESTORE_BASE + file);
+ 	}
+ out:
+-- 
+2.31.1
+

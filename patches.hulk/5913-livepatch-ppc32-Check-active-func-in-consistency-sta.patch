@@ -1,0 +1,106 @@
+From 64638832973d45d671fecb6abb6bdce63bdbcfe7 Mon Sep 17 00:00:00 2001
+From: Cheng Jian <cj.chengjian@huawei.com>
+Date: Sat, 29 May 2021 14:43:01 +0800
+Subject: [PATCH] livepatch/ppc32: Check active func in consistency stack
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 64638832973d45d671fecb6abb6bdce63bdbcfe7
+
+ checking
+
+hulk inclusion
+category: bugfix
+bugzilla: 51924
+CVE: NA
+
+---------------------------
+
+When doing consistency stack checking, if we try to patch a function
+which has been patched already. We should check the new function(not
+the origin func) that is activeness currently, it's always the first
+entry in list func_node->func_stack.
+
+Example :
+        module : origin                 livepatch v1            livepatch v2
+        func   : old func A -[enable]=> new func A' -[enable]=> new func A''
+        check  :                A                       A'
+
+when we try to patch function A to new function A'' by livepatch v2,
+but the func A has already patched to function A' by livepatch v1, so
+function A' which provided in livepatch v1 is active in the stack
+instead of origin function A. Even if the long jump method is used, we
+jump to the new function A' using a call without LR, the origin function
+A will not appear in the stack. We must check the active function A' in
+consistency stack checking.
+
+Signed-off-by: Cheng Jian <cj.chengjian@huawei.com>
+Reviewed-By: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: yangerkun <yangerkun@huawei.com>
+
+Signed-off-by: Dong Kai <dongkai11@huawei.com>
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+
+Signed-off-by: Ye Weihua <yeweihua4@huawei.com>
+Reviewed-by: Kuohai Xu <xukuohai@huawei.com>
+Reviewed-by: Yang Jihong <yangjihong1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/powerpc/kernel/livepatch_32.c | 33 ++++++++++++++++++++++++++++--
+ 1 file changed, 31 insertions(+), 2 deletions(-)
+
+diff --git a/arch/powerpc/kernel/livepatch_32.c b/arch/powerpc/kernel/livepatch_32.c
+index da6c9592d1f8..4bb92faec0c3 100644
+--- a/arch/powerpc/kernel/livepatch_32.c
++++ b/arch/powerpc/kernel/livepatch_32.c
+@@ -85,6 +85,7 @@ static int klp_check_activeness_func(struct stackframe *frame, void *data)
+ 	struct klp_func *func;
+ 	unsigned long func_addr, func_size;
+ 	const char *func_name;
++	struct klp_func_node *func_node;
+ 
+ 	if (args->ret)
+ 		return args->ret;
+@@ -92,9 +93,37 @@ static int klp_check_activeness_func(struct stackframe *frame, void *data)
+ 	for (obj = patch->objs; obj->funcs; obj++) {
+ 		for (func = obj->funcs; func->old_name; func++) {
+ 			if (args->enable) {
+-				func_addr = (unsigned long)func->old_func;
+-				func_size = func->old_size;
++				/*
++				 * When enable, checking the currently
++				 * active functions.
++				 */
++				func_node = klp_find_func_node(func->old_func);
++				if (!func_node ||
++				    list_empty(&func_node->func_stack)) {
++					/*
++					 * No patched on this function
++					 * [ the origin one ]
++					 */
++					func_addr = (unsigned long)func->old_func;
++					func_size = func->old_size;
++				} else {
++					/*
++					 * Previously patched function
++					 * [ the active one ]
++					 */
++					struct klp_func *prev;
++
++					prev = list_first_or_null_rcu(
++						&func_node->func_stack,
++						struct klp_func, stack_node);
++					func_addr = (unsigned long)prev->new_func;
++					func_size = prev->new_size;
++				}
+ 			} else {
++				/*
++				 * When disable, check for the function itself
++				 * which to be unpatched.
++				 */
+ 				func_addr = (unsigned long)func->new_func;
+ 				func_size = func->new_size;
+ 			}
+-- 
+2.26.2
+

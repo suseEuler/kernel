@@ -1,0 +1,735 @@
+From f0218c23a60d3acca7c73df888f9f6c93532f528 Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Fri, 26 Feb 2021 20:22:04 +0800
+Subject: [PATCH] arm64/mpam: Migrate old MSCs' discovery process to new branch
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: f0218c23a60d3acca7c73df888f9f6c93532f528
+
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+We used to make use of mpam_node structure to initialize MSCs and directly
+use resctrl_resource structure to store the MSCs' probing information
+before, it's a good choice until we support multiple MSC's node per domain,
+so far this new framework mpam_device->mpam_component->mpam_class has been
+constructed, we should make MPAM setup process compatible with this new
+framework firstly.
+
+At present, we only parsed the base address to create the mpam devices, but
+did not deal with the interruption registration issue, which will be dealt
+with later.
+
+We will continue to update discovery process from MPAM ACPI tlb according to
+latest MPAM ACPI spec.
+
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/mpam_resource.h |  33 ---
+ arch/arm64/include/asm/mpam_sched.h    |   8 -
+ arch/arm64/kernel/mpam/mpam_device.c   |   2 +-
+ arch/arm64/kernel/mpam/mpam_device.h   |   8 +-
+ arch/arm64/kernel/mpam/mpam_resctrl.c  | 360 +------------------------
+ drivers/acpi/arm64/mpam.c              |  48 +++-
+ include/linux/arm_mpam.h               |  67 +++++
+ 7 files changed, 106 insertions(+), 420 deletions(-)
+ create mode 100644 include/linux/arm_mpam.h
+
+diff --git a/arch/arm64/include/asm/mpam_resource.h b/arch/arm64/include/asm/mpam_resource.h
+index 10d727512d61..aa5bbe390c19 100644
+--- a/arch/arm64/include/asm/mpam_resource.h
++++ b/arch/arm64/include/asm/mpam_resource.h
+@@ -207,37 +207,4 @@
+ /* hard code for mbw_max max-percentage's cresponding masks */
+ #define MBA_MAX_WD 63u
+ 
+-/*
+- * emulate the mpam nodes
+- * These should be reported by ACPI MPAM Table.
+- */
+-
+-struct mpam_node {
+-	/* for label mpam_node instance*/
+-	u32 component_id;
+-	/* MPAM node header */
+-	u8              type;   /* MPAM_SMMU, MPAM_CACHE, MPAM_MC */
+-	u64             addr;
+-	void __iomem	*base;
+-	struct cpumask  cpu_mask;
+-	u64		default_ctrl;
+-
+-	/* for debug */
+-	char            *cpus_list;
+-	char		*name;
+-	struct list_head list;
+-};
+-
+-int __init mpam_force_init(void);
+-
+-int __init mpam_nodes_discovery_start(void);
+-
+-void __init mpam_nodes_discovery_failed(void);
+-
+-int __init mpam_nodes_discovery_complete(void);
+-
+-int mpam_create_cache_node(u32 component_id, phys_addr_t hwpage_address);
+-
+-int mpam_create_memory_node(u32 component_id, phys_addr_t hwpage_address);
+-
+ #endif /* _ASM_ARM64_MPAM_RESOURCE_H */
+diff --git a/arch/arm64/include/asm/mpam_sched.h b/arch/arm64/include/asm/mpam_sched.h
+index 350296157087..08ed349b6efa 100644
+--- a/arch/arm64/include/asm/mpam_sched.h
++++ b/arch/arm64/include/asm/mpam_sched.h
+@@ -40,14 +40,6 @@ static inline void mpam_sched_in(void)
+ 		__mpam_sched_in();
+ }
+ 
+-enum mpam_enable_type {
+-	enable_denied = 0,
+-	enable_default,
+-	enable_acpi,
+-};
+-
+-extern enum mpam_enable_type __read_mostly mpam_enabled;
+-
+ #else
+ 
+ static inline void mpam_sched_in(void) {}
+diff --git a/arch/arm64/kernel/mpam/mpam_device.c b/arch/arm64/kernel/mpam/mpam_device.c
+index ff7905ed8212..e2d2947f930f 100644
+--- a/arch/arm64/kernel/mpam/mpam_device.c
++++ b/arch/arm64/kernel/mpam/mpam_device.c
+@@ -31,7 +31,7 @@
+ #include <linux/types.h>
+ #include <linux/cpu.h>
+ #include <linux/cacheinfo.h>
+-#include <asm/mpam.h>
++#include <linux/arm_mpam.h>
+ #include <asm/mpam_resource.h>
+ #include <asm/mpam.h>
+ 
+diff --git a/arch/arm64/kernel/mpam/mpam_device.h b/arch/arm64/kernel/mpam/mpam_device.h
+index a98c34742374..3165d6b1a270 100644
+--- a/arch/arm64/kernel/mpam/mpam_device.h
++++ b/arch/arm64/kernel/mpam/mpam_device.h
+@@ -5,6 +5,7 @@
+ #include <linux/err.h>
+ #include <linux/cpumask.h>
+ #include <linux/types.h>
++#include <linux/arm_mpam.h>
+ #include "mpam_internal.h"
+ 
+ struct mpam_config;
+@@ -15,13 +16,6 @@ struct mpam_config;
+  */
+ #define SZ_MPAM_DEVICE  (3 * SZ_4K)
+ 
+-enum mpam_class_types {
+-	MPAM_CLASS_SMMU,
+-	MPAM_CLASS_CACHE,   /* Well known caches, e.g. L2 */
+-	MPAM_CLASS_MEMORY,  /* Main memory */
+-	MPAM_CLASS_UNKNOWN, /* Everything else, e.g. TLBs etc */
+-};
+-
+ /*
+  * An mpam_device corresponds to an MSC, an interface to a component's cache
+  * or bandwidth controls. It is associated with a set of CPUs, and a component.
+diff --git a/arch/arm64/kernel/mpam/mpam_resctrl.c b/arch/arm64/kernel/mpam/mpam_resctrl.c
+index 298eb8332676..48b24c390413 100644
+--- a/arch/arm64/kernel/mpam/mpam_resctrl.c
++++ b/arch/arm64/kernel/mpam/mpam_resctrl.c
+@@ -33,6 +33,7 @@
+ #include <linux/sched/signal.h>
+ #include <linux/sched/task.h>
+ #include <linux/resctrlfs.h>
++#include <linux/arm_mpam.h>
+ 
+ #include <asm/mpam_sched.h>
+ #include <asm/mpam_resource.h>
+@@ -90,208 +91,6 @@ void mpam_resctrl_clear_default_cpu(unsigned int cpu)
+ 	cpumask_clear_cpu(cpu, &resctrl_group_default.cpu_mask);
+ }
+ 
+-static inline void mpam_node_assign_val(struct mpam_node *n,
+-				char *name,
+-				u8 type,
+-				phys_addr_t hwpage_address,
+-				u32 component_id)
+-{
+-	n->name = name;
+-	n->type = type;
+-	n->addr = hwpage_address;
+-	n->component_id = component_id;
+-	n->cpus_list = "0";
+-}
+-
+-#define MPAM_NODE_NAME_SIZE (10)
+-
+-struct mpam_node *mpam_nodes_ptr;
+-
+-static int __init mpam_init(void);
+-
+-static void mpam_nodes_unmap(void)
+-{
+-	struct mpam_node *n;
+-
+-	list_for_each_entry(n, &mpam_nodes_ptr->list, list) {
+-		if (n->base) {
+-			iounmap(n->base);
+-			n->base = NULL;
+-		}
+-	}
+-}
+-
+-static int mpam_nodes_init(void)
+-{
+-	int ret = 0;
+-	struct mpam_node *n;
+-
+-	list_for_each_entry(n, &mpam_nodes_ptr->list, list) {
+-		ret |= cpulist_parse(n->cpus_list, &n->cpu_mask);
+-		n->base = ioremap(n->addr, 0x10000);
+-		if (!n->base) {
+-			mpam_nodes_unmap();
+-			return -ENOMEM;
+-		}
+-	}
+-
+-	return ret;
+-}
+-
+-static void mpam_nodes_destroy(void)
+-{
+-	struct mpam_node *n, *tmp;
+-
+-	if (!mpam_nodes_ptr)
+-		return;
+-
+-	list_for_each_entry_safe(n, tmp, &mpam_nodes_ptr->list, list) {
+-		kfree(n->name);
+-		list_del(&n->list);
+-		kfree(n);
+-	}
+-
+-	list_del(&mpam_nodes_ptr->list);
+-	kfree(mpam_nodes_ptr);
+-	mpam_nodes_ptr = NULL;
+-}
+-
+-int __init mpam_nodes_discovery_start(void)
+-{
+-	if (!mpam_enabled)
+-		return -EINVAL;
+-
+-	mpam_nodes_ptr = kzalloc(sizeof(struct mpam_node), GFP_KERNEL);
+-	if (!mpam_nodes_ptr)
+-		return -ENOMEM;
+-
+-	INIT_LIST_HEAD(&mpam_nodes_ptr->list);
+-
+-	return 0;
+-}
+-
+-void __init mpam_nodes_discovery_failed(void)
+-{
+-	mpam_nodes_destroy();
+-}
+-
+-int __init mpam_nodes_discovery_complete(void)
+-{
+-	return mpam_init();
+-}
+-
+-static inline int validate_mpam_node(int type,
+-				int component_id)
+-{
+-	int ret = 0;
+-	struct mpam_node *n;
+-
+-	list_for_each_entry(n, &mpam_nodes_ptr->list, list) {
+-		if (n->component_id == component_id &&
+-				n->type == type) {
+-			ret = -EINVAL;
+-			break;
+-		}
+-	}
+-
+-	return ret;
+-}
+-
+-int mpam_create_cache_node(u32 component_id,
+-			phys_addr_t hwpage_address)
+-{
+-	struct mpam_node *new;
+-	char *name;
+-
+-	if (validate_mpam_node(RDT_RESOURCE_L3, component_id))
+-		goto skip;
+-
+-	new = kzalloc(sizeof(struct mpam_node), GFP_KERNEL);
+-	if (!new)
+-		return -ENOMEM;
+-
+-	name = kzalloc(MPAM_NODE_NAME_SIZE, GFP_KERNEL);
+-	if (!name) {
+-		kfree(new);
+-		return -ENOMEM;
+-	}
+-	snprintf(name, MPAM_NODE_NAME_SIZE, "%s%d", "L3TALL", component_id);
+-
+-	mpam_node_assign_val(new,
+-			name,
+-			RDT_RESOURCE_L3,
+-			hwpage_address,
+-			component_id);
+-	list_add_tail(&new->list, &mpam_nodes_ptr->list);
+-
+-skip:
+-	return 0;
+-}
+-
+-int mpam_create_memory_node(u32 component_id,
+-			phys_addr_t hwpage_address)
+-{
+-	struct mpam_node *new;
+-	char *name;
+-
+-	if (validate_mpam_node(RDT_RESOURCE_MC, component_id))
+-		goto skip;
+-
+-	new = kzalloc(sizeof(struct mpam_node), GFP_KERNEL);
+-	if (!new)
+-		return -ENOMEM;
+-
+-	name = kzalloc(MPAM_NODE_NAME_SIZE, GFP_KERNEL);
+-	if (!name) {
+-		kfree(new);
+-		return -ENOMEM;
+-	}
+-	snprintf(name, MPAM_NODE_NAME_SIZE, "%s%d", "HHAALL", component_id);
+-
+-	mpam_node_assign_val(new,
+-			name,
+-			RDT_RESOURCE_MC,
+-			hwpage_address,
+-			component_id);
+-	list_add_tail(&new->list, &mpam_nodes_ptr->list);
+-
+-skip:
+-	return 0;
+-
+-}
+-
+-int __init mpam_force_init(void)
+-{
+-	int ret;
+-
+-	if (mpam_enabled != enable_default)
+-		return 0;
+-
+-	ret = mpam_nodes_discovery_start();
+-	if (ret)
+-		return ret;
+-
+-	ret |= mpam_create_cache_node(0, 0x000098b90000ULL);
+-	ret |= mpam_create_cache_node(1, 0x000090b90000ULL);
+-	ret |= mpam_create_cache_node(2, 0x200098b90000ULL);
+-	ret |= mpam_create_cache_node(3, 0x200090b90000ULL);
+-	ret |= mpam_create_memory_node(0, 0x000098c10000ULL);
+-	ret |= mpam_create_memory_node(1, 0x000090c10000ULL);
+-	ret |= mpam_create_memory_node(2, 0x200098c10000ULL);
+-	ret |= mpam_create_memory_node(3, 0x200090c10000ULL);
+-	if (ret) {
+-		mpam_nodes_discovery_failed();
+-		pr_err("Failed to force create mpam node\n");
+-		return -EINVAL;
+-	}
+-
+-	ret = mpam_nodes_discovery_complete();
+-	if (!ret)
+-		pr_info("Successfully init mpam by hardcode.\n");
+-
+-	return 1;
+-}
+-
+ static void
+ cat_wrmsr(struct rdt_domain *d, int partid);
+ static void
+@@ -535,19 +334,6 @@ void closid_free(int closid)
+ 	closid_free_map |= 1 << closid;
+ }
+ 
+-static int mpam_online_cpu(unsigned int cpu)
+-{
+-	return mpam_resctrl_set_default_cpu(cpu);
+-}
+-
+-/* remove related resource when cpu offline */
+-static int mpam_offline_cpu(unsigned int cpu)
+-{
+-	mpam_resctrl_clear_default_cpu(cpu);
+-
+-	return 0;
+-}
+-
+ /*
+  * Choose a width for the resource name and resource data based on the
+  * resource that has widest name and cbm.
+@@ -1301,156 +1087,16 @@ struct rdt_domain *mpam_find_domain(struct resctrl_resource *r, int id,
+ 	return NULL;
+ }
+ 
+-static void mpam_domains_destroy(struct resctrl_resource *r)
+-{
+-	struct list_head *pos, *q;
+-	struct rdt_domain *d;
+-
+-	list_for_each_safe(pos, q, &r->domains) {
+-		d = list_entry(pos, struct rdt_domain, list);
+-		list_del(pos);
+-		if (d) {
+-			kfree(d->ctrl_val);
+-			kfree(d);
+-		}
+-	}
+-}
+-
+-static void mpam_domains_init(struct resctrl_resource *r)
+-{
+-	int id = 0;
+-	struct mpam_node *n;
+-	struct list_head *add_pos = NULL;
+-	struct rdt_domain *d;
+-	struct raw_resctrl_resource *rr = (struct raw_resctrl_resource *)r->res;
+-	u32 val;
+-
+-	list_for_each_entry(n, &mpam_nodes_ptr->list, list) {
+-		if (r->rid != n->type)
+-			continue;
+-
+-		d = mpam_find_domain(r, id, &add_pos);
+-		if (IS_ERR(d)) {
+-			mpam_domains_destroy(r);
+-			pr_warn("Could't find cache id %d\n", id);
+-			return;
+-		}
+-
+-		if (!d)
+-			d = kzalloc(sizeof(*d), GFP_KERNEL);
+-		else
+-			continue;
+-
+-		if (!d) {
+-			mpam_domains_destroy(r);
+-			return;
+-		}
+-
+-		d->id = id;
+-		d->base = n->base;
+-		cpumask_copy(&d->cpu_mask, &n->cpu_mask);
+-		rr->default_ctrl = n->default_ctrl;
+-
+-		val = mpam_readl(d->base + MPAMF_IDR);
+-		rr->num_partid = MPAMF_IDR_PARTID_MAX_GET(val) + 1;
+-		rr->num_pmg = MPAMF_IDR_PMG_MAX_GET(val) + 1;
+-
+-		r->mon_capable = MPAMF_IDR_HAS_MSMON(val);
+-		r->mon_enabled = MPAMF_IDR_HAS_MSMON(val);
+-
+-		if (r->rid == RDT_RESOURCE_L3) {
+-			r->alloc_capable = MPAMF_IDR_HAS_CPOR_PART(val);
+-			r->alloc_enabled = MPAMF_IDR_HAS_CPOR_PART(val);
+-
+-			val = mpam_readl(d->base + MPAMF_CSUMON_IDR);
+-			rr->num_mon = MPAMF_IDR_NUM_MON(val);
+-		} else if (r->rid == RDT_RESOURCE_MC) {
+-			r->alloc_capable = MPAMF_IDR_HAS_MBW_PART(val);
+-			r->alloc_enabled = MPAMF_IDR_HAS_MBW_PART(val);
+-
+-			val = mpam_readl(d->base + MPAMF_MBWUMON_IDR);
+-			rr->num_mon = MPAMF_IDR_NUM_MON(val);
+-		}
+-
+-		r->alloc_capable = 1;
+-		r->alloc_enabled = 1;
+-		r->mon_capable = 1;
+-		r->mon_enabled = 1;
+-
+-		d->cpus_list = n->cpus_list;
+-
+-		d->ctrl_val = kmalloc_array(rr->num_partid, sizeof(*d->ctrl_val), GFP_KERNEL);
+-		if (!d->ctrl_val) {
+-			kfree(d);
+-			mpam_domains_destroy(r);
+-
+-			return;
+-		}
+-
+-		if (add_pos)
+-			list_add_tail(&d->list, add_pos);
+-
+-		id++;
+-	}
+-}
+-
+ enum mpam_enable_type __read_mostly mpam_enabled;
+ static int __init mpam_setup(char *str)
+ {
+ 	if (!strcmp(str, "=acpi"))
+-		mpam_enabled = enable_acpi;
+-	else
+-		mpam_enabled = enable_default;
++		mpam_enabled = MPAM_ENABLE_ACPI;
++
+ 	return 1;
+ }
+ __setup("mpam", mpam_setup);
+ 
+-static int __init mpam_init(void)
+-{
+-	struct resctrl_resource *r;
+-	int state, ret;
+-
+-	rdt_alloc_capable = 1;
+-	rdt_mon_capable = 1;
+-
+-	ret = mpam_nodes_init();
+-	if (ret) {
+-		pr_err("internal error: bad cpu list\n");
+-		goto out;
+-	}
+-
+-	mpam_domains_init(&resctrl_resources_all[RDT_RESOURCE_L3]);
+-	mpam_domains_init(&resctrl_resources_all[RDT_RESOURCE_MC]);
+-
+-	state = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN,
+-				  "arm64/mpam:online:",
+-				  mpam_online_cpu, mpam_offline_cpu);
+-	if (state < 0) {
+-		ret = state;
+-		goto out;
+-	}
+-
+-	ret = mpam_resctrl_init();
+-	if (ret) {
+-		cpuhp_remove_state(state);
+-		goto out;
+-	}
+-
+-	for_each_resctrl_resource(r) {
+-		if (r->alloc_capable)
+-			pr_info("MPAM %s allocation detected\n", r->name);
+-	}
+-
+-	for_each_resctrl_resource(r) {
+-		if (r->mon_capable)
+-			pr_info("MPAM %s monitoring detected\n", r->name);
+-	}
+-
+-out:
+-	mpam_nodes_destroy();
+-	return ret;
+-}
+-
+ int __init mpam_resctrl_init(void)
+ {
+ 	mpam_init_padding();
+diff --git a/drivers/acpi/arm64/mpam.c b/drivers/acpi/arm64/mpam.c
+index 1f82dce33e07..10e4769d5227 100644
+--- a/drivers/acpi/arm64/mpam.c
++++ b/drivers/acpi/arm64/mpam.c
+@@ -30,7 +30,7 @@
+ #include <linux/cacheinfo.h>
+ #include <linux/string.h>
+ #include <linux/nodemask.h>
+-#include <asm/mpam_resource.h>
++#include <linux/arm_mpam.h>
+ 
+ /**
+  * acpi_mpam_label_cache_component_id() - Recursivly find @min_physid
+@@ -95,6 +95,7 @@ static int __init acpi_mpam_parse_memory(struct acpi_mpam_header *h)
+ {
+ 	int ret = 0;
+ 	u32 component_id;
++	struct mpam_device *dev;
+ 	struct acpi_mpam_node_memory *node = (struct acpi_mpam_node_memory *)h;
+ 
+ 	ret = acpi_mpam_label_memory_component_id(node->proximity_domain,
+@@ -104,9 +105,9 @@ static int __init acpi_mpam_parse_memory(struct acpi_mpam_header *h)
+ 		return -EINVAL;
+ 	}
+ 
+-	ret = mpam_create_memory_node(component_id,
++	dev = mpam_device_create_memory(component_id,
+ 					node->header.base_address);
+-	if (ret) {
++	if (IS_ERR(dev)) {
+ 		pr_err("Failed to create memory node\n");
+ 		return -EINVAL;
+ 	}
+@@ -118,7 +119,10 @@ static int __init acpi_mpam_parse_cache(struct acpi_mpam_header *h,
+ 						struct acpi_table_header *pptt)
+ {
+ 	int ret = 0;
++	int level;
+ 	u32 component_id;
++	struct mpam_device *dev;
++	struct cacheinfo *ci;
+ 	struct acpi_pptt_cache *pptt_cache;
+ 	struct acpi_pptt_processor *pptt_cpu_node;
+ 	struct acpi_mpam_node_cache *node = (struct acpi_mpam_node_cache *)h;
+@@ -148,9 +152,28 @@ static int __init acpi_mpam_parse_cache(struct acpi_mpam_header *h,
+ 		return -EINVAL;
+ 	}
+ 
+-	ret = mpam_create_cache_node(component_id,
+-					node->header.base_address);
+-	if (ret) {
++	cpus_read_lock();
++	ci = cacheinfo_shared_cpu_map_search(pptt_cpu_node);
++	if (!ci) {
++		pr_err_once("No CPU has cache with PPTT reference 0x%x",
++				node->PPTT_ref);
++		pr_err_once("All CPUs must be online to probe mpam.\n");
++		cpus_read_unlock();
++		return -ENODEV;
++	}
++
++	level = ci->level;
++	ci = NULL;
++	cpus_read_unlock();
++
++	/*
++	 * Possible we can get cpu-affinity in next MPAM ACPI version,
++	 * now we have to set it to NULL and use default possible_aff-
++	 * inity.
++	 */
++	dev = mpam_device_create_cache(level, component_id, NULL,
++				node->header.base_address);
++	if (IS_ERR(dev)) {
+ 		pr_err("Failed to create cache node\n");
+ 		return -EINVAL;
+ 	}
+@@ -166,7 +189,8 @@ static int __init acpi_mpam_parse_table(struct acpi_table_header *table,
+ 	struct acpi_mpam_header *node_hdr;
+ 	int ret = 0;
+ 
+-	ret = mpam_nodes_discovery_start();
++	ret = mpam_discovery_start();
++
+ 	if (ret)
+ 		return ret;
+ 
+@@ -200,9 +224,9 @@ static int __init acpi_mpam_parse_table(struct acpi_table_header *table,
+ 
+ 	if (ret) {
+ 		pr_err("discovery failed: %d\n", ret);
+-		mpam_nodes_discovery_failed();
++		mpam_discovery_failed();
+ 	} else {
+-		ret = mpam_nodes_discovery_complete();
++		ret = mpam_discovery_complete();
+ 		if (!ret)
+ 			pr_info("Successfully init mpam by ACPI.\n");
+ 	}
+@@ -219,11 +243,7 @@ int __init acpi_mpam_parse(void)
+ 	if (!cpus_have_const_cap(ARM64_HAS_MPAM))
+ 		return 0;
+ 
+-	ret = mpam_force_init();
+-	if (ret)
+-		return 0;
+-
+-	if (acpi_disabled)
++	if (acpi_disabled || mpam_enabled != MPAM_ENABLE_ACPI)
+ 		return 0;
+ 
+ 	status = acpi_get_table(ACPI_SIG_MPAM, 0, &mpam);
+diff --git a/include/linux/arm_mpam.h b/include/linux/arm_mpam.h
+new file mode 100644
+index 000000000000..18da2090ccd5
+--- /dev/null
++++ b/include/linux/arm_mpam.h
+@@ -0,0 +1,67 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __LINUX_ARM_MPAM_H
++#define __LINUX_ARM_MPAM_H
++
++#include <linux/err.h>
++#include <linux/cpumask.h>
++#include <linux/types.h>
++
++struct mpam_device;
++
++enum mpam_class_types {
++	MPAM_CLASS_SMMU,
++	MPAM_CLASS_CACHE,   /* Well known caches, e.g. L2 */
++	MPAM_CLASS_MEMORY,  /* Main memory */
++	MPAM_CLASS_UNKNOWN, /* Everything else, e.g. TLBs etc */
++};
++
++struct mpam_device * __init
++__mpam_device_create(u8 level_idx, enum mpam_class_types type,
++			int component_id, const struct cpumask *fw_affinity,
++			phys_addr_t hwpage_address);
++
++/*
++ * Create a device for a well known cache, e.g. L2.
++ * @level_idx and @cache_id will be used to match the cache via cacheinfo
++ * to learn the component affinity and export domain/resources via resctrl.
++ * If the device can only be accessed from a smaller set of CPUs, provide
++ * this as @device_affinity, which can otherwise be NULL.
++ *
++ * Returns the new device, or an ERR_PTR().
++ */
++static inline struct mpam_device * __init
++mpam_device_create_cache(u8 level_idx, int cache_id,
++			const struct cpumask *device_affinity,
++			phys_addr_t hwpage_address)
++{
++	return __mpam_device_create(level_idx, MPAM_CLASS_CACHE, cache_id,
++			device_affinity, hwpage_address);
++}
++/*
++ * Create a device for a main memory.
++ * For NUMA systems @nid allows multiple components to be created,
++ * which will be exported as resctrl domains. MSCs for memory must
++ * be accessible from any cpu.
++ */
++static inline struct mpam_device * __init
++mpam_device_create_memory(int nid, phys_addr_t hwpage_address)
++{
++	struct cpumask dev_affinity;
++
++	cpumask_copy(&dev_affinity, cpumask_of_node(nid));
++
++	return __mpam_device_create(~0, MPAM_CLASS_MEMORY, nid,
++			&dev_affinity, hwpage_address);
++}
++int __init mpam_discovery_start(void);
++int __init mpam_discovery_complete(void);
++void __init mpam_discovery_failed(void);
++
++enum mpam_enable_type {
++	MPAM_ENABLE_DENIED = 0,
++	MPAM_ENABLE_ACPI,
++};
++
++extern enum mpam_enable_type mpam_enabled;
++
++#endif
+-- 
+2.26.2
+

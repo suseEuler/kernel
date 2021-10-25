@@ -1,0 +1,110 @@
+From ebc9b95260151d966728cf0063b3b4e465f934d9 Mon Sep 17 00:00:00 2001
+From: Ming Lei <ming.lei@redhat.com>
+Date: Thu, 14 Oct 2021 16:17:07 +0800
+Subject: [PATCH] nvme: prepare for pairing quiescing and unquiescing
+Git-commit: ebc9b95260151d966728cf0063b3b4e465f934d9
+Patch-mainline: v5.16-rc1
+References: bsn#12
+openEuler-commit: a739b9e1158e8a30986da195bfc93b3ae79f28d0
+
+Add two helpers so that we can prepare for pairing quiescing and
+unquiescing which will be done in next patch.
+
+Signed-off-by: Ming Lei <ming.lei@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Link: https://lore.kernel.org/r/20211014081710.1871747-4-ming.lei@redhat.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/nvme/host/core.c | 54 ++++++++++++++++++++++++----------------
+ 1 file changed, 32 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index dd425ae68c07..cdea98169131 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -102,26 +102,6 @@ static void nvme_update_bdev_size(struct gendisk *disk)
+ 	}
+ }
+ 
+-/*
+- * Prepare a queue for teardown.
+- *
+- * This must forcibly unquiesce queues to avoid blocking dispatch, and only set
+- * the capacity to 0 after that to avoid blocking dispatchers that may be
+- * holding bd_butex.  This will end buffered writers dirtying pages that can't
+- * be synced.
+- */
+-static void nvme_set_queue_dying(struct nvme_ns *ns)
+-{
+-	if (test_and_set_bit(NVME_NS_DEAD, &ns->flags))
+-		return;
+-
+-	blk_set_queue_dying(ns->queue);
+-	blk_mq_unquiesce_queue(ns->queue);
+-
+-	set_capacity(ns->disk, 0);
+-	nvme_update_bdev_size(ns->disk);
+-}
+-
+ static void nvme_queue_scan(struct nvme_ctrl *ctrl)
+ {
+ 	/*
+@@ -4540,6 +4520,36 @@ int nvme_init_ctrl(struct nvme_ctrl *ctrl, struct device *dev,
+ }
+ EXPORT_SYMBOL_GPL(nvme_init_ctrl);
+ 
++static void nvme_start_ns_queue(struct nvme_ns *ns)
++{
++	blk_mq_unquiesce_queue(ns->queue);
++}
++
++static void nvme_stop_ns_queue(struct nvme_ns *ns)
++{
++	blk_mq_quiesce_queue(ns->queue);
++}
++
++/*
++ * Prepare a queue for teardown.
++ *
++ * This must forcibly unquiesce queues to avoid blocking dispatch, and only set
++ * the capacity to 0 after that to avoid blocking dispatchers that may be
++ * holding bd_butex.  This will end buffered writers dirtying pages that can't
++ * be synced.
++ */
++static void nvme_set_queue_dying(struct nvme_ns *ns)
++{
++	if (test_and_set_bit(NVME_NS_DEAD, &ns->flags))
++		return;
++
++	blk_set_queue_dying(ns->queue);
++	nvme_start_ns_queue(ns);
++
++	set_capacity(ns->disk, 0);
++	nvme_update_bdev_size(ns->disk);
++}
++
+ /**
+  * nvme_kill_queues(): Ends all namespace queues
+  * @ctrl: the dead controller that needs to end
+@@ -4618,7 +4628,7 @@ void nvme_stop_queues(struct nvme_ctrl *ctrl)
+ 
+ 	down_read(&ctrl->namespaces_rwsem);
+ 	list_for_each_entry(ns, &ctrl->namespaces, list)
+-		blk_mq_quiesce_queue(ns->queue);
++		nvme_stop_ns_queue(ns);
+ 	up_read(&ctrl->namespaces_rwsem);
+ }
+ EXPORT_SYMBOL_GPL(nvme_stop_queues);
+@@ -4629,7 +4639,7 @@ void nvme_start_queues(struct nvme_ctrl *ctrl)
+ 
+ 	down_read(&ctrl->namespaces_rwsem);
+ 	list_for_each_entry(ns, &ctrl->namespaces, list)
+-		blk_mq_unquiesce_queue(ns->queue);
++		nvme_start_ns_queue(ns);
+ 	up_read(&ctrl->namespaces_rwsem);
+ }
+ EXPORT_SYMBOL_GPL(nvme_start_queues);
+-- 
+2.26.2
+

@@ -1,0 +1,112 @@
+From 60565144df0a04ddb48d0d9658794f851ba3c7ae Mon Sep 17 00:00:00 2001
+From: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Date: Tue, 12 Oct 2021 16:38:01 +0800
+Subject: [PATCH] init: only move down lockup_detector_init() when
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 60565144df0a04ddb48d0d9658794f851ba3c7ae
+
+ sdei_watchdog is enabled
+
+hulk inclusion
+category: bugfix
+bugzilla: 173968 https://gitee.com/openeuler/kernel/issues/I4DDEL
+
+-------------------------------------------------
+
+When I enable CONFIG_DEBUG_PREEMPT and CONFIG_PREEMPT on X86, I got the
+following Call Trace:
+
+[    3.341853] BUG: using smp_processor_id() in preemptible [00000000] code: swapper/0/1
+[    3.344392] caller is debug_smp_processor_id+0x17/0x20
+[    3.344395] CPU: 1 PID: 1 Comm: swapper/0 Not tainted 5.10.0+ #398
+[    3.344397] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.10.2-0-g5f4c7b1-prebuilt.qemu-project.org 04/01/2014
+[    3.344399] Call Trace:
+[    3.344410]  dump_stack+0x60/0x76
+[    3.344412]  check_preemption_disabled+0xba/0xc0
+[    3.344415]  debug_smp_processor_id+0x17/0x20
+[    3.344422]  hardlockup_detector_event_create+0xf/0x60
+[    3.344427]  hardlockup_detector_perf_init+0xf/0x41
+[    3.344430]  watchdog_nmi_probe+0xe/0x10
+[    3.344432]  lockup_detector_init+0x22/0x5b
+[    3.344437]  kernel_init_freeable+0x20c/0x245
+[    3.344439]  ? rest_init+0xd0/0xd0
+[    3.344441]  kernel_init+0xe/0x110
+[    3.344446]  ret_from_fork+0x22/0x30
+
+It is because sched_init_smp() set 'current->nr_cpus_allowed' to
+possible cpu number, and check_preemption_disabled() failed. This issue
+is introduced by commit a79050434b45, which move down
+lockup_detector_init() after do_basic_setup(). Fix it by moving
+lockup_detector_init() to its origin place when sdei_watchdog is
+disabled. There is no problem when sdei_watchdog is enabled because
+watchdog_nmi_probe() is overridden in
+'arch/arm64/kernel/watchdog_sdei.c' in this case.
+
+Fixes: a79050434b45 ("lockup_detector: init lockup detector after all the init_calls")
+Signed-off-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Wei Li <liwei391@huawei.com>
+Signed-off-by: Chen Jun <chenjun102@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/kernel/watchdog_sdei.c | 2 +-
+ include/linux/nmi.h               | 2 ++
+ init/main.c                       | 6 +++++-
+ 3 files changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm64/kernel/watchdog_sdei.c b/arch/arm64/kernel/watchdog_sdei.c
+index aa980b090598..cdbe2ebe3d69 100644
+--- a/arch/arm64/kernel/watchdog_sdei.c
++++ b/arch/arm64/kernel/watchdog_sdei.c
+@@ -21,7 +21,7 @@
+ #define SDEI_NMI_WATCHDOG_HWIRQ		29
+ 
+ static int sdei_watchdog_event_num;
+-static bool disable_sdei_nmi_watchdog;
++bool disable_sdei_nmi_watchdog;
+ static bool sdei_watchdog_registered;
+ static DEFINE_PER_CPU(ktime_t, last_check_time);
+ 
+diff --git a/include/linux/nmi.h b/include/linux/nmi.h
+index 662405794e4c..8c9b857e7f62 100644
+--- a/include/linux/nmi.h
++++ b/include/linux/nmi.h
+@@ -231,8 +231,10 @@ int proc_watchdog_cpumask(struct ctl_table *, int, void *, size_t *, loff_t *);
+ 
+ #ifdef CONFIG_SDEI_WATCHDOG
+ void sdei_watchdog_clear_eoi(void);
++extern bool disable_sdei_nmi_watchdog;
+ #else
+ static inline void sdei_watchdog_clear_eoi(void) { }
++#define disable_sdei_nmi_watchdog 1
+ #endif
+ 
+ #endif
+diff --git a/init/main.c b/init/main.c
+index f6fe37a744b7..ad414aa0a0eb 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -1518,6 +1518,8 @@ static noinline void __init kernel_init_freeable(void)
+ 
+ 	rcu_init_tasks_generic();
+ 	do_pre_smp_initcalls();
++	if (disable_sdei_nmi_watchdog)
++		lockup_detector_init();
+ 
+ 	smp_init();
+ 	sched_init_smp();
+@@ -1529,7 +1531,9 @@ static noinline void __init kernel_init_freeable(void)
+ 
+ 	do_basic_setup();
+ 
+-	lockup_detector_init();
++	/* sdei_watchdog needs to be initialized after sdei_init */
++	if (!disable_sdei_nmi_watchdog)
++		lockup_detector_init();
+ 
+ 	kunit_run_all_tests();
+ 
+-- 
+2.26.2
+

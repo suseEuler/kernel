@@ -1,0 +1,108 @@
+From 051d7aaea6b086b300d3b6541431840c96930b71 Mon Sep 17 00:00:00 2001
+From: Cheng Jian <cj.chengjian@huawei.com>
+Date: Mon, 29 Nov 2021 16:28:55 +0800
+Subject: [PATCH] panic/printk: fix zap_lock
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 051d7aaea6b086b300d3b6541431840c96930b71
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 34546, https://gitee.com/openeuler/kernel/issues/I4JKT1
+CVE: NA
+
+----------------------------------------
+
+There are two problems with the implementation and use of
+zap_lock().
+
+Firstly, This console_sem does not require reinit in zap_lock(),
+this is because:
+
+1). printk() itself does try_lock() and skips console handling
+when the semaphore is not available.
+
+2). panic() tries to push the messages later in console_flush_on_panic().
+It ignores the semaphore. Also most console drivers ignore their
+internal locks because oops_in_progress is set by bust_spinlocks().
+
+Secondly, The situation is more complicated when NMI is not used.
+
+1). Non-stopped CPUs are in unknown state, most likely in a busy loop.
+Nobody knows whether printk() is repeatedly called in the loop.
+When it was called, re-initializing any lock would cause double
+unlock and deadlock.
+
+2). It would be possible to add some more hacks. One problem is that
+there are two groups of users. One prefer to risk a deadlock and
+have a chance to see the messages. Others prefer to always
+reach emergency_restart() and reboot the machine.
+
+Fixes: d0dfaa87c2aa ("printk/panic: Avoid deadlock in printk()")
+Signed-off-by: Cheng Jian <cj.chengjian@huawei.com>
+Reviewed-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Chen Zhou <chenzhou10@huawei.com>
+Signed-off-by: Cheng Jian <cj.chengjian@huawei.com>
+Reviewed-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/panic.c         | 25 +++++++++++++++++++++++++
+ kernel/printk/printk.c |  3 ---
+ 2 files changed, 25 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/panic.c b/kernel/panic.c
+index 75f07bb57006..3d75855db4e6 100644
+--- a/kernel/panic.c
++++ b/kernel/panic.c
+@@ -265,7 +265,32 @@ void panic(const char *fmt, ...)
+ 		crash_smp_send_stop();
+ 	}
+ 
++	/*
++	 * ZAP console related locks when nmi broadcast. If a crash is occurring,
++	 * make sure we can't deadlock. And make sure that we print immediately.
++	 *
++	 * A deadlock caused by logbuf_lock can be occured when panic:
++	 *	a) Panic CPU is running in non-NMI context;
++	 *	b) Panic CPU sends out shutdown IPI via NMI vector;
++	 *      c) One of the CPUs that we bring down via NMI vector holded logbuf_lock;
++	 *	d) Panic CPU try to hold logbuf_lock, then deadlock occurs.
++	 *
++	 * At present, only try to solve this problem for the ARCH with NMI,
++	 * by reinit lock, this situation is more complicated when NMI is not
++	 * used.
++	 * 1).	Non-stopped CPUs are in unknown state, most likely in a busy loop.
++	 *	Nobody knows whether printk() is repeatedly called in the loop.
++	 *	When it was called, re-initializing any lock would cause double
++	 *      unlock and deadlock.
++	 *
++	 * 2).	It would be possible to add some more hacks. One problem is that
++	 *	there are two groups of users. One prefer to risk a deadlock and
++	 *	have a chance to see the messages. Others prefer to always
++	 *      reach emergency_restart() and reboot the machine.
++	 */
++#ifdef CONFIG_X86
+ 	zap_locks();
++#endif
+ 
+ 	/*
+ 	 * Run any panic handlers, including those that might need to
+diff --git a/kernel/printk/printk.c b/kernel/printk/printk.c
+index a504ff599d69..bf58d5777bce 100644
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@ -1747,9 +1747,6 @@ void zap_locks(void)
+ 	if (raw_spin_is_locked(&logbuf_lock)) {
+ 		debug_locks_off();
+ 		raw_spin_lock_init(&logbuf_lock);
+-
+-		console_suspended = 1;
+-		sema_init(&console_sem, 1);
+ 	}
+ 
+ 	if (raw_spin_is_locked(&console_owner_lock)) {
+-- 
+2.26.2
+

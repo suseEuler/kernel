@@ -1,0 +1,149 @@
+From d1d488d813703618f0dd93f0e4c4a05928114aa8 Mon Sep 17 00:00:00 2001
+From: Christian Brauner <christian.brauner@ubuntu.com>
+Date: Wed, 14 Jul 2021 15:47:50 +0200
+Subject: [PATCH] fs: add vfs_parse_fs_param_source() helper
+Git-commit: d1d488d813703618f0dd93f0e4c4a05928114aa8
+Patch-mainline: v5.14-rc2
+References: bsn#12
+openEuler-commit: 7e367217d26ec34abb594e4d1f2f2d9761a62b86
+
+Add a simple helper that filesystems can use in their parameter parser
+to parse the "source" parameter. A few places open-coded this function
+and that already caused a bug in the cgroup v1 parser that we fixed.
+Let's make it harder to get this wrong by introducing a helper which
+performs all necessary checks.
+
+Link: https://syzkaller.appspot.com/bug?id=6312526aba5beae046fdae8f00399f87aab48b12
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Signed-off-by: Christian Brauner <christian.brauner@ubuntu.com>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/fs_context.c            | 54 +++++++++++++++++++++++++-------------
+ include/linux/fs_context.h |  2 ++
+ kernel/cgroup/cgroup-v1.c  | 14 ++++------
+ 3 files changed, 43 insertions(+), 27 deletions(-)
+
+diff --git a/fs/fs_context.c b/fs/fs_context.c
+index 4858645ca620..b7e43a780a62 100644
+--- a/fs/fs_context.c
++++ b/fs/fs_context.c
+@@ -79,6 +79,35 @@ static int vfs_parse_sb_flag(struct fs_context *fc, const char *key)
+ 	return -ENOPARAM;
+ }
+ 
++/**
++ * vfs_parse_fs_param_source - Handle setting "source" via parameter
++ * @fc: The filesystem context to modify
++ * @param: The parameter
++ *
++ * This is a simple helper for filesystems to verify that the "source" they
++ * accept is sane.
++ *
++ * Returns 0 on success, -ENOPARAM if this is not  "source" parameter, and
++ * -EINVAL otherwise. In the event of failure, supplementary error information
++ *  is logged.
++ */
++int vfs_parse_fs_param_source(struct fs_context *fc, struct fs_parameter *param)
++{
++	if (strcmp(param->key, "source") != 0)
++		return -ENOPARAM;
++
++	if (param->type != fs_value_is_string)
++		return invalf(fc, "Non-string source");
++
++	if (fc->source)
++		return invalf(fc, "Multiple sources");
++
++	fc->source = param->string;
++	param->string = NULL;
++	return 0;
++}
++EXPORT_SYMBOL(vfs_parse_fs_param_source);
++
+ /**
+  * vfs_parse_fs_param - Add a single parameter to a superblock config
+  * @fc: The filesystem context to modify
+@@ -122,15 +151,9 @@ int vfs_parse_fs_param(struct fs_context *fc, struct fs_parameter *param)
+ 	/* If the filesystem doesn't take any arguments, give it the
+ 	 * default handling of source.
+ 	 */
+-	if (strcmp(param->key, "source") == 0) {
+-		if (param->type != fs_value_is_string)
+-			return invalf(fc, "VFS: Non-string source");
+-		if (fc->source)
+-			return invalf(fc, "VFS: Multiple sources");
+-		fc->source = param->string;
+-		param->string = NULL;
+-		return 0;
+-	}
++	ret = vfs_parse_fs_param_source(fc, param);
++	if (ret != -ENOPARAM)
++		return ret;
+ 
+ 	return invalf(fc, "%s: Unknown parameter '%s'",
+ 		      fc->fs_type->name, param->key);
+@@ -504,16 +527,11 @@ static int legacy_parse_param(struct fs_context *fc, struct fs_parameter *param)
+ 	struct legacy_fs_context *ctx = fc->fs_private;
+ 	unsigned int size = ctx->data_size;
+ 	size_t len = 0;
++	int ret;
+ 
+-	if (strcmp(param->key, "source") == 0) {
+-		if (param->type != fs_value_is_string)
+-			return invalf(fc, "VFS: Legacy: Non-string source");
+-		if (fc->source)
+-			return invalf(fc, "VFS: Legacy: Multiple sources");
+-		fc->source = param->string;
+-		param->string = NULL;
+-		return 0;
+-	}
++	ret = vfs_parse_fs_param_source(fc, param);
++	if (ret != -ENOPARAM)
++		return ret;
+ 
+ 	if (ctx->param_type == LEGACY_FS_MONOLITHIC_PARAMS)
+ 		return invalf(fc, "VFS: Legacy: Can't mix monolithic and individual options");
+diff --git a/include/linux/fs_context.h b/include/linux/fs_context.h
+index 5b44b0195a28..6b54982fc5f3 100644
+--- a/include/linux/fs_context.h
++++ b/include/linux/fs_context.h
+@@ -139,6 +139,8 @@ extern int vfs_parse_fs_string(struct fs_context *fc, const char *key,
+ extern int generic_parse_monolithic(struct fs_context *fc, void *data);
+ extern int vfs_get_tree(struct fs_context *fc);
+ extern void put_fs_context(struct fs_context *fc);
++extern int vfs_parse_fs_param_source(struct fs_context *fc,
++				     struct fs_parameter *param);
+ extern void fc_drop_locked(struct fs_context *fc);
+ 
+ /*
+diff --git a/kernel/cgroup/cgroup-v1.c b/kernel/cgroup/cgroup-v1.c
+index 812dd4ed0129..88b72815aa9d 100644
+--- a/kernel/cgroup/cgroup-v1.c
++++ b/kernel/cgroup/cgroup-v1.c
+@@ -915,15 +915,11 @@ int cgroup1_parse_param(struct fs_context *fc, struct fs_parameter *param)
+ 
+ 	opt = fs_parse(fc, cgroup1_fs_parameters, param, &result);
+ 	if (opt == -ENOPARAM) {
+-		if (strcmp(param->key, "source") == 0) {
+-			if (param->type != fs_value_is_string)
+-				return invalf(fc, "Non-string source");
+-			if (fc->source)
+-				return invalf(fc, "Multiple sources not supported");
+-			fc->source = param->string;
+-			param->string = NULL;
+-			return 0;
+-		}
++		int ret;
++
++		ret = vfs_parse_fs_param_source(fc, param);
++		if (ret != -ENOPARAM)
++			return ret;
+ 		for_each_subsys(ss, i) {
+ 			if (strcmp(param->key, ss->legacy_name))
+ 				continue;
+-- 
+2.26.2
+

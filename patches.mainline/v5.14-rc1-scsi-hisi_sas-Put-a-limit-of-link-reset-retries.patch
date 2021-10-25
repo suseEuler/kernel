@@ -1,0 +1,82 @@
+From 366da0da1f5fe4e7e702f5864a557e57f485431f Mon Sep 17 00:00:00 2001
+From: Luo Jiaxing <luojiaxing@huawei.com>
+Date: Mon, 7 Jun 2021 17:29:35 +0800
+Subject: [PATCH] scsi: hisi_sas: Put a limit of link reset retries
+Git-commit: 366da0da1f5fe4e7e702f5864a557e57f485431f
+Patch-mainline: v5.14-rc1
+References: bsn#12
+
+
+If an OOB event is received but the phy still fails to come up, a link
+reset will be issued repeatedly at an interval of 20s until the phy comes
+up.
+
+Set a limit for link reset issue retries to avoid printing the timeout
+message endlessly.
+
+Link: https://lore.kernel.org/r/1623058179-80434-2-git-send-email-john.garry@huawei.com
+Signed-off-by: Luo Jiaxing <luojiaxing@huawei.com>
+Signed-off-by: John Garry <john.garry@huawei.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ drivers/scsi/hisi_sas/hisi_sas.h      |  1 +
+ drivers/scsi/hisi_sas/hisi_sas_main.c | 15 +++++++++++++--
+ 2 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/scsi/hisi_sas/hisi_sas.h b/drivers/scsi/hisi_sas/hisi_sas.h
+index cf879cc59e4c..8e36ede12cf1 100644
+--- a/drivers/scsi/hisi_sas/hisi_sas.h
++++ b/drivers/scsi/hisi_sas/hisi_sas.h
+@@ -185,6 +185,7 @@ struct hisi_sas_phy {
+ 	enum sas_linkrate	minimum_linkrate;
+ 	enum sas_linkrate	maximum_linkrate;
+ 	int enable;
++	int wait_phyup_cnt;
+ 	atomic_t down_cnt;
+ 
+ 	/* Trace FIFO */
+diff --git a/drivers/scsi/hisi_sas/hisi_sas_main.c b/drivers/scsi/hisi_sas/hisi_sas_main.c
+index 5a204074099c..50420741fc81 100644
+--- a/drivers/scsi/hisi_sas/hisi_sas_main.c
++++ b/drivers/scsi/hisi_sas/hisi_sas_main.c
+@@ -857,6 +857,7 @@ static void hisi_sas_phyup_work(struct work_struct *work)
+ 	struct asd_sas_phy *sas_phy = &phy->sas_phy;
+ 	int phy_no = sas_phy->id;
+ 
++	phy->wait_phyup_cnt = 0;
+ 	if (phy->identify.target_port_protocols == SAS_PROTOCOL_SSP)
+ 		hisi_hba->hw->sl_notify_ssp(hisi_hba, phy_no);
+ 	hisi_sas_bytes_dmaed(hisi_hba, phy_no, GFP_KERNEL);
+@@ -899,6 +900,8 @@ static void hisi_sas_wait_phyup_timedout(struct timer_list *t)
+ 	hisi_sas_notify_phy_event(phy, HISI_PHYE_LINK_RESET);
+ }
+ 
++#define HISI_SAS_WAIT_PHYUP_RETRIES	10
++
+ void hisi_sas_phy_oob_ready(struct hisi_hba *hisi_hba, int phy_no)
+ {
+ 	struct hisi_sas_phy *phy = &hisi_hba->phy[phy_no];
+@@ -909,8 +912,16 @@ void hisi_sas_phy_oob_ready(struct hisi_hba *hisi_hba, int phy_no)
+ 		return;
+ 
+ 	if (!timer_pending(&phy->timer)) {
+-		phy->timer.expires = jiffies + HISI_SAS_WAIT_PHYUP_TIMEOUT * HZ;
+-		add_timer(&phy->timer);
++		if (phy->wait_phyup_cnt < HISI_SAS_WAIT_PHYUP_RETRIES) {
++			phy->wait_phyup_cnt++;
++			phy->timer.expires = jiffies +
++					     HISI_SAS_WAIT_PHYUP_TIMEOUT * HZ;
++			add_timer(&phy->timer);
++		} else {
++			dev_warn(dev, "phy%d failed to come up %d times, giving up\n",
++				 phy_no, phy->wait_phyup_cnt);
++			phy->wait_phyup_cnt = 0;
++		}
+ 	}
+ }
+ EXPORT_SYMBOL_GPL(hisi_sas_phy_oob_ready);
+-- 
+2.31.1
+

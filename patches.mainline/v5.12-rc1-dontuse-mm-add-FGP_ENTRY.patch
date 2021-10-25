@@ -1,0 +1,176 @@
+From 44835d20b2a0c9b4c0c3fb96e90f4e2fd4a4e41d Mon Sep 17 00:00:00 2001
+From: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+Date: Thu, 25 Feb 2021 17:15:36 -0800
+Subject: [PATCH] mm: add FGP_ENTRY
+Git-commit: 44835d20b2a0c9b4c0c3fb96e90f4e2fd4a4e41d
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+The functionality of find_lock_entry() and find_get_entry() can be
+provided by pagecache_get_page(), which lets us delete find_lock_entry()
+and make find_get_entry() static.
+
+Link: https://lkml.kernel.org/r/20201112212641.27837-5-willy@infradead.org
+Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Cc: Dave Chinner <dchinner@redhat.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: William Kucharski <william.kucharski@oracle.com>
+Cc: Yang Shi <yang.shi@linux.alibaba.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ include/linux/pagemap.h |  1 +
+ mm/filemap.c            | 44 ++++++++---------------------------------
+ mm/internal.h           |  3 ---
+ mm/shmem.c              |  3 ++-
+ mm/swap_state.c         |  3 ++-
+ 5 files changed, 13 insertions(+), 41 deletions(-)
+
+diff --git a/include/linux/pagemap.h b/include/linux/pagemap.h
+index bd629d676a27..b379b2388202 100644
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@ -315,6 +315,7 @@ pgoff_t page_cache_prev_miss(struct address_space *mapping,
+ #define FGP_NOWAIT		0x00000020
+ #define FGP_FOR_MMAP		0x00000040
+ #define FGP_HEAD		0x00000080
++#define FGP_ENTRY		0x00000100
+ 
+ struct page *pagecache_get_page(struct address_space *mapping, pgoff_t offset,
+ 		int fgp_flags, gfp_t cache_gfp_mask);
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 57eae5163bce..84b7813badf1 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -1658,7 +1658,7 @@ pgoff_t page_cache_prev_miss(struct address_space *mapping,
+ }
+ EXPORT_SYMBOL(page_cache_prev_miss);
+ 
+-/**
++/*
+  * find_get_entry - find and get a page cache entry
+  * @mapping: the address_space to search
+  * @index: The page cache index.
+@@ -1671,7 +1671,7 @@ EXPORT_SYMBOL(page_cache_prev_miss);
+  *
+  * Return: The head page or shadow entry, %NULL if nothing is found.
+  */
+-struct page *find_get_entry(struct address_space *mapping, pgoff_t index)
++static struct page *find_get_entry(struct address_space *mapping, pgoff_t index)
+ {
+ 	XA_STATE(xas, &mapping->i_pages, index);
+ 	struct page *page;
+@@ -1707,39 +1707,6 @@ struct page *find_get_entry(struct address_space *mapping, pgoff_t index)
+ 	return page;
+ }
+ 
+-/**
+- * find_lock_entry - Locate and lock a page cache entry.
+- * @mapping: The address_space to search.
+- * @index: The page cache index.
+- *
+- * Looks up the page at @mapping & @index.  If there is a page in the
+- * cache, the head page is returned locked and with an increased refcount.
+- *
+- * If the slot holds a shadow entry of a previously evicted page, or a
+- * swap entry from shmem/tmpfs, it is returned.
+- *
+- * Context: May sleep.
+- * Return: The head page or shadow entry, %NULL if nothing is found.
+- */
+-struct page *find_lock_entry(struct address_space *mapping, pgoff_t index)
+-{
+-	struct page *page;
+-
+-repeat:
+-	page = find_get_entry(mapping, index);
+-	if (page && !xa_is_value(page)) {
+-		lock_page(page);
+-		/* Has the page been truncated? */
+-		if (unlikely(page->mapping != mapping)) {
+-			unlock_page(page);
+-			put_page(page);
+-			goto repeat;
+-		}
+-		VM_BUG_ON_PAGE(!thp_contains(page, index), page);
+-	}
+-	return page;
+-}
+-
+ /**
+  * pagecache_get_page - Find and get a reference to a page.
+  * @mapping: The address_space to search.
+@@ -1755,6 +1722,8 @@ struct page *find_lock_entry(struct address_space *mapping, pgoff_t index)
+  * * %FGP_LOCK - The page is returned locked.
+  * * %FGP_HEAD - If the page is present and a THP, return the head page
+  *   rather than the exact page specified by the index.
++ * * %FGP_ENTRY - If there is a shadow / swap / DAX entry, return it
++ *   instead of allocating a new page to replace it.
+  * * %FGP_CREAT - If no page is present then a new page is allocated using
+  *   @gfp_mask and added to the page cache and the VM's LRU list.
+  *   The page is returned locked and with an increased refcount.
+@@ -1779,8 +1748,11 @@ struct page *pagecache_get_page(struct address_space *mapping, pgoff_t index,
+ 
+ repeat:
+ 	page = find_get_entry(mapping, index);
+-	if (xa_is_value(page))
++	if (xa_is_value(page)) {
++		if (fgp_flags & FGP_ENTRY)
++			return page;
+ 		page = NULL;
++	}
+ 	if (!page)
+ 		goto no_page;
+ 
+diff --git a/mm/internal.h b/mm/internal.h
+index 25d2b2439f19..eed74f1e6147 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -60,9 +60,6 @@ static inline void force_page_cache_readahead(struct address_space *mapping,
+ 	force_page_cache_ra(&ractl, &file->f_ra, nr_to_read);
+ }
+ 
+-struct page *find_get_entry(struct address_space *mapping, pgoff_t index);
+-struct page *find_lock_entry(struct address_space *mapping, pgoff_t index);
+-
+ /**
+  * page_evictable - test whether a page is evictable
+  * @page: the page to test
+diff --git a/mm/shmem.c b/mm/shmem.c
+index 5ea1fa53db3f..bd5bb78128af 100644
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -1812,7 +1812,8 @@ static int shmem_getpage_gfp(struct inode *inode, pgoff_t index,
+ 	sbinfo = SHMEM_SB(inode->i_sb);
+ 	charge_mm = vma ? vma->vm_mm : current->mm;
+ 
+-	page = find_lock_entry(mapping, index);
++	page = pagecache_get_page(mapping, index,
++					FGP_ENTRY | FGP_HEAD | FGP_LOCK, 0);
+ 	if (xa_is_value(page)) {
+ 		error = shmem_swapin_page(inode, index, &page,
+ 					  sgp, gfp, vma, fault_type);
+diff --git a/mm/swap_state.c b/mm/swap_state.c
+index f270c30d4681..3cdee7b11da9 100644
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@ -403,7 +403,8 @@ struct page *find_get_incore_page(struct address_space *mapping, pgoff_t index)
+ {
+ 	swp_entry_t swp;
+ 	struct swap_info_struct *si;
+-	struct page *page = find_get_entry(mapping, index);
++	struct page *page = pagecache_get_page(mapping, index,
++						FGP_ENTRY | FGP_HEAD, 0);
+ 
+ 	if (!page)
+ 		return page;
+-- 
+2.31.1
+

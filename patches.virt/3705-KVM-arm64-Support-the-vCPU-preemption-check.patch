@@ -1,0 +1,223 @@
+From cf6d95e33dfa0344abea230ed48a1fad69591f36 Mon Sep 17 00:00:00 2001
+From: Zengruan Ye <yezengruan@huawei.com>
+Date: Tue, 2 Feb 2021 17:44:51 +0800
+Subject: [PATCH] KVM: arm64: Support the vCPU preemption check
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: cf6d95e33dfa0344abea230ed48a1fad69591f36
+
+
+virt inclusion
+category: feature
+bugzilla: 47624
+CVE: NA
+
+--------------------------------
+
+Support the vcpu_is_preempted() functionality under KVM/arm64. This will
+enhance lock performance on overcommitted hosts (more runnable vCPUs
+than physical CPUs in the system) as doing busy waits for preempted
+vCPUs will hurt system performance far worse than early yielding.
+
+unix benchmark result:
+  host:  kernel 4.19.87, HiSilicon Kunpeng920, 8 CPUs
+  guest: kernel 4.19.87, 16 vCPUs
+
+               test-case                |    after-patch    |   before-patch
+----------------------------------------+-------------------+------------------
+ Dhrystone 2 using register variables   | 338955728.5 lps   | 339266319.5 lps
+ Double-Precision Whetstone             |     30634.9 MWIPS |     30884.4 MWIPS
+ Execl Throughput                       |      6753.2 lps   |      3580.1 lps
+ File Copy 1024 bufsize 2000 maxblocks  |    490048.0 KBps  |    313282.3 KBps
+ File Copy 256 bufsize 500 maxblocks    |    129662.5 KBps  |     83550.7 KBps
+ File Copy 4096 bufsize 8000 maxblocks  |   1552551.5 KBps  |    814327.0 KBps
+ Pipe Throughput                        |   8976422.5 lps   |   9048628.4 lps
+ Pipe-based Context Switching           |    258641.7 lps   |    252925.9 lps
+ Process Creation                       |      5312.2 lps   |      4507.9 lps
+ Shell Scripts (1 concurrent)           |      8704.2 lpm   |      6720.9 lpm
+ Shell Scripts (8 concurrent)           |      1708.8 lpm   |       607.2 lpm
+ System Call Overhead                   |   3714444.7 lps   |   3746386.8 lps
+----------------------------------------+-------------------+------------------
+ System Benchmarks Index Score          |      2270.6       |      1679.2
+
+Signed-off-by: Zengruan Ye <yezengruan@huawei.com>
+Reviewed-by: Zhanghailiang <zhang.zhanghailiang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/paravirt.h |   3 +
+ arch/arm64/kernel/paravirt.c      | 106 ++++++++++++++++++++++++++++++
+ arch/arm64/kernel/setup.c         |   2 +
+ include/linux/cpuhotplug.h        |   1 +
+ 4 files changed, 112 insertions(+)
+
+diff --git a/arch/arm64/include/asm/paravirt.h b/arch/arm64/include/asm/paravirt.h
+index 2aa95a36f60a..47de3b6d36df 100644
+--- a/arch/arm64/include/asm/paravirt.h
++++ b/arch/arm64/include/asm/paravirt.h
+@@ -29,6 +29,8 @@ static inline u64 paravirt_steal_clock(int cpu)
+ 
+ int __init pv_time_init(void);
+ 
++int __init pv_sched_init(void);
++
+ __visible bool __native_vcpu_is_preempted(int cpu);
+ static inline bool pv_vcpu_is_preempted(int cpu)
+ {
+@@ -38,6 +40,7 @@ static inline bool pv_vcpu_is_preempted(int cpu)
+ #else
+ 
+ #define pv_time_init() do {} while (0)
++#define pv_sched_init() do {} while (0)
+ 
+ #endif // CONFIG_PARAVIRT
+ 
+diff --git a/arch/arm64/kernel/paravirt.c b/arch/arm64/kernel/paravirt.c
+index f6fcec118be9..76de5d725c51 100644
+--- a/arch/arm64/kernel/paravirt.c
++++ b/arch/arm64/kernel/paravirt.c
+@@ -21,6 +21,7 @@
+ 
+ #include <asm/paravirt.h>
+ #include <asm/pvclock-abi.h>
++#include <asm/pvsched-abi.h>
+ #include <asm/smp_plat.h>
+ 
+ struct static_key paravirt_steal_enabled;
+@@ -162,3 +163,108 @@ int __init pv_time_init(void)
+ 
+ 	return 0;
+ }
++
++
++DEFINE_PER_CPU(struct pvsched_vcpu_state, pvsched_vcpu_region) __aligned(64);
++EXPORT_PER_CPU_SYMBOL(pvsched_vcpu_region);
++
++static bool kvm_vcpu_is_preempted(int cpu)
++{
++	struct pvsched_vcpu_state *reg;
++	u32 preempted;
++
++	reg = &per_cpu(pvsched_vcpu_region, cpu);
++	if (!reg) {
++		pr_warn_once("PV sched enabled but not configured for cpu %d\n",
++			     cpu);
++		return false;
++	}
++
++	preempted = le32_to_cpu(READ_ONCE(reg->preempted));
++
++	return !!preempted;
++}
++
++static int pvsched_vcpu_state_dying_cpu(unsigned int cpu)
++{
++	struct pvsched_vcpu_state *reg;
++	struct arm_smccc_res res;
++
++	reg = this_cpu_ptr(&pvsched_vcpu_region);
++	if (!reg)
++		return -EFAULT;
++
++	arm_smccc_1_1_invoke(ARM_SMCCC_HV_PV_SCHED_IPA_RELEASE, &res);
++	memset(reg, 0, sizeof(*reg));
++
++	return 0;
++}
++
++static int init_pvsched_vcpu_state(unsigned int cpu)
++{
++	struct pvsched_vcpu_state *reg;
++	struct arm_smccc_res res;
++
++	reg = this_cpu_ptr(&pvsched_vcpu_region);
++	if (!reg)
++		return -EFAULT;
++
++	/* Pass the memory address to host via hypercall */
++	arm_smccc_1_1_invoke(ARM_SMCCC_HV_PV_SCHED_IPA_INIT,
++			     virt_to_phys(reg), &res);
++
++	return 0;
++}
++
++static int kvm_arm_init_pvsched(void)
++{
++	int ret;
++
++	ret = cpuhp_setup_state(CPUHP_AP_ARM_KVM_PVSCHED_STARTING,
++				"hypervisor/arm/pvsched:starting",
++				init_pvsched_vcpu_state,
++				pvsched_vcpu_state_dying_cpu);
++
++	if (ret < 0) {
++		pr_warn("PV sched init failed\n");
++		return ret;
++	}
++
++	return 0;
++}
++
++static bool has_kvm_pvsched(void)
++{
++	struct arm_smccc_res res;
++
++	/* To detect the presence of PV sched support we require SMCCC 1.1+ */
++	if (arm_smccc_1_1_get_conduit() == SMCCC_CONDUIT_NONE)
++		return false;
++
++	arm_smccc_1_1_invoke(ARM_SMCCC_ARCH_FEATURES_FUNC_ID,
++			     ARM_SMCCC_HV_PV_SCHED_FEATURES, &res);
++
++	return (res.a0 == SMCCC_RET_SUCCESS);
++}
++
++int __init pv_sched_init(void)
++{
++	int ret;
++
++	if (is_hyp_mode_available())
++		return 0;
++
++	if (!has_kvm_pvsched()) {
++		pr_warn("PV sched is not available\n");
++		return 0;
++	}
++
++	ret = kvm_arm_init_pvsched();
++	if (ret)
++		return ret;
++
++	pv_ops.sched.vcpu_is_preempted = kvm_vcpu_is_preempted;
++	pr_info("using PV sched preempted\n");
++
++	return 0;
++}
+diff --git a/arch/arm64/kernel/setup.c b/arch/arm64/kernel/setup.c
+index 7a1613d09261..2ffe8d936d94 100644
+--- a/arch/arm64/kernel/setup.c
++++ b/arch/arm64/kernel/setup.c
+@@ -368,6 +368,8 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
+ 	smp_init_cpus();
+ 	smp_build_mpidr_hash();
+ 
++	pv_sched_init();
++
+ 	/* Init percpu seeds for random tags after cpus are set up. */
+ 	kasan_init_tags();
+ 
+diff --git a/include/linux/cpuhotplug.h b/include/linux/cpuhotplug.h
+index bc56287a1ed1..c9e712c00b54 100644
+--- a/include/linux/cpuhotplug.h
++++ b/include/linux/cpuhotplug.h
+@@ -143,6 +143,7 @@ enum cpuhp_state {
+ 	/* Must be the last timer callback */
+ 	CPUHP_AP_DUMMY_TIMER_STARTING,
+ 	CPUHP_AP_ARM_XEN_STARTING,
++	CPUHP_AP_ARM_KVM_PVSCHED_STARTING,
+ 	CPUHP_AP_ARM_CORESIGHT_STARTING,
+ 	CPUHP_AP_ARM_CORESIGHT_CTI_STARTING,
+ 	CPUHP_AP_ARM64_ISNDEP_STARTING,
+-- 
+2.26.2
+

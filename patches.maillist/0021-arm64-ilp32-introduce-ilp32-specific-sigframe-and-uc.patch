@@ -1,0 +1,202 @@
+From e93536658d748a43375ec101c32a65e0e0a3d1b6 Mon Sep 17 00:00:00 2001
+From: Yury Norov <ynorov@caviumnetworks.comk>
+Date: Tue, 22 Dec 2020 06:40:55 +0000
+Subject: [PATCH] arm64: ilp32: introduce ilp32-specific sigframe and ucontext
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: e93536658d748a43375ec101c32a65e0e0a3d1b6
+
+
+maillist inclusion
+category: feature
+bugzilla: 46790
+CVE: NA
+
+Reference: https://github.com/norov/linux/commits/ilp32-5.2
+
+--------------------------------
+
+ILP32 uses AARCH32 compat structures and syscall handlers for signals. But
+ILP32 rt_sigframe and ucontext structures differ from both LP64 and AARCH32.
+>From software point of view ILP32 is typical 32-bit compat ABI, and from
+hardware point of view, it's just like LP64.
+
+struct rt_sigframe defined in this patch in
+arch/arm64/kernel/signal_ilp32.c redefines one in
+arch/arm64/kernel/signal.c. And functions located in
+arch/arm64/include/signal_common.h pick up new structure to generate the
+code suitable for ILP32.
+
+Signed-off-by: Yury Norov <ynorov@caviumnetworks.com>
+Signed-off-by: Yury Norov <ynorov@marvell.com>
+Signed-off-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Acked-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Chen Jun <chenjun102@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/signal_ilp32.h | 23 +++++++++
+ arch/arm64/kernel/Makefile            |  3 +-
+ arch/arm64/kernel/signal.c            |  3 ++
+ arch/arm64/kernel/signal_ilp32.c      | 67 +++++++++++++++++++++++++++
+ arch/arm64/kernel/sys_ilp32.c         |  6 +++
+ 5 files changed, 101 insertions(+), 1 deletion(-)
+ create mode 100644 arch/arm64/include/asm/signal_ilp32.h
+ create mode 100644 arch/arm64/kernel/signal_ilp32.c
+
+diff --git a/arch/arm64/include/asm/signal_ilp32.h b/arch/arm64/include/asm/signal_ilp32.h
+new file mode 100644
+index 000000000000..64333dfaeaa2
+--- /dev/null
++++ b/arch/arm64/include/asm/signal_ilp32.h
+@@ -0,0 +1,23 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++#ifndef __ASM_SIGNAL_ILP32_H
++#define __ASM_SIGNAL_ILP32_H
++
++#ifdef CONFIG_ARM64_ILP32
++
++#include <linux/compat.h>
++
++int ilp32_setup_rt_frame(int usig, struct ksignal *ksig, sigset_t *set,
++			  struct pt_regs *regs);
++
++#else
++
++static inline int ilp32_setup_rt_frame(int usig, struct ksignal *ksig,
++					sigset_t *set, struct pt_regs *regs)
++{
++	return -ENOSYS;
++}
++
++#endif /* CONFIG_ARM64_ILP32 */
++
++#endif /* __ASM_SIGNAL_ILP32_H */
+diff --git a/arch/arm64/kernel/Makefile b/arch/arm64/kernel/Makefile
+index 6ee9429ec6dc..e05b20a0b6a8 100644
+--- a/arch/arm64/kernel/Makefile
++++ b/arch/arm64/kernel/Makefile
+@@ -29,7 +29,8 @@ obj-$(CONFIG_AARCH32_EL0)			+= binfmt_elf32.o sys32.o signal32.o			\
+ 					   sys_compat.o
+ obj-$(CONFIG_AARCH32_EL0)			+= sigreturn32.o
+ obj-$(CONFIG_KUSER_HELPERS)		+= kuser32.o
+-obj-$(CONFIG_ARM64_ILP32)		+= binfmt_ilp32.o sys_ilp32.o
++obj-$(CONFIG_ARM64_ILP32)		+= binfmt_ilp32.o sys_ilp32.o 		\
++					   signal_ilp32.o
+ obj-$(CONFIG_COMPAT)		+= sys32_common.o signal32_common.o
+ obj-$(CONFIG_FUNCTION_TRACER)		+= ftrace.o entry-ftrace.o
+ obj-$(CONFIG_MODULES)			+= module.o
+diff --git a/arch/arm64/kernel/signal.c b/arch/arm64/kernel/signal.c
+index 603e66a95628..541083100d49 100644
+--- a/arch/arm64/kernel/signal.c
++++ b/arch/arm64/kernel/signal.c
+@@ -32,6 +32,7 @@
+ #include <asm/signal32.h>
+ #include <asm/traps.h>
+ #include <asm/vdso.h>
++#include <asm/signal_ilp32.h>
+ 
+ #define get_sigset(s, m) __copy_from_user(s, m, sizeof(*s))
+ #define put_sigset(s, m) __copy_to_user(m, s, sizeof(*s))
+@@ -591,6 +592,8 @@ static void handle_signal(struct ksignal *ksig, struct pt_regs *regs)
+ 			ret = a32_setup_rt_frame(usig, ksig, oldset, regs);
+ 		else
+ 			ret = a32_setup_frame(usig, ksig, oldset, regs);
++	} else if (is_ilp32_compat_task()) {
++		ret = ilp32_setup_rt_frame(usig, ksig, oldset, regs);
+ 	} else {
+ 		ret = setup_rt_frame(usig, ksig, oldset, regs);
+ 	}
+diff --git a/arch/arm64/kernel/signal_ilp32.c b/arch/arm64/kernel/signal_ilp32.c
+new file mode 100644
+index 000000000000..64090e2addb2
+--- /dev/null
++++ b/arch/arm64/kernel/signal_ilp32.c
+@@ -0,0 +1,67 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/*
++ * Copyright (C) 1995-2009 Russell King
++ * Copyright (C) 2012 ARM Ltd.
++ * Copyright (C) 2018 Cavium Networks.
++ * Yury Norov <ynorov@caviumnetworks.com>
++ */
++
++#include <linux/compat.h>
++#include <linux/signal.h>
++#include <linux/syscalls.h>
++
++#include <asm/fpsimd.h>
++#include <asm/unistd.h>
++#include <asm/ucontext.h>
++#include <asm/vdso.h>
++
++#include <asm/signal_ilp32.h>
++#include <asm/signal32_common.h>
++
++#define get_sigset(s, m) get_sigset_t(s, m)
++#define put_sigset(s, m) put_sigset_t(m, s)
++
++#define restore_altstack(stack) compat_restore_altstack(stack)
++#define __save_altstack(stack, sp) __compat_save_altstack(stack, sp)
++#define copy_siginfo_to_user(frame_info, ksig_info) \
++		copy_siginfo_to_user32(frame_info, ksig_info)
++
++#define setup_return(regs, ka, user_layout, usig)			\
++{									\
++	__setup_return(regs, ka, user_layout, usig);			\
++	regs->regs[30] =						\
++		(unsigned long)VDSO_SYMBOL(current->mm->context.vdso,	\
++						    sigtramp_ilp32);	\
++}
++
++struct ilp32_ucontext {
++	u32		uc_flags;
++	u32		uc_link;
++	compat_stack_t	uc_stack;
++	compat_sigset_t	uc_sigmask;
++	/* glibc uses a 1024-bit sigset_t */
++	__u8		__unused[1024 / 8 - sizeof(compat_sigset_t)];
++	/* last for future expansion */
++	struct sigcontext uc_mcontext;
++};
++
++struct rt_sigframe {
++	struct compat_siginfo info;
++	struct ilp32_ucontext uc;
++};
++
++#include <asm/signal_common.h>
++
++COMPAT_SYSCALL_DEFINE0(ilp32_rt_sigreturn)
++{
++	struct pt_regs *regs = current_pt_regs();
++
++	return __sys_rt_sigreturn(regs);
++}
++
++int ilp32_setup_rt_frame(int usig, struct ksignal *ksig,
++			  sigset_t *set, struct pt_regs *regs)
++{
++	return __setup_rt_frame(usig, ksig, set, regs);
++}
+diff --git a/arch/arm64/kernel/sys_ilp32.c b/arch/arm64/kernel/sys_ilp32.c
+index 05eca957a18d..1c8db8f8341a 100644
+--- a/arch/arm64/kernel/sys_ilp32.c
++++ b/arch/arm64/kernel/sys_ilp32.c
+@@ -55,6 +55,12 @@
+ #define __arm64_compat_sys_msgctl		__arm64_compat_sys_old_msgctl
+ #define __arm64_compat_sys_shmctl		__arm64_compat_sys_old_shmctl
+ 
++/*
++ * Using custom wrapper for rt_sigreturn() to handle custom
++ * struct rt_sigframe.
++ */
++#define __arm64_compat_sys_rt_sigreturn		__arm64_compat_sys_ilp32_rt_sigreturn
++
+ /*
+  * Wrappers to pass the pt_regs argument.
+  */
+-- 
+2.26.2
+

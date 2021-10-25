@@ -1,0 +1,119 @@
+From ad9850b5db9208cdfea7f4f39d65f3c65654bf19 Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Fri, 26 Feb 2021 20:22:22 +0800
+Subject: [PATCH] arm64/mpam: Implement intpartid narrowing process
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: ad9850b5db9208cdfea7f4f39d65f3c65654bf19
+
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+According to Arm MPAM spec definition, register MPAMCFG_PART_SEL's high
+16 bit should be set to 0 and MPAMCFG_INTPARTID's high 16 bit should be
+set to 1 when establishing intpartid association, and we should use
+intpartid in MPAMCFG_PART_SEL instead of reqpartid as long as intpartid
+narrowing is implemented.
+
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/mpam_resource.h |  4 +++
+ arch/arm64/kernel/mpam/mpam_device.c   | 35 +++++++++++++++-----------
+ 2 files changed, 25 insertions(+), 14 deletions(-)
+
+diff --git a/arch/arm64/include/asm/mpam_resource.h b/arch/arm64/include/asm/mpam_resource.h
+index aa5bbe390c19..4c042eb2da20 100644
+--- a/arch/arm64/include/asm/mpam_resource.h
++++ b/arch/arm64/include/asm/mpam_resource.h
+@@ -91,6 +91,10 @@
+ #define MSMON_CFG_CSU_TYPE          0x43
+ #define MSMON_CFG_MBWU_TYPE         0x42
+ 
++/*
++ * Set MPAMCFG_INTPARTID internal bit
++ */
++#define MPAMCFG_INTPARTID_INTERNAL  BIT(16)
+ /*
+  * Set MPAMCFG_PART_SEL internal bit
+  */
+diff --git a/arch/arm64/kernel/mpam/mpam_device.c b/arch/arm64/kernel/mpam/mpam_device.c
+index 3c0f28c4bec2..a331ec67fa42 100644
+--- a/arch/arm64/kernel/mpam/mpam_device.c
++++ b/arch/arm64/kernel/mpam/mpam_device.c
+@@ -1076,16 +1076,29 @@ static int mpam_device_frob_mon(struct mpam_device *dev,
+ 	return 0;
+ }
+ 
+-static int mpam_device_narrow_map(struct mpam_device *dev, u32 partid,
++static void mpam_device_narrow_map(struct mpam_device *dev, u32 partid,
+ 					u32 intpartid)
+ {
+-	return 0;
++	int cur_intpartid;
++
++	lockdep_assert_held(&dev->lock);
++
++	mpam_write_reg(dev, MPAMCFG_PART_SEL, partid);
++	wmb(); /* subsequent writes must be applied to our new partid */
++
++	cur_intpartid = mpam_read_reg(dev, MPAMCFG_INTPARTID);
++	/* write association, this need set 16 bit to 1 */
++	intpartid = intpartid | MPAMCFG_INTPARTID_INTERNAL;
++	/* reqpartid has already been associated to this intpartid */
++	if (cur_intpartid == intpartid)
++		return;
++
++	mpam_write_reg(dev, MPAMCFG_INTPARTID, intpartid);
+ }
+ 
+ static int mpam_device_config(struct mpam_device *dev, u32 partid,
+ 					struct mpam_config *cfg)
+ {
+-	int ret;
+ 	u16 cmax = GENMASK(dev->cmax_wd, 0);
+ 	u32 pri_val = 0;
+ 	u16 intpri, dspri, max_intpri, max_dspri;
+@@ -1101,15 +1114,10 @@ static int mpam_device_config(struct mpam_device *dev, u32 partid,
+ 	 * upstream(resctrl) keep this order
+ 	 */
+ 	if (mpam_has_feature(mpam_feat_part_nrw, dev->features)) {
+-		if (cfg && mpam_has_feature(mpam_feat_part_nrw, cfg->valid)) {
+-			ret = mpam_device_narrow_map(dev, partid,
+-					cfg->intpartid);
+-			if (ret)
+-				goto out;
+-			partid = PART_SEL_SET_INTERNAL(cfg->intpartid);
+-		} else {
+-			partid = PART_SEL_SET_INTERNAL(cfg->intpartid);
+-		}
++		if (cfg && mpam_has_feature(mpam_feat_part_nrw, cfg->valid))
++			mpam_device_narrow_map(dev, partid, cfg->intpartid);
++		/* intpartid success, set 16 bit to 1*/
++		partid = PART_SEL_SET_INTERNAL(cfg->intpartid);
+ 	}
+ 
+ 	mpam_write_reg(dev, MPAMCFG_PART_SEL, partid);
+@@ -1185,8 +1193,7 @@ static int mpam_device_config(struct mpam_device *dev, u32 partid,
+ 	 */
+ 	mb();
+ 
+-out:
+-	return ret;
++	return 0;
+ }
+ 
+ static void mpam_component_device_sync(void *__ctx)
+-- 
+2.26.2
+

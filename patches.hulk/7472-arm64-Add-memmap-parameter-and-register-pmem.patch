@@ -1,0 +1,306 @@
+From 94dc364f5eda10f49449ba573dc3322e1ea92280 Mon Sep 17 00:00:00 2001
+From: ZhuLing <zhuling8@huawei.com>
+Date: Tue, 27 Jul 2021 22:02:14 +0800
+Subject: [PATCH] arm64: Add memmap parameter and register pmem
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 94dc364f5eda10f49449ba573dc3322e1ea92280
+
+
+hulk inclusion
+category: feature
+bugzilla: 48159
+CVE: NA
+
+------------------------------
+
+Register pmem in arm64:
+Use memmap(memmap=nn[KMG]!ss[KMG]) reserve memory and
+e820(driver/nvdimm/e820.c) function to register persistent
+memory in arm64. when the kernel restart or update, the data
+in PMEM will not be lost and can be loaded faster. this is a
+general features.
+
+driver/nvdimm/e820.c:
+The function of this file is scan "iomem_resource" and take
+advantage of nvdimm resource discovery mechanism by registering
+a resource named "Persistent Memory (legacy)", this function
+doesn't depend on architecture.
+
+We will push the feature to linux kernel community and discuss to
+modify the file name. because people have a mistaken notion that
+the e820.c is depend on x86.
+
+If you want use this features, you need do as follows:
+1.Reserve memory: add memmap to reserve memory in grub.cfg
+  memmap=nn[KMG]!ss[KMG] exp:memmap=100K!0x1a0000000.
+2.Insmod nd_e820.ko: modprobe nd_e820.
+3.Check pmem device in /dev exp: /dev/pmem0
+
+Signed-off-by: ZhuLing <zhuling8@huawei.com>
+Signed-off-by: Sang Yan <sangyan@huawei.com>
+Reviewed-by: Chen Wandun <chenwandun@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ arch/arm64/Kconfig         | 21 +++++++++
+ arch/arm64/kernel/Makefile |  1 +
+ arch/arm64/kernel/pmem.c   | 35 ++++++++++++++
+ arch/arm64/kernel/setup.c  | 10 ++++
+ arch/arm64/mm/init.c       | 95 ++++++++++++++++++++++++++++++++++++++
+ drivers/nvdimm/Kconfig     |  5 ++
+ drivers/nvdimm/Makefile    |  2 +-
+ 7 files changed, 168 insertions(+), 1 deletion(-)
+ create mode 100644 arch/arm64/kernel/pmem.c
+
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -1303,6 +1303,27 @@ config RODATA_FULL_DEFAULT_ENABLED
+ 	  This requires the linear region to be mapped down to pages,
+ 	  which may adversely affect performance in some cases.
+ 
++config ARM64_PMEM_RESERVE
++	bool "Reserve memory for persistent storage"
++	default n
++	help
++	  Use memmap=nn[KMG]!ss[KMG](memmap=100K!0x1a0000000) reserve
++	  memory for persistent storage.
++
++	  Say y here to enable this feature.
++
++config ARM64_PMEM_LEGACY_DEVICE
++	bool "Create persistent storage"
++	depends on BLK_DEV
++	depends on LIBNVDIMM
++	select ARM64_PMEM_RESERVE
++	help
++	  Use reserved memory for persistent storage when the kernel
++	  restart or update. the data in PMEM will not be lost and
++	  can be loaded faster.
++
++	  Say y if unsure.
++
+ config ARM64_SW_TTBR0_PAN
+ 	bool "Emulate Privileged Access Never using TTBR0_EL1 switching"
+ 	help
+--- a/arch/arm64/kernel/Makefile
++++ b/arch/arm64/kernel/Makefile
+@@ -68,6 +68,7 @@ obj-$(CONFIG_ARM64_PTR_AUTH)		+= pointer
+ obj-$(CONFIG_SHADOW_CALL_STACK)		+= scs.o
+ obj-$(CONFIG_ARM64_MTE)			+= mte.o
+ obj-$(CONFIG_MPAM)			+= mpam/
++obj-$(CONFIG_ARM64_PMEM_LEGACY_DEVICE)   += pmem.o
+ 
+ obj-y					+= vdso/ probes/
+ obj-$(CONFIG_COMPAT_VDSO)		+= vdso32/
+--- /dev/null
++++ b/arch/arm64/kernel/pmem.c
+@@ -0,0 +1,35 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright(c) 2021 Huawei Technologies Co., Ltd
++ *
++ * Derived from x86 and arm64 implement PMEM.
++ */
++#include <linux/platform_device.h>
++#include <linux/init.h>
++#include <linux/ioport.h>
++#include <linux/module.h>
++
++static int found(struct resource *res, void *data)
++{
++	return 1;
++}
++
++static int __init register_e820_pmem(void)
++{
++	struct platform_device *pdev;
++	int rc;
++
++	rc = walk_iomem_res_desc(IORES_DESC_PERSISTENT_MEMORY_LEGACY,
++				 IORESOURCE_MEM, 0, -1, NULL, found);
++	if (rc <= 0)
++		return 0;
++
++	/*
++	 * See drivers/nvdimm/e820.c for the implementation, this is
++	 * simply here to trigger the module to load on demand.
++	 */
++	pdev = platform_device_alloc("e820_pmem", -1);
++
++	return platform_device_add(pdev);
++}
++device_initcall(register_e820_pmem);
+--- a/arch/arm64/kernel/setup.c
++++ b/arch/arm64/kernel/setup.c
+@@ -67,6 +67,10 @@ static int __init arm64_enable_cpu0_hotp
+ __setup("arm64_cpu0_hotplug", arm64_enable_cpu0_hotplug);
+ #endif
+ 
++#ifdef CONFIG_ARM64_PMEM_RESERVE
++extern struct resource pmem_res;
++#endif
++
+ phys_addr_t __fdt_pointer __initdata;
+ 
+ /*
+@@ -274,6 +278,12 @@ static void __init request_standard_reso
+ 			request_resource(res, &quick_kexec_res);
+ #endif
+ 	}
++
++#ifdef CONFIG_ARM64_PMEM_RESERVE
++	if (pmem_res.end && pmem_res.start)
++		request_resource(&iomem_resource, &pmem_res);
++#endif
++
+ }
+ 
+ static int __init reserve_memblock_reserved_regions(void)
+--- a/arch/arm64/mm/init.c
++++ b/arch/arm64/mm/init.c
+@@ -52,6 +52,7 @@
+  */
+ s64 memstart_addr __ro_after_init = -1;
+ EXPORT_SYMBOL(memstart_addr);
++phys_addr_t start_at, mem_size;
+ 
+ /*
+  * If the corresponding config options are enabled, we create both ZONE_DMA
+@@ -62,6 +63,18 @@ EXPORT_SYMBOL(memstart_addr);
+  */
+ phys_addr_t arm64_dma_phys_limit __ro_after_init;
+ 
++static unsigned long long pmem_size, pmem_start;
++
++#ifdef CONFIG_ARM64_PMEM_RESERVE
++struct resource pmem_res = {
++	.name = "Persistent Memory (legacy)",
++	.start = 0,
++	.end = 0,
++	.flags = IORESOURCE_MEM,
++	.desc = IORES_DESC_PERSISTENT_MEMORY_LEGACY
++};
++#endif
++
+ #ifndef CONFIG_KEXEC_CORE
+ static void __init reserve_crashkernel(void)
+ {
+@@ -355,6 +368,83 @@ out:
+ }
+ #endif
+ 
++static bool __init is_mem_valid(unsigned long long mem_size, unsigned long long mem_start)
++{
++	if (!memblock_is_region_memory(mem_start, mem_size)) {
++		pr_warn("cannot reserve mem: region is not memory!\n");
++		return false;
++	}
++
++	if (memblock_is_region_reserved(mem_start, mem_size)) {
++		pr_warn("cannot reserve mem: region overlaps reserved memory!\n");
++		return false;
++	}
++
++	if (!IS_ALIGNED(mem_start, SZ_2M)) {
++		pr_warn("cannot reserve mem: base address is not 2MB aligned!\n");
++		return false;
++	}
++
++	return true;
++}
++
++static int __init parse_memmap_one(char *p)
++{
++	char *oldp;
++
++	if (!p)
++		return -EINVAL;
++
++	oldp = p;
++	mem_size = memparse(p, &p);
++	if (p == oldp)
++		return -EINVAL;
++
++	if (!mem_size)
++		return -EINVAL;
++
++	mem_size = PAGE_ALIGN(mem_size);
++
++	if (*p == '!') {
++		start_at = memparse(p+1, &p);
++
++		pmem_start = start_at;
++		pmem_size = mem_size;
++	} else
++		pr_info("Unrecognized memmap option, please check the parameter.\n");
++
++	return *p == '\0' ? 0 : -EINVAL;
++}
++
++static int __init parse_memmap_opt(char *str)
++{
++	while (str) {
++		char *k = strchr(str, ',');
++
++		if (k)
++			*k++ = 0;
++		parse_memmap_one(str);
++		str = k;
++	}
++
++	return 0;
++}
++early_param("memmap", parse_memmap_opt);
++
++#ifdef CONFIG_ARM64_PMEM_RESERVE
++static void __init reserve_pmem(void)
++{
++	if (!is_mem_valid(mem_size, start_at))
++		return;
++
++	memblock_remove(pmem_start, pmem_size);
++	pr_info("pmem reserved: 0x%016llx - 0x%016llx (%lld MB)\n",
++		pmem_start, pmem_start + pmem_size, pmem_size >> 20);
++	pmem_res.start = pmem_start;
++	pmem_res.end = pmem_start + pmem_size - 1;
++}
++#endif
++
+ void __init arm64_memblock_init(void)
+ {
+ 	const s64 linear_region_size = BIT(vabits_actual - 1);
+@@ -531,6 +621,11 @@ void __init bootmem_init(void)
+ #ifdef CONFIG_QUICK_KEXEC
+ 	reserve_quick_kexec();
+ #endif
++
++#ifdef CONFIG_ARM64_PMEM_RESERVE
++	reserve_pmem();
++#endif
++
+ 	memblock_dump_all();
+ }
+ 
+--- a/drivers/nvdimm/Kconfig
++++ b/drivers/nvdimm/Kconfig
+@@ -132,3 +132,8 @@ config NVDIMM_TEST_BUILD
+ 	  infrastructure.
+ 
+ endif
++
++config PMEM_LEGACY
++	tristate "Pmem_legacy"
++	select X86_PMEM_LEGACY if X86
++	select ARM64_PMEM_LEGACY_DEVICE if ARM64
+--- a/drivers/nvdimm/Makefile
++++ b/drivers/nvdimm/Makefile
+@@ -3,7 +3,7 @@ obj-$(CONFIG_LIBNVDIMM) += libnvdimm.o
+ obj-$(CONFIG_BLK_DEV_PMEM) += nd_pmem.o
+ obj-$(CONFIG_ND_BTT) += nd_btt.o
+ obj-$(CONFIG_ND_BLK) += nd_blk.o
+-obj-$(CONFIG_X86_PMEM_LEGACY) += nd_e820.o
++obj-$(CONFIG_PMEM_LEGACY) += nd_e820.o
+ obj-$(CONFIG_OF_PMEM) += of_pmem.o
+ obj-$(CONFIG_VIRTIO_PMEM) += virtio_pmem.o nd_virtio.o
+ 

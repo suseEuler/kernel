@@ -1,0 +1,123 @@
+From 8a5bb6f47fdbd153cb4ed6e58c5cc4b3de77ac52 Mon Sep 17 00:00:00 2001
+From: Sumit Garg <sumit.garg@linaro.org>
+Date: Tue, 23 Feb 2021 20:39:08 +0800
+Subject: [PATCH] irqchip/gic-v3: Enable support for SGIs to act as NMIs
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 8a5bb6f47fdbd153cb4ed6e58c5cc4b3de77ac52
+
+
+maillist inclusion
+category: feature
+bugzilla: 49593
+CVE: NA
+Reference: https://www.spinics.net/lists/arm-kernel/msg851005.html
+
+-------------------------------------------------
+
+Add support to handle SGIs as pseudo NMIs. As SGIs or IPIs default to a
+special flow handler: handle_percpu_devid_fasteoi_ipi(), so skip NMI
+handler update in case of SGIs.
+
+Also, enable NMI support prior to gic_smp_init() as allocation of SGIs
+as IRQs/NMIs happen as part of this routine.
+
+Signed-off-by: Sumit Garg <sumit.garg@linaro.org>
+Signed-off-by: Wei Li <liwei391@huawei.com>
+Reviewed-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/irqchip/irq-gic-v3.c | 29 +++++++++++++++++++++--------
+ 1 file changed, 21 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/irqchip/irq-gic-v3.c b/drivers/irqchip/irq-gic-v3.c
+index 45bdb571f560..7da8c83cd638 100644
+--- a/drivers/irqchip/irq-gic-v3.c
++++ b/drivers/irqchip/irq-gic-v3.c
+@@ -455,6 +455,7 @@ static u32 gic_get_ppi_index(struct irq_data *d)
+ static int gic_irq_nmi_setup(struct irq_data *d)
+ {
+ 	struct irq_desc *desc = irq_to_desc(d->irq);
++	u32 idx;
+ 
+ 	if (!gic_supports_nmi())
+ 		return -EINVAL;
+@@ -472,16 +473,22 @@ static int gic_irq_nmi_setup(struct irq_data *d)
+ 		return -EINVAL;
+ 
+ 	/* desc lock should already be held */
+-	if (gic_irq_in_rdist(d)) {
+-		u32 idx = gic_get_ppi_index(d);
++	switch (get_intid_range(d)) {
++	case SGI_RANGE:
++		break;
++	case PPI_RANGE:
++	case EPPI_RANGE:
++		idx = gic_get_ppi_index(d);
+ 
+ 		/* Setting up PPI as NMI, only switch handler for first NMI */
+ 		if (!refcount_inc_not_zero(&ppi_nmi_refs[idx])) {
+ 			refcount_set(&ppi_nmi_refs[idx], 1);
+ 			desc->handle_irq = handle_percpu_devid_fasteoi_nmi;
+ 		}
+-	} else {
++		break;
++	default:
+ 		desc->handle_irq = handle_fasteoi_nmi;
++		break;
+ 	}
+ 
+ 	gic_irq_set_prio(d, GICD_INT_NMI_PRI);
+@@ -492,6 +499,7 @@ static int gic_irq_nmi_setup(struct irq_data *d)
+ static void gic_irq_nmi_teardown(struct irq_data *d)
+ {
+ 	struct irq_desc *desc = irq_to_desc(d->irq);
++	u32 idx;
+ 
+ 	if (WARN_ON(!gic_supports_nmi()))
+ 		return;
+@@ -509,14 +517,20 @@ static void gic_irq_nmi_teardown(struct irq_data *d)
+ 		return;
+ 
+ 	/* desc lock should already be held */
+-	if (gic_irq_in_rdist(d)) {
+-		u32 idx = gic_get_ppi_index(d);
++	switch (get_intid_range(d)) {
++	case SGI_RANGE:
++		break;
++	case PPI_RANGE:
++	case EPPI_RANGE:
++		idx = gic_get_ppi_index(d);
+ 
+ 		/* Tearing down NMI, only switch handler for last NMI */
+ 		if (refcount_dec_and_test(&ppi_nmi_refs[idx]))
+ 			desc->handle_irq = handle_percpu_devid_irq;
+-	} else {
++		break;
++	default:
+ 		desc->handle_irq = handle_fasteoi_irq;
++		break;
+ 	}
+ 
+ 	gic_irq_set_prio(d, GICD_INT_DEF_PRI);
+@@ -1702,6 +1716,7 @@ static int __init gic_init_bases(void __iomem *dist_base,
+ 
+ 	gic_dist_init();
+ 	gic_cpu_init();
++	gic_enable_nmi_support();
+ 	gic_smp_init();
+ 	gic_cpu_pm_init();
+ 
+@@ -1713,8 +1728,6 @@ static int __init gic_init_bases(void __iomem *dist_base,
+ 			gicv2m_init(handle, gic_data.domain);
+ 	}
+ 
+-	gic_enable_nmi_support();
+-
+ 	return 0;
+ 
+ out_free:
+-- 
+2.26.2
+

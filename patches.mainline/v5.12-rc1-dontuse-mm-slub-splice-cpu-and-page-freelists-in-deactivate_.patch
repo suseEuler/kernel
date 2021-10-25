@@ -1,0 +1,138 @@
+From d930ff03c4d12621443f2d1c56d2f80745469021 Mon Sep 17 00:00:00 2001
+From: Vlastimil Babka <vbabka@suse.cz>
+Date: Wed, 24 Feb 2021 12:01:19 -0800
+Subject: [PATCH] mm, slub: splice cpu and page freelists in deactivate_slab()
+Git-commit: d930ff03c4d12621443f2d1c56d2f80745469021
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+In deactivate_slab() we currently move all but one objects on the cpu
+freelist to the page freelist one by one using the costly cmpxchg_double()
+operation.  Then we unfreeze the page while moving the last object on page
+freelist, with a final cmpxchg_double().
+
+This can be optimized to avoid the cmpxchg_double() per object.  Just
+count the objects on cpu freelist (to adjust page->inuse properly) and
+also remember the last object in the chain.  Then splice page->freelist to
+the last object and effectively add the whole cpu freelist to
+page->freelist while unfreezing the page, with a single cmpxchg_double().
+
+Link: https://lkml.kernel.org/r/20210115183543.15097-1-vbabka@suse.cz
+Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+Reviewed-by: Jann Horn <jannh@google.com>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: Pekka Enberg <penberg@kernel.org>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ mm/slub.c | 59 ++++++++++++++++++++++---------------------------------
+ 1 file changed, 24 insertions(+), 35 deletions(-)
+
+diff --git a/mm/slub.c b/mm/slub.c
+index 175cd905b58a..13e5821ce3e2 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -2167,9 +2167,9 @@ static void deactivate_slab(struct kmem_cache *s, struct page *page,
+ {
+ 	enum slab_modes { M_NONE, M_PARTIAL, M_FULL, M_FREE };
+ 	struct kmem_cache_node *n = get_node(s, page_to_nid(page));
+-	int lock = 0;
++	int lock = 0, free_delta = 0;
+ 	enum slab_modes l = M_NONE, m = M_NONE;
+-	void *nextfree;
++	void *nextfree, *freelist_iter, *freelist_tail;
+ 	int tail = DEACTIVATE_TO_HEAD;
+ 	struct page new;
+ 	struct page old;
+@@ -2180,45 +2180,34 @@ static void deactivate_slab(struct kmem_cache *s, struct page *page,
+ 	}
+ 
+ 	/*
+-	 * Stage one: Free all available per cpu objects back
+-	 * to the page freelist while it is still frozen. Leave the
+-	 * last one.
+-	 *
+-	 * There is no need to take the list->lock because the page
+-	 * is still frozen.
++	 * Stage one: Count the objects on cpu's freelist as free_delta and
++	 * remember the last object in freelist_tail for later splicing.
+ 	 */
+-	while (freelist && (nextfree = get_freepointer(s, freelist))) {
+-		void *prior;
+-		unsigned long counters;
++	freelist_tail = NULL;
++	freelist_iter = freelist;
++	while (freelist_iter) {
++		nextfree = get_freepointer(s, freelist_iter);
+ 
+ 		/*
+ 		 * If 'nextfree' is invalid, it is possible that the object at
+-		 * 'freelist' is already corrupted.  So isolate all objects
+-		 * starting at 'freelist'.
++		 * 'freelist_iter' is already corrupted.  So isolate all objects
++		 * starting at 'freelist_iter' by skipping them.
+ 		 */
+-		if (freelist_corrupted(s, page, &freelist, nextfree))
++		if (freelist_corrupted(s, page, &freelist_iter, nextfree))
+ 			break;
+ 
+-		do {
+-			prior = page->freelist;
+-			counters = page->counters;
+-			set_freepointer(s, freelist, prior);
+-			new.counters = counters;
+-			new.inuse--;
+-			VM_BUG_ON(!new.frozen);
++		freelist_tail = freelist_iter;
++		free_delta++;
+ 
+-		} while (!__cmpxchg_double_slab(s, page,
+-			prior, counters,
+-			freelist, new.counters,
+-			"drain percpu freelist"));
+-
+-		freelist = nextfree;
++		freelist_iter = nextfree;
+ 	}
+ 
+ 	/*
+-	 * Stage two: Ensure that the page is unfrozen while the
+-	 * list presence reflects the actual number of objects
+-	 * during unfreeze.
++	 * Stage two: Unfreeze the page while splicing the per-cpu
++	 * freelist to the head of page's freelist.
++	 *
++	 * Ensure that the page is unfrozen while the list presence
++	 * reflects the actual number of objects during unfreeze.
+ 	 *
+ 	 * We setup the list membership and then perform a cmpxchg
+ 	 * with the count. If there is a mismatch then the page
+@@ -2231,15 +2220,15 @@ static void deactivate_slab(struct kmem_cache *s, struct page *page,
+ 	 */
+ redo:
+ 
+-	old.freelist = page->freelist;
+-	old.counters = page->counters;
++	old.freelist = READ_ONCE(page->freelist);
++	old.counters = READ_ONCE(page->counters);
+ 	VM_BUG_ON(!old.frozen);
+ 
+ 	/* Determine target state of the slab */
+ 	new.counters = old.counters;
+-	if (freelist) {
+-		new.inuse--;
+-		set_freepointer(s, freelist, old.freelist);
++	if (freelist_tail) {
++		new.inuse -= free_delta;
++		set_freepointer(s, freelist_tail, old.freelist);
+ 		new.freelist = freelist;
+ 	} else
+ 		new.freelist = old.freelist;
+-- 
+2.31.1
+

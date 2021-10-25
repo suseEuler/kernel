@@ -1,0 +1,215 @@
+From b16616815cc92960234a0bbb2e573b75d160364f Mon Sep 17 00:00:00 2001
+From: Xie XiuQi <xiexiuqi@huawei.com>
+Date: Fri, 26 Feb 2021 20:20:52 +0800
+Subject: [PATCH] arm64/mpam: debug: print more useful info for mon_data
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: b16616815cc92960234a0bbb2e573b75d160364f
+
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+Signed-off-by: Xie XiuQi <xiexiuqi@huawei.com>
+Reviewed-by: Hanjun Guo <guohanjun@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/resctrl.h |  2 ++
+ arch/arm64/kernel/mpam.c         |  2 ++
+ arch/arm64/kernel/mpam_ctrlmon.c | 60 ++++++++++++++++++++++++++++----
+ arch/arm64/kernel/mpam_mon.c     | 13 ++++++-
+ 4 files changed, 69 insertions(+), 8 deletions(-)
+
+diff --git a/arch/arm64/include/asm/resctrl.h b/arch/arm64/include/asm/resctrl.h
+index ffebafa85839..0a0a12b17ab3 100644
+--- a/arch/arm64/include/asm/resctrl.h
++++ b/arch/arm64/include/asm/resctrl.h
+@@ -55,6 +55,8 @@ int resctrl_group_schemata_show(struct kernfs_open_file *of,
+ 	     r < resctrl_resources_all + MPAM_NUM_RESOURCES;		\
+ 	     r++)							\
+ 
++int mpam_get_mon_config(struct resctrl_resource *r);
++
+ int mkdir_mondata_all(struct kernfs_node *parent_kn,
+ 			     struct resctrl_group *prgrp,
+ 			     struct kernfs_node **dest_kn);
+diff --git a/arch/arm64/kernel/mpam.c b/arch/arm64/kernel/mpam.c
+index 56188953f954..eeed3b63da4f 100644
+--- a/arch/arm64/kernel/mpam.c
++++ b/arch/arm64/kernel/mpam.c
+@@ -338,6 +338,8 @@ static __init bool get_rdt_mon_resources(void)
+ {
+ 	bool ret = true;
+ 
++	mpam_get_mon_config(&resctrl_resources_all[MPAM_RESOURCE_CACHE]);
++	mpam_get_mon_config(&resctrl_resources_all[MPAM_RESOURCE_MC]);
+ 	return ret;
+ }
+ 
+diff --git a/arch/arm64/kernel/mpam_ctrlmon.c b/arch/arm64/kernel/mpam_ctrlmon.c
+index 78bc26272340..8d93da01d5b5 100644
+--- a/arch/arm64/kernel/mpam_ctrlmon.c
++++ b/arch/arm64/kernel/mpam_ctrlmon.c
+@@ -256,7 +256,7 @@ int resctrl_group_schemata_show(struct kernfs_open_file *of,
+  * use pmg as monitor id
+  * just use match_pardid only.
+  */
+-static u64 mbwu_read(struct rdt_domain *d, struct rdtgroup *g)
++static inline u64 mbwu_read(struct rdt_domain *d, struct rdtgroup *g)
+ {
+ 	u32 pmg = g->mon.rmid;
+ 
+@@ -264,7 +264,7 @@ static u64 mbwu_read(struct rdt_domain *d, struct rdtgroup *g)
+ 	return mpam_readl(d->base + MSMON_MBWU);
+ }
+ 
+-static u64 csu_read(struct rdt_domain *d, struct rdtgroup *g)
++static inline u64 csu_read(struct rdt_domain *d, struct rdtgroup *g)
+ {
+ 	u32 pmg = g->mon.rmid;
+ 
+@@ -272,23 +272,66 @@ static u64 csu_read(struct rdt_domain *d, struct rdtgroup *g)
+ 	return mpam_readl(d->base + MSMON_CSU);
+ }
+ 
++static inline char *kernfs_node_name(struct kernfs_open_file *of)
++{
++	return (char *)(of ? of->kn->name : NULL);
++}
++
++static inline void put_resource_name(char *res)
++{
++	kfree(res);
++}
++
++/*
++ * pick resource name from mon data name
++ * eg. from mon_L3_01 we got L3
++ * */
++static inline char *get_resource_name(char *name)
++{
++	char *s, *p, *res;
++
++	if (!name)
++		return NULL;
++
++	s = name + 4;	/* skip "mon_" prefix */
++	p = strrchr(name, '_');
++	res = kmemdup_nul(s, p - s, GFP_KERNEL);
++	if (!res)
++		res = NULL;
++
++	return res;
++}
++
+ int resctrl_group_mondata_show(struct seq_file *m, void *arg)
+ {
+ 	struct kernfs_open_file *of = m->private;
+ 	struct rdtgroup *rdtgrp;
+ 	struct rdt_domain *d;
+ 	int ret = 0;
++	char *resname = get_resource_name(kernfs_node_name(of));
++
++	if (!resname)
++		return -ENOMEM;
+ 
+ 	rdtgrp = resctrl_group_kn_lock_live(of->kn);
+ 
+ 	d = of->kn->priv;
+ 
++	if (rdtgrp)
+ 	/* for debug */
+-	seq_printf(m, "group: partid: %d, pmg: %d",
+-		   rdtgrp->closid, rdtgrp->mon.rmid);
++		seq_printf(m, "resource: %s, group: partid: %d, pmg: %d\n",
++				resname, rdtgrp->closid, rdtgrp->mon.rmid);
++	else
++		seq_printf(m, "resource: %s: need partid and pmg here\n",
++				resname);
++
++	if (d)
++		seq_printf(m, "domain: id %d: cpu_list %s, base %016llx\n",
++			   d->id, d->cpus_list, (u64)d->base);
+ 
+ 	/* show monitor data */
+ 
++	put_resource_name(resname);
+ 	resctrl_group_kn_unlock(of->kn);
+ 	return ret;
+ }
+@@ -342,10 +385,9 @@ static int mkdir_mondata_subdir(struct kernfs_node *parent_kn,
+ #if 1
+ 	struct kernfs_node *kn;
+ 	char name[32];
+-	int ret;
++	int ret = 0;
+ 
+ 	sprintf(name, "mon_%s_%02d", r->name, d->id);
+-
+ 	kn = __kernfs_create_file(parent_kn, name, 0444,
+ 				  GLOBAL_ROOT_UID, GLOBAL_ROOT_GID, 0,
+ 				  &kf_mondata_ops, d, NULL, NULL);
+@@ -354,6 +396,7 @@ static int mkdir_mondata_subdir(struct kernfs_node *parent_kn,
+ 
+ 	ret = resctrl_group_kn_set_ugid(kn);
+ 	if (ret) {
++		pr_info("%s: create name %s, error ret %d\n", __func__, name, ret);
+ 		kernfs_remove(kn);
+ 		return ret;
+ 	}
+@@ -442,10 +485,13 @@ mongroup_create_dir(struct kernfs_node *parent_kn, struct resctrl_group *prgrp,
+ 	struct kernfs_node *kn;
+ 	int ret;
+ 
++	pr_info("%s: create dir %s\n", __func__, name);
+ 	/* create the directory */
+ 	kn = kernfs_create_dir(parent_kn, name, parent_kn->mode, prgrp);
+-	if (IS_ERR(kn))
++	if (IS_ERR(kn)) {
++		pr_info("%s: create dir %s, error\n", __func__, name);
+ 		return PTR_ERR(kn);
++	}
+ 
+ 	if (dest_kn)
+ 		*dest_kn = kn;
+diff --git a/arch/arm64/kernel/mpam_mon.c b/arch/arm64/kernel/mpam_mon.c
+index ebf8980e072b..503d97da82ad 100644
+--- a/arch/arm64/kernel/mpam_mon.c
++++ b/arch/arm64/kernel/mpam_mon.c
+@@ -51,8 +51,11 @@ int alloc_pmg(void)
+ {
+ 	u32 pmg = ffs(pmg_free_map);
+ 
+-	if (pmg == 0)
++	if (pmg == 0) {
++		pr_info("%s: no pmg available\n");
+ 		return -ENOSPC;
++	}
++
+ 	pmg--;
+ 	pmg_free_map &= ~(1 << pmg);
+ 
+@@ -79,3 +82,11 @@ void free_rmid(u32 pmg)
+ {
+ 	free_pmg(pmg);
+ }
++
++int mpam_get_mon_config(struct resctrl_resource *r)
++{
++	r->mon_capable = true;
++	r->mon_enabled = true;
++
++	return 0;
++}
+-- 
+2.26.2
+

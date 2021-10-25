@@ -1,0 +1,171 @@
+From 5362a4b6ee6136018558ef6b2c4701aa15ebc602 Mon Sep 17 00:00:00 2001
+From: Nicholas Piggin <npiggin@gmail.com>
+Date: Wed, 26 May 2021 22:00:05 +1000
+Subject: [PATCH] powerpc: Fix reverse map real-mode address lookup with huge
+Git-commit: 5362a4b6ee6136018558ef6b2c4701aa15ebc602
+Patch-mainline: v5.13-rc5
+References: bsn#12
+
+ vmalloc
+
+real_vmalloc_addr() does not currently work for huge vmalloc, which is
+what the reverse map can be allocated with for radix host, hash guest.
+
+Extract the hugepage aware equivalent from eeh code into a helper, and
+convert existing sites including this one to use it.
+
+Fixes: 8abddd968a30 ("powerpc/64s/radix: Enable huge vmalloc mappings")
+Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20210526120005.3432222-1-npiggin@gmail.com
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ arch/powerpc/include/asm/pte-walk.h  | 29 ++++++++++++++++++++++++++++
+ arch/powerpc/kernel/eeh.c            | 23 +---------------------
+ arch/powerpc/kernel/io-workarounds.c | 16 +++------------
+ arch/powerpc/kvm/book3s_hv_rm_mmu.c  | 15 ++------------
+ 4 files changed, 35 insertions(+), 48 deletions(-)
+
+diff --git a/arch/powerpc/include/asm/pte-walk.h b/arch/powerpc/include/asm/pte-walk.h
+index 33fa5dd8ee6a..714a35f0d425 100644
+--- a/arch/powerpc/include/asm/pte-walk.h
++++ b/arch/powerpc/include/asm/pte-walk.h
+@@ -31,6 +31,35 @@ static inline pte_t *find_init_mm_pte(unsigned long ea, unsigned *hshift)
+ 	pgd_t *pgdir = init_mm.pgd;
+ 	return __find_linux_pte(pgdir, ea, NULL, hshift);
+ }
++
++/*
++ * Convert a kernel vmap virtual address (vmalloc or ioremap space) to a
++ * physical address, without taking locks. This can be used in real-mode.
++ */
++static inline phys_addr_t ppc_find_vmap_phys(unsigned long addr)
++{
++	pte_t *ptep;
++	phys_addr_t pa;
++	int hugepage_shift;
++
++	/*
++	 * init_mm does not free page tables, and does not do THP. It may
++	 * have huge pages from huge vmalloc / ioremap etc.
++	 */
++	ptep = find_init_mm_pte(addr, &hugepage_shift);
++	if (WARN_ON(!ptep))
++		return 0;
++
++	pa = PFN_PHYS(pte_pfn(*ptep));
++
++	if (!hugepage_shift)
++		hugepage_shift = PAGE_SHIFT;
++
++	pa |= addr & ((1ul << hugepage_shift) - 1);
++
++	return pa;
++}
++
+ /*
+  * This is what we should always use. Any other lockless page table lookup needs
+  * careful audit against THP split.
+diff --git a/arch/powerpc/kernel/eeh.c b/arch/powerpc/kernel/eeh.c
+index f24cd53ff26e..3bbdcc86d01b 100644
+--- a/arch/powerpc/kernel/eeh.c
++++ b/arch/powerpc/kernel/eeh.c
+@@ -346,28 +346,7 @@ void eeh_slot_error_detail(struct eeh_pe *pe, int severity)
+  */
+ static inline unsigned long eeh_token_to_phys(unsigned long token)
+ {
+-	pte_t *ptep;
+-	unsigned long pa;
+-	int hugepage_shift;
+-
+-	/*
+-	 * We won't find hugepages here(this is iomem). Hence we are not
+-	 * worried about _PAGE_SPLITTING/collapse. Also we will not hit
+-	 * page table free, because of init_mm.
+-	 */
+-	ptep = find_init_mm_pte(token, &hugepage_shift);
+-	if (!ptep)
+-		return token;
+-
+-	pa = pte_pfn(*ptep);
+-
+-	/* On radix we can do hugepage mappings for io, so handle that */
+-	if (!hugepage_shift)
+-		hugepage_shift = PAGE_SHIFT;
+-
+-	pa <<= PAGE_SHIFT;
+-	pa |= token & ((1ul << hugepage_shift) - 1);
+-	return pa;
++	return ppc_find_vmap_phys(token);
+ }
+ 
+ /*
+diff --git a/arch/powerpc/kernel/io-workarounds.c b/arch/powerpc/kernel/io-workarounds.c
+index 51bbaae94ccc..c877f074d174 100644
+--- a/arch/powerpc/kernel/io-workarounds.c
++++ b/arch/powerpc/kernel/io-workarounds.c
+@@ -55,7 +55,6 @@ static struct iowa_bus *iowa_pci_find(unsigned long vaddr, unsigned long paddr)
+ #ifdef CONFIG_PPC_INDIRECT_MMIO
+ struct iowa_bus *iowa_mem_find_bus(const PCI_IO_ADDR addr)
+ {
+-	unsigned hugepage_shift;
+ 	struct iowa_bus *bus;
+ 	int token;
+ 
+@@ -65,22 +64,13 @@ struct iowa_bus *iowa_mem_find_bus(const PCI_IO_ADDR addr)
+ 		bus = &iowa_busses[token - 1];
+ 	else {
+ 		unsigned long vaddr, paddr;
+-		pte_t *ptep;
+ 
+ 		vaddr = (unsigned long)PCI_FIX_ADDR(addr);
+ 		if (vaddr < PHB_IO_BASE || vaddr >= PHB_IO_END)
+ 			return NULL;
+-		/*
+-		 * We won't find huge pages here (iomem). Also can't hit
+-		 * a page table free due to init_mm
+-		 */
+-		ptep = find_init_mm_pte(vaddr, &hugepage_shift);
+-		if (ptep == NULL)
+-			paddr = 0;
+-		else {
+-			WARN_ON(hugepage_shift);
+-			paddr = pte_pfn(*ptep) << PAGE_SHIFT;
+-		}
++
++		paddr = ppc_find_vmap_phys(vaddr);
++
+ 		bus = iowa_pci_find(vaddr, paddr);
+ 
+ 		if (bus == NULL)
+diff --git a/arch/powerpc/kvm/book3s_hv_rm_mmu.c b/arch/powerpc/kvm/book3s_hv_rm_mmu.c
+index 7af7c70f1468..7a0f12404e0e 100644
+--- a/arch/powerpc/kvm/book3s_hv_rm_mmu.c
++++ b/arch/powerpc/kvm/book3s_hv_rm_mmu.c
+@@ -23,20 +23,9 @@
+ #include <asm/pte-walk.h>
+ 
+ /* Translate address of a vmalloc'd thing to a linear map address */
+-static void *real_vmalloc_addr(void *x)
++static void *real_vmalloc_addr(void *addr)
+ {
+-	unsigned long addr = (unsigned long) x;
+-	pte_t *p;
+-	/*
+-	 * assume we don't have huge pages in vmalloc space...
+-	 * So don't worry about THP collapse/split. Called
+-	 * Only in realmode with MSR_EE = 0, hence won't need irq_save/restore.
+-	 */
+-	p = find_init_mm_pte(addr, NULL);
+-	if (!p || !pte_present(*p))
+-		return NULL;
+-	addr = (pte_pfn(*p) << PAGE_SHIFT) | (addr & ~PAGE_MASK);
+-	return __va(addr);
++	return __va(ppc_find_vmap_phys((unsigned long)addr));
+ }
+ 
+ /* Return 1 if we need to do a global tlbie, 0 if we can use tlbiel */
+-- 
+2.31.1
+

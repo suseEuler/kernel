@@ -1,0 +1,1894 @@
+From 0c564931c303e8f74eced7d3aa28e7af2c6abd25 Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Fri, 26 Feb 2021 20:22:40 +0800
+Subject: [PATCH] arm64/mpam: Split header files into suitable location
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 0c564931c303e8f74eced7d3aa28e7af2c6abd25
+
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+So far there are some declarations shared by resctrlfs.c and mpam
+core module files under kernel/mpam directory scattered in mpam.h
+and resctrl.h, this is organized like this:
+
+-- asm/
+   +-- resctrl.h        +
+   +-- mpam.h           |    +
+   +-- mpam_resource.h  |    |    +
+                        |    |    |
+-- fs/                  |    |    +-> mpam/
+   +-- resctrlfs.c <----+----+------> +-- mpam_resctrl.c ...
+
+We move this declarations shared by resctrlfs.c and mpam/ to resctrl.h
+and split another declarations into mpam_internal.h, also including
+moving mpam_resource.h to mpam/ directory, currently this is organized
+like this:
+
+-- asm/
+   +-- mpam.h           +----> export to other modules(e.g. SMMU master io)
+   +-- resctrl.h        +
+                        |
+-- mpam/                |
+   +-- mpam_internal.h  |    +
+   +-- mpam_resource.h  |    |    +
+                        |    |    |
+-- fs/                  |    +----+-> mpam/
+   +-- resctrlfs.c <----+-----------> +-- mpam_resctrl.c ...
+
+In this way can we build a clearer framework for MPAM usage.
+
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/mpam.h          | 380 +------------------------
+ arch/arm64/include/asm/mpam_resource.h | 228 ---------------
+ arch/arm64/include/asm/resctrl.h       | 333 ++++++++++++++++++++--
+ arch/arm64/kernel/mpam/mpam_ctrlmon.c  |  96 ++++++-
+ arch/arm64/kernel/mpam/mpam_device.c   |   2 +-
+ arch/arm64/kernel/mpam/mpam_internal.h | 142 ++++++++-
+ arch/arm64/kernel/mpam/mpam_resctrl.c  |   3 +-
+ arch/arm64/kernel/mpam/mpam_resource.h | 228 +++++++++++++++
+ fs/resctrlfs.c                         |  94 +-----
+ include/linux/resctrlfs.h              |  82 ------
+ 10 files changed, 792 insertions(+), 796 deletions(-)
+ delete mode 100644 arch/arm64/include/asm/mpam_resource.h
+ create mode 100644 arch/arm64/kernel/mpam/mpam_resource.h
+
+diff --git a/arch/arm64/include/asm/mpam.h b/arch/arm64/include/asm/mpam.h
+index 930658a775d6..d4a19238f807 100644
+--- a/arch/arm64/include/asm/mpam.h
++++ b/arch/arm64/include/asm/mpam.h
+@@ -2,381 +2,13 @@
+ #ifndef _ASM_ARM64_MPAM_H
+ #define _ASM_ARM64_MPAM_H
+ 
+-#include <linux/sched.h>
+-#include <linux/kernfs.h>
+-#include <linux/jump_label.h>
+-
+-#include <linux/seq_buf.h>
+-#include <linux/seq_file.h>
+-#include <linux/resctrlfs.h>
+-
+-/* MPAM register */
+-#define SYS_MPAM0_EL1			sys_reg(3, 0, 10, 5, 1)
+-#define SYS_MPAM1_EL1			sys_reg(3, 0, 10, 5, 0)
+-#define SYS_MPAM2_EL2			sys_reg(3, 4, 10, 5, 0)
+-#define SYS_MPAM3_EL3			sys_reg(3, 6, 10, 5, 0)
+-#define SYS_MPAM1_EL12			sys_reg(3, 5, 10, 5, 0)
+-#define SYS_MPAMHCR_EL2			sys_reg(3, 4, 10, 4, 0)
+-#define SYS_MPAMVPMV_EL2		sys_reg(3, 4, 10, 4, 1)
+-#define SYS_MPAMVPMn_EL2(n)		sys_reg(3, 4, 10, 6, n)
+-#define SYS_MPAMIDR_EL1			sys_reg(3, 0, 10, 4, 4)
+-
+-#define MPAM_MASK(n)			((1UL << n) - 1)
+-/* plan to use GENMASK(n, 0) instead */
+-
+-/*
+- * MPAMx_ELn:
+- * 15:0		PARTID_I
+- * 31:16	PARTID_D
+- * 39:32	PMG_I
+- * 47:40	PMG_D
+- * 48		TRAPMPAM1EL1
+- * 49		TRAPMPAM0EL1
+- * 61:49	Reserved
+- * 62		TRAPLOWER
+- * 63		MPAMEN
+- */
+-#define PARTID_BITS			(16)
+-#define PMG_BITS			(8)
+-#define PARTID_MASK			MPAM_MASK(PARTID_BITS)
+-#define PMG_MASK			MPAM_MASK(PMG_BITS)
+-
+-#define PARTID_I_SHIFT			(0)
+-#define PARTID_D_SHIFT			(PARTID_I_SHIFT + PARTID_BITS)
+-#define PMG_I_SHIFT			(PARTID_D_SHIFT + PARTID_BITS)
+-#define PMG_D_SHIFT			(PMG_I_SHIFT + PMG_BITS)
+-
+-#define PARTID_I_MASK			(PARTID_MASK << PARTID_I_SHIFT)
+-#define PARTID_D_MASK			(PARTID_MASK << PARTID_D_SHIFT)
+-#define PARTID_I_CLR(r)			((r) & ~PARTID_I_MASK)
+-#define PARTID_D_CLR(r)			((r) & ~PARTID_D_MASK)
+-#define PARTID_CLR(r)			(PARTID_I_CLR(r) & PARTID_D_CLR(r))
+-
+-#define PARTID_I_SET(r, id)		(PARTID_I_CLR(r) | ((id) << PARTID_I_SHIFT))
+-#define PARTID_D_SET(r, id)		(PARTID_D_CLR(r) | ((id) << PARTID_D_SHIFT))
+-#define PARTID_SET(r, id)		(PARTID_CLR(r) | ((id) << PARTID_I_SHIFT) | ((id) << PARTID_D_SHIFT))
+-
+-#define PMG_I_MASK			(PMG_MASK << PMG_I_SHIFT)
+-#define PMG_D_MASK			(PMG_MASK << PMG_D_SHIFT)
+-#define PMG_I_CLR(r)			((r) & ~PMG_I_MASK)
+-#define PMG_D_CLR(r)			((r) & ~PMG_D_MASK)
+-#define PMG_CLR(r)			(PMG_I_CLR(r) & PMG_D_CLR(r))
+-
+-#define PMG_I_SET(r, id)		(PMG_I_CLR(r) | ((id) << PMG_I_SHIFT))
+-#define PMG_D_SET(r, id)		(PMG_D_CLR(r) | ((id) << PMG_D_SHIFT))
+-#define PMG_SET(r, id)			(PMG_CLR(r) | ((id) << PMG_I_SHIFT) | ((id) << PMG_D_SHIFT))
+-
+-#define TRAPMPAM1EL1_SHIFT		(PMG_D_SHIFT + PMG_BITS)
+-#define TRAPMPAM0EL1_SHIFT		(TRAPMPAM1EL1_SHIFT + 1)
+-#define TRAPLOWER_SHIFT			(TRAPMPAM0EL1_SHIFT + 13)
+-#define MPAMEN_SHIFT			(TRAPLOWER_SHIFT + 1)
+-
+-/*
+- * MPAMHCR_EL2:
+- * 0		EL0_VPMEN
+- * 1		EL1_VPMEN
+- * 7:2		Reserved
+- * 8		GSTAPP_PLK
+- * 30:9		Reserved
+- * 31		TRAP_MPAMIDR_EL1
+- * 63:32	Reserved
+- */
+-#define EL0_VPMEN_SHIFT			(0)
+-#define EL1_VPMEN_SHIFT			(EL0_VPMEN_SHIFT + 1)
+-#define GSTAPP_PLK_SHIFT		(8)
+-#define TRAP_MPAMIDR_EL1_SHIFT		(31)
+-
+-/*
+- * MPAMIDR_EL1:
+- * 15:0		PARTID_MAX
+- * 16		Reserved
+- * 17		HAS_HCR
+- * 20:18	VPMR_MAX
+- * 31:21	Reserved
+- * 39:32	PMG_MAX
+- * 63:40	Reserved
+- */
+-#define VPMR_MAX_BITS			(3)
+-#define PARTID_MAX_SHIFT		(0)
+-#define PARTID_MAX_MASK		(MPAM_MASK(PARTID_BITS) << PARTID_MAX_SHIFT)
+-#define HAS_HCR_SHIFT			(PARTID_MAX_SHIFT + PARTID_BITS + 1)
+-#define VPMR_MAX_SHIFT			(HAS_HCR_SHIFT + 1)
+-#define PMG_MAX_SHIFT			(VPMR_MAX_SHIFT + VPMR_MAX_BITS + 11)
+-#define PMG_MAX_MASK			(MPAM_MASK(PMG_BITS) << PMG_MAX_SHIFT)
+-#define VPMR_MASK			MPAM_MASK(VPMR_MAX_BITS)
+-
+-/*
+- * MPAMVPMV_EL2:
+- * 31:0		VPM_V
+- * 63:32	Reserved
+- */
+-#define VPM_V_BITS			32
+-
+-DECLARE_STATIC_KEY_FALSE(resctrl_enable_key);
+-DECLARE_STATIC_KEY_FALSE(resctrl_mon_enable_key);
+-
+-extern int max_name_width, max_data_width;
+-
+-enum resctrl_ctrl_type {
+-	SCHEMA_COMM = 0,
+-	SCHEMA_PRI,
+-	SCHEMA_HDL,
+-	SCHEMA_NUM_CTRL_TYPE
+-};
+-
+-struct resctrl_ctrl_feature {
+-	enum resctrl_ctrl_type type;
+-	int        flags;
+-	const char *name;
+-
+-	u32        max_wd;
+-
+-	int        base;
+-	int        evt;
+-
+-	int        default_ctrl;
+-
+-	bool       capable;
+-	bool       enabled;
+-};
+-
+-#define for_each_ctrl_type(t)	\
+-		for (t = SCHEMA_COMM; t != SCHEMA_NUM_CTRL_TYPE; t++)
+-
+-#define for_each_extend_ctrl_type(t)	\
+-		for (t = SCHEMA_PRI; t != SCHEMA_NUM_CTRL_TYPE; t++)
+-
+-enum resctrl_conf_type {
+-	CDP_BOTH = 0,
+-	CDP_CODE,
+-	CDP_DATA,
+-	CDP_NUM_CONF_TYPE,
+-};
+-
+-static inline int conf_name_to_conf_type(char *name)
++#ifdef CONFIG_MPAM
++extern int mpam_rmid_to_partid_pmg(int rmid, int *partid, int *pmg);
++#else
++static inline int mpam_rmid_to_partid_pmg(int rmid, int *partid, int *pmg)
+ {
+-	enum resctrl_conf_type t;
+-
+-	if (!strcmp(name, "L3CODE") || !strcmp(name, "L2CODE"))
+-		t = CDP_CODE;
+-	else if (!strcmp(name, "L3DATA") || !strcmp(name, "L2DATA"))
+-		t = CDP_DATA;
+-	else
+-		t = CDP_BOTH;
+-	return t;
++	return 0;
+ }
+-
+-#define for_each_conf_type(t) \
+-		for (t = CDP_BOTH; t < CDP_NUM_CONF_TYPE; t++)
+-
+-typedef struct { u16 val; } hw_mpamid_t;
+-
+-#define hw_closid_t hw_mpamid_t
+-#define hw_monid_t hw_mpamid_t
+-#define hw_closid_val(__x) (__x.val)
+-#define hw_monid_val(__x) (__x.val)
+-
+-#define as_hw_t(__name, __x) \
+-			((hw_##__name##id_t){(__x)})
+-#define hw_val(__name, __x) \
+-			hw_##__name##id_val(__x)
+-
+-/**
+- * When cdp enabled, give (closid + 1) to Cache LxDATA.
+- */
+-#define resctrl_cdp_map(__name, __closid, __type, __result)    \
+-do {   \
+-	if (__type == CDP_CODE) \
+-		__result = as_hw_t(__name, __closid); \
+-	else if (__type == CDP_DATA)     \
+-		__result = as_hw_t(__name, __closid + 1); \
+-	else    \
+-		__result = as_hw_t(__name, __closid); \
+-} while (0)
+-
+-bool is_resctrl_cdp_enabled(void);
+-
+-#define hw_alloc_times_validate(__times, __flag) \
+-do {   \
+-	__flag = is_resctrl_cdp_enabled();	\
+-	__times = flag ? 2 : 1;	\
+-} while (0)
+-
+-
+-/**
+- * struct resctrl_staged_config - parsed configuration to be applied
+- * @hw_closid:      raw closid for this configuration, regardless of CDP
+- * @new_ctrl:       new ctrl value to be loaded
+- * @have_new_ctrl:  did user provide new_ctrl for this domain
+- * @new_ctrl_type:  CDP property of the new ctrl
+- * @cdp_both_ctrl:   did cdp both control if cdp enabled
+- */
+-struct resctrl_staged_config {
+-	hw_closid_t     hw_closid;
+-	u32             new_ctrl[SCHEMA_NUM_CTRL_TYPE];
+-	bool            have_new_ctrl;
+-	enum resctrl_conf_type  conf_type;
+-	enum resctrl_ctrl_type  ctrl_type;
+-	bool            cdp_both_ctrl;
+-};
+-
+-/* later move to resctrl common directory */
+-#define RESCTRL_NAME_LEN    15
+-
+-struct resctrl_schema_ctrl {
+-	struct list_head       list;
+-	char name[RESCTRL_NAME_LEN];
+-	enum resctrl_ctrl_type     ctrl_type;
+-};
+-
+-/**
+- * @list:   Member of resctrl's schema list
+- * @name:   Name visible in the schemata file
+- * @conf_type:  Type of configuration, e.g. code/data/both
+- * @res:    The rdt_resource for this entry
+- * @schemata_ctrl_list:   Type of ctrl configuration. e.g. priority/hardlimit
+- * @cdp_mc_both:   did cdp both mon/ctrl if cdp enabled
+- */
+-struct resctrl_schema {
+-	struct list_head        list;
+-	char                    name[RESCTRL_NAME_LEN];
+-	enum resctrl_conf_type      conf_type;
+-	struct resctrl_resource     *res;
+-	struct list_head        schema_ctrl_list;
+-	bool                cdp_mc_both;
+-};
+-
+-extern struct list_head resctrl_all_schema;
+-
+-/**
+- * struct rdt_domain - group of cpus sharing an RDT resource
+- * @list:	all instances of this resource
+- * @id:		unique id for this instance
+- * @cpu_mask:	which cpus share this resource
+- * @rmid_busy_llc:
+- *		bitmap of which limbo RMIDs are above threshold
+- * @mbm_total:	saved state for MBM total bandwidth
+- * @mbm_local:	saved state for MBM local bandwidth
+- * @mbm_over:	worker to periodically read MBM h/w counters
+- * @cqm_limbo:	worker to periodically read CQM h/w counters
+- * @mbm_work_cpu:
+- *		worker cpu for MBM h/w counters
+- * @cqm_work_cpu:
+- *		worker cpu for CQM h/w counters
+- * @ctrl_val:	array of cache or mem ctrl values (indexed by CLOSID)
+- * @new_ctrl:	new ctrl value to be loaded
+- * @have_new_ctrl: did user provide new_ctrl for this domain
+- */
+-struct rdt_domain {
+-	struct list_head	list;
+-	int			id;
+-	struct cpumask		cpu_mask;
+-	void __iomem		*base;
+-
+-	/* arch specific fields */
+-	u32			*ctrl_val[SCHEMA_NUM_CTRL_TYPE];
+-	bool			have_new_ctrl;
+-
+-	/* for debug */
+-	char			*cpus_list;
+-
+-	struct resctrl_staged_config staged_cfg[CDP_NUM_CONF_TYPE];
+-};
+-
+-#define RESCTRL_SHOW_DOM_MAX_NUM 8
+-
+-int __init resctrl_group_init(void);
+-
+-int resctrl_group_mondata_show(struct seq_file *m, void *arg);
+-void rmdir_mondata_subdir_allrdtgrp(struct resctrl_resource *r,
+-				    unsigned int dom_id);
+-
+-int cdp_enable(int level, int data_type, int code_type);
+-
+-void post_resctrl_mount(void);
+-
+-#define mpam_read_sysreg_s(reg, name) read_sysreg_s(reg)
+-#define mpam_write_sysreg_s(v, r, n) write_sysreg_s(v, r)
+-#define mpam_readl(addr) readl(addr)
+-#define mpam_writel(v, addr) writel(v, addr)
+-
+-struct sd_closid;
+-
+-struct msr_param {
+-	enum resctrl_ctrl_type type;
+-	struct sd_closid *closid;
+-};
+-
+-/**
+- * struct resctrl_resource - attributes of an RDT resource
+- * @rid:		The index of the resource
+- * @alloc_enabled:	Is allocation enabled on this machine
+- * @mon_enabled:		Is monitoring enabled for this feature
+- * @alloc_capable:	Is allocation available on this machine
+- * @mon_capable:		Is monitor feature available on this machine
+- * @name:		Name to use in "schemata" file
+- * @num_closid:		Number of CLOSIDs available
+- * @cache_level:	Which cache level defines scope of this resource
+- * @msr_base:		Base MSR address for CBMs
+- * @msr_update:		Function pointer to update QOS MSRs
+- * @data_width:		Character width of data when displaying
+- * @domains:		All domains for this resource
+- * @cache:		Cache allocation related data
+- * @format_str:		Per resource format string to show domain value
+- * @parse_ctrlval:	Per resource function pointer to parse control values
+- * @evt_list:			List of monitoring events
+- * @num_rmid:			Number of RMIDs available
+- * @mon_scale:			cqm counter * mon_scale = occupancy in bytes
+- * @fflags:			flags to choose base and info files
+- */
+-
+-struct raw_resctrl_resource {
+-	u16                 num_partid;
+-	u16                 num_intpartid;
+-	u16                 num_pmg;
+-
+-	void (*msr_update)(struct resctrl_resource *r, struct rdt_domain *d,
+-				struct msr_param *para);
+-	u64 (*msr_read)(struct resctrl_resource *r, struct rdt_domain *d,
+-				struct msr_param *para);
+-
+-	int			data_width;
+-	const char		*format_str;
+-	int (*parse_ctrlval)(char *buf, struct resctrl_resource *r,
+-				struct resctrl_staged_config *cfg,
+-				enum resctrl_ctrl_type ctrl_type);
+-
+-	u16                num_mon;
+-	u64 (*mon_read)(struct rdt_domain *d, void *md_priv);
+-	int (*mon_write)(struct rdt_domain *d, void *md_priv);
+-
+-	struct resctrl_ctrl_feature ctrl_features[SCHEMA_NUM_CTRL_TYPE];
+-
+-	unsigned long       fflags;
+-};
+-
+-/* 64bit arm64 specified */
+-union mon_data_bits {
+-	void *priv;
+-	struct {
+-		u8	rid;
+-		u8	domid;
+-		u8	partid;
+-		u8	pmg;
+-		u8	mon;
+-		u8	cdp_both_mon;
+-	} u;
+-};
+-
+-ssize_t resctrl_group_schemata_write(struct kernfs_open_file *of,
+-				char *buf, size_t nbytes, loff_t off);
+-
+-int resctrl_group_schemata_show(struct kernfs_open_file *of,
+-				struct seq_file *s, void *v);
+-
+-struct rdt_domain *mpam_find_domain(struct resctrl_resource *r, int id,
+-		struct list_head **pos);
+-
+-extern int mpam_rmid_to_partid_pmg(int rmid, int *partid, int *pmg);
++#endif
+ 
+ #endif /* _ASM_ARM64_MPAM_H */
+diff --git a/arch/arm64/include/asm/mpam_resource.h b/arch/arm64/include/asm/mpam_resource.h
+deleted file mode 100644
+index 4833a38a773c..000000000000
+--- a/arch/arm64/include/asm/mpam_resource.h
++++ /dev/null
+@@ -1,228 +0,0 @@
+-/* SPDX-License-Identifier: GPL-2.0 */
+-#ifndef _ASM_ARM64_MPAM_RESOURCE_H
+-#define _ASM_ARM64_MPAM_RESOURCE_H
+-
+-#include <linux/bitops.h>
+-
+-#define MPAMF_IDR           0x0000
+-#define MPAMF_SIDR          0x0008
+-#define MPAMF_MSMON_IDR     0x0080
+-#define MPAMF_IMPL_IDR      0x0028
+-#define MPAMF_CPOR_IDR      0x0030
+-#define MPAMF_CCAP_IDR      0x0038
+-#define MPAMF_MBW_IDR       0x0040
+-#define MPAMF_PRI_IDR       0x0048
+-#define MPAMF_CSUMON_IDR    0x0088
+-#define MPAMF_MBWUMON_IDR   0x0090
+-#define MPAMF_PARTID_NRW_IDR    0x0050
+-#define MPAMF_IIDR          0x0018
+-#define MPAMF_AIDR          0x0020
+-#define MPAMCFG_PART_SEL    0x0100
+-#define MPAMCFG_CPBM        0x1000
+-#define MPAMCFG_CMAX        0x0108
+-#define MPAMCFG_MBW_MIN     0x0200
+-#define MPAMCFG_MBW_MAX     0x0208
+-#define MPAMCFG_MBW_WINWD   0x0220
+-#define MPAMCFG_MBW_PBM     0x2000
+-#define MPAMCFG_PRI         0x0400
+-#define MPAMCFG_MBW_PROP    0x0500
+-#define MPAMCFG_INTPARTID   0x0600
+-#define MSMON_CFG_MON_SEL   0x0800
+-#define MSMON_CFG_CSU_FLT   0x0810
+-#define MSMON_CFG_CSU_CTL   0x0818
+-#define MSMON_CFG_MBWU_FLT  0x0820
+-#define MSMON_CFG_MBWU_CTL  0x0828
+-#define MSMON_CSU           0x0840
+-#define MSMON_CSU_CAPTURE   0x0848
+-#define MSMON_MBWU          0x0860
+-#define MSMON_MBWU_CAPTURE  0x0868
+-#define MSMON_CAPT_EVNT     0x0808
+-#define MPAMF_ESR           0x00F8
+-#define MPAMF_ECR           0x00F0
+-
+-#define HAS_CCAP_PART       BIT(24)
+-#define HAS_CPOR_PART       BIT(25)
+-#define HAS_MBW_PART        BIT(26)
+-#define HAS_PRI_PART        BIT(27)
+-#define HAS_IMPL_IDR        BIT(29)
+-#define HAS_MSMON           BIT(30)
+-#define HAS_PARTID_NRW      BIT(31)
+-
+-/* MPAMF_IDR */
+-#define MPAMF_IDR_PMG_MAX_MASK      ((BIT(8) - 1) << 16)
+-#define MPAMF_IDR_PMG_MAX_SHIFT     16
+-#define MPAMF_IDR_PARTID_MAX_MASK   (BIT(16) - 1)
+-#define MPAMF_IDR_PMG_MAX_GET(v)    ((v & MPAMF_IDR_PMG_MAX_MASK) >> 16)
+-#define MPAMF_IDR_PARTID_MAX_GET(v) (v & MPAMF_IDR_PARTID_MAX_MASK)
+-
+-#define MPAMF_IDR_HAS_CCAP_PART(v)  ((v) & HAS_CCAP_PART)
+-#define MPAMF_IDR_HAS_CPOR_PART(v)  ((v) & HAS_CPOR_PART)
+-#define MPAMF_IDR_HAS_MBW_PART(v)   ((v) & HAS_MBW_PART)
+-#define MPAMF_IDR_HAS_MSMON(v)      ((v) & HAS_MSMON)
+-#define MPAMF_IDR_PARTID_MASK       GENMASK(15, 0)
+-#define MPAMF_IDR_PMG_MASK          GENMASK(23, 16)
+-#define MPAMF_IDR_PMG_SHIFT         16
+-#define MPAMF_IDR_HAS_PARTID_NRW(v) ((v) & HAS_PARTID_NRW)
+-#define NUM_MON_MASK                (BIT(16) - 1)
+-#define MPAMF_IDR_NUM_MON(v)        ((v) & NUM_MON_MASK)
+-
+-#define CPBM_WD_MASK        0xFFFF
+-#define CPBM_MASK           0x7FFF
+-
+-#define MBW_MAX_HARDLIM             BIT(31)
+-#define MBW_PROP_HARDLIM            BIT(31)
+-#define MBW_MAX_MASK                GENMASK(15, 0)
+-#define MBW_MAX_BWA_FRACT(w)        GENMASK(w - 1, 0)
+-#define MBW_MAX_SET(v, w)           (v << (16 - w))
+-/* MPAMCFG_MBW_PROP */
+-#define MBW_PROP_SET_HDL(r)   (r | MBW_PROP_HARDLIM)
+-/* MPAMCFG_MBW_MAX */
+-#define MBW_MAX_SET_HDL(r)    (r | MBW_MAX_HARDLIM)
+-#define MBW_MAX_GET_HDL(r)    ((r & MBW_MAX_HARDLIM) >> 31)
+-#define MBW_MAX_GET(v, w)     (((v) & MBW_MAX_MASK) >> (16 - w))
+-
+-#define MSMON_MATCH_PMG     BIT(17)
+-#define MSMON_MATCH_PARTID  BIT(16)
+-#define MSMON_CFG_CTL_EN    BIT(31)
+-#define MSMON_CFG_FLT_SET(r, p)     ((r) << 16|(p))
+-#define MBWU_SUBTYPE_DEFAULT        (3 << 20)
+-#define MSMON_CFG_MBWU_CTL_SET(m)   (BIT(31)|MBWU_SUBTYPE_DEFAULT|(m))
+-#define MSMON_CFG_CSU_CTL_SET(m)    (BIT(31)|(m))
+-#define MSMON_CFG_CSU_TYPE          0x43
+-#define MSMON_CFG_MBWU_TYPE         0x42
+-
+-/*
+- * Set MPAMCFG_INTPARTID internal bit
+- */
+-#define MPAMCFG_INTPARTID_INTERNAL  BIT(16)
+-#define INTPARTID_INTPARTID_MASK    (BIT(15) - 1)
+-#define MPAMCFG_INTPARTID_INTPARTID_GET(r) (r & INTPARTID_INTPARTID_MASK)
+-/*
+- * Set MPAMCFG_PART_SEL internal bit
+- */
+-#define MPAMCFG_PART_SEL_INTERNAL   BIT(16)
+-
+-/* MPAMF_ESR - MPAM Error Status Register */
+-#define MPAMF_ESR_PARTID_OR_MON GENMASK(15, 0)
+-#define MPAMF_ESR_PMG           GENMASK(23, 16)
+-#define MPAMF_ESR_ERRCODE       GENMASK(27, 24)
+-#define MPAMF_ESR_ERRCODE_SHIFT 24
+-#define MPAMF_ESR_OVRWR         BIT(31)
+-#define MPAMF_ESR_ERRCODE_MASK  ((BIT(4) - 1) << 24)
+-
+-/* MPAMF_ECR - MPAM Error Control Register */
+-#define MPAMF_ECR_INTEN         BIT(0)
+-
+-/*
+- * Size of the memory mapped registers: 4K of feature page then 2 x 4K
+- * bitmap registers
+- */
+-#define SZ_MPAM_DEVICE  (3 * SZ_4K)
+-
+-/*
+- * MSMON_CSU - Memory system performance monitor cache storage usage monitor
+- *            register
+- * MSMON_CSU_CAPTURE -  Memory system performance monitor cache storage usage
+- *                     capture register
+- * MSMON_MBWU  - Memory system performance monitor memory bandwidth usage
+- *               monitor register
+- * MSMON_MBWU_CAPTURE - Memory system performance monitor memory bandwidth usage
+- *                     capture register
+- */
+-#define MSMON___VALUE          GENMASK(30, 0)
+-#define MSMON___NRDY           BIT(31)
+-
+-/*
+- * MSMON_CAPT_EVNT - Memory system performance monitoring capture event
+- *                  generation register
+- */
+-#define MSMON_CAPT_EVNT_NOW    BIT(0)
+-/*
+- * MPAMCFG_MBW_MAX SET - temp Hard code
+- */
+-#define MPAMCFG_PRI_DSPRI_SHIFT			16
+-#define MPAMCFG_INTPRI_GET(r)  (r & GENMASK(15, 0))
+-#define MPAMCFG_DSPRI_GET(r)   ((r & GENMASK(31, 16)) >> 16)
+-/* Always same if both supported */
+-#define MPAMCFG_PRI_GET(r)     (MPAMCFG_DSPRI_GET(r) | MPAMCFG_INTPRI_GET(r))
+-
+-/* MPAMF_PRI_IDR - MPAM features priority partitioning ID register */
+-#define MPAMF_PRI_IDR_HAS_INTPRI        BIT(0)
+-#define MPAMF_PRI_IDR_INTPRI_0_IS_LOW   BIT(1)
+-#define MPAMF_PRI_IDR_INTPRI_WD_SHIFT   4
+-#define MPAMF_PRI_IDR_INTPRI_WD         GENMASK(9, 4)
+-#define MPAMF_PRI_IDR_HAS_DSPRI         BIT(16)
+-#define MPAMF_PRI_IDR_DSPRI_0_IS_LOW    BIT(17)
+-#define MPAMF_PRI_IDR_DSPRI_WD_SHIFT    20
+-#define MPAMF_PRI_IDR_DSPRI_WD          GENMASK(25, 20)
+-
+-/* MPAMF_CSUMON_IDR - MPAM cache storage usage monitor ID register */
+-#define MPAMF_CSUMON_IDR_NUM_MON        GENMASK(15, 0)
+-#define MPAMF_CSUMON_IDR_HAS_CAPTURE    BIT(31)
+-
+-/* MPAMF_MBWUMON_IDR - MPAM memory bandwidth usage monitor ID register */
+-#define MPAMF_MBWUMON_IDR_NUM_MON       GENMASK(15, 0)
+-#define MPAMF_MBWUMON_IDR_HAS_CAPTURE   BIT(31)
+-
+-/* MPAMF_CPOR_IDR - MPAM features cache portion partitioning ID register */
+-#define MPAMF_CPOR_IDR_CPBM_WD          GENMASK(15, 0)
+-
+-/* MPAMF_CCAP_IDR - MPAM features cache capacity partitioning ID register */
+-#define MPAMF_CCAP_IDR_CMAX_WD          GENMASK(5, 0)
+-
+-/* MPAMF_MBW_IDR - MPAM features memory bandwidth partitioning ID register */
+-#define MPAMF_MBW_IDR_BWA_WD            GENMASK(5, 0)
+-#define MPAMF_MBW_IDR_HAS_MIN           BIT(10)
+-#define MPAMF_MBW_IDR_HAS_MAX           BIT(11)
+-#define MPAMF_MBW_IDR_HAS_PBM           BIT(12)
+-
+-#define MPAMF_MBW_IDR_HAS_PROP          BIT(13)
+-#define MPAMF_MBW_IDR_WINDWR            BIT(14)
+-#define MPAMF_MBW_IDR_BWPBM_WD          GENMASK(28, 16)
+-#define MPAMF_MBW_IDR_BWPBM_WD_SHIFT	16
+-
+-/* MPAMF_PARTID_NRW_IDR - MPAM features partid narrow ID register */
+-#define MPAMF_PARTID_NRW_IDR_MASK	 (BIT(16) - 1)
+-
+-#define MSMON_CFG_CTL_TYPE           GENMASK(7, 0)
+-#define MSMON_CFG_CTL_MATCH_PARTID   BIT(16)
+-#define MSMON_CFG_CTL_MATCH_PMG      BIT(17)
+-#define MSMON_CFG_CTL_SUBTYPE        GENMASK(23, 20)
+-#define MSMON_CFG_CTL_SUBTYPE_SHIFT  20
+-#define MSMON_CFG_CTL_OFLOW_FRZ      BIT(24)
+-#define MSMON_CFG_CTL_OFLOW_INTR     BIT(25)
+-#define MSMON_CFG_CTL_OFLOW_STATUS   BIT(26)
+-#define MSMON_CFG_CTL_CAPT_RESET     BIT(27)
+-#define MSMON_CFG_CTL_CAPT_EVNT      GENMASK(30, 28)
+-#define MSMON_CFG_CTL_CAPT_EVNT_SHIFT		28
+-#define MSMON_CFG_CTL_EN					BIT(31)
+-
+-#define MPAMF_IDR_HAS_PRI_PART(v)			(v & BIT(27))
+-
+-/* MPAMF_MSMON_IDR - MPAM performance monitoring ID register */
+-#define MPAMF_MSMON_IDR_MSMON_CSU               BIT(16)
+-#define MPAMF_MSMON_IDR_MSMON_MBWU              BIT(17)
+-#define MPAMF_MSMON_IDR_HAS_LOCAL_CAPT_EVNT     BIT(31)
+-
+-/*
+- * MSMON_CFG_MBWU_FLT - Memory system performance monitor configure memory
+- *                     bandwidth usage monitor filter register
+- */
+-#define MSMON_CFG_MBWU_FLT_PARTID               GENMASK(15, 0)
+-#define MSMON_CFG_MBWU_FLT_PMG_SHIFT			16
+-#define MSMON_CFG_MBWU_FLT_PMG                  GENMASK(23, 16)
+-#define MSMON_CFG_MBWU_TYPE 0x42
+-
+-/*
+- * MSMON_CFG_CSU_FLT - Memory system performance monitor configure cache storage
+- *                    usage monitor filter register
+- */
+-#define MSMON_CFG_CSU_FLT_PARTID		GENMASK(15, 0)
+-#define MSMON_CFG_CSU_FLT_PMG			GENMASK(23, 16)
+-#define MSMON_CFG_CSU_FLT_PMG_SHIFT		16
+-#define MSMON_CFG_CSU_TYPE  0x43
+-
+-/* hard code for mbw_max max-percentage's cresponding masks */
+-#define MBA_MAX_WD 63u
+-
+-#endif /* _ASM_ARM64_MPAM_RESOURCE_H */
+diff --git a/arch/arm64/include/asm/resctrl.h b/arch/arm64/include/asm/resctrl.h
+index 44a5bcfa5b92..56769a34a294 100644
+--- a/arch/arm64/include/asm/resctrl.h
++++ b/arch/arm64/include/asm/resctrl.h
+@@ -1,9 +1,12 @@
+ #ifndef _ASM_ARM64_RESCTRL_H
+ #define _ASM_ARM64_RESCTRL_H
+ 
++#include <linux/resctrlfs.h>
+ #include <asm/mpam_sched.h>
+ #include <asm/mpam.h>
+ 
++#if defined(CONFIG_RESCTRL) && defined(CONFIG_MPAM)
++
+ #define resctrl_group rdtgroup
+ #define resctrl_alloc_capable rdt_alloc_capable
+ #define resctrl_mon_capable rdt_mon_capable
+@@ -40,13 +43,81 @@ enum rdt_group_type {
+ 	RDT_NUM_GROUP,
+ };
+ 
++/**
++ * struct resctrl_cache - Cache allocation related data
++ * @cbm_len:        Length of the cache bit mask
++ * @min_cbm_bits:   Minimum number of consecutive bits to be set
++ * @shareable_bits: Bitmask of shareable resource with other
++ *          executing entities
++ */
++struct resctrl_cache {
++	u32     cbm_len;
++	u32     shareable_bits;
++	u32     min_cbm_bits;
++};
++
++/**
++ * struct resctrl_membw - Memory bandwidth allocation related data
++ * @min_bw:     Minimum memory bandwidth percentage user can request
++ * @bw_gran:        Granularity at which the memory bandwidth is allocated
++ * @delay_linear:   True if memory B/W delay is in linear scale
++ * @ctrl_extend_bits: Indicates if there are extra ctrl capabilities supported.
++ *          e.g. priority/hardlimit.
++ */
++struct resctrl_membw {
++	u32     min_bw;
++	u32     bw_gran;
++	u32     delay_linear;
++};
++
++/**
++ * struct resctrl_resource - attributes of an RDT resource
++ * @rid:		The index of the resource
++ * @alloc_enabled:		Is allocation enabled on this machine
++ * @mon_enabled:		Is monitoring enabled for this feature
++ * @alloc_capable:		Is allocation available on this machine
++ * @mon_capable:		Is monitor feature available on this machine
++ * @name:		Name to use in "schemata" file
++ * @domains:	All domains for this resource
++ * @cache:		Cache allocation related data
++ * @mbw:		Memory Bandwidth allocation related data
++ * @evt_list:	List of monitoring events
++ * @fflags:		flags to choose base and info files
++ */
++struct resctrl_resource {
++	int             rid;
++	bool            alloc_enabled;
++	bool            mon_enabled;
++	bool            alloc_capable;
++	bool            mon_capable;
++	char            *name;
++	struct list_head    domains;
++	u32             dom_num;
++	struct list_head    evt_list;
++	unsigned long   fflags;
++
++	struct resctrl_cache cache;
++	struct resctrl_membw mbw;
++
++	bool            cdp_capable;
++	bool            cdp_enable;
++	u32             *default_ctrl;
++
++	u32             ctrl_extend_bits;
++
++	void            *res;
++};
++
++/* List of all resource groups */
++extern struct list_head resctrl_all_groups;
++
+ /**
+  * struct mongroup - store mon group's data in resctrl fs.
+  * @mon_data_kn     kernlfs node for the mon_data directory
+  * @parent:         parent rdtgrp
+  * @crdtgrp_list:       child rdtgroup node list
+  * @rmid:           rmid for this rdtgroup
+- * @mon:            monnitor id
++ * @init:           init flag
+  */
+ struct mongroup {
+ 	struct kernfs_node  *mon_data_kn;
+@@ -59,7 +130,7 @@ struct mongroup {
+ /**
+  * struct sd_closid - software defined closid
+  * @intpartid:  closid for this rdtgroup only for allocation
+- * @weak_closid:    closid for synchronizing configuration and monitoring
++ * @reqpartid:  closid for synchronizing configuration and monitoring
+  */
+ struct sd_closid {
+ 	u32         intpartid;
+@@ -70,6 +141,7 @@ struct sd_closid {
+  * struct rdtgroup - store rdtgroup's data in resctrl file system.
+  * @kn:             kernfs node
+  * @resctrl_group_list:     linked list for all rdtgroups
++ * @closid:             software defined closid
+  * @cpu_mask:           CPUs assigned to this rdtgroup
+  * @flags:          status bits
+  * @waitcount:          how many cpus expect to find this
+@@ -89,11 +161,214 @@ struct rdtgroup {
+ 	struct mongroup     mon;
+ };
+ 
++enum resctrl_ctrl_type {
++	SCHEMA_COMM = 0,
++	SCHEMA_PRI,
++	SCHEMA_HDL,
++	SCHEMA_NUM_CTRL_TYPE
++};
++
++#define for_each_ctrl_type(t)	\
++		for (t = SCHEMA_COMM; t != SCHEMA_NUM_CTRL_TYPE; t++)
++
++#define for_each_extend_ctrl_type(t)	\
++		for (t = SCHEMA_PRI; t != SCHEMA_NUM_CTRL_TYPE; t++)
++
++/**
++ * struct resctrl_ctrl_feature - ctrl feature member live in schema list
++ * @flags:    Does what ctrl types can this feature server for
++ * @name:     Name of this ctrl feature
++ * @max_wd:   Max width of this feature can be input from outter space
++ * @base:     Base of integer from outter space
++ * @evt:      rdt_event_id event owned for applying configuration
++ * @capable:  Does this feature support
++ * @enabled:  Enabled or not.
++ * @default_ctrl:  Default ctrl value of this feature
++ */
++struct resctrl_ctrl_feature {
++	enum resctrl_ctrl_type type;
++	int        flags;
++	const char *name;
++	u32        max_wd;
++	int        base;
++	enum rdt_event_id   evt;
++	int        default_ctrl;
++	bool       capable;
++	bool       enabled;
++};
++
++struct msr_param {
++	enum resctrl_ctrl_type type;
++	struct sd_closid *closid;
++};
++
++enum resctrl_conf_type {
++	CDP_BOTH = 0,
++	CDP_CODE,
++	CDP_DATA,
++	CDP_NUM_CONF_TYPE,
++};
++
++static inline int conf_name_to_conf_type(char *name)
++{
++	enum resctrl_conf_type t;
++
++	if (!strcmp(name, "L3CODE") || !strcmp(name, "L2CODE"))
++		t = CDP_CODE;
++	else if (!strcmp(name, "L3DATA") || !strcmp(name, "L2DATA"))
++		t = CDP_DATA;
++	else
++		t = CDP_BOTH;
++	return t;
++}
++
++#define for_each_conf_type(t) \
++		for (t = CDP_BOTH; t < CDP_NUM_CONF_TYPE; t++)
++
++typedef struct { u16 val; } hw_def_t;
++
++#define hw_closid_t hw_def_t
++#define hw_monid_t hw_def_t
++#define hw_closid_val(__x) (__x.val)
++#define hw_monid_val(__x) (__x.val)
++
++#define as_hw_t(__name, __x) \
++			((hw_##__name##id_t){(__x)})
++#define hw_val(__name, __x) \
++			hw_##__name##id_val(__x)
++
++/**
++ * When cdp enabled, give (closid + 1) to Cache LxDATA.
++ */
++#define resctrl_cdp_map(__name, __closid, __type, __result)    \
++do {   \
++	if (__type == CDP_CODE) \
++		__result = as_hw_t(__name, __closid); \
++	else if (__type == CDP_DATA)     \
++		__result = as_hw_t(__name, __closid + 1); \
++	else    \
++		__result = as_hw_t(__name, __closid); \
++} while (0)
++
++bool is_resctrl_cdp_enabled(void);
++
++#define hw_alloc_validate(__flag) \
++do {   \
++	if (is_resctrl_cdp_enabled()) \
++		__flag = true;  \
++	else    \
++		__flag = false; \
++} while (0)
++
++#define hw_alloc_times_validate(__times, __flag) \
++do {   \
++	hw_alloc_validate(__flag); \
++	if (__flag) \
++		__times = 2;    \
++	else    \
++		__times = 1;    \
++} while (0)
++
++/**
++ * struct resctrl_staged_config - parsed configuration to be applied
++ * @hw_closid:      raw closid for this configuration, regardless of CDP
++ * @new_ctrl:       new ctrl value to be loaded
++ * @have_new_ctrl:  did user provide new_ctrl for this domain
++ * @new_ctrl_type:  CDP property of the new ctrl
++ * @cdp_both_ctrl:   did cdp both control if cdp enabled
++ */
++struct resctrl_staged_config {
++	hw_closid_t     hw_closid;
++	u32             new_ctrl[SCHEMA_NUM_CTRL_TYPE];
++	bool            have_new_ctrl;
++	enum resctrl_conf_type  conf_type;
++	enum resctrl_ctrl_type  ctrl_type;
++	bool            cdp_both_ctrl;
++};
++
++/* later move to resctrl common directory */
++#define RESCTRL_NAME_LEN    15
++
++struct resctrl_schema_ctrl {
++	struct list_head       list;
++	char name[RESCTRL_NAME_LEN];
++	enum resctrl_ctrl_type     ctrl_type;
++};
++
++/**
++ * @list:   Member of resctrl's schema list
++ * @name:   Name visible in the schemata file
++ * @conf_type:  Type of configuration, e.g. code/data/both
++ * @res:    The rdt_resource for this entry
++ * @schemata_ctrl_list:   Type of ctrl configuration. e.g. priority/hardlimit
++ * @cdp_mc_both:   did cdp both mon/ctrl if cdp enabled
++ */
++struct resctrl_schema {
++	struct list_head        list;
++	char                name[RESCTRL_NAME_LEN];
++	enum resctrl_conf_type      conf_type;
++	struct resctrl_resource     *res;
++	struct list_head        schema_ctrl_list;
++	bool                cdp_mc_both;
++};
++
+ int schemata_list_init(void);
+ 
+ void schemata_list_destroy(void);
+ 
+-int resctrl_lru_request_mon(void);
++/**
++ * struct rdt_domain - group of cpus sharing an RDT resource
++ * @list:	all instances of this resource
++ * @id:		unique id for this instance
++ * @cpu_mask:	which cpus share this resource
++ * @base        MMIO base address
++ * @ctrl_val:	array of cache or mem ctrl values (indexed by CLOSID)
++ * @have_new_ctrl: did user provide new_ctrl for this domain
++ */
++struct rdt_domain {
++	struct list_head	list;
++	int			id;
++	struct cpumask		cpu_mask;
++	void __iomem		*base;
++
++	/* arch specific fields */
++	u32			*ctrl_val[SCHEMA_NUM_CTRL_TYPE];
++	bool			have_new_ctrl;
++
++	/* for debug */
++	char			*cpus_list;
++
++	struct resctrl_staged_config staged_cfg[CDP_NUM_CONF_TYPE];
++};
++
++/*
++ * Internal struct of resctrl_resource structure,
++ * for static initialization.
++ */
++struct raw_resctrl_resource {
++	u16		num_partid;
++	u16		num_intpartid;
++	u16		num_pmg;
++
++	u16		extend_ctrls_wd[SCHEMA_NUM_CTRL_TYPE];
++
++	void (*msr_update)(struct resctrl_resource *r, struct rdt_domain *d,
++					struct msr_param *para);
++	u64 (*msr_read)(struct resctrl_resource *r, struct rdt_domain *d,
++					struct msr_param *para);
++
++	int			data_width;
++	const char		*format_str;
++	int (*parse_ctrlval)(char *buf, struct resctrl_resource *r,
++			struct resctrl_staged_config *cfg, enum resctrl_ctrl_type ctrl_type);
++
++	u16			num_mon;
++	u64 (*mon_read)(struct rdt_domain *d, void *md_priv);
++	int (*mon_write)(struct rdt_domain *d, void *md_priv);
++	unsigned long       fflags;
++
++	struct resctrl_ctrl_feature ctrl_features[SCHEMA_NUM_CTRL_TYPE];
++};
+ 
+ int rmid_alloc(int entry_idx);
+ void rmid_free(int rmid);
+@@ -103,7 +378,8 @@ int closid_alloc(void);
+ void closid_free(int closid);
+ 
+ void update_cpu_closid_rmid(void *info);
+-void update_closid_rmid(const struct cpumask *cpu_mask, struct resctrl_group *r);
++void update_closid_rmid(const struct cpumask *cpu_mask,
++				struct resctrl_group *r);
+ int __resctrl_group_move_task(struct task_struct *tsk,
+ 				struct resctrl_group *rdtgrp);
+ 
+@@ -117,18 +393,11 @@ void rdt_last_cmd_clear(void);
+ void rdt_last_cmd_puts(const char *s);
+ void rdt_last_cmd_printf(const char *fmt, ...);
+ 
+-extern struct mutex resctrl_group_mutex;
+-
+-void release_rdtgroupfs_options(void);
+-int parse_rdtgroupfs_options(char *data);
+-
+ void resctrl_resource_reset(void);
+ 
+ #define release_resctrl_group_fs_options release_rdtgroupfs_options
+ #define parse_resctrl_group_fs_options parse_rdtgroupfs_options
+ 
+-int mpam_get_mon_config(struct resctrl_resource *r);
+-
+ int resctrl_group_init_alloc(struct rdtgroup *rdtgrp);
+ 
+ static inline int __resctrl_group_show_options(struct seq_file *seq)
+@@ -136,15 +405,46 @@ static inline int __resctrl_group_show_options(struct seq_file *seq)
+ 	return 0;
+ }
+ 
++int resctrl_update_groups_config(struct rdtgroup *rdtgrp);
++
++#define RESCTRL_MAX_CLOSID 32
++
++int __init resctrl_group_init(void);
++
++void post_resctrl_mount(void);
++
++extern struct mutex resctrl_group_mutex;
++DECLARE_STATIC_KEY_FALSE(resctrl_alloc_enable_key);
++extern struct rdtgroup resctrl_group_default;
+ int resctrl_mkdir_mondata_all_subdir(struct kernfs_node *parent_kn,
+-			struct resctrl_group *prgrp);
++		struct resctrl_group *prgrp);
+ 
+-struct resctrl_resource *
+-mpam_resctrl_get_resource(enum resctrl_resource_level level);
++int resctrl_group_create_info_dir(struct kernfs_node *parent_kn,
++		struct kernfs_node **kn_info);
+ 
+-int resctrl_update_groups_config(struct rdtgroup *rdtgrp);
++int register_resctrl_specific_files(struct rftype *files, size_t len);
++extern struct kernfs_ops resctrl_group_kf_single_ops;
+ 
+-#define RESCTRL_MAX_CLOSID 32
++extern struct rdtgroup *resctrl_group_kn_lock_live(struct kernfs_node *kn);
++void resctrl_group_kn_unlock(struct kernfs_node *kn);
++
++void release_rdtgroupfs_options(void);
++int parse_rdtgroupfs_options(char *data);
++
++int resctrl_group_add_files(struct kernfs_node *kn, unsigned long fflags);
++
++#define RESCTRL_MAX_CBM 32
++
++struct resctrl_fs_context {
++	struct kernfs_fs_context        kfc;
++};
++
++static inline struct resctrl_fs_context *resctrl_fc2context(struct fs_context *fc)
++{
++	struct kernfs_fs_context *kfc = fc->fs_private;
++
++	return container_of(kfc, struct resctrl_fs_context, kfc);
++}
+ 
+ /*
+  * This is only for avoiding unnecessary cost in mpam_sched_in()
+@@ -178,4 +478,5 @@ static inline u32 resctrl_navie_closid(struct sd_closid closid)
+ 	return closid.intpartid;
+ }
+ 
++#endif
+ #endif /* _ASM_ARM64_RESCTRL_H */
+diff --git a/arch/arm64/kernel/mpam/mpam_ctrlmon.c b/arch/arm64/kernel/mpam/mpam_ctrlmon.c
+index 5f0481356d32..4b5b7bd5877b 100644
+--- a/arch/arm64/kernel/mpam/mpam_ctrlmon.c
++++ b/arch/arm64/kernel/mpam/mpam_ctrlmon.c
+@@ -29,8 +29,9 @@
+ #include <linux/kernfs.h>
+ #include <linux/seq_file.h>
+ #include <linux/slab.h>
++#include <asm/mpam.h>
+ 
+-#include <asm/mpam_resource.h>
++#include "mpam_resource.h"
+ #include "mpam_internal.h"
+ 
+ /* schemata content list */
+@@ -751,6 +752,99 @@ int resctrl_mkdir_mondata_all_subdir(struct kernfs_node *parent_kn,
+ 	return ret;
+ }
+ 
++static int resctrl_group_mkdir_info_resdir(struct resctrl_resource *r,
++		char *name,unsigned long fflags, struct kernfs_node *kn_info)
++{
++	struct kernfs_node *kn_subdir;
++	int ret;
++
++	kn_subdir = kernfs_create_dir(kn_info, name,
++				      kn_info->mode, r);
++	if (IS_ERR(kn_subdir))
++		return PTR_ERR(kn_subdir);
++
++	kernfs_get(kn_subdir);
++	ret = resctrl_group_kn_set_ugid(kn_subdir);
++	if (ret)
++		return ret;
++
++	ret = resctrl_group_add_files(kn_subdir, fflags);
++	if (!ret)
++		kernfs_activate(kn_subdir);
++
++	return ret;
++}
++
++int resctrl_group_create_info_dir(struct kernfs_node *parent_kn,
++		struct kernfs_node **kn_info)
++{
++	struct resctrl_schema *s;
++	struct resctrl_resource *r;
++	struct raw_resctrl_resource *rr;
++	unsigned long fflags;
++	char name[32];
++	int ret;
++
++	/* create the directory */
++	*kn_info = kernfs_create_dir(parent_kn, "info", parent_kn->mode, NULL);
++	if (IS_ERR(*kn_info))
++		return PTR_ERR(*kn_info);
++	kernfs_get(*kn_info);
++
++	ret = resctrl_group_add_files(*kn_info, RF_TOP_INFO);
++	if (ret)
++		goto out_destroy;
++
++	list_for_each_entry(s, &resctrl_all_schema, list) {
++		r = s->res;
++		if (!r)
++			continue;
++		rr = r->res;
++		if (r->alloc_enabled) {
++			fflags =  rr->fflags | RF_CTRL_INFO;
++			ret = resctrl_group_mkdir_info_resdir(r, s->name,
++				fflags, *kn_info);
++			if (ret)
++				goto out_destroy;
++		}
++	}
++
++	list_for_each_entry(s, &resctrl_all_schema, list) {
++		r = s->res;
++		if (!r)
++			continue;
++		rr = r->res;
++		if (r->mon_enabled) {
++			fflags =  rr->fflags | RF_MON_INFO;
++			snprintf(name, sizeof(name), "%s_MON", s->name);
++			ret = resctrl_group_mkdir_info_resdir(r, name,
++				fflags, *kn_info);
++			if (ret)
++				goto out_destroy;
++		}
++	}
++
++	/*
++	 m This extra ref will be put in kernfs_remove() and guarantees
++	 * that @rdtgrp->kn is always accessible.
++	 */
++	kernfs_get(*kn_info);
++
++	ret = resctrl_group_kn_set_ugid(*kn_info);
++	if (ret)
++		goto out_destroy;
++
++	kernfs_activate(*kn_info);
++
++	return 0;
++
++out_destroy:
++	kernfs_remove(*kn_info);
++	return ret;
++}
++
++
++
+ /* Initialize MBA resource with default values. */
+ static void rdtgroup_init_mba(struct resctrl_schema *s, u32 closid)
+ {
+diff --git a/arch/arm64/kernel/mpam/mpam_device.c b/arch/arm64/kernel/mpam/mpam_device.c
+index 401b20476552..384d880b3248 100644
+--- a/arch/arm64/kernel/mpam/mpam_device.c
++++ b/arch/arm64/kernel/mpam/mpam_device.c
+@@ -32,8 +32,8 @@
+ #include <linux/cpu.h>
+ #include <linux/cacheinfo.h>
+ #include <linux/arm_mpam.h>
+-#include <asm/mpam_resource.h>
+ 
++#include "mpam_resource.h"
+ #include "mpam_device.h"
+ #include "mpam_internal.h"
+ 
+diff --git a/arch/arm64/kernel/mpam/mpam_internal.h b/arch/arm64/kernel/mpam/mpam_internal.h
+index d74989e03993..40dcc02f4e57 100644
+--- a/arch/arm64/kernel/mpam/mpam_internal.h
++++ b/arch/arm64/kernel/mpam/mpam_internal.h
+@@ -2,8 +2,6 @@
+ #ifndef _ASM_ARM64_MPAM_INTERNAL_H
+ #define _ASM_ARM64_MPAM_INTERNAL_H
+ 
+-#include <linux/resctrlfs.h>
+-#include <asm/mpam.h>
+ #include <asm/resctrl.h>
+ 
+ typedef u32 mpam_features_t;
+@@ -12,6 +10,142 @@ struct mpam_component;
+ struct rdt_domain;
+ struct mpam_class;
+ struct raw_resctrl_resource;
++struct resctrl_resource;
++/* MPAM register */
++#define SYS_MPAM0_EL1			sys_reg(3, 0, 10, 5, 1)
++#define SYS_MPAM1_EL1			sys_reg(3, 0, 10, 5, 0)
++#define SYS_MPAM2_EL2			sys_reg(3, 4, 10, 5, 0)
++#define SYS_MPAM3_EL3			sys_reg(3, 6, 10, 5, 0)
++#define SYS_MPAM1_EL12			sys_reg(3, 5, 10, 5, 0)
++#define SYS_MPAMHCR_EL2			sys_reg(3, 4, 10, 4, 0)
++#define SYS_MPAMVPMV_EL2		sys_reg(3, 4, 10, 4, 1)
++#define SYS_MPAMVPMn_EL2(n)		sys_reg(3, 4, 10, 6, n)
++#define SYS_MPAMIDR_EL1			sys_reg(3, 0, 10, 4, 4)
++
++#define MPAM_MASK(n)			((1UL << n) - 1)
++/* plan to use GENMASK(n, 0) instead */
++
++/*
++ * MPAMx_ELn:
++ * 15:0		PARTID_I
++ * 31:16	PARTID_D
++ * 39:32	PMG_I
++ * 47:40	PMG_D
++ * 48		TRAPMPAM1EL1
++ * 49		TRAPMPAM0EL1
++ * 61:49	Reserved
++ * 62		TRAPLOWER
++ * 63		MPAMEN
++ */
++#define PARTID_BITS			(16)
++#define PMG_BITS			(8)
++#define PARTID_MASK			MPAM_MASK(PARTID_BITS)
++#define PMG_MASK			MPAM_MASK(PMG_BITS)
++
++#define PARTID_I_SHIFT			(0)
++#define PARTID_D_SHIFT			(PARTID_I_SHIFT + PARTID_BITS)
++#define PMG_I_SHIFT			(PARTID_D_SHIFT + PARTID_BITS)
++#define PMG_D_SHIFT			(PMG_I_SHIFT + PMG_BITS)
++
++#define PARTID_I_MASK			(PARTID_MASK << PARTID_I_SHIFT)
++#define PARTID_D_MASK			(PARTID_MASK << PARTID_D_SHIFT)
++#define PARTID_I_CLR(r)			((r) & ~PARTID_I_MASK)
++#define PARTID_D_CLR(r)			((r) & ~PARTID_D_MASK)
++#define PARTID_CLR(r)			(PARTID_I_CLR(r) & PARTID_D_CLR(r))
++
++#define PARTID_I_SET(r, id)		(PARTID_I_CLR(r) | ((id) << PARTID_I_SHIFT))
++#define PARTID_D_SET(r, id)		(PARTID_D_CLR(r) | ((id) << PARTID_D_SHIFT))
++#define PARTID_SET(r, id)		(PARTID_CLR(r) | ((id) << PARTID_I_SHIFT) | ((id) << PARTID_D_SHIFT))
++
++#define PMG_I_MASK			(PMG_MASK << PMG_I_SHIFT)
++#define PMG_D_MASK			(PMG_MASK << PMG_D_SHIFT)
++#define PMG_I_CLR(r)			((r) & ~PMG_I_MASK)
++#define PMG_D_CLR(r)			((r) & ~PMG_D_MASK)
++#define PMG_CLR(r)			(PMG_I_CLR(r) & PMG_D_CLR(r))
++
++#define PMG_I_SET(r, id)		(PMG_I_CLR(r) | ((id) << PMG_I_SHIFT))
++#define PMG_D_SET(r, id)		(PMG_D_CLR(r) | ((id) << PMG_D_SHIFT))
++#define PMG_SET(r, id)			(PMG_CLR(r) | ((id) << PMG_I_SHIFT) | ((id) << PMG_D_SHIFT))
++
++#define TRAPMPAM1EL1_SHIFT		(PMG_D_SHIFT + PMG_BITS)
++#define TRAPMPAM0EL1_SHIFT		(TRAPMPAM1EL1_SHIFT + 1)
++#define TRAPLOWER_SHIFT			(TRAPMPAM0EL1_SHIFT + 13)
++#define MPAMEN_SHIFT			(TRAPLOWER_SHIFT + 1)
++
++/*
++ * MPAMHCR_EL2:
++ * 0		EL0_VPMEN
++ * 1		EL1_VPMEN
++ * 7:2		Reserved
++ * 8		GSTAPP_PLK
++ * 30:9		Reserved
++ * 31		TRAP_MPAMIDR_EL1
++ * 63:32	Reserved
++ */
++#define EL0_VPMEN_SHIFT			(0)
++#define EL1_VPMEN_SHIFT			(EL0_VPMEN_SHIFT + 1)
++#define GSTAPP_PLK_SHIFT		(8)
++#define TRAP_MPAMIDR_EL1_SHIFT		(31)
++
++/*
++ * MPAMIDR_EL1:
++ * 15:0		PARTID_MAX
++ * 16		Reserved
++ * 17		HAS_HCR
++ * 20:18	VPMR_MAX
++ * 31:21	Reserved
++ * 39:32	PMG_MAX
++ * 63:40	Reserved
++ */
++#define VPMR_MAX_BITS			(3)
++#define PARTID_MAX_SHIFT		(0)
++#define PARTID_MAX_MASK			(MPAM_MASK(PARTID_BITS) << PARTID_MAX_SHIFT)
++#define HAS_HCR_SHIFT			(PARTID_MAX_SHIFT + PARTID_BITS + 1)
++#define VPMR_MAX_SHIFT			(HAS_HCR_SHIFT + 1)
++#define PMG_MAX_SHIFT			(VPMR_MAX_SHIFT + VPMR_MAX_BITS + 11)
++#define PMG_MAX_MASK			(MPAM_MASK(PMG_BITS) << PMG_MAX_SHIFT)
++#define VPMR_MASK			MPAM_MASK(VPMR_MAX_BITS)
++
++/*
++ * MPAMVPMV_EL2:
++ * 31:0		VPM_V
++ * 63:32	Reserved
++ */
++#define VPM_V_BITS			32
++
++DECLARE_STATIC_KEY_FALSE(resctrl_enable_key);
++DECLARE_STATIC_KEY_FALSE(resctrl_mon_enable_key);
++
++extern int max_name_width, max_data_width;
++
++#define RESCTRL_SHOW_DOM_MAX_NUM 8
++
++#define mpam_read_sysreg_s(reg, name) read_sysreg_s(reg)
++#define mpam_write_sysreg_s(v, r, n) write_sysreg_s(v, r)
++#define mpam_readl(addr) readl(addr)
++#define mpam_writel(v, addr) writel(v, addr)
++
++/* 64bit arm64 specified */
++union mon_data_bits {
++	void *priv;
++	struct {
++		u8	rid;
++		u8	domid;
++		u8	partid;
++		u8	pmg;
++		u8	mon;
++		u8	cdp_both_mon;
++	} u;
++};
++
++ssize_t resctrl_group_schemata_write(struct kernfs_open_file *of,
++				char *buf, size_t nbytes, loff_t off);
++
++int resctrl_group_schemata_show(struct kernfs_open_file *of,
++				struct seq_file *s, void *v);
++
++struct rdt_domain *mpam_find_domain(struct resctrl_resource *r, int id,
++		struct list_head **pos);
+ 
+ extern bool rdt_alloc_capable;
+ extern bool rdt_mon_capable;
+@@ -201,4 +335,8 @@ int assoc_rmid_with_mon(u32 rmid);
+ void deassoc_rmid_with_mon(u32 rmid);
+ u32 get_rmid_mon(u32 rmid, enum resctrl_resource_level rid);
+ int rmid_mon_ptrs_init(u32 nr_rmids);
++
++struct resctrl_resource *
++mpam_resctrl_get_resource(enum resctrl_resource_level level);
++
+ #endif
+diff --git a/arch/arm64/kernel/mpam/mpam_resctrl.c b/arch/arm64/kernel/mpam/mpam_resctrl.c
+index e7c51845dbf3..2dc81aa5c3a7 100644
+--- a/arch/arm64/kernel/mpam/mpam_resctrl.c
++++ b/arch/arm64/kernel/mpam/mpam_resctrl.c
+@@ -35,10 +35,11 @@
+ #include <linux/arm_mpam.h>
+ 
+ #include <asm/mpam_sched.h>
+-#include <asm/mpam_resource.h>
++#include <asm/mpam.h>
+ #include <asm/io.h>
+ 
+ #include "mpam_device.h"
++#include "mpam_resource.h"
+ #include "mpam_internal.h"
+ 
+ /* Mutex to protect rdtgroup access. */
+diff --git a/arch/arm64/kernel/mpam/mpam_resource.h b/arch/arm64/kernel/mpam/mpam_resource.h
+new file mode 100644
+index 000000000000..93452498c8d1
+--- /dev/null
++++ b/arch/arm64/kernel/mpam/mpam_resource.h
+@@ -0,0 +1,228 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _ASM_ARM64_MPAM_RESOURCE_H
++#define _ASM_ARM64_MPAM_RESOURCE_H
++
++#include <linux/bitops.h>
++
++#define MPAMF_IDR           0x0000
++#define MPAMF_SIDR          0x0008
++#define MPAMF_MSMON_IDR     0x0080
++#define MPAMF_IMPL_IDR      0x0028
++#define MPAMF_CPOR_IDR      0x0030
++#define MPAMF_CCAP_IDR      0x0038
++#define MPAMF_MBW_IDR       0x0040
++#define MPAMF_PRI_IDR       0x0048
++#define MPAMF_CSUMON_IDR    0x0088
++#define MPAMF_MBWUMON_IDR   0x0090
++#define MPAMF_PARTID_NRW_IDR    0x0050
++#define MPAMF_IIDR          0x0018
++#define MPAMF_AIDR          0x0020
++#define MPAMCFG_PART_SEL    0x0100
++#define MPAMCFG_CPBM        0x1000
++#define MPAMCFG_CMAX        0x0108
++#define MPAMCFG_MBW_MIN     0x0200
++#define MPAMCFG_MBW_MAX     0x0208
++#define MPAMCFG_MBW_WINWD   0x0220
++#define MPAMCFG_MBW_PBM     0x2000
++#define MPAMCFG_PRI         0x0400
++#define MPAMCFG_MBW_PROP    0x0500
++#define MPAMCFG_INTPARTID   0x0600
++#define MSMON_CFG_MON_SEL   0x0800
++#define MSMON_CFG_CSU_FLT   0x0810
++#define MSMON_CFG_CSU_CTL   0x0818
++#define MSMON_CFG_MBWU_FLT  0x0820
++#define MSMON_CFG_MBWU_CTL  0x0828
++#define MSMON_CSU           0x0840
++#define MSMON_CSU_CAPTURE   0x0848
++#define MSMON_MBWU          0x0860
++#define MSMON_MBWU_CAPTURE  0x0868
++#define MSMON_CAPT_EVNT     0x0808
++#define MPAMF_ESR           0x00F8
++#define MPAMF_ECR           0x00F0
++
++#define HAS_CCAP_PART       BIT(24)
++#define HAS_CPOR_PART       BIT(25)
++#define HAS_MBW_PART        BIT(26)
++#define HAS_PRI_PART        BIT(27)
++#define HAS_IMPL_IDR        BIT(29)
++#define HAS_MSMON           BIT(30)
++#define HAS_PARTID_NRW      BIT(31)
++
++/* MPAMF_IDR */
++#define MPAMF_IDR_PMG_MAX_MASK      ((BIT(8) - 1) << 16)
++#define MPAMF_IDR_PMG_MAX_SHIFT     16
++#define MPAMF_IDR_PARTID_MAX_MASK   (BIT(16) - 1)
++#define MPAMF_IDR_PMG_MAX_GET(v)    ((v & MPAMF_IDR_PMG_MAX_MASK) >> 16)
++#define MPAMF_IDR_PARTID_MAX_GET(v) (v & MPAMF_IDR_PARTID_MAX_MASK)
++
++#define MPAMF_IDR_HAS_CCAP_PART(v)  ((v) & HAS_CCAP_PART)
++#define MPAMF_IDR_HAS_CPOR_PART(v)  ((v) & HAS_CPOR_PART)
++#define MPAMF_IDR_HAS_MBW_PART(v)   ((v) & HAS_MBW_PART)
++#define MPAMF_IDR_HAS_MSMON(v)      ((v) & HAS_MSMON)
++#define MPAMF_IDR_PARTID_MASK       GENMASK(15, 0)
++#define MPAMF_IDR_PMG_MASK          GENMASK(23, 16)
++#define MPAMF_IDR_PMG_SHIFT         16
++#define MPAMF_IDR_HAS_PARTID_NRW(v) ((v) & HAS_PARTID_NRW)
++#define NUM_MON_MASK                (BIT(16) - 1)
++#define MPAMF_IDR_NUM_MON(v)        ((v) & NUM_MON_MASK)
++
++#define CPBM_WD_MASK        0xFFFF
++#define CPBM_MASK           0x7FFF
++
++#define MBW_MAX_HARDLIM             BIT(31)
++#define MBW_PROP_HARDLIM            BIT(31)
++#define MBW_MAX_MASK                GENMASK(15, 0)
++#define MBW_MAX_BWA_FRACT(w)        GENMASK(w - 1, 0)
++#define MBW_MAX_SET(v, w)           (v << (16 - w))
++/* MPAMCFG_MBW_PROP */
++#define MBW_PROP_SET_HDL(r)   (r | MBW_PROP_HARDLIM)
++/* MPAMCFG_MBW_MAX */
++#define MBW_MAX_SET_HDL(r)    (r | MBW_MAX_HARDLIM)
++#define MBW_MAX_GET_HDL(r)    ((r & MBW_MAX_HARDLIM) >> 31)
++#define MBW_MAX_GET(v, w)     (((v) & MBW_MAX_MASK) >> (16 - w))
++
++#define MSMON_MATCH_PMG     BIT(17)
++#define MSMON_MATCH_PARTID  BIT(16)
++#define MSMON_CFG_CTL_EN    BIT(31)
++#define MSMON_CFG_FLT_SET(r, p)     ((r) << 16|(p))
++#define MBWU_SUBTYPE_DEFAULT        (3 << 20)
++#define MSMON_CFG_MBWU_CTL_SET(m)   (BIT(31)|MBWU_SUBTYPE_DEFAULT|(m))
++#define MSMON_CFG_CSU_CTL_SET(m)    (BIT(31)|(m))
++#define MSMON_CFG_CSU_TYPE          0x43
++#define MSMON_CFG_MBWU_TYPE         0x42
++
++/*
++ * Set MPAMCFG_INTPARTID internal bit
++ */
++#define MPAMCFG_INTPARTID_INTERNAL  BIT(16)
++#define INTPARTID_INTPARTID_MASK    (BIT(15) - 1)
++#define MPAMCFG_INTPARTID_INTPARTID_GET(r) (r & INTPARTID_INTPARTID_MASK)
++/*
++ * Set MPAMCFG_PART_SEL internal bit
++ */
++#define MPAMCFG_PART_SEL_INTERNAL   BIT(16)
++
++/* MPAMF_ESR - MPAM Error Status Register */
++#define MPAMF_ESR_PARTID_OR_MON GENMASK(15, 0)
++#define MPAMF_ESR_PMG           GENMASK(23, 16)
++#define MPAMF_ESR_ERRCODE       GENMASK(27, 24)
++#define MPAMF_ESR_ERRCODE_SHIFT 24
++#define MPAMF_ESR_OVRWR         BIT(31)
++#define MPAMF_ESR_ERRCODE_MASK  ((BIT(4) - 1) << 24)
++
++/* MPAMF_ECR - MPAM Error Control Register */
++#define MPAMF_ECR_INTEN         BIT(0)
++
++/*
++ * Size of the memory mapped registers: 4K of feature page then 2 x 4K
++ * bitmap registers
++ */
++#define SZ_MPAM_DEVICE  (3 * SZ_4K)
++
++/*
++ * MSMON_CSU - Memory system performance monitor cache storage usage monitor
++ *            register
++ * MSMON_CSU_CAPTURE -  Memory system performance monitor cache storage usage
++ *                     capture register
++ * MSMON_MBWU  - Memory system performance monitor memory bandwidth usage
++ *               monitor register
++ * MSMON_MBWU_CAPTURE - Memory system performance monitor memory bandwidth usage
++ *                     capture register
++ */
++#define MSMON___VALUE          GENMASK(30, 0)
++#define MSMON___NRDY           BIT(31)
++
++/*
++ * MSMON_CAPT_EVNT - Memory system performance monitoring capture event
++ *                  generation register
++ */
++#define MSMON_CAPT_EVNT_NOW    BIT(0)
++/*
++ * MPAMCFG_MBW_MAX SET - temp Hard code
++ */
++#define MPAMCFG_PRI_DSPRI_SHIFT			16
++#define MPAMCFG_INTPRI_GET(r)  (r & GENMASK(15, 0))
++#define MPAMCFG_DSPRI_GET(r)   ((r & GENMASK(31, 16)) >> 16)
++/* Always same if both supported */
++#define MPAMCFG_PRI_GET(r)     (MPAMCFG_DSPRI_GET(r) | MPAMCFG_INTPRI_GET(r))
++
++/* MPAMF_PRI_IDR - MPAM features priority partitioning ID register */
++#define MPAMF_PRI_IDR_HAS_INTPRI        BIT(0)
++#define MPAMF_PRI_IDR_INTPRI_0_IS_LOW   BIT(1)
++#define MPAMF_PRI_IDR_INTPRI_WD_SHIFT   4
++#define MPAMF_PRI_IDR_INTPRI_WD         GENMASK(9, 4)
++#define MPAMF_PRI_IDR_HAS_DSPRI         BIT(16)
++#define MPAMF_PRI_IDR_DSPRI_0_IS_LOW    BIT(17)
++#define MPAMF_PRI_IDR_DSPRI_WD_SHIFT    20
++#define MPAMF_PRI_IDR_DSPRI_WD          GENMASK(25, 20)
++
++/* MPAMF_CSUMON_IDR - MPAM cache storage usage monitor ID register */
++#define MPAMF_CSUMON_IDR_NUM_MON        GENMASK(15, 0)
++#define MPAMF_CSUMON_IDR_HAS_CAPTURE    BIT(31)
++
++/* MPAMF_MBWUMON_IDR - MPAM memory bandwidth usage monitor ID register */
++#define MPAMF_MBWUMON_IDR_NUM_MON       GENMASK(15, 0)
++#define MPAMF_MBWUMON_IDR_HAS_CAPTURE   BIT(31)
++
++/* MPAMF_CPOR_IDR - MPAM features cache portion partitioning ID register */
++#define MPAMF_CPOR_IDR_CPBM_WD                  GENMASK(15, 0)
++
++/* MPAMF_CCAP_IDR - MPAM features cache capacity partitioning ID register */
++#define MPAMF_CCAP_IDR_CMAX_WD                  GENMASK(5, 0)
++
++/* MPAMF_MBW_IDR - MPAM features memory bandwidth partitioning ID register */
++#define MPAMF_MBW_IDR_BWA_WD            GENMASK(5, 0)
++#define MPAMF_MBW_IDR_HAS_MIN           BIT(10)
++#define MPAMF_MBW_IDR_HAS_MAX           BIT(11)
++#define MPAMF_MBW_IDR_HAS_PBM           BIT(12)
++
++#define MPAMF_MBW_IDR_HAS_PROP          BIT(13)
++#define MPAMF_MBW_IDR_WINDWR            BIT(14)
++#define MPAMF_MBW_IDR_BWPBM_WD          GENMASK(28, 16)
++#define MPAMF_MBW_IDR_BWPBM_WD_SHIFT	16
++
++/* MPAMF_PARTID_NRW_IDR - MPAM features partid narrow ID register */
++#define MPAMF_PARTID_NRW_IDR_MASK	 (BIT(16) - 1)
++
++#define MSMON_CFG_CTL_TYPE           GENMASK(7, 0)
++#define MSMON_CFG_CTL_MATCH_PARTID   BIT(16)
++#define MSMON_CFG_CTL_MATCH_PMG      BIT(17)
++#define MSMON_CFG_CTL_SUBTYPE        GENMASK(23, 20)
++#define MSMON_CFG_CTL_SUBTYPE_SHIFT  20
++#define MSMON_CFG_CTL_OFLOW_FRZ      BIT(24)
++#define MSMON_CFG_CTL_OFLOW_INTR     BIT(25)
++#define MSMON_CFG_CTL_OFLOW_STATUS   BIT(26)
++#define MSMON_CFG_CTL_CAPT_RESET     BIT(27)
++#define MSMON_CFG_CTL_CAPT_EVNT      GENMASK(30, 28)
++#define MSMON_CFG_CTL_CAPT_EVNT_SHIFT		28
++#define MSMON_CFG_CTL_EN					BIT(31)
++
++#define MPAMF_IDR_HAS_PRI_PART(v)			(v & BIT(27))
++
++/* MPAMF_MSMON_IDR - MPAM performance monitoring ID register */
++#define MPAMF_MSMON_IDR_MSMON_CSU               BIT(16)
++#define MPAMF_MSMON_IDR_MSMON_MBWU              BIT(17)
++#define MPAMF_MSMON_IDR_HAS_LOCAL_CAPT_EVNT     BIT(31)
++
++/*
++ * MSMON_CFG_MBWU_FLT - Memory system performance monitor configure memory
++ *                     bandwidth usage monitor filter register
++ */
++#define MSMON_CFG_MBWU_FLT_PARTID               GENMASK(15, 0)
++#define MSMON_CFG_MBWU_FLT_PMG_SHIFT			16
++#define MSMON_CFG_MBWU_FLT_PMG                  GENMASK(23, 16)
++#define MSMON_CFG_MBWU_TYPE 0x42
++
++/*
++ * MSMON_CFG_CSU_FLT - Memory system performance monitor configure cache storage
++ *                    usage monitor filter register
++ */
++#define MSMON_CFG_CSU_FLT_PARTID		GENMASK(15, 0)
++#define MSMON_CFG_CSU_FLT_PMG			GENMASK(23, 16)
++#define MSMON_CFG_CSU_FLT_PMG_SHIFT		16
++#define MSMON_CFG_CSU_TYPE  0x43
++
++/* hard code for mbw_max max-percentage's cresponding masks */
++#define MBA_MAX_WD 63u
++
++#endif /* _ASM_ARM64_MPAM_RESOURCE_H */
+diff --git a/fs/resctrlfs.c b/fs/resctrlfs.c
+index b199e5e9709b..5f6aecf2db8c 100644
+--- a/fs/resctrlfs.c
++++ b/fs/resctrlfs.c
+@@ -40,8 +40,8 @@
+ 
+ #include <uapi/linux/magic.h>
+ 
+-#include <asm/mpam.h>
+ #include <asm/resctrl.h>
++#include <asm/mpam.h>
+ 
+ DEFINE_STATIC_KEY_FALSE(resctrl_enable_key);
+ DEFINE_STATIC_KEY_FALSE(resctrl_mon_enable_key);
+@@ -143,7 +143,7 @@ static int __resctrl_group_add_files(struct kernfs_node *kn, unsigned long fflag
+ 	return ret;
+ }
+ 
+-static int resctrl_group_add_files(struct kernfs_node *kn, unsigned long fflags)
++int resctrl_group_add_files(struct kernfs_node *kn, unsigned long fflags)
+ {
+ 	int ret = 0;
+ 
+@@ -154,94 +154,6 @@ static int resctrl_group_add_files(struct kernfs_node *kn, unsigned long fflags)
+ 	return ret;
+ }
+ 
+-static int resctrl_group_mkdir_info_resdir(struct resctrl_resource *r, char *name,
+-				      unsigned long fflags)
+-{
+-	struct kernfs_node *kn_subdir;
+-	int ret;
+-
+-	kn_subdir = kernfs_create_dir(kn_info, name,
+-				      kn_info->mode, r);
+-	if (IS_ERR(kn_subdir))
+-		return PTR_ERR(kn_subdir);
+-
+-	kernfs_get(kn_subdir);
+-	ret = resctrl_group_kn_set_ugid(kn_subdir);
+-	if (ret)
+-		return ret;
+-
+-	ret = resctrl_group_add_files(kn_subdir, fflags);
+-	if (!ret)
+-		kernfs_activate(kn_subdir);
+-
+-	return ret;
+-}
+-
+-static int resctrl_group_create_info_dir(struct kernfs_node *parent_kn)
+-{
+-	struct resctrl_schema *s;
+-	struct resctrl_resource *r;
+-	struct raw_resctrl_resource *rr;
+-	unsigned long fflags;
+-	char name[32];
+-	int ret;
+-
+-	/* create the directory */
+-	kn_info = kernfs_create_dir(parent_kn, "info", parent_kn->mode, NULL);
+-	if (IS_ERR(kn_info))
+-		return PTR_ERR(kn_info);
+-	kernfs_get(kn_info);
+-
+-	ret = resctrl_group_add_files(kn_info, RF_TOP_INFO);
+-	if (ret)
+-		goto out_destroy;
+-
+-	list_for_each_entry(s, &resctrl_all_schema, list) {
+-		r = s->res;
+-		if (!r)
+-			continue;
+-		rr = r->res;
+-		if (r->alloc_enabled) {
+-			fflags =  rr->fflags | RF_CTRL_INFO;
+-			ret = resctrl_group_mkdir_info_resdir(r, s->name, fflags);
+-			if (ret)
+-				goto out_destroy;
+-		}
+-	}
+-
+-	list_for_each_entry(s, &resctrl_all_schema, list) {
+-		r = s->res;
+-		if (!r)
+-			continue;
+-		rr = r->res;
+-		if (r->mon_enabled) {
+-			fflags =  rr->fflags | RF_MON_INFO;
+-			snprintf(name, sizeof(name), "%s_MON", s->name);
+-			ret = resctrl_group_mkdir_info_resdir(r, name, fflags);
+-			if (ret)
+-				goto out_destroy;
+-		}
+-	}
+-
+-	/*
+-	 m This extra ref will be put in kernfs_remove() and guarantees
+-	 * that @rdtgrp->kn is always accessible.
+-	 */
+-	kernfs_get(kn_info);
+-
+-	ret = resctrl_group_kn_set_ugid(kn_info);
+-	if (ret)
+-		goto out_destroy;
+-
+-	kernfs_activate(kn_info);
+-
+-	return 0;
+-
+-out_destroy:
+-	kernfs_remove(kn_info);
+-	return ret;
+-}
+-
+ /*
+  * We don't allow resctrl_group directories to be created anywhere
+  * except the root directory. Thus when looking for the resctrl_group
+@@ -439,7 +351,7 @@ static int resctrl_get_tree(struct fs_context *fc)
+ 	if (ret)
+ 		goto out;
+ 
+-	ret = resctrl_group_create_info_dir(resctrl_group_default.kn);
++	ret = resctrl_group_create_info_dir(resctrl_group_default.kn, &kn_info);
+ 	if (ret)
+ 		goto out;
+ 
+diff --git a/include/linux/resctrlfs.h b/include/linux/resctrlfs.h
+index 88720c706f06..f000a87d3bdf 100644
+--- a/include/linux/resctrlfs.h
++++ b/include/linux/resctrlfs.h
+@@ -10,59 +10,6 @@
+ #include <linux/seq_buf.h>
+ #include <linux/seq_file.h>
+ 
+-/**
+- * struct resctrl_cache - Cache allocation related data
+- * @cbm_len:        Length of the cache bit mask
+- * @min_cbm_bits:   Minimum number of consecutive bits to be set
+- * @cbm_idx_mult:   Multiplier of CBM index
+- * @cbm_idx_offset: Offset of CBM index. CBM index is computed by:
+- *          closid * cbm_idx_multi + cbm_idx_offset
+- *          in a cache bit mask
+- * @shareable_bits: Bitmask of shareable resource with other
+- *          executing entities
+- * @arch_has_sparse_bitmaps:   True if a bitmap like f00f is valid.
+- */
+-struct resctrl_cache {
+-	u32     cbm_len;
+-	u32     shareable_bits;
+-	u32     min_cbm_bits;
+-};
+-
+-/**
+- * struct resctrl_membw - Memory bandwidth allocation related data
+- * @min_bw:     Minimum memory bandwidth percentage user can request
+- * @bw_gran:        Granularity at which the memory bandwidth is allocated
+- * @delay_linear:   True if memory B/W delay is in linear scale
+- * @ctrl_extend_bits: Indicates if there are extra ctrl capabilities supported.
+- *          e.g. priority/hardlimit.
+- */
+-struct resctrl_membw {
+-	u32     min_bw;
+-	u32     bw_gran;
+-	u32     delay_linear;
+-};
+-
+-struct resctrl_resource {
+-	int			rid;
+-	bool			alloc_enabled;
+-	bool			mon_enabled;
+-	bool			alloc_capable;
+-	bool			mon_capable;
+-	char			*name;
+-	struct list_head	domains;
+-	u32			dom_num;
+-	struct list_head	evt_list;
+-	unsigned long		fflags;
+-
+-	struct resctrl_cache cache;
+-	struct resctrl_membw mbw;
+-
+-	bool cdp_capable;
+-	bool cdp_enable;
+-
+-	void *res;
+-};
+-
+ DECLARE_STATIC_KEY_FALSE(resctrl_enable_key);
+ 
+ /* rftype.flags */
+@@ -88,9 +35,6 @@ DECLARE_STATIC_KEY_FALSE(resctrl_enable_key);
+ #define RF_TOP_INFO			(RFTYPE_INFO | RFTYPE_TOP)
+ #define RF_CTRL_BASE			(RFTYPE_BASE | RFTYPE_CTRL)
+ 
+-/* List of all resource groups */
+-extern struct list_head resctrl_all_groups;
+-
+ /**
+  * struct rftype - describe each file in the resctrl file system
+  * @name:	File name
+@@ -121,30 +65,4 @@ struct rftype {
+ 			 char *buf, size_t nbytes, loff_t off);
+ };
+ 
+-DECLARE_STATIC_KEY_FALSE(resctrl_alloc_enable_key);
+-extern struct rdtgroup resctrl_group_default;
+-
+-int __init resctrl_group_init(void);
+-
+-int register_resctrl_specific_files(struct rftype *files, size_t len);
+-extern struct kernfs_ops resctrl_group_kf_single_ops;
+-
+-extern struct rdtgroup *resctrl_group_kn_lock_live(struct kernfs_node *kn);
+-void resctrl_group_kn_unlock(struct kernfs_node *kn);
+-
+-struct resctrl_fs_context {
+-	struct kernfs_fs_context        kfc;
+-};
+-
+-static inline struct resctrl_fs_context *resctrl_fc2context(struct fs_context *fc)
+-{
+-	struct kernfs_fs_context *kfc = fc->fs_private;
+-
+-	return container_of(kfc, struct resctrl_fs_context, kfc);
+-}
+-
+-void post_resctrl_mount(void);
+-
+-#define RESCTRL_MAX_CBM 32
+-
+ #endif /* _RESCTRLFS_H */
+-- 
+2.26.2
+

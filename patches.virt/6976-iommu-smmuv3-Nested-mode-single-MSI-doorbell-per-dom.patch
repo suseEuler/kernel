@@ -1,0 +1,96 @@
+From b4ddfa737eca0043559055325e6d8c0483425065 Mon Sep 17 00:00:00 2001
+From: Eric Auger <eric.auger@redhat.com>
+Date: Mon, 19 Jul 2021 11:20:39 +0800
+Subject: [PATCH] iommu/smmuv3: Nested mode single MSI doorbell per domain
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: b4ddfa737eca0043559055325e6d8c0483425065
+
+ enforcement
+
+virt inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I401IF
+CVE: NA
+
+------------------------------
+
+In nested mode we enforce the rule that all devices belonging
+to the same iommu_domain share the same msi_domain.
+
+Indeed if there were several physical MSI doorbells being used
+within a single iommu_domain, it becomes really difficult to
+resolve the nested stage mapping translating into the correct
+physical doorbell. So let's forbid this situation.
+
+Signed-off-by: Eric Auger <eric.auger@redhat.com>
+Signed-off-by: Kunkun Jiang<jiangkunkun@huawei.com>
+Reviewed-by: Keqian Zhu <zhukeqian1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c | 41 +++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+index 43b28d2d9085..d84013aae8f9 100644
+--- a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
++++ b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+@@ -2672,6 +2672,37 @@ static void arm_smmu_detach_dev(struct arm_smmu_master *master)
+ 	arm_smmu_install_ste_for_dev(master);
+ }
+ 
++static bool arm_smmu_share_msi_domain(struct iommu_domain *domain,
++				      struct device *dev)
++{
++	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
++	struct irq_domain *irqd = dev_get_msi_domain(dev);
++	struct arm_smmu_master *master;
++	unsigned long flags;
++	bool share = false;
++
++	if (!irqd)
++		return true;
++
++	spin_lock_irqsave(&smmu_domain->devices_lock, flags);
++	list_for_each_entry(master, &smmu_domain->devices, domain_head) {
++		struct irq_domain *d = dev_get_msi_domain(master->dev);
++
++		if (!d)
++			continue;
++		if (irqd != d) {
++			dev_info(dev, "Nested mode forbids to attach devices "
++				 "using different physical MSI doorbells "
++				 "to the same iommu_domain");
++			goto unlock;
++		}
++	}
++	share = true;
++unlock:
++	spin_unlock_irqrestore(&smmu_domain->devices_lock, flags);
++	return share;
++}
++
+ static int arm_smmu_attach_dev(struct iommu_domain *domain, struct device *dev)
+ {
+ 	int ret = 0;
+@@ -2733,6 +2764,16 @@ static int arm_smmu_attach_dev(struct iommu_domain *domain, struct device *dev)
+ 		ret = -EINVAL;
+ 		goto out_unlock;
+ 	}
++	/*
++	 * In nested mode we must check all devices belonging to the
++	 * domain share the same physical MSI doorbell. Otherwise nested
++	 * stage MSI binding is not supported.
++	 */
++	if (smmu_domain->stage == ARM_SMMU_DOMAIN_NESTED &&
++		!arm_smmu_share_msi_domain(domain, dev)) {
++		ret = -EINVAL;
++		goto out_unlock;
++	}
+ 
+ 	master->domain = smmu_domain;
+ 
+-- 
+2.26.2
+

@@ -1,0 +1,144 @@
+From a3747b53b1771a787fea71d86a2fc39aea337685 Mon Sep 17 00:00:00 2001
+From: Johannes Weiner <hannes@cmpxchg.org>
+Date: Thu, 29 Apr 2021 22:56:14 -0700
+Subject: [PATCH] mm: memcontrol: kill mem_cgroup_nodeinfo()
+Git-commit: a3747b53b1771a787fea71d86a2fc39aea337685
+Patch-mainline: v5.13-rc1
+References: bsn#1
+
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+No need to encapsulate a simple struct member access.
+
+Link: https://lkml.kernel.org/r/20210209163304.77088-3-hannes@cmpxchg.org
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Reviewed-by: Shakeel Butt <shakeelb@google.com>
+Reviewed-by: Roman Gushchin <guro@fb.com>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Reviewed-by: Michal Koutný <mkoutny@suse.com>
+Cc: Tejun Heo <tj@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/memcontrol.h |    8 +-------
+ mm/memcontrol.c            |   21 +++++++++++----------
+ 2 files changed, 12 insertions(+), 17 deletions(-)
+
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -627,12 +627,6 @@ void mem_cgroup_uncharge_list(struct lis
+ 
+ void mem_cgroup_migrate(struct page *oldpage, struct page *newpage);
+ 
+-static struct mem_cgroup_per_node *
+-mem_cgroup_nodeinfo(struct mem_cgroup *memcg, int nid)
+-{
+-	return memcg->nodeinfo[nid];
+-}
+-
+ /**
+  * mem_cgroup_lruvec - get the lru list vector for a memcg & node
+  * @memcg: memcg of the wanted lruvec
+@@ -655,7 +649,7 @@ static inline struct lruvec *mem_cgroup_
+ 	if (!memcg)
+ 		memcg = root_mem_cgroup;
+ 
+-	mz = mem_cgroup_nodeinfo(memcg, pgdat->node_id);
++	mz = memcg->nodeinfo[pgdat->node_id];
+ 	lruvec = &mz->lruvec;
+ out:
+ 	/*
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -409,13 +409,14 @@ static int memcg_expand_one_shrinker_map
+ 					 int size, int old_size)
+ {
+ 	struct memcg_shrinker_map *new, *old;
++	struct mem_cgroup_per_node *pn;
+ 	int nid;
+ 
+ 	lockdep_assert_held(&memcg_shrinker_map_mutex);
+ 
+ 	for_each_node(nid) {
+-		old = rcu_dereference_protected(
+-			mem_cgroup_nodeinfo(memcg, nid)->shrinker_map, true);
++		pn = memcg->nodeinfo[nid];
++		old = rcu_dereference_protected(pn->shrinker_map, true);
+ 		/* Not yet online memcg */
+ 		if (!old)
+ 			return 0;
+@@ -428,7 +429,7 @@ static int memcg_expand_one_shrinker_map
+ 		memset(new->map, (int)0xff, old_size);
+ 		memset((void *)new->map + old_size, 0, size - old_size);
+ 
+-		rcu_assign_pointer(memcg->nodeinfo[nid]->shrinker_map, new);
++		rcu_assign_pointer(pn->shrinker_map, new);
+ 		call_rcu(&old->rcu, memcg_free_shrinker_map_rcu);
+ 	}
+ 
+@@ -445,7 +446,7 @@ static void memcg_free_shrinker_maps(str
+ 		return;
+ 
+ 	for_each_node(nid) {
+-		pn = mem_cgroup_nodeinfo(memcg, nid);
++		pn = memcg->nodeinfo[nid];
+ 		map = rcu_dereference_protected(pn->shrinker_map, true);
+ 		if (map)
+ 			kvfree(map);
+@@ -714,7 +715,7 @@ static void mem_cgroup_remove_from_trees
+ 	int nid;
+ 
+ 	for_each_node(nid) {
+-		mz = mem_cgroup_nodeinfo(memcg, nid);
++		mz = memcg->nodeinfo[nid];
+ 		mctz = soft_limit_tree_node(nid);
+ 		if (mctz)
+ 			mem_cgroup_remove_exceeded(mz, mctz);
+@@ -797,7 +798,7 @@ parent_nodeinfo(struct mem_cgroup_per_no
+ 	parent = parent_mem_cgroup(pn->memcg);
+ 	if (!parent)
+ 		return NULL;
+-	return mem_cgroup_nodeinfo(parent, nid);
++	return parent->nodeinfo[nid];
+ }
+ 
+ void __mod_memcg_lruvec_state(struct lruvec *lruvec, enum node_stat_item idx,
+@@ -1158,7 +1159,7 @@ struct mem_cgroup *mem_cgroup_iter(struc
+ 	if (reclaim) {
+ 		struct mem_cgroup_per_node *mz;
+ 
+-		mz = mem_cgroup_nodeinfo(root, reclaim->pgdat->node_id);
++		mz = root->nodeinfo[reclaim->pgdat->node_id];
+ 		iter = &mz->iter;
+ 
+ 		if (prev && reclaim->generation != iter->generation)
+@@ -1261,7 +1262,7 @@ static void __invalidate_reclaim_iterato
+ 	int nid;
+ 
+ 	for_each_node(nid) {
+-		mz = mem_cgroup_nodeinfo(from, nid);
++		mz = from->nodeinfo[nid];
+ 		iter = &mz->iter;
+ 		cmpxchg(&iter->position, dead_memcg, NULL);
+ 	}
+@@ -2474,7 +2475,7 @@ static int memcg_hotplug_cpu_dead(unsign
+ 				struct mem_cgroup_per_node *pn;
+ 				long x;
+ 
+-				pn = mem_cgroup_nodeinfo(memcg, nid);
++				pn = memcg->nodeinfo[nid];
+ 				lstatc = per_cpu_ptr(pn->lruvec_stat_cpu, cpu);
+ 
+ 				x = lstatc->count[i];
+@@ -4217,7 +4218,7 @@ static int memcg_stat_show(struct seq_fi
+ 		unsigned long file_cost = 0;
+ 
+ 		for_each_online_pgdat(pgdat) {
+-			mz = mem_cgroup_nodeinfo(memcg, pgdat->node_id);
++			mz = memcg->nodeinfo[pgdat->node_id];
+ 
+ 			anon_cost += mz->lruvec.anon_cost;
+ 			file_cost += mz->lruvec.file_cost;

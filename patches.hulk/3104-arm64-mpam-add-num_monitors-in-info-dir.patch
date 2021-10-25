@@ -1,0 +1,125 @@
+From 5c8245a49e5b9a322dc662da4e54b489f9f3a57d Mon Sep 17 00:00:00 2001
+From: Xie XiuQi <xiexiuqi@huawei.com>
+Date: Fri, 26 Feb 2021 20:21:06 +0800
+Subject: [PATCH] arm64/mpam: add num_monitors in info dir
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 5c8245a49e5b9a322dc662da4e54b489f9f3a57d
+
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+root@(none)$ pwd
+/sys/fs/resctrl/info
+root@(none)$ grep . */*
+L3/num_partids:32
+L3_MON/num_monitors:8
+L3_MON/num_pmgs:4
+MB/num_partids:16
+MB_MON/num_monitors:16
+MB_MON/num_pmgs:4
+
+Signed-off-by: Xie XiuQi <xiexiuqi@huawei.com>
+Reviewed-by: Hanjun Guo <guohanjun@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/mpam_resource.h |  4 ++++
+ arch/arm64/kernel/mpam.c               | 26 ++++++++++++++++++++++++++
+ arch/arm64/kernel/mpam_ctrlmon.c       |  5 +++++
+ 3 files changed, 35 insertions(+)
+
+diff --git a/arch/arm64/include/asm/mpam_resource.h b/arch/arm64/include/asm/mpam_resource.h
+index efc660974d69..0b442cb96171 100644
+--- a/arch/arm64/include/asm/mpam_resource.h
++++ b/arch/arm64/include/asm/mpam_resource.h
+@@ -54,6 +54,10 @@
+ #define MPAMF_IDR_PMG_MAX_GET(v)	((v & MPAMF_IDR_PMG_MAX_MASK) >> 16)
+ #define MPAMF_IDR_PARTID_MAX_GET(v)	(v & MPAMF_IDR_PARTID_MAX_MASK)
+ 
++/* MPAMF_x_IDR */
++#define NUM_MON_MASK			(BIT(16) - 1)
++#define MPAMF_IDR_NUM_MON(v)		((v) & NUM_MON_MASK)
++
+ /* TODO */
+ 
+ #define CPBM_WD_MASK		0xFFFF
+diff --git a/arch/arm64/kernel/mpam.c b/arch/arm64/kernel/mpam.c
+index c172a41488b7..3884f1320084 100644
+--- a/arch/arm64/kernel/mpam.c
++++ b/arch/arm64/kernel/mpam.c
+@@ -730,6 +730,17 @@ static int resctrl_num_pmg_show(struct kernfs_open_file *of,
+ 	return 0;
+ }
+ 
++static int resctrl_num_mon_show(struct kernfs_open_file *of,
++				struct seq_file *seq, void *v)
++{
++	struct resctrl_resource *r = of->kn->parent->priv;
++	struct raw_resctrl_resource *rr = (struct raw_resctrl_resource *)r->res;
++
++	seq_printf(seq, "%d\n", rr->num_mon);
++
++	return 0;
++}
++
+ int cpus_mon_write(struct rdtgroup *rdtgrp, cpumask_var_t newmask,
+ 		   cpumask_var_t tmpmask)
+ {
+@@ -1094,6 +1105,13 @@ static struct rftype res_specific_files[] = {
+ 		.seq_show       = resctrl_num_pmg_show,
+ 		.fflags         = RF_MON_INFO,
+ 	},
++	{
++		.name           = "num_monitors",
++		.mode           = 0444,
++		.kf_ops         = &resctrl_group_kf_single_ops,
++		.seq_show       = resctrl_num_mon_show,
++		.fflags         = RF_MON_INFO,
++	},
+ 	{
+ 		.name		= "last_cmd_status",
+ 		.mode		= 0444,
+@@ -1215,6 +1233,14 @@ static void mpam_domains_init(struct resctrl_resource *r)
+ 		rr->num_partid = MPAMF_IDR_PARTID_MAX_GET(val);
+ 		rr->num_pmg = MPAMF_IDR_PMG_MAX_GET(val);
+ 
++		if (r->rid == MPAM_RESOURCE_CACHE) {
++			val = mpam_readl(d->base + MPAMF_CSUMON_IDR);
++			rr->num_mon = MPAMF_IDR_NUM_MON(val);
++		} else if (r->rid == MPAM_RESOURCE_MC) {
++			val = mpam_readl(d->base + MPAMF_MBWUMON_IDR);
++			rr->num_mon = MPAMF_IDR_NUM_MON(val);
++		}
++
+ 		d->cpus_list = n->cpus_list;
+ 
+ 		d->ctrl_val = kmalloc_array(rr->num_partid, sizeof(*d->ctrl_val), GFP_KERNEL);
+diff --git a/arch/arm64/kernel/mpam_ctrlmon.c b/arch/arm64/kernel/mpam_ctrlmon.c
+index 1e5b2a2d2cfc..b6bf0b86c1a4 100644
+--- a/arch/arm64/kernel/mpam_ctrlmon.c
++++ b/arch/arm64/kernel/mpam_ctrlmon.c
+@@ -566,6 +566,11 @@ int mkdir_mondata_all(struct kernfs_node *parent_kn,
+ 	 */
+ 	for_each_resctrl_resource(r) {
+ 		if (r->mon_enabled) {
++			/* HHA does not support monitor by pmg */
++			if ((prgrp->type == RDTMON_GROUP) &&
++			    (r->rid == MPAM_RESOURCE_MC))
++				continue;
++
+ 			ret = mkdir_mondata_subdir_alldom(kn, r, prgrp);
+ 			if (ret)
+ 				goto out_destroy;
+-- 
+2.26.2
+

@@ -1,0 +1,171 @@
+From b3a23e33686f75aa9f6e405a14095c95aab2dffe Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Fri, 26 Feb 2021 20:22:42 +0800
+Subject: [PATCH] arm64/mpam: Filter schema control type with ctrl features
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: b3a23e33686f75aa9f6e405a14095c95aab2dffe
+
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+ctrl_features array, introduced by 61fa56e1dd8a ("arm64/mpam: Add
+resctrl_ctrl_feature structure to manage ctrl features"), which lives
+in raw_resctrl_resource structure for listing ctrl features's type do
+we support in total for this resource, this filters illegal parameters
+outside from mount options and provides useful info for add_schema()
+for registering a new control type node in schema list.
+
+This action helps us to add new ctrl feature easier later.
+
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/resctrl.h      |  2 ++
+ arch/arm64/kernel/mpam/mpam_ctrlmon.c | 24 ++++++++------------
+ arch/arm64/kernel/mpam/mpam_resctrl.c | 32 +++++++++++++++------------
+ 3 files changed, 29 insertions(+), 29 deletions(-)
+
+diff --git a/arch/arm64/include/asm/resctrl.h b/arch/arm64/include/asm/resctrl.h
+index 56769a34a294..c88ede75205c 100644
+--- a/arch/arm64/include/asm/resctrl.h
++++ b/arch/arm64/include/asm/resctrl.h
+@@ -195,6 +195,8 @@ struct resctrl_ctrl_feature {
+ 	int        default_ctrl;
+ 	bool       capable;
+ 	bool       enabled;
++
++	const char *ctrl_suffix;
+ };
+ 
+ struct msr_param {
+diff --git a/arch/arm64/kernel/mpam/mpam_ctrlmon.c b/arch/arm64/kernel/mpam/mpam_ctrlmon.c
+index 4b5b7bd5877b..26b558abf6eb 100644
+--- a/arch/arm64/kernel/mpam/mpam_ctrlmon.c
++++ b/arch/arm64/kernel/mpam/mpam_ctrlmon.c
+@@ -42,12 +42,9 @@ static int add_schema(enum resctrl_conf_type t, struct resctrl_resource *r)
+ {
+ 	int ret = 0;
+ 	char *suffix = "";
+-	char *ctrl_suffix = "";
+ 	struct resctrl_schema *s;
+ 	struct raw_resctrl_resource *rr;
+-	struct resctrl_schema_ctrl *sc, *sc_tmp;
+-	struct resctrl_schema_ctrl *sc_pri = NULL;
+-	struct resctrl_schema_ctrl *sc_hdl = NULL;
++	struct resctrl_schema_ctrl *sc, *tmp;
+ 	enum resctrl_ctrl_type type;
+ 
+ 	s = kzalloc(sizeof(*s), GFP_KERNEL);
+@@ -93,6 +90,9 @@ static int add_schema(enum resctrl_conf_type t, struct resctrl_resource *r)
+ 	rr = r->res;
+ 	INIT_LIST_HEAD(&s->schema_ctrl_list);
+ 	for_each_extend_ctrl_type(type) {
++		struct resctrl_ctrl_feature *feature =
++			&rr->ctrl_features[type];
++
+ 		if (!rr->ctrl_features[type].enabled ||
+ 			!rr->ctrl_features[type].max_wd)
+ 			continue;
+@@ -103,25 +103,19 @@ static int add_schema(enum resctrl_conf_type t, struct resctrl_resource *r)
+ 			goto err;
+ 		}
+ 		sc->ctrl_type = type;
+-		if (type == SCHEMA_PRI) {
+-			sc_pri = sc;
+-			ctrl_suffix = "PRI";
+-		} else if (type == SCHEMA_HDL) {
+-			sc_hdl = sc;
+-			ctrl_suffix = "HDL";
+-		}
+ 
+ 		WARN_ON_ONCE(strlen(r->name) + strlen(suffix) +
+-			strlen(ctrl_suffix) + 1 > RESCTRL_NAME_LEN);
+-		snprintf(sc->name, sizeof(sc->name), "%s%s%s",
+-			r->name, suffix, ctrl_suffix);
++			strlen(feature->ctrl_suffix) + 1 > RESCTRL_NAME_LEN);
++		snprintf(sc->name, sizeof(sc->name), "%s%s%s", r->name,
++			suffix, feature->ctrl_suffix);
++
+ 		list_add_tail(&sc->list, &s->schema_ctrl_list);
+ 	}
+ 
+ 	return 0;
+ 
+ err:
+-	list_for_each_entry_safe(sc, sc_tmp, &s->schema_ctrl_list, list) {
++	list_for_each_entry_safe(sc, tmp, &s->schema_ctrl_list, list) {
+ 		list_del(&sc->list);
+ 		kfree(sc);
+ 	}
+diff --git a/arch/arm64/kernel/mpam/mpam_resctrl.c b/arch/arm64/kernel/mpam/mpam_resctrl.c
+index deae8e94aeb4..ee55873286f7 100644
+--- a/arch/arm64/kernel/mpam/mpam_resctrl.c
++++ b/arch/arm64/kernel/mpam/mpam_resctrl.c
+@@ -1048,17 +1048,28 @@ static void basic_ctrl_enable(void)
+ 	}
+ }
+ 
+-static int extend_ctrl_enable(enum resctrl_ctrl_type type)
++static int extend_ctrl_enable(char *tok)
+ {
+ 	bool match = false;
++	struct resctrl_resource *r;
+ 	struct raw_resctrl_resource *rr;
+ 	struct mpam_resctrl_res *res;
++	struct resctrl_ctrl_feature *feature;
++	enum resctrl_ctrl_type type;
+ 
+ 	for_each_supported_resctrl_exports(res) {
+-		rr = res->resctrl_res.res;
+-		if (rr->ctrl_features[type].capable) {
+-			rr->ctrl_features[type].enabled = true;
+-			match = true;
++		r = &res->resctrl_res;
++		if (!r->alloc_capable)
++			continue;
++		rr = r->res;
++		for_each_ctrl_type(type) {
++			feature = &rr->ctrl_features[type];
++			if (strcmp(feature->name, tok))
++				continue;
++			if (rr->ctrl_features[type].capable) {
++				rr->ctrl_features[type].enabled = true;
++				match = true;
++			}
+ 		}
+ 	}
+ 
+@@ -1103,17 +1114,10 @@ int parse_rdtgroupfs_options(char *data)
+ 			ret = cdpl2_enable();
+ 			if (ret)
+ 				goto out;
+-		} else if (!strcmp(token, "priority")) {
+-			ret = extend_ctrl_enable(SCHEMA_PRI);
+-			if (ret)
+-				goto out;
+-		} else if (!strcmp(token, "hardlimit")) {
+-			ret = extend_ctrl_enable(SCHEMA_HDL);
++		} else {
++			ret = extend_ctrl_enable(token);
+ 			if (ret)
+ 				goto out;
+-		} else {
+-			ret = -EINVAL;
+-			goto out;
+ 		}
+ 	}
+ 
+-- 
+2.26.2
+

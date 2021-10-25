@@ -1,0 +1,93 @@
+From 8abddd968a303db75e4debe77a3df484164f1f33 Mon Sep 17 00:00:00 2001
+From: Nicholas Piggin <npiggin@gmail.com>
+Date: Mon, 3 May 2021 19:17:55 +1000
+Subject: [PATCH] powerpc/64s/radix: Enable huge vmalloc mappings
+Git-commit: 8abddd968a303db75e4debe77a3df484164f1f33
+Patch-mainline: v5.13-rc1
+References: bsn#12
+
+
+This reduces TLB misses by nearly 30x on a `git diff` workload on a
+2-node POWER9 (59,800 -> 2,100) and reduces CPU cycles by 0.54%, due
+to vfs hashes being allocated with 2MB pages.
+
+Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+Reviewed-by: Christophe Leroy <christophe.leroy@csgroup.eu>
+Acked-by: Michael Ellerman <mpe@ellerman.id.au>
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20210503091755.613393-1-npiggin@gmail.com
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ .../admin-guide/kernel-parameters.txt          |  2 ++
+ arch/powerpc/Kconfig                           |  1 +
+ arch/powerpc/kernel/module.c                   | 18 +++++++++++++-----
+ 3 files changed, 16 insertions(+), 5 deletions(-)
+
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -3226,6 +3226,8 @@
+ 
+ 	nohugeiomap	[KNL,X86,PPC,ARM64] Disable kernel huge I/O mappings.
+ 
++	nohugevmalloc	[PPC] Disable kernel huge vmalloc mappings.
++
+ 	nosmt		[KNL,S390] Disable symmetric multithreading (SMT).
+ 			Equivalent to smt=1.
+ 
+--- a/arch/powerpc/Kconfig
++++ b/arch/powerpc/Kconfig
+@@ -179,6 +179,7 @@ config PPC
+ 	select GENERIC_TIME_VSYSCALL
+ 	select HAVE_ARCH_AUDITSYSCALL
+ 	select HAVE_ARCH_HUGE_VMAP		if PPC_BOOK3S_64 && PPC_RADIX_MMU
++	select HAVE_ARCH_HUGE_VMALLOC		if HAVE_ARCH_HUGE_VMAP
+ 	select HAVE_ARCH_JUMP_LABEL
+ 	select HAVE_ARCH_KASAN			if PPC32 && PPC_PAGE_SHIFT <= 14
+ 	select HAVE_ARCH_KASAN_VMALLOC		if PPC32 && PPC_PAGE_SHIFT <= 14
+--- a/arch/powerpc/kernel/module.c
++++ b/arch/powerpc/kernel/module.c
+@@ -8,6 +8,7 @@
+ #include <linux/moduleloader.h>
+ #include <linux/err.h>
+ #include <linux/vmalloc.h>
++#include <linux/mm.h>
+ #include <linux/bug.h>
+ #include <asm/module.h>
+ #include <linux/uaccess.h>
+@@ -88,17 +89,22 @@ int module_finalize(const Elf_Ehdr *hdr,
+ 	return 0;
+ }
+ 
+-#ifdef MODULES_VADDR
+ static __always_inline void *
+ __module_alloc(unsigned long size, unsigned long start, unsigned long end)
+ {
+-	return __vmalloc_node_range(size, 1, start, end, GFP_KERNEL,
+-				    PAGE_KERNEL_EXEC, VM_FLUSH_RESET_PERMS, NUMA_NO_NODE,
+-				    __builtin_return_address(0));
++	/*
++	 * Don't do huge page allocations for modules yet until more testing
++	 * is done. STRICT_MODULE_RWX may require extra work to support this
++	 * too.
++	 */
++	return __vmalloc_node_range(size, 1, start, end, GFP_KERNEL, PAGE_KERNEL_EXEC,
++				    VM_FLUSH_RESET_PERMS | VM_NO_HUGE_VMAP,
++				    NUMA_NO_NODE, __builtin_return_address(0));
+ }
+ 
+ void *module_alloc(unsigned long size)
+ {
++#ifdef MODULES_VADDR
+ 	unsigned long limit = (unsigned long)_etext - SZ_32M;
+ 	void *ptr = NULL;
+ 
+@@ -112,5 +118,7 @@ void *module_alloc(unsigned long size)
+ 		ptr = __module_alloc(size, MODULES_VADDR, MODULES_END);
+ 
+ 	return ptr;
+-}
++#else
++	return __module_alloc(size, VMALLOC_START, VMALLOC_END);
+ #endif
++}

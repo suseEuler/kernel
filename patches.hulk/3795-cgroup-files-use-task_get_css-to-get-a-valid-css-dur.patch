@@ -1,0 +1,108 @@
+From 0b7329771d3d8b1f1cd61d97bd4691740b0b195f Mon Sep 17 00:00:00 2001
+From: Hou Tao <houtao1@huawei.com>
+Date: Wed, 17 Mar 2021 20:56:35 +0800
+Subject: [PATCH] cgroup/files: use task_get_css() to get a valid css during
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 0b7329771d3d8b1f1cd61d97bd4691740b0b195f
+
+ dup_fd()
+
+hulk inclusion
+category: bugfix
+bugzilla: 50779
+CVE: NA
+
+-------------------------------------------------
+
+Process fork and cgroup migration can happen simultaneously, and
+in the following case use-after-free of css_set is possible:
+
+CPU 0: process fork    CPU 1: cgroup migration
+
+dup_fd                 __cgroup1_procs_write(threadgroup=false)
+  files_cgroup_assign
+    // task A
+    task_lock
+    task_cgroup(current, files_cgrp_id)
+      css_set = task_css_set_check()
+
+ 			 cgroup_migrate_execute
+  			   files_cgroup_can_attach
+			   css_set_move_task
+			     put_css_set_locked()
+  			   files_cgroup_attach
+			     // task B which is in the same
+			     // thread group as task A
+			     task_lock
+			 cgroup_migrate_finish
+			   // the css_set will be freed
+			   put_css_set_locked()
+
+      // use-after-free
+      css_set->subsys[files_cgrp_id]
+
+Fix it by using task_get_css() instead to get a valid css.
+
+Fixes: 52cc1eccf6de ("cgroups: Resource controller for open files")
+Signed-off-by: Hou Tao <houtao1@huawei.com>
+Reviewed-by: luojiajun <luojiajun3@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+
+Signed-off-by: Lu Jialin <lujialin4@huawei.com>
+Reviewed-by: Xiu Jianfeng <xiujianfeng@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/filescontrol.c      | 12 +++++-------
+ include/linux/cgroup.h |  6 ------
+ 2 files changed, 5 insertions(+), 13 deletions(-)
+
+diff --git a/fs/filescontrol.c b/fs/filescontrol.c
+index 44ad9ef44e20..1d2d29127fd4 100644
+--- a/fs/filescontrol.c
++++ b/fs/filescontrol.c
+@@ -293,18 +293,16 @@ struct cgroup_subsys files_cgrp_subsys = {
+ 	.dfl_cftypes = files,
+ };
+ 
++/*
++ * It could race against cgroup migration of current task, and
++ * using task_get_css() to get a valid css.
++ */
+ void files_cgroup_assign(struct files_struct *files)
+ {
+-	struct task_struct *tsk = current;
+ 	struct cgroup_subsys_state *css;
+-	struct cgroup *cgrp;
+ 
+-	task_lock(tsk);
+-	cgrp = task_cgroup(tsk, files_cgrp_id);
+-	css = cgroup_subsys_state(cgrp, files_cgrp_id);
+-	css_get(css);
++	css = task_get_css(current, files_cgrp_id);
+ 	files->files_cgroup = container_of(css, struct files_cgroup, css);
+-	task_unlock(tsk);
+ }
+ 
+ void files_cgroup_remove(struct files_struct *files)
+diff --git a/include/linux/cgroup.h b/include/linux/cgroup.h
+index 7c12797ca081..618838c48313 100644
+--- a/include/linux/cgroup.h
++++ b/include/linux/cgroup.h
+@@ -432,12 +432,6 @@ static inline void cgroup_put(struct cgroup *cgrp)
+ 	css_put(&cgrp->self);
+ }
+ 
+-static inline struct cgroup_subsys_state *cgroup_subsys_state(
+-	struct cgroup *cgrp, int subsys_id)
+-{
+-	return cgrp->subsys[subsys_id];
+-}
+-
+ /**
+  * task_css_set_check - obtain a task's css_set with extra access conditions
+  * @task: the task to obtain css_set for
+-- 
+2.26.2
+

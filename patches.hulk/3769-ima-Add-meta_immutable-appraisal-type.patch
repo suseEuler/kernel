@@ -1,0 +1,126 @@
+From ab8c2a6311c1dd2cd89dabdf2503810b6abc56d8 Mon Sep 17 00:00:00 2001
+From: Roberto Sassu <roberto.sassu@huawei.com>
+Date: Wed, 3 Mar 2021 08:44:06 +0100
+Subject: [PATCH] ima: Add meta_immutable appraisal type
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: ab8c2a6311c1dd2cd89dabdf2503810b6abc56d8
+
+
+hulk inclusion
+category: feature
+feature: IMA Digest Lists extension
+bugzilla: 46797
+
+-------------------------------------------------
+
+Currently, IMA supports the appraise_type=imasig option in the policy to
+require file signatures. This patch introduces the new option
+appraise_type=meta_immutable to require that file metadata are signed and
+immutable. This requirement can be satisfied by portable signatures and
+by digest lists if they are marked as immutable.
+
+The main purpose of this option is to ensure that file metadata are correct
+at the time of access, so that policies relying on labels can be correctly
+enforced. For example, requiring immutable metadata would prevent an
+administrator from altering the label assigned to a process during
+execve() by changing the label of the executable.
+
+Signed-off-by: Roberto Sassu <roberto.sassu@huawei.com>
+Signed-off-by: Tianxing Zhang <zhangtianxing3@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ security/integrity/ima/ima_appraise.c |  9 +++++++++
+ security/integrity/ima/ima_policy.c   | 13 ++++++++++---
+ security/integrity/integrity.h        |  1 +
+ 3 files changed, 20 insertions(+), 3 deletions(-)
+
+diff --git a/security/integrity/ima/ima_appraise.c b/security/integrity/ima/ima_appraise.c
+index 3d848e1b7e69..0799d4de9e2d 100644
+--- a/security/integrity/ima/ima_appraise.c
++++ b/security/integrity/ima/ima_appraise.c
+@@ -457,6 +457,15 @@ int ima_appraise_measurement(enum ima_hooks func,
+ 		WARN_ONCE(true, "Unexpected integrity status %d\n", status);
+ 	}
+ 
++	if ((iint->flags & IMA_META_IMMUTABLE_REQUIRED) &&
++	    status != INTEGRITY_PASS_IMMUTABLE) {
++		status = INTEGRITY_FAIL;
++		cause = "metadata-modifiable";
++		integrity_audit_msg(AUDIT_INTEGRITY_DATA, inode,
++				    filename, op, cause, rc, 0);
++		goto out;
++	}
++
+ 	if (xattr_value)
+ 		rc = xattr_verify(func, iint, xattr_value, xattr_len, &status,
+ 				  &cause, found_digest);
+diff --git a/security/integrity/ima/ima_policy.c b/security/integrity/ima/ima_policy.c
+index e567ed8e6232..ea55cbf273a8 100644
+--- a/security/integrity/ima/ima_policy.c
++++ b/security/integrity/ima/ima_policy.c
+@@ -1044,7 +1044,8 @@ static bool ima_validate_rule(struct ima_rule_entry *entry)
+ 		return false;
+ 
+ 	if (entry->action != APPRAISE &&
+-	    entry->flags & (IMA_DIGSIG_REQUIRED | IMA_MODSIG_ALLOWED | IMA_CHECK_BLACKLIST))
++	    entry->flags & (IMA_DIGSIG_REQUIRED | IMA_MODSIG_ALLOWED |
++			    IMA_CHECK_BLACKLIST | IMA_META_IMMUTABLE_REQUIRED))
+ 		return false;
+ 
+ 	/*
+@@ -1075,7 +1076,8 @@ static bool ima_validate_rule(struct ima_rule_entry *entry)
+ 				     IMA_UID | IMA_FOWNER | IMA_FSUUID |
+ 				     IMA_INMASK | IMA_EUID | IMA_PCR |
+ 				     IMA_FSNAME | IMA_DIGSIG_REQUIRED |
+-				     IMA_PERMIT_DIRECTIO))
++				     IMA_PERMIT_DIRECTIO |
++				     IMA_META_IMMUTABLE_REQUIRED))
+ 			return false;
+ 
+ 		break;
+@@ -1087,7 +1089,8 @@ static bool ima_validate_rule(struct ima_rule_entry *entry)
+ 				     IMA_INMASK | IMA_EUID | IMA_PCR |
+ 				     IMA_FSNAME | IMA_DIGSIG_REQUIRED |
+ 				     IMA_PERMIT_DIRECTIO | IMA_MODSIG_ALLOWED |
+-				     IMA_CHECK_BLACKLIST))
++				     IMA_CHECK_BLACKLIST |
++				     IMA_META_IMMUTABLE_REQUIRED))
+ 			return false;
+ 
+ 		break;
+@@ -1432,6 +1435,8 @@ static int ima_parse_rule(char *rule, struct ima_rule_entry *entry)
+ 				 strcmp(args[0].from, "imasig|modsig") == 0)
+ 				entry->flags |= IMA_DIGSIG_REQUIRED |
+ 						IMA_MODSIG_ALLOWED;
++			else if (strcmp(args[0].from, "meta_immutable") == 0)
++				entry->flags |= IMA_META_IMMUTABLE_REQUIRED;
+ 			else
+ 				result = -EINVAL;
+ 			break;
+@@ -1782,6 +1787,8 @@ int ima_policy_show(struct seq_file *m, void *v)
+ 	}
+ 	if (entry->flags & IMA_CHECK_BLACKLIST)
+ 		seq_puts(m, "appraise_flag=check_blacklist ");
++	if (entry->flags & IMA_META_IMMUTABLE_REQUIRED)
++		seq_puts(m, "appraise_type=meta_immutable ");
+ 	if (entry->flags & IMA_PERMIT_DIRECTIO)
+ 		seq_puts(m, "permit_directio ");
+ 	rcu_read_unlock();
+diff --git a/security/integrity/integrity.h b/security/integrity/integrity.h
+index b33f6e9bb4a5..3f846d7b28e9 100644
+--- a/security/integrity/integrity.h
++++ b/security/integrity/integrity.h
+@@ -40,6 +40,7 @@
+ #define IMA_FAIL_UNVERIFIABLE_SIGS	0x10000000
+ #define IMA_MODSIG_ALLOWED	0x20000000
+ #define IMA_CHECK_BLACKLIST	0x40000000
++#define IMA_META_IMMUTABLE_REQUIRED	0x80000000
+ 
+ #define IMA_DO_MASK		(IMA_MEASURE | IMA_APPRAISE | IMA_AUDIT | \
+ 				 IMA_HASH | IMA_APPRAISE_SUBMASK)
+-- 
+2.26.2
+

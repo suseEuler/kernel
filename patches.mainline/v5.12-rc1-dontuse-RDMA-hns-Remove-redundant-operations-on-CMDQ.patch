@@ -1,0 +1,138 @@
+From 563aeb226630610707980e8abe20af1e6f410ce4 Mon Sep 17 00:00:00 2001
+From: Lang Cheng <chenglang@huawei.com>
+Date: Sun, 7 Feb 2021 16:55:41 +0800
+Subject: [PATCH] RDMA/hns: Remove redundant operations on CMDQ
+Git-commit: 563aeb226630610707980e8abe20af1e6f410ce4
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+CMDQ works serially, after each successful transmission, the head and tail
+pointers will be equal, so there is no need to check whether the queue is
+full. At the same time, since the descriptor of each transmission is new,
+there is no need to perform a cleanup operation. Then, the field named
+next_to_clean in structure hns_roce_v2_cmq_ring is redundant.
+
+Fixes: a04ff739f2a9 ("RDMA/hns: Add command queue support for hip08 RoCE driver")
+Link: https://lore.kernel.org/r/1612688143-28226-4-git-send-email-liweihang@huawei.com
+Signed-off-by: Lang Cheng <chenglang@huawei.com>
+Signed-off-by: Weihang Li <liweihang@huawei.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.c | 54 ++--------------------
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.h |  1 -
+ 2 files changed, 5 insertions(+), 50 deletions(-)
+
+diff --git a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+index ba5272249dcd..c15ae3e2e49a 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+@@ -1130,15 +1130,6 @@ static int hns_roce_v2_rst_process_cmd(struct hns_roce_dev *hr_dev)
+ 	return 0;
+ }
+ 
+-static int hns_roce_cmq_space(struct hns_roce_v2_cmq_ring *ring)
+-{
+-	int ntu = ring->next_to_use;
+-	int ntc = ring->next_to_clean;
+-	int used = (ntu - ntc + ring->desc_num) % ring->desc_num;
+-
+-	return ring->desc_num - used - 1;
+-}
+-
+ static int hns_roce_alloc_cmq_desc(struct hns_roce_dev *hr_dev,
+ 				   struct hns_roce_v2_cmq_ring *ring)
+ {
+@@ -1178,7 +1169,6 @@ static int hns_roce_init_cmq_ring(struct hns_roce_dev *hr_dev, bool ring_type)
+ 					    &priv->cmq.csq : &priv->cmq.crq;
+ 
+ 	ring->flag = ring_type;
+-	ring->next_to_clean = 0;
+ 	ring->next_to_use = 0;
+ 
+ 	return hns_roce_alloc_cmq_desc(hr_dev, ring);
+@@ -1284,30 +1274,6 @@ static int hns_roce_cmq_csq_done(struct hns_roce_dev *hr_dev)
+ 	return head == priv->cmq.csq.next_to_use;
+ }
+ 
+-static int hns_roce_cmq_csq_clean(struct hns_roce_dev *hr_dev)
+-{
+-	struct hns_roce_v2_priv *priv = hr_dev->priv;
+-	struct hns_roce_v2_cmq_ring *csq = &priv->cmq.csq;
+-	struct hns_roce_cmq_desc *desc;
+-	u16 ntc = csq->next_to_clean;
+-	u32 head;
+-	int clean = 0;
+-
+-	desc = &csq->desc[ntc];
+-	head = roce_read(hr_dev, ROCEE_TX_CMQ_HEAD_REG);
+-	while (head != ntc) {
+-		memset(desc, 0, sizeof(*desc));
+-		ntc++;
+-		if (ntc == csq->desc_num)
+-			ntc = 0;
+-		desc = &csq->desc[ntc];
+-		clean++;
+-	}
+-	csq->next_to_clean = ntc;
+-
+-	return clean;
+-}
+-
+ static int __hns_roce_cmq_send(struct hns_roce_dev *hr_dev,
+ 			       struct hns_roce_cmq_desc *desc, int num)
+ {
+@@ -1322,15 +1288,6 @@ static int __hns_roce_cmq_send(struct hns_roce_dev *hr_dev,
+ 
+ 	spin_lock_bh(&csq->lock);
+ 
+-	if (num > hns_roce_cmq_space(csq)) {
+-		spin_unlock_bh(&csq->lock);
+-		return -EBUSY;
+-	}
+-
+-	/*
+-	 * Record the location of desc in the cmq for this time
+-	 * which will be use for hardware to write back
+-	 */
+ 	ntc = csq->next_to_use;
+ 
+ 	while (handle < num) {
+@@ -1377,15 +1334,14 @@ static int __hns_roce_cmq_send(struct hns_roce_dev *hr_dev,
+ 				ntc = 0;
+ 		}
+ 	} else {
++		/* FW/HW reset or incorrect number of desc */
++		ntc = roce_read(hr_dev, ROCEE_TX_CMQ_HEAD_REG);
++		dev_warn(hr_dev->dev, "CMDQ move head from %d to %d\n",
++			 csq->next_to_use, ntc);
++		csq->next_to_use = ntc;
+ 		ret = -EAGAIN;
+ 	}
+ 
+-	/* clean the command send queue */
+-	handle = hns_roce_cmq_csq_clean(hr_dev);
+-	if (handle != num)
+-		dev_warn(hr_dev->dev, "Cleaned %d, need to clean %d\n",
+-			 handle, num);
+-
+ 	spin_unlock_bh(&csq->lock);
+ 
+ 	return ret;
+diff --git a/drivers/infiniband/hw/hns/hns_roce_hw_v2.h b/drivers/infiniband/hw/hns/hns_roce_hw_v2.h
+index 631f6798a8fd..d271a10cfaf4 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.h
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.h
+@@ -1881,7 +1881,6 @@ struct hns_roce_v2_cmq_ring {
+ 	u16 buf_size;
+ 	u16 desc_num;
+ 	int next_to_use;
+-	int next_to_clean;
+ 	u8 flag;
+ 	spinlock_t lock; /* command queue lock */
+ };
+-- 
+2.31.1
+

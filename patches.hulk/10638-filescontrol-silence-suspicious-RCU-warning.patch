@@ -1,0 +1,80 @@
+From e2b24a5adac6dde7a96f88b8f1f9405f2ff4c009 Mon Sep 17 00:00:00 2001
+From: "zhangyi (F)" <yi.zhang@huawei.com>
+Date: Sat, 30 Oct 2021 15:51:28 +0800
+Subject: [PATCH] filescontrol: silence suspicious RCU warning
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: e2b24a5adac6dde7a96f88b8f1f9405f2ff4c009
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4G4S5
+
+---------------------------
+
+files_fdtable() in files_cgroup_count_fds() should be invoked under
+files_struct->file_lock, otherwise a suspicious RCU usage warning
+triggers below when CONFIG_PROVE_RCU and CONFIG_LOCKDEP are enabled.
+
+  =============================
+  WARNING: suspicious RCU usage
+  ...
+  -----------------------------
+  fs/filescontrol.c:96 suspicious rcu_dereference_check() usage!
+  ...
+  stack backtrace:
+  CPU: 0 PID: 0 Comm: swapper/0 Not tainted
+  4.19.36-cph920-32bitc-vmalloc-binder-debugon.aarch64 #6
+  Call trace:
+   dump_backtrace+0x0/0x198
+   show_stack+0x24/0x30
+   dump_stack+0xd0/0x11c
+   lockdep_rcu_suspicious+0xcc/0x110
+   files_cgroup_count_fds+0xc0/0xe0
+   dup_fd+0x234/0x448
+   copy_process.isra.2.part.3+0x698/0x1490
+   _do_fork+0xe8/0x728
+   kernel_thread+0x48/0x58
+   rest_init+0x34/0x2a0
+   start_kernel+0x52c/0x558
+
+Although the 'newf' is newly created and will not be released in
+paralle, still silence the warning through adding spin_lock around.
+
+Fixes: 52cc1eccf6de ("cgroups: Resource controller for open files")
+Signed-off-by: zhangyi (F) <yi.zhang@huawei.com>
+Reviewed-by: yangerkun <yangerkun@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Conflict:
+	fs/file.c
+Signed-off-by: Lu Jialin <lujialin4@huawei.com>
+Reviewed-by: weiyang wang <wangweiyang2@huawei.com>
+Reviewed-by: Hou Tao <houtao1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/file.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/fs/file.c b/fs/file.c
+index 58f4acb5c862..3b99457518ef 100644
+--- a/fs/file.c
++++ b/fs/file.c
+@@ -374,8 +374,12 @@ struct files_struct *dup_fd(struct files_struct *oldf, unsigned int max_fds, int
+ 
+ 	rcu_assign_pointer(newf->fdt, new_fdt);
+ #ifdef CONFIG_CGROUP_FILES
+-	if (!files_cgroup_alloc_fd(newf, files_cgroup_count_fds(newf)))
++	spin_lock(&newf->file_lock);
++	if (!files_cgroup_alloc_fd(newf, files_cgroup_count_fds(newf))) {
++		spin_unlock(&newf->file_lock);
+ 		return newf;
++	}
++	spin_unlock(&newf->file_lock);
+ 
+ /* could not get enough FD resources.  Need to clean up. */
+ 	new_fds = new_fdt->fd;
+-- 
+2.26.2
+

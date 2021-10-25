@@ -1,0 +1,107 @@
+From 866b485262173a2b873386162b2ddcfbcb542b4a Mon Sep 17 00:00:00 2001
+From: Georgi Djakov <georgi.djakov@linaro.org>
+Date: Thu, 29 Apr 2021 22:54:57 -0700
+Subject: [PATCH] mm/page_owner: record the timestamp of all pages during free
+Git-commit: 866b485262173a2b873386162b2ddcfbcb542b4a
+Patch-mainline: v5.13-rc1
+References: bsn#12
+
+
+Collect the time when each allocation is freed, to help with memory
+analysis with kdump/ramdump.  Add the timestamp also in the page_owner
+debugfs file and print it in dump_page().
+
+Having another timestamp when we free the page helps for debugging page
+migration issues.  For example both alloc and free timestamps being the
+same can gave hints that there is an issue with migrating memory, as
+opposed to a page just being dropped during migration.
+
+Link: https://lkml.kernel.org/r/20210203175905.12267-1-georgi.djakov@linaro.org
+Signed-off-by: Georgi Djakov <georgi.djakov@linaro.org>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ Documentation/vm/page_owner.rst |  2 +-
+ mm/page_owner.c                 | 12 ++++++++----
+ 2 files changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/Documentation/vm/page_owner.rst b/Documentation/vm/page_owner.rst
+index 4e67c2e9bbed..2175465c9bf2 100644
+--- a/Documentation/vm/page_owner.rst
++++ b/Documentation/vm/page_owner.rst
+@@ -47,7 +47,7 @@ size change due to this facility.
+ 
+    text    data     bss     dec     hex filename
+    48800   2445     644   51889    cab1 mm/page_alloc.o
+-   6574     108      29    6711    1a37 mm/page_owner.o
++   6662     108      29    6799    1a8f mm/page_owner.o
+    1025       8       8    1041     411 mm/page_ext.o
+ 
+ Although, roughly, 8 KB code is added in total, page_alloc.o increase by
+diff --git a/mm/page_owner.c b/mm/page_owner.c
+index d15c7c4994f5..9ceae81ba7b8 100644
+--- a/mm/page_owner.c
++++ b/mm/page_owner.c
+@@ -27,6 +27,7 @@ struct page_owner {
+ 	depot_stack_handle_t handle;
+ 	depot_stack_handle_t free_handle;
+ 	u64 ts_nsec;
++	u64 free_ts_nsec;
+ 	pid_t pid;
+ };
+ 
+@@ -148,6 +149,7 @@ void __reset_page_owner(struct page *page, unsigned int order)
+ 	struct page_ext *page_ext;
+ 	depot_stack_handle_t handle = 0;
+ 	struct page_owner *page_owner;
++	u64 free_ts_nsec = local_clock();
+ 
+ 	handle = save_stack(GFP_NOWAIT | __GFP_NOWARN);
+ 
+@@ -158,6 +160,7 @@ void __reset_page_owner(struct page *page, unsigned int order)
+ 		__clear_bit(PAGE_EXT_OWNER_ALLOCATED, &page_ext->flags);
+ 		page_owner = get_page_owner(page_ext);
+ 		page_owner->free_handle = handle;
++		page_owner->free_ts_nsec = free_ts_nsec;
+ 		page_ext = page_ext_next(page_ext);
+ 	}
+ }
+@@ -243,6 +246,7 @@ void __copy_page_owner(struct page *oldpage, struct page *newpage)
+ 	new_page_owner->handle = old_page_owner->handle;
+ 	new_page_owner->pid = old_page_owner->pid;
+ 	new_page_owner->ts_nsec = old_page_owner->ts_nsec;
++	new_page_owner->free_ts_nsec = old_page_owner->ts_nsec;
+ 
+ 	/*
+ 	 * We don't clear the bit on the oldpage as it's going to be freed
+@@ -356,10 +360,10 @@ print_page_owner(char __user *buf, size_t count, unsigned long pfn,
+ 		return -ENOMEM;
+ 
+ 	ret = snprintf(kbuf, count,
+-			"Page allocated via order %u, mask %#x(%pGg), pid %d, ts %llu ns\n",
++			"Page allocated via order %u, mask %#x(%pGg), pid %d, ts %llu ns, free_ts %llu ns\n",
+ 			page_owner->order, page_owner->gfp_mask,
+ 			&page_owner->gfp_mask, page_owner->pid,
+-			page_owner->ts_nsec);
++			page_owner->ts_nsec, page_owner->free_ts_nsec);
+ 
+ 	if (ret >= count)
+ 		goto err;
+@@ -435,9 +439,9 @@ void __dump_page_owner(struct page *page)
+ 	else
+ 		pr_alert("page_owner tracks the page as freed\n");
+ 
+-	pr_alert("page last allocated via order %u, migratetype %s, gfp_mask %#x(%pGg), pid %d, ts %llu\n",
++	pr_alert("page last allocated via order %u, migratetype %s, gfp_mask %#x(%pGg), pid %d, ts %llu, free_ts %llu\n",
+ 		 page_owner->order, migratetype_names[mt], gfp_mask, &gfp_mask,
+-		 page_owner->pid, page_owner->ts_nsec);
++		 page_owner->pid, page_owner->ts_nsec, page_owner->free_ts_nsec);
+ 
+ 	handle = READ_ONCE(page_owner->handle);
+ 	if (!handle) {
+-- 
+2.31.1
+

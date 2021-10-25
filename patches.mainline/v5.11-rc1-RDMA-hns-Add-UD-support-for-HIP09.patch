@@ -1,0 +1,144 @@
+From 66d86e529dd58616495ea0b03cc687e5d6522b59 Mon Sep 17 00:00:00 2001
+From: Weihang Li <liweihang@huawei.com>
+Date: Mon, 16 Nov 2020 19:33:27 +0800
+Subject: [PATCH] RDMA/hns: Add UD support for HIP09
+Git-commit: 66d86e529dd58616495ea0b03cc687e5d6522b59
+Patch-mainline: v5.11-rc1
+References: bsn#12
+
+
+HIP09 supports service type of Unreliable Datagram, add necessary process
+to enable this feature.
+
+Link: https://lore.kernel.org/r/1605526408-6936-7-git-send-email-liweihang@huawei.com
+Signed-off-by: Weihang Li <liweihang@huawei.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ drivers/infiniband/hw/hns/hns_roce_ah.c    |  3 ++
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.c |  6 ++--
+ drivers/infiniband/hw/hns/hns_roce_main.c  |  1 +
+ drivers/infiniband/hw/hns/hns_roce_qp.c    | 39 ++++++++++++++++------
+ 4 files changed, 37 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/infiniband/hw/hns/hns_roce_ah.c b/drivers/infiniband/hw/hns/hns_roce_ah.c
+index d65ff6aa322f..b09ef3335e96 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_ah.c
++++ b/drivers/infiniband/hw/hns/hns_roce_ah.c
+@@ -64,6 +64,9 @@ int hns_roce_create_ah(struct ib_ah *ibah, struct rdma_ah_init_attr *init_attr,
+ 	struct hns_roce_ah *ah = to_hr_ah(ibah);
+ 	int ret = 0;
+ 
++	if (hr_dev->pci_dev->revision <= PCI_REVISION_ID_HIP08 && udata)
++		return -EOPNOTSUPP;
++
+ 	ah->av.port = rdma_ah_get_port_num(ah_attr);
+ 	ah->av.gid_index = grh->sgid_index;
+ 
+diff --git a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+index 8ba88017da53..1bd81fb7b6e1 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+@@ -693,7 +693,7 @@ static int hns_roce_v2_post_send(struct ib_qp *ibqp,
+ 		       ~(((qp->sq.head + nreq) >> ilog2(qp->sq.wqe_cnt)) & 0x1);
+ 
+ 		/* Corresponding to the QP type, wqe process separately */
+-		if (ibqp->qp_type == IB_QPT_GSI)
++		if (ibqp->qp_type == IB_QPT_GSI || ibqp->qp_type == IB_QPT_UD)
+ 			ret = set_ud_wqe(qp, wr, wqe, &sge_idx, owner_bit);
+ 		else if (ibqp->qp_type == IB_QPT_RC)
+ 			ret = set_rc_wqe(qp, wr, wqe, &sge_idx, owner_bit);
+@@ -5151,7 +5151,9 @@ static int hns_roce_v2_destroy_qp_common(struct hns_roce_dev *hr_dev,
+ 	unsigned long flags;
+ 	int ret = 0;
+ 
+-	if (hr_qp->ibqp.qp_type == IB_QPT_RC && hr_qp->state != IB_QPS_RESET) {
++	if ((hr_qp->ibqp.qp_type == IB_QPT_RC ||
++	     hr_qp->ibqp.qp_type == IB_QPT_UD) &&
++	   hr_qp->state != IB_QPS_RESET) {
+ 		/* Modify qp to reset before destroying qp */
+ 		ret = hns_roce_v2_modify_qp(&hr_qp->ibqp, NULL, 0,
+ 					    hr_qp->state, IB_QPS_RESET);
+diff --git a/drivers/infiniband/hw/hns/hns_roce_main.c b/drivers/infiniband/hw/hns/hns_roce_main.c
+index 97fdc55e992a..f01590d8c3cf 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_main.c
++++ b/drivers/infiniband/hw/hns/hns_roce_main.c
+@@ -424,6 +424,7 @@ static const struct ib_device_ops hns_roce_dev_ops = {
+ 	.alloc_pd = hns_roce_alloc_pd,
+ 	.alloc_ucontext = hns_roce_alloc_ucontext,
+ 	.create_ah = hns_roce_create_ah,
++	.create_user_ah = hns_roce_create_ah,
+ 	.create_cq = hns_roce_create_cq,
+ 	.create_qp = hns_roce_create_qp,
+ 	.dealloc_pd = hns_roce_dealloc_pd,
+diff --git a/drivers/infiniband/hw/hns/hns_roce_qp.c b/drivers/infiniband/hw/hns/hns_roce_qp.c
+index e288946c6138..5e505a30c2ea 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_qp.c
++++ b/drivers/infiniband/hw/hns/hns_roce_qp.c
+@@ -998,6 +998,30 @@ void hns_roce_qp_destroy(struct hns_roce_dev *hr_dev, struct hns_roce_qp *hr_qp,
+ 	kfree(hr_qp);
+ }
+ 
++static int check_qp_type(struct hns_roce_dev *hr_dev, enum ib_qp_type type,
++			 bool is_user)
++{
++	switch (type) {
++	case IB_QPT_UD:
++		if (hr_dev->pci_dev->revision <= PCI_REVISION_ID_HIP08 &&
++		    is_user)
++			goto out;
++		fallthrough;
++	case IB_QPT_RC:
++	case IB_QPT_GSI:
++		break;
++	default:
++		goto out;
++	}
++
++	return 0;
++
++out:
++	ibdev_err(&hr_dev->ib_dev, "not support QP type %d\n", type);
++
++	return -EOPNOTSUPP;
++}
++
+ struct ib_qp *hns_roce_create_qp(struct ib_pd *pd,
+ 				 struct ib_qp_init_attr *init_attr,
+ 				 struct ib_udata *udata)
+@@ -1007,15 +1031,9 @@ struct ib_qp *hns_roce_create_qp(struct ib_pd *pd,
+ 	struct hns_roce_qp *hr_qp;
+ 	int ret;
+ 
+-	switch (init_attr->qp_type) {
+-	case IB_QPT_RC:
+-	case IB_QPT_GSI:
+-		break;
+-	default:
+-		ibdev_err(ibdev, "not support QP type %d\n",
+-			  init_attr->qp_type);
+-		return ERR_PTR(-EOPNOTSUPP);
+-	}
++	ret = check_qp_type(hr_dev, init_attr->qp_type, !!udata);
++	if (ret)
++		return ERR_PTR(ret);
+ 
+ 	hr_qp = kzalloc(sizeof(*hr_qp), GFP_KERNEL);
+ 	if (!hr_qp)
+@@ -1030,10 +1048,11 @@ struct ib_qp *hns_roce_create_qp(struct ib_pd *pd,
+ 	if (ret) {
+ 		ibdev_err(ibdev, "Create QP type 0x%x failed(%d)\n",
+ 			  init_attr->qp_type, ret);
+-		ibdev_err(ibdev, "Create GSI QP failed!\n");
++
+ 		kfree(hr_qp);
+ 		return ERR_PTR(ret);
+ 	}
++
+ 	return &hr_qp->ibqp;
+ }
+ 
+-- 
+2.31.1
+

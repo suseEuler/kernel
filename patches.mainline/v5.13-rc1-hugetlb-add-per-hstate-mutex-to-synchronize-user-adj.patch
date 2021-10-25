@@ -1,0 +1,107 @@
+From 2938396771c8fd0870b5284319f9e78b4b552a79 Mon Sep 17 00:00:00 2001
+From: Mike Kravetz <mike.kravetz@oracle.com>
+Date: Tue, 4 May 2021 18:34:52 -0700
+Subject: [PATCH] hugetlb: add per-hstate mutex to synchronize user adjustments
+Git-commit: 2938396771c8fd0870b5284319f9e78b4b552a79
+Patch-mainline: v5.13-rc1
+References: bsn#12
+
+
+The helper routine hstate_next_node_to_alloc accesses and modifies the
+hstate variable next_nid_to_alloc.  The helper is used by the routines
+alloc_pool_huge_page and adjust_pool_surplus.  adjust_pool_surplus is
+called with hugetlb_lock held.  However, alloc_pool_huge_page can not be
+called with the hugetlb lock held as it will call the page allocator.
+Two instances of alloc_pool_huge_page could be run in parallel or
+alloc_pool_huge_page could run in parallel with adjust_pool_surplus
+which may result in the variable next_nid_to_alloc becoming invalid for
+the caller and pages being allocated on the wrong node.
+
+Both alloc_pool_huge_page and adjust_pool_surplus are only called from
+the routine set_max_huge_pages after boot.  set_max_huge_pages is only
+called as the reusult of a user writing to the proc/sysfs nr_hugepages,
+or nr_hugepages_mempolicy file to adjust the number of hugetlb pages.
+
+It makes little sense to allow multiple adjustment to the number of
+hugetlb pages in parallel.  Add a mutex to the hstate and use it to only
+allow one hugetlb page adjustment at a time.  This will synchronize
+modifications to the next_nid_to_alloc variable.
+
+Link: https://lkml.kernel.org/r/20210409205254.242291-4-mike.kravetz@oracle.com
+Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Reviewed-by: Oscar Salvador <osalvador@suse.de>
+Reviewed-by: Miaohe Lin <linmiaohe@huawei.com>
+Reviewed-by: Muchun Song <songmuchun@bytedance.com>
+Reviewed-by: David Hildenbrand <david@redhat.com>
+Cc: "Aneesh Kumar K . V" <aneesh.kumar@linux.ibm.com>
+Cc: Barry Song <song.bao.hua@hisilicon.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Hillf Danton <hdanton@sina.com>
+Cc: HORIGUCHI NAOYA <naoya.horiguchi@nec.com>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Mina Almasry <almasrymina@google.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Roman Gushchin <guro@fb.com>
+Cc: Shakeel Butt <shakeelb@google.com>
+Cc: Waiman Long <longman@redhat.com>
+Cc: Will Deacon <will@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ include/linux/hugetlb.h |    1 +
+ mm/hugetlb.c            |    8 ++++++++
+ 2 files changed, 9 insertions(+)
+
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -531,6 +531,7 @@ HPAGEFLAG(RestoreReserve, restore_reserv
+ #define HSTATE_NAME_LEN 32
+ /* Defines one hugetlb page size */
+ struct hstate {
++	struct mutex resize_lock;
+ 	int next_nid_to_alloc;
+ 	int next_nid_to_free;
+ 	unsigned int order;
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -2657,6 +2657,11 @@ static int set_max_huge_pages(struct hst
+ 	else
+ 		return -ENOMEM;
+ 
++	/*
++	 * resize_lock mutex prevents concurrent adjustments to number of
++	 * pages in hstate via the proc/sysfs interfaces.
++	 */
++	mutex_lock(&h->resize_lock);
+ 	spin_lock(&hugetlb_lock);
+ 
+ 	/*
+@@ -2689,6 +2694,7 @@ static int set_max_huge_pages(struct hst
+ 	if (hstate_is_gigantic(h) && !IS_ENABLED(CONFIG_CONTIG_ALLOC)) {
+ 		if (count > persistent_huge_pages(h)) {
+ 			spin_unlock(&hugetlb_lock);
++			mutex_unlock(&h->resize_lock);
+ 			NODEMASK_FREE(node_alloc_noretry);
+ 			return -EINVAL;
+ 		}
+@@ -2763,6 +2769,7 @@ static int set_max_huge_pages(struct hst
+ out:
+ 	h->max_huge_pages = persistent_huge_pages(h);
+ 	spin_unlock(&hugetlb_lock);
++	mutex_unlock(&h->resize_lock);
+ 
+ 	NODEMASK_FREE(node_alloc_noretry);
+ 
+@@ -3249,6 +3256,7 @@ void __init hugetlb_add_hstate(unsigned
+ 	BUG_ON(hugetlb_max_hstate >= HUGE_MAX_HSTATE);
+ 	BUG_ON(order == 0);
+ 	h = &hstates[hugetlb_max_hstate++];
++	mutex_init(&h->resize_lock);
+ 	h->order = order;
+ 	h->mask = ~((1ULL << (order + PAGE_SHIFT)) - 1);
+ 	h->nr_huge_pages = 0;

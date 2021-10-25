@@ -1,0 +1,193 @@
+From 17b31a727b619fdcf36008add0c34370c1ec6426 Mon Sep 17 00:00:00 2001
+From: Yu Jiahua <yujiahua1@huawei.com>
+Date: Tue, 19 Oct 2021 18:03:58 +0800
+Subject: [PATCH] sched: Aware multi-core system for optimize loadtracking
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 17b31a727b619fdcf36008add0c34370c1ec6426
+
+
+hulk inclusion
+category: feature
+bugzilla: 181656 https://gitee.com/openeuler/kernel/issues/I4DDEL
+
+-------------------------------------------------
+
+Optimize load tracking feature have uncertain impact
+on scheduler in multi-core system. Therefore, an aware
+switch is needed to percept the number of cpus on system,
+if one than one cpu is detected, optimize load tracking
+feature will be disable.
+
+Signed-off-by: Yu Jiahua <yujiahua1@huawei.com>
+Reviewed-by: Chen Hui <judy.chenhui@huawei.com>
+Signed-off-by: Chen Jun <chenjun102@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/sched/sysctl.h |  6 +--
+ kernel/sched/fair.c          | 74 +++++++++++++++++++-----------------
+ kernel/sysctl.c              |  6 ++-
+ 3 files changed, 46 insertions(+), 40 deletions(-)
+
+diff --git a/include/linux/sched/sysctl.h b/include/linux/sched/sysctl.h
+index 378bcb58c509..525d73dd8ef9 100644
+--- a/include/linux/sched/sysctl.h
++++ b/include/linux/sched/sysctl.h
+@@ -103,12 +103,12 @@ extern int sysctl_blocked_averages(struct ctl_table *table, int write,
+ 		  void __user *buffer, size_t *lenp, loff_t *ppos);
+ extern int sysctl_tick_update_load(struct ctl_table *table, int write,
+ 		  void __user *buffer, size_t *lenp, loff_t *ppos);
+-extern int sysctl_update_load_latency(struct ctl_table *table, int write,
+-		  void __user *buffer, size_t *lenp, loff_t *ppos);
++extern int sysctl_update_load_tracking_aware(struct ctl_table *table,
++		  int write, void __user *buffer, size_t *lenp, loff_t *ppos);
+ 
+-extern unsigned int sysctl_load_tracking_latency;
+ extern struct static_key_true sched_tick_update_load;
+ extern struct static_key_true sched_blocked_averages;
++extern struct static_key_false sched_load_tracking_aware_enable;
+ #endif
+ 
+ #endif /* _LINUX_SCHED_SYSCTL_H */
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 1417af3dd427..8c830dce4481 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -39,34 +39,35 @@ unsigned int sysctl_sched_latency			= 6000000ULL;
+ static unsigned int normalized_sysctl_sched_latency	= 6000000ULL;
+ 
+ #ifdef CONFIG_IAS_SMART_LOAD_TRACKING
+-#define LANTENCY_MIN 10
+-#define LANTENCY_MAX 30
+-unsigned int sysctl_load_tracking_latency = LANTENCY_MIN;
++DEFINE_STATIC_KEY_FALSE(sched_load_tracking_aware_enable);
++static void set_load_tracking_aware(bool enabled)
++{
++	if (enabled)
++		static_branch_enable(&sched_load_tracking_aware_enable);
++	else
++		static_branch_disable(&sched_load_tracking_aware_enable);
++}
+ 
+-int sysctl_update_load_latency(struct ctl_table *table, int write,
+-			       void __user *buffer, size_t *lenp, loff_t *ppos)
++int sysctl_update_load_tracking_aware(struct ctl_table *table, int write,
++			   void __user *buffer, size_t *lenp, loff_t *ppos)
+ {
+-	int ret;
+-	int min = LANTENCY_MIN;
+-	int max = LANTENCY_MAX;
+-	int latency = sysctl_load_tracking_latency;
+ 	struct ctl_table t;
++	int err;
++	int state = static_branch_likely(&sched_load_tracking_aware_enable);
+ 
+ 	if (write && !capable(CAP_SYS_ADMIN))
+ 		return -EPERM;
+ 
+ 	t = *table;
+-	t.data = &latency;
+-	t.extra1 = &min;
+-	t.extra2 = &max;
+-
+-	ret = proc_dointvec_minmax(&t, write, buffer, lenp, ppos);
+-	if (ret || !write)
+-		return ret;
++	t.data = &state;
++	err = proc_dointvec_minmax(&t, write, buffer, lenp, ppos);
++	if (err < 0)
++		return err;
+ 
+-	sysctl_load_tracking_latency = latency;
++	if (write)
++		set_load_tracking_aware(state);
+ 
+-	return 0;
++	return err;
+ }
+ #endif
+ 
+@@ -3832,39 +3833,42 @@ static void detach_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *s
+ #define SKIP_AGE_LOAD	0x2
+ #define DO_ATTACH	0x4
+ 
++#ifdef CONFIG_IAS_SMART_LOAD_TRACKING
++/*
++ * Check load tracking senario. In single-core system without cpu frequency update,
++ * precise load tracking will be unnecessary. So here we just shutdown load tracking,
++ * for decreasing cpu usage.
++ */
++static inline int check_load_switch(void)
++{
++	if (static_branch_unlikely(&sched_load_tracking_aware_enable))
++		if (num_online_cpus() == 1)
++		/* no need to update load average in single core senario */
++			return 1;
++
++	return 0;
++}
++#endif
++
+ /* Update task and its cfs_rq load average */
+ static inline void update_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ {
+ 	u64 now = cfs_rq_clock_pelt(cfs_rq);
+ 	int decayed;
++
+ #ifdef CONFIG_IAS_SMART_LOAD_TRACKING
+-	u64 delta;
++	if (check_load_switch())
++		return;
+ #endif
+-
+ 	/*
+ 	 * Track task load average for carrying it to new CPU after migrated, and
+ 	 * track group sched_entity load average for task_h_load calc in migration
+ 	 */
+-#ifdef CONFIG_IAS_SMART_LOAD_TRACKING
+-	delta = now - se->avg.last_update_time;
+-	delta >>= sysctl_load_tracking_latency;
+-
+-	if (!delta)
+-		return;
+-
+-	if (se->avg.last_update_time && !(flags & SKIP_AGE_LOAD))
+-		__update_load_avg_se(now, cfs_rq, se);
+-
+-	decayed  = update_cfs_rq_load_avg(now, cfs_rq);
+-	decayed |= propagate_entity_load_avg(se);
+-#else
+ 	if (se->avg.last_update_time && !(flags & SKIP_AGE_LOAD))
+ 		__update_load_avg_se(now, cfs_rq, se);
+ 
+ 	decayed  = update_cfs_rq_load_avg(now, cfs_rq);
+ 	decayed |= propagate_entity_load_avg(se);
+-#endif
+-
+ 
+ 	if (!se->avg.last_update_time && (flags & DO_ATTACH)) {
+ 
+diff --git a/kernel/sysctl.c b/kernel/sysctl.c
+index 626530cf1342..c7ca58de3b1b 100644
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -1682,11 +1682,13 @@ static struct ctl_table ias_table[] = {
+ 		.extra2		= SYSCTL_ONE,
+ 	},
+ 	{
+-		.procname	= "sched_load_tracking_latency",
++		.procname	= "sched_load_tracking_aware_enable",
+ 		.data		= NULL,
+ 		.maxlen		= sizeof(unsigned int),
+ 		.mode		= 0644,
+-		.proc_handler	= sysctl_update_load_latency,
++		.proc_handler	= sysctl_update_load_tracking_aware,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
+ 	},
+ #endif
+ 	{ }
+-- 
+2.26.2
+

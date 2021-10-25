@@ -1,0 +1,424 @@
+From 086c4b46b521898937129547f5fd43f29112bd51 Mon Sep 17 00:00:00 2001
+From: Cheng Jian <cj.chengjian@huawei.com>
+Date: Sat, 29 May 2021 14:42:40 +0800
+Subject: [PATCH] livepatch/core: Split livepatch consistency
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 086c4b46b521898937129547f5fd43f29112bd51
+
+
+euler inclusion
+category: feature
+bugzilla: 51921
+CVE: N/A
+
+----------------------------------------
+
+In the previous version we forced the association between
+livepatch wo_ftrace and stop_machine. This is unwise and
+obviously confusing.
+
+commit d83a7cb375ee ("livepatch: change to a per-task
+consistency model") introduce a PER-TASK consistency model.
+It's a hybrid of kGraft and kpatch: it uses kGraft's per-task
+consistency and syscall barrier switching combined with
+kpatch's stack trace switching. There are also a number of
+fallback options which make it quite flexible.
+
+So we split livepatch consistency for without ftrace to two model:
+[1] PER-TASK consistency model.
+per-task consistency and syscall barrier switching combined with
+kpatch's stack trace switching.
+
+[2] STOP-MACHINE consistency model.
+stop-machine consistency and kpatch's stack trace switching.
+
+Signed-off-by: Cheng Jian <cj.chengjian@huawei.com>
+Reviewed-by: Li Bin <huawei.libin@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Signed-off-by: Dong Kai <dongkai11@huawei.com>
+
+Signed-off-by: Ye Weihua <yeweihua4@huawei.com>
+Reviewed-by: Yang Jihong <yangjihong1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/livepatch.h     |  8 ++---
+ kernel/livepatch/Kconfig      | 27 +++++++++++++++++
+ kernel/livepatch/Makefile     |  6 ++--
+ kernel/livepatch/core.c       | 57 +++++++++++++++++------------------
+ kernel/livepatch/patch.c      |  4 +++
+ kernel/livepatch/transition.c |  7 +++++
+ 6 files changed, 73 insertions(+), 36 deletions(-)
+
+diff --git a/include/linux/livepatch.h b/include/linux/livepatch.h
+index e5142c198d7d..244cd5fa2859 100644
+--- a/include/linux/livepatch.h
++++ b/include/linux/livepatch.h
+@@ -75,7 +75,7 @@ struct klp_func {
+ 	unsigned long old_size, new_size;
+ 	bool nop;
+ 	bool patched;
+-#ifdef CONFIG_LIVEPATCH_FTRACE
++#ifdef CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY
+ 	bool transition;
+ #endif
+ };
+@@ -202,7 +202,7 @@ int klp_apply_section_relocs(struct module *pmod, Elf_Shdr *sechdrs,
+ 			     unsigned int symindex, unsigned int secindex,
+ 			     const char *objname);
+ 
+-#ifdef CONFIG_LIVEPATCH_FTRACE
++#ifdef CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY
+ /* Called from the module loader during module coming/going states */
+ int klp_module_coming(struct module *mod);
+ void klp_module_going(struct module *mod);
+@@ -239,7 +239,7 @@ void klp_shadow_free_all(unsigned long id, klp_shadow_dtor_t dtor);
+ struct klp_state *klp_get_state(struct klp_patch *patch, unsigned long id);
+ struct klp_state *klp_get_prev_state(unsigned long id);
+ 
+-#else /* !CONFIG_LIVEPATCH_FTRACE */
++#else /* !CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY */
+ 
+ static inline int klp_module_coming(struct module *mod) { return 0; }
+ static inline void klp_module_going(struct module *mod) {}
+@@ -252,7 +252,7 @@ static inline bool klp_have_reliable_stack(void) { return true; }
+ #define klp_smp_isb()
+ #endif
+ 
+-#endif /* CONFIG_LIVEPATCH_FTRACE */
++#endif /* CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY */
+ 
+ #else /* !CONFIG_LIVEPATCH */
+ 
+diff --git a/kernel/livepatch/Kconfig b/kernel/livepatch/Kconfig
+index 4e6dfea097f3..354fdfdebc32 100644
+--- a/kernel/livepatch/Kconfig
++++ b/kernel/livepatch/Kconfig
+@@ -50,6 +50,33 @@ config LIVEPATCH_WO_FTRACE
+ 
+ endchoice
+ 
++choice
++	prompt "live patching consistency model"
++	depends on LIVEPATCH
++	default LIVEPATCH_PER_TASK_CONSISTENCY if LIVEPATCH_FTRACE
++	default LIVEPATCH_STOP_MACHINE_CONSISTENCY if LIVEPATCH_WO_FTRACE
++	help
++	  Livepatch consistency model configuration.
++
++config LIVEPATCH_PER_TASK_CONSISTENCY
++	bool "per task consistency"
++	help
++	  Use basic per-task consistency model
++	  It's a hybrid of kGraft and kpatch:
++	  uses kGraft's per-task consistency and syscall
++	  barrier switching combined with kpatch's stack
++	  trace switching. There are also a number of
++	  fallback options which make it quite flexible.
++
++config LIVEPATCH_STOP_MACHINE_CONSISTENCY
++	bool "stop machine consistency"
++	help
++	  Use stop machine consistency model
++	  stop-machine consistency and kpatch's stack
++	  trace checking.
++
++endchoice
++
+ config LIVEPATCH_STACK
+ 	bool "Enforcing the patch stacking principle"
+ 	depends on LIVEPATCH_FTRACE || LIVEPATCH_WO_FTRACE
+diff --git a/kernel/livepatch/Makefile b/kernel/livepatch/Makefile
+index d44badbd4ece..4130bb7d5417 100644
+--- a/kernel/livepatch/Makefile
++++ b/kernel/livepatch/Makefile
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ obj-$(CONFIG_LIVEPATCH) += livepatch.o
+-obj-$(CONFIG_LIVEPATCH_FTRACE) += transition.o
+-obj-$(CONFIG_LIVEPATCH_FTRACE) += shadow.o
+-obj-$(CONFIG_LIVEPATCH_FTRACE) += state.o
++obj-$(CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY) += transition.o
++obj-$(CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY) += shadow.o
++obj-$(CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY) += state.o
+ 
+ livepatch-objs := core.o patch.o
+diff --git a/kernel/livepatch/core.c b/kernel/livepatch/core.c
+index f20aba5a8e35..5c4819e8d10e 100644
+--- a/kernel/livepatch/core.c
++++ b/kernel/livepatch/core.c
+@@ -27,11 +27,10 @@
+ #ifdef CONFIG_LIVEPATCH_RESTRICT_KPROBE
+ #include <linux/kprobes.h>
+ #endif
+-#ifdef CONFIG_LIVEPATCH_FTRACE
++#if defined(CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY)
+ #include "state.h"
+ #include "transition.h"
+-#endif
+-#ifdef CONFIG_LIVEPATCH_WO_FTRACE
++#elif defined(CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY)
+ #include <linux/stop_machine.h>
+ #endif
+ 
+@@ -54,7 +53,7 @@ LIST_HEAD(klp_patches);
+ 
+ static struct kobject *klp_root_kobj;
+ 
+-#ifdef CONFIG_LIVEPATCH_WO_FTRACE
++#ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
+ struct patch_data {
+ 	struct klp_patch        *patch;
+ 	atomic_t                cpu_count;
+@@ -419,7 +418,7 @@ static ssize_t enabled_store(struct kobject *kobj, struct kobj_attribute *attr,
+ 		goto out;
+ 	}
+ 
+-#ifdef CONFIG_LIVEPATCH_FTRACE
++#if defined(CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY)
+ 	/*
+ 	 * Allow to reverse a pending transition in both ways. It might be
+ 	 * necessary to complete the transition without forcing and breaking
+@@ -433,7 +432,7 @@ static ssize_t enabled_store(struct kobject *kobj, struct kobj_attribute *attr,
+ 		ret = __klp_disable_patch(patch);
+ 	else
+ 		ret = -EINVAL;
+-#else /* ifdef CONFIG_LIVEPATCH_WO_FTRACE */
++#elif defined(CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY)
+ 	if (enabled) {
+ 		ret = -EINVAL;
+ 	} else {
+@@ -460,7 +459,7 @@ static ssize_t enabled_show(struct kobject *kobj,
+ 	return snprintf(buf, PAGE_SIZE-1, "%d\n", patch->enabled);
+ }
+ 
+-#ifdef CONFIG_LIVEPATCH_FTRACE
++#ifdef CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY
+ static ssize_t transition_show(struct kobject *kobj,
+ 			       struct kobj_attribute *attr, char *buf)
+ {
+@@ -499,20 +498,20 @@ static ssize_t force_store(struct kobject *kobj, struct kobj_attribute *attr,
+ 
+ 	return count;
+ }
+-#endif /* #ifdef CONFIG_LIVEPATCH_FTRACE */
++#endif /* #ifdef CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY */
+ 
+ static struct kobj_attribute enabled_kobj_attr = __ATTR_RW(enabled);
+-#ifdef CONFIG_LIVEPATCH_FTRACE
++#ifdef CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY
+ static struct kobj_attribute transition_kobj_attr = __ATTR_RO(transition);
+ static struct kobj_attribute force_kobj_attr = __ATTR_WO(force);
+-#endif /* #ifdef CONFIG_LIVEPATCH_FTRACE */
++#endif /* #ifdef CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY */
+ 
+ static struct attribute *klp_patch_attrs[] = {
+ 	&enabled_kobj_attr.attr,
+-#ifdef CONFIG_LIVEPATCH_FTRACE
++#ifdef CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY
+ 	&transition_kobj_attr.attr,
+ 	&force_kobj_attr.attr,
+-#endif /* #ifdef CONFIG_LIVEPATCH_FTRACE */
++#endif /* #ifdef CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY */
+ 	NULL
+ };
+ ATTRIBUTE_GROUPS(klp_patch);
+@@ -728,7 +727,7 @@ static void __klp_free_funcs(struct klp_object *obj, bool nops_only)
+ 	}
+ }
+ 
+-#ifdef CONFIG_LIVEPATCH_FTRACE
++#ifdef CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY
+ /* Clean up when a patched object is unloaded */
+ static void klp_free_object_loaded(struct klp_object *obj)
+ {
+@@ -743,14 +742,14 @@ static void klp_free_object_loaded(struct klp_object *obj)
+ 			func->new_func = NULL;
+ 	}
+ }
+-#endif /* #ifdef CONFIG_LIVEPATCH_FTRACE */
++#endif /* #ifdef CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY */
+ 
+ static void __klp_free_objects(struct klp_patch *patch, bool nops_only)
+ {
+ 	struct klp_object *obj, *tmp_obj;
+ 
+ 	klp_for_each_object_safe(patch, obj, tmp_obj) {
+-#ifdef CONFIG_LIVEPATCH_WO_FTRACE
++#ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
+ 		if (klp_is_module(obj))
+ 			module_put(obj->mod);
+ #endif
+@@ -769,7 +768,7 @@ static void klp_free_objects(struct klp_patch *patch)
+ 	__klp_free_objects(patch, false);
+ }
+ 
+-#ifdef CONFIG_LIVEPATCH_FTRACE
++#ifdef CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY
+ static void klp_free_objects_dynamic(struct klp_patch *patch)
+ {
+ 	__klp_free_objects(patch, true);
+@@ -862,7 +861,7 @@ static int klp_init_func(struct klp_object *obj, struct klp_func *func)
+ 
+ 	INIT_LIST_HEAD(&func->stack_node);
+ 	func->patched = false;
+-#ifdef CONFIG_LIVEPATCH_FTRACE
++#ifdef CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY
+ 	func->transition = false;
+ #endif
+ 
+@@ -984,7 +983,7 @@ static int klp_init_object(struct klp_patch *patch, struct klp_object *obj)
+ 	return 0;
+ 
+ out:
+-#ifdef CONFIG_LIVEPATCH_WO_FTRACE
++#ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
+ 	if (klp_is_module(obj))
+ 		module_put(obj->mod);
+ #endif
+@@ -1039,7 +1038,7 @@ static int klp_init_patch_early(struct klp_patch *patch)
+ 	return 0;
+ }
+ 
+-#ifdef CONFIG_LIVEPATCH_WO_FTRACE
++#ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
+ static void klp_free_objects_mod_limited(struct klp_patch *patch,
+ 					struct klp_object *limit)
+ {
+@@ -1079,13 +1078,13 @@ static int klp_init_patch(struct klp_patch *patch)
+ 
+ 	return 0;
+ out:
+-#ifdef CONFIG_LIVEPATCH_WO_FTRACE
++#ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
+ 	klp_free_objects_mod_limited(patch, obj);
+ #endif
+ 	return ret;
+ }
+ 
+-#ifdef CONFIG_LIVEPATCH_FTRACE
++#ifdef CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY
+ static int __klp_disable_patch(struct klp_patch *patch)
+ {
+ 	struct klp_object *obj;
+@@ -1117,7 +1116,7 @@ static int __klp_disable_patch(struct klp_patch *patch)
+ 
+ 	return 0;
+ }
+-#else /* ifdef CONFIG_LIVEPATCH_WO_FTRACE */
++#elif defined(CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY)
+ int __weak klp_check_calltrace(struct klp_patch *patch, int enable)
+ {
+ 	return 0;
+@@ -1197,9 +1196,9 @@ static int __klp_disable_patch(struct klp_patch *patch)
+ 	klp_free_patch_async(patch);
+ 	return 0;
+ }
+-#endif /* ifdef CONFIG_LIVEPATCH_FTRACE */
++#endif /* if defined(CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY) */
+ 
+-#ifdef CONFIG_LIVEPATCH_FTRACE
++#ifdef CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY
+ static int __klp_enable_patch(struct klp_patch *patch)
+ {
+ 	struct klp_object *obj;
+@@ -1254,7 +1253,7 @@ static int __klp_enable_patch(struct klp_patch *patch)
+ 	klp_cancel_transition();
+ 	return ret;
+ }
+-#else /* ifdef CONFIG_LIVEPATCH_WO_FTRACE */
++#elif defined(CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY)
+ /*
+  * This function is called from stop_machine() context.
+  */
+@@ -1358,7 +1357,7 @@ static int __klp_enable_patch(struct klp_patch *patch)
+ 
+ 	return 0;
+ }
+-#endif /* #ifdef CONFIG_LIVEPATCH_FTRACE */
++#endif /* #ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY */
+ 
+ /**
+  * klp_enable_patch() - enable the livepatch
+@@ -1396,7 +1395,7 @@ int klp_enable_patch(struct klp_patch *patch)
+ 
+ 	mutex_lock(&klp_mutex);
+ 
+-#ifdef CONFIG_LIVEPATCH_FTRACE
++#ifdef CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY
+ 	if (!klp_is_patch_compatible(patch)) {
+ 		pr_err("Livepatch patch (%s) is not compatible with the already installed livepatches.\n",
+ 			patch->mod->name);
+@@ -1462,7 +1461,7 @@ void klp_unpatch_replaced_patches(struct klp_patch *new_patch)
+ 	}
+ }
+ 
+-#ifdef CONFIG_LIVEPATCH_FTRACE
++#ifdef CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY
+ /*
+  * This function removes the dynamically allocated 'nop' functions.
+  *
+@@ -1618,7 +1617,7 @@ void klp_module_going(struct module *mod)
+ 
+ 	mutex_unlock(&klp_mutex);
+ }
+-#endif /* ifdef CONFIG_LIVEPATCH_FTRACE */
++#endif /* ifdef CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY */
+ 
+ static int __init klp_init(void)
+ {
+diff --git a/kernel/livepatch/patch.c b/kernel/livepatch/patch.c
+index 16967cf6c69a..28e0de4edd72 100644
+--- a/kernel/livepatch/patch.c
++++ b/kernel/livepatch/patch.c
+@@ -79,7 +79,11 @@ static void notrace klp_ftrace_handler(unsigned long ip,
+ 	 */
+ 	smp_rmb();
+ 
++#ifdef CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY
+ 	if (unlikely(func->transition)) {
++#else
++	{
++#endif
+ 
+ 		/*
+ 		 * Enforce the order of the func->transition and
+diff --git a/kernel/livepatch/transition.c b/kernel/livepatch/transition.c
+index f6310f848f34..b5ef759ad510 100644
+--- a/kernel/livepatch/transition.c
++++ b/kernel/livepatch/transition.c
+@@ -194,7 +194,9 @@ static int klp_check_stack_func(struct klp_func *func, unsigned long *entries,
+ 				unsigned int nr_entries)
+ {
+ 	unsigned long func_addr, func_size, address;
++#ifdef CONFIG_LIVEPATCH_FTRACE
+ 	struct klp_ops *ops;
++#endif
+ 	int i;
+ 
+ 	for (i = 0; i < nr_entries; i++) {
+@@ -208,6 +210,7 @@ static int klp_check_stack_func(struct klp_func *func, unsigned long *entries,
+ 			func_addr = (unsigned long)func->new_func;
+ 			func_size = func->new_size;
+ 		} else {
++#ifdef CONFIG_LIVEPATCH_FTRACE
+ 			/*
+ 			 * Check for the to-be-patched function
+ 			 * (the previous func).
+@@ -226,6 +229,10 @@ static int klp_check_stack_func(struct klp_func *func, unsigned long *entries,
+ 				func_addr = (unsigned long)prev->new_func;
+ 				func_size = prev->new_size;
+ 			}
++#else
++			func_addr = (unsigned long)func->old_func;
++			func_size = func->old_size;
++#endif
+ 		}
+ 
+ 		if (address >= func_addr && address < func_addr + func_size)
+-- 
+2.26.2
+

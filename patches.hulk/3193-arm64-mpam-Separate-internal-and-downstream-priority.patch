@@ -1,0 +1,198 @@
+From 28e3f99f31cbbf763b9dfc5f2c50c299d07d30ac Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Fri, 26 Feb 2021 20:22:35 +0800
+Subject: [PATCH] arm64/mpam: Separate internal and downstream priority event
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 28e3f99f31cbbf763b9dfc5f2c50c299d07d30ac
+
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+There are two aspects involved:
+
+  - Getting configuration
+
+    We divide event QOS_XX_PRI_EVENT_ID into QOS_XX_INTPRI_EVENT_ID and
+    QOS_XX_DSPRI_EVENT_ID, in spite of having attempted to set same value
+    of filling dspri and intpti in mpam_config structure but exactly we
+    need read seperately to ensure their independence.
+
+    Besides, an event such as QOS_CAT_INTPRI_EVENT_ID is not necessary to
+    be read from MSC's register but set to be 0 directly if corresponding
+    feature doesn't support.
+
+  - Applying configuration
+
+    When applying downstream or internal priority configuration, given
+    the independence of their two, we should check if feature mpam_feat_
+    xxpri_part supported first and next check mpam_feat_xxpri_part_0_low,
+    and convert dspri and intpri into a proper value according to it's max
+    width.
+
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/resctrl.h      | 10 +++++---
+ arch/arm64/kernel/mpam/mpam_device.c  | 30 ++++++++++++++---------
+ arch/arm64/kernel/mpam/mpam_resctrl.c | 35 +++++++++++++++------------
+ 3 files changed, 43 insertions(+), 32 deletions(-)
+
+diff --git a/arch/arm64/include/asm/resctrl.h b/arch/arm64/include/asm/resctrl.h
+index 37e750029fbc..1cd24441d2e6 100644
+--- a/arch/arm64/include/asm/resctrl.h
++++ b/arch/arm64/include/asm/resctrl.h
+@@ -23,10 +23,12 @@ enum rdt_event_id {
+ 	QOS_L3_MBM_LOCAL_EVENT_ID       = 0x03,
+ 
+ 	QOS_CAT_CPBM_EVENT_ID           = 0x04,
+-	QOS_CAT_PRI_EVENT_ID            = 0x05,
+-	QOS_MBA_MAX_EVENT_ID            = 0x06,
+-	QOS_MBA_PRI_EVENT_ID            = 0x07,
+-	QOS_MBA_HDL_EVENT_ID            = 0x08,
++	QOS_CAT_INTPRI_EVENT_ID         = 0x05,
++	QOS_CAT_DSPRI_EVENT_ID          = 0x06,
++	QOS_MBA_MAX_EVENT_ID            = 0x07,
++	QOS_MBA_INTPRI_EVENT_ID         = 0x08,
++	QOS_MBA_DSPRI_EVENT_ID          = 0x09,
++	QOS_MBA_HDL_EVENT_ID            = 0x0a,
+ 	/* Must be the last */
+ 	RESCTRL_NUM_EVENT_IDS,
+ };
+diff --git a/arch/arm64/kernel/mpam/mpam_device.c b/arch/arm64/kernel/mpam/mpam_device.c
+index a1e6564401ba..401b20476552 100644
+--- a/arch/arm64/kernel/mpam/mpam_device.c
++++ b/arch/arm64/kernel/mpam/mpam_device.c
+@@ -1599,19 +1599,25 @@ static void mpam_component_read_mpamcfg(void *_ctx)
+ 			val = mpam_read_reg(dev, MPAMCFG_MBW_MAX);
+ 			val = MBW_MAX_GET_HDL(val);
+ 			break;
+-		case QOS_CAT_PRI_EVENT_ID:
+-		case QOS_MBA_PRI_EVENT_ID:
+-			if (mpam_has_feature(mpam_feat_intpri_part, dev->features))
+-				intpri = MPAMCFG_INTPRI_GET(val);
+-			if (mpam_has_feature(mpam_feat_dspri_part, dev->features))
+-				dspri = MPAMCFG_DSPRI_GET(val);
+-			if (!mpam_has_feature(mpam_feat_intpri_part_0_low,
+-				dev->features))
++		case QOS_CAT_INTPRI_EVENT_ID:
++		case QOS_MBA_INTPRI_EVENT_ID:
++			if (!mpam_has_feature(mpam_feat_intpri_part, dev->features))
++				break;
++			val = mpam_read_reg(dev, MPAMCFG_PRI);
++			intpri = MPAMCFG_INTPRI_GET(val);
++			if (!mpam_has_feature(mpam_feat_intpri_part_0_low, dev->features))
+ 				intpri = GENMASK(dev->intpri_wd - 1, 0) & ~intpri;
+-			if (!mpam_has_feature(mpam_feat_dspri_part_0_low,
+-				dev->features))
+-				dspri = GENMASK(dev->intpri_wd - 1, 0) & ~dspri;
+-			val = (dspri > intpri) ? dspri : intpri;
++			val = intpri;
++			break;
++		case QOS_CAT_DSPRI_EVENT_ID:
++		case QOS_MBA_DSPRI_EVENT_ID:
++			if (!mpam_has_feature(mpam_feat_dspri_part, dev->features))
++				break;
++			val = mpam_read_reg(dev, MPAMCFG_PRI);
++			dspri = MPAMCFG_DSPRI_GET(val);
++			if (!mpam_has_feature(mpam_feat_dspri_part_0_low, dev->features))
++				dspri = GENMASK(dev->dspri_wd - 1, 0) & ~dspri;
++			val = dspri;
+ 			break;
+ 		default:
+ 			break;
+diff --git a/arch/arm64/kernel/mpam/mpam_resctrl.c b/arch/arm64/kernel/mpam/mpam_resctrl.c
+index ac14b2aca483..f23bd231cc33 100644
+--- a/arch/arm64/kernel/mpam/mpam_resctrl.c
++++ b/arch/arm64/kernel/mpam/mpam_resctrl.c
+@@ -292,58 +292,61 @@ common_wrmsr(struct resctrl_resource *r, struct rdt_domain *d,
+ 
+ static u64 cache_rdmsr(struct rdt_domain *d, struct msr_param *para)
+ {
+-	u32 result;
++	u32 result, intpri, dspri;
+ 	struct sync_args args;
+ 	struct mpam_resctrl_dom *dom;
+ 
+ 	args.closid = *para->closid;
++	dom = container_of(d, struct mpam_resctrl_dom, resctrl_dom);
+ 
+ 	switch (para->type) {
+ 	case SCHEMA_COMM:
+ 		args.eventid = QOS_CAT_CPBM_EVENT_ID;
++		mpam_component_get_config(dom->comp, &args, &result);
+ 		break;
+ 	case SCHEMA_PRI:
+-		args.eventid = QOS_CAT_PRI_EVENT_ID;
++		args.eventid = QOS_CAT_INTPRI_EVENT_ID;
++		mpam_component_get_config(dom->comp, &args, &intpri);
++		args.eventid = QOS_MBA_DSPRI_EVENT_ID;
++		mpam_component_get_config(dom->comp, &args, &dspri);
++		result = (intpri > dspri) ? intpri : dspri;
+ 		break;
+ 	default:
+ 		return 0;
+ 	}
+ 
+-	dom = container_of(d, struct mpam_resctrl_dom, resctrl_dom);
+-	mpam_component_get_config(dom->comp, &args, &result);
+-
+ 	return result;
+ }
+ 
+ static u64 mbw_rdmsr(struct rdt_domain *d, struct msr_param *para)
+ {
+-	u32 result;
++	u32 result, intpri, dspri;
+ 	struct sync_args args;
+ 	struct mpam_resctrl_dom *dom;
+ 
+ 	args.closid = *para->closid;
++	dom = container_of(d, struct mpam_resctrl_dom, resctrl_dom);
+ 
+-	/*
+-	 * software default set memory bandwidth by
+-	 * MPAMCFG_MBW_MAX but not MPAMCFG_MBW_PBM.
+-	 */
+ 	switch (para->type) {
+ 	case SCHEMA_COMM:
+ 		args.eventid = QOS_MBA_MAX_EVENT_ID;
++		mpam_component_get_config(dom->comp, &args, &result);
++		break;
++	case SCHEMA_PRI:
++		args.eventid = QOS_MBA_INTPRI_EVENT_ID;
++		mpam_component_get_config(dom->comp, &args, &intpri);
++		args.eventid = QOS_MBA_DSPRI_EVENT_ID;
++		mpam_component_get_config(dom->comp, &args, &dspri);
++		result = (intpri > dspri) ? intpri : dspri;
+ 		break;
+ 	case SCHEMA_HDL:
+ 		args.eventid = QOS_MBA_HDL_EVENT_ID;
+-		break;
+-	case SCHEMA_PRI:
+-		args.eventid = QOS_MBA_PRI_EVENT_ID;
++		mpam_component_get_config(dom->comp, &args, &result);
+ 		break;
+ 	default:
+ 		return 0;
+ 	}
+ 
+-	dom = container_of(d, struct mpam_resctrl_dom, resctrl_dom);
+-	mpam_component_get_config(dom->comp, &args, &result);
+-
+ 	return result;
+ }
+ 
+-- 
+2.26.2
+

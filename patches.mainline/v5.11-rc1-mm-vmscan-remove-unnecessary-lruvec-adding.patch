@@ -1,0 +1,135 @@
+From 3d06afab5268218255581c0852daab963baa522e Mon Sep 17 00:00:00 2001
+From: Alex Shi <alex.shi@linux.alibaba.com>
+Date: Tue, 15 Dec 2020 12:33:37 -0800
+Subject: [PATCH] mm/vmscan: remove unnecessary lruvec adding
+Git-commit: 3d06afab5268218255581c0852daab963baa522e
+Patch-mainline: v5.11-rc1
+References: bsn#12
+
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+We don't have to add a freeable page into lru and then remove from it.
+This change saves a couple of actions and makes the moving more clear.
+
+The SetPageLRU needs to be kept before put_page_testzero for list
+integrity, otherwise:
+
+  #0 move_pages_to_lru             #1 release_pages
+  if !put_page_testzero
+     			           if (put_page_testzero())
+     			              !PageLRU //skip lru_lock
+     SetPageLRU()
+     list_add(&page->lru,)
+                                         list_add(&page->lru,)
+
+[akpm@linux-foundation.org: coding style fixes]
+
+Link: https://lkml.kernel.org/r/1604566549-62481-6-git-send-email-alex.shi@linux.alibaba.com
+Signed-off-by: Alex Shi <alex.shi@linux.alibaba.com>
+Acked-by: Hugh Dickins <hughd@google.com>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Alexander Duyck <alexander.duyck@gmail.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+Cc: "Chen, Rong A" <rong.a.chen@intel.com>
+Cc: Daniel Jordan <daniel.m.jordan@oracle.com>
+Cc: "Huang, Ying" <ying.huang@intel.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Kirill A. Shutemov <kirill@shutemov.name>
+Cc: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mika Penttilä <mika.penttila@nextfour.com>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Shakeel Butt <shakeelb@google.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+Cc: Wei Yang <richard.weiyang@gmail.com>
+Cc: Yang Shi <yang.shi@linux.alibaba.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ mm/vmscan.c | 38 +++++++++++++++++++++++++-------------
+ 1 file changed, 25 insertions(+), 13 deletions(-)
+
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 242368592ea7..1c3df77972e8 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -1851,26 +1851,30 @@ static unsigned noinline_for_stack move_pages_to_lru(struct lruvec *lruvec,
+ 	while (!list_empty(list)) {
+ 		page = lru_to_page(list);
+ 		VM_BUG_ON_PAGE(PageLRU(page), page);
++		list_del(&page->lru);
+ 		if (unlikely(!page_evictable(page))) {
+-			list_del(&page->lru);
+ 			spin_unlock_irq(&pgdat->lru_lock);
+ 			putback_lru_page(page);
+ 			spin_lock_irq(&pgdat->lru_lock);
+ 			continue;
+ 		}
+-		lruvec = mem_cgroup_page_lruvec(page, pgdat);
+ 
++		/*
++		 * The SetPageLRU needs to be kept here for list integrity.
++		 * Otherwise:
++		 *   #0 move_pages_to_lru             #1 release_pages
++		 *   if !put_page_testzero
++		 *				      if (put_page_testzero())
++		 *				        !PageLRU //skip lru_lock
++		 *     SetPageLRU()
++		 *     list_add(&page->lru,)
++		 *                                        list_add(&page->lru,)
++		 */
+ 		SetPageLRU(page);
+-		lru = page_lru(page);
+ 
+-		nr_pages = thp_nr_pages(page);
+-		update_lru_size(lruvec, lru, page_zonenum(page), nr_pages);
+-		list_move(&page->lru, &lruvec->lists[lru]);
+-
+-		if (put_page_testzero(page)) {
++		if (unlikely(put_page_testzero(page))) {
+ 			__ClearPageLRU(page);
+ 			__ClearPageActive(page);
+-			del_page_from_lru_list(page, lruvec, lru);
+ 
+ 			if (unlikely(PageCompound(page))) {
+ 				spin_unlock_irq(&pgdat->lru_lock);
+@@ -1878,11 +1882,19 @@ static unsigned noinline_for_stack move_pages_to_lru(struct lruvec *lruvec,
+ 				spin_lock_irq(&pgdat->lru_lock);
+ 			} else
+ 				list_add(&page->lru, &pages_to_free);
+-		} else {
+-			nr_moved += nr_pages;
+-			if (PageActive(page))
+-				workingset_age_nonresident(lruvec, nr_pages);
++
++			continue;
+ 		}
++
++		lruvec = mem_cgroup_page_lruvec(page, pgdat);
++		lru = page_lru(page);
++		nr_pages = thp_nr_pages(page);
++
++		update_lru_size(lruvec, lru, page_zonenum(page), nr_pages);
++		list_add(&page->lru, &lruvec->lists[lru]);
++		nr_moved += nr_pages;
++		if (PageActive(page))
++			workingset_age_nonresident(lruvec, nr_pages);
+ 	}
+ 
+ 	/*
+-- 
+2.31.1
+

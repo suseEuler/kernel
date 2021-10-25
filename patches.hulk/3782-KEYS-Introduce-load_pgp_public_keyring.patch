@@ -1,0 +1,123 @@
+From c31efa813806dbf57fef6051260009b6015e5501 Mon Sep 17 00:00:00 2001
+From: Roberto Sassu <roberto.sassu@huawei.com>
+Date: Wed, 3 Mar 2021 08:44:19 +0100
+Subject: [PATCH] KEYS: Introduce load_pgp_public_keyring()
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: c31efa813806dbf57fef6051260009b6015e5501
+
+
+hulk inclusion
+category: feature
+feature: IMA Digest Lists extension
+bugzilla: 46797
+
+-------------------------------------------------
+
+Preload PGP keys from 'pubring.gpg', placed in certs/ of the kernel source
+directory.
+
+Signed-off-by: Roberto Sassu <roberto.sassu@huawei.com>
+Signed-off-by: Tianxing Zhang <zhangtianxing3@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ certs/Kconfig               |  7 +++++++
+ certs/Makefile              |  7 +++++++
+ certs/system_certificates.S | 18 ++++++++++++++++++
+ certs/system_keyring.c      | 22 ++++++++++++++++++++++
+ 4 files changed, 54 insertions(+)
+
+--- a/certs/Kconfig
++++ b/certs/Kconfig
+@@ -100,4 +100,11 @@ config SYSTEM_REVOCATION_KEYS
+ 	  containing X.509 certificates to be included in the default blacklist
+ 	  keyring.
+ 
++config PGP_PRELOAD_PUBLIC_KEYS
++	bool "Preload PGP public keys"
++	select PGP_PRELOAD
++	default n
++	help
++	  Provide a keyring of PGP public keys.
++
+ endmenu
+--- a/certs/Makefile
++++ b/certs/Makefile
+@@ -22,6 +22,13 @@ $(obj)/system_certificates.o: $(obj)/x50
+ # Cope with signing_key.x509 existing in $(srctree) not $(objtree)
+ AFLAGS_system_certificates.o := -I$(srctree)
+ 
++ifdef CONFIG_PGP_PRELOAD_PUBLIC_KEYS
++ifeq ($(shell ls $(srctree)/certs/pubring.gpg 2> /dev/null), $(srctree)/certs/pubring.gpg)
++AFLAGS_system_certificates.o += -DHAVE_PUBRING_GPG
++$(obj)/system_certificates.o: $(srctree)/certs/pubring.gpg
++endif
++endif
++
+ quiet_cmd_extract_certs  = EXTRACT_CERTS   $(patsubst "%",%,$(2))
+       cmd_extract_certs  = scripts/extract-cert $(2) $@
+ 
+--- a/certs/system_certificates.S
++++ b/certs/system_certificates.S
+@@ -35,3 +35,21 @@ system_certificate_list_size:
+ #else
+ 	.long __cert_list_end - __cert_list_start
+ #endif
++
++	.align 8
++	.globl pgp_public_keys
++pgp_public_keys:
++__pgp_key_list_start:
++#ifdef HAVE_PUBRING_GPG
++	.incbin "certs/pubring.gpg"
++#endif
++__pgp_key_list_end:
++
++	.align 8
++	.globl pgp_public_keys_size
++pgp_public_keys_size:
++#ifdef CONFIG_64BIT
++	.quad __pgp_key_list_end - __pgp_key_list_start
++#else
++	.long __pgp_key_list_end - __pgp_key_list_start
++#endif
+--- a/certs/system_keyring.c
++++ b/certs/system_keyring.c
+@@ -11,6 +11,7 @@
+ #include <linux/cred.h>
+ #include <linux/err.h>
+ #include <linux/slab.h>
++#include <linux/pgp.h>
+ #include <linux/verification.h>
+ #include <keys/asymmetric-type.h>
+ #include <keys/system_keyring.h>
+@@ -144,6 +145,27 @@ static __init int load_system_certificat
+ }
+ late_initcall(load_system_certificate_list);
+ 
++#ifdef CONFIG_PGP_PRELOAD_PUBLIC_KEYS
++extern __initconst const u8 pgp_public_keys[];
++extern __initconst const unsigned long pgp_public_keys_size;
++
++/*
++ * Load a list of PGP keys.
++ */
++static __init int load_pgp_public_keyring(void)
++{
++	pr_notice("Load PGP public keys\n");
++
++	if (preload_pgp_keys(pgp_public_keys,
++			     pgp_public_keys_size,
++			     builtin_trusted_keys) < 0)
++		pr_err("Can't load PGP public keys\n");
++
++	return 0;
++}
++late_initcall(load_pgp_public_keyring);
++#endif /* CONFIG_PGP_PRELOAD_PUBLIC_KEYS */
++
+ #ifdef CONFIG_SYSTEM_DATA_VERIFICATION
+ 
+ /**

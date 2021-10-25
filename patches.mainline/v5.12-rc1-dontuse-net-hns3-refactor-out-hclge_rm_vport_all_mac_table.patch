@@ -1,0 +1,126 @@
+From 80a9f3f1fa81c75b45c9073b46372ec7ee55fedf Mon Sep 17 00:00:00 2001
+From: Hao Chen <chenhao288@hisilicon.com>
+Date: Fri, 12 Feb 2021 11:24:17 +0800
+Subject: [PATCH] net: hns3: refactor out hclge_rm_vport_all_mac_table()
+Git-commit: 80a9f3f1fa81c75b45c9073b46372ec7ee55fedf
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+hclge_rm_vport_all_mac_table() is bloated, so split it into
+separate functions for readability and maintainability.
+
+Signed-off-by: Hao Chen <chenhao288@hisilicon.com>
+Signed-off-by: Huazhong Tan <tanhuazhong@huawei.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ .../hisilicon/hns3/hns3pf/hclge_main.c        | 67 ++++++++++++-------
+ 1 file changed, 43 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
+index 47a7115fdb5d..34b744df6709 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
+@@ -8353,36 +8353,18 @@ static void hclge_sync_mac_table(struct hclge_dev *hdev)
+ 	}
+ }
+ 
+-void hclge_rm_vport_all_mac_table(struct hclge_vport *vport, bool is_del_list,
+-				  enum HCLGE_MAC_ADDR_TYPE mac_type)
++static void hclge_build_del_list(struct list_head *list,
++				 bool is_del_list,
++				 struct list_head *tmp_del_list)
+ {
+-	int (*unsync)(struct hclge_vport *vport, const unsigned char *addr);
+ 	struct hclge_mac_node *mac_cfg, *tmp;
+-	struct hclge_dev *hdev = vport->back;
+-	struct list_head tmp_del_list, *list;
+-	int ret;
+-
+-	if (mac_type == HCLGE_MAC_ADDR_UC) {
+-		list = &vport->uc_mac_list;
+-		unsync = hclge_rm_uc_addr_common;
+-	} else {
+-		list = &vport->mc_mac_list;
+-		unsync = hclge_rm_mc_addr_common;
+-	}
+-
+-	INIT_LIST_HEAD(&tmp_del_list);
+-
+-	if (!is_del_list)
+-		set_bit(vport->vport_id, hdev->vport_config_block);
+-
+-	spin_lock_bh(&vport->mac_list_lock);
+ 
+ 	list_for_each_entry_safe(mac_cfg, tmp, list, node) {
+ 		switch (mac_cfg->state) {
+ 		case HCLGE_MAC_TO_DEL:
+ 		case HCLGE_MAC_ACTIVE:
+ 			list_del(&mac_cfg->node);
+-			list_add_tail(&mac_cfg->node, &tmp_del_list);
++			list_add_tail(&mac_cfg->node, tmp_del_list);
+ 			break;
+ 		case HCLGE_MAC_TO_ADD:
+ 			if (is_del_list) {
+@@ -8392,10 +8374,18 @@ void hclge_rm_vport_all_mac_table(struct hclge_vport *vport, bool is_del_list,
+ 			break;
+ 		}
+ 	}
++}
+ 
+-	spin_unlock_bh(&vport->mac_list_lock);
++static void hclge_unsync_del_list(struct hclge_vport *vport,
++				  int (*unsync)(struct hclge_vport *vport,
++						const unsigned char *addr),
++				  bool is_del_list,
++				  struct list_head *tmp_del_list)
++{
++	struct hclge_mac_node *mac_cfg, *tmp;
++	int ret;
+ 
+-	list_for_each_entry_safe(mac_cfg, tmp, &tmp_del_list, node) {
++	list_for_each_entry_safe(mac_cfg, tmp, tmp_del_list, node) {
+ 		ret = unsync(vport, mac_cfg->mac_addr);
+ 		if (!ret || ret == -ENOENT) {
+ 			/* clear all mac addr from hardware, but remain these
+@@ -8413,6 +8403,35 @@ void hclge_rm_vport_all_mac_table(struct hclge_vport *vport, bool is_del_list,
+ 			mac_cfg->state = HCLGE_MAC_TO_DEL;
+ 		}
+ 	}
++}
++
++void hclge_rm_vport_all_mac_table(struct hclge_vport *vport, bool is_del_list,
++				  enum HCLGE_MAC_ADDR_TYPE mac_type)
++{
++	int (*unsync)(struct hclge_vport *vport, const unsigned char *addr);
++	struct hclge_dev *hdev = vport->back;
++	struct list_head tmp_del_list, *list;
++
++	if (mac_type == HCLGE_MAC_ADDR_UC) {
++		list = &vport->uc_mac_list;
++		unsync = hclge_rm_uc_addr_common;
++	} else {
++		list = &vport->mc_mac_list;
++		unsync = hclge_rm_mc_addr_common;
++	}
++
++	INIT_LIST_HEAD(&tmp_del_list);
++
++	if (!is_del_list)
++		set_bit(vport->vport_id, hdev->vport_config_block);
++
++	spin_lock_bh(&vport->mac_list_lock);
++
++	hclge_build_del_list(list, is_del_list, &tmp_del_list);
++
++	spin_unlock_bh(&vport->mac_list_lock);
++
++	hclge_unsync_del_list(vport, unsync, is_del_list, &tmp_del_list);
+ 
+ 	spin_lock_bh(&vport->mac_list_lock);
+ 
+-- 
+2.31.1
+

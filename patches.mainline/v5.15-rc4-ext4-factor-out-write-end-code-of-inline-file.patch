@@ -1,0 +1,335 @@
+From 6984aef59814fb5c47b0e30c56e101186b5ebf8c Mon Sep 17 00:00:00 2001
+From: Zhang Yi <yi.zhang@huawei.com>
+Date: Fri, 16 Jul 2021 20:20:23 +0800
+Subject: [PATCH] ext4: factor out write end code of inline file
+Git-commit: 6984aef59814fb5c47b0e30c56e101186b5ebf8c
+Patch-mainline: v5.15-rc4
+References: bsn#12
+
+
+Now that the inline_data file write end procedure are falled into the
+common write end functions, it is not clear. Factor them out and do
+some cleanup. This patch also drop ext4_da_write_inline_data_end()
+and switch to use ext4_write_inline_data_end() instead because we also
+need to do the same error processing if we failed to write data into
+inline entry.
+
+Signed-off-by: Zhang Yi <yi.zhang@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Link: https://lore.kernel.org/r/20210716122024.1105856-4-yi.zhang@huawei.com
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/ext4/ext4.h   |   3 --
+ fs/ext4/inline.c | 117 ++++++++++++++++++++++++-----------------------
+ fs/ext4/inode.c  |  73 ++++++++++-------------------
+ 3 files changed, 84 insertions(+), 109 deletions(-)
+
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -3437,9 +3437,6 @@ extern int ext4_da_write_inline_data_beg
+ 					   unsigned flags,
+ 					   struct page **pagep,
+ 					   void **fsdata);
+-extern int ext4_da_write_inline_data_end(struct inode *inode, loff_t pos,
+-					 unsigned len, unsigned copied,
+-					 struct page *page);
+ extern int ext4_try_add_inline_entry(handle_t *handle,
+ 				     struct ext4_filename *fname,
+ 				     struct inode *dir, struct inode *inode);
+--- a/fs/ext4/inline.c
++++ b/fs/ext4/inline.c
+@@ -729,40 +729,82 @@ convert:
+ int ext4_write_inline_data_end(struct inode *inode, loff_t pos, unsigned len,
+ 			       unsigned copied, struct page *page)
+ {
+-	int ret, no_expand;
++	handle_t *handle = ext4_journal_current_handle();
++	int no_expand;
+ 	void *kaddr;
+ 	struct ext4_iloc iloc;
++	int ret = 0, ret2;
+ 
+ 	if (unlikely(copied < len) && !PageUptodate(page))
+-		return 0;
++		copied = 0;
+ 
+-	ret = ext4_get_inode_loc(inode, &iloc);
+-	if (ret) {
+-		ext4_std_error(inode->i_sb, ret);
+-		return ret;
++	if (likely(copied)) {
++		ret = ext4_get_inode_loc(inode, &iloc);
++		if (ret) {
++			unlock_page(page);
++			put_page(page);
++			ext4_std_error(inode->i_sb, ret);
++			goto out;
++		}
++		ext4_write_lock_xattr(inode, &no_expand);
++		BUG_ON(!ext4_has_inline_data(inode));
++
++		/*
++		 * ei->i_inline_off may have changed since ext4_write_begin()
++		 * called ext4_try_to_write_inline_data()
++		 */
++		(void) ext4_find_inline_data_nolock(inode);
++
++		kaddr = kmap_atomic(page);
++		ext4_write_inline_data(inode, &iloc, kaddr, pos, copied);
++		kunmap_atomic(kaddr);
++		SetPageUptodate(page);
++		/* clear page dirty so that writepages wouldn't work for us. */
++		ClearPageDirty(page);
++
++		ext4_write_unlock_xattr(inode, &no_expand);
++		brelse(iloc.bh);
++
++		/*
++		 * It's important to update i_size while still holding page
++		 * lock: page writeout could otherwise come in and zero
++		 * beyond i_size.
++		 */
++		ext4_update_inode_size(inode, pos + copied);
+ 	}
++	unlock_page(page);
++	put_page(page);
+ 
+-	ext4_write_lock_xattr(inode, &no_expand);
+-	BUG_ON(!ext4_has_inline_data(inode));
+-
+ 	/*
+-	 * ei->i_inline_off may have changed since ext4_write_begin()
+-	 * called ext4_try_to_write_inline_data()
++	 * Don't mark the inode dirty under page lock. First, it unnecessarily
++	 * makes the holding time of page lock longer. Second, it forces lock
++	 * ordering of page lock and transaction start for journaling
++	 * filesystems.
++	 */
++	if (likely(copied))
++		mark_inode_dirty(inode);
++out:
++	/*
++	 * If we didn't copy as much data as expected, we need to trim back
++	 * size of xattr containing inline data.
+ 	 */
+-	(void) ext4_find_inline_data_nolock(inode);
+-
+-	kaddr = kmap_atomic(page);
+-	ext4_write_inline_data(inode, &iloc, kaddr, pos, copied);
+-	kunmap_atomic(kaddr);
+-	SetPageUptodate(page);
+-	/* clear page dirty so that writepages wouldn't work for us. */
+-	ClearPageDirty(page);
+-
+-	ext4_write_unlock_xattr(inode, &no_expand);
+-	brelse(iloc.bh);
+-	mark_inode_dirty(inode);
++	if (pos + len > inode->i_size && ext4_can_truncate(inode))
++		ext4_orphan_add(handle, inode);
+ 
+-	return copied;
++	ret2 = ext4_journal_stop(handle);
++	if (!ret)
++		ret = ret2;
++	if (pos + len > inode->i_size) {
++		ext4_truncate_failed_write(inode);
++		/*
++		 * If truncate failed early the inode might still be
++		 * on the orphan list; we need to make sure the inode
++		 * is removed from the orphan list in that case.
++		 */
++		if (inode->i_nlink)
++			ext4_orphan_del(NULL, inode);
++	}
++	return ret ? ret : copied;
+ }
+ 
+ struct buffer_head *
+@@ -943,43 +985,6 @@ out:
+ 	return ret;
+ }
+ 
+-int ext4_da_write_inline_data_end(struct inode *inode, loff_t pos,
+-				  unsigned len, unsigned copied,
+-				  struct page *page)
+-{
+-	int ret;
+-
+-	ret = ext4_write_inline_data_end(inode, pos, len, copied, page);
+-	if (ret < 0) {
+-		unlock_page(page);
+-		put_page(page);
+-		return ret;
+-	}
+-	copied = ret;
+-
+-	/*
+-	 * No need to use i_size_read() here, the i_size
+-	 * cannot change under us because we hold i_mutex.
+-	 *
+-	 * But it's important to update i_size while still holding page lock:
+-	 * page writeout could otherwise come in and zero beyond i_size.
+-	 */
+-	if (pos+copied > inode->i_size)
+-		i_size_write(inode, pos+copied);
+-	unlock_page(page);
+-	put_page(page);
+-
+-	/*
+-	 * Don't mark the inode dirty under page lock. First, it unnecessarily
+-	 * makes the holding time of page lock longer. Second, it forces lock
+-	 * ordering of page lock and transaction start for journaling
+-	 * filesystems.
+-	 */
+-	mark_inode_dirty(inode);
+-
+-	return copied;
+-}
+-
+ #ifdef INLINE_DIR_DEBUG
+ void ext4_show_inline_dir(struct inode *dir, struct buffer_head *bh,
+ 			  void *inline_start, int inline_size)
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -1283,23 +1283,14 @@ static int ext4_write_end(struct file *f
+ 	loff_t old_size = inode->i_size;
+ 	int ret = 0, ret2;
+ 	int i_size_changed = 0;
+-	int inline_data = ext4_has_inline_data(inode);
+ 	bool verity = ext4_verity_in_progress(inode);
+ 
+ 	trace_ext4_write_end(inode, pos, len, copied);
+-	if (inline_data) {
+-		ret = ext4_write_inline_data_end(inode, pos, len,
+-						 copied, page);
+-		if (ret < 0) {
+-			unlock_page(page);
+-			put_page(page);
+-			goto errout;
+-		}
+-		copied = ret;
+-		ret = 0;
+-	} else
+-		copied = block_write_end(file, mapping, pos,
+-					 len, copied, page, fsdata);
++
++	if (ext4_has_inline_data(inode))
++		return ext4_write_inline_data_end(inode, pos, len, copied, page);
++
++	copied = block_write_end(file, mapping, pos, len, copied, page, fsdata);
+ 	/*
+ 	 * it's important to update i_size while still holding page lock:
+ 	 * page writeout could otherwise come in and zero beyond i_size.
+@@ -1320,10 +1311,9 @@ static int ext4_write_end(struct file *f
+ 	 * ordering of page lock and transaction start for journaling
+ 	 * filesystems.
+ 	 */
+-	if (i_size_changed || inline_data)
++	if (i_size_changed)
+ 		ret = ext4_mark_inode_dirty(handle, inode);
+ 
+-errout:
+ 	if (pos + len > inode->i_size && !verity && ext4_can_truncate(inode))
+ 		/* if we have allocated more blocks and copied
+ 		 * less. We will have blocks allocated outside
+@@ -1395,7 +1385,6 @@ static int ext4_journalled_write_end(str
+ 	int partial = 0;
+ 	unsigned from, to;
+ 	int size_changed = 0;
+-	int inline_data = ext4_has_inline_data(inode);
+ 	bool verity = ext4_verity_in_progress(inode);
+ 
+ 	trace_ext4_journalled_write_end(inode, pos, len, copied);
+@@ -1404,17 +1393,10 @@ static int ext4_journalled_write_end(str
+ 
+ 	BUG_ON(!ext4_handle_valid(handle));
+ 
+-	if (inline_data) {
+-		ret = ext4_write_inline_data_end(inode, pos, len,
+-						 copied, page);
+-		if (ret < 0) {
+-			unlock_page(page);
+-			put_page(page);
+-			goto errout;
+-		}
+-		copied = ret;
+-		ret = 0;
+-	} else if (unlikely(copied < len) && !PageUptodate(page)) {
++	if (ext4_has_inline_data(inode))
++		return ext4_write_inline_data_end(inode, pos, len, copied, page);
++
++	if (unlikely(copied < len) && !PageUptodate(page)) {
+ 		copied = 0;
+ 		ext4_journalled_zero_new_buffers(handle, page, from, to);
+ 	} else {
+@@ -1437,13 +1419,12 @@ static int ext4_journalled_write_end(str
+ 	if (old_size < pos && !verity)
+ 		pagecache_isize_extended(inode, old_size, pos);
+ 
+-	if (size_changed || inline_data) {
++	if (size_changed) {
+ 		ret2 = ext4_mark_inode_dirty(handle, inode);
+ 		if (!ret)
+ 			ret = ret2;
+ 	}
+ 
+-errout:
+ 	if (pos + len > inode->i_size && !verity && ext4_can_truncate(inode))
+ 		/* if we have allocated more blocks and copied
+ 		 * less. We will have blocks allocated outside
+@@ -3078,7 +3059,7 @@ static int ext4_da_write_end(struct file
+ 			     struct page *page, void *fsdata)
+ {
+ 	struct inode *inode = mapping->host;
+-	int ret = 0, ret2;
++	int ret;
+ 	handle_t *handle = ext4_journal_current_handle();
+ 	loff_t new_i_size;
+ 	unsigned long start, end;
+@@ -3089,6 +3070,12 @@ static int ext4_da_write_end(struct file
+ 				      len, copied, page, fsdata);
+ 
+ 	trace_ext4_da_write_end(inode, pos, len, copied);
++
++	if (write_mode != CONVERT_INLINE_DATA &&
++	    ext4_test_inode_state(inode, EXT4_STATE_MAY_INLINE_DATA) &&
++	    ext4_has_inline_data(inode))
++		return ext4_write_inline_data_end(inode, pos, len, copied, page);
++
+ 	start = pos & (PAGE_SIZE - 1);
+ 	end = start + copied - 1;
+ 
+@@ -3108,26 +3095,12 @@ static int ext4_da_write_end(struct file
+ 	 * ext4_da_write_inline_data_end().
+ 	 */
+ 	new_i_size = pos + copied;
+-	if (copied && new_i_size > inode->i_size) {
+-		if (ext4_has_inline_data(inode) ||
+-		    ext4_da_should_update_i_disksize(page, end))
+-			ext4_update_i_disksize(inode, new_i_size);
+-	}
+-
+-	if (write_mode != CONVERT_INLINE_DATA &&
+-	    ext4_test_inode_state(inode, EXT4_STATE_MAY_INLINE_DATA) &&
+-	    ext4_has_inline_data(inode))
+-		ret = ext4_da_write_inline_data_end(inode, pos, len, copied,
+-						     page);
+-	else
+-		ret = generic_write_end(file, mapping, pos, len, copied,
+-							page, fsdata);
+-
+-	copied = ret;
+-	ret2 = ext4_journal_stop(handle);
+-	if (unlikely(ret2 && !ret))
+-		ret = ret2;
++	if (copied && new_i_size > inode->i_size &&
++	    ext4_da_should_update_i_disksize(page, end))
++		ext4_update_i_disksize(inode, new_i_size);
+ 
++	copied = generic_write_end(file, mapping, pos, len, copied, page, fsdata);
++	ret = ext4_journal_stop(handle);
+ 	return ret ? ret : copied;
+ }
+ 

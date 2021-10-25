@@ -1,0 +1,111 @@
+From ffa772cfe9356ce94d3061335c2681f60e7c1c5b Mon Sep 17 00:00:00 2001
+From: Yang Yang <yang.yang@vivo.com>
+Date: Fri, 5 Feb 2021 01:13:10 -0800
+Subject: [PATCH] kyber: introduce kyber_depth_updated()
+Git-commit: ffa772cfe9356ce94d3061335c2681f60e7c1c5b
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+Hang occurs when user changes the scheduler queue depth, by writing to
+the 'nr_requests' sysfs file of that device.
+
+The details of the environment that we found the problem are as follows:
+  an eMMC block device
+  total driver tags: 16
+  default queue_depth: 32
+  kqd->async_depth initialized in kyber_init_sched() with queue_depth=32
+
+Then we change queue_depth to 256, by writing to the 'nr_requests' sysfs
+file. But kqd->async_depth don't be updated after queue_depth changes.
+Now the value of async depth is too small for queue_depth=256, this may
+cause hang.
+
+This patch introduces kyber_depth_updated(), so that kyber can update
+async depth when queue depth changes.
+
+Signed-off-by: Yang Yang <yang.yang@vivo.com>
+Reviewed-by: Omar Sandoval <osandov@fb.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ block/kyber-iosched.c | 29 +++++++++++++----------------
+ 1 file changed, 13 insertions(+), 16 deletions(-)
+
+diff --git a/block/kyber-iosched.c b/block/kyber-iosched.c
+index f13da10953bf..33d34d69cade 100644
+--- a/block/kyber-iosched.c
++++ b/block/kyber-iosched.c
+@@ -355,19 +355,9 @@ static void kyber_timer_fn(struct timer_list *t)
+ 	}
+ }
+ 
+-static unsigned int kyber_sched_tags_shift(struct request_queue *q)
+-{
+-	/*
+-	 * All of the hardware queues have the same depth, so we can just grab
+-	 * the shift of the first one.
+-	 */
+-	return q->queue_hw_ctx[0]->sched_tags->bitmap_tags->sb.shift;
+-}
+-
+ static struct kyber_queue_data *kyber_queue_data_alloc(struct request_queue *q)
+ {
+ 	struct kyber_queue_data *kqd;
+-	unsigned int shift;
+ 	int ret = -ENOMEM;
+ 	int i;
+ 
+@@ -402,9 +392,6 @@ static struct kyber_queue_data *kyber_queue_data_alloc(struct request_queue *q)
+ 		kqd->latency_targets[i] = kyber_latency_targets[i];
+ 	}
+ 
+-	shift = kyber_sched_tags_shift(q);
+-	kqd->async_depth = (1U << shift) * KYBER_ASYNC_PERCENT / 100U;
+-
+ 	return kqd;
+ 
+ err_buckets:
+@@ -460,9 +447,19 @@ static void kyber_ctx_queue_init(struct kyber_ctx_queue *kcq)
+ 		INIT_LIST_HEAD(&kcq->rq_list[i]);
+ }
+ 
++static void kyber_depth_updated(struct blk_mq_hw_ctx *hctx)
++{
++	struct kyber_queue_data *kqd = hctx->queue->elevator->elevator_data;
++	struct blk_mq_tags *tags = hctx->sched_tags;
++	unsigned int shift = tags->bitmap_tags->sb.shift;
++
++	kqd->async_depth = (1U << shift) * KYBER_ASYNC_PERCENT / 100U;
++
++	sbitmap_queue_min_shallow_depth(tags->bitmap_tags, kqd->async_depth);
++}
++
+ static int kyber_init_hctx(struct blk_mq_hw_ctx *hctx, unsigned int hctx_idx)
+ {
+-	struct kyber_queue_data *kqd = hctx->queue->elevator->elevator_data;
+ 	struct kyber_hctx_data *khd;
+ 	int i;
+ 
+@@ -504,8 +501,7 @@ static int kyber_init_hctx(struct blk_mq_hw_ctx *hctx, unsigned int hctx_idx)
+ 	khd->batching = 0;
+ 
+ 	hctx->sched_data = khd;
+-	sbitmap_queue_min_shallow_depth(hctx->sched_tags->bitmap_tags,
+-					kqd->async_depth);
++	kyber_depth_updated(hctx);
+ 
+ 	return 0;
+ 
+@@ -1024,6 +1020,7 @@ static struct elevator_type kyber_sched = {
+ 		.completed_request = kyber_completed_request,
+ 		.dispatch_request = kyber_dispatch_request,
+ 		.has_work = kyber_has_work,
++		.depth_updated = kyber_depth_updated,
+ 	},
+ #ifdef CONFIG_BLK_DEBUG_FS
+ 	.queue_debugfs_attrs = kyber_queue_debugfs_attrs,
+-- 
+2.31.1
+

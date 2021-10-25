@@ -1,0 +1,112 @@
+From 476b30a0949aec865dcc64d4c14f621b1a8afd12 Mon Sep 17 00:00:00 2001
+From: Yang Shi <shy828301@gmail.com>
+Date: Tue, 4 May 2021 18:36:39 -0700
+Subject: [PATCH] mm: vmscan: don't need allocate shrinker->nr_deferred for
+Git-commit: 476b30a0949aec865dcc64d4c14f621b1a8afd12
+Patch-mainline: v5.13-rc1
+References: bsn#12
+
+ memcg aware shrinkers
+
+Now nr_deferred is available on per memcg level for memcg aware
+shrinkers, so don't need allocate shrinker->nr_deferred for such
+shrinkers anymore.
+
+The prealloc_memcg_shrinker() would return -ENOSYS if !CONFIG_MEMCG or
+memcg is disabled by kernel command line, then shrinker's
+SHRINKER_MEMCG_AWARE flag would be cleared.  This makes the
+implementation of this patch simpler.
+
+Link: https://lkml.kernel.org/r/20210311190845.9708-12-shy828301@gmail.com
+Signed-off-by: Yang Shi <shy828301@gmail.com>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Reviewed-by: Kirill Tkhai <ktkhai@virtuozzo.com>
+Acked-by: Roman Gushchin <guro@fb.com>
+Reviewed-by: Shakeel Butt <shakeelb@google.com>
+Cc: Dave Chinner <david@fromorbit.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ mm/vmscan.c | 31 ++++++++++++++++---------------
+ 1 file changed, 16 insertions(+), 15 deletions(-)
+
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 19b134d985c5..9617c5ff3e98 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -346,6 +346,9 @@ static int prealloc_memcg_shrinker(struct shrinker *shrinker)
+ {
+ 	int id, ret = -ENOMEM;
+ 
++	if (mem_cgroup_disabled())
++		return -ENOSYS;
++
+ 	down_write(&shrinker_rwsem);
+ 	/* This may call shrinker, so it must use down_read_trylock() */
+ 	id = idr_alloc(&shrinker_idr, shrinker, 0, 0, GFP_KERNEL);
+@@ -425,7 +428,7 @@ static bool writeback_throttling_sane(struct scan_control *sc)
+ #else
+ static int prealloc_memcg_shrinker(struct shrinker *shrinker)
+ {
+-	return 0;
++	return -ENOSYS;
+ }
+ 
+ static void unregister_memcg_shrinker(struct shrinker *shrinker)
+@@ -537,8 +540,18 @@ static unsigned long lruvec_lru_size(struct lruvec *lruvec, enum lru_list lru,
+  */
+ int prealloc_shrinker(struct shrinker *shrinker)
+ {
+-	unsigned int size = sizeof(*shrinker->nr_deferred);
++	unsigned int size;
++	int err;
+ 
++	if (shrinker->flags & SHRINKER_MEMCG_AWARE) {
++		err = prealloc_memcg_shrinker(shrinker);
++		if (err != -ENOSYS)
++			return err;
++
++		shrinker->flags &= ~SHRINKER_MEMCG_AWARE;
++	}
++
++	size = sizeof(*shrinker->nr_deferred);
+ 	if (shrinker->flags & SHRINKER_NUMA_AWARE)
+ 		size *= nr_node_ids;
+ 
+@@ -546,28 +559,16 @@ int prealloc_shrinker(struct shrinker *shrinker)
+ 	if (!shrinker->nr_deferred)
+ 		return -ENOMEM;
+ 
+-	if (shrinker->flags & SHRINKER_MEMCG_AWARE) {
+-		if (prealloc_memcg_shrinker(shrinker))
+-			goto free_deferred;
+-	}
+-
+ 	return 0;
+-
+-free_deferred:
+-	kfree(shrinker->nr_deferred);
+-	shrinker->nr_deferred = NULL;
+-	return -ENOMEM;
+ }
+ 
+ void free_prealloced_shrinker(struct shrinker *shrinker)
+ {
+-	if (!shrinker->nr_deferred)
+-		return;
+-
+ 	if (shrinker->flags & SHRINKER_MEMCG_AWARE) {
+ 		down_write(&shrinker_rwsem);
+ 		unregister_memcg_shrinker(shrinker);
+ 		up_write(&shrinker_rwsem);
++		return;
+ 	}
+ 
+ 	kfree(shrinker->nr_deferred);
+-- 
+2.31.1
+

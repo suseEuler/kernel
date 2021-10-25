@@ -1,0 +1,80 @@
+From 247b8dd6964642aac77094015916028b955bd67b Mon Sep 17 00:00:00 2001
+From: Li Hua <hucool.lihua@huawei.com>
+Date: Tue, 19 Oct 2021 18:03:54 +0800
+Subject: [PATCH] sched/idle: Optimize the loop time algorithm to reduce
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 247b8dd6964642aac77094015916028b955bd67b
+
+ multicore disturb
+
+hulk inclusion
+category: bugfix
+bugzilla: 180841 https://gitee.com/openeuler/kernel/issues/I4DDEL
+
+The idle cpu will call ktime_get frequently. The smp_rmb() will influence the
+share cache, especially arm a15 share L2 cache. The performance drop will enlarge
+when the loop time is millisecond level.
+
+Signed-off-by: Li Hua <hucool.lihua@huawei.com>
+Reviewed-by: Chen Hui <judy.chenhui@huawei.com>
+Signed-off-by: Chen Jun <chenjun102@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/sched/idle.c | 30 +++++++++++++++++++++++-------
+ 1 file changed, 23 insertions(+), 7 deletions(-)
+
+diff --git a/kernel/sched/idle.c b/kernel/sched/idle.c
+index a503e7d4c170..0aa35c0958e3 100644
+--- a/kernel/sched/idle.c
++++ b/kernel/sched/idle.c
+@@ -61,22 +61,38 @@ __setup("hlt", cpu_idle_nopoll_setup);
+ #endif
+ 
+ #ifdef CONFIG_IAS_SMART_IDLE
+-static void smart_idle_poll(void)
++/* looping 2000 times is probably microsecond level for 2GHZ CPU*/
++#define MICRO_LEVEL_COUNT 2000
++static inline void delay_relax(unsigned long delay_max)
++{
++	unsigned long delay_count = 0;
++
++	delay_max = (delay_max < MICRO_LEVEL_COUNT) ? delay_max : MICRO_LEVEL_COUNT;
++	while (unlikely(!tif_need_resched()) && delay_count < delay_max) {
++		barrier();
++		__asm__ __volatile__("nop;");
++		delay_count++;
++	}
++}
++
++static inline void smart_idle_poll(void)
+ {
+ 	unsigned long poll_duration = poll_threshold_ns;
+ 	ktime_t cur, stop;
+ 
+-	if (!poll_duration)
++	if (likely(!poll_duration))
+ 		return;
+ 
+ 	stop = ktime_add_ns(ktime_get(), poll_duration);
+-
+-	do {
+-		cpu_relax();
+-		if (tif_need_resched())
++	while (true) {
++		delay_relax(poll_duration);
++		if (likely(tif_need_resched()))
+ 			break;
+ 		cur = ktime_get();
+-	} while (ktime_before(cur, stop));
++		if (likely(!ktime_before(cur, stop)))
++			break;
++		poll_duration = ktime_sub_ns(stop, cur);
++	}
+ }
+ #endif
+ 
+-- 
+2.26.2
+

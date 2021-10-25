@@ -1,0 +1,93 @@
+From a178015cde69981cdcd8f109c5abc98703fead62 Mon Sep 17 00:00:00 2001
+From: Yang Shi <shy828301@gmail.com>
+Date: Tue, 4 May 2021 18:36:42 -0700
+Subject: [PATCH] mm: memcontrol: reparent nr_deferred when memcg offline
+Git-commit: a178015cde69981cdcd8f109c5abc98703fead62
+Patch-mainline: v5.13-rc1
+References: bsn#12
+
+
+Now shrinker's nr_deferred is per memcg for memcg aware shrinkers, add
+to parent's corresponding nr_deferred when memcg offline.
+
+Link: https://lkml.kernel.org/r/20210311190845.9708-13-shy828301@gmail.com
+Signed-off-by: Yang Shi <shy828301@gmail.com>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Acked-by: Kirill Tkhai <ktkhai@virtuozzo.com>
+Acked-by: Roman Gushchin <guro@fb.com>
+Reviewed-by: Shakeel Butt <shakeelb@google.com>
+Cc: Dave Chinner <david@fromorbit.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ include/linux/memcontrol.h |  1 +
+ mm/memcontrol.c            |  1 +
+ mm/vmscan.c                | 24 ++++++++++++++++++++++++
+ 3 files changed, 26 insertions(+)
+
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index 32bd62047238..c193be760709 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -1614,6 +1614,7 @@ static inline bool mem_cgroup_under_socket_pressure(struct mem_cgroup *memcg)
+ int alloc_shrinker_info(struct mem_cgroup *memcg);
+ void free_shrinker_info(struct mem_cgroup *memcg);
+ void set_shrinker_bit(struct mem_cgroup *memcg, int nid, int shrinker_id);
++void reparent_shrinker_deferred(struct mem_cgroup *memcg);
+ #else
+ #define mem_cgroup_sockets_enabled 0
+ static inline void mem_cgroup_sk_alloc(struct sock *sk) { };
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 36f31d611dea..3004afb6d090 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -5154,6 +5154,7 @@ static void mem_cgroup_css_offline(struct cgroup_subsys_state *css)
+ 	page_counter_set_low(&memcg->memory, 0);
+ 
+ 	memcg_offline_kmem(memcg);
++	reparent_shrinker_deferred(memcg);
+ 	wb_memcg_offline(memcg);
+ 
+ 	drain_all_stock(memcg);
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 9617c5ff3e98..8c2d2003acbe 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -397,6 +397,30 @@ static long add_nr_deferred_memcg(long nr, int nid, struct shrinker *shrinker,
+ 	return atomic_long_add_return(nr, &info->nr_deferred[shrinker->id]);
+ }
+ 
++void reparent_shrinker_deferred(struct mem_cgroup *memcg)
++{
++	int i, nid;
++	long nr;
++	struct mem_cgroup *parent;
++	struct shrinker_info *child_info, *parent_info;
++
++	parent = parent_mem_cgroup(memcg);
++	if (!parent)
++		parent = root_mem_cgroup;
++
++	/* Prevent from concurrent shrinker_info expand */
++	down_read(&shrinker_rwsem);
++	for_each_node(nid) {
++		child_info = shrinker_info_protected(memcg, nid);
++		parent_info = shrinker_info_protected(parent, nid);
++		for (i = 0; i < shrinker_nr_max; i++) {
++			nr = atomic_long_read(&child_info->nr_deferred[i]);
++			atomic_long_add(nr, &parent_info->nr_deferred[i]);
++		}
++	}
++	up_read(&shrinker_rwsem);
++}
++
+ static bool cgroup_reclaim(struct scan_control *sc)
+ {
+ 	return sc->target_mem_cgroup;
+-- 
+2.31.1
+

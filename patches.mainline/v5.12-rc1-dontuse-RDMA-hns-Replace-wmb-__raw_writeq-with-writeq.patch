@@ -1,0 +1,185 @@
+From 86f767e6fc1e719215ccf2b2ec65466f505f731b Mon Sep 17 00:00:00 2001
+From: Lang Cheng <chenglang@huawei.com>
+Date: Fri, 5 Feb 2021 17:39:29 +0800
+Subject: [PATCH] RDMA/hns: Replace wmb&__raw_writeq with writeq
+Git-commit: 86f767e6fc1e719215ccf2b2ec65466f505f731b
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+Currently, the driver updates doorbell looks like this:
+
+post()
+{
+	wqe.field = 0x111;
+	wmb();
+	update_wq_db();
+}
+
+update_wq_db()
+{
+	db.field = 0x222;
+	__raw_writeq(db, db_reg);
+}
+
+writeq() is a better choice than __raw_writeq() because it calls dma_wmb()
+to barrier in ARM64, and dma_wmb() is better than wmb() for ROCEE device.
+
+This patch removes all wmb() before updating doorbell of SQ/RQ/CQ/SRQ by
+replacing __raw_writeq() with writeq() to improve performence.  The new
+process looks like this:
+
+post()
+{
+	wqe.field = 0x111;
+	update_wq_db();
+}
+
+update_wq_db()
+{
+	db.field = 0x222;
+	writeq(db, db_reg);
+}
+
+Link: https://lore.kernel.org/r/1612517974-31867-8-git-send-email-liweihang@huawei.com
+Signed-off-by: Lang Cheng <chenglang@huawei.com>
+Signed-off-by: Weihang Li <liweihang@huawei.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ drivers/infiniband/hw/hns/hns_roce_device.h |  2 +-
+ drivers/infiniband/hw/hns/hns_roce_hw_v1.c  | 15 ---------------
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.c  | 20 +-------------------
+ 3 files changed, 2 insertions(+), 35 deletions(-)
+
+diff --git a/drivers/infiniband/hw/hns/hns_roce_device.h b/drivers/infiniband/hw/hns/hns_roce_device.h
+index 1f94154323c3..74eb08f42ac2 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_device.h
++++ b/drivers/infiniband/hw/hns/hns_roce_device.h
+@@ -1077,7 +1077,7 @@ static inline struct hns_roce_srq *to_hr_srq(struct ib_srq *ibsrq)
+ 
+ static inline void hns_roce_write64_k(__le32 val[2], void __iomem *dest)
+ {
+-	__raw_writeq(*(u64 *) val, dest);
++	writeq(*(u64 *)val, dest);
+ }
+ 
+ static inline struct hns_roce_qp
+diff --git a/drivers/infiniband/hw/hns/hns_roce_hw_v1.c b/drivers/infiniband/hw/hns/hns_roce_hw_v1.c
+index 262ad58f9606..5346fdca9473 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v1.c
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v1.c
+@@ -330,8 +330,6 @@ static int hns_roce_v1_post_send(struct ib_qp *ibqp,
+ 	/* Set DB return */
+ 	if (likely(nreq)) {
+ 		qp->sq.head += nreq;
+-		/* Memory barrier */
+-		wmb();
+ 
+ 		roce_set_field(sq_db.u32_4, SQ_DOORBELL_U32_4_SQ_HEAD_M,
+ 			       SQ_DOORBELL_U32_4_SQ_HEAD_S,
+@@ -411,8 +409,6 @@ static int hns_roce_v1_post_recv(struct ib_qp *ibqp,
+ out:
+ 	if (likely(nreq)) {
+ 		hr_qp->rq.head += nreq;
+-		/* Memory barrier */
+-		wmb();
+ 
+ 		if (ibqp->qp_type == IB_QPT_GSI) {
+ 			__le32 tmp;
+@@ -1984,12 +1980,6 @@ static void __hns_roce_v1_cq_clean(struct hns_roce_cq *hr_cq, u32 qpn,
+ 
+ 	if (nfreed) {
+ 		hr_cq->cons_index += nfreed;
+-		/*
+-		 * Make sure update of buffer contents is done before
+-		 * updating consumer index.
+-		 */
+-		wmb();
+-
+ 		hns_roce_v1_cq_set_ci(hr_cq, hr_cq->cons_index);
+ 	}
+ }
+@@ -2330,8 +2320,6 @@ int hns_roce_v1_poll_cq(struct ib_cq *ibcq, int num_entries, struct ib_wc *wc)
+ 		*hr_cq->tptr_addr = hr_cq->cons_index &
+ 			((hr_cq->cq_depth << 1) - 1);
+ 
+-		/* Memroy barrier */
+-		wmb();
+ 		hns_roce_v1_cq_set_ci(hr_cq, hr_cq->cons_index);
+ 	}
+ 
+@@ -3220,9 +3208,6 @@ static int hns_roce_v1_m_qp(struct ib_qp *ibqp, const struct ib_qp_attr *attr,
+ 	 * need to hw to flash RQ HEAD by DB again
+ 	 */
+ 	if (cur_state == IB_QPS_INIT && new_state == IB_QPS_INIT) {
+-		/* Memory barrier */
+-		wmb();
+-
+ 		roce_set_field(doorbell[0], RQ_DOORBELL_U32_4_RQ_HEAD_M,
+ 			       RQ_DOORBELL_U32_4_RQ_HEAD_S, hr_qp->rq.head);
+ 		roce_set_field(doorbell[1], RQ_DOORBELL_U32_8_QPN_M,
+diff --git a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+index 75e331acf8c6..175a5eed3f4d 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+@@ -744,8 +744,6 @@ static int hns_roce_v2_post_send(struct ib_qp *ibqp,
+ 	if (likely(nreq)) {
+ 		qp->sq.head += nreq;
+ 		qp->next_sge = sge_idx;
+-		/* Memory barrier */
+-		wmb();
+ 
+ 		if (nreq == 1 && qp->sq.head == qp->sq.tail + 1 &&
+ 		    (qp->en_flags & HNS_ROCE_QP_CAP_DIRECT_WQE))
+@@ -875,8 +873,6 @@ static int hns_roce_v2_post_recv(struct ib_qp *ibqp,
+ out:
+ 	if (likely(nreq)) {
+ 		hr_qp->rq.head += nreq;
+-		/* Memory barrier */
+-		wmb();
+ 
+ 		/*
+ 		 * Hip08 hardware cannot flush the WQEs in RQ if the QP state
+@@ -1015,12 +1011,6 @@ static int hns_roce_v2_post_srq_recv(struct ib_srq *ibsrq,
+ 	}
+ 
+ 	if (likely(nreq)) {
+-		/*
+-		 * Make sure that descriptors are written before
+-		 * doorbell record.
+-		 */
+-		wmb();
+-
+ 		srq_db.byte_4 =
+ 			cpu_to_le32(HNS_ROCE_V2_SRQ_DB << V2_DB_BYTE_4_CMD_S |
+ 				    (srq->srqn & V2_DB_BYTE_4_TAG_M));
+@@ -3198,11 +3188,6 @@ static void __hns_roce_v2_cq_clean(struct hns_roce_cq *hr_cq, u32 qpn,
+ 
+ 	if (nfreed) {
+ 		hr_cq->cons_index += nfreed;
+-		/*
+-		 * Make sure update of buffer contents is done before
+-		 * updating consumer index.
+-		 */
+-		wmb();
+ 		hns_roce_v2_cq_set_ci(hr_cq, hr_cq->cons_index);
+ 	}
+ }
+@@ -3711,11 +3696,8 @@ static int hns_roce_v2_poll_cq(struct ib_cq *ibcq, int num_entries,
+ 			break;
+ 	}
+ 
+-	if (npolled) {
+-		/* Memory barrier */
+-		wmb();
++	if (npolled)
+ 		hns_roce_v2_cq_set_ci(hr_cq, hr_cq->cons_index);
+-	}
+ 
+ out:
+ 	spin_unlock_irqrestore(&hr_cq->lock, flags);
+-- 
+2.31.1
+

@@ -1,0 +1,135 @@
+From 588c7fa022d7b2361500ead5660d9a1a2ecd9b7d Mon Sep 17 00:00:00 2001
+From: Hyeonggon Yoo <42.hyeyoo@gmail.com>
+Date: Mon, 28 Jun 2021 19:34:39 -0700
+Subject: [PATCH] mm, slub: change run-time assertion in kmalloc_index() to
+Git-commit: 588c7fa022d7b2361500ead5660d9a1a2ecd9b7d
+Patch-mainline: v5.14-rc1
+References: bsn#12
+
+ compile-time
+
+Currently when size is not supported by kmalloc_index, compiler will
+generate a run-time BUG() while compile-time error is also possible, and
+better.  So change BUG to BUILD_BUG_ON_MSG to make compile-time check
+possible.
+
+Also remove code that allocates more than 32MB because current
+implementation supports only up to 32MB.
+
+[42.hyeyoo@gmail.com: fix support for clang 10]
+  Link: https://lkml.kernel.org/r/20210518181247.GA10062@hyeyoo
+[vbabka@suse.cz: fix false-positive assert in kernel/bpf/local_storage.c]
+  Link: https://lkml.kernel.org/r/bea97388-01df-8eac-091b-a3c89b4a4a09@suse.czLink: https://lkml.kernel.org/r/20210511173448.GA54466@hyeyoo
+[elver@google.com: kfence fix]
+  Link: https://lkml.kernel.org/r/20210512195227.245000695c9014242e9a00e5@linux-foundation.org
+
+Signed-off-by: Hyeonggon Yoo <42.hyeyoo@gmail.com>
+Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Marco Elver <elver@google.com>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: Pekka Enberg <penberg@kernel.org>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Cc: Marco Elver <elver@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ include/linux/slab.h    | 17 ++++++++++++++---
+ mm/kfence/kfence_test.c |  5 +++--
+ mm/slab_common.c        |  7 +++----
+ 3 files changed, 20 insertions(+), 9 deletions(-)
+
+diff --git a/include/linux/slab.h b/include/linux/slab.h
+index 0c97d788762c..bc9ab3a5a017 100644
+--- a/include/linux/slab.h
++++ b/include/linux/slab.h
+@@ -346,8 +346,14 @@ static __always_inline enum kmalloc_cache_type kmalloc_type(gfp_t flags)
+  * 1 =  65 .. 96 bytes
+  * 2 = 129 .. 192 bytes
+  * n = 2^(n-1)+1 .. 2^n
++ *
++ * Note: __kmalloc_index() is compile-time optimized, and not runtime optimized;
++ * typical usage is via kmalloc_index() and therefore evaluated at compile-time.
++ * Callers where !size_is_constant should only be test modules, where runtime
++ * overheads of __kmalloc_index() can be tolerated.  Also see kmalloc_slab().
+  */
+-static __always_inline unsigned int kmalloc_index(size_t size)
++static __always_inline unsigned int __kmalloc_index(size_t size,
++						    bool size_is_constant)
+ {
+ 	if (!size)
+ 		return 0;
+@@ -382,12 +388,17 @@ static __always_inline unsigned int kmalloc_index(size_t size)
+ 	if (size <=  8 * 1024 * 1024) return 23;
+ 	if (size <=  16 * 1024 * 1024) return 24;
+ 	if (size <=  32 * 1024 * 1024) return 25;
+-	if (size <=  64 * 1024 * 1024) return 26;
+-	BUG();
++
++	if ((IS_ENABLED(CONFIG_CC_IS_GCC) || CONFIG_CLANG_VERSION >= 110000)
++	    && !IS_ENABLED(CONFIG_PROFILE_ALL_BRANCHES) && size_is_constant)
++		BUILD_BUG_ON_MSG(1, "unexpected size in kmalloc_index()");
++	else
++		BUG();
+ 
+ 	/* Will never be reached. Needed because the compiler may complain */
+ 	return -1;
+ }
++#define kmalloc_index(s) __kmalloc_index(s, true)
+ #endif /* !CONFIG_SLOB */
+ 
+ void *__kmalloc(size_t size, gfp_t flags) __assume_kmalloc_alignment __malloc;
+diff --git a/mm/kfence/kfence_test.c b/mm/kfence/kfence_test.c
+index 4acf4251ee04..7f24b9bcb2ec 100644
+--- a/mm/kfence/kfence_test.c
++++ b/mm/kfence/kfence_test.c
+@@ -197,7 +197,7 @@ static void test_cache_destroy(void)
+ 
+ static inline size_t kmalloc_cache_alignment(size_t size)
+ {
+-	return kmalloc_caches[kmalloc_type(GFP_KERNEL)][kmalloc_index(size)]->align;
++	return kmalloc_caches[kmalloc_type(GFP_KERNEL)][__kmalloc_index(size, false)]->align;
+ }
+ 
+ /* Must always inline to match stack trace against caller. */
+@@ -267,7 +267,8 @@ static void *test_alloc(struct kunit *test, size_t size, gfp_t gfp, enum allocat
+ 
+ 		if (is_kfence_address(alloc)) {
+ 			struct page *page = virt_to_head_page(alloc);
+-			struct kmem_cache *s = test_cache ?: kmalloc_caches[kmalloc_type(GFP_KERNEL)][kmalloc_index(size)];
++			struct kmem_cache *s = test_cache ?:
++					kmalloc_caches[kmalloc_type(GFP_KERNEL)][__kmalloc_index(size, false)];
+ 
+ 			/*
+ 			 * Verify that various helpers return the right values
+diff --git a/mm/slab_common.c b/mm/slab_common.c
+index 1ded52592b56..b97b6fa8a7c6 100644
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@ -754,8 +754,8 @@ struct kmem_cache *kmalloc_slab(size_t size, gfp_t flags)
+ 
+ /*
+  * kmalloc_info[] is to make slub_debug=,kmalloc-xx option work at boot time.
+- * kmalloc_index() supports up to 2^26=64MB, so the final entry of the table is
+- * kmalloc-67108864.
++ * kmalloc_index() supports up to 2^25=32MB, so the final entry of the table is
++ * kmalloc-32M.
+  */
+ const struct kmalloc_info_struct kmalloc_info[] __initconst = {
+ 	INIT_KMALLOC_INFO(0, 0),
+@@ -783,8 +783,7 @@ const struct kmalloc_info_struct kmalloc_info[] __initconst = {
+ 	INIT_KMALLOC_INFO(4194304, 4M),
+ 	INIT_KMALLOC_INFO(8388608, 8M),
+ 	INIT_KMALLOC_INFO(16777216, 16M),
+-	INIT_KMALLOC_INFO(33554432, 32M),
+-	INIT_KMALLOC_INFO(67108864, 64M)
++	INIT_KMALLOC_INFO(33554432, 32M)
+ };
+ 
+ /*
+-- 
+2.31.1
+

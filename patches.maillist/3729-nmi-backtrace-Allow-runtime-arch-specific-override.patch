@@ -1,0 +1,232 @@
+From 755a12c0b78605d4c8c4b5060537a29e04940220 Mon Sep 17 00:00:00 2001
+From: Sumit Garg <sumit.garg@linaro.org>
+Date: Tue, 23 Feb 2021 20:39:10 +0800
+Subject: [PATCH] nmi: backtrace: Allow runtime arch specific override
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 755a12c0b78605d4c8c4b5060537a29e04940220
+
+
+maillist inclusion
+category: feature
+bugzilla: 49593
+CVE: NA
+Reference: https://www.spinics.net/lists/arm-kernel/msg851005.html
+
+-------------------------------------------------
+
+Add a boolean return to arch_trigger_cpumask_backtrace() to support a
+use-case where a particular architecture detects at runtime if it supports
+NMI backtrace or it would like to fallback to default implementation using
+SMP cross-calls.
+
+Currently such an architecture example is arm64 supporting pseudo NMIs
+feature which is only available on platforms which have support for GICv3
+or later version.
+
+Signed-off-by: Sumit Garg <sumit.garg@linaro.org>
+Signed-off-by: Wei Li <liwei391@huawei.com>
+Reviewed-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm/include/asm/irq.h       |  2 +-
+ arch/arm/kernel/smp.c            |  3 ++-
+ arch/mips/include/asm/irq.h      |  2 +-
+ arch/mips/kernel/process.c       |  3 ++-
+ arch/powerpc/include/asm/nmi.h   |  2 +-
+ arch/powerpc/kernel/stacktrace.c |  3 ++-
+ arch/sparc/include/asm/irq_64.h  |  2 +-
+ arch/sparc/kernel/process_64.c   |  4 +++-
+ arch/x86/include/asm/irq.h       |  2 +-
+ arch/x86/kernel/apic/hw_nmi.c    |  3 ++-
+ include/linux/nmi.h              | 12 ++++--------
+ 11 files changed, 20 insertions(+), 18 deletions(-)
+
+diff --git a/arch/arm/include/asm/irq.h b/arch/arm/include/asm/irq.h
+index 46d41140df27..54b0180c8aeb 100644
+--- a/arch/arm/include/asm/irq.h
++++ b/arch/arm/include/asm/irq.h
+@@ -31,7 +31,7 @@ void handle_IRQ(unsigned int, struct pt_regs *);
+ void init_IRQ(void);
+ 
+ #ifdef CONFIG_SMP
+-extern void arch_trigger_cpumask_backtrace(const cpumask_t *mask,
++extern bool arch_trigger_cpumask_backtrace(const cpumask_t *mask,
+ 					   bool exclude_self);
+ #define arch_trigger_cpumask_backtrace arch_trigger_cpumask_backtrace
+ #endif
+diff --git a/arch/arm/kernel/smp.c b/arch/arm/kernel/smp.c
+index 48099c6e1e4a..bb20a4369129 100644
+--- a/arch/arm/kernel/smp.c
++++ b/arch/arm/kernel/smp.c
+@@ -856,7 +856,8 @@ static void raise_nmi(cpumask_t *mask)
+ 	__ipi_send_mask(ipi_desc[IPI_CPU_BACKTRACE], mask);
+ }
+ 
+-void arch_trigger_cpumask_backtrace(const cpumask_t *mask, bool exclude_self)
++bool arch_trigger_cpumask_backtrace(const cpumask_t *mask, bool exclude_self)
+ {
+ 	nmi_trigger_cpumask_backtrace(mask, exclude_self, raise_nmi);
++	return true;
+ }
+diff --git a/arch/mips/include/asm/irq.h b/arch/mips/include/asm/irq.h
+index c5d351786416..34f3b423d352 100644
+--- a/arch/mips/include/asm/irq.h
++++ b/arch/mips/include/asm/irq.h
+@@ -78,7 +78,7 @@ extern int cp0_fdc_irq;
+ 
+ extern int get_c0_fdc_int(void);
+ 
+-void arch_trigger_cpumask_backtrace(const struct cpumask *mask,
++bool arch_trigger_cpumask_backtrace(const struct cpumask *mask,
+ 				    bool exclude_self);
+ #define arch_trigger_cpumask_backtrace arch_trigger_cpumask_backtrace
+ 
+diff --git a/arch/mips/kernel/process.c b/arch/mips/kernel/process.c
+index 75ebd8d7bd5d..d19e672c8557 100644
+--- a/arch/mips/kernel/process.c
++++ b/arch/mips/kernel/process.c
+@@ -735,9 +735,10 @@ static void raise_backtrace(cpumask_t *mask)
+ 	}
+ }
+ 
+-void arch_trigger_cpumask_backtrace(const cpumask_t *mask, bool exclude_self)
++bool arch_trigger_cpumask_backtrace(const cpumask_t *mask, bool exclude_self)
+ {
+ 	nmi_trigger_cpumask_backtrace(mask, exclude_self, raise_backtrace);
++	return true;
+ }
+ 
+ int mips_get_process_fp_mode(struct task_struct *task)
+diff --git a/arch/powerpc/include/asm/nmi.h b/arch/powerpc/include/asm/nmi.h
+index 84b4cfe73edd..a5eb3e2410dc 100644
+--- a/arch/powerpc/include/asm/nmi.h
++++ b/arch/powerpc/include/asm/nmi.h
+@@ -9,7 +9,7 @@ static inline void arch_touch_nmi_watchdog(void) {}
+ #endif
+ 
+ #if defined(CONFIG_NMI_IPI) && defined(CONFIG_STACKTRACE)
+-extern void arch_trigger_cpumask_backtrace(const cpumask_t *mask,
++extern bool arch_trigger_cpumask_backtrace(const cpumask_t *mask,
+ 					   bool exclude_self);
+ #define arch_trigger_cpumask_backtrace arch_trigger_cpumask_backtrace
+ #endif
+diff --git a/arch/powerpc/kernel/stacktrace.c b/arch/powerpc/kernel/stacktrace.c
+index b6440657ef92..22b112ab891e 100644
+--- a/arch/powerpc/kernel/stacktrace.c
++++ b/arch/powerpc/kernel/stacktrace.c
+@@ -264,8 +264,9 @@ static void raise_backtrace_ipi(cpumask_t *mask)
+ 	}
+ }
+ 
+-void arch_trigger_cpumask_backtrace(const cpumask_t *mask, bool exclude_self)
++bool arch_trigger_cpumask_backtrace(const cpumask_t *mask, bool exclude_self)
+ {
+ 	nmi_trigger_cpumask_backtrace(mask, exclude_self, raise_backtrace_ipi);
++	return true;
+ }
+ #endif /* defined(CONFIG_PPC_BOOK3S_64) && defined(CONFIG_NMI_IPI) */
+diff --git a/arch/sparc/include/asm/irq_64.h b/arch/sparc/include/asm/irq_64.h
+index 4d748e93b974..35c01ff09f8f 100644
+--- a/arch/sparc/include/asm/irq_64.h
++++ b/arch/sparc/include/asm/irq_64.h
+@@ -87,7 +87,7 @@ static inline unsigned long get_softint(void)
+ 	return retval;
+ }
+ 
+-void arch_trigger_cpumask_backtrace(const struct cpumask *mask,
++bool arch_trigger_cpumask_backtrace(const struct cpumask *mask,
+ 				    bool exclude_self);
+ #define arch_trigger_cpumask_backtrace arch_trigger_cpumask_backtrace
+ 
+diff --git a/arch/sparc/kernel/process_64.c b/arch/sparc/kernel/process_64.c
+index 6f8c7822fc06..4f5a1125735f 100644
+--- a/arch/sparc/kernel/process_64.c
++++ b/arch/sparc/kernel/process_64.c
+@@ -248,7 +248,7 @@ static void __global_reg_poll(struct global_reg_snapshot *gp)
+ 	}
+ }
+ 
+-void arch_trigger_cpumask_backtrace(const cpumask_t *mask, bool exclude_self)
++bool arch_trigger_cpumask_backtrace(const cpumask_t *mask, bool exclude_self)
+ {
+ 	struct thread_info *tp = current_thread_info();
+ 	struct pt_regs *regs = get_irq_regs();
+@@ -303,6 +303,8 @@ void arch_trigger_cpumask_backtrace(const cpumask_t *mask, bool exclude_self)
+ 	memset(global_cpu_snapshot, 0, sizeof(global_cpu_snapshot));
+ 
+ 	spin_unlock_irqrestore(&global_cpu_snapshot_lock, flags);
++
++	return true;
+ }
+ 
+ #ifdef CONFIG_MAGIC_SYSRQ
+diff --git a/arch/x86/include/asm/irq.h b/arch/x86/include/asm/irq.h
+index 528c8a71fe7f..b7668e0ad2c4 100644
+--- a/arch/x86/include/asm/irq.h
++++ b/arch/x86/include/asm/irq.h
+@@ -47,7 +47,7 @@ extern void init_ISA_irqs(void);
+ extern void __init init_IRQ(void);
+ 
+ #ifdef CONFIG_X86_LOCAL_APIC
+-void arch_trigger_cpumask_backtrace(const struct cpumask *mask,
++bool arch_trigger_cpumask_backtrace(const struct cpumask *mask,
+ 				    bool exclude_self);
+ 
+ #define arch_trigger_cpumask_backtrace arch_trigger_cpumask_backtrace
+diff --git a/arch/x86/kernel/apic/hw_nmi.c b/arch/x86/kernel/apic/hw_nmi.c
+index 34a992e275ef..e7dcd28bc824 100644
+--- a/arch/x86/kernel/apic/hw_nmi.c
++++ b/arch/x86/kernel/apic/hw_nmi.c
+@@ -34,10 +34,11 @@ static void nmi_raise_cpu_backtrace(cpumask_t *mask)
+ 	apic->send_IPI_mask(mask, NMI_VECTOR);
+ }
+ 
+-void arch_trigger_cpumask_backtrace(const cpumask_t *mask, bool exclude_self)
++bool arch_trigger_cpumask_backtrace(const cpumask_t *mask, bool exclude_self)
+ {
+ 	nmi_trigger_cpumask_backtrace(mask, exclude_self,
+ 				      nmi_raise_cpu_backtrace);
++	return true;
+ }
+ 
+ static int nmi_cpu_backtrace_handler(unsigned int cmd, struct pt_regs *regs)
+diff --git a/include/linux/nmi.h b/include/linux/nmi.h
+index 112e1e431466..662405794e4c 100644
+--- a/include/linux/nmi.h
++++ b/include/linux/nmi.h
+@@ -163,26 +163,22 @@ static inline void touch_nmi_watchdog(void)
+ #ifdef arch_trigger_cpumask_backtrace
+ static inline bool trigger_all_cpu_backtrace(void)
+ {
+-	arch_trigger_cpumask_backtrace(cpu_online_mask, false);
+-	return true;
++	return arch_trigger_cpumask_backtrace(cpu_online_mask, false);
+ }
+ 
+ static inline bool trigger_allbutself_cpu_backtrace(void)
+ {
+-	arch_trigger_cpumask_backtrace(cpu_online_mask, true);
+-	return true;
++	return arch_trigger_cpumask_backtrace(cpu_online_mask, true);
+ }
+ 
+ static inline bool trigger_cpumask_backtrace(struct cpumask *mask)
+ {
+-	arch_trigger_cpumask_backtrace(mask, false);
+-	return true;
++	return arch_trigger_cpumask_backtrace(mask, false);
+ }
+ 
+ static inline bool trigger_single_cpu_backtrace(int cpu)
+ {
+-	arch_trigger_cpumask_backtrace(cpumask_of(cpu), false);
+-	return true;
++	return arch_trigger_cpumask_backtrace(cpumask_of(cpu), false);
+ }
+ 
+ /* generic implementation */
+-- 
+2.26.2
+

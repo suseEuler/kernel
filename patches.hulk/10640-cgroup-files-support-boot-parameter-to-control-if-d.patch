@@ -1,0 +1,167 @@
+From 26ba3a84286847bcbafff9eecb2fd8aabca50b85 Mon Sep 17 00:00:00 2001
+From: Yang Yingliang <yangyingliang@huawei.com>
+Date: Sat, 30 Oct 2021 15:51:30 +0800
+Subject: [PATCH] cgroup/files: support boot parameter to control if disable
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 26ba3a84286847bcbafff9eecb2fd8aabca50b85
+
+ files cgroup
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4G4S5
+
+--------------------------------
+
+When files cgroup is enabled, it's will leads syscall performance
+regression in UnixBench. Add a helper files_cgroup_enabled() and
+use it to control if use files cgroup, wen can use cgroup_disable=files
+in cmdline to disable files cgroup.
+
+syscall of UnixBench (large is better)
+enable files cgroup:            2868.5
+disable files cgroup:           3177.0
+disable config of files cgroup: 3186.5
+
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Reviewed-by: Tao Hou <houtao1@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Conflicts:
+	Documentation/admin-guide/kernel-parameters.txt
+Signed-off-by: Lu Jialin <lujialin4@huawei.com>
+Reviewed-by: weiyang wang <wangweiyang2@huawei.com>
+Reviewed-by: Hou Tao <houtao1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ .../admin-guide/kernel-parameters.txt         |  7 ++++---
+ fs/file.c                                     | 21 ++++++++++++-------
+ include/linux/filescontrol.h                  |  6 ++++++
+ 3 files changed, 24 insertions(+), 10 deletions(-)
+
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index 3469cf42e15b..b0b9265fe5f3 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -500,9 +500,10 @@
+ 			  a single hierarchy
+ 			- foo isn't visible as an individually mountable
+ 			  subsystem
+-			{Currently only "memory" controller deal with this and
+-			cut the overhead, others just disable the usage. So
+-			only cgroup_disable=memory is actually worthy}
++			{Currently "memory" and "files" controller deal with
++			this and cut the overhead, others just disable the usage.
++			So cgroup_disable=memory and cgroup_disable=files are
++			actually worthy}
+ 
+ 	cgroup_no_v1=	[KNL] Disable cgroup controllers and named hierarchies in v1
+ 			Format: { { controller | "all" | "named" }
+diff --git a/fs/file.c b/fs/file.c
+index df17b9e9e67e..59f8d3d82509 100644
+--- a/fs/file.c
++++ b/fs/file.c
+@@ -308,7 +308,8 @@ struct files_struct *dup_fd(struct files_struct *oldf, unsigned int max_fds, int
+ 	new_fdt->full_fds_bits = newf->full_fds_bits_init;
+ 	new_fdt->fd = &newf->fd_array[0];
+ #ifdef CONFIG_CGROUP_FILES
+-	files_cgroup_assign(newf);
++	if (files_cgroup_enabled())
++		files_cgroup_assign(newf);
+ #endif
+ 
+ 	spin_lock(&oldf->file_lock);
+@@ -374,6 +375,8 @@ struct files_struct *dup_fd(struct files_struct *oldf, unsigned int max_fds, int
+ 
+ 	rcu_assign_pointer(newf->fdt, new_fdt);
+ #ifdef CONFIG_CGROUP_FILES
++	if (!files_cgroup_enabled())
++		return newf;
+ 	spin_lock(&newf->file_lock);
+ 	if (!files_cgroup_alloc_fd(newf, files_cgroup_count_fds(newf))) {
+ 		spin_unlock(&newf->file_lock);
+@@ -398,7 +401,8 @@ struct files_struct *dup_fd(struct files_struct *oldf, unsigned int max_fds, int
+ 
+ out_release:
+ #ifdef CONFIG_CGROUP_FILES
+-	files_cgroup_remove(newf);
++	if (files_cgroup_enabled())
++		files_cgroup_remove(newf);
+ #endif
+ 	kmem_cache_free(files_cachep, newf);
+ out:
+@@ -426,7 +430,8 @@ static struct fdtable *close_files(struct files_struct * files)
+ 				struct file * file = xchg(&fdt->fd[i], NULL);
+ 				if (file) {
+ #ifdef CONFIG_CGROUP_FILES
+-					files_cgroup_unalloc_fd(files, 1);
++					if (files_cgroup_enabled())
++						files_cgroup_unalloc_fd(files, 1);
+ #endif
+ 					filp_close(file, files);
+ 					cond_resched();
+@@ -437,7 +442,8 @@ static struct fdtable *close_files(struct files_struct * files)
+ 		}
+ 	}
+ #ifdef CONFIG_CGROUP_FILES
+-	files_cgroup_remove(files);
++	if (files_cgroup_enabled())
++		files_cgroup_remove(files);
+ #endif
+ 
+ 	return fdt;
+@@ -559,7 +565,7 @@ int __alloc_fd(struct files_struct *files,
+ 	if (error)
+ 		goto repeat;
+ #ifdef CONFIG_CGROUP_FILES
+-	if (files_cgroup_alloc_fd(files, 1)) {
++	if (files_cgroup_enabled() && files_cgroup_alloc_fd(files, 1)) {
+ 		error = -EMFILE;
+ 		goto out;
+ 	}
+@@ -607,7 +613,7 @@ static void __put_unused_fd(struct files_struct *files, unsigned int fd)
+ {
+ 	struct fdtable *fdt = files_fdtable(files);
+ #ifdef CONFIG_CGROUP_FILES
+-	if (test_bit(fd, fdt->open_fds))
++	if (files_cgroup_enabled() && test_bit(fd, fdt->open_fds))
+ 		files_cgroup_unalloc_fd(files, 1);
+ #endif
+ 	__clear_open_fd(fd, fdt);
+@@ -1041,7 +1047,8 @@ __releases(&files->file_lock)
+ 		goto out;
+ 	}
+ #ifdef CONFIG_CGROUP_FILES
+-	if (!tofree && files_cgroup_alloc_fd(files, 1)) {
++	if (files_cgroup_enabled() &&
++	    !tofree && files_cgroup_alloc_fd(files, 1)) {
+ 		err = -EMFILE;
+ 		goto out;
+ 	}
+diff --git a/include/linux/filescontrol.h b/include/linux/filescontrol.h
+index 49dc620cf64e..0182f145a339 100644
+--- a/include/linux/filescontrol.h
++++ b/include/linux/filescontrol.h
+@@ -19,6 +19,7 @@
+ #define _LINUX_FILESCONTROL_H
+ 
+ #include <linux/fdtable.h>
++#include <linux/cgroup.h>
+ 
+ #ifdef CONFIG_CGROUP_FILES
+ 
+@@ -30,5 +31,10 @@ extern struct files_struct init_files;
+ void files_cgroup_assign(struct files_struct *files);
+ void files_cgroup_remove(struct files_struct *files);
+ 
++static inline bool files_cgroup_enabled(void)
++{
++	return cgroup_subsys_enabled(files_cgrp_subsys);
++}
++
+ #endif /* CONFIG_CGROUP_FILES */
+ #endif /* _LINUX_FILESCONTROL_H */
+-- 
+2.26.2
+

@@ -1,0 +1,174 @@
+From e070c8b91ac1c7810c8448b1e5534d1895a0c7f4 Mon Sep 17 00:00:00 2001
+From: Yufeng Mo <moyufeng@huawei.com>
+Date: Fri, 5 Feb 2021 16:32:47 +0800
+Subject: [PATCH] net: hns3: add support for obtaining the maximum frame size
+Git-commit: e070c8b91ac1c7810c8448b1e5534d1895a0c7f4
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+Since the newer hardware may supports different frame size,
+so add support to obtain the capability from the firmware
+instead of the fixed value.
+
+Signed-off-by: Yufeng Mo <moyufeng@huawei.com>
+Signed-off-by: Huazhong Tan <tanhuazhong@huawei.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ drivers/net/ethernet/hisilicon/hns3/hnae3.h               |    1 +
+ drivers/net/ethernet/hisilicon/hns3/hns3_debugfs.c        |    1 +
+ drivers/net/ethernet/hisilicon/hns3/hns3_enet.c           |    3 +--
+ drivers/net/ethernet/hisilicon/hns3/hns3_enet.h           |    5 ++---
+ drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_cmd.h    |    3 ++-
+ drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c   |    6 +++++-
+ drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_cmd.h  |    3 ++-
+ drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_main.c |    4 ++++
+ drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_main.h |    2 ++
+ 9 files changed, 20 insertions(+), 8 deletions(-)
+
+--- a/drivers/net/ethernet/hisilicon/hns3/hnae3.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hnae3.h
+@@ -283,6 +283,7 @@ struct hnae3_dev_specs {
+ 	u16 int_ql_max; /* max value of interrupt coalesce based on INT_QL */
+ 	u16 max_int_gl; /* max value of interrupt coalesce based on INT_GL */
+ 	u8 max_non_tso_bd_num; /* max BD number of one non-TSO packet */
++	u16 max_frm_size;
+ };
+ 
+ struct hnae3_client_ops {
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3_debugfs.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3_debugfs.c
+@@ -389,6 +389,7 @@ static void hns3_dbg_dev_specs(struct hn
+ 		 kinfo->tc_info.num_tc);
+ 	dev_info(priv->dev, "MAX INT QL: %u\n", dev_specs->int_ql_max);
+ 	dev_info(priv->dev, "MAX INT GL: %u\n", dev_specs->max_int_gl);
++	dev_info(priv->dev, "MAX frame size: %u\n", dev_specs->max_frm_size);
+ }
+ 
+ static ssize_t hns3_dbg_cmd_read(struct file *filp, char __user *buffer,
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3_enet.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3_enet.c
+@@ -4327,8 +4327,7 @@ static int hns3_client_init(struct hnae3
+ 
+ 	hns3_dbg_init(handle);
+ 
+-	/* MTU range: (ETH_MIN_MTU(kernel default) - 9702) */
+-	netdev->max_mtu = HNS3_MAX_MTU;
++	netdev->max_mtu = HNS3_MAX_MTU(ae_dev->dev_specs.max_frm_size);
+ 
+ 	if (test_bit(HNAE3_DEV_SUPPORT_HW_TX_CSUM_B, ae_dev->caps))
+ 		set_bit(HNS3_NIC_STATE_HW_TX_CSUM_ENABLE, &priv->state);
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3_enet.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3_enet.h
+@@ -56,9 +56,8 @@ enum hns3_nic_state {
+ #define HNS3_RING_MIN_PENDING			72
+ #define HNS3_RING_BD_MULTIPLE			8
+ /* max frame size of mac */
+-#define HNS3_MAC_MAX_FRAME			9728
+-#define HNS3_MAX_MTU \
+-	(HNS3_MAC_MAX_FRAME - (ETH_HLEN + ETH_FCS_LEN + 2 * VLAN_HLEN))
++#define HNS3_MAX_MTU(max_frm_size) \
++	((max_frm_size) - (ETH_HLEN + ETH_FCS_LEN + 2 * VLAN_HLEN))
+ 
+ #define HNS3_BD_SIZE_512_TYPE			0
+ #define HNS3_BD_SIZE_1024_TYPE			1
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_cmd.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_cmd.h
+@@ -1135,7 +1135,8 @@ struct hclge_dev_specs_0_cmd {
+ #define HCLGE_DEF_MAX_INT_GL		0x1FE0U
+ 
+ struct hclge_dev_specs_1_cmd {
+-	__le32 rsv0;
++	__le16 max_frm_size;
++	__le16 rsv0;
+ 	__le16 max_int_gl;
+ 	u8 rsv1[18];
+ };
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
+@@ -1371,6 +1371,7 @@ static void hclge_set_default_dev_specs(
+ 	ae_dev->dev_specs.rss_key_size = HCLGE_RSS_KEY_SIZE;
+ 	ae_dev->dev_specs.max_tm_rate = HCLGE_ETHER_MAX_RATE;
+ 	ae_dev->dev_specs.max_int_gl = HCLGE_DEF_MAX_INT_GL;
++	ae_dev->dev_specs.max_frm_size = HCLGE_MAC_MAX_FRAME;
+ }
+ 
+ static void hclge_parse_dev_specs(struct hclge_dev *hdev,
+@@ -1390,6 +1391,7 @@ static void hclge_parse_dev_specs(struct
+ 	ae_dev->dev_specs.rss_key_size = le16_to_cpu(req0->rss_key_size);
+ 	ae_dev->dev_specs.max_tm_rate = le32_to_cpu(req0->max_tm_rate);
+ 	ae_dev->dev_specs.max_int_gl = le16_to_cpu(req1->max_int_gl);
++	ae_dev->dev_specs.max_frm_size = le16_to_cpu(req1->max_frm_size);
+ }
+ 
+ static void hclge_check_dev_specs(struct hclge_dev *hdev)
+@@ -1406,6 +1408,8 @@ static void hclge_check_dev_specs(struct
+ 		dev_specs->max_tm_rate = HCLGE_ETHER_MAX_RATE;
+ 	if (!dev_specs->max_int_gl)
+ 		dev_specs->max_int_gl = HCLGE_DEF_MAX_INT_GL;
++	if (!dev_specs->max_frm_size)
++		dev_specs->max_frm_size = HCLGE_MAC_MAX_FRAME;
+ }
+ 
+ static int hclge_query_dev_specs(struct hclge_dev *hdev)
+@@ -9693,7 +9697,7 @@ int hclge_set_vport_mtu(struct hclge_vpo
+ 	/* HW supprt 2 layer vlan */
+ 	max_frm_size = new_mtu + ETH_HLEN + ETH_FCS_LEN + 2 * VLAN_HLEN;
+ 	if (max_frm_size < HCLGE_MAC_MIN_FRAME ||
+-	    max_frm_size > HCLGE_MAC_MAX_FRAME)
++	    max_frm_size > hdev->ae_dev->dev_specs.max_frm_size)
+ 		return -EINVAL;
+ 
+ 	max_frm_size = max(max_frm_size, HCLGE_MAC_DEFAULT_FRAME);
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_cmd.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_cmd.h
+@@ -297,7 +297,8 @@ struct hclgevf_dev_specs_0_cmd {
+ #define HCLGEVF_DEF_MAX_INT_GL		0x1FE0U
+ 
+ struct hclgevf_dev_specs_1_cmd {
+-	__le32 rsv0;
++	__le16 max_frm_size;
++	__le16 rsv0;
+ 	__le16 max_int_gl;
+ 	u8 rsv1[18];
+ };
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_main.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_main.c
+@@ -3089,6 +3089,7 @@ static void hclgevf_set_default_dev_spec
+ 	ae_dev->dev_specs.rss_ind_tbl_size = HCLGEVF_RSS_IND_TBL_SIZE;
+ 	ae_dev->dev_specs.rss_key_size = HCLGEVF_RSS_KEY_SIZE;
+ 	ae_dev->dev_specs.max_int_gl = HCLGEVF_DEF_MAX_INT_GL;
++	ae_dev->dev_specs.max_frm_size = HCLGEVF_MAC_MAX_FRAME;
+ }
+ 
+ static void hclgevf_parse_dev_specs(struct hclgevf_dev *hdev,
+@@ -3107,6 +3108,7 @@ static void hclgevf_parse_dev_specs(stru
+ 	ae_dev->dev_specs.int_ql_max = le16_to_cpu(req0->int_ql_max);
+ 	ae_dev->dev_specs.rss_key_size = le16_to_cpu(req0->rss_key_size);
+ 	ae_dev->dev_specs.max_int_gl = le16_to_cpu(req1->max_int_gl);
++	ae_dev->dev_specs.max_frm_size = le16_to_cpu(req1->max_frm_size);
+ }
+ 
+ static void hclgevf_check_dev_specs(struct hclgevf_dev *hdev)
+@@ -3121,6 +3123,8 @@ static void hclgevf_check_dev_specs(stru
+ 		dev_specs->rss_key_size = HCLGEVF_RSS_KEY_SIZE;
+ 	if (!dev_specs->max_int_gl)
+ 		dev_specs->max_int_gl = HCLGEVF_DEF_MAX_INT_GL;
++	if (!dev_specs->max_frm_size)
++		dev_specs->max_frm_size = HCLGEVF_MAC_MAX_FRAME;
+ }
+ 
+ static int hclgevf_query_dev_specs(struct hclgevf_dev *hdev)
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_main.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_main.h
+@@ -126,6 +126,8 @@
+ #define HCLGEVF_RSS_INPUT_TUPLE_SCTP_NO_PORT	\
+ 	(HCLGEVF_D_IP_BIT | HCLGEVF_S_IP_BIT | HCLGEVF_V_TAG_BIT)
+ 
++#define HCLGEVF_MAC_MAX_FRAME		9728
++
+ #define HCLGEVF_STATS_TIMER_INTERVAL	36U
+ 
+ enum hclgevf_evt_cause {

@@ -1,0 +1,182 @@
+From 4f96d3deeea706e7228bd0594b1739feaca9c7f2 Mon Sep 17 00:00:00 2001
+From: Zenghui Yu <yuzenghui@huawei.com>
+Date: Fri, 26 Nov 2021 16:27:01 +0800
+Subject: [PATCH] perf, kvm/arm64: Add stat support on arm64
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 4f96d3deeea706e7228bd0594b1739feaca9c7f2
+
+
+virt inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4IZPY
+CVE: NA
+
+-------------------------------------------------
+
+'perf kvm stat report/record' generates a statistical analysis of KVM
+events and can be used to analyze guest exit reasons. This patch tries
+to add stat support on arm64.
+
+We have a mapping between guest's "exit_code" and "exit_reason" which
+already exists under arch/arm64/include/asm/ (kvm_arm_exception_type),
+and we've used it to report guest's exit type through trace_kvm_exit().
+Copy kvm_arm_exception_type into aarch64_guest_exits.h, thus export it
+to userspace.
+
+It records on two available KVM tracepoints for arm64: "kvm:kvm_entry"
+and "kvm:kvm_exit", and reports statistical data which includes events
+handles time, samples, and so on.
+
+A simple test go below:
+
+ # pgrep qemu
+6039
+9937
+
+ # ./tools/perf/perf kvm stat record -p 6039
+[ perf record: Woken up 3 times to write data ]
+[ perf record: Captured and wrote 15.629 MB perf.data.guest (199063 samples) ]
+
+ # ./tools/perf/perf kvm stat report --event=vmexit
+
+Analyze events for all VMs, all VCPUs:
+
+             VM-EXIT    Samples  Samples%     Time%    Min Time    Max Time         Avg time
+
+                TRAP      49040    97.15%   100.00%      2.60us   4072.98us   3431.60us ( +-   0.17% )
+                 IRQ       1437     2.85%     0.00%      0.90us     24.56us      2.06us ( +-   1.37% )
+
+Total Samples:50477, Total events handled time:168288630.04us.
+
+Signed-off-by: Zenghui Yu <yuzenghui@huawei.com>
+Reviewed-by: Hailiang Zhang <zhang.zhanghailiang@huawei.com>
+Signed-off-by: Zenghui Yu <yuzenghui@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Link: https://lore.kernel.org/r/1560330526-15468-5-git-send-email-yuzenghui@huawei.com
+Link: https://gitee.com/openeuler/kernel/commit/15db05576381
+Reviewed-by: Yanan Wang <wangyanan55@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ tools/perf/arch/arm64/Makefile                |  2 +
+ tools/perf/arch/arm64/util/Build              |  1 +
+ .../arch/arm64/util/aarch64_guest_exits.h     | 27 +++++++++++
+ tools/perf/arch/arm64/util/kvm-stat.c         | 46 +++++++++++++++++++
+ 4 files changed, 76 insertions(+)
+ create mode 100644 tools/perf/arch/arm64/util/aarch64_guest_exits.h
+ create mode 100644 tools/perf/arch/arm64/util/kvm-stat.c
+
+diff --git a/tools/perf/arch/arm64/Makefile b/tools/perf/arch/arm64/Makefile
+index dbef716a1913..172146e95dbc 100644
+--- a/tools/perf/arch/arm64/Makefile
++++ b/tools/perf/arch/arm64/Makefile
+@@ -2,6 +2,8 @@
+ ifndef NO_DWARF
+ PERF_HAVE_DWARF_REGS := 1
+ endif
++
++HAVE_KVM_STAT_SUPPORT := 1
+ PERF_HAVE_JITDUMP := 1
+ PERF_HAVE_ARCH_REGS_QUERY_REGISTER_OFFSET := 1
+ 
+diff --git a/tools/perf/arch/arm64/util/Build b/tools/perf/arch/arm64/util/Build
+index b53294d74b01..8d2b9bcfffca 100644
+--- a/tools/perf/arch/arm64/util/Build
++++ b/tools/perf/arch/arm64/util/Build
+@@ -2,6 +2,7 @@ perf-y += header.o
+ perf-y += machine.o
+ perf-y += perf_regs.o
+ perf-y += tsc.o
++perf-y += kvm-stat.o
+ perf-$(CONFIG_DWARF)     += dwarf-regs.o
+ perf-$(CONFIG_LOCAL_LIBUNWIND) += unwind-libunwind.o
+ perf-$(CONFIG_LIBDW_DWARF_UNWIND) += unwind-libdw.o
+diff --git a/tools/perf/arch/arm64/util/aarch64_guest_exits.h b/tools/perf/arch/arm64/util/aarch64_guest_exits.h
+new file mode 100644
+index 000000000000..aec2e6e012d3
+--- /dev/null
++++ b/tools/perf/arch/arm64/util/aarch64_guest_exits.h
+@@ -0,0 +1,27 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Copyright(c) 2019 Huawei Technologies Co., Ltd
++ */
++
++#ifndef ARCH_PERF_AARCH64_GUEST_EXITS_H
++#define ARCH_PERF_AARCH64_GUEST_EXITS_H
++
++/* virt.h */
++/* Error returned when an invalid stub number is passed into x0 */
++#define HVC_STUB_ERR	0xbadca11
++
++/* kvm_asm.h */
++#define ARM_EXCEPTION_IRQ         0
++#define ARM_EXCEPTION_EL1_SERROR  1
++#define ARM_EXCEPTION_TRAP        2
++#define ARM_EXCEPTION_IL          3
++/* The hyp-stub will return this for any kvm_call_hyp() call */
++#define ARM_EXCEPTION_HYP_GONE    HVC_STUB_ERR
++
++#define kvm_arm_exception_type					\
++	{ARM_EXCEPTION_IRQ,		"IRQ"		},	\
++	{ARM_EXCEPTION_EL1_SERROR,	"SERROR"	},	\
++	{ARM_EXCEPTION_TRAP,		"TRAP"		},	\
++	{ARM_EXCEPTION_HYP_GONE,	"HYP_GONE"	}
++
++#endif /* ARCH_PERF_AARCH64_GUEST_EXITS_H */
+diff --git a/tools/perf/arch/arm64/util/kvm-stat.c b/tools/perf/arch/arm64/util/kvm-stat.c
+new file mode 100644
+index 000000000000..2fed20370829
+--- /dev/null
++++ b/tools/perf/arch/arm64/util/kvm-stat.c
+@@ -0,0 +1,46 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Arch specific functions for perf kvm stat.
++ * Copyright(c) 2019 Huawei Technologies Co., Ltd
++ */
++
++#include "../../../util/kvm-stat.h"
++#include "aarch64_guest_exits.h"
++
++define_exit_reasons_table(arm64_exit_reasons, kvm_arm_exception_type);
++
++static struct kvm_events_ops exit_events = {
++	.is_begin_event = exit_event_begin,
++	.is_end_event = exit_event_end,
++	.decode_key = exit_event_decode_key,
++	.name = "VM-EXIT"
++};
++
++const char *vcpu_id_str = "vcpu_id";
++const int decode_str_len = 20;
++const char *kvm_exit_reason = "ret";
++const char *kvm_entry_trace = "kvm:kvm_entry";
++const char *kvm_exit_trace = "kvm:kvm_exit";
++
++const char *kvm_events_tp[] = {
++	"kvm:kvm_entry",
++	"kvm:kvm_exit",
++	NULL,
++};
++
++struct kvm_reg_events_ops kvm_reg_events_ops[] = {
++	{ .name = "vmexit", .ops = &exit_events },
++	{ NULL, NULL },
++};
++
++const char * const kvm_skip_events[] = {
++	NULL,
++};
++
++int cpu_isa_init(struct perf_kvm_stat *kvm, const char *cpuid __maybe_unused)
++{
++	kvm->exit_reasons = arm64_exit_reasons;
++	kvm->exit_reasons_isa = "aarch64";
++
++	return 0;
++}
+-- 
+2.26.2
+

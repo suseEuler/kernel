@@ -1,0 +1,108 @@
+From 826bfeb37bb4302ee6042f330c4c0c757152bdb8 Mon Sep 17 00:00:00 2001
+From: "Peter Zijlstra (Intel)" <peterz@infradead.org>
+Date: Mon, 18 Jan 2021 15:12:23 +0100
+Subject: [PATCH] preempt/dynamic: Support dynamic preempt with preempt= boot
+Git-commit: 826bfeb37bb4302ee6042f330c4c0c757152bdb8
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+ option
+
+Support the preempt= boot option and patch the static call sites
+accordingly.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Frederic Weisbecker <frederic@kernel.org>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Link: https://lkml.kernel.org/r/20210118141223.123667-9-frederic@kernel.org
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ kernel/sched/core.c | 68 ++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 67 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 880611c701d3..0c067176edc5 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -5328,9 +5328,75 @@ DEFINE_STATIC_CALL(preempt_schedule_notrace, __preempt_schedule_notrace_func);
+ EXPORT_STATIC_CALL(preempt_schedule_notrace);
+ #endif
+ 
+-
+ #endif /* CONFIG_PREEMPTION */
+ 
++#ifdef CONFIG_PREEMPT_DYNAMIC
++
++#include <linux/entry-common.h>
++
++/*
++ * SC:cond_resched
++ * SC:might_resched
++ * SC:preempt_schedule
++ * SC:preempt_schedule_notrace
++ * SC:irqentry_exit_cond_resched
++ *
++ *
++ * NONE:
++ *   cond_resched               <- __cond_resched
++ *   might_resched              <- RET0
++ *   preempt_schedule           <- NOP
++ *   preempt_schedule_notrace   <- NOP
++ *   irqentry_exit_cond_resched <- NOP
++ *
++ * VOLUNTARY:
++ *   cond_resched               <- __cond_resched
++ *   might_resched              <- __cond_resched
++ *   preempt_schedule           <- NOP
++ *   preempt_schedule_notrace   <- NOP
++ *   irqentry_exit_cond_resched <- NOP
++ *
++ * FULL:
++ *   cond_resched               <- RET0
++ *   might_resched              <- RET0
++ *   preempt_schedule           <- preempt_schedule
++ *   preempt_schedule_notrace   <- preempt_schedule_notrace
++ *   irqentry_exit_cond_resched <- irqentry_exit_cond_resched
++ */
++static int __init setup_preempt_mode(char *str)
++{
++	if (!strcmp(str, "none")) {
++		static_call_update(cond_resched, __cond_resched);
++		static_call_update(might_resched, (typeof(&__cond_resched)) __static_call_return0);
++		static_call_update(preempt_schedule, (typeof(&preempt_schedule)) NULL);
++		static_call_update(preempt_schedule_notrace, (typeof(&preempt_schedule_notrace)) NULL);
++		static_call_update(irqentry_exit_cond_resched, (typeof(&irqentry_exit_cond_resched)) NULL);
++		pr_info("Dynamic Preempt: %s\n", str);
++	} else if (!strcmp(str, "voluntary")) {
++		static_call_update(cond_resched, __cond_resched);
++		static_call_update(might_resched, __cond_resched);
++		static_call_update(preempt_schedule, (typeof(&preempt_schedule)) NULL);
++		static_call_update(preempt_schedule_notrace, (typeof(&preempt_schedule_notrace)) NULL);
++		static_call_update(irqentry_exit_cond_resched, (typeof(&irqentry_exit_cond_resched)) NULL);
++		pr_info("Dynamic Preempt: %s\n", str);
++	} else if (!strcmp(str, "full")) {
++		static_call_update(cond_resched, (typeof(&__cond_resched)) __static_call_return0);
++		static_call_update(might_resched, (typeof(&__cond_resched)) __static_call_return0);
++		static_call_update(preempt_schedule, __preempt_schedule_func);
++		static_call_update(preempt_schedule_notrace, __preempt_schedule_notrace_func);
++		static_call_update(irqentry_exit_cond_resched, irqentry_exit_cond_resched);
++		pr_info("Dynamic Preempt: %s\n", str);
++	} else {
++		pr_warn("Dynamic Preempt: Unsupported preempt mode %s, default to full\n", str);
++		return 1;
++	}
++	return 0;
++}
++__setup("preempt=", setup_preempt_mode);
++
++#endif /* CONFIG_PREEMPT_DYNAMIC */
++
++
+ /*
+  * This is the entry point to schedule() from kernel preemption
+  * off of irq context.
+-- 
+2.31.1
+

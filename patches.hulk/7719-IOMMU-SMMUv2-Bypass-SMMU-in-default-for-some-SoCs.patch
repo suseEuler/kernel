@@ -1,0 +1,109 @@
+From 4f9fce3abafbcb14811a9b76faf7ae01014ea663 Mon Sep 17 00:00:00 2001
+From: Hanjun Guo <guohanjun@huawei.com>
+Date: Wed, 29 Sep 2021 16:02:11 +0800
+Subject: [PATCH] IOMMU: SMMUv2: Bypass SMMU in default for some SoCs
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 4f9fce3abafbcb14811a9b76faf7ae01014ea663
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I41AUQ
+CVE: NA
+
+-------------------------------------
+
+Support SMMU default bypass for some CPU SoCs which the SMMU is not
+functional well in address translation mode.
+
+We already have the .def_domain_type hook for iommu_ops in iommu driver,
+so we add the CPU SoC SMMU bypass code in the .def_domain_type hook in
+smmuv2 driver, and return IOMMU_DOMAIN_IDENTITY for such SoCs.
+
+After we add the hook, we set all the devices for such SoCs in pass
+through mode, no matter adding iommu.passthrough=off/on or not in the
+boot cmdline.
+
+While we at it, update the config SMMU_BYPASS_DEV to specify the
+useage.
+
+Signed-off-by: Hanjun Guo <guohanjun@huawei.com>
+Cc: Guo Hui <guohui@uniontech.com>
+Cc: Cheng Jian <cj.chengjian@huawei.com>
+Cc: Zhen Lei <thunder.leizhen@huawei.com>
+Cc: Xiuqi Xie <xiexiuqi@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/iommu/Kconfig                 | 13 ++++++++-----
+ drivers/iommu/arm/arm-smmu/arm-smmu.c | 22 ++++++++++++++++++++++
+ 2 files changed, 30 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/iommu/Kconfig b/drivers/iommu/Kconfig
+index a65f1f835e7d..d6c04563f60d 100644
+--- a/drivers/iommu/Kconfig
++++ b/drivers/iommu/Kconfig
+@@ -409,13 +409,16 @@ config VIRTIO_IOMMU
+ 
+ 	  Say Y here if you intend to run this kernel as a guest.
+ 
+-config  SMMU_BYPASS_DEV
++config SMMU_BYPASS_DEV
+ 	bool "SMMU bypass streams for some specific devices"
+ 	depends on ARM_SMMU_V3=y
+ 	help
+-	  according smmu.bypassdev cmdline, SMMU performs attribute
+-	  transformation only,with no address translation.
+-	  E.g:SMMU allow iMR3408/3416 Raid bypass at DMA default domain
+-	  to support other devices Virtualization through.
++	  Using the smmu.bypassdev cmdline, to collect the devices that SMMU
++	  performs attribute transformation only, with no address translation.
++	  E.g:SMMU allow iMR3408/3416 Raid bypass at DMA default domain to
++	  support other devices to use virtualization such as VFIO.
++
++	  This feature will be replaced by ACPI IORT RMR node, which will be
++	  upstreamed in mainline.
+ 
+ endif # IOMMU_SUPPORT
+diff --git a/drivers/iommu/arm/arm-smmu/arm-smmu.c b/drivers/iommu/arm/arm-smmu/arm-smmu.c
+index e96983dac939..1f951070f519 100644
+--- a/drivers/iommu/arm/arm-smmu/arm-smmu.c
++++ b/drivers/iommu/arm/arm-smmu/arm-smmu.c
+@@ -1581,11 +1581,33 @@ static void arm_smmu_get_resv_regions(struct device *dev,
+ 	iommu_dma_get_resv_regions(dev, head);
+ }
+ 
++#ifdef CONFIG_ARM64
++#include <asm/cputype.h>
++static bool cpu_using_identity_iommu_domain(struct device *dev)
++{
++	u32 midr = read_cpuid_id();
++
++	if (((midr & MIDR_CPU_MODEL_MASK) == MIDR_PHYTIUM_FT2000PLUS)
++		|| ((midr & MIDR_CPU_MODEL_MASK) == MIDR_PHYTIUM_FT2500))
++		return true;
++
++	return false;
++}
++#else
++static bool cpu_using_identity_iommu_domain(struct device *dev)
++{
++	return false;
++}
++#endif
++
+ static int arm_smmu_def_domain_type(struct device *dev)
+ {
+ 	struct arm_smmu_master_cfg *cfg = dev_iommu_priv_get(dev);
+ 	const struct arm_smmu_impl *impl = cfg->smmu->impl;
+ 
++	if (cpu_using_identity_iommu_domain(dev))
++		return IOMMU_DOMAIN_IDENTITY;
++
+ 	if (impl && impl->def_domain_type)
+ 		return impl->def_domain_type(dev);
+ 
+-- 
+2.26.2
+

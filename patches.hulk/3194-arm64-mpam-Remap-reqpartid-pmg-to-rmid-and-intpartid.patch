@@ -1,0 +1,1204 @@
+From 0b16164dc7a958282bbd44e28c4d52195eea4d27 Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Fri, 26 Feb 2021 20:22:36 +0800
+Subject: [PATCH] arm64/mpam: Remap reqpartid,pmg to rmid and intpartid to
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 0b16164dc7a958282bbd44e28c4d52195eea4d27
+
+ closid
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+So far we use sd_closid, including {reqpartid, intpartid}, to label each
+resctrl group including ctrlgroup and mongroup, This can perfectly handle
+this case where number of reqpartid exceeds intpartid, this always happen
+when intpartid narrowing supported, otherwise their two are of same number.
+So we use excessive reqpartid to indicate (1)- how configurations can be
+synchronized from the configuration indexed by intpartid, not only that,
+(2)- take part of monitor role.
+
+But reqpartid in (2) with pmg still be scattered, So far we have not yet
+a right way to explain how can we use their two properly. In order to
+ensure their resources can be fully utilized, and given this idea from
+Intel-RDT's design which uses rmid for monitoring, a rmid remap matrix is
+delivered for transforming partid and pmg to rmid, this matrix is organized
+like this:
+
+                 [bitmap entry indexed by partid]
+                       [col pos is partid]
+
+                     [0]  [1]  [2]  [3]  [4]  [5]
+   occ->bitmap[:0]    1    0    0    1    1    1
+        bitmap[:1]    1    0    0    1    1    1
+        bitmap[:2]    1    1    1    1    1    1
+        bitmap[:3]    1    1    1    1    1    1
+[row pos-1 is pmg]
+
+Calculate rmid = partid + NR_partid * pmg
+
+occ represents if this bitmap has been used by a partid, it is because
+a certain partid should not be accompany with a duplicated pmg for
+monitoring, this design easily saves a lot of space, and can also decrease
+time complexity of allocating and free rmid process from O(NR_partid)*
+O(NR_pmg) to O(NR_partid) + O(log(NR_pmg)) compared with using list.
+
+By this way, we get a continuous rmid set with upper bound(NR_pmg *
+NR_partid - 1), given an rmid we can assume that if it's a valid rmid
+by judging whether it falls within this range or not.
+
+rmid implicts the reqpartid info, so we can use relevant helpers to get
+this reqpartid for sd_closid@reqpartid and perfectly accomplish this
+configuration sync mission, this also makes closid simpler which can be
+consists of intpartid index only, also each resctrl group is happy to own
+consecutive rmid.
+
+This also has some profound influences, for instance for MPAM there
+also support SMMU io using partid and pmg, we can use a single helper
+mpam_rmid_to_partid_pmg() in SMMU driver to complete this remap process
+for rmid input from outside user space.
+
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/mpam.h         |   3 +-
+ arch/arm64/include/asm/resctrl.h      |  55 +--
+ arch/arm64/kernel/mpam/mpam_ctrlmon.c |  17 +-
+ arch/arm64/kernel/mpam/mpam_mon.c     |  49 ---
+ arch/arm64/kernel/mpam/mpam_resctrl.c | 506 +++++++++++++++++++++-----
+ fs/resctrlfs.c                        | 138 +++----
+ 6 files changed, 529 insertions(+), 239 deletions(-)
+
+diff --git a/arch/arm64/include/asm/mpam.h b/arch/arm64/include/asm/mpam.h
+index 5fac0fb3c807..014d5728f607 100644
+--- a/arch/arm64/include/asm/mpam.h
++++ b/arch/arm64/include/asm/mpam.h
+@@ -362,7 +362,8 @@ int resctrl_group_alloc_mon(struct rdtgroup *grp);
+ 
+ u16 mpam_resctrl_max_mon_num(void);
+ 
+-void pmg_init(void);
+ void mon_init(void);
+ 
++extern int mpam_rmid_to_partid_pmg(int rmid, int *partid, int *pmg);
++
+ #endif /* _ASM_ARM64_MPAM_H */
+diff --git a/arch/arm64/include/asm/resctrl.h b/arch/arm64/include/asm/resctrl.h
+index 1cd24441d2e6..40f97b1ddb83 100644
+--- a/arch/arm64/include/asm/resctrl.h
++++ b/arch/arm64/include/asm/resctrl.h
+@@ -2,6 +2,7 @@
+ #define _ASM_ARM64_RESCTRL_H
+ 
+ #include <asm/mpam_sched.h>
++#include <asm/mpam.h>
+ 
+ #define resctrl_group rdtgroup
+ #define resctrl_alloc_capable rdt_alloc_capable
+@@ -95,17 +96,12 @@ void schemata_list_destroy(void);
+ 
+ int resctrl_lru_request_mon(void);
+ 
+-int alloc_rmid(void);
+-void free_rmid(u32 id);
++int rmid_alloc(int entry_idx);
++void rmid_free(int rmid);
+ 
+-enum closid_type {
+-	CLOSID_INT    = 0x1,
+-	CLOSID_REQ      = 0x2,
+-	CLOSID_NUM_TYPES,
+-};
+ int resctrl_id_init(void);
+-int resctrl_id_alloc(enum closid_type);
+-void resctrl_id_free(enum closid_type, int id);
++int closid_alloc(void);
++void closid_free(int closid);
+ 
+ void update_cpu_closid_rmid(void *info);
+ void update_closid_rmid(const struct cpumask *cpu_mask, struct resctrl_group *r);
+@@ -152,20 +148,35 @@ int resctrl_update_groups_config(struct rdtgroup *rdtgrp);
+ #define RESCTRL_MAX_CLOSID 32
+ 
+ /*
+- * left 16 bits of closid store parent(master)'s
+- * closid, the reset store current group's closid,
+- * this used for judging if tasks are allowed to move
+- * another ctrlmon/mon group, it is because when
+- * a mon group is permited to allocated another
+- * closid different from it's parent, only closid
+- * is not sufficient to do that.
++ * This is only for avoiding unnecessary cost in mpam_sched_in()
++ *  called by __switch_to() if using mpam_rmid_to_partid_pmg()
++ * to get partid and pmg, we just simply shift and get their
++ * two easily when we want.
+  */
+-#define TASK_CLOSID_SET(prclosid, closid)    \
+-		((prclosid << 16) | closid)
++static inline void resctrl_navie_rmid_partid_pmg(u32 rmid, int *partid, int *pmg)
++{
++	*partid = rmid >> 16;
++	*pmg = (rmid << 16) >> 16;
++}
++
++static inline u32 resctrl_navie_rmid(u32 rmid)
++{
++	int ret, partid, pmg;
++
++	ret = mpam_rmid_to_partid_pmg(rmid, (int *)&partid, (int *)&pmg);
++	if (ret)
++		return 0;
+ 
+-#define TASK_CLOSID_CUR_GET(closid)   \
+-		(closid & GENMASK(15, 0))
+-#define TASK_CLOSID_PR_GET(closid)    \
+-		((closid & GENMASK(31, 16)) >> 16)
++	return (partid << 16) | pmg;
++}
++
++/*
++ * closid.reqpartid is used as part of mapping to rmid, now
++ * we only need to map intpartid to closid.
++ */
++static inline u32 resctrl_navie_closid(struct sd_closid closid)
++{
++	return closid.intpartid;
++}
+ 
+ #endif /* _ASM_ARM64_RESCTRL_H */
+diff --git a/arch/arm64/kernel/mpam/mpam_ctrlmon.c b/arch/arm64/kernel/mpam/mpam_ctrlmon.c
+index fa4d4ee3af5b..ddb5f099a1b4 100644
+--- a/arch/arm64/kernel/mpam/mpam_ctrlmon.c
++++ b/arch/arm64/kernel/mpam/mpam_ctrlmon.c
+@@ -556,6 +556,7 @@ int resctrl_group_mondata_show(struct seq_file *m, void *arg)
+ 	int ret = 0;
+ 	char *resname = get_resource_name(kernfs_node_name(of));
+ 	u64 usage;
++	int pmg;
+ 
+ 	if (!resname)
+ 		return -ENOMEM;
+@@ -601,7 +602,13 @@ int resctrl_group_mondata_show(struct seq_file *m, void *arg)
+ 			resctrl_cdp_map(clos, entry->closid.reqpartid,
+ 				type, hw_closid);
+ 			md.u.partid = hw_closid_val(hw_closid);
+-			md.u.pmg = entry->mon.rmid;
++
++			ret = mpam_rmid_to_partid_pmg(entry->mon.rmid,
++				NULL, &pmg);
++			if (ret)
++				return ret;
++
++			md.u.pmg = pmg;
+ 			md.u.mon = entry->mon.mon;
+ 			usage += resctrl_dom_mon_data(r, d, md.priv);
+ 		}
+@@ -647,6 +654,7 @@ static int resctrl_mkdir_mondata_dom(struct kernfs_node *parent_kn,
+ 	struct kernfs_node *kn;
+ 	char name[32];
+ 	int ret = 0;
++	int pmg;
+ 
+ 	r = s->res;
+ 	rr = r->res;
+@@ -658,7 +666,12 @@ static int resctrl_mkdir_mondata_dom(struct kernfs_node *parent_kn,
+ 	md.u.partid = hw_closid_val(hw_closid);
+ 	resctrl_cdp_map(mon, prgrp->mon.mon, s->conf_type, hw_monid);
+ 	md.u.mon = hw_monid_val(hw_monid);
+-	md.u.pmg = prgrp->mon.rmid;
++
++	ret = mpam_rmid_to_partid_pmg(prgrp->mon.rmid, NULL, &pmg);
++	if (ret)
++		return ret;
++	md.u.pmg = pmg;
++
+ 	md.u.cdp_both_mon = s->cdp_mc_both;
+ 
+ 	snprintf(name, sizeof(name), "mon_%s_%02d", s->name, d->id);
+diff --git a/arch/arm64/kernel/mpam/mpam_mon.c b/arch/arm64/kernel/mpam/mpam_mon.c
+index 8dfdba6a5ba2..0f1b2663399d 100644
+--- a/arch/arm64/kernel/mpam/mpam_mon.c
++++ b/arch/arm64/kernel/mpam/mpam_mon.c
+@@ -34,55 +34,6 @@
+  */
+ bool rdt_mon_capable;
+ 
+-static int pmg_free_map;
+-void pmg_init(void)
+-{
+-	u16 num_pmg = USHRT_MAX;
+-	struct mpam_resctrl_res *res;
+-	struct resctrl_resource *r;
+-	struct raw_resctrl_resource *rr;
+-
+-	/* Use the max num_pmg among all resources */
+-	for_each_supported_resctrl_exports(res) {
+-		r = &res->resctrl_res;
+-		rr = r->res;
+-		num_pmg = min(num_pmg, rr->num_pmg);
+-	}
+-
+-	pmg_free_map = BIT_MASK(num_pmg) - 1;
+-
+-	/* pmg 0 is always reserved for the default group */
+-	pmg_free_map &= ~1;
+-}
+-
+-static int alloc_pmg(void)
+-{
+-	u32 pmg = ffs(pmg_free_map);
+-
+-	if (pmg == 0)
+-		return -ENOSPC;
+-
+-	pmg--;
+-	pmg_free_map &= ~(1 << pmg);
+-
+-	return pmg;
+-}
+-
+-static void free_pmg(u32 pmg)
+-{
+-	pmg_free_map |= 1 << pmg;
+-}
+-
+-int alloc_rmid(void)
+-{
+-	return alloc_pmg();
+-}
+-
+-void free_rmid(u32 id)
+-{
+-	free_pmg(id);
+-}
+-
+ /*
+  * A simple LRU monitor allocation machanism, each
+  * monitor free map occupies two section, one for
+diff --git a/arch/arm64/kernel/mpam/mpam_resctrl.c b/arch/arm64/kernel/mpam/mpam_resctrl.c
+index f23bd231cc33..5550887d366a 100644
+--- a/arch/arm64/kernel/mpam/mpam_resctrl.c
++++ b/arch/arm64/kernel/mpam/mpam_resctrl.c
+@@ -476,8 +476,8 @@ common_wrmon(struct rdt_domain *d, void *md_priv)
+  *   limited as the number of resources grows.
+  */
+ 
+-static unsigned long *intpartid_free_map, *reqpartid_free_map;
+ static int num_intpartid, num_reqpartid;
++static unsigned long *intpartid_free_map;
+ 
+ static void mpam_resctrl_closid_collect(void)
+ {
+@@ -513,83 +513,435 @@ static void mpam_resctrl_closid_collect(void)
+ 	}
+ }
+ 
+-static inline int local_closid_bitmap_init(int bits_num, unsigned long **ptr)
++int closid_bitmap_init(void)
+ {
+ 	int pos;
+ 	u32 times, flag;
++	u32 bits_num;
+ 
++	mpam_resctrl_closid_collect();
++	bits_num = num_intpartid;
+ 	hw_alloc_times_validate(times, flag);
++	bits_num = rounddown(bits_num, times);
++	if (!bits_num)
++		return -EINVAL;
+ 
+-	if (flag)
+-		bits_num = rounddown(bits_num, 2);
++	if (intpartid_free_map)
++		kfree(intpartid_free_map);
+ 
+-	if (!*ptr) {
+-		*ptr = bitmap_zalloc(bits_num, GFP_KERNEL);
+-		if (!*ptr)
+-			return -ENOMEM;
+-	}
++	intpartid_free_map = bitmap_zalloc(bits_num, GFP_KERNEL);
++	if (!intpartid_free_map)
++		return -ENOMEM;
+ 
+-	bitmap_set(*ptr, 0, bits_num);
++	bitmap_set(intpartid_free_map, 0, bits_num);
+ 
+ 	/* CLOSID 0 is always reserved for the default group */
+-	pos = find_first_bit(*ptr, bits_num);
+-	bitmap_clear(*ptr, pos, times);
++	pos = find_first_bit(intpartid_free_map, bits_num);
++	bitmap_clear(intpartid_free_map, pos, times);
+ 
+ 	return 0;
+ }
+ 
+-int closid_bitmap_init(void)
++/**
++ * struct rmid_transform - Matrix for transforming rmid to partid and pmg
++ * @rows:           Number of bits for remap_body[:] bitmap
++ * @clos:           Number of bitmaps
++ * @nr_usage:       Number rmid we have
++ * @stride:         Step stride from transforming rmid to partid and pmg
++ * @remap_body:     Storing bitmaps' entry and itself
++ * @remap_enabled:  Does remap_body init done
++ */
++struct rmid_transform {
++	u32 rows;
++	u32 cols;
++	u32 nr_usage;
++	int stride;
++	unsigned long **remap_body;
++	bool remap_enabled;
++};
++static struct rmid_transform rmid_remap_matrix;
++
++/*
++ * a rmid remap matrix is delivered for transforming partid pmg to rmid,
++ * this matrix is organized like this:
++ *
++ *                  [bitmap entry indexed by partid]
++ *
++ *                  [0]   [1]  [2]  [3]   [4]  [5]
++ *             occ   1     0    0    1     1    1
++ *      bitmap[:0]   1     0    0    1     1    1
++ *      bitmap[:1]   1     1    1    1     1    1
++ *      bitmap[:2]   1     1    1    1     1    1
++ *     [pos is pmg]
++ *
++ * Calculate rmid = partid + NR_partid * pmg
++ *
++ * occ represents if this bitmap has been used by a partid, it is because
++ * a certain partid should not be accompany with a duplicated pmg for
++ * monitoring, this design easily saves a lot of space, and can also decrease
++ * time complexity of allocating and free rmid process from O(NR_partid)*
++ * O(NR_pmg) to O(NR_partid) + O(log(NR_pmg)) compared with using list.
++ */
++static int set_rmid_remap_matrix(u32 rows, u32 cols)
+ {
+-	int ret;
++	u32 times, flag;
++	int ret, col;
+ 
+-	mpam_resctrl_closid_collect();
+-	if (!num_intpartid || !num_reqpartid)
++	/*
++	 * cols stands for partid, so if cdp enabled we must
++	 * keep at least two partid for LxCODE and LxDATA
++	 * respectively once time.
++	 */
++	hw_alloc_times_validate(times, flag);
++	rmid_remap_matrix.cols = rounddown(cols, times);
++	rmid_remap_matrix.stride = times;
++	if (times > rmid_remap_matrix.cols)
+ 		return -EINVAL;
+ 
+-	if (intpartid_free_map)
+-		kfree(intpartid_free_map);
+-	if (reqpartid_free_map)
+-		kfree(reqpartid_free_map);
++	/*
++	 * first row of rmid remap matrix is used for indicating
++	 * if remap bitmap is occupied by a col index.
++	 */
++	rmid_remap_matrix.rows = rows + 1;
++
++	if (rows == 0 || cols == 0)
++		return -EINVAL;
++
++	rmid_remap_matrix.nr_usage = rows * cols;
++
++	/* free history pointer for matrix recreation */
++	if (rmid_remap_matrix.remap_body) {
++		for (col = 0; col < cols; col++) {
++			if (!rmid_remap_matrix.remap_body[col])
++				continue;
++			kfree(rmid_remap_matrix.remap_body[col]);
++		}
++		kfree(rmid_remap_matrix.remap_body);
++	}
++
++	rmid_remap_matrix.remap_body = kcalloc(rmid_remap_matrix.cols,
++			sizeof(*rmid_remap_matrix.remap_body), GFP_KERNEL);
++	if (!rmid_remap_matrix.remap_body)
++		return -ENOMEM;
++
++	for (col = 0; col < cols; col++) {
++		if (rmid_remap_matrix.remap_body[col])
++			kfree(rmid_remap_matrix.remap_body[col]);
++
++		rmid_remap_matrix.remap_body[col] =
++				bitmap_zalloc(rmid_remap_matrix.rows,
++				GFP_KERNEL);
++		if (!rmid_remap_matrix.remap_body[col]) {
++			ret = -ENOMEM;
++			goto clean;
++		}
++
++		bitmap_set(rmid_remap_matrix.remap_body[col],
++				0, rmid_remap_matrix.rows);
++	}
++
++	rmid_remap_matrix.remap_enabled = 1;
++
++	return 0;
++clean:
++	for (col = 0; col < cols; col++) {
++		if (!rmid_remap_matrix.remap_body[col])
++			continue;
++		kfree(rmid_remap_matrix.remap_body[col]);
++		rmid_remap_matrix.remap_body[col] = NULL;
++	}
++	if (rmid_remap_matrix.remap_body) {
++		kfree(rmid_remap_matrix.remap_body);
++		rmid_remap_matrix.remap_body = NULL;
++	}
++
++	return ret;
++}
++
++static u32 probe_rmid_remap_matrix_cols(void)
++{
++	return (u32)num_reqpartid;
++}
++
++static u32 probe_rmid_remap_matrix_rows(void)
++{
++	return (u32)mpam_sysprops_num_pmg();
++}
++
++static inline unsigned long **__rmid_remap_bmp(int col)
++{
++	if (!rmid_remap_matrix.remap_enabled)
++		return NULL;
++
++	if ((u32)col >= rmid_remap_matrix.cols)
++		return NULL;
++
++	return rmid_remap_matrix.remap_body + col;
++}
++
++#define for_each_rmid_remap_bmp(bmp)	\
++	for (bmp = __rmid_remap_bmp(0);	\
++		bmp <= __rmid_remap_bmp(rmid_remap_matrix.cols - 1); \
++		bmp++)
++
++#define for_each_valid_rmid_remap_bmp(bmp)	\
++		for_each_rmid_remap_bmp(bmp)	\
++			if (bmp && *bmp)
++
++#define STRIDE_CHK(stride)	\
++		(stride == rmid_remap_matrix.stride)
++
++#define STRIDE_INC_CHK(stride)	\
++		(++stride == rmid_remap_matrix.stride)
++
++#define STRIDE_CHK_AND_WARN(stride)	\
++do {	\
++	if (!STRIDE_CHK(stride))	\
++		WARN_ON_ONCE("Unexpected stride\n");	\
++} while (0)
++
++static void set_rmid_remap_bmp_occ(unsigned long *bmp)
++{
++	clear_bit(0, bmp);
++}
++
++static void unset_rmid_remap_bmp_occ(unsigned long *bmp)
++{
++	set_bit(0, bmp);
++}
++
++static void rmid_remap_bmp_bdr_set(unsigned long *bmp, int b)
++{
++	set_bit(b + 1, bmp);
++}
+ 
+-	ret = local_closid_bitmap_init(num_intpartid, &intpartid_free_map);
++static void rmid_remap_bmp_bdr_clear(unsigned long *bmp, int b)
++{
++	clear_bit(b + 1, bmp);
++}
++
++static int is_rmid_remap_bmp_occ(unsigned long *bmp)
++{
++	return (find_first_bit(bmp, rmid_remap_matrix.rows) == 0) ? 0 : 1;
++}
++
++static int is_rmid_remap_bmp_full(unsigned long *bmp)
++{
++	return ((is_rmid_remap_bmp_occ(bmp) &&
++			bitmap_weight(bmp, rmid_remap_matrix.rows) ==
++			(rmid_remap_matrix.rows-1)) ||
++			bitmap_full(bmp, rmid_remap_matrix.rows));
++}
++
++static int rmid_remap_bmp_alloc_pmg(unsigned long *bmp)
++{
++	int pos;
++
++	pos = find_first_bit(bmp, rmid_remap_matrix.rows);
++	if (pos == rmid_remap_matrix.rows)
++		return -ENOSPC;
++
++	clear_bit(pos, bmp);
++	return pos - 1;
++}
++
++static int rmid_remap_matrix_init(void)
++{
++	int stride = 0;
++	int ret;
++	u32 cols, rows;
++	unsigned long **bmp;
++
++	cols = probe_rmid_remap_matrix_cols();
++	rows = probe_rmid_remap_matrix_rows();
++
++	ret = set_rmid_remap_matrix(rows, cols);
+ 	if (ret)
+ 		goto out;
+ 
+-	ret = local_closid_bitmap_init(num_reqpartid, &reqpartid_free_map);
++	/*
++	 * if CDP disabled, drop partid = 0, pmg = 0
++	 * from bitmap for root resctrl group reserving
++	 * default rmid, otherwise drop partid = 0 and
++	 * partid = 1 for LxCACHE, LxDATA reservation.
++	 */
++	for_each_valid_rmid_remap_bmp(bmp) {
++		set_rmid_remap_bmp_occ(*bmp);
++		rmid_remap_bmp_bdr_clear(*bmp, 0);
++		if (STRIDE_INC_CHK(stride))
++			break;
++	}
++
++	STRIDE_CHK_AND_WARN(stride);
++
++	return 0;
++
++out:
++	return ret;
++}
++
++int resctrl_id_init(void)
++{
++	int ret;
++
++	ret = closid_bitmap_init();
+ 	if (ret)
+-		goto out;
++		return ret;
++
++	ret = rmid_remap_matrix_init();
++	if (ret)
++		return ret;
++
++	mon_init();
+ 
+ 	return 0;
++}
++
++static int is_rmid_valid(int rmid)
++{
++	return ((u32)rmid >= rmid_remap_matrix.nr_usage) ? 0 : 1;
++}
++
++static int to_rmid(int partid, int pmg)
++{
++	return (partid + (rmid_remap_matrix.cols * pmg));
++}
++
++static int rmid_to_partid_pmg(int rmid, int *partid, int *pmg)
++{
++	if (!is_rmid_valid(rmid))
++		return -EINVAL;
++
++	if (pmg)
++		*pmg = rmid / rmid_remap_matrix.cols;
++	if (partid)
++		*partid = rmid % rmid_remap_matrix.cols;
++	return 0;
++}
++
++static int __rmid_alloc(int partid)
++{
++	int stride = 0;
++	int partid_sel = 0;
++	int ret, pmg;
++	int rmid[2] = {-1, -1};
++	unsigned long **cmp, **bmp;
++
++	if (partid >= 0) {
++		cmp = __rmid_remap_bmp(partid);
++		if (!cmp) {
++			ret = -EINVAL;
++			goto out;
++		}
++		for_each_valid_rmid_remap_bmp(bmp) {
++			if (bmp < cmp)
++				continue;
++			set_rmid_remap_bmp_occ(*bmp);
++
++			ret = rmid_remap_bmp_alloc_pmg(*bmp);
++			if (ret < 0)
++				goto out;
++			pmg = ret;
++			rmid[stride] = to_rmid(partid + stride, pmg);
++			if (STRIDE_INC_CHK(stride))
++				break;
++		}
++	} else {
++		for_each_valid_rmid_remap_bmp(bmp) {
++			partid_sel++;
++
++			if (is_rmid_remap_bmp_occ(*bmp))
++				continue;
++			set_rmid_remap_bmp_occ(*bmp);
++
++			ret = rmid_remap_bmp_alloc_pmg(*bmp);
++			if (ret < 0)
++				goto out;
++			pmg = ret;
++			rmid[stride] = to_rmid(partid_sel - 1, pmg);
++			if (STRIDE_INC_CHK(stride))
++				break;
++		}
++	}
++
++	if (!STRIDE_CHK(stride)) {
++		ret = -ENOSPC;
++		goto out;
++	}
++
++	return rmid[0];
++
+ out:
++	rmid_free(rmid[0]);
+ 	return ret;
+ }
+ 
++int rmid_alloc(int partid)
++{
++	return __rmid_alloc(partid);
++}
++
++void rmid_free(int rmid)
++{
++	int stride = 0;
++	int partid, pmg;
++	unsigned long **bmp, **cmp;
++
++	if (rmid_to_partid_pmg(rmid, &partid, &pmg))
++		return;
++
++	cmp = __rmid_remap_bmp(partid);
++	if (!cmp)
++		return;
++
++	for_each_valid_rmid_remap_bmp(bmp) {
++		if (bmp < cmp)
++			continue;
++
++		rmid_remap_bmp_bdr_set(*bmp, pmg);
++
++		if (is_rmid_remap_bmp_full(*bmp))
++			unset_rmid_remap_bmp_occ(*bmp);
++
++		if (STRIDE_INC_CHK(stride))
++			break;
++	}
++
++	STRIDE_CHK_AND_WARN(stride);
++}
++
++int mpam_rmid_to_partid_pmg(int rmid, int *partid, int *pmg)
++{
++	return rmid_to_partid_pmg(rmid, partid, pmg);
++}
++EXPORT_SYMBOL(mpam_rmid_to_partid_pmg);
++
+ /*
+  * If cdp enabled, allocate two closid once time, then return first
+  * allocated id.
+  */
+-static int closid_bitmap_alloc(int bits_num, unsigned long *ptr)
++int closid_alloc(void)
+ {
+ 	int pos;
+ 	u32 times, flag;
+ 
+ 	hw_alloc_times_validate(times, flag);
+ 
+-	pos = find_first_bit(ptr, bits_num);
+-	if (pos == bits_num)
++	pos = find_first_bit(intpartid_free_map, num_intpartid);
++	if (pos == num_intpartid)
+ 		return -ENOSPC;
+ 
+-	bitmap_clear(ptr, pos, times);
++	bitmap_clear(intpartid_free_map, pos, times);
+ 
+ 	return pos;
+ }
+ 
+-static void closid_bitmap_free(int pos, unsigned long *ptr)
++void closid_free(int closid)
+ {
+ 	u32 times, flag;
+ 
+ 	hw_alloc_times_validate(times, flag);
+-	bitmap_set(ptr, pos, times);
++	bitmap_set(intpartid_free_map, closid, times);
+ }
+ 
+ /*
+@@ -773,8 +1125,8 @@ void update_cpu_closid_rmid(void *info)
+ 	struct rdtgroup *r = info;
+ 
+ 	if (r) {
+-		this_cpu_write(pqr_state.default_closid, r->closid.reqpartid);
+-		this_cpu_write(pqr_state.default_rmid, r->mon.rmid);
++		this_cpu_write(pqr_state.default_closid, resctrl_navie_closid(r->closid));
++		this_cpu_write(pqr_state.default_rmid, resctrl_navie_rmid(r->mon.rmid));
+ 	}
+ 
+ 	/*
+@@ -868,15 +1220,12 @@ int __resctrl_group_move_task(struct task_struct *tsk,
+ 		 * their parent CTRL group.
+ 		 */
+ 		if (rdtgrp->type == RDTCTRL_GROUP) {
+-			tsk->closid = TASK_CLOSID_SET(rdtgrp->closid.intpartid,
+-				rdtgrp->closid.reqpartid);
+-			tsk->rmid = rdtgrp->mon.rmid;
++			tsk->closid = resctrl_navie_closid(rdtgrp->closid);
++			tsk->rmid = resctrl_navie_rmid(rdtgrp->mon.rmid);
+ 		} else if (rdtgrp->type == RDTMON_GROUP) {
+-			if (rdtgrp->mon.parent->closid.intpartid ==
+-				TASK_CLOSID_PR_GET(tsk->closid)) {
+-				tsk->closid = TASK_CLOSID_SET(rdtgrp->closid.intpartid,
+-					rdtgrp->closid.reqpartid);
+-				tsk->rmid = rdtgrp->mon.rmid;
++			if (rdtgrp->mon.parent->closid.intpartid == tsk->closid) {
++				tsk->closid = resctrl_navie_closid(rdtgrp->closid);
++				tsk->rmid = resctrl_navie_rmid(rdtgrp->mon.rmid);
+ 			} else {
+ 				rdt_last_cmd_puts("Can't move task to different control group\n");
+ 				ret = -EINVAL;
+@@ -1274,13 +1623,10 @@ static void show_resctrl_tasks(struct rdtgroup *r, struct seq_file *s)
+ 	rcu_read_lock();
+ 	for_each_process_thread(p, t) {
+ 		if ((r->type == RDTMON_GROUP &&
+-			TASK_CLOSID_CUR_GET(t->closid) == r->closid.reqpartid &&
+-			t->rmid == r->mon.rmid) ||
++			t->rmid == resctrl_navie_rmid(r->mon.rmid)) ||
+ 			(r->type == RDTCTRL_GROUP &&
+-			TASK_CLOSID_PR_GET(t->closid) == r->closid.intpartid))
+-			seq_printf(s, "group:(gid:%d mon:%d) task:(pid:%d gid:%d rmid:%d)\n",
+-				r->closid.reqpartid, r->mon.mon, t->pid,
+-				(int)TASK_CLOSID_CUR_GET(t->closid), t->rmid);
++			t->closid == resctrl_navie_closid(r->closid)))
++			seq_printf(s, "%d\n", t->pid);
+ 	}
+ 	rcu_read_unlock();
+ }
+@@ -1431,9 +1777,11 @@ int __init mpam_resctrl_init(void)
+ void __mpam_sched_in(void)
+ {
+ 	struct intel_pqr_state *state = this_cpu_ptr(&pqr_state);
+-	u64 closid = state->default_closid;
+ 	u64 partid_d, partid_i;
+-	u64 pmg = state->default_rmid;
++	u64 rmid = state->default_rmid;
++	u64 closid = state->default_closid;
++	u64 reqpartid = 0;
++	u64 pmg = 0;
+ 
+ 	/*
+ 	 * If this task has a closid/rmid assigned, use it.
+@@ -1441,35 +1789,28 @@ void __mpam_sched_in(void)
+ 	 */
+ 	if (static_branch_likely(&resctrl_alloc_enable_key)) {
+ 		if (current->closid)
+-			closid = TASK_CLOSID_CUR_GET(current->closid);
++			closid = current->closid;
+ 	}
+ 
+ 	if (static_branch_likely(&resctrl_mon_enable_key)) {
+ 		if (current->rmid)
+-			pmg = current->rmid;
++			rmid = current->rmid;
+ 	}
+ 
+-	if (closid != state->cur_closid || pmg != state->cur_rmid) {
++	if (closid != state->cur_closid || rmid != state->cur_rmid) {
+ 		u64 reg;
+ 
++		resctrl_navie_rmid_partid_pmg(rmid, (int *)&reqpartid, (int *)&pmg);
++
+ 		if (resctrl_cdp_enabled) {
+ 			hw_closid_t hw_closid;
+ 
+-			resctrl_cdp_map(clos, closid, CDP_DATA, hw_closid);
++			resctrl_cdp_map(clos, reqpartid, CDP_DATA, hw_closid);
+ 			partid_d = hw_closid_val(hw_closid);
+ 
+-			resctrl_cdp_map(clos, closid, CDP_CODE, hw_closid);
++			resctrl_cdp_map(clos, reqpartid, CDP_CODE, hw_closid);
+ 			partid_i = hw_closid_val(hw_closid);
+ 
+-			/*
+-			 * when cdp enabled, we use partid_i to label cur_closid
+-			 * of cpu state instead of partid_d, because each task/
+-			 * rdtgrp's closid is labeled by CDP_BOTH/CDP_CODE but not
+-			 * CDP_DATA.
+-			 */
+-			state->cur_closid = partid_i;
+-			state->cur_rmid = pmg;
+-
+ 			/* set in EL0 */
+ 			reg = mpam_read_sysreg_s(SYS_MPAM0_EL1, "SYS_MPAM0_EL1");
+ 			reg = PARTID_D_SET(reg, partid_d);
+@@ -1484,21 +1825,21 @@ void __mpam_sched_in(void)
+ 			reg = PMG_SET(reg, pmg);
+ 			mpam_write_sysreg_s(reg, SYS_MPAM1_EL1, "SYS_MPAM1_EL1");
+ 		} else {
+-			state->cur_closid = closid;
+-			state->cur_rmid = pmg;
+-
+ 			/* set in EL0 */
+ 			reg = mpam_read_sysreg_s(SYS_MPAM0_EL1, "SYS_MPAM0_EL1");
+-			reg = PARTID_SET(reg, closid);
++			reg = PARTID_SET(reg, reqpartid);
+ 			reg = PMG_SET(reg, pmg);
+ 			mpam_write_sysreg_s(reg, SYS_MPAM0_EL1, "SYS_MPAM0_EL1");
+ 
+ 			/* set in EL1 */
+ 			reg = mpam_read_sysreg_s(SYS_MPAM1_EL1, "SYS_MPAM1_EL1");
+-			reg = PARTID_SET(reg, closid);
++			reg = PARTID_SET(reg, reqpartid);
+ 			reg = PMG_SET(reg, pmg);
+ 			mpam_write_sysreg_s(reg, SYS_MPAM1_EL1, "SYS_MPAM1_EL1");
+ 		}
++
++		state->cur_rmid = rmid;
++		state->cur_closid = closid;
+ 	}
+ }
+ 
+@@ -1665,36 +2006,3 @@ u16 mpam_resctrl_max_mon_num(void)
+ 
+ 	return mon_num;
+ }
+-
+-int resctrl_id_init(void)
+-{
+-	int ret;
+-
+-	ret = closid_bitmap_init();
+-	if (ret)
+-		goto out;
+-
+-	pmg_init();
+-	mon_init();
+-
+-out:
+-	return ret;
+-}
+-
+-int resctrl_id_alloc(enum closid_type type)
+-{
+-	if (type == CLOSID_INT)
+-		return closid_bitmap_alloc(num_intpartid, intpartid_free_map);
+-	else if (type == CLOSID_REQ)
+-		return closid_bitmap_alloc(num_reqpartid, reqpartid_free_map);
+-
+-	return -ENOSPC;
+-}
+-
+-void resctrl_id_free(enum closid_type type, int id)
+-{
+-	if (type == CLOSID_INT)
+-		return closid_bitmap_free(id, intpartid_free_map);
+-	else if (type == CLOSID_REQ)
+-		return closid_bitmap_free(id, reqpartid_free_map);
+-}
+diff --git a/fs/resctrlfs.c b/fs/resctrlfs.c
+index ce0c7511b10d..b1c8e4f10415 100644
+--- a/fs/resctrlfs.c
++++ b/fs/resctrlfs.c
+@@ -40,6 +40,7 @@
+ 
+ #include <uapi/linux/magic.h>
+ 
++#include <asm/mpam.h>
+ #include <asm/resctrl.h>
+ 
+ DEFINE_STATIC_KEY_FALSE(resctrl_enable_key);
+@@ -343,25 +344,17 @@ mongroup_create_dir(struct kernfs_node *parent_kn, struct resctrl_group *prgrp,
+ 	return ret;
+ }
+ 
+-static inline void free_mon_id(struct resctrl_group *rdtgrp)
+-{
+-	if (rdtgrp->mon.rmid)
+-		free_rmid(rdtgrp->mon.rmid);
+-	else if (rdtgrp->closid.reqpartid)
+-		resctrl_id_free(CLOSID_REQ, rdtgrp->closid.reqpartid);
+-}
+-
+ static void mkdir_mondata_all_prepare_clean(struct resctrl_group *prgrp)
+ {
+ 	if (prgrp->type == RDTCTRL_GROUP && prgrp->closid.intpartid)
+-		resctrl_id_free(CLOSID_INT, prgrp->closid.intpartid);
+-	free_mon_id(prgrp);
++		closid_free(prgrp->closid.intpartid);
++	rmid_free(prgrp->mon.rmid);
+ }
+ 
+ static int mkdir_mondata_all_prepare(struct resctrl_group *rdtgrp)
+ {
+ 	int ret = 0;
+-	int mon, rmid, reqpartid;
++	int mon;
+ 	struct resctrl_group *prgrp;
+ 
+ 	mon = resctrl_lru_request_mon();
+@@ -372,39 +365,8 @@ static int mkdir_mondata_all_prepare(struct resctrl_group *rdtgrp)
+ 	}
+ 	rdtgrp->mon.mon = mon;
+ 
+-	prgrp = rdtgrp->mon.parent;
+-
+ 	if (rdtgrp->type == RDTMON_GROUP) {
+-		/*
+-		 * this for mon id allocation, for mpam, rmid
+-		 * (pmg) is just reserved for creating monitoring
+-		 * group, it has the same effect with reqpartid
+-		 * (reqpartid) except for config allocation, but
+-		 * for some fuzzy reasons, we keep it until spec
+-		 * changes. We also allocate rmid first if it's
+-		 * available.
+-		 */
+-		rmid = alloc_rmid();
+-		if (rmid < 0) {
+-			reqpartid = resctrl_id_alloc(CLOSID_REQ);
+-			if (reqpartid < 0) {
+-				rdt_last_cmd_puts("out of closID\n");
+-				ret = -EINVAL;
+-				goto out;
+-			}
+-			rdtgrp->closid.reqpartid = reqpartid;
+-			rdtgrp->mon.rmid = 0;
+-		} else {
+-			/*
+-			 * this time copy reqpartid from father group,
+-			 * as rmid is sufficient to monitoring.
+-			 */
+-			rdtgrp->closid.reqpartid = prgrp->closid.reqpartid;
+-			rdtgrp->mon.rmid = rmid;
+-		}
+-		/*
+-		 * establish relationship from ctrl to mon group.
+-		 */
++		prgrp = rdtgrp->mon.parent;
+ 		rdtgrp->closid.intpartid = prgrp->closid.intpartid;
+ 	}
+ 
+@@ -539,7 +501,7 @@ static int resctrl_get_tree(struct fs_context *fc)
+ static inline bool
+ is_task_match_resctrl_group(struct task_struct *t, struct resctrl_group *r)
+ {
+-	return (TASK_CLOSID_PR_GET(t->closid) == r->closid.intpartid);
++	return (t->closid == r->closid.intpartid);
+ }
+ 
+ /*
+@@ -558,9 +520,8 @@ static void resctrl_move_group_tasks(struct resctrl_group *from, struct resctrl_
+ 	read_lock(&tasklist_lock);
+ 	for_each_process_thread(p, t) {
+ 		if (!from || is_task_match_resctrl_group(t, from)) {
+-			t->closid = TASK_CLOSID_SET(to->closid.intpartid,
+-				to->closid.reqpartid);
+-			t->rmid = to->mon.rmid;
++			t->closid = resctrl_navie_closid(to->closid);
++			t->rmid = resctrl_navie_rmid(to->mon.rmid);
+ 
+ #ifdef CONFIG_SMP
+ 			/*
+@@ -588,7 +549,7 @@ static void free_all_child_rdtgrp(struct resctrl_group *rdtgrp)
+ 	head = &rdtgrp->mon.crdtgrp_list;
+ 	list_for_each_entry_safe(sentry, stmp, head, mon.crdtgrp_list) {
+ 		/* rmid may not be used */
+-		free_mon_id(sentry);
++		rmid_free(sentry->mon.rmid);
+ 		list_del(&sentry->mon.crdtgrp_list);
+ 		kfree(sentry);
+ 	}
+@@ -620,7 +581,7 @@ static void rmdir_all_sub(void)
+ 		cpumask_or(&resctrl_group_default.cpu_mask,
+ 			   &resctrl_group_default.cpu_mask, &rdtgrp->cpu_mask);
+ 
+-		free_mon_id(rdtgrp);
++		rmid_free(rdtgrp->mon.rmid);
+ 
+ 		kernfs_remove(rdtgrp->kn);
+ 		list_del(&rdtgrp->resctrl_group_list);
+@@ -701,6 +662,46 @@ static struct file_system_type resctrl_fs_type = {
+ 	.kill_sb                = resctrl_kill_sb,
+ };
+ 
++static int find_rdtgrp_allocable_rmid(struct resctrl_group *rdtgrp)
++{
++	int ret, rmid, reqpartid;
++	struct resctrl_group *prgrp, *entry;
++	struct list_head *head;
++
++	prgrp = rdtgrp->mon.parent;
++	if (prgrp == &resctrl_group_default) {
++		rmid = rmid_alloc(-1);
++		if (rmid < 0)
++			return rmid;
++	} else {
++		do {
++			rmid = rmid_alloc(prgrp->closid.reqpartid);
++			if (rmid >= 0)
++				break;
++
++			head = &prgrp->mon.crdtgrp_list;
++			list_for_each_entry(entry, head, mon.crdtgrp_list) {
++				if (entry == rdtgrp)
++					continue;
++				rmid = rmid_alloc(entry->closid.reqpartid);
++				if (rmid >= 0)
++					break;
++			}
++		} while (0);
++	}
++
++	if (rmid < 0)
++		rmid = rmid_alloc(-1);
++
++	ret = mpam_rmid_to_partid_pmg(rmid, &reqpartid, NULL);
++	if (ret)
++		return ret;
++	rdtgrp->mon.rmid = rmid;
++	rdtgrp->closid.reqpartid = reqpartid;
++
++	return rmid;
++}
++
+ static int mkdir_resctrl_prepare(struct kernfs_node *parent_kn,
+ 			     struct kernfs_node *prgrp_kn,
+ 			     const char *name, umode_t mode,
+@@ -737,21 +738,21 @@ static int mkdir_resctrl_prepare(struct kernfs_node *parent_kn,
+ 	 * getting monitoring for child mon groups.
+ 	 */
+ 	if (rdtgrp->type == RDTCTRL_GROUP) {
+-		ret = resctrl_id_alloc(CLOSID_INT);
++		ret = closid_alloc();
+ 		if (ret < 0) {
+ 			rdt_last_cmd_puts("out of CLOSIDs\n");
+ 			goto out_unlock;
+ 		}
+ 		rdtgrp->closid.intpartid = ret;
+-		ret = resctrl_id_alloc(CLOSID_REQ);
+-		if (ret < 0) {
+-			rdt_last_cmd_puts("out of SLAVE CLOSIDs\n");
+-			goto out_unlock;
+-		}
+-		rdtgrp->closid.reqpartid = ret;
+-		ret = 0;
+ 	}
+ 
++	ret = find_rdtgrp_allocable_rmid(rdtgrp);
++	if (ret < 0) {
++		rdt_last_cmd_puts("out of RMIDs\n");
++		goto out_free_closid;
++	}
++	rdtgrp->mon.rmid = ret;
++
+ 	INIT_LIST_HEAD(&rdtgrp->mon.crdtgrp_list);
+ 
+ 	/* kernfs creates the directory for rdtgrp */
+@@ -759,7 +760,7 @@ static int mkdir_resctrl_prepare(struct kernfs_node *parent_kn,
+ 	if (IS_ERR(kn)) {
+ 		ret = PTR_ERR(kn);
+ 		rdt_last_cmd_puts("kernfs create error\n");
+-		goto out_free_rgrp;
++		goto out_free_rmid;
+ 	}
+ 	rdtgrp->kn = kn;
+ 
+@@ -808,8 +809,12 @@ static int mkdir_resctrl_prepare(struct kernfs_node *parent_kn,
+ 	mkdir_mondata_all_prepare_clean(rdtgrp);
+ out_destroy:
+ 	kernfs_remove(rdtgrp->kn);
+-out_free_rgrp:
++out_free_rmid:
++	rmid_free(rdtgrp->mon.rmid);
+ 	kfree(rdtgrp);
++out_free_closid:
++	if (rdtgrp->type == RDTCTRL_GROUP)
++		closid_free(rdtgrp->closid.intpartid);
+ out_unlock:
+ 	resctrl_group_kn_unlock(prgrp_kn);
+ 	return ret;
+@@ -956,9 +961,10 @@ static void resctrl_group_rm_mon(struct resctrl_group *rdtgrp,
+ 
+ 	/* Update per cpu closid and rmid of the moved CPUs first */
+ 	for_each_cpu(cpu, &rdtgrp->cpu_mask) {
+-		per_cpu(pqr_state.default_closid, cpu) = prdtgrp->closid.reqpartid;
+-		per_cpu(pqr_state.default_rmid, cpu) = prdtgrp->mon.rmid;
++		per_cpu(pqr_state.default_closid, cpu) = resctrl_navie_closid(prdtgrp->closid);
++		per_cpu(pqr_state.default_rmid, cpu) = resctrl_navie_rmid(prdtgrp->mon.rmid);
+ 	}
++
+ 	/*
+ 	 * Update the MSR on moved CPUs and CPUs which have moved
+ 	 * task running on them.
+@@ -968,7 +974,7 @@ static void resctrl_group_rm_mon(struct resctrl_group *rdtgrp,
+ 
+ 	rdtgrp->flags |= RDT_DELETED;
+ 
+-	free_mon_id(rdtgrp);
++	rmid_free(rdtgrp->mon.rmid);
+ 
+ 	/*
+ 	 * Remove the rdtgrp from the parent ctrl_mon group's list
+@@ -1006,9 +1012,9 @@ static void resctrl_group_rm_ctrl(struct resctrl_group *rdtgrp, cpumask_var_t tm
+ 	/* Update per cpu closid and rmid of the moved CPUs first */
+ 	for_each_cpu(cpu, &rdtgrp->cpu_mask) {
+ 		per_cpu(pqr_state.default_closid, cpu) =
+-			resctrl_group_default.closid.reqpartid;
++			resctrl_navie_closid(resctrl_group_default.closid);
+ 		per_cpu(pqr_state.default_rmid, cpu) =
+-			resctrl_group_default.mon.rmid;
++			resctrl_navie_rmid(resctrl_group_default.mon.rmid);
+ 	}
+ 
+ 	/*
+@@ -1019,8 +1025,8 @@ static void resctrl_group_rm_ctrl(struct resctrl_group *rdtgrp, cpumask_var_t tm
+ 	update_closid_rmid(tmpmask, NULL);
+ 
+ 	rdtgrp->flags |= RDT_DELETED;
+-	resctrl_id_free(CLOSID_INT, rdtgrp->closid.intpartid);
+-	resctrl_id_free(CLOSID_REQ, rdtgrp->closid.reqpartid);
++	closid_free(rdtgrp->closid.intpartid);
++	rmid_free(rdtgrp->mon.rmid);
+ 
+ 	/*
+ 	 * Free all the child monitor group rmids.
+-- 
+2.26.2
+

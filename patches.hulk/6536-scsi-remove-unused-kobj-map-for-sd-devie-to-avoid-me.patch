@@ -1,0 +1,131 @@
+From ecb923f0920eac832435d5e39b880c858d04c271 Mon Sep 17 00:00:00 2001
+From: Yufen Yu <yuyufen@huawei.com>
+Date: Thu, 1 Jul 2021 09:51:19 +0800
+Subject: [PATCH] scsi: remove unused kobj map for sd devie to avoid memleak
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: ecb923f0920eac832435d5e39b880c858d04c271
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 168625
+CVE: NA
+
+-------------------------------------------------
+
+After calling add_disk, we have register new kobj map for sd device,
+then we can remove old unused kobj map which probed by sd_remove.
+
+Signed-off-by: Yufen Yu <yuyufen@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Chen Jun <chenjun102@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ block/genhd.c            |  8 ++++++++
+ drivers/base/map.c       | 28 ++++++++++++++++++++++++++++
+ drivers/scsi/sd.c        |  1 +
+ include/linux/genhd.h    |  2 ++
+ include/linux/kobj_map.h |  2 ++
+ 5 files changed, 41 insertions(+)
+
+diff --git a/block/genhd.c b/block/genhd.c
+index 796baf761202..b11b70a6bab5 100644
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -663,6 +663,14 @@ void blk_unregister_region(dev_t devt, unsigned long range)
+ 
+ EXPORT_SYMBOL(blk_unregister_region);
+ 
++void blk_delete_region(dev_t devt, unsigned long range,
++			struct kobject *(*probe)(dev_t, int *, void *))
++{
++	kobj_delete(bdev_map, devt, range, probe);
++}
++
++EXPORT_SYMBOL(blk_delete_region);
++
+ static struct kobject *exact_match(dev_t devt, int *partno, void *data)
+ {
+ 	struct gendisk *p = data;
+diff --git a/drivers/base/map.c b/drivers/base/map.c
+index 5650ab2b247a..551296d48502 100644
+--- a/drivers/base/map.c
++++ b/drivers/base/map.c
+@@ -92,6 +92,34 @@ void kobj_unmap(struct kobj_map *domain, dev_t dev, unsigned long range)
+ 	kfree(found);
+ }
+ 
++void kobj_delete(struct kobj_map *domain, dev_t dev, unsigned long range,
++		kobj_probe_t *probe)
++{
++	unsigned n = MAJOR(dev + range - 1) - MAJOR(dev) + 1;
++	unsigned index = MAJOR(dev);
++	unsigned i;
++	struct probe *found = NULL;
++
++	if (n > 255)
++		n = 255;
++
++	mutex_lock(domain->lock);
++	for (i = 0; i < n; i++, index++) {
++		struct probe **s;
++		for (s = &domain->probes[index % 255]; *s; s = &(*s)->next) {
++			struct probe *p = *s;
++			if (p->dev == dev && p->range == range && p->get == probe) {
++				*s = p->next;
++				if (!found)
++					found = p;
++				break;
++			}
++		}
++	}
++	mutex_unlock(domain->lock);
++	kfree(found);
++}
++
+ struct kobject *kobj_lookup(struct kobj_map *domain, dev_t dev, int *index)
+ {
+ 	struct kobject *kobj;
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index 01f87bcab3dd..613e81daa4ab 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -3488,6 +3488,7 @@ static int sd_probe(struct device *dev)
+ 			sdp->host->hostt->rpm_autosuspend_delay);
+ 	}
+ 	device_add_disk(dev, gd, NULL);
++	blk_delete_region(disk_devt(sdkp->disk), SD_MINORS, sd_default_probe);
+ 	if (sdkp->capacity)
+ 		sd_dif_config_host(sdkp);
+ 
+diff --git a/include/linux/genhd.h b/include/linux/genhd.h
+index 03da3f603d30..f70458755828 100644
+--- a/include/linux/genhd.h
++++ b/include/linux/genhd.h
+@@ -349,6 +349,8 @@ extern void blk_register_region(dev_t devt, unsigned long range,
+ 			int (*lock)(dev_t, void *),
+ 			void *data);
+ extern void blk_unregister_region(dev_t devt, unsigned long range);
++extern void blk_delete_region(dev_t devt, unsigned long range,
++			struct kobject *(*probe)(dev_t, int *, void *));
+ 
+ #define alloc_disk_node(minors, node_id)				\
+ ({									\
+diff --git a/include/linux/kobj_map.h b/include/linux/kobj_map.h
+index c9919f8b2293..73361fe1c43a 100644
+--- a/include/linux/kobj_map.h
++++ b/include/linux/kobj_map.h
+@@ -14,6 +14,8 @@ struct kobj_map;
+ int kobj_map(struct kobj_map *, dev_t, unsigned long, struct module *,
+ 	     kobj_probe_t *, int (*)(dev_t, void *), void *);
+ void kobj_unmap(struct kobj_map *, dev_t, unsigned long);
++void kobj_delete(struct kobj_map *, dev_t, unsigned long,
++		kobj_probe_t *);
+ struct kobject *kobj_lookup(struct kobj_map *, dev_t, int *);
+ struct kobj_map *kobj_map_init(kobj_probe_t *, struct mutex *);
+ 
+-- 
+2.26.2
+

@@ -1,0 +1,138 @@
+From 3f2a8fc4b15de18644e8a80a09edda168676e22c Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Mon, 18 Jan 2021 15:12:16 +0100
+Subject: [PATCH] static_call/x86: Add __static_call_return0()
+Git-commit: 3f2a8fc4b15de18644e8a80a09edda168676e22c
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+Provide a stub function that return 0 and wire up the static call site
+patching to replace the CALL with a single 5 byte instruction that
+clears %RAX, the return value register.
+
+The function can be cast to any function pointer type that has a
+single %RAX return (including pointers). Also provide a version that
+returns an int for convenience. We are clearing the entire %RAX register
+in any case, whether the return value is 32 or 64 bits, since %RAX is
+always a scratch register anyway.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Frederic Weisbecker <frederic@kernel.org>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Link: https://lkml.kernel.org/r/20210118141223.123667-2-frederic@kernel.org
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ arch/x86/kernel/static_call.c | 17 +++++++++++++++--
+ include/linux/static_call.h   | 12 ++++++++++++
+ kernel/static_call.c          |  5 +++++
+ 3 files changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/arch/x86/kernel/static_call.c b/arch/x86/kernel/static_call.c
+index ca9a380d9c0b..9442c4136c38 100644
+--- a/arch/x86/kernel/static_call.c
++++ b/arch/x86/kernel/static_call.c
+@@ -11,14 +11,26 @@ enum insn_type {
+ 	RET = 3,  /* tramp / site cond-tail-call */
+ };
+ 
++/*
++ * data16 data16 xorq %rax, %rax - a single 5 byte instruction that clears %rax
++ * The REX.W cancels the effect of any data16.
++ */
++static const u8 xor5rax[] = { 0x66, 0x66, 0x48, 0x31, 0xc0 };
++
+ static void __ref __static_call_transform(void *insn, enum insn_type type, void *func)
+ {
++	const void *emulate = NULL;
+ 	int size = CALL_INSN_SIZE;
+ 	const void *code;
+ 
+ 	switch (type) {
+ 	case CALL:
+ 		code = text_gen_insn(CALL_INSN_OPCODE, insn, func);
++		if (func == &__static_call_return0) {
++			emulate = code;
++			code = &xor5rax;
++		}
++
+ 		break;
+ 
+ 	case NOP:
+@@ -41,7 +53,7 @@ static void __ref __static_call_transform(void *insn, enum insn_type type, void
+ 	if (unlikely(system_state == SYSTEM_BOOTING))
+ 		return text_poke_early(insn, code, size);
+ 
+-	text_poke_bp(insn, code, size, NULL);
++	text_poke_bp(insn, code, size, emulate);
+ }
+ 
+ static void __static_call_validate(void *insn, bool tail)
+@@ -54,7 +66,8 @@ static void __static_call_validate(void *insn, bool tail)
+ 			return;
+ 	} else {
+ 		if (opcode == CALL_INSN_OPCODE ||
+-		    !memcmp(insn, ideal_nops[NOP_ATOMIC5], 5))
++		    !memcmp(insn, ideal_nops[NOP_ATOMIC5], 5) ||
++		    !memcmp(insn, xor5rax, 5))
+ 			return;
+ 	}
+ 
+diff --git a/include/linux/static_call.h b/include/linux/static_call.h
+index a2c064585c03..bd6735d10e2e 100644
+--- a/include/linux/static_call.h
++++ b/include/linux/static_call.h
+@@ -142,6 +142,8 @@ extern void __static_call_update(struct static_call_key *key, void *tramp, void
+ extern int static_call_mod_init(struct module *mod);
+ extern int static_call_text_reserved(void *start, void *end);
+ 
++extern long __static_call_return0(void);
++
+ #define DEFINE_STATIC_CALL(name, _func)					\
+ 	DECLARE_STATIC_CALL(name, _func);				\
+ 	struct static_call_key STATIC_CALL_KEY(name) = {		\
+@@ -206,6 +208,11 @@ static inline int static_call_text_reserved(void *start, void *end)
+ 	return 0;
+ }
+ 
++static inline long __static_call_return0(void)
++{
++	return 0;
++}
++
+ #define EXPORT_STATIC_CALL(name)					\
+ 	EXPORT_SYMBOL(STATIC_CALL_KEY(name));				\
+ 	EXPORT_SYMBOL(STATIC_CALL_TRAMP(name))
+@@ -222,6 +229,11 @@ struct static_call_key {
+ 	void *func;
+ };
+ 
++static inline long __static_call_return0(void)
++{
++	return 0;
++}
++
+ #define DEFINE_STATIC_CALL(name, _func)					\
+ 	DECLARE_STATIC_CALL(name, _func);				\
+ 	struct static_call_key STATIC_CALL_KEY(name) = {		\
+diff --git a/kernel/static_call.c b/kernel/static_call.c
+index 84565c2a41b8..0bc11b5ce681 100644
+--- a/kernel/static_call.c
++++ b/kernel/static_call.c
+@@ -438,6 +438,11 @@ int __init static_call_init(void)
+ }
+ early_initcall(static_call_init);
+ 
++long __static_call_return0(void)
++{
++	return 0;
++}
++
+ #ifdef CONFIG_STATIC_CALL_SELFTEST
+ 
+ static int func_a(int x)
+-- 
+2.31.1
+

@@ -1,0 +1,138 @@
+From 2d7a21715f25122779e2bed17db8c57aa01e922f Mon Sep 17 00:00:00 2001
+From: Muchun Song <songmuchun@bytedance.com>
+Date: Wed, 30 Jun 2021 18:48:25 -0700
+Subject: [PATCH] mm: sparsemem: use huge PMD mapping for vmemmap pages
+Git-commit: 2d7a21715f25122779e2bed17db8c57aa01e922f
+Patch-mainline: v5.14-rc1
+References: bsn#12
+
+
+The preparation of splitting huge PMD mapping of vmemmap pages is ready,
+so switch the mapping from PTE to PMD.
+
+Link: https://lkml.kernel.org/r/20210616094915.34432-3-songmuchun@bytedance.com
+Signed-off-by: Muchun Song <songmuchun@bytedance.com>
+Reviewed-by: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Chen Huang <chenhuang5@huawei.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Xiongchun Duan <duanxiongchun@bytedance.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+[jyang: fixby euler OLK-5.10 commit 0cf76862475fc32d9a58c7bbb31b5280193ac0dd]
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ .../admin-guide/kernel-parameters.txt         |  7 ------
+ arch/x86/mm/init_64.c                         |  8 ++----
+ include/linux/hugetlb.h                       | 25 +++++--------------
+ 3 files changed, 8 insertions(+), 32 deletions(-)
+
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index 597572ceb8ba..7a7da02b3bc6 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -1572,13 +1572,6 @@
+ 			enabled.
+ 			Allows heavy hugetlb users to free up some more
+ 			memory (6 * PAGE_SIZE for each 2MB hugetlb page).
+-			This feauture is not free though. Large page
+-			tables are not used to back vmemmap pages which
+-			can lead to a performance degradation for some
+-			workloads. Also there will be memory allocation
+-			required when hugetlb pages are freed from the
+-			pool which can lead to corner cases under heavy
+-			memory pressure.
+ 			Format: { on | off (default) }
+ 
+ 			on:  enable the feature
+diff --git a/arch/x86/mm/init_64.c b/arch/x86/mm/init_64.c
+index 9d9d18d0c2a1..65ea58527176 100644
+--- a/arch/x86/mm/init_64.c
++++ b/arch/x86/mm/init_64.c
+@@ -34,7 +34,6 @@
+ #include <linux/gfp.h>
+ #include <linux/kcore.h>
+ #include <linux/bootmem_info.h>
+-#include <linux/hugetlb.h>
+ 
+ #include <asm/processor.h>
+ #include <asm/bios_ebda.h>
+@@ -1558,8 +1557,7 @@ int __meminit vmemmap_populate(unsigned long start, unsigned long end, int node,
+ {
+ 	int err;
+ 
+-	if ((is_hugetlb_free_vmemmap_enabled()  && !altmap) ||
+-	    end - start < PAGES_PER_SECTION * sizeof(struct page))
++	if (end - start < PAGES_PER_SECTION * sizeof(struct page))
+ 		err = vmemmap_populate_basepages(start, end, node, NULL);
+ 	else if (boot_cpu_has(X86_FEATURE_PSE))
+ 		err = vmemmap_populate_hugepages(start, end, node, altmap);
+@@ -1639,8 +1637,6 @@ void register_page_bootmem_memmap(unsigned long section_nr,
+ 	pmd_t *pmd;
+ 	unsigned int nr_pmd_pages;
+ 	struct page *page;
+-	bool base_mapping = !boot_cpu_has(X86_FEATURE_PSE) ||
+-			    is_hugetlb_free_vmemmap_enabled();
+ 
+ 	for (; addr < end; addr = next) {
+ 		pte_t *pte = NULL;
+@@ -1666,7 +1662,7 @@ void register_page_bootmem_memmap(unsigned long section_nr,
+ 		}
+ 		get_page_bootmem(section_nr, pud_page(*pud), MIX_SECTION_INFO);
+ 
+-		if (base_mapping) {
++		if (!boot_cpu_has(X86_FEATURE_PSE)) {
+ 			next = (addr + PAGE_SIZE) & PAGE_MASK;
+ 			pmd = pmd_offset(pud, addr);
+ 			if (pmd_none(*pmd))
+diff --git a/include/linux/hugetlb.h b/include/linux/hugetlb.h
+index cfde3bec2261..f11ba701e199 100644
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -895,20 +895,6 @@ static inline void huge_ptep_modify_prot_commit(struct vm_area_struct *vma,
+ }
+ #endif
+ 
+-#ifdef CONFIG_HUGETLB_PAGE_FREE_VMEMMAP
+-extern bool hugetlb_free_vmemmap_enabled;
+-
+-static inline bool is_hugetlb_free_vmemmap_enabled(void)
+-{
+-	return hugetlb_free_vmemmap_enabled;
+-}
+-#else
+-static inline bool is_hugetlb_free_vmemmap_enabled(void)
+-{
+-	return false;
+-}
+-#endif
+-
+ #else	/* CONFIG_HUGETLB_PAGE */
+ struct hstate {};
+ 
+@@ -1063,13 +1049,14 @@ static inline void set_huge_swap_pte_at(struct mm_struct *mm, unsigned long addr
+ 					pte_t *ptep, pte_t pte, unsigned long sz)
+ {
+ }
+-
+-static inline bool is_hugetlb_free_vmemmap_enabled(void)
+-{
+-	return false;
+-}
+ #endif	/* CONFIG_HUGETLB_PAGE */
+ 
++#ifdef CONFIG_HUGETLB_PAGE_FREE_VMEMMAP
++extern bool hugetlb_free_vmemmap_enabled;
++#else
++#define hugetlb_free_vmemmap_enabled	false
++#endif
++
+ static inline spinlock_t *huge_pte_lock(struct hstate *h,
+ 					struct mm_struct *mm, pte_t *pte)
+ {
+-- 
+2.31.1
+

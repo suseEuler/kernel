@@ -1,0 +1,275 @@
+From b0889e5779be16ba0430dc17764a0abe604ac6c1 Mon Sep 17 00:00:00 2001
+From: Yury Norov <ynorov@caviumnetworks.com>
+Date: Tue, 22 Dec 2020 06:40:51 +0000
+Subject: [PATCH] arm64: ilp32: share aarch32 syscall handlers
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: b0889e5779be16ba0430dc17764a0abe604ac6c1
+
+
+maillist inclusion
+category: feature
+bugzilla: 46790
+CVE: NA
+
+Reference: https://github.com/norov/linux/commits/ilp32-5.2
+
+--------------------------------
+
+According to userspace/kernel ABI, userspace off_t is  passed in register
+pair just like in aarch32. In this patch corresponding aarch32 handlers
+are shared to ilp32 code.
+
+Signed-off-by: Yury Norov <ynorov@caviumnetworks.com>
+Signed-off-by: Yury Norov <ynorov@marvell.com>
+Signed-off-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Acked-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Chen Jun <chenjun102@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/kernel/Makefile       |   1 +
+ arch/arm64/kernel/sys32.c        | 102 -----------------------------
+ arch/arm64/kernel/sys32_common.c | 106 +++++++++++++++++++++++++++++++
+ 3 files changed, 107 insertions(+), 102 deletions(-)
+ create mode 100644 arch/arm64/kernel/sys32_common.c
+
+diff --git a/arch/arm64/kernel/Makefile b/arch/arm64/kernel/Makefile
+index 2ffa09cbef65..79f5c37abe13 100644
+--- a/arch/arm64/kernel/Makefile
++++ b/arch/arm64/kernel/Makefile
+@@ -30,6 +30,7 @@ obj-$(CONFIG_AARCH32_EL0)			+= binfmt_elf32.o sys32.o signal32.o			\
+ obj-$(CONFIG_AARCH32_EL0)			+= sigreturn32.o
+ obj-$(CONFIG_KUSER_HELPERS)		+= kuser32.o
+ obj-$(CONFIG_ARM64_ILP32)		+= binfmt_ilp32.o
++obj-$(CONFIG_COMPAT)		+= sys32_common.o
+ obj-$(CONFIG_FUNCTION_TRACER)		+= ftrace.o entry-ftrace.o
+ obj-$(CONFIG_MODULES)			+= module.o
+ obj-$(CONFIG_ARM64_MODULE_PLTS)		+= module-plts.o
+diff --git a/arch/arm64/kernel/sys32.c b/arch/arm64/kernel/sys32.c
+index 3c3c13a9dde3..7577acaae911 100644
+--- a/arch/arm64/kernel/sys32.c
++++ b/arch/arm64/kernel/sys32.c
+@@ -20,108 +20,6 @@
+ asmlinkage long compat_sys_sigreturn(void);
+ asmlinkage long compat_sys_rt_sigreturn(void);
+ 
+-COMPAT_SYSCALL_DEFINE3(aarch32_statfs64, const char __user *, pathname,
+-		       compat_size_t, sz, struct compat_statfs64 __user *, buf)
+-{
+-	/*
+-	 * 32-bit ARM applies an OABI compatibility fixup to statfs64 and
+-	 * fstatfs64 regardless of whether OABI is in use, and therefore
+-	 * arbitrary binaries may rely upon it, so we must do the same.
+-	 * For more details, see commit:
+-	 *
+-	 * 713c481519f19df9 ("[ARM] 3108/2: old ABI compat: statfs64 and
+-	 * fstatfs64")
+-	 */
+-	if (sz == 88)
+-		sz = 84;
+-
+-	return kcompat_sys_statfs64(pathname, sz, buf);
+-}
+-
+-COMPAT_SYSCALL_DEFINE3(aarch32_fstatfs64, unsigned int, fd, compat_size_t, sz,
+-		       struct compat_statfs64 __user *, buf)
+-{
+-	/* see aarch32_statfs64 */
+-	if (sz == 88)
+-		sz = 84;
+-
+-	return kcompat_sys_fstatfs64(fd, sz, buf);
+-}
+-
+-/*
+- * Note: off_4k is always in units of 4K. If we can't do the
+- * requested offset because it is not page-aligned, we return -EINVAL.
+- */
+-COMPAT_SYSCALL_DEFINE6(aarch32_mmap2, unsigned long, addr, unsigned long, len,
+-		       unsigned long, prot, unsigned long, flags,
+-		       unsigned long, fd, unsigned long, off_4k)
+-{
+-	if (off_4k & (~PAGE_MASK >> 12))
+-		return -EINVAL;
+-
+-	off_4k >>= (PAGE_SHIFT - 12);
+-
+-	return ksys_mmap_pgoff(addr, len, prot, flags, fd, off_4k);
+-}
+-
+-#ifdef CONFIG_CPU_BIG_ENDIAN
+-#define arg_u32p(name)	u32, name##_hi, u32, name##_lo
+-#else
+-#define arg_u32p(name)	u32, name##_lo, u32, name##_hi
+-#endif
+-
+-#define arg_u64(name)	(((u64)name##_hi << 32) | name##_lo)
+-
+-COMPAT_SYSCALL_DEFINE6(aarch32_pread64, unsigned int, fd, char __user *, buf,
+-		       size_t, count, u32, __pad, arg_u32p(pos))
+-{
+-	return ksys_pread64(fd, buf, count, arg_u64(pos));
+-}
+-
+-COMPAT_SYSCALL_DEFINE6(aarch32_pwrite64, unsigned int, fd,
+-		       const char __user *, buf, size_t, count, u32, __pad,
+-		       arg_u32p(pos))
+-{
+-	return ksys_pwrite64(fd, buf, count, arg_u64(pos));
+-}
+-
+-COMPAT_SYSCALL_DEFINE4(aarch32_truncate64, const char __user *, pathname,
+-		       u32, __pad, arg_u32p(length))
+-{
+-	return ksys_truncate(pathname, arg_u64(length));
+-}
+-
+-COMPAT_SYSCALL_DEFINE4(aarch32_ftruncate64, unsigned int, fd, u32, __pad,
+-		       arg_u32p(length))
+-{
+-	return ksys_ftruncate(fd, arg_u64(length));
+-}
+-
+-COMPAT_SYSCALL_DEFINE5(aarch32_readahead, int, fd, u32, __pad,
+-		       arg_u32p(offset), size_t, count)
+-{
+-	return ksys_readahead(fd, arg_u64(offset), count);
+-}
+-
+-COMPAT_SYSCALL_DEFINE6(aarch32_fadvise64_64, int, fd, int, advice,
+-		       arg_u32p(offset), arg_u32p(len))
+-{
+-	return ksys_fadvise64_64(fd, arg_u64(offset), arg_u64(len), advice);
+-}
+-
+-COMPAT_SYSCALL_DEFINE6(aarch32_sync_file_range2, int, fd, unsigned int, flags,
+-		       arg_u32p(offset), arg_u32p(nbytes))
+-{
+-	return ksys_sync_file_range(fd, arg_u64(offset), arg_u64(nbytes),
+-				    flags);
+-}
+-
+-COMPAT_SYSCALL_DEFINE6(aarch32_fallocate, int, fd, int, mode,
+-		       arg_u32p(offset), arg_u32p(len))
+-{
+-	return ksys_fallocate(fd, mode, arg_u64(offset), arg_u64(len));
+-}
+-
+ #undef __SYSCALL
+ #define __SYSCALL(nr, sym)	asmlinkage long __arm64_##sym(const struct pt_regs *);
+ #include <asm/unistd32.h>
+diff --git a/arch/arm64/kernel/sys32_common.c b/arch/arm64/kernel/sys32_common.c
+new file mode 100644
+index 000000000000..bbf81d8991ba
+--- /dev/null
++++ b/arch/arm64/kernel/sys32_common.c
+@@ -0,0 +1,106 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include <linux/compat.h>
++#include <linux/syscalls.h>
++
++COMPAT_SYSCALL_DEFINE3(aarch32_statfs64, const char __user *, pathname,
++		       compat_size_t, sz, struct compat_statfs64 __user *, buf)
++{
++	/*
++	 * 32-bit ARM applies an OABI compatibility fixup to statfs64 and
++	 * fstatfs64 regardless of whether OABI is in use, and therefore
++	 * arbitrary binaries may rely upon it, so we must do the same.
++	 * For more details, see commit:
++	 *
++	 * 713c481519f19df9 ("[ARM] 3108/2: old ABI compat: statfs64 and
++	 * fstatfs64")
++	 */
++	if (sz == 88)
++		sz = 84;
++
++	return kcompat_sys_statfs64(pathname, sz, buf);
++}
++
++COMPAT_SYSCALL_DEFINE3(aarch32_fstatfs64, unsigned int, fd, compat_size_t, sz,
++		       struct compat_statfs64 __user *, buf)
++{
++	/* see aarch32_statfs64 */
++	if (sz == 88)
++		sz = 84;
++
++	return kcompat_sys_fstatfs64(fd, sz, buf);
++}
++
++/*
++ * Note: off_4k is always in units of 4K. If we can't do the
++ * requested offset because it is not page-aligned, we return -EINVAL.
++ */
++COMPAT_SYSCALL_DEFINE6(aarch32_mmap2, unsigned long, addr, unsigned long, len,
++		       unsigned long, prot, unsigned long, flags,
++		       unsigned long, fd, unsigned long, off_4k)
++{
++	if (off_4k & (~PAGE_MASK >> 12))
++		return -EINVAL;
++
++	off_4k >>= (PAGE_SHIFT - 12);
++
++	return ksys_mmap_pgoff(addr, len, prot, flags, fd, off_4k);
++}
++
++#ifdef CONFIG_CPU_BIG_ENDIAN
++#define arg_u32p(name)	u32, name##_hi, u32, name##_lo
++#else
++#define arg_u32p(name)	u32, name##_lo, u32, name##_hi
++#endif
++
++#define arg_u64(name)	(((u64)name##_hi << 32) | name##_lo)
++
++COMPAT_SYSCALL_DEFINE6(aarch32_pread64, unsigned int, fd, char __user *, buf,
++		       size_t, count, u32, __pad, arg_u32p(pos))
++{
++	return ksys_pread64(fd, buf, count, arg_u64(pos));
++}
++
++COMPAT_SYSCALL_DEFINE6(aarch32_pwrite64, unsigned int, fd,
++		       const char __user *, buf, size_t, count, u32, __pad,
++		       arg_u32p(pos))
++{
++	return ksys_pwrite64(fd, buf, count, arg_u64(pos));
++}
++
++COMPAT_SYSCALL_DEFINE4(aarch32_truncate64, const char __user *, pathname,
++		       u32, __pad, arg_u32p(length))
++{
++	return ksys_truncate(pathname, arg_u64(length));
++}
++
++COMPAT_SYSCALL_DEFINE4(aarch32_ftruncate64, unsigned int, fd, u32, __pad,
++		       arg_u32p(length))
++{
++	return ksys_ftruncate(fd, arg_u64(length));
++}
++
++COMPAT_SYSCALL_DEFINE5(aarch32_readahead, int, fd, u32, __pad,
++		       arg_u32p(offset), size_t, count)
++{
++	return ksys_readahead(fd, arg_u64(offset), count);
++}
++
++COMPAT_SYSCALL_DEFINE6(aarch32_fadvise64_64, int, fd, int, advice,
++		       arg_u32p(offset), arg_u32p(len))
++{
++	return ksys_fadvise64_64(fd, arg_u64(offset), arg_u64(len), advice);
++}
++
++COMPAT_SYSCALL_DEFINE6(aarch32_sync_file_range2, int, fd, unsigned int, flags,
++		       arg_u32p(offset), arg_u32p(nbytes))
++{
++	return ksys_sync_file_range(fd, arg_u64(offset), arg_u64(nbytes),
++				    flags);
++}
++
++COMPAT_SYSCALL_DEFINE6(aarch32_fallocate, int, fd, int, mode,
++		       arg_u32p(offset), arg_u32p(len))
++{
++	return ksys_fallocate(fd, mode, arg_u64(offset), arg_u64(len));
++}
+-- 
+2.26.2
+

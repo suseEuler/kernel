@@ -1,0 +1,82 @@
+From 8119d09ef0437f8484babd2ea9fcd021923d6805 Mon Sep 17 00:00:00 2001
+From: yangerkun <yangerkun@huawei.com>
+Date: Mon, 28 Jun 2021 21:26:38 +0800
+Subject: [PATCH] ext4: stop return ENOSPC from ext4_issue_zeroout
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 8119d09ef0437f8484babd2ea9fcd021923d6805
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 167373
+CVE: NA
+
+---------------------------
+
+Our testcase(briefly described as fsstress on dm thin-provisioning which
+ext4 see volume size with 100G but actual size 10G) trigger a hungtask
+bug since ext4_writepages fall into a infinite loop:
+
+static int ext4_writepages(xxx)
+{
+    ...
+   while (!done && mpd.first_page <= mpd.last_page) {
+       ...
+       ret = mpage_prepare_extent_to_map(&mpd);
+       if (!ret) {
+           ...
+           ret = mpage_map_and_submit_extent(handle,
+&mpd,&give_up_on_write);
+           <----- will return -ENOSPC
+           ...
+       }
+       ...
+       if (ret == -ENOSPC && sbi->s_journal) {
+           <------ we cannot break since we will get ENOSPC forever
+           jbd2_journal_force_commit_nested(sbi->s_journal);
+           ret = 0;
+           continue;
+       }
+       ...
+   }
+}
+
+Got ENOSPC with follow stack:
+...
+ext4_ext_map_blocks
+  ext4_ext_convert_to_initialized
+    ext4_ext_zeroout
+      ext4_issue_zeroout
+        ...
+        submit_bio_wait <-- bio to thinpool will return ENOSPC
+
+Actually the ENOSPC from thin-provisioning means that a EIO from block
+device. We need convert the err as EIO to stop confuse ext4.
+
+Signed-off-by: yangerkun <yangerkun@huawei.com>
+Reviewed-by: Zhang Yi <yi.zhang@huawei.com>
+Signed-off-by: Chen Jun <chenjun102@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/ext4/inode.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 27e896ef3f0b..63b53660dc5b 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -427,6 +427,9 @@ int ext4_issue_zeroout(struct inode *inode, ext4_lblk_t lblk, ext4_fsblk_t pblk,
+ 	if (ret > 0)
+ 		ret = 0;
+ 
++	if (ret == -ENOSPC)
++		ret = -EIO;
++
+ 	return ret;
+ }
+ 
+-- 
+2.26.2
+

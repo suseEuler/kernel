@@ -1,0 +1,204 @@
+From 3ead0c63db58659733ce00c92af02554f5c03e14 Mon Sep 17 00:00:00 2001
+From: Krzysztof Struczynski <krzysztof.struczynski@huawei.com>
+Date: Fri, 10 Sep 2021 19:59:46 +0800
+Subject: [PATCH] ima: Parse per ima namespace policy file
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 3ead0c63db58659733ce00c92af02554f5c03e14
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I49KW1
+CVE: NA
+
+--------------------------------
+
+Parse per ima namespace policy file. The path is passed as for the root
+ima namespace through the ima securityfs 'policy' entry.
+
+Signed-off-by: Krzysztof Struczynski <krzysztof.struczynski@huawei.com>
+Reviewed-by: Zhang Tianxing <zhangtianxing3@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ security/integrity/ima/ima.h        |  6 +++---
+ security/integrity/ima/ima_fs.c     | 13 +++++++------
+ security/integrity/ima/ima_policy.c | 25 +++++++++++--------------
+ 3 files changed, 21 insertions(+), 23 deletions(-)
+
+diff --git a/security/integrity/ima/ima.h b/security/integrity/ima/ima.h
+index 98a10a2d89b4..aff8a3c748bf 100644
+--- a/security/integrity/ima/ima.h
++++ b/security/integrity/ima/ima.h
+@@ -312,10 +312,10 @@ int ima_match_policy(struct inode *inode, const struct cred *cred, u32 secid,
+ void ima_init_policy(void);
+ void ima_init_ns_policy(struct ima_namespace *ima_ns,
+ 			const struct ima_policy_setup_data *policy_setup_data);
+-void ima_update_policy(void);
++void ima_update_policy(struct ima_namespace *ima_ns);
+ void ima_update_policy_flag(struct ima_namespace *ima_ns);
+-ssize_t ima_parse_add_rule(char *);
+-void ima_delete_rules(void);
++ssize_t ima_parse_add_rule(char *rule, struct ima_namespace *ima_ns);
++void ima_delete_rules(struct ima_namespace *ima_ns);
+ int ima_check_policy(const struct ima_namespace *ima_ns);
+ void *ima_policy_start(struct seq_file *m, loff_t *pos);
+ void *ima_policy_next(struct seq_file *m, void *v, loff_t *pos);
+diff --git a/security/integrity/ima/ima_fs.c b/security/integrity/ima/ima_fs.c
+index 8436729642fe..6738cfc5a3dd 100644
+--- a/security/integrity/ima/ima_fs.c
++++ b/security/integrity/ima/ima_fs.c
+@@ -328,7 +328,8 @@ static const struct file_operations ima_ascii_measurements_ops = {
+ 	.release = seq_release,
+ };
+ 
+-static ssize_t ima_read_sfs_file(char *path, struct dentry *dentry)
++static ssize_t ima_read_sfs_file(char *path, struct dentry *dentry,
++				 struct ima_namespace *ima_ns)
+ {
+ 	void *data = NULL;
+ 	char *datap;
+@@ -370,7 +371,7 @@ static ssize_t ima_read_sfs_file(char *path, struct dentry *dentry)
+ 				break;
+ 
+ 			pr_debug("rule: %s\n", p);
+-			rc = ima_parse_add_rule(p);
++			rc = ima_parse_add_rule(p, ima_ns);
+ 		} else if (dentry == digest_list_data ||
+ 			   dentry == digest_list_data_del) {
+ 			/* Only check size when adding digest lists */
+@@ -452,7 +453,7 @@ static ssize_t ima_write_data(struct file *file, const char __user *buf,
+ 		goto out_free;
+ 
+ 	if (data[0] == '/') {
+-		result = ima_read_sfs_file(data, dentry);
++		result = ima_read_sfs_file(data, dentry, ima_ns);
+ 	} else if (dentry == ima_policy) {
+ 		if (ima_ns->policy_data->ima_appraise & IMA_APPRAISE_POLICY) {
+ 			pr_err("signed policy file (specified "
+@@ -462,7 +463,7 @@ static ssize_t ima_write_data(struct file *file, const char __user *buf,
+ 					    "signed policy required", 1, 0);
+ 			result = -EACCES;
+ 		} else {
+-			result = ima_parse_add_rule(data);
++			result = ima_parse_add_rule(data, ima_ns);
+ 		}
+ 	} else if (dentry == digest_list_data) {
+ 		if (!ima_current_is_parser()) {
+@@ -593,13 +594,13 @@ static int ima_release_data_upload(struct inode *inode, struct file *file)
+ 			    "policy_update", cause, !valid_policy, 0);
+ 
+ 	if (!valid_policy) {
+-		ima_delete_rules();
++		ima_delete_rules(ima_ns);
+ 		valid_policy = 1;
+ 		clear_bit(flag, &ima_fs_flags);
+ 		return 0;
+ 	}
+ 
+-	ima_update_policy();
++	ima_update_policy(ima_ns);
+ #if !defined(CONFIG_IMA_WRITE_POLICY) && !defined(CONFIG_IMA_READ_POLICY)
+ 	securityfs_remove(ima_policy);
+ 	ima_policy = NULL;
+diff --git a/security/integrity/ima/ima_policy.c b/security/integrity/ima/ima_policy.c
+index 828793553a0e..a2f1253b46dc 100644
+--- a/security/integrity/ima/ima_policy.c
++++ b/security/integrity/ima/ima_policy.c
+@@ -858,7 +858,8 @@ static void add_rules(struct ima_namespace *ima_ns,
+ 	}
+ }
+ 
+-static int ima_parse_rule(char *rule, struct ima_rule_entry *entry);
++static int ima_parse_rule(char *rule, struct ima_rule_entry *entry,
++			  struct ima_namespace *ima_ns);
+ 
+ static int ima_init_arch_policy(void)
+ {
+@@ -888,7 +889,8 @@ static int ima_init_arch_policy(void)
+ 		result = strlcpy(rule, *rules, sizeof(rule));
+ 
+ 		INIT_LIST_HEAD(&arch_policy_entry[i].list);
+-		result = ima_parse_rule(rule, &arch_policy_entry[i]);
++		result = ima_parse_rule(rule, &arch_policy_entry[i],
++					&init_ima_ns);
+ 		if (result) {
+ 			pr_warn("Skipping unknown architecture policy rule: %s\n",
+ 				rule);
+@@ -1044,10 +1046,8 @@ int ima_check_policy(const struct ima_namespace *ima_ns)
+  * Policy rules are never deleted so ima_policy_flag gets zeroed only once when
+  * we switch from the default policy to user defined.
+  */
+-void ima_update_policy(void)
++void ima_update_policy(struct ima_namespace *ima_ns)
+ {
+-	/* Update only the current ima namespace */
+-	struct ima_namespace *ima_ns = get_current_ns();
+ 	struct list_head *policy = &ima_ns->policy_data->ima_policy_rules;
+ 
+ 	list_splice_tail_init_rcu(&ima_ns->policy_data->ima_temp_rules,
+@@ -1305,7 +1305,8 @@ static bool ima_validate_rule(struct ima_rule_entry *entry)
+ 	return true;
+ }
+ 
+-static int ima_parse_rule(char *rule, struct ima_rule_entry *entry)
++static int ima_parse_rule(char *rule, struct ima_rule_entry *entry,
++			  struct ima_namespace *ima_ns)
+ {
+ 	struct audit_buffer *ab;
+ 	char *from;
+@@ -1313,7 +1314,6 @@ static int ima_parse_rule(char *rule, struct ima_rule_entry *entry)
+ 	bool uid_token;
+ 	struct ima_template_desc *template_desc;
+ 	int result = 0;
+-	struct ima_namespace *ima_ns = get_current_ns();
+ 
+ 	ab = integrity_audit_log_start(audit_context(), GFP_KERNEL,
+ 				       AUDIT_INTEGRITY_POLICY_RULE);
+@@ -1692,19 +1692,18 @@ static int ima_parse_rule(char *rule, struct ima_rule_entry *entry)
+ /**
+  * ima_parse_add_rule - add a rule to ima_policy_rules
+  * @rule - ima measurement policy rule
++ * @ima_ns - pointer to the ima namespace the rule will be added to
+  *
+  * Avoid locking by allowing just one writer at a time in ima_write_policy()
+  * Returns the length of the rule parsed, an error code on failure
+  */
+-ssize_t ima_parse_add_rule(char *rule)
++ssize_t ima_parse_add_rule(char *rule, struct ima_namespace *ima_ns)
+ {
+ 	static const char op[] = "update_policy";
+ 	char *p;
+ 	struct ima_rule_entry *entry;
+ 	ssize_t result, len;
+ 	int audit_info = 0;
+-	/* Add rules only to the current ima namespace */
+-	struct ima_namespace *ima_ns = get_current_ns();
+ 
+ 	p = strsep(&rule, "\n");
+ 	len = strlen(p) + 1;
+@@ -1722,7 +1721,7 @@ ssize_t ima_parse_add_rule(char *rule)
+ 
+ 	INIT_LIST_HEAD(&entry->list);
+ 
+-	result = ima_parse_rule(p, entry);
++	result = ima_parse_rule(p, entry, ima_ns);
+ 	if (result) {
+ 		ima_free_rule(entry);
+ 		integrity_audit_msg(AUDIT_INTEGRITY_STATUS, NULL,
+@@ -1742,10 +1741,8 @@ ssize_t ima_parse_add_rule(char *rule)
+  * different from the active one.  There is also only one user of
+  * ima_delete_rules() at a time.
+  */
+-void ima_delete_rules(void)
++void ima_delete_rules(struct ima_namespace *ima_ns)
+ {
+-	/* Delete rules only from the current ima namespace */
+-	struct ima_namespace *ima_ns = get_current_ns();
+ 	struct ima_rule_entry *entry, *tmp;
+ 
+ 	ima_ns->policy_data->temp_ima_appraise = 0;
+-- 
+2.26.2
+

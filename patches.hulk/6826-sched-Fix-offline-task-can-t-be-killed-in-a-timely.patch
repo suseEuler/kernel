@@ -1,0 +1,151 @@
+From bf8d90ceaf043e1d2f36dc017fe1add3acd54851 Mon Sep 17 00:00:00 2001
+From: Zheng Zucheng <zhengzucheng@huawei.com>
+Date: Mon, 12 Jul 2021 20:09:42 +0800
+Subject: [PATCH] sched: Fix offline task can't be killed in a timely
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: bf8d90ceaf043e1d2f36dc017fe1add3acd54851
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I3ZX4D
+CVE: NA
+
+--------------------------------
+
+If online tasks occupy 100% CPU resources, offline tasks can't be scheduled
+since offline tasks are throttled, as a result, offline task can't timely
+respond after receiving SIGKILL signal.
+
+Signed-off-by: Zheng Zucheng <zhengzucheng@huawei.com>
+Reviewed-by: Chen Hui <judy.chenhui@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/cgroup.h |  4 ++++
+ include/linux/sched.h  |  4 ++++
+ kernel/cgroup/cgroup.c | 22 ++++++++++++++++++++++
+ kernel/sched/core.c    | 32 ++++++++++++++++++++++++++++++++
+ kernel/signal.c        |  3 +++
+ 5 files changed, 65 insertions(+)
+
+diff --git a/include/linux/cgroup.h b/include/linux/cgroup.h
+index 618838c48313..4c4f1ddc1f5f 100644
+--- a/include/linux/cgroup.h
++++ b/include/linux/cgroup.h
+@@ -959,4 +959,8 @@ static inline void cgroup_bpf_put(struct cgroup *cgrp) {}
+ 
+ #endif /* CONFIG_CGROUP_BPF */
+ 
++#ifdef CONFIG_QOS_SCHED
++void cgroup_move_task_to_root(struct task_struct *tsk);
++#endif
++
+ #endif /* _LINUX_CGROUP_H */
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 1823e541c0f7..8408622c53ee 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -2091,4 +2091,8 @@ int sched_trace_rq_nr_running(struct rq *rq);
+ 
+ const struct cpumask *sched_trace_rd_span(struct root_domain *rd);
+ 
++#ifdef CONFIG_QOS_SCHED
++void sched_move_offline_task(struct task_struct *p);
++#endif
++
+ #endif
+diff --git a/kernel/cgroup/cgroup.c b/kernel/cgroup/cgroup.c
+index adfc3bc04c0c..701ef7ba4f95 100644
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@ -2842,6 +2842,28 @@ void cgroup_procs_write_finish(struct task_struct *task, bool locked)
+ 			ss->post_attach();
+ }
+ 
++#ifdef CONFIG_QOS_SCHED
++void cgroup_move_task_to_root(struct task_struct *tsk)
++{
++	struct css_set *css;
++	struct cgroup *cpu_cgrp;
++	struct cgroup *cpu_root_cgrp;
++
++	mutex_lock(&cgroup_mutex);
++	percpu_down_write(&cgroup_threadgroup_rwsem);
++
++	spin_lock_irq(&css_set_lock);
++	css = task_css_set(tsk);
++	cpu_cgrp = css->subsys[cpu_cgrp_id]->cgroup;
++	cpu_root_cgrp = &cpu_cgrp->root->cgrp;
++	spin_unlock_irq(&css_set_lock);
++
++	(void)cgroup_attach_task(cpu_root_cgrp, tsk, false);
++	percpu_up_write(&cgroup_threadgroup_rwsem);
++	mutex_unlock(&cgroup_mutex);
++}
++#endif
++
+ static void cgroup_print_ss_mask(struct seq_file *seq, u16 ss_mask)
+ {
+ 	struct cgroup_subsys *ss;
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index d1811e56f52d..a3bd9985d801 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -7451,6 +7451,38 @@ static void sched_change_qos_group(struct task_struct *tsk, struct task_group *t
+ 		__setscheduler(rq, tsk, &attr, 0);
+ 	}
+ }
++
++struct offline_args {
++	struct work_struct work;
++	struct task_struct *p;
++};
++
++static void sched_move_work(struct work_struct *work)
++{
++	struct sched_param param = { .sched_priority = 0 };
++	struct offline_args *args = container_of(work, struct offline_args, work);
++
++	cgroup_move_task_to_root(args->p);
++	sched_setscheduler(args->p, SCHED_NORMAL, &param);
++	put_task_struct(args->p);
++	kfree(args);
++}
++
++void sched_move_offline_task(struct task_struct *p)
++{
++	struct offline_args *args;
++
++	if (unlikely(task_group(p)->qos_level != -1))
++		return;
++
++	args = kmalloc(sizeof(struct offline_args), GFP_ATOMIC);
++	if (args) {
++		get_task_struct(p);
++		args->p = p;
++		INIT_WORK(&args->work, sched_move_work);
++		queue_work(system_highpri_wq, &args->work);
++	}
++}
+ #endif
+ 
+ static inline void alloc_uclamp_sched_group(struct task_group *tg,
+diff --git a/kernel/signal.c b/kernel/signal.c
+index ef8f2a28d37c..ec83b1fbb0d3 100644
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -1047,6 +1047,9 @@ static void complete_signal(int sig, struct task_struct *p, enum pid_type type)
+ 			signal->group_stop_count = 0;
+ 			t = p;
+ 			do {
++#ifdef CONFIG_QOS_SCHED
++				sched_move_offline_task(t);
++#endif
+ 				task_clear_jobctl_pending(t, JOBCTL_PENDING_MASK);
+ 				sigaddset(&t->pending.signal, SIGKILL);
+ 				signal_wake_up(t, 1);
+-- 
+2.26.2
+

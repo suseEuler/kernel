@@ -1,0 +1,115 @@
+Git-commit: 37cbd27ef4b2abafcb79b18063b7effdb470348c
+From: Will Deacon <will@kernel.org>
+Date: Thu, 18 Mar 2021 17:07:37 +0000
+Subject: [PATCH] arm64: vdso: Avoid ISB after reading from cntvct_el0
+References: bsn#19
+Patch-mainline: v5.10.58
+
+commit 77ec462536a13d4b428a1eead725c4818a49f0b1 upstream.
+
+We can avoid the expensive ISB instruction after reading the counter in
+the vDSO gettime functions by creating a fake address hazard against a
+dummy stack read, just like we do inside the kernel.
+
+Signed-off-by: Will Deacon <will@kernel.org>
+Reviewed-by: Vincenzo Frascino <vincenzo.frascino@arm.com>
+Link: https://lore.kernel.org/r/20210318170738.7756-5-will@kernel.org
+Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Chanho Park <chanho61.park@samsung.com>
+Signed-off-by: Kai Liu <kai.liu@suse.com>
+---
+ arch/arm64/include/asm/arch_timer.h        | 21 ---------------------
+ arch/arm64/include/asm/barrier.h           | 19 +++++++++++++++++++
+ arch/arm64/include/asm/vdso/gettimeofday.h |  6 +-----
+ 3 files changed, 20 insertions(+), 26 deletions(-)
+
+diff --git a/arch/arm64/include/asm/arch_timer.h b/arch/arm64/include/asm/arch_timer.h
+index 9f0ec21d6327..88d20f04c64a 100644
+--- a/arch/arm64/include/asm/arch_timer.h
++++ b/arch/arm64/include/asm/arch_timer.h
+@@ -165,25 +165,6 @@ static inline void arch_timer_set_cntkctl(u32 cntkctl)
+ 	isb();
+ }
+ 
+-/*
+- * Ensure that reads of the counter are treated the same as memory reads
+- * for the purposes of ordering by subsequent memory barriers.
+- *
+- * This insanity brought to you by speculative system register reads,
+- * out-of-order memory accesses, sequence locks and Thomas Gleixner.
+- *
+- * http://lists.infradead.org/pipermail/linux-arm-kernel/2019-February/631195.html
+- */
+-#define arch_counter_enforce_ordering(val) do {				\
+-	u64 tmp, _val = (val);						\
+-									\
+-	asm volatile(							\
+-	"	eor	%0, %1, %1\n"					\
+-	"	add	%0, sp, %0\n"					\
+-	"	ldr	xzr, [%0]"					\
+-	: "=r" (tmp) : "r" (_val));					\
+-} while (0)
+-
+ static __always_inline u64 __arch_counter_get_cntpct_stable(void)
+ {
+ 	u64 cnt;
+@@ -224,8 +205,6 @@ static __always_inline u64 __arch_counter_get_cntvct(void)
+ 	return cnt;
+ }
+ 
+-#undef arch_counter_enforce_ordering
+-
+ static inline int arch_timer_arch_init(void)
+ {
+ 	return 0;
+diff --git a/arch/arm64/include/asm/barrier.h b/arch/arm64/include/asm/barrier.h
+index c3009b0e5239..37d891af8ea5 100644
+--- a/arch/arm64/include/asm/barrier.h
++++ b/arch/arm64/include/asm/barrier.h
+@@ -70,6 +70,25 @@ static inline unsigned long array_index_mask_nospec(unsigned long idx,
+ 	return mask;
+ }
+ 
++/*
++ * Ensure that reads of the counter are treated the same as memory reads
++ * for the purposes of ordering by subsequent memory barriers.
++ *
++ * This insanity brought to you by speculative system register reads,
++ * out-of-order memory accesses, sequence locks and Thomas Gleixner.
++ *
++ * http://lists.infradead.org/pipermail/linux-arm-kernel/2019-February/631195.html
++ */
++#define arch_counter_enforce_ordering(val) do {				\
++	u64 tmp, _val = (val);						\
++									\
++	asm volatile(							\
++	"	eor	%0, %1, %1\n"					\
++	"	add	%0, sp, %0\n"					\
++	"	ldr	xzr, [%0]"					\
++	: "=r" (tmp) : "r" (_val));					\
++} while (0)
++
+ #define __smp_mb()	dmb(ish)
+ #define __smp_rmb()	dmb(ishld)
+ #define __smp_wmb()	dmb(ishst)
+diff --git a/arch/arm64/include/asm/vdso/gettimeofday.h b/arch/arm64/include/asm/vdso/gettimeofday.h
+index 631ab1281633..4b4c0dac0e14 100644
+--- a/arch/arm64/include/asm/vdso/gettimeofday.h
++++ b/arch/arm64/include/asm/vdso/gettimeofday.h
+@@ -83,11 +83,7 @@ static __always_inline u64 __arch_get_hw_counter(s32 clock_mode,
+ 	 */
+ 	isb();
+ 	asm volatile("mrs %0, cntvct_el0" : "=r" (res) :: "memory");
+-	/*
+-	 * This isb() is required to prevent that the seq lock is
+-	 * speculated.#
+-	 */
+-	isb();
++	arch_counter_enforce_ordering(res);
+ 
+ 	return res;
+ }
+-- 
+2.31.1
+

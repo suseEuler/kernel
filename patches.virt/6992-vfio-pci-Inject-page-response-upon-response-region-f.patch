@@ -1,0 +1,132 @@
+From 9b4742a6dd67e4a9309c325376682bde5da60fdf Mon Sep 17 00:00:00 2001
+From: Eric Auger <eric.auger@redhat.com>
+Date: Mon, 19 Jul 2021 11:20:55 +0800
+Subject: [PATCH] vfio/pci: Inject page response upon response region fill
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 9b4742a6dd67e4a9309c325376682bde5da60fdf
+
+
+virt inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I401IF
+CVE: NA
+
+------------------------------
+
+When the userspace increments the head of the page response
+buffer ring, let's push the response into the iommu layer.
+This is done through a workqueue that pops the responses from
+the ring buffer and increment the tail.
+
+Signed-off-by: Eric Auger <eric.auger@redhat.com>
+Signed-off-by: Kunkun Jiang<jiangkunkun@huawei.com>
+Reviewed-by: Keqian Zhu <zhukeqian1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/vfio/pci/vfio_pci.c         | 40 +++++++++++++++++++++++++++++
+ drivers/vfio/pci/vfio_pci_private.h |  7 +++++
+ drivers/vfio/pci/vfio_pci_rdwr.c    |  1 +
+ 3 files changed, 48 insertions(+)
+
+diff --git a/drivers/vfio/pci/vfio_pci.c b/drivers/vfio/pci/vfio_pci.c
+index b1c8295fd4be..a9d25b339572 100644
+--- a/drivers/vfio/pci/vfio_pci.c
++++ b/drivers/vfio/pci/vfio_pci.c
+@@ -552,6 +552,32 @@ static int vfio_pci_dma_fault_init(struct vfio_pci_device *vdev)
+ 	return ret;
+ }
+ 
++static void dma_response_inject(struct work_struct *work)
++{
++	struct vfio_pci_dma_fault_response_work *rwork =
++		container_of(work, struct vfio_pci_dma_fault_response_work, inject);
++	struct vfio_region_dma_fault_response *header = rwork->header;
++	struct vfio_pci_device *vdev = rwork->vdev;
++	struct iommu_page_response *resp;
++	u32 tail, head, size;
++
++	mutex_lock(&vdev->fault_response_queue_lock);
++
++	tail = header->tail;
++	head = header->head;
++	size = header->nb_entries;
++
++	while (CIRC_CNT(head, tail, size) >= 1) {
++		resp = (struct iommu_page_response *)(vdev->fault_response_pages + header->offset +
++						tail * header->entry_size);
++
++		/* TODO: properly handle the return value */
++		iommu_page_response(&vdev->pdev->dev, resp);
++		header->tail = tail = (tail + 1) % size;
++	}
++	mutex_unlock(&vdev->fault_response_queue_lock);
++}
++
+ #define DMA_FAULT_RESPONSE_RING_LENGTH 512
+ 
+ static int vfio_pci_dma_fault_response_init(struct vfio_pci_device *vdev)
+@@ -597,8 +623,22 @@ static int vfio_pci_dma_fault_response_init(struct vfio_pci_device *vdev)
+ 	header->nb_entries = DMA_FAULT_RESPONSE_RING_LENGTH;
+ 	header->offset = PAGE_SIZE;
+ 
++	vdev->response_work = kzalloc(sizeof(*vdev->response_work), GFP_KERNEL);
++	if (!vdev->response_work)
++		goto out;
++	vdev->response_work->header = header;
++	vdev->response_work->vdev = vdev;
++
++	/* launch the thread that will extract the response */
++	INIT_WORK(&vdev->response_work->inject, dma_response_inject);
++	vdev->dma_fault_response_wq =
++		create_singlethread_workqueue("vfio-dma-fault-response");
++	if (!vdev->dma_fault_response_wq)
++		return -ENOMEM;
++
+ 	return 0;
+ out:
++	kfree(vdev->fault_response_pages);
+ 	vdev->fault_response_pages = NULL;
+ 	return ret;
+ }
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index 82a883c101c9..5944f96ced0c 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -52,6 +52,12 @@ struct vfio_pci_irq_ctx {
+ 	struct irq_bypass_producer	producer;
+ };
+ 
++struct vfio_pci_dma_fault_response_work {
++	struct work_struct inject;
++	struct vfio_region_dma_fault_response *header;
++	struct vfio_pci_device *vdev;
++};
++
+ struct vfio_pci_device;
+ struct vfio_pci_region;
+ 
+@@ -146,6 +152,7 @@ struct vfio_pci_device {
+ 	u8			*fault_pages;
+ 	u8			*fault_response_pages;
+ 	struct workqueue_struct *dma_fault_response_wq;
++	struct vfio_pci_dma_fault_response_work *response_work;
+ 	struct mutex		fault_queue_lock;
+ 	struct mutex		fault_response_queue_lock;
+ 	struct list_head	dummy_resources_list;
+diff --git a/drivers/vfio/pci/vfio_pci_rdwr.c b/drivers/vfio/pci/vfio_pci_rdwr.c
+index efde0793360b..78c494fe35cc 100644
+--- a/drivers/vfio/pci/vfio_pci_rdwr.c
++++ b/drivers/vfio/pci/vfio_pci_rdwr.c
+@@ -430,6 +430,7 @@ size_t vfio_pci_dma_fault_response_rw(struct vfio_pci_device *vdev, char __user
+ 		mutex_lock(&vdev->fault_response_queue_lock);
+ 		header->head = new_head;
+ 		mutex_unlock(&vdev->fault_response_queue_lock);
++		queue_work(vdev->dma_fault_response_wq, &vdev->response_work->inject);
+ 	} else {
+ 		if (copy_to_user(buf, base + pos, count))
+ 			return -EFAULT;
+-- 
+2.26.2
+

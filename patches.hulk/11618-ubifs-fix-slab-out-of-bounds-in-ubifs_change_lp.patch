@@ -1,0 +1,92 @@
+From b153f8a9c74e50dabbac8ba119ef9b4e6cddccb4 Mon Sep 17 00:00:00 2001
+From: Baokun Li <libaokun1@huawei.com>
+Date: Tue, 30 Nov 2021 16:32:03 +0800
+Subject: [PATCH] ubifs: fix slab-out-of-bounds in ubifs_change_lp
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: b153f8a9c74e50dabbac8ba119ef9b4e6cddccb4
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 182993 https://gitee.com/openeuler/kernel/issues/I4DDEL
+
+---------------------------
+
+Hulk Robot reported a KASAN report about slab-out-of-bounds:
+ ==================================================================
+ BUG: KASAN: slab-out-of-bounds in ubifs_change_lp+0x3a9/0x1390 [ubifs]
+ Read of size 8 at addr ffff888101c961f8 by task fsstress/1068
+ [...]
+ Call Trace:
+  check_memory_region+0x1c1/0x1e0
+  ubifs_change_lp+0x3a9/0x1390 [ubifs]
+  ubifs_change_one_lp+0x170/0x220 [ubifs]
+  ubifs_garbage_collect+0x7f9/0xda0 [ubifs]
+  ubifs_budget_space+0xfe4/0x1bd0 [ubifs]
+  ubifs_write_begin+0x528/0x10c0 [ubifs]
+
+ Allocated by task 1068:
+  kmemdup+0x25/0x50
+  ubifs_lpt_lookup_dirty+0x372/0xb00 [ubifs]
+  ubifs_update_one_lp+0x46/0x260 [ubifs]
+  ubifs_tnc_end_commit+0x98b/0x1720 [ubifs]
+  do_commit+0x6cb/0x1950 [ubifs]
+  ubifs_run_commit+0x15a/0x2b0 [ubifs]
+  ubifs_budget_space+0x1061/0x1bd0 [ubifs]
+  ubifs_write_begin+0x528/0x10c0 [ubifs]
+ [...]
+ ==================================================================
+
+In ubifs_garbage_collect(), if ubifs_find_dirty_leb returns an error,
+lp is an uninitialized variable. But lp.num might be used in the out
+branch, which is a random value. If the value is -1 or another value
+that can pass the check, soob may occur in the ubifs_change_lp() in
+the following procedure.
+
+To solve this problem, we initialize lp.lnum to -1, and then initialize
+it correctly in ubifs_find_dirty_leb, which is not equal to -1, and
+ubifs_return_leb is executed only when lp.lnum != -1.
+
+if find a retained or indexing LEB and continue to next loop, but break
+before find another LEB, the "taken" flag of this LEB will be cleaned
+in ubi_return_lebi(). This bug has also been fixed in this patch.
+
+Reported-by: Hulk Robot <hulkci@huawei.com>
+Signed-off-by: Baokun Li <libaokun1@huawei.com>
+Reviewed-by: Zhang Yi <yi.zhang@huawei.com>
+
+Signed-off-by: Chen Jun <chenjun102@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/ubifs/gc.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/fs/ubifs/gc.c b/fs/ubifs/gc.c
+index dc3e26e9ed7b..05e1eeae8457 100644
+--- a/fs/ubifs/gc.c
++++ b/fs/ubifs/gc.c
+@@ -692,6 +692,9 @@ int ubifs_garbage_collect(struct ubifs_info *c, int anyway)
+ 	for (i = 0; ; i++) {
+ 		int space_before, space_after;
+ 
++		/* Maybe continue after find and break before find */
++		lp.lnum = -1;
++
+ 		cond_resched();
+ 
+ 		/* Give the commit an opportunity to run */
+@@ -843,7 +846,8 @@ int ubifs_garbage_collect(struct ubifs_info *c, int anyway)
+ 	ubifs_wbuf_sync_nolock(wbuf);
+ 	ubifs_ro_mode(c, ret);
+ 	mutex_unlock(&wbuf->io_mutex);
+-	ubifs_return_leb(c, lp.lnum);
++	if (lp.lnum != -1)
++		ubifs_return_leb(c, lp.lnum);
+ 	return ret;
+ }
+ 
+-- 
+2.26.2
+

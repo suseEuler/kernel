@@ -1,0 +1,95 @@
+From 9551158069ba8fcc893798d42dc4f978b62ef60f Mon Sep 17 00:00:00 2001
+From: Marco Elver <elver@google.com>
+Date: Wed, 24 Mar 2021 21:37:47 -0700
+Subject: [PATCH] kfence: make compatible with kmemleak
+Git-commit: 9551158069ba8fcc893798d42dc4f978b62ef60f
+Patch-mainline: v5.12-rc5
+References: bsn#12
+
+
+Because memblock allocations are registered with kmemleak, the KFENCE
+pool was seen by kmemleak as one large object.  Later allocations
+through kfence_alloc() that were registered with kmemleak via
+slab_post_alloc_hook() would then overlap and trigger a warning.
+Therefore, once the pool is initialized, we can remove (free) it from
+kmemleak again, since it should be treated as allocator-internal and be
+seen as "free memory".
+
+The second problem is that kmemleak is passed the rounded size, and not
+the originally requested size, which is also the size of KFENCE objects.
+To avoid kmemleak scanning past the end of an object and trigger a
+KFENCE out-of-bounds error, fix the size if it is a KFENCE object.
+
+For simplicity, to avoid a call to kfence_ksize() in
+slab_post_alloc_hook() (and avoid new IS_ENABLED(CONFIG_DEBUG_KMEMLEAK)
+guard), just call kfence_ksize() in mm/kmemleak.c:create_object().
+
+Link: https://lkml.kernel.org/r/20210317084740.3099921-1-elver@google.com
+Signed-off-by: Marco Elver <elver@google.com>
+Reported-by: Luis Henriques <lhenriques@suse.de>
+Reviewed-by: Catalin Marinas <catalin.marinas@arm.com>
+Tested-by: Luis Henriques <lhenriques@suse.de>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Andrey Konovalov <andreyknvl@google.com>
+Cc: Jann Horn <jannh@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ mm/kfence/core.c | 9 +++++++++
+ mm/kmemleak.c    | 3 ++-
+ 2 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/mm/kfence/core.c b/mm/kfence/core.c
+index 3b8ec938470a..d53c91f881a4 100644
+--- a/mm/kfence/core.c
++++ b/mm/kfence/core.c
+@@ -12,6 +12,7 @@
+ #include <linux/debugfs.h>
+ #include <linux/kcsan-checks.h>
+ #include <linux/kfence.h>
++#include <linux/kmemleak.h>
+ #include <linux/list.h>
+ #include <linux/lockdep.h>
+ #include <linux/memblock.h>
+@@ -480,6 +481,14 @@ static bool __init kfence_init_pool(void)
+ 		addr += 2 * PAGE_SIZE;
+ 	}
+ 
++	/*
++	 * The pool is live and will never be deallocated from this point on.
++	 * Remove the pool object from the kmemleak object tree, as it would
++	 * otherwise overlap with allocations returned by kfence_alloc(), which
++	 * are registered with kmemleak through the slab post-alloc hook.
++	 */
++	kmemleak_free(__kfence_pool);
++
+ 	return true;
+ 
+ err:
+diff --git a/mm/kmemleak.c b/mm/kmemleak.c
+index c0014d3b91c1..fe6e3ae8e8c6 100644
+--- a/mm/kmemleak.c
++++ b/mm/kmemleak.c
+@@ -97,6 +97,7 @@
+ #include <linux/atomic.h>
+ 
+ #include <linux/kasan.h>
++#include <linux/kfence.h>
+ #include <linux/kmemleak.h>
+ #include <linux/memory_hotplug.h>
+ 
+@@ -589,7 +590,7 @@ static struct kmemleak_object *create_object(unsigned long ptr, size_t size,
+ 	atomic_set(&object->use_count, 1);
+ 	object->flags = OBJECT_ALLOCATED;
+ 	object->pointer = ptr;
+-	object->size = size;
++	object->size = kfence_ksize((void *)ptr) ?: size;
+ 	object->excess_ref = 0;
+ 	object->min_count = min_count;
+ 	object->count = 0;			/* white color initially */
+-- 
+2.31.1
+

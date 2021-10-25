@@ -1,0 +1,135 @@
+From 9c222ac0f6d7b3b09f6852d1880d3f7e26177e56 Mon Sep 17 00:00:00 2001
+From: Ye Weihua <yeweihua4@huawei.com>
+Date: Wed, 23 Jun 2021 10:38:36 +0800
+Subject: [PATCH] livepatch: fix unload hook could not be excuted
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 9c222ac0f6d7b3b09f6852d1880d3f7e26177e56
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 110621
+CVE: NA
+
+--------------------------------
+
+Livepatch can add some hook functions when inserting and disabling the
+patch. The hook functions called during inserting is named load hooks,
+and the hook functions called during disabling is named unload hooks.
+
+During the test, it is found that unload hooks is not executed. The
+reason is that the __klp_free_objects() is called before
+klp_free_patch_finish() is executed. This function deletes obj from the
+patch list. Therefore, klp_for_each_object in klp_free_patch_finish()
+cannot fund obj. As a result, the klp_unload_hook() is not executed.
+
+Signed-off-by: Ye Weihua <yeweihua4@huawei.com>
+Reviewed-by: Kuohai Xu <xukuohai@huawei.com>
+Signed-off-by: Chen Jun <chenjun102@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/livepatch.h | 10 ++++++++++
+ kernel/livepatch/core.c   | 36 +++++++++++++++++++++++-------------
+ 2 files changed, 33 insertions(+), 13 deletions(-)
+
+diff --git a/include/linux/livepatch.h b/include/linux/livepatch.h
+index 8d228381ee28..ce32a8da1517 100644
+--- a/include/linux/livepatch.h
++++ b/include/linux/livepatch.h
+@@ -163,6 +163,13 @@ struct klp_state {
+ 	void *data;
+ };
+ 
++#ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
++struct klp_hook_node {
++	struct klp_hook *hooks_unload;
++	struct klp_hook_node *next;
++};
++#endif
++
+ /**
+  * struct klp_patch - patch structure for live patching
+  * @mod:	reference to the live patch module
+@@ -192,6 +199,9 @@ struct klp_patch {
+ 	bool forced;
+ 	struct work_struct free_work;
+ 	struct completion finish;
++#ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
++	struct klp_hook_node *hook;
++#endif
+ };
+ 
+ #define klp_for_each_object_static(patch, obj) \
+diff --git a/kernel/livepatch/core.c b/kernel/livepatch/core.c
+index 272f8730e176..58cdfeea46d2 100644
+--- a/kernel/livepatch/core.c
++++ b/kernel/livepatch/core.c
+@@ -759,11 +759,23 @@ static void klp_free_object_loaded(struct klp_object *obj)
+ static void __klp_free_objects(struct klp_patch *patch, bool nops_only)
+ {
+ 	struct klp_object *obj, *tmp_obj;
++#ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
++	patch->hook = NULL;
++#endif
+ 
+ 	klp_for_each_object_safe(patch, obj, tmp_obj) {
+ #ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
+ 		if (klp_is_module(obj))
+ 			module_put(obj->mod);
++		if (obj->hooks_unload) {
++			struct klp_hook_node **pnode = &patch->hook;
++			while (*pnode != NULL)
++				pnode = &(*pnode)->next;
++			*pnode = kzalloc(sizeof(struct klp_hook_node),
++					 GFP_KERNEL);
++			(*pnode)->hooks_unload = obj->hooks_unload;
++			(*pnode)->next = NULL;
++		}
+ #endif
+ 		__klp_free_funcs(obj, nops_only);
+ 
+@@ -816,17 +828,18 @@ static inline int klp_load_hook(struct klp_object *obj)
+ 	return 0;
+ }
+ 
+-static inline int klp_unload_hook(struct klp_object *obj)
++static inline void klp_unload_patch_hooks(struct klp_patch *patch)
+ {
+ 	struct klp_hook *hook;
+-
+-	if (!obj->hooks_unload)
+-		return 0;
+-
+-	for (hook = obj->hooks_unload; hook->hook; hook++)
+-		(*hook->hook)();
+-
+-	return 0;
++	struct klp_hook_node *tmp;
++
++	while (patch->hook) {
++		for (hook = patch->hook->hooks_unload; hook->hook; hook++)
++			(*hook->hook)();
++		tmp = patch->hook;
++		patch->hook = patch->hook->next;
++		kfree(tmp);
++	}
+ }
+ #endif
+ 
+@@ -841,10 +854,7 @@ static inline int klp_unload_hook(struct klp_object *obj)
+ static void klp_free_patch_finish(struct klp_patch *patch)
+ {
+ #ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
+-	struct klp_object *obj;
+-
+-	klp_for_each_object(patch, obj)
+-		klp_unload_hook(obj);
++	klp_unload_patch_hooks(patch);
+ #endif
+ 	/*
+ 	 * Avoid deadlock with enabled_store() sysfs callback by
+-- 
+2.26.2
+

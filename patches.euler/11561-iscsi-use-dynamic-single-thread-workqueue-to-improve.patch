@@ -1,0 +1,148 @@
+From 4728ac8290091066d8d9bbcd65a376d13d400efe Mon Sep 17 00:00:00 2001
+From: Biaoxiang Ye <yebiaoxiang@huawei.com>
+Date: Fri, 26 Nov 2021 16:26:52 +0800
+Subject: [PATCH] iscsi: use dynamic single thread workqueue to improve
+ performance
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 4728ac8290091066d8d9bbcd65a376d13d400efe
+
+
+euleros inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4IZNO
+CVE: NA
+
+-------------------------------------------------
+
+On aarch64 NUMA machines, the kworker of iscsi created always jump
+around across node boundaries. If it work on the different node even
+different cpu package with the softirq of network interface, memcpy
+with in iscsi_tcp_segment_recv will be slow down, and iscsi got an
+terrible performance.
+
+In this patch, we trace the cpu of softirq, and tell queue_work_on
+to execute iscsi_xmitworker on the same NUMA node.
+
+The performance data as below:
+fio cmd:
+fio -filename=/dev/disk/by-id/wwn-0x6883fd3100a2ad260036281700000000
+-direct=1 -iodepth=32 -rw=read -bs=64k -size=30G -ioengine=libaio
+-numjobs=1 -group_reporting -name=mytest -time_based -ramp_time=60
+-runtime=60
+
+before patch:
+Jobs: 1 (f=1): [R] [52.5% done] [852.3MB/0KB/0KB /s] [13.7K/0/0 iops] [eta 00m:57s]
+Jobs: 1 (f=1): [R] [53.3% done] [861.4MB/0KB/0KB /s] [13.8K/0/0 iops] [eta 00m:56s]
+Jobs: 1 (f=1): [R] [54.2% done] [868.2MB/0KB/0KB /s] [13.9K/0/0 iops] [eta 00m:55s]
+
+after pactch:
+Jobs: 1 (f=1): [R] [53.3% done] [1070MB/0KB/0KB /s] [17.2K/0/0 iops] [eta 00m:56s]
+Jobs: 1 (f=1): [R] [55.0% done] [1064MB/0KB/0KB /s] [17.3K/0/0 iops] [eta 00m:54s]
+Jobs: 1 (f=1): [R] [56.7% done] [1069MB/0KB/0KB /s] [17.1K/0/0 iops] [eta 00m:52s]
+
+cpu info:
+Architecture:          aarch64
+Byte Order:            Little Endian
+CPU(s):                128
+On-line CPU(s) list:   0-127
+Thread(s) per core:    1
+Core(s) per socket:    64
+Socket(s):             2
+NUMA node(s):          4
+Model:                 0
+CPU max MHz:           2600.0000
+CPU min MHz:           200.0000
+BogoMIPS:              200.00
+L1d cache:             64K
+L1i cache:             64K
+L2 cache:              512K
+L3 cache:              32768K
+NUMA node0 CPU(s):     0-31
+NUMA node1 CPU(s):     32-63
+NUMA node2 CPU(s):     64-95
+NUMA node3 CPU(s):     96-127
+
+Signed-off-by: Biaoxiang Ye <yebiaoxiang@huawei.com>
+Acked-by: Hanjun Guo <guohanjun@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Reviewed-by: fang yi <eric.fangyi@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/scsi/iscsi_tcp.c |  8 ++++++++
+ drivers/scsi/libiscsi.c  | 17 ++++++++++++-----
+ 2 files changed, 20 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/scsi/iscsi_tcp.c b/drivers/scsi/iscsi_tcp.c
+index d39f812d9b92..a226a040647a 100644
+--- a/drivers/scsi/iscsi_tcp.c
++++ b/drivers/scsi/iscsi_tcp.c
+@@ -127,6 +127,7 @@ static void iscsi_sw_tcp_data_ready(struct sock *sk)
+ 	struct iscsi_conn *conn;
+ 	struct iscsi_tcp_conn *tcp_conn;
+ 	read_descriptor_t rd_desc;
++	int current_cpu;
+ 
+ 	read_lock_bh(&sk->sk_callback_lock);
+ 	conn = sk->sk_user_data;
+@@ -136,6 +137,13 @@ static void iscsi_sw_tcp_data_ready(struct sock *sk)
+ 	}
+ 	tcp_conn = conn->dd_data;
+ 
++	/* save intimate cpu when in softirq */
++	if (!sock_owned_by_user_nocheck(sk)) {
++		current_cpu = smp_processor_id();
++		if (conn->intimate_cpu != current_cpu)
++			conn->intimate_cpu = current_cpu;
++	}
++
+ 	/*
+ 	 * Use rd_desc to pass 'conn' to iscsi_tcp_recv.
+ 	 * We set count to 1 because we want the network layer to
+diff --git a/drivers/scsi/libiscsi.c b/drivers/scsi/libiscsi.c
+index ed6a6bbfef23..fa1cb988dfcf 100644
+--- a/drivers/scsi/libiscsi.c
++++ b/drivers/scsi/libiscsi.c
+@@ -87,9 +87,15 @@ inline void iscsi_conn_queue_work(struct iscsi_conn *conn)
+ {
+ 	struct Scsi_Host *shost = conn->session->host;
+ 	struct iscsi_host *ihost = shost_priv(shost);
++	int intimate_cpu = conn->intimate_cpu;
+ 
+-	if (ihost->workq)
+-		queue_work(ihost->workq, &conn->xmitwork);
++	if (ihost->workq) {
++		/* we expect it to be excuted on the same numa of the intimate cpu */
++		if ((intimate_cpu >= 0) && cpu_possible(intimate_cpu))
++			queue_work_on(intimate_cpu, ihost->workq, &conn->xmitwork);
++		else
++			queue_work(ihost->workq, &conn->xmitwork);
++	}
+ }
+ EXPORT_SYMBOL_GPL(iscsi_conn_queue_work);
+ 
+@@ -2732,9 +2738,9 @@ struct Scsi_Host *iscsi_host_alloc(struct scsi_host_template *sht,
+ 	if (xmit_can_sleep) {
+ 		snprintf(ihost->workq_name, sizeof(ihost->workq_name),
+ 			"iscsi_q_%d", shost->host_no);
+-		ihost->workq = alloc_workqueue("%s",
+-			WQ_SYSFS | __WQ_LEGACY | WQ_MEM_RECLAIM | WQ_UNBOUND,
+-			1, ihost->workq_name);
++		/* this kind of workqueue only support single work */
++		ihost->workq = alloc_ordered_workqueue("%s", __WQ_LEGACY | WQ_MEM_RECLAIM |
++							__WQ_DYNAMIC, ihost->workq_name);
+ 		if (!ihost->workq)
+ 			goto free_host;
+ 	}
+@@ -2986,6 +2992,7 @@ iscsi_conn_setup(struct iscsi_cls_session *cls_session, int dd_size,
+ 	conn->c_stage = ISCSI_CONN_INITIAL_STAGE;
+ 	conn->id = conn_idx;
+ 	conn->exp_statsn = 0;
++	conn->intimate_cpu = -1;
+ 
+ 	timer_setup(&conn->transport_timer, iscsi_check_transport_timeouts, 0);
+ 
+-- 
+2.26.2
+

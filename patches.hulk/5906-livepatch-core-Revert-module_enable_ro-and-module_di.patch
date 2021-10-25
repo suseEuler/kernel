@@ -1,0 +1,187 @@
+From f440d90fa6607e1f0ca70d7ce1b3899f6fb57cba Mon Sep 17 00:00:00 2001
+From: Dong Kai <dongkai11@huawei.com>
+Date: Sat, 29 May 2021 14:42:54 +0800
+Subject: [PATCH] livepatch/core: Revert module_enable_ro and module_disable_ro
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: f440d90fa6607e1f0ca70d7ce1b3899f6fb57cba
+
+
+hulk inclusion
+category: feature
+bugzilla: 51921
+CVE: NA
+
+---------------------------
+
+After commit d556e1be3332 ("livepatch: Remove module_disable_ro() usage")
+and commit 0d9fbf78fefb ("module: Remove module_disable_ro()") and
+commit e6eff4376e28 ("module: Make module_enable_ro() static again") merged,
+the module_disable_ro is removed and module_enable_ro is make static.
+
+It's ok for x86/ppc platform because the livepatch module relocation is
+done by text poke func which internally modify the text addr by remap
+to high virtaddr which has write permission.
+
+However for arm/arm64 platform, it's apply_relocate[_add] still directly
+modify the text code so we should change the module text permission before
+relocation. Otherwise it will lead to following problem:
+
+  Unable to handle kernel write to read-only memory at virtual address ffff800008a95288
+  Mem abort info:
+  ESR = 0x9600004f
+  EC = 0x25: DABT (current EL), IL = 32 bits
+  SET = 0, FnV = 0
+  EA = 0, S1PTW = 0
+  Data abort info:
+  ISV = 0, ISS = 0x0000004f
+  CM = 0, WnR = 1
+  swapper pgtable: 4k pages, 48-bit VAs, pgdp=000000004133c000
+  [ffff800008a95288] pgd=00000000bdfff003, p4d=00000000bdfff003, pud=00000000bdffe003,
+		     pmd=0000000080ce7003, pte=0040000080d5d783
+  Internal error: Oops: 9600004f [#1] PREEMPT SMP
+  Modules linked in: livepatch_testmod_drv(OK+) testmod_drv(O)
+  CPU: 0 PID: 139 Comm: insmod Tainted: G           O  K   5.10.0-01131-gf6b4602e09b2-dirty #35
+  Hardware name: linux,dummy-virt (DT)
+  pstate: 80000005 (Nzcv daif -PAN -UAO -TCO BTYPE=--)
+  pc : reloc_insn_imm+0x54/0x78
+  lr : reloc_insn_imm+0x50/0x78
+  sp : ffff800011cf3910
+  ...
+  Call trace:
+   reloc_insn_imm+0x54/0x78
+   apply_relocate_add+0x464/0x680
+   klp_apply_section_relocs+0x11c/0x148
+   klp_enable_patch+0x338/0x998
+   patch_init+0x338/0x1000 [livepatch_testmod_drv]
+   do_one_initcall+0x60/0x1d8
+   do_init_module+0x58/0x1e0
+   load_module+0x1fb4/0x2688
+   __do_sys_finit_module+0xc0/0x128
+   __arm64_sys_finit_module+0x20/0x30
+   do_el0_svc+0x84/0x1b0
+   el0_svc+0x14/0x20
+   el0_sync_handler+0x90/0xc8
+   el0_sync+0x158/0x180
+   Code: 2a0503e0 9ad42a73 97d6a499 91000673 (b90002a0)
+   ---[ end trace 67dd2ef1203ed335 ]---
+
+Though the permission change is not necessary to x86/ppc platform, consider
+that the jump_label_register api may modify the text code either, we just
+put the change handle here instead of putting it in arch-specific relocate.
+
+Besides, the jump_label_module_nb callback called in jump_label_register
+also maybe need motify the module code either, it sort and swap the jump
+entries if necessary. So just disable ro before jump_label handling and
+restore it back.
+
+Signed-off-by: Dong Kai <dongkai11@huawei.com>
+
+Signed-off-by: Ye Weihua <yeweihua4@huawei.com>
+Reviewed-by: Yang Jihong <yangjihong1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/module.h  |  8 ++++++++
+ kernel/livepatch/core.c | 12 ++++++++++--
+ kernel/module.c         | 16 ++++++++++++++--
+ 3 files changed, 32 insertions(+), 4 deletions(-)
+
+diff --git a/include/linux/module.h b/include/linux/module.h
+index 7937f3394514..d7c6792d705b 100644
+--- a/include/linux/module.h
++++ b/include/linux/module.h
+@@ -887,6 +887,14 @@ extern int module_sysfs_initialized;
+ 
+ #define __MODULE_STRING(x) __stringify(x)
+ 
++#ifdef CONFIG_STRICT_MODULE_RWX
++extern void module_enable_ro(const struct module *mod, bool after_init);
++extern void module_disable_ro(const struct module *mod);
++#else
++static inline void module_enable_ro(const struct module *mod, bool after_init) { }
++static inline void module_disable_ro(const struct module *mod) { }
++#endif
++
+ #ifdef CONFIG_GENERIC_BUG
+ void module_bug_finalize(const Elf_Ehdr *, const Elf_Shdr *,
+ 			 struct module *);
+diff --git a/kernel/livepatch/core.c b/kernel/livepatch/core.c
+index b1b80b1c6d3e..ccfb0f4e5569 100644
+--- a/kernel/livepatch/core.c
++++ b/kernel/livepatch/core.c
+@@ -968,6 +968,7 @@ static int klp_init_object_loaded(struct klp_patch *patch,
+ 	struct klp_func *func;
+ 	int ret;
+ 
++	module_disable_ro(patch->mod);
+ 	if (klp_is_module(obj)) {
+ 		/*
+ 		 * Only write module-specific relocations here
+@@ -976,9 +977,12 @@ static int klp_init_object_loaded(struct klp_patch *patch,
+ 		 * itself.
+ 		 */
+ 		ret = klp_apply_object_relocs(patch, obj);
+-		if (ret)
++		if (ret) {
++			module_enable_ro(patch->mod, true);
+ 			return ret;
++		}
+ 	}
++	module_enable_ro(patch->mod, true);
+ 
+ 	klp_for_each_func(obj, func) {
+ 		ret = klp_find_object_symbol(obj->name, func->old_name,
+@@ -1147,10 +1151,14 @@ static int klp_init_patch(struct klp_patch *patch)
+ 	}
+ 
+ 	set_mod_klp_rel_state(patch->mod, MODULE_KLP_REL_DONE);
++	module_disable_ro(patch->mod);
+ 	jump_label_apply_nops(patch->mod);
+ 	ret = jump_label_register(patch->mod);
+-	if (ret)
++	if (ret) {
++		module_enable_ro(patch->mod, true);
+ 		goto out;
++	}
++	module_enable_ro(patch->mod, true);
+ 
+ #ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
+ 	klp_for_each_object(patch, obj)
+diff --git a/kernel/module.c b/kernel/module.c
+index b87b333b7bde..a54dda703feb 100644
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@ -2063,7 +2063,20 @@ static void frob_writable_data(const struct module_layout *layout,
+ 		   (layout->size - layout->ro_after_init_size) >> PAGE_SHIFT);
+ }
+ 
+-static void module_enable_ro(const struct module *mod, bool after_init)
++/* livepatching wants to disable read-only so it can frob module. */
++void module_disable_ro(const struct module *mod)
++{
++	if (!rodata_enabled)
++		return;
++
++	frob_text(&mod->core_layout, set_memory_rw);
++	frob_rodata(&mod->core_layout, set_memory_rw);
++	frob_ro_after_init(&mod->core_layout, set_memory_rw);
++	frob_text(&mod->init_layout, set_memory_rw);
++	frob_rodata(&mod->init_layout, set_memory_rw);
++}
++
++void module_enable_ro(const struct module *mod, bool after_init)
+ {
+ 	if (!rodata_enabled)
+ 		return;
+@@ -2108,7 +2121,6 @@ static int module_enforce_rwx_sections(Elf_Ehdr *hdr, Elf_Shdr *sechdrs,
+ 
+ #else /* !CONFIG_STRICT_MODULE_RWX */
+ static void module_enable_nx(const struct module *mod) { }
+-static void module_enable_ro(const struct module *mod, bool after_init) {}
+ static int module_enforce_rwx_sections(Elf_Ehdr *hdr, Elf_Shdr *sechdrs,
+ 				       char *secstrings, struct module *mod)
+ {
+-- 
+2.26.2
+

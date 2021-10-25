@@ -1,0 +1,115 @@
+From 31b912de1316644040ca9a0fb9b514ffa462c20c Mon Sep 17 00:00:00 2001
+From: Joao Martins <joao.m.martins@oracle.com>
+Date: Thu, 29 Apr 2021 22:55:47 -0700
+Subject: [PATCH] mm/gup: decrement head page once for group of subpages
+Git-commit: 31b912de1316644040ca9a0fb9b514ffa462c20c
+Patch-mainline: v5.13-rc1
+References: bsn#12
+
+
+Rather than decrementing the head page refcount one by one, we walk the
+page array and checking which belong to the same compound_head.  Later on
+we decrement the calculated amount of references in a single write to the
+head page.  To that end switch to for_each_compound_head() does most of
+the work.
+
+set_page_dirty() needs no adjustment as it's a nop for non-dirty head
+pages and it doesn't operate on tail pages.
+
+This considerably improves unpinning of pages with THP and hugetlbfs:
+
+ - THP
+
+   gup_test -t -m 16384 -r 10 [-L|-a] -S -n 512 -w
+   PIN_LONGTERM_BENCHMARK (put values): ~87.6k us -> ~23.2k us
+
+- 16G with 1G huge page size
+
+  gup_test -f /mnt/huge/file -m 16384 -r 10 [-L|-a] -S -n 512 -w
+  PIN_LONGTERM_BENCHMARK: (put values): ~87.6k us -> ~27.5k us
+
+Link: https://lkml.kernel.org/r/20210212130843.13865-3-joao.m.martins@oracle.com
+Signed-off-by: Joao Martins <joao.m.martins@oracle.com>
+Reviewed-by: John Hubbard <jhubbard@nvidia.com>
+Reviewed-by: Jason Gunthorpe <jgg@nvidia.com>
+Cc: Christoph Hellwig <hch@infradead.org>
+Cc: Doug Ledford <dledford@redhat.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ mm/gup.c | 29 +++++++++++------------------
+ 1 file changed, 11 insertions(+), 18 deletions(-)
+
+diff --git a/mm/gup.c b/mm/gup.c
+index 5856f68467b3..de1b75ef44da 100644
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@ -265,20 +265,15 @@ void unpin_user_pages_dirty_lock(struct page **pages, unsigned long npages,
+ 				 bool make_dirty)
+ {
+ 	unsigned long index;
+-
+-	/*
+-	 * TODO: this can be optimized for huge pages: if a series of pages is
+-	 * physically contiguous and part of the same compound page, then a
+-	 * single operation to the head page should suffice.
+-	 */
++	struct page *head;
++	unsigned int ntails;
+ 
+ 	if (!make_dirty) {
+ 		unpin_user_pages(pages, npages);
+ 		return;
+ 	}
+ 
+-	for (index = 0; index < npages; index++) {
+-		struct page *page = compound_head(pages[index]);
++	for_each_compound_head(index, pages, npages, head, ntails) {
+ 		/*
+ 		 * Checking PageDirty at this point may race with
+ 		 * clear_page_dirty_for_io(), but that's OK. Two key
+@@ -299,9 +294,9 @@ void unpin_user_pages_dirty_lock(struct page **pages, unsigned long npages,
+ 		 * written back, so it gets written back again in the
+ 		 * next writeback cycle. This is harmless.
+ 		 */
+-		if (!PageDirty(page))
+-			set_page_dirty_lock(page);
+-		unpin_user_page(page);
++		if (!PageDirty(head))
++			set_page_dirty_lock(head);
++		put_compound_head(head, ntails, FOLL_PIN);
+ 	}
+ }
+ EXPORT_SYMBOL(unpin_user_pages_dirty_lock);
+@@ -318,6 +313,8 @@ EXPORT_SYMBOL(unpin_user_pages_dirty_lock);
+ void unpin_user_pages(struct page **pages, unsigned long npages)
+ {
+ 	unsigned long index;
++	struct page *head;
++	unsigned int ntails;
+ 
+ 	/*
+ 	 * If this WARN_ON() fires, then the system *might* be leaking pages (by
+@@ -326,13 +323,9 @@ void unpin_user_pages(struct page **pages, unsigned long npages)
+ 	 */
+ 	if (WARN_ON(IS_ERR_VALUE(npages)))
+ 		return;
+-	/*
+-	 * TODO: this can be optimized for huge pages: if a series of pages is
+-	 * physically contiguous and part of the same compound page, then a
+-	 * single operation to the head page should suffice.
+-	 */
+-	for (index = 0; index < npages; index++)
+-		unpin_user_page(pages[index]);
++
++	for_each_compound_head(index, pages, npages, head, ntails)
++		put_compound_head(head, ntails, FOLL_PIN);
+ }
+ EXPORT_SYMBOL(unpin_user_pages);
+ 
+-- 
+2.31.1
+

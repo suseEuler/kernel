@@ -1,0 +1,120 @@
+From 0cc12581b3db9a5cd3f03febdeddb6010b9c8b2a Mon Sep 17 00:00:00 2001
+From: Cheng Jian <cj.chengjian@huawei.com>
+Date: Mon, 29 Nov 2021 16:28:54 +0800
+Subject: [PATCH] printk/panic: Avoid deadlock in printk()
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 0cc12581b3db9a5cd3f03febdeddb6010b9c8b2a
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 34546, https://gitee.com/openeuler/kernel/issues/I4JKT1
+CVE: NA
+
+-----------------------------------------------
+
+A deadlock caused by logbuf_lock occurs when panic:
+
+	a) Panic CPU is running in non-NMI context
+	b) Panic CPU sends out shutdown IPI via NMI vector
+	c) One of the CPUs that we bring down via NMI vector holded logbuf_lock
+	d) Panic CPU try to hold logbuf_lock, then deadlock occurs.
+
+we try to re-init the logbuf_lock in printk_safe_flush_on_panic()
+to avoid deadlock, but it does not work here, because :
+
+Firstly, it is inappropriate to check num_online_cpus() here.
+When the CPU bring down via NMI vector, the panic CPU willn't
+wait too long for other cores to stop, so when this problem
+occurs, num_online_cpus() may be greater than 1.
+
+Secondly, printk_safe_flush_on_panic() is called after panic
+notifier callback, so if printk() is called in panic notifier
+callback, deadlock will still occurs. Eg, if ftrace_dump_on_oops
+is set, we print some debug information, it will try to hold the
+logbuf_lock.
+
+To avoid this deadlock, attempt to re-init logbuf_lock from panic
+CPU before panic_notifier_list callback,
+
+Signed-off-by: Cheng Jian <cj.chengjian@huawei.com>
+Reviewed-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Chen Zhou <chenzhou10@huawei.com>
+Signed-off-by: Cheng Jian <cj.chengjian@huawei.com>
+Reviewed-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/printk.h |  5 +++++
+ kernel/panic.c         |  2 ++
+ kernel/printk/printk.c | 17 +++++++++++++++++
+ 3 files changed, 24 insertions(+)
+
+diff --git a/include/linux/printk.h b/include/linux/printk.h
+index fe7eb2351610..de1457e3af3f 100644
+--- a/include/linux/printk.h
++++ b/include/linux/printk.h
+@@ -209,6 +209,7 @@ void show_regs_print_info(const char *log_lvl);
+ extern asmlinkage void dump_stack(void) __cold;
+ extern void printk_safe_flush(void);
+ extern void printk_safe_flush_on_panic(void);
++extern void zap_locks(void);
+ #else
+ static inline __printf(1, 0)
+ int vprintk(const char *s, va_list args)
+@@ -280,6 +281,10 @@ static inline void printk_safe_flush(void)
+ static inline void printk_safe_flush_on_panic(void)
+ {
+ }
++
++static inline void zap_locks(void)
++{
++}
+ #endif
+ 
+ extern int kptr_restrict;
+diff --git a/kernel/panic.c b/kernel/panic.c
+index 332736a72a58..75f07bb57006 100644
+--- a/kernel/panic.c
++++ b/kernel/panic.c
+@@ -265,6 +265,8 @@ void panic(const char *fmt, ...)
+ 		crash_smp_send_stop();
+ 	}
+ 
++	zap_locks();
++
+ 	/*
+ 	 * Run any panic handlers, including those that might need to
+ 	 * add information to the kmsg dump output.
+diff --git a/kernel/printk/printk.c b/kernel/printk/printk.c
+index d0df95346ab3..a504ff599d69 100644
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@ -1742,6 +1742,23 @@ static DEFINE_RAW_SPINLOCK(console_owner_lock);
+ static struct task_struct *console_owner;
+ static bool console_waiter;
+ 
++void zap_locks(void)
++{
++	if (raw_spin_is_locked(&logbuf_lock)) {
++		debug_locks_off();
++		raw_spin_lock_init(&logbuf_lock);
++
++		console_suspended = 1;
++		sema_init(&console_sem, 1);
++	}
++
++	if (raw_spin_is_locked(&console_owner_lock)) {
++		raw_spin_lock_init(&console_owner_lock);
++		console_owner = NULL;
++		console_waiter = false;
++	}
++}
++
+ /**
+  * console_lock_spinning_enable - mark beginning of code where another
+  *	thread might safely busy wait
+-- 
+2.26.2
+

@@ -1,0 +1,583 @@
+From 0262388abf3b6b5e8cd8aebafdf8ae2e76f55f5b Mon Sep 17 00:00:00 2001
+From: Sang Yan <sangyan@huawei.com>
+Date: Tue, 27 Jul 2021 22:02:13 +0800
+Subject: [PATCH] arm64: smp: Add support for cpu park
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 0262388abf3b6b5e8cd8aebafdf8ae2e76f55f5b
+
+
+hulk inclusion
+category: feature
+bugzilla: 48159
+CVE: N/A
+
+------------------------------
+
+Introducing a feature of CPU PARK in order to save time
+of cpus down and up during kexec, which may cost 250ms of
+per cpu's down and 30ms of up.
+
+As a result, for 128 cores, it costs more than 30 seconds
+to down and up cpus during kexec. Think about 256 cores and more.
+
+CPU PARK is a state that cpu power-on and staying in spin loop, polling
+for exit chances, such as writing exit address.
+
+Reserving a block of memory, to fill with cpu park text section,
+exit address and park-magic-flag of each cpu. In implementation,
+reserved one page for one cpu core.
+
+Cpus going to park state instead of down in machine_shutdown().
+Cpus going out of park state in smp_init instead of brought up.
+
+One of cpu park sections in pre-reserved memory blocks,:
++--------------+
++ exit address +
++--------------+
++ park magic   +
++--------------+
++ park codes   +
++      .       +
++      .       +
++      .       +
++--------------+
+
+Signed-off-by: Sang Yan <sangyan@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ arch/arm64/Kconfig                |  12 ++
+ arch/arm64/include/asm/kexec.h    |   6 +
+ arch/arm64/include/asm/smp.h      |  15 ++
+ arch/arm64/kernel/Makefile        |   1 +
+ arch/arm64/kernel/cpu-park.S      |  58 ++++++++
+ arch/arm64/kernel/machine_kexec.c |   2 +-
+ arch/arm64/kernel/process.c       |   4 +
+ arch/arm64/kernel/smp.c           | 231 ++++++++++++++++++++++++++++++
+ arch/arm64/mm/init.c              |  64 +++++++++
+ 9 files changed, 392 insertions(+), 1 deletion(-)
+ create mode 100644 arch/arm64/kernel/cpu-park.S
+
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -1230,6 +1230,18 @@ config CRASH_DUMP
+ 
+ 	  For more details see Documentation/admin-guide/kdump/kdump.rst
+ 
++config ARM64_CPU_PARK
++	bool "Support CPU PARK on kexec"
++	depends on SMP
++	depends on KEXEC_CORE
++	help
++	 This enables support for CPU PARK feature in
++	 order to save time of cpu down to up.
++	 CPU park is a state through kexec, spin loop
++	 instead of cpu die before jumping to new kernel,
++	 jumping out from loop to new kernel entry in
++	 smp_init.
++
+ config XEN_DOM0
+ 	def_bool y
+ 	depends on XEN
+--- a/arch/arm64/include/asm/kexec.h
++++ b/arch/arm64/include/asm/kexec.h
+@@ -36,6 +36,11 @@
+ 
+ #define CRASH_ADDR_HIGH_MAX	MEMBLOCK_ALLOC_ACCESSIBLE
+ 
++#ifdef CONFIG_ARM64_CPU_PARK
++/* CPU park state flag: "park" */
++#define PARK_MAGIC 0x7061726b
++#endif
++
+ #ifndef __ASSEMBLY__
+ 
+ /**
+@@ -100,6 +105,7 @@ static inline bool crash_is_nosave(unsig
+ static inline void crash_prepare_suspend(void) {}
+ static inline void crash_post_resume(void) {}
+ #endif
++void machine_kexec_mask_interrupts(void);
+ 
+ #ifdef CONFIG_KEXEC_CORE
+ extern void __init reserve_crashkernel(void);
+--- a/arch/arm64/include/asm/smp.h
++++ b/arch/arm64/include/asm/smp.h
+@@ -145,6 +145,21 @@ bool cpus_are_stuck_in_kernel(void);
+ 
+ extern void crash_smp_send_stop(void);
+ extern bool smp_crash_stop_failed(void);
++#ifdef CONFIG_ARM64_CPU_PARK
++#define PARK_SECTION_SIZE 1024
++struct cpu_park_info {
++	/* Physical address of reserved park memory. */
++	unsigned long start;
++	/* park reserve mem len should be PARK_SECTION_SIZE * NR_CPUS */
++	unsigned long len;
++	/* Virtual address of reserved park memory. */
++	unsigned long start_v;
++};
++extern struct cpu_park_info park_info;
++extern void enter_cpu_park(unsigned long text, unsigned long exit);
++extern void do_cpu_park(unsigned long exit);
++extern int kexec_smp_send_park(void);
++#endif
+ 
+ #endif /* ifndef __ASSEMBLY__ */
+ 
+--- a/arch/arm64/kernel/Makefile
++++ b/arch/arm64/kernel/Makefile
+@@ -56,6 +56,7 @@ obj-$(CONFIG_RANDOMIZE_BASE)		+= kaslr.o
+ obj-$(CONFIG_HIBERNATION)		+= hibernate.o hibernate-asm.o
+ obj-$(CONFIG_KEXEC_CORE)		+= machine_kexec.o relocate_kernel.o	\
+ 					   cpu-reset.o
++obj-$(CONFIG_ARM64_CPU_PARK)		+= cpu-park.o
+ obj-$(CONFIG_KEXEC_FILE)		+= machine_kexec_file.o kexec_image.o
+ obj-$(CONFIG_ARM64_RELOC_TEST)		+= arm64-reloc-test.o
+ arm64-reloc-test-y := reloc_test_core.o reloc_test_syms.o
+--- /dev/null
++++ b/arch/arm64/kernel/cpu-park.S
+@@ -0,0 +1,58 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * CPU park routines
++ *
++ * Copyright (C) 2020 Huawei Technologies., Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/linkage.h>
++#include <asm/assembler.h>
++#include <asm/kexec.h>
++#include <asm/sysreg.h>
++#include <asm/virt.h>
++
++.text
++.pushsection    .idmap.text, "awx"
++
++/* cpu park helper in idmap section */
++SYM_CODE_START(enter_cpu_park)
++	/* Clear sctlr_el1 flags. */
++	mrs	x12, sctlr_el1
++	mov_q	x13, SCTLR_ELx_FLAGS
++	bic	x12, x12, x13
++	pre_disable_mmu_workaround
++	msr	sctlr_el1, x12		/* disable mmu */
++	isb
++
++	mov	x18, x0
++	mov	x0, x1			/* secondary_entry addr */
++	br	x18			/* call do_cpu_park of each cpu */
++SYM_CODE_END(enter_cpu_park)
++
++.popsection
++
++SYM_CODE_START(do_cpu_park)
++	ldr	x18, =PARK_MAGIC	/* magic number "park" */
++	add	x1, x0, #8
++	str	x18, [x1]		/* set on-park flag */
++	dc	civac, x1		/* flush cache of "park" */
++	dsb     nsh
++	isb
++
++.Lloop:
++	wfe
++	isb
++	ldr	x19, [x0]
++	cmp	x19, #0			/* test secondary_entry */
++	b.eq	.Lloop
++
++	ic	iallu			/* invalidate the local I-cache */
++	dsb	nsh
++	isb
++
++	br	x19			/* jump to secondary_entry */
++SYM_CODE_END(do_cpu_park)
+--- a/arch/arm64/kernel/machine_kexec.c
++++ b/arch/arm64/kernel/machine_kexec.c
+@@ -214,7 +214,7 @@ void machine_kexec(struct kimage *kimage
+ 	BUG(); /* Should never get here. */
+ }
+ 
+-static void machine_kexec_mask_interrupts(void)
++void machine_kexec_mask_interrupts(void)
+ {
+ 	unsigned int i;
+ 	struct irq_desc *desc;
+--- a/arch/arm64/kernel/process.c
++++ b/arch/arm64/kernel/process.c
+@@ -151,6 +151,10 @@ void arch_cpu_idle_dead(void)
+  */
+ void machine_shutdown(void)
+ {
++#ifdef CONFIG_ARM64_CPU_PARK
++	if (kexec_smp_send_park() == 0)
++		return;
++#endif
+ 	smp_shutdown_nonboot_cpus(reboot_cpu);
+ }
+ 
+--- a/arch/arm64/kernel/smp.c
++++ b/arch/arm64/kernel/smp.c
+@@ -32,6 +32,8 @@
+ #include <linux/irq_work.h>
+ #include <linux/kernel_stat.h>
+ #include <linux/kexec.h>
++#include <linux/console.h>
++
+ #include <linux/kvm_host.h>
+ #include <linux/perf/arm_pmu.h>
+ 
+@@ -95,6 +97,167 @@ static inline int op_cpu_kill(unsigned i
+ }
+ #endif
+ 
++#ifdef CONFIG_ARM64_CPU_PARK
++struct cpu_park_section {
++	unsigned long exit;	/* exit address of park look */
++	unsigned long magic;	/* maigc represent park state */
++	char text[0];		/* text section of park */
++};
++
++static int mmap_cpu_park_mem(void)
++{
++	if (!park_info.start)
++		return -ENOMEM;
++
++	if (park_info.start_v)
++		return 0;
++
++	park_info.start_v = (unsigned long)__ioremap(park_info.start,
++						     park_info.len,
++						     PAGE_KERNEL_EXEC);
++	if (!park_info.start_v) {
++		pr_warn("map park memory failed.");
++		return -ENOMEM;
++	}
++
++	return 0;
++}
++
++static inline unsigned long cpu_park_section_v(unsigned int cpu)
++{
++	return park_info.start_v + PARK_SECTION_SIZE * (cpu - 1);
++}
++
++static inline unsigned long cpu_park_section_p(unsigned int cpu)
++{
++	return park_info.start + PARK_SECTION_SIZE * (cpu - 1);
++}
++
++/*
++ * Write the secondary_entry to exit section of park state.
++ * Then the secondary cpu will jump straight into the kernel
++ * by the secondary_entry.
++ */
++static int write_park_exit(unsigned int cpu)
++{
++	struct cpu_park_section *park_section;
++	unsigned long *park_exit;
++	unsigned long *park_text;
++
++	if (mmap_cpu_park_mem() != 0)
++		return -EPERM;
++
++	park_section = (struct cpu_park_section *)cpu_park_section_v(cpu);
++	park_exit = &park_section->exit;
++	park_text = (unsigned long *)park_section->text;
++	pr_debug("park_text 0x%lx : 0x%lx, do_cpu_park text 0x%lx : 0x%lx",
++		 (unsigned long)park_text, *park_text,
++		 (unsigned long)do_cpu_park,
++		 *(unsigned long *)do_cpu_park);
++
++	/*
++	 * Test first 8 bytes to determine
++	 * whether needs to write cpu park exit.
++	 */
++	if (*park_text == *(unsigned long *)do_cpu_park) {
++		writeq_relaxed(__pa_symbol(secondary_entry), park_exit);
++		__flush_dcache_area((__force void *)park_exit,
++				    sizeof(unsigned long));
++		flush_icache_range((unsigned long)park_exit,
++				   (unsigned long)(park_exit + 1));
++		sev();
++		dsb(sy);
++		isb();
++
++		pr_debug("Write cpu %u secondary entry 0x%lx to 0x%lx.",
++			cpu, *park_exit, (unsigned long)park_exit);
++		pr_info("Boot cpu %u from PARK state.", cpu);
++		return 0;
++	}
++
++	return -EPERM;
++}
++
++/* Install cpu park sections for the specific cpu. */
++static int install_cpu_park(unsigned int cpu)
++{
++	struct cpu_park_section *park_section;
++	unsigned long *park_exit;
++	unsigned long *park_magic;
++	unsigned long park_text_len;
++
++	park_section = (struct cpu_park_section *)cpu_park_section_v(cpu);
++	pr_debug("Install cpu park on cpu %u park exit 0x%lx park text 0x%lx",
++		 cpu, (unsigned long)park_section,
++		 (unsigned long)(park_section->text));
++
++	park_exit = &park_section->exit;
++	park_magic = &park_section->magic;
++	park_text_len = PARK_SECTION_SIZE - sizeof(struct cpu_park_section);
++
++	*park_exit = 0UL;
++	*park_magic = 0UL;
++	memcpy((void *)park_section->text, do_cpu_park, park_text_len);
++	__flush_dcache_area((void *)park_section, PARK_SECTION_SIZE);
++
++	return 0;
++}
++
++static int uninstall_cpu_park(unsigned int cpu)
++{
++	unsigned long park_section;
++
++	if (mmap_cpu_park_mem() != 0)
++		return -EPERM;
++
++	park_section = cpu_park_section_v(cpu);
++	memset((void *)park_section, 0, PARK_SECTION_SIZE);
++	__flush_dcache_area((void *)park_section, PARK_SECTION_SIZE);
++
++	return 0;
++}
++
++static int cpu_wait_park(unsigned int cpu)
++{
++	long timeout;
++	struct cpu_park_section *park_section;
++
++	volatile unsigned long *park_magic;
++
++	park_section = (struct cpu_park_section *)cpu_park_section_v(cpu);
++	park_magic = &park_section->magic;
++
++	timeout = USEC_PER_SEC;
++	while (*park_magic != PARK_MAGIC && timeout--)
++		udelay(1);
++
++	if (timeout > 0)
++		pr_debug("cpu %u park done.", cpu);
++	else
++		pr_err("cpu %u park failed.", cpu);
++
++	return *park_magic == PARK_MAGIC;
++}
++
++static void cpu_park(unsigned int cpu)
++{
++	unsigned long park_section_p;
++	unsigned long park_exit_phy;
++	unsigned long do_park;
++	typeof(enter_cpu_park) *park;
++
++	park_section_p = cpu_park_section_p(cpu);
++	park_exit_phy = park_section_p;
++	pr_debug("Go to park cpu %u exit address 0x%lx", cpu, park_exit_phy);
++
++	do_park = park_section_p + sizeof(struct cpu_park_section);
++	park = (void *)__pa_symbol(enter_cpu_park);
++
++	cpu_install_idmap();
++	park(do_park, park_exit_phy);
++	unreachable();
++}
++#endif
+ 
+ /*
+  * Boot a secondary CPU, and assign it the specified idle task.
+@@ -104,6 +267,10 @@ static int boot_secondary(unsigned int c
+ {
+ 	const struct cpu_operations *ops = get_cpu_ops(cpu);
+ 
++#ifdef CONFIG_ARM64_CPU_PARK
++	if (write_park_exit(cpu) == 0)
++		return 0;
++#endif
+ 	if (ops->cpu_boot)
+ 		return ops->cpu_boot(cpu);
+ 
+@@ -139,6 +306,9 @@ int __cpu_up(unsigned int cpu, struct ta
+ 	 */
+ 	wait_for_completion_timeout(&cpu_running,
+ 				    msecs_to_jiffies(5000));
++#ifdef CONFIG_ARM64_CPU_PARK
++	uninstall_cpu_park(cpu);
++#endif
+ 	if (cpu_online(cpu))
+ 		return 0;
+ 
+@@ -853,10 +1023,32 @@ void arch_irq_work_raise(void)
+ 
+ static void local_cpu_stop(void)
+ {
++#ifdef CONFIG_ARM64_CPU_PARK
++	int cpu;
++	const struct cpu_operations *ops = NULL;
++#endif
++
+ 	set_cpu_online(smp_processor_id(), false);
+ 
+ 	local_daif_mask();
+ 	sdei_mask_local_cpu();
++
++#ifdef CONFIG_ARM64_CPU_PARK
++	/*
++	 * Go to cpu park state.
++	 * Otherwise go to cpu die.
++	 */
++	cpu = smp_processor_id();
++	if (kexec_in_progress && park_info.start_v) {
++		machine_kexec_mask_interrupts();
++		cpu_park(cpu);
++
++		ops = get_cpu_ops(cpu);
++		if (ops && ops->cpu_die)
++			ops->cpu_die(cpu);
++	}
++#endif
++
+ 	cpu_park_loop();
+ }
+ 
+@@ -1069,6 +1261,45 @@ void smp_send_stop(void)
+ 	sdei_mask_local_cpu();
+ }
+ 
++#ifdef CONFIG_ARM64_CPU_PARK
++int kexec_smp_send_park(void)
++{
++	unsigned long cpu;
++
++	if (WARN_ON(!kexec_in_progress)) {
++		pr_crit("%s called not in kexec progress.", __func__);
++		return -EPERM;
++	}
++
++	if (mmap_cpu_park_mem() != 0) {
++		pr_info("no cpuparkmem, goto normal way.");
++		return -EPERM;
++	}
++
++	local_irq_disable();
++
++	if (num_online_cpus() > 1) {
++		cpumask_t mask;
++
++		cpumask_copy(&mask, cpu_online_mask);
++		cpumask_clear_cpu(smp_processor_id(), &mask);
++
++		for_each_cpu(cpu, &mask)
++			install_cpu_park(cpu);
++		smp_cross_call(&mask, IPI_CPU_STOP);
++
++		/* Wait for other CPUs to park */
++		for_each_cpu(cpu, &mask)
++			cpu_wait_park(cpu);
++		pr_info("smp park other cpus done\n");
++	}
++
++	sdei_mask_local_cpu();
++
++	return 0;
++}
++#endif
++
+ #ifdef CONFIG_KEXEC_CORE
+ void crash_smp_send_stop(void)
+ {
+--- a/arch/arm64/mm/init.c
++++ b/arch/arm64/mm/init.c
+@@ -304,6 +304,57 @@ static void __init fdt_enforce_memory_re
+ 		memblock_add(usable_rgns[1].base, usable_rgns[1].size);
+ }
+ 
++#ifdef CONFIG_ARM64_CPU_PARK
++struct cpu_park_info park_info = {
++	.start = 0,
++	.len = PARK_SECTION_SIZE * NR_CPUS,
++	.start_v = 0,
++};
++
++static int __init parse_park_mem(char *p)
++{
++	if (!p)
++		return 0;
++
++	park_info.start = PAGE_ALIGN(memparse(p, NULL));
++	if (park_info.start == 0)
++		pr_info("cpu park mem params[%s]", p);
++
++	return 0;
++}
++early_param("cpuparkmem", parse_park_mem);
++
++static int __init reserve_park_mem(void)
++{
++	if (park_info.start == 0 || park_info.len == 0)
++		return 0;
++
++	park_info.start = PAGE_ALIGN(park_info.start);
++	park_info.len = PAGE_ALIGN(park_info.len);
++
++	if (!memblock_is_region_memory(park_info.start, park_info.len)) {
++		pr_warn("cannot reserve park mem: region is not memory!");
++		goto out;
++	}
++
++	if (memblock_is_region_reserved(park_info.start, park_info.len)) {
++		pr_warn("cannot reserve park mem: region overlaps reserved memory!");
++		goto out;
++	}
++
++	memblock_remove(park_info.start, park_info.len);
++	pr_info("cpu park mem reserved: 0x%016lx - 0x%016lx (%ld MB)",
++		park_info.start, park_info.start + park_info.len,
++		park_info.len >> 20);
++
++	return 0;
++out:
++	park_info.start = 0;
++	park_info.len = 0;
++	return -EINVAL;
++}
++#endif
++
+ void __init arm64_memblock_init(void)
+ {
+ 	const s64 linear_region_size = BIT(vabits_actual - 1);
+@@ -459,6 +510,19 @@ void __init bootmem_init(void)
+ 	dma_contiguous_reserve(arm64_dma_phys_limit);
+ 
+ 	/*
++	 * Reserve park memory before crashkernel and quick kexec.
++	 * Because park memory must be specified by address, but
++	 * crashkernel and quickkexec may be specified by memory length,
++	 * then find one sutiable memory region to reserve.
++	 *
++	 * So reserve park memory firstly is better, but it may cause
++	 * crashkernel or quickkexec reserving failed.
++	 */
++#ifdef CONFIG_ARM64_CPU_PARK
++	reserve_park_mem();
++#endif
++
++	/*
+ 	 * request_standard_resources() depends on crashkernel's memory being
+ 	 * reserved, so do it here.
+ 	 */

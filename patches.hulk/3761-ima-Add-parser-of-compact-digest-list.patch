@@ -1,0 +1,361 @@
+From 4bc4c4ca82a1801f2ff7b684d3adf15567fa45a7 Mon Sep 17 00:00:00 2001
+From: Roberto Sassu <roberto.sassu@huawei.com>
+Date: Wed, 3 Mar 2021 08:43:58 +0100
+Subject: [PATCH] ima: Add parser of compact digest list
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 4bc4c4ca82a1801f2ff7b684d3adf15567fa45a7
+
+
+hulk inclusion
+category: feature
+feature: IMA Digest Lists extension
+bugzilla: 46797
+
+-------------------------------------------------
+
+This patch introduces the parser of the compact digest list. The format is
+optimized to store a large quantity of data with the same type. It is the
+only format supported by the kernel. Digest lists can be uploaded by
+writing the path to securityfs, as the same as for IMA policies.
+
+A compact list is a set of consecutive data blocks, each consisting of a
+header and a payload. The header indicates the version of the header, the
+type of data, type modifiers, the hash algorithm, how many elements and the
+length of the payload.
+
+COMPACT_KEY identifies public keys used for signature verification of the
+digest lists; COMPACT_PARSER identifies digests of user space parsers
+allowed to directly upload parsed digest lists to the kernel; COMPACT_FILE
+identifies digests of regular files; COMPACT_METADATA identifies digest of
+file metadata.
+
+Type modifiers indicate attributes of the elements included in the payload.
+The COMPACT_MOD_IMMUTABLE modifier indicates that a file or metadata are
+immutable.
+
+This patch also introduces ima_lookup_loaded_digest() and
+ima_add_digest_data_entry() to search and add digests in the new hash table
+(ima_digests_htable).
+
+Signed-off-by: Roberto Sassu <roberto.sassu@huawei.com>
+Signed-off-by: Tianxing Zhang <zhangtianxing3@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Kai Liu <kai.liu@suse.com>
+---
+ security/integrity/ima/Kconfig           |  10 ++
+ security/integrity/ima/Makefile          |   1 +
+ security/integrity/ima/ima_digest_list.c | 176 +++++++++++++++++++++++
+ security/integrity/ima/ima_digest_list.h |  32 +++++
+ security/integrity/integrity.h           |  37 +++++
+ 5 files changed, 256 insertions(+)
+ create mode 100644 security/integrity/ima/ima_digest_list.c
+ create mode 100644 security/integrity/ima/ima_digest_list.h
+
+diff --git a/security/integrity/ima/Kconfig b/security/integrity/ima/Kconfig
+index 12e9250c1bec..0b5781db7ee9 100644
+--- a/security/integrity/ima/Kconfig
++++ b/security/integrity/ima/Kconfig
+@@ -334,3 +334,13 @@ config IMA_SECURE_AND_OR_TRUSTED_BOOT
+        help
+           This option is selected by architectures to enable secure and/or
+           trusted boot based on IMA runtime policies.
++
++config IMA_DIGEST_LIST
++	bool "Measure and appraise files with digest lists"
++	depends on IMA
++	default n
++	help
++	   This option allows users to load digest lists. If calculated digests
++	   of accessed files are found in one of those lists, no new entries are
++	   added to the measurement list, and access to the file is granted if
++	   appraisal is in enforcing mode.
+diff --git a/security/integrity/ima/Makefile b/security/integrity/ima/Makefile
+index 67dabca670e2..9dda78739c85 100644
+--- a/security/integrity/ima/Makefile
++++ b/security/integrity/ima/Makefile
+@@ -14,3 +14,4 @@ ima-$(CONFIG_HAVE_IMA_KEXEC) += ima_kexec.o
+ ima-$(CONFIG_IMA_BLACKLIST_KEYRING) += ima_mok.o
+ ima-$(CONFIG_IMA_MEASURE_ASYMMETRIC_KEYS) += ima_asymmetric_keys.o
+ ima-$(CONFIG_IMA_QUEUE_EARLY_BOOT_KEYS) += ima_queue_keys.o
++ima-$(CONFIG_IMA_DIGEST_LIST) += ima_digest_list.o
+diff --git a/security/integrity/ima/ima_digest_list.c b/security/integrity/ima/ima_digest_list.c
+new file mode 100644
+index 000000000000..0dcc69954887
+--- /dev/null
++++ b/security/integrity/ima/ima_digest_list.c
+@@ -0,0 +1,176 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2017-2019 Huawei Technologies Duesseldorf GmbH
++ *
++ * Author: Roberto Sassu <roberto.sassu@huawei.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation, version 2 of the
++ * License.
++ *
++ * File: ima_digest_list.c
++ *      Functions to manage digest lists.
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/vmalloc.h>
++#include <linux/module.h>
++
++#include "ima.h"
++#include "ima_digest_list.h"
++
++struct ima_h_table ima_digests_htable = {
++	.len = ATOMIC_LONG_INIT(0),
++	.queue[0 ... IMA_MEASURE_HTABLE_SIZE - 1] = HLIST_HEAD_INIT
++};
++
++/*************************
++ * Get/add/del functions *
++ *************************/
++struct ima_digest *ima_lookup_digest(u8 *digest, enum hash_algo algo,
++				     enum compact_types type)
++{
++	struct ima_digest *d = NULL;
++	int digest_len = hash_digest_size[algo];
++	unsigned int key = ima_hash_key(digest);
++
++	rcu_read_lock();
++	hlist_for_each_entry_rcu(d, &ima_digests_htable.queue[key], hnext)
++		if (d->algo == algo && d->type == type &&
++		    !memcmp(d->digest, digest, digest_len))
++			break;
++
++	rcu_read_unlock();
++	return d;
++}
++
++static int ima_add_digest_data_entry(u8 *digest, enum hash_algo algo,
++				     enum compact_types type, u16 modifiers)
++{
++	struct ima_digest *d;
++	int digest_len = hash_digest_size[algo];
++	unsigned int key = ima_hash_key(digest);
++
++	d = ima_lookup_digest(digest, algo, type);
++	if (d) {
++		d->modifiers |= modifiers;
++		if (d->count < (u16)(~((u16)0)))
++			d->count++;
++		return -EEXIST;
++	}
++
++	d = kmalloc(sizeof(*d) + digest_len, GFP_KERNEL);
++	if (d == NULL)
++		return -ENOMEM;
++
++	d->algo = algo;
++	d->type = type;
++	d->modifiers = modifiers;
++	d->count = 1;
++
++	memcpy(d->digest, digest, digest_len);
++	hlist_add_head_rcu(&d->hnext, &ima_digests_htable.queue[key]);
++	atomic_long_inc(&ima_digests_htable.len);
++	return 0;
++}
++
++static void ima_del_digest_data_entry(u8 *digest, enum hash_algo algo,
++				     enum compact_types type)
++{
++	struct ima_digest *d;
++
++	d = ima_lookup_digest(digest, algo, type);
++	if (!d)
++		return;
++
++	if (--d->count > 0)
++		return;
++
++	hlist_del_rcu(&d->hnext);
++	atomic_long_dec(&ima_digests_htable.len);
++}
++
++/***********************
++ * Compact list parser *
++ ***********************/
++struct compact_list_hdr {
++	u8 version;
++	u8 _reserved;
++	u16 type;
++	u16 modifiers;
++	u16 algo;
++	u32 count;
++	u32 datalen;
++} __packed;
++
++int ima_parse_compact_list(loff_t size, void *buf, int op)
++{
++	u8 *digest;
++	void *bufp = buf, *bufendp = buf + size;
++	struct compact_list_hdr *hdr;
++	size_t digest_len;
++	int ret = 0, i;
++
++	while (bufp < bufendp) {
++		if (bufp + sizeof(*hdr) > bufendp) {
++			pr_err("compact list, invalid data\n");
++			return -EINVAL;
++		}
++
++		hdr = bufp;
++
++		if (hdr->version != 1) {
++			pr_err("compact list, unsupported version\n");
++			return -EINVAL;
++		}
++
++		if (ima_canonical_fmt) {
++			hdr->type = le16_to_cpu(hdr->type);
++			hdr->modifiers = le16_to_cpu(hdr->modifiers);
++			hdr->algo = le16_to_cpu(hdr->algo);
++			hdr->count = le32_to_cpu(hdr->count);
++			hdr->datalen = le32_to_cpu(hdr->datalen);
++		}
++
++		if (hdr->algo >= HASH_ALGO__LAST)
++			return -EINVAL;
++
++		digest_len = hash_digest_size[hdr->algo];
++
++		if (hdr->type >= COMPACT__LAST) {
++			pr_err("compact list, invalid type %d\n", hdr->type);
++			return -EINVAL;
++		}
++
++		bufp += sizeof(*hdr);
++
++		for (i = 0; i < hdr->count; i++) {
++			if (bufp + digest_len > bufendp) {
++				pr_err("compact list, invalid data\n");
++				return -EINVAL;
++			}
++
++			digest = bufp;
++			bufp += digest_len;
++
++			if (op == DIGEST_LIST_OP_ADD)
++				ret = ima_add_digest_data_entry(digest,
++					hdr->algo, hdr->type, hdr->modifiers);
++			else if (op == DIGEST_LIST_OP_DEL)
++				ima_del_digest_data_entry(digest, hdr->algo,
++					hdr->type);
++			if (ret < 0 && ret != -EEXIST)
++				return ret;
++		}
++
++		if (i != hdr->count ||
++		    bufp != (void *)hdr + sizeof(*hdr) + hdr->datalen) {
++			pr_err("compact list, invalid data\n");
++			return -EINVAL;
++		}
++	}
++
++	return bufp - buf;
++}
+diff --git a/security/integrity/ima/ima_digest_list.h b/security/integrity/ima/ima_digest_list.h
+new file mode 100644
+index 000000000000..ac6b0ee0aec6
+--- /dev/null
++++ b/security/integrity/ima/ima_digest_list.h
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (C) 2017-2019 Huawei Technologies Duesseldorf GmbH
++ *
++ * Author: Roberto Sassu <roberto.sassu@huawei.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation, version 2 of the
++ * License.
++ *
++ * File: ima_digest_list.h
++ *      Header of ima_digest_list.c
++ */
++
++#ifndef __LINUX_IMA_DIGEST_LIST_H
++#define __LINUX_IMA_DIGEST_LIST_H
++
++#define DIGEST_LIST_OP_ADD 0
++#define DIGEST_LIST_OP_DEL 1
++
++#ifdef CONFIG_IMA_DIGEST_LIST
++extern struct ima_h_table ima_digests_htable;
++
++int ima_parse_compact_list(loff_t size, void *buf, int op);
++#else
++static inline int ima_parse_compact_list(loff_t size, void *buf, int op)
++{
++	return -EOPNOTSUPP;
++}
++#endif /*CONFIG_IMA_DIGEST_LIST*/
++#endif /*LINUX_IMA_DIGEST_LIST_H*/
+diff --git a/security/integrity/integrity.h b/security/integrity/integrity.h
+index 413c803c5208..2f0a179b2832 100644
+--- a/security/integrity/integrity.h
++++ b/security/integrity/integrity.h
+@@ -17,6 +17,7 @@
+ #include <crypto/sha1.h>
+ #include <linux/key.h>
+ #include <linux/audit.h>
++#include <linux/hash_info.h>
+ 
+ /* iint action cache flags */
+ #define IMA_MEASURE		0x00000001
+@@ -140,6 +141,42 @@ struct integrity_iint_cache {
+ 	struct ima_digest_data *ima_hash;
+ };
+ 
++enum compact_types { COMPACT_KEY, COMPACT_PARSER, COMPACT_FILE,
++		     COMPACT_METADATA, COMPACT__LAST };
++enum compact_modifiers { COMPACT_MOD_IMMUTABLE, COMPACT_MOD__LAST };
++
++struct ima_digest {
++	struct hlist_node hnext;
++	enum hash_algo algo;
++	enum compact_types type;
++	u16 modifiers;
++	u16 count;
++	u8 digest[0];
++};
++
++static inline bool ima_digest_is_immutable(struct ima_digest *digest)
++{
++	return (digest->modifiers & (1 << COMPACT_MOD_IMMUTABLE));
++}
++
++#ifdef CONFIG_IMA_DIGEST_LIST
++struct ima_digest *ima_lookup_digest(u8 *digest, enum hash_algo algo,
++				     enum compact_types type);
++struct ima_digest *ima_digest_allow(struct ima_digest *digest, int action);
++#else
++static inline struct ima_digest *ima_lookup_digest(u8 *digest,
++						   enum hash_algo algo,
++						   enum compact_types type)
++{
++	return NULL;
++}
++static inline struct ima_digest *ima_digest_allow(struct ima_digest *digest,
++						  int action)
++{
++	return NULL;
++}
++#endif
++
+ /* rbtree tree calls to lookup, insert, delete
+  * integrity data associated with an inode.
+  */
+-- 
+2.26.2
+

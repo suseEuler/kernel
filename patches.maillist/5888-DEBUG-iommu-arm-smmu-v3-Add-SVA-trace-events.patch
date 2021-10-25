@@ -1,0 +1,246 @@
+From 685ace6c824e6bb16918a0d344c355766f9ab9f4 Mon Sep 17 00:00:00 2001
+From: Jean-Philippe Brucker <jean-philippe@linaro.org>
+Date: Sat, 29 May 2021 07:03:34 +0000
+Subject: [PATCH] DEBUG: iommu/arm-smmu-v3: Add SVA trace events
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 685ace6c824e6bb16918a0d344c355766f9ab9f4
+
+
+maillist inclusion
+category: feature
+bugzilla: 51855
+CVE: NA
+
+Reference: https://jpbrucker.net/git/linux/commit/?h=sva/2021-03-01&id=870541b34bfa7ba8d5846fcb3246e533e7492e20
+
+---------------------------------------------
+
+It's useful when debugging to have some trace events for SVA object
+allocation and freeing.
+
+Signed-off-by: Jean-Philippe Brucker <jean-philippe@linaro.org>
+Signed-off-by: Lijun Fang <fanglijun3@huawei.com>
+Reviewed-by: Weilong Chen <chenweilong@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ .../iommu/arm/arm-smmu-v3/arm-smmu-v3-sva.c   | 15 +++-
+ drivers/iommu/iommu-traces.c                  | 13 +++
+ include/trace/events/smmu.h                   | 89 +++++++++++++++++++
+ 3 files changed, 116 insertions(+), 1 deletion(-)
+ create mode 100644 include/trace/events/smmu.h
+
+diff --git a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3-sva.c b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3-sva.c
+index 1efaa118ddd7..d4e1238347a6 100644
+--- a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3-sva.c
++++ b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3-sva.c
+@@ -8,6 +8,8 @@
+ #include <linux/mmu_notifier.h>
+ #include <linux/slab.h>
+ 
++#include <trace/events/smmu.h>
++
+ #include "arm-smmu-v3.h"
+ #include "../../iommu-sva-lib.h"
+ #include "../../io-pgtable-arm.h"
+@@ -191,6 +193,7 @@ static void arm_smmu_mm_invalidate_range(struct mmu_notifier *mn,
+ 		arm_smmu_tlb_inv_range_asid(start, size, smmu_mn->cd->asid,
+ 					    PAGE_SIZE, false, smmu_domain);
+ 	arm_smmu_atc_inv_domain(smmu_domain, mm->pasid, start, size);
++	trace_smmu_mm_invalidate(mm->pasid, start, end);
+ }
+ 
+ static void arm_smmu_mm_release(struct mmu_notifier *mn, struct mm_struct *mm)
+@@ -240,6 +243,7 @@ arm_smmu_mmu_notifier_get(struct arm_smmu_domain *smmu_domain,
+ 	list_for_each_entry(smmu_mn, &smmu_domain->mmu_notifiers, list) {
+ 		if (smmu_mn->mn.mm == mm) {
+ 			refcount_inc(&smmu_mn->refs);
++			trace_smmu_mn_get(mm->pasid);
+ 			return smmu_mn;
+ 		}
+ 	}
+@@ -270,6 +274,7 @@ arm_smmu_mmu_notifier_get(struct arm_smmu_domain *smmu_domain,
+ 		goto err_put_notifier;
+ 
+ 	list_add(&smmu_mn->list, &smmu_domain->mmu_notifiers);
++	trace_smmu_mn_alloc(mm->pasid);
+ 	return smmu_mn;
+ 
+ err_put_notifier:
+@@ -286,8 +291,10 @@ static void arm_smmu_mmu_notifier_put(struct arm_smmu_mmu_notifier *smmu_mn)
+ 	struct arm_smmu_ctx_desc *cd = smmu_mn->cd;
+ 	struct arm_smmu_domain *smmu_domain = smmu_mn->domain;
+ 
+-	if (!refcount_dec_and_test(&smmu_mn->refs))
++	if (!refcount_dec_and_test(&smmu_mn->refs)) {
++		trace_smmu_mn_put(mm->pasid);
+ 		return;
++	}
+ 
+ 	list_del(&smmu_mn->list);
+ 	arm_smmu_write_ctx_desc(smmu_domain, mm->pasid, NULL);
+@@ -303,6 +310,7 @@ static void arm_smmu_mmu_notifier_put(struct arm_smmu_mmu_notifier *smmu_mn)
+ 
+ 	/* Frees smmu_mn */
+ 	mmu_notifier_put(&smmu_mn->mn);
++	trace_smmu_mn_free(mm->pasid);
+ 	arm_smmu_free_shared_cd(cd);
+ }
+ 
+@@ -321,6 +329,7 @@ __arm_smmu_sva_bind(struct device *dev, struct mm_struct *mm)
+ 	/* If bind() was already called for this {dev, mm} pair, reuse it. */
+ 	list_for_each_entry(bond, &master->bonds, list) {
+ 		if (bond->mm == mm) {
++			trace_smmu_bind_get(dev, mm->pasid);
+ 			refcount_inc(&bond->refs);
+ 			return &bond->sva;
+ 		}
+@@ -346,6 +355,7 @@ __arm_smmu_sva_bind(struct device *dev, struct mm_struct *mm)
+ 	}
+ 
+ 	list_add(&bond->list, &master->bonds);
++	trace_smmu_bind_alloc(dev, mm->pasid);
+ 	return &bond->sva;
+ 
+ err_free_pasid:
+@@ -390,10 +400,13 @@ void arm_smmu_sva_unbind(struct iommu_sva *handle)
+ 
+ 	mutex_lock(&sva_lock);
+ 	if (refcount_dec_and_test(&bond->refs)) {
++		trace_smmu_unbind_free(handle->dev, bond->mm->pasid);
+ 		list_del(&bond->list);
+ 		arm_smmu_mmu_notifier_put(bond->smmu_mn);
+ 		iommu_sva_free_pasid(bond->mm);
+ 		kfree(bond);
++	} else {
++		trace_smmu_unbind_put(handle->dev, bond->mm->pasid);
+ 	}
+ 	mutex_unlock(&sva_lock);
+ }
+diff --git a/drivers/iommu/iommu-traces.c b/drivers/iommu/iommu-traces.c
+index 1e9ca7789de1..31b20735ab31 100644
+--- a/drivers/iommu/iommu-traces.c
++++ b/drivers/iommu/iommu-traces.c
+@@ -11,6 +11,7 @@
+ 
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/iommu.h>
++#include <trace/events/smmu.h>
+ 
+ /* iommu_group_event */
+ EXPORT_TRACEPOINT_SYMBOL_GPL(add_device_to_group);
+@@ -26,3 +27,15 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(unmap);
+ 
+ /* iommu_error */
+ EXPORT_TRACEPOINT_SYMBOL_GPL(io_page_fault);
++
++/* Arm SMMUv3 traces */
++EXPORT_TRACEPOINT_SYMBOL_GPL(smmu_bind_alloc);
++EXPORT_TRACEPOINT_SYMBOL_GPL(smmu_bind_get);
++EXPORT_TRACEPOINT_SYMBOL_GPL(smmu_unbind_put);
++EXPORT_TRACEPOINT_SYMBOL_GPL(smmu_unbind_free);
++EXPORT_TRACEPOINT_SYMBOL_GPL(smmu_mm_release);
++EXPORT_TRACEPOINT_SYMBOL_GPL(smmu_mm_invalidate);
++EXPORT_TRACEPOINT_SYMBOL_GPL(smmu_mn_alloc);
++EXPORT_TRACEPOINT_SYMBOL_GPL(smmu_mn_free);
++EXPORT_TRACEPOINT_SYMBOL_GPL(smmu_mn_get);
++EXPORT_TRACEPOINT_SYMBOL_GPL(smmu_mn_put);
+diff --git a/include/trace/events/smmu.h b/include/trace/events/smmu.h
+new file mode 100644
+index 000000000000..31354c4b9d81
+--- /dev/null
++++ b/include/trace/events/smmu.h
+@@ -0,0 +1,89 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Arm SMMUv3 trace points
++ */
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM smmu
++
++#if !defined(_TRACE_SMMU_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _TRACE_SMMU_H
++
++#include <linux/tracepoint.h>
++
++struct device;
++
++DECLARE_EVENT_CLASS(smmu_bond,
++		    TP_PROTO(struct device *dev, unsigned int pasid),
++		    TP_ARGS(dev, pasid),
++		    TP_STRUCT__entry(
++			__string(dev, dev_name(dev))
++			__field(int, pasid)
++		    ),
++		    TP_fast_assign(
++			__assign_str(dev, dev_name(dev));
++			__entry->pasid = pasid;
++		    ),
++		    TP_printk("dev=%s pasid=%d", __get_str(dev), __entry->pasid)
++);
++
++DEFINE_EVENT(smmu_bond, smmu_bind_alloc,
++	     TP_PROTO(struct device *dev, unsigned int pasid),
++	     TP_ARGS(dev, pasid));
++
++DEFINE_EVENT(smmu_bond, smmu_bind_get,
++	     TP_PROTO(struct device *dev, unsigned int pasid),
++	     TP_ARGS(dev, pasid));
++
++DEFINE_EVENT(smmu_bond, smmu_unbind_put,
++	     TP_PROTO(struct device *dev, unsigned int pasid),
++	     TP_ARGS(dev, pasid));
++
++DEFINE_EVENT(smmu_bond, smmu_unbind_free,
++	     TP_PROTO(struct device *dev, unsigned int pasid),
++	     TP_ARGS(dev, pasid));
++
++TRACE_EVENT(smmu_mm_release,
++	    TP_PROTO(unsigned int pasid),
++	    TP_ARGS(pasid),
++	    TP_STRUCT__entry(__field(int, pasid)),
++	    TP_fast_assign(__entry->pasid = pasid;),
++	    TP_printk("pasid=%d", __entry->pasid)
++);
++
++TRACE_EVENT(smmu_mm_invalidate,
++	    TP_PROTO(unsigned int pasid,
++		     unsigned long start, unsigned long end),
++	    TP_ARGS(pasid, start, end),
++	    TP_STRUCT__entry(
++			__field(int, pasid)
++			__field(unsigned long, start)
++			__field(unsigned long, end)
++		    ),
++	    TP_fast_assign(
++			   __entry->pasid = pasid;
++			   __entry->start = start;
++			   __entry->end = end;
++			  ),
++	    TP_printk("pasid=%d start=0x%lx end=0x%lx",
++		      __entry->pasid, __entry->start,
++		      __entry->end)
++)
++
++DECLARE_EVENT_CLASS(smmu_mn,
++		    TP_PROTO(unsigned int pasid),
++		    TP_ARGS(pasid),
++		    TP_STRUCT__entry(__field(int, pasid)),
++		    TP_fast_assign(__entry->pasid = pasid;),
++		    TP_printk("pasid=%d", __entry->pasid)
++);
++
++DEFINE_EVENT(smmu_mn, smmu_mn_alloc, TP_PROTO(unsigned int pasid), TP_ARGS(pasid));
++DEFINE_EVENT(smmu_mn, smmu_mn_free, TP_PROTO(unsigned int pasid), TP_ARGS(pasid));
++DEFINE_EVENT(smmu_mn, smmu_mn_get, TP_PROTO(unsigned int pasid), TP_ARGS(pasid));
++DEFINE_EVENT(smmu_mn, smmu_mn_put, TP_PROTO(unsigned int pasid), TP_ARGS(pasid));
++
++
++#endif /* _TRACE_SMMU_H */
++
++/* This part must be outside protection */
++#include <trace/define_trace.h>
+-- 
+2.26.2
+

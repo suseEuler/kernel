@@ -1,0 +1,75 @@
+From 961045004b774aae7a244fa0435f8a6a2495c234 Mon Sep 17 00:00:00 2001
+From: Yunsheng Lin <linyunsheng@huawei.com>
+Date: Fri, 18 Jun 2021 20:09:45 +0800
+Subject: [PATCH] net: hns3: fix reuse conflict of the rx page
+Git-commit: 961045004b774aae7a244fa0435f8a6a2495c234
+Patch-mainline: v5.14-rc1
+References: bsn#12
+
+
+In the current rx page reuse handling process, the rx page buffer may
+have conflict between driver and stack in high-pressure scenario.
+
+To fix this problem, we need to check whether the page is only owned
+by driver at the begin and at the end of a page to make sure there is
+no reuse conflict between driver and stack when desc_cb->page_offset
+is rollbacked to zero or increased.
+
+Fixes: fa7711b888f2 ("net: hns3: optimize the rx page reuse handling process")
+Signed-off-by: Yunsheng Lin <linyunsheng@huawei.com>
+Signed-off-by: Guangbin Huang <huangguangbin2@huawei.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ .../net/ethernet/hisilicon/hns3/hns3_enet.c   | 26 ++++++++++++++-----
+ 1 file changed, 19 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3_enet.c b/drivers/net/ethernet/hisilicon/hns3/hns3_enet.c
+index 51bbf5f760c5..cdb5f14fb6bc 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3_enet.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3_enet.c
+@@ -3537,21 +3537,33 @@ static void hns3_nic_reuse_page(struct sk_buff *skb, int i,
+ 	int size = le16_to_cpu(desc->rx.size);
+ 	u32 truesize = hns3_buf_size(ring);
+ 	u32 frag_size = size - pull_len;
++	bool reused;
+ 
+ 	/* Avoid re-using remote or pfmem page */
+ 	if (unlikely(!dev_page_is_reusable(desc_cb->priv)))
+ 		goto out;
+ 
+-	/* Stack is not using and current page_offset is non-zero, we can
+-	 * reuse from the zero offset.
++	reused = hns3_can_reuse_page(desc_cb);
++
++	/* Rx page can be reused when:
++	 * 1. Rx page is only owned by the driver when page_offset
++	 *    is zero, which means 0 @ truesize will be used by
++	 *    stack after skb_add_rx_frag() is called, and the rest
++	 *    of rx page can be reused by driver.
++	 * Or
++	 * 2. Rx page is only owned by the driver when page_offset
++	 *    is non-zero, which means page_offset @ truesize will
++	 *    be used by stack after skb_add_rx_frag() is called,
++	 *    and 0 @ truesize can be reused by driver.
+ 	 */
+-	if (desc_cb->page_offset && hns3_can_reuse_page(desc_cb)) {
+-		desc_cb->page_offset = 0;
+-		desc_cb->reuse_flag = 1;
+-	} else if (desc_cb->page_offset + truesize * 2 <=
+-		   hns3_page_size(ring)) {
++	if ((!desc_cb->page_offset && reused) ||
++	    ((desc_cb->page_offset + truesize + truesize) <=
++	     hns3_page_size(ring) && desc_cb->page_offset)) {
+ 		desc_cb->page_offset += truesize;
+ 		desc_cb->reuse_flag = 1;
++	} else if (desc_cb->page_offset && reused) {
++		desc_cb->page_offset = 0;
++		desc_cb->reuse_flag = 1;
+ 	} else if (frag_size <= ring->rx_copybreak) {
+ 		void *frag = napi_alloc_frag(frag_size);
+ 
+-- 
+2.31.1
+

@@ -1,0 +1,132 @@
+From 9b94ae729068f6608ec7364dea891ee86dd3dad2 Mon Sep 17 00:00:00 2001
+From: Meng Yu <yumeng18@huawei.com>
+Date: Thu, 4 Mar 2021 14:35:45 +0800
+Subject: [PATCH] crypto: hisilicon/hpre - add algorithm type
+Git-commit: 9b94ae729068f6608ec7364dea891ee86dd3dad2
+Patch-mainline: v5.13-rc1
+References: bsn#12
+
+
+Algorithm type is brought in to get hardware HPRE queue
+to support different algorithms.
+
+Signed-off-by: Meng Yu <yumeng18@huawei.com>
+Reviewed-by: Zaibo Xu <xuzaibo@huawei.com>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ drivers/crypto/hisilicon/hpre/hpre.h        | 10 +++++++++-
+ drivers/crypto/hisilicon/hpre/hpre_crypto.c | 12 ++++++------
+ drivers/crypto/hisilicon/hpre/hpre_main.c   | 11 +++++++++--
+ 3 files changed, 24 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/crypto/hisilicon/hpre/hpre.h b/drivers/crypto/hisilicon/hpre/hpre.h
+index cc50f23947cf..02193e1ac694 100644
+--- a/drivers/crypto/hisilicon/hpre/hpre.h
++++ b/drivers/crypto/hisilicon/hpre/hpre.h
+@@ -10,6 +10,14 @@
+ #define HPRE_PF_DEF_Q_NUM		64
+ #define HPRE_PF_DEF_Q_BASE		0
+ 
++/*
++ * type used in qm sqc DW6.
++ * 0 - Algorithm which has been supported in V2, like RSA, DH and so on;
++ * 1 - ECC algorithm in V3.
++ */
++#define HPRE_V2_ALG_TYPE	0
++#define HPRE_V3_ECC_ALG_TYPE	1
++
+ enum {
+ 	HPRE_CLUSTER0,
+ 	HPRE_CLUSTER1,
+@@ -92,7 +100,7 @@ struct hpre_sqe {
+ 	__le32 rsvd1[_HPRE_SQE_ALIGN_EXT];
+ };
+ 
+-struct hisi_qp *hpre_create_qp(void);
++struct hisi_qp *hpre_create_qp(u8 type);
+ int hpre_algs_register(struct hisi_qm *qm);
+ void hpre_algs_unregister(struct hisi_qm *qm);
+ 
+diff --git a/drivers/crypto/hisilicon/hpre/hpre_crypto.c b/drivers/crypto/hisilicon/hpre/hpre_crypto.c
+index d89b2f57c5bf..712bea9f61d5 100644
+--- a/drivers/crypto/hisilicon/hpre/hpre_crypto.c
++++ b/drivers/crypto/hisilicon/hpre/hpre_crypto.c
+@@ -152,12 +152,12 @@ static void hpre_rm_req_from_ctx(struct hpre_asym_request *hpre_req)
+ 	}
+ }
+ 
+-static struct hisi_qp *hpre_get_qp_and_start(void)
++static struct hisi_qp *hpre_get_qp_and_start(u8 type)
+ {
+ 	struct hisi_qp *qp;
+ 	int ret;
+ 
+-	qp = hpre_create_qp();
++	qp = hpre_create_qp(type);
+ 	if (!qp) {
+ 		pr_err("Can not create hpre qp!\n");
+ 		return ERR_PTR(-ENODEV);
+@@ -422,11 +422,11 @@ static void hpre_alg_cb(struct hisi_qp *qp, void *resp)
+ 	req->cb(ctx, resp);
+ }
+ 
+-static int hpre_ctx_init(struct hpre_ctx *ctx)
++static int hpre_ctx_init(struct hpre_ctx *ctx, u8 type)
+ {
+ 	struct hisi_qp *qp;
+ 
+-	qp = hpre_get_qp_and_start();
++	qp = hpre_get_qp_and_start(type);
+ 	if (IS_ERR(qp))
+ 		return PTR_ERR(qp);
+ 
+@@ -674,7 +674,7 @@ static int hpre_dh_init_tfm(struct crypto_kpp *tfm)
+ {
+ 	struct hpre_ctx *ctx = kpp_tfm_ctx(tfm);
+ 
+-	return hpre_ctx_init(ctx);
++	return hpre_ctx_init(ctx, HPRE_V2_ALG_TYPE);
+ }
+ 
+ static void hpre_dh_exit_tfm(struct crypto_kpp *tfm)
+@@ -1100,7 +1100,7 @@ static int hpre_rsa_init_tfm(struct crypto_akcipher *tfm)
+ 		return PTR_ERR(ctx->rsa.soft_tfm);
+ 	}
+ 
+-	ret = hpre_ctx_init(ctx);
++	ret = hpre_ctx_init(ctx, HPRE_V2_ALG_TYPE);
+ 	if (ret)
+ 		crypto_free_akcipher(ctx->rsa.soft_tfm);
+ 
+diff --git a/drivers/crypto/hisilicon/hpre/hpre_main.c b/drivers/crypto/hisilicon/hpre/hpre_main.c
+index e7a2c70eb9cf..76f0a87c584d 100644
+--- a/drivers/crypto/hisilicon/hpre/hpre_main.c
++++ b/drivers/crypto/hisilicon/hpre/hpre_main.c
+@@ -226,13 +226,20 @@ static u32 vfs_num;
+ module_param_cb(vfs_num, &vfs_num_ops, &vfs_num, 0444);
+ MODULE_PARM_DESC(vfs_num, "Number of VFs to enable(1-63), 0(default)");
+ 
+-struct hisi_qp *hpre_create_qp(void)
++struct hisi_qp *hpre_create_qp(u8 type)
+ {
+ 	int node = cpu_to_node(smp_processor_id());
+ 	struct hisi_qp *qp = NULL;
+ 	int ret;
+ 
+-	ret = hisi_qm_alloc_qps_node(&hpre_devices, 1, 0, node, &qp);
++	if (type != HPRE_V2_ALG_TYPE && type != HPRE_V3_ECC_ALG_TYPE)
++		return NULL;
++
++	/*
++	 * type: 0 - RSA/DH. algorithm supported in V2,
++	 *       1 - ECC algorithm in V3.
++	 */
++	ret = hisi_qm_alloc_qps_node(&hpre_devices, 1, type, node, &qp);
+ 	if (!ret)
+ 		return qp;
+ 
+-- 
+2.31.1
+

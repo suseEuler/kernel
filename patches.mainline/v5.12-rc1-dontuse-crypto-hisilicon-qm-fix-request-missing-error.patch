@@ -1,0 +1,76 @@
+From 80d89fa2b42b83d7ed7d45d6988b4da41a87cc48 Mon Sep 17 00:00:00 2001
+From: Weili Qian <qianweili@huawei.com>
+Date: Fri, 5 Feb 2021 18:12:54 +0800
+Subject: [PATCH] crypto: hisilicon/qm - fix request missing error
+Git-commit: 80d89fa2b42b83d7ed7d45d6988b4da41a87cc48
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+Add 'qp_stop_fail_cb' to ensure it is called as device is resetting.
+
+Signed-off-by: Weili Qian <qianweili@huawei.com>
+Reviewed-by: Zaibo Xu <xuzaibo@huawei.com>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ drivers/crypto/hisilicon/qm.c | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/drivers/crypto/hisilicon/qm.c b/drivers/crypto/hisilicon/qm.c
+index cd72d2d26be9..4a4ad82b08f2 100644
+--- a/drivers/crypto/hisilicon/qm.c
++++ b/drivers/crypto/hisilicon/qm.c
+@@ -624,6 +624,9 @@ static void qm_cq_head_update(struct hisi_qp *qp)
+ 
+ static void qm_poll_qp(struct hisi_qp *qp, struct hisi_qm *qm)
+ {
++	if (unlikely(atomic_read(&qp->qp_status.flags) == QP_STOP))
++		return;
++
+ 	if (qp->event_cb) {
+ 		qp->event_cb(qp);
+ 		return;
+@@ -1879,6 +1882,28 @@ int hisi_qm_start_qp(struct hisi_qp *qp, unsigned long arg)
+ }
+ EXPORT_SYMBOL_GPL(hisi_qm_start_qp);
+ 
++/**
++ * qp_stop_fail_cb() - call request cb.
++ * @qp: stopped failed qp.
++ *
++ * Callback function should be called whether task completed or not.
++ */
++static void qp_stop_fail_cb(struct hisi_qp *qp)
++{
++	int qp_used = atomic_read(&qp->qp_status.used);
++	u16 cur_tail = qp->qp_status.sq_tail;
++	u16 cur_head = (cur_tail + QM_Q_DEPTH - qp_used) % QM_Q_DEPTH;
++	struct hisi_qm *qm = qp->qm;
++	u16 pos;
++	int i;
++
++	for (i = 0; i < qp_used; i++) {
++		pos = (i + cur_head) % QM_Q_DEPTH;
++		qp->req_cb(qp, qp->sqe + (u32)(qm->sqe_size * pos));
++		atomic_dec(&qp->qp_status.used);
++	}
++}
++
+ /**
+  * qm_drain_qp() - Drain a qp.
+  * @qp: The qp we want to drain.
+@@ -1974,6 +1999,9 @@ static int qm_stop_qp_nolock(struct hisi_qp *qp)
+ 	else
+ 		flush_work(&qp->qm->work);
+ 
++	if (unlikely(qp->is_resetting && atomic_read(&qp->qp_status.used)))
++		qp_stop_fail_cb(qp);
++
+ 	dev_dbg(dev, "stop queue %u!", qp->qp_id);
+ 
+ 	return 0;
+-- 
+2.31.1
+

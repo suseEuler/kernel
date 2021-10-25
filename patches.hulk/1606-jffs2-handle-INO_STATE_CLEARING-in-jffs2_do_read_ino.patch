@@ -1,0 +1,77 @@
+From 1b482fce43b03efa853e48c2ddc6496ea55ec473 Mon Sep 17 00:00:00 2001
+From: Hou Tao <houtao1@huawei.com>
+Date: Fri, 22 Jan 2021 19:21:30 +0800
+Subject: [PATCH] jffs2: handle INO_STATE_CLEARING in jffs2_do_read_inode()
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 1b482fce43b03efa853e48c2ddc6496ea55ec473
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 47446
+CVE: NA
+--------------------------
+
+For inode that fails to be created midway, GC procedure may
+try to GC its dnode, and in the following case BUG() will be
+triggered:
+
+CPU 0                       CPU 1
+in jffs2_do_create()        in jffs2_garbage_collect_pass()
+
+jffs2_write_dnode succeed
+// for dirent
+jffs2_reserve_space fail
+
+			    inum = ic->ino
+			    nlink = ic->pino_nlink (> 0)
+
+iget_failed
+  make_bad_inode
+    remove_inode_hash
+  iput
+    jffs2_evict_inode
+      jffs2_do_clear_inode
+        jffs2_set_inocache_state(INO_STATE_CLEARING)
+
+			    jffs2_gc_fetch_inode
+			      jffs2_iget
+			        // a new inode is created because
+			        // the old inode had been unhashed
+			        iget_locked
+			      jffs2_do_read_inode
+			        jffs2_get_ino_cache
+				// assert BUG()
+				f->inocache->state = INO_STATE_CLEARING
+
+Fix it by waiting for its state changes to INO_STATE_CHECKEDABSENT.
+
+Link: http://lists.infradead.org/pipermail/linux-mtd/2019-February/087762.html
+Signed-off-by: Hou Tao <houtao1@huawei.com>
+Reviewed-by: Wei Fang <fangwei1@huawei.com>
+Signed-off-by: zhangyi (F) <yi.zhang@huawei.com>
+[cherry-pick from hulk-4.4]
+Signed-off-by: yangerkun <yangerkun@huawei.com>
+Reviewed-by: Hou Tao <houtao1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/jffs2/readinode.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/fs/jffs2/readinode.c b/fs/jffs2/readinode.c
+index 03b4f99614be..d9260ee4ce4a 100644
+--- a/fs/jffs2/readinode.c
++++ b/fs/jffs2/readinode.c
+@@ -1344,6 +1344,7 @@ int jffs2_do_read_inode(struct jffs2_sb_info *c, struct jffs2_inode_info *f,
+ 
+ 		case INO_STATE_CHECKING:
+ 		case INO_STATE_GC:
++		case INO_STATE_CLEARING:
+ 			/* If it's in either of these states, we need
+ 			   to wait for whoever's got it to finish and
+ 			   put it back. */
+-- 
+2.26.2
+

@@ -1,0 +1,162 @@
+From 4773e57df70b069883da78a09f6c95ddf7f5aeee Mon Sep 17 00:00:00 2001
+From: Cheng Jian <cj.chengjian@huawei.com>
+Date: Sat, 29 May 2021 14:42:41 +0800
+Subject: [PATCH] livepatch/core: Supprt load and unload hooks
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 4773e57df70b069883da78a09f6c95ddf7f5aeee
+
+
+euler inclusion
+category: feature
+bugzilla: 51921
+CVE: N/A
+
+----------------------------------------
+
+The front-tools kpatch-build support load and unload hooks
+in the older version and already changed to use pre/post
+callbacks after commit 93862e385de ("livepatch: add (un)patch
+callbacks").
+
+However, for livepatch based on stop machine consistency,
+this callbacks will be called within stop_machine context if
+we using it. This is dangerous because we can't known what
+the user will do in the callbacks. It may trigger system
+crash if using any function which internally might sleep.
+
+Here we use the old load/unload hooks to allow user-defined
+hooks. Although it's not good enough compared to pre/post
+callbacks, it can meets user needs to some extent.
+Of cource, this requires cooperation of kpatch-build tools.
+
+Signed-off-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+
+Signed-off-by: Dong Kai <dongkai11@huawei.com>
+
+Signed-off-by: Ye Weihua <yeweihua4@huawei.com>
+Reviewed-by: Yang Jihong <yangjihong1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/livepatch.h | 10 ++++++++++
+ kernel/livepatch/core.c   | 39 +++++++++++++++++++++++++++++++++++++++
+ kernel/livepatch/core.h   |  3 ++-
+ 3 files changed, 51 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/livepatch.h b/include/linux/livepatch.h
+index 244cd5fa2859..92f85e6d18f8 100644
+--- a/include/linux/livepatch.h
++++ b/include/linux/livepatch.h
+@@ -82,6 +82,12 @@ struct klp_func {
+ 
+ struct klp_object;
+ 
++#ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
++struct klp_hook {
++	void (*hook)(void);
++};
++#endif
++
+ /**
+  * struct klp_callbacks - pre/post live-(un)patch callback structure
+  * @pre_patch:		executed before code patching
+@@ -121,6 +127,10 @@ struct klp_object {
+ 	/* external */
+ 	const char *name;
+ 	struct klp_func *funcs;
++#ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
++	struct klp_hook *hooks_load;
++	struct klp_hook *hooks_unload;
++#endif
+ 	struct klp_callbacks callbacks;
+ 
+ 	/* internal */
+diff --git a/kernel/livepatch/core.c b/kernel/livepatch/core.c
+index 5c4819e8d10e..b47d4d28b369 100644
+--- a/kernel/livepatch/core.c
++++ b/kernel/livepatch/core.c
+@@ -790,6 +790,34 @@ static void klp_free_patch_start(struct klp_patch *patch)
+ 	klp_free_objects(patch);
+ }
+ 
++#ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
++static inline int klp_load_hook(struct klp_object *obj)
++{
++	struct klp_hook *hook;
++
++	if (!obj->hooks_load)
++		return 0;
++
++	for (hook = obj->hooks_load; hook->hook; hook++)
++		(*hook->hook)();
++
++	return 0;
++}
++
++static inline int klp_unload_hook(struct klp_object *obj)
++{
++	struct klp_hook *hook;
++
++	if (!obj->hooks_unload)
++		return 0;
++
++	for (hook = obj->hooks_unload; hook->hook; hook++)
++		(*hook->hook)();
++
++	return 0;
++}
++#endif
++
+ /*
+  * This function implements the free part that must be called outside
+  * klp_mutex.
+@@ -800,6 +828,12 @@ static void klp_free_patch_start(struct klp_patch *patch)
+  */
+ static void klp_free_patch_finish(struct klp_patch *patch)
+ {
++#ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
++	struct klp_object *obj;
++
++	klp_for_each_object(patch, obj)
++		klp_unload_hook(obj);
++#endif
+ 	/*
+ 	 * Avoid deadlock with enabled_store() sysfs callback by
+ 	 * calling this outside klp_mutex. It is safe because
+@@ -1074,6 +1108,11 @@ static int klp_init_patch(struct klp_patch *patch)
+ 			goto out;
+ 	}
+ 
++#ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
++	klp_for_each_object(patch, obj)
++		klp_load_hook(obj);
++#endif
++
+ 	list_add_tail(&patch->list, &klp_patches);
+ 
+ 	return 0;
+diff --git a/kernel/livepatch/core.h b/kernel/livepatch/core.h
+index 38209c7361b6..9bcd139eb7d6 100644
+--- a/kernel/livepatch/core.h
++++ b/kernel/livepatch/core.h
+@@ -23,6 +23,7 @@ static inline bool klp_is_object_loaded(struct klp_object *obj)
+ 	return !obj->name || obj->mod;
+ }
+ 
++#ifdef CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY
+ static inline int klp_pre_patch_callback(struct klp_object *obj)
+ {
+ 	int ret = 0;
+@@ -55,5 +56,5 @@ static inline void klp_post_unpatch_callback(struct klp_object *obj)
+ 
+ 	obj->callbacks.post_unpatch_enabled = false;
+ }
+-
++#endif /* CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY */
+ #endif /* _LIVEPATCH_CORE_H */
+-- 
+2.26.2
+

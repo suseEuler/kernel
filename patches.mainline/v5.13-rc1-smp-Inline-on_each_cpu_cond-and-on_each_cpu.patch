@@ -1,0 +1,235 @@
+From ae2b249080892761b444bdbff980bb5d92de3574 Mon Sep 17 00:00:00 2001
+From: Nadav Amit <namit@vmware.com>
+Date: Fri, 9 Jul 2021 09:47:08 +0000
+Subject: [PATCH] smp: Inline on_each_cpu_cond() and on_each_cpu()
+Git-commit: a5aa5ce300597224ec76dacc8e63ba3ad7a18bbd
+Patch-mainline: v5.13-rc1
+References: bsn#12
+openEuler-commit: ae2b249080892761b444bdbff980bb5d92de3574
+
+Simplify the code and avoid having an additional function on the stack
+by inlining on_each_cpu_cond() and on_each_cpu().
+
+Suggested-by: Peter Zijlstra <peterz@infradead.org>
+Signed-off-by: Nadav Amit <namit@vmware.com>
+[ Minor edits. ]
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Link: https://lore.kernel.org/r/20210220231712.2475218-10-namit@vmware.com
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/smp.h | 50 ++++++++++++++++++++++++++++------------
+ kernel/smp.c        | 56 ---------------------------------------------
+ kernel/up.c         | 38 +-----------------------------
+ 3 files changed, 37 insertions(+), 107 deletions(-)
+
+diff --git a/include/linux/smp.h b/include/linux/smp.h
+index 238a3f97a415..84a0b4828f66 100644
+--- a/include/linux/smp.h
++++ b/include/linux/smp.h
+@@ -50,30 +50,52 @@ extern unsigned int total_cpus;
+ int smp_call_function_single(int cpuid, smp_call_func_t func, void *info,
+ 			     int wait);
+ 
++void on_each_cpu_cond_mask(smp_cond_func_t cond_func, smp_call_func_t func,
++			   void *info, bool wait, const struct cpumask *mask);
++
++int smp_call_function_single_async(int cpu, call_single_data_t *csd);
++
+ /*
+  * Call a function on all processors
+  */
+-void on_each_cpu(smp_call_func_t func, void *info, int wait);
++static inline void on_each_cpu(smp_call_func_t func, void *info, int wait)
++{
++	on_each_cpu_cond_mask(NULL, func, info, wait, cpu_online_mask);
++}
+ 
+-/*
+- * Call a function on processors specified by mask, which might include
+- * the local one.
++/**
++ * on_each_cpu_mask(): Run a function on processors specified by
++ * cpumask, which may include the local processor.
++ * @mask: The set of cpus to run on (only runs on online subset).
++ * @func: The function to run. This must be fast and non-blocking.
++ * @info: An arbitrary pointer to pass to the function.
++ * @wait: If true, wait (atomically) until function has completed
++ *        on other CPUs.
++ *
++ * If @wait is true, then returns once @func has returned.
++ *
++ * You must not call this function with disabled interrupts or from a
++ * hardware interrupt handler or from a bottom half handler.  The
++ * exception is that it may be used during early boot while
++ * early_boot_irqs_disabled is set.
+  */
+-void on_each_cpu_mask(const struct cpumask *mask, smp_call_func_t func,
+-		void *info, bool wait);
++static inline void on_each_cpu_mask(const struct cpumask *mask,
++				    smp_call_func_t func, void *info, bool wait)
++{
++	on_each_cpu_cond_mask(NULL, func, info, wait, mask);
++}
+ 
+ /*
+  * Call a function on each processor for which the supplied function
+  * cond_func returns a positive value. This may include the local
+- * processor.
++ * processor.  May be used during early boot while early_boot_irqs_disabled is
++ * set. Use local_irq_save/restore() instead of local_irq_disable/enable().
+  */
+-void on_each_cpu_cond(smp_cond_func_t cond_func, smp_call_func_t func,
+-		      void *info, bool wait);
+-
+-void on_each_cpu_cond_mask(smp_cond_func_t cond_func, smp_call_func_t func,
+-			   void *info, bool wait, const struct cpumask *mask);
+-
+-int smp_call_function_single_async(int cpu, struct __call_single_data *csd);
++static inline void on_each_cpu_cond(smp_cond_func_t cond_func,
++				    smp_call_func_t func, void *info, bool wait)
++{
++	on_each_cpu_cond_mask(cond_func, func, info, wait, cpu_online_mask);
++}
+ 
+ #ifdef CONFIG_SMP
+ 
+diff --git a/kernel/smp.c b/kernel/smp.c
+index 4a04ff682ac6..a5a87a51e726 100644
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@ -847,55 +847,6 @@ void __init smp_init(void)
+ 	smp_cpus_done(setup_max_cpus);
+ }
+ 
+-/*
+- * Call a function on all processors.  May be used during early boot while
+- * early_boot_irqs_disabled is set.  Use local_irq_save/restore() instead
+- * of local_irq_disable/enable().
+- */
+-void on_each_cpu(smp_call_func_t func, void *info, int wait)
+-{
+-	unsigned long flags;
+-
+-	preempt_disable();
+-	smp_call_function(func, info, wait);
+-	local_irq_save(flags);
+-	func(info);
+-	local_irq_restore(flags);
+-	preempt_enable();
+-}
+-EXPORT_SYMBOL(on_each_cpu);
+-
+-/**
+- * on_each_cpu_mask(): Run a function on processors specified by
+- * cpumask, which may include the local processor.
+- * @mask: The set of cpus to run on (only runs on online subset).
+- * @func: The function to run. This must be fast and non-blocking.
+- * @info: An arbitrary pointer to pass to the function.
+- * @wait: If true, wait (atomically) until function has completed
+- *        on other CPUs.
+- *
+- * If @wait is true, then returns once @func has returned.
+- *
+- * You must not call this function with disabled interrupts or from a
+- * hardware interrupt handler or from a bottom half handler.  The
+- * exception is that it may be used during early boot while
+- * early_boot_irqs_disabled is set.
+- */
+-void on_each_cpu_mask(const struct cpumask *mask, smp_call_func_t func,
+-			void *info, bool wait)
+-{
+-	unsigned int scf_flags;
+-
+-	scf_flags = SCF_RUN_LOCAL;
+-	if (wait)
+-		scf_flags |= SCF_WAIT;
+-
+-	preempt_disable();
+-	smp_call_function_many_cond(mask, func, info, scf_flags, NULL);
+-	preempt_enable();
+-}
+-EXPORT_SYMBOL(on_each_cpu_mask);
+-
+ /*
+  * on_each_cpu_cond(): Call a function on each processor for which
+  * the supplied function cond_func returns true, optionally waiting
+@@ -932,13 +883,6 @@ void on_each_cpu_cond_mask(smp_cond_func_t cond_func, smp_call_func_t func,
+ }
+ EXPORT_SYMBOL(on_each_cpu_cond_mask);
+ 
+-void on_each_cpu_cond(smp_cond_func_t cond_func, smp_call_func_t func,
+-		      void *info, bool wait)
+-{
+-	on_each_cpu_cond_mask(cond_func, func, info, wait, cpu_online_mask);
+-}
+-EXPORT_SYMBOL(on_each_cpu_cond);
+-
+ static void do_nothing(void *unused)
+ {
+ }
+diff --git a/kernel/up.c b/kernel/up.c
+index 4edd5493eba2..c7321307923a 100644
+--- a/kernel/up.c
++++ b/kernel/up.c
+@@ -36,35 +36,6 @@ int smp_call_function_single_async(int cpu, struct __call_single_data *csd)
+ }
+ EXPORT_SYMBOL(smp_call_function_single_async);
+ 
+-void on_each_cpu(smp_call_func_t func, void *info, int wait)
+-{
+-	unsigned long flags;
+-
+-	local_irq_save(flags);
+-	func(info);
+-	local_irq_restore(flags);
+-}
+-EXPORT_SYMBOL(on_each_cpu);
+-
+-/*
+- * Note we still need to test the mask even for UP
+- * because we actually can get an empty mask from
+- * code that on SMP might call us without the local
+- * CPU in the mask.
+- */
+-void on_each_cpu_mask(const struct cpumask *mask,
+-		      smp_call_func_t func, void *info, bool wait)
+-{
+-	unsigned long flags;
+-
+-	if (cpumask_test_cpu(0, mask)) {
+-		local_irq_save(flags);
+-		func(info);
+-		local_irq_restore(flags);
+-	}
+-}
+-EXPORT_SYMBOL(on_each_cpu_mask);
+-
+ /*
+  * Preemption is disabled here to make sure the cond_func is called under the
+  * same condtions in UP and SMP.
+@@ -75,7 +46,7 @@ void on_each_cpu_cond_mask(smp_cond_func_t cond_func, smp_call_func_t func,
+ 	unsigned long flags;
+ 
+ 	preempt_disable();
+-	if (cond_func(0, info)) {
++	if ((!cond_func || cond_func(0, info)) && cpumask_test_cpu(0, mask)) {
+ 		local_irq_save(flags);
+ 		func(info);
+ 		local_irq_restore(flags);
+@@ -84,13 +55,6 @@ void on_each_cpu_cond_mask(smp_cond_func_t cond_func, smp_call_func_t func,
+ }
+ EXPORT_SYMBOL(on_each_cpu_cond_mask);
+ 
+-void on_each_cpu_cond(smp_cond_func_t cond_func, smp_call_func_t func,
+-		      void *info, bool wait)
+-{
+-	on_each_cpu_cond_mask(cond_func, func, info, wait, NULL);
+-}
+-EXPORT_SYMBOL(on_each_cpu_cond);
+-
+ int smp_call_on_cpu(unsigned int cpu, int (*func)(void *), void *par, bool phys)
+ {
+ 	int ret;
+-- 
+2.26.2
+

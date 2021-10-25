@@ -1,0 +1,144 @@
+From 0c95cba4925509c13fce6278456a0badb9e49775 Mon Sep 17 00:00:00 2001
+From: Nicholas Piggin <npiggin@gmail.com>
+Date: Thu, 29 Apr 2021 22:58:16 -0700
+Subject: [PATCH] mm: apply_to_pte_range warn and fail if a large pte is
+Git-commit: 0c95cba4925509c13fce6278456a0badb9e49775
+Patch-mainline: v5.13-rc1
+References: bsn#12
+
+ encountered
+
+apply_to_pte_range might mistake a large pte for bad, or treat it as a
+page table, resulting in a crash or corruption.  Add a test to warn and
+return error if large entries are found.
+
+Link: https://lkml.kernel.org/r/20210317062402.533919-4-npiggin@gmail.com
+Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+Reviewed-by: Miaohe Lin <linmiaohe@huawei.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Ding Tianhong <dingtianhong@huawei.com>
+Cc: "H. Peter Anvin" <hpa@zytor.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Michael Ellerman <mpe@ellerman.id.au>
+Cc: Russell King <linux@armlinux.org.uk>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Uladzislau Rezki (Sony) <urezki@gmail.com>
+Cc: Will Deacon <will@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ mm/memory.c | 66 +++++++++++++++++++++++++++++++++++++++--------------
+ 1 file changed, 49 insertions(+), 17 deletions(-)
+
+diff --git a/mm/memory.c b/mm/memory.c
+index a62f06750e93..cbdc2cd9cedb 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -2457,13 +2457,21 @@ static int apply_to_pmd_range(struct mm_struct *mm, pud_t *pud,
+ 	}
+ 	do {
+ 		next = pmd_addr_end(addr, end);
+-		if (create || !pmd_none_or_clear_bad(pmd)) {
+-			err = apply_to_pte_range(mm, pmd, addr, next, fn, data,
+-						 create, mask);
+-			if (err)
+-				break;
++		if (pmd_none(*pmd) && !create)
++			continue;
++		if (WARN_ON_ONCE(pmd_leaf(*pmd)))
++			return -EINVAL;
++		if (!pmd_none(*pmd) && WARN_ON_ONCE(pmd_bad(*pmd))) {
++			if (!create)
++				continue;
++			pmd_clear_bad(pmd);
+ 		}
++		err = apply_to_pte_range(mm, pmd, addr, next,
++					 fn, data, create, mask);
++		if (err)
++			break;
+ 	} while (pmd++, addr = next, addr != end);
++
+ 	return err;
+ }
+ 
+@@ -2485,13 +2493,21 @@ static int apply_to_pud_range(struct mm_struct *mm, p4d_t *p4d,
+ 	}
+ 	do {
+ 		next = pud_addr_end(addr, end);
+-		if (create || !pud_none_or_clear_bad(pud)) {
+-			err = apply_to_pmd_range(mm, pud, addr, next, fn, data,
+-						 create, mask);
+-			if (err)
+-				break;
++		if (pud_none(*pud) && !create)
++			continue;
++		if (WARN_ON_ONCE(pud_leaf(*pud)))
++			return -EINVAL;
++		if (!pud_none(*pud) && WARN_ON_ONCE(pud_bad(*pud))) {
++			if (!create)
++				continue;
++			pud_clear_bad(pud);
+ 		}
++		err = apply_to_pmd_range(mm, pud, addr, next,
++					 fn, data, create, mask);
++		if (err)
++			break;
+ 	} while (pud++, addr = next, addr != end);
++
+ 	return err;
+ }
+ 
+@@ -2513,13 +2529,21 @@ static int apply_to_p4d_range(struct mm_struct *mm, pgd_t *pgd,
+ 	}
+ 	do {
+ 		next = p4d_addr_end(addr, end);
+-		if (create || !p4d_none_or_clear_bad(p4d)) {
+-			err = apply_to_pud_range(mm, p4d, addr, next, fn, data,
+-						 create, mask);
+-			if (err)
+-				break;
++		if (p4d_none(*p4d) && !create)
++			continue;
++		if (WARN_ON_ONCE(p4d_leaf(*p4d)))
++			return -EINVAL;
++		if (!p4d_none(*p4d) && WARN_ON_ONCE(p4d_bad(*p4d))) {
++			if (!create)
++				continue;
++			p4d_clear_bad(p4d);
+ 		}
++		err = apply_to_pud_range(mm, p4d, addr, next,
++					 fn, data, create, mask);
++		if (err)
++			break;
+ 	} while (p4d++, addr = next, addr != end);
++
+ 	return err;
+ }
+ 
+@@ -2539,9 +2563,17 @@ static int __apply_to_page_range(struct mm_struct *mm, unsigned long addr,
+ 	pgd = pgd_offset(mm, addr);
+ 	do {
+ 		next = pgd_addr_end(addr, end);
+-		if (!create && pgd_none_or_clear_bad(pgd))
++		if (pgd_none(*pgd) && !create)
+ 			continue;
+-		err = apply_to_p4d_range(mm, pgd, addr, next, fn, data, create, &mask);
++		if (WARN_ON_ONCE(pgd_leaf(*pgd)))
++			return -EINVAL;
++		if (!pgd_none(*pgd) && WARN_ON_ONCE(pgd_bad(*pgd))) {
++			if (!create)
++				continue;
++			pgd_clear_bad(pgd);
++		}
++		err = apply_to_p4d_range(mm, pgd, addr, next,
++					 fn, data, create, &mask);
+ 		if (err)
+ 			break;
+ 	} while (pgd++, addr = next, addr != end);
+-- 
+2.31.1
+

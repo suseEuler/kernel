@@ -1,0 +1,184 @@
+From 3b876a78d8661f48f9ddb169ac2402a27009f20d Mon Sep 17 00:00:00 2001
+From: Kai Shen <shenkai8@huawei.com>
+Date: Wed, 7 Jul 2021 16:22:55 +0800
+Subject: [PATCH] arm64: errata: add option to disable cache readunique
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 3b876a78d8661f48f9ddb169ac2402a27009f20d
+
+ prefetch on HIP08
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I3ZFV2
+CVE: NA
+
+-----------------------------------------------------------
+
+Random performance decreases appear on cases of Hackbench which test
+pipe or socket communication among multi-threads on Hisi HIP08 SoC.
+Cache sharing which caused by the change of the data layout and the
+cache readunique prefetch mechanism both lead to this problem.
+
+Readunique mechanism which may caused by store operation will invalid
+cachelines on other cores during data fetching stage which can cause
+cacheline invalidation happens frequently in a sharing data access
+situation.
+
+Disable cache readunique prefetch can trackle this problem.
+Test cases are like:
+    for i in 20;do
+        echo "--------pipe thread num=$i----------"
+        for j in $(seq 1 10);do
+            ./hackbench -pipe $i thread 1000
+        done
+    done
+
+We disable readunique prefetch only in el2 for in el1 disabling
+readunique prefetch may cause panic due to lack of related priority
+which often be set in BIOS.
+
+Introduce CONFIG_HISILICON_ERRATUM_HIP08_RU_PREFETCH and disable RU
+prefetch using boot cmdline 'readunique_prefetch=off'.
+
+Signed-off-by: Kai Shen <shenkai8@huawei.com>
+Signed-off-by: Hanjun Guo <guohanjun@huawei.com>
+[XQ: adjusted context]
+Signed-off-by: Xie XiuQi <xiexiuqi@huawei.com>
+Reviewed-by: Hanjun Guo <guohanjun@huawei.com>
+Signed-off-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/Kconfig               | 18 ++++++++++
+ arch/arm64/include/asm/cpucaps.h |  3 +-
+ arch/arm64/kernel/cpu_errata.c   | 56 ++++++++++++++++++++++++++++++++
+ 3 files changed, 76 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
+index 0a0644230064..80011f971dbb 100644
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -820,6 +820,24 @@ config SOCIONEXT_SYNQUACER_PREITS
+ 
+ 	  If unsure, say Y.
+ 
++config HISILICON_ERRATUM_HIP08_RU_PREFETCH
++	bool "HIP08 RU: HiSilicon HIP08 cache readunique might cause performance drop"
++	default y
++	help
++	  The HiSilicon HIP08 cache readunique might compromise performance,
++	  use cmdline "readunique_prefetch_disable" to disable RU prefetch.
++
++	  If unsure, say Y.
++
++config HISILICON_HIP08_RU_PREFETCH_DEFAULT_OFF
++	bool "HIP08 RU: disable HiSilicon HIP08 cache readunique by default"
++	depends on HISILICON_ERRATUM_HIP08_RU_PREFETCH
++	default n
++	help
++	  Disable HiSilicon HIP08 cache readunique by default.
++
++	  If unsure, say N.
++
+ endmenu
+ 
+ 
+diff --git a/arch/arm64/include/asm/cpucaps.h b/arch/arm64/include/asm/cpucaps.h
+index 3cbbd7be0e1d..e7d2bdc92acf 100644
+--- a/arch/arm64/include/asm/cpucaps.h
++++ b/arch/arm64/include/asm/cpucaps.h
+@@ -67,7 +67,8 @@
+ #define ARM64_MTE				57
+ #define ARM64_WORKAROUND_1508412		58
+ #define ARM64_HAS_MPAM				59
++#define ARM64_WORKAROUND_HISI_HIP08_RU_PREFETCH 60
+ 
+-#define ARM64_NCAPS				60
++#define ARM64_NCAPS				61
+ 
+ #endif /* __ASM_CPUCAPS_H */
+diff --git a/arch/arm64/kernel/cpu_errata.c b/arch/arm64/kernel/cpu_errata.c
+index cafaf0da05b7..3a427d9f0ef6 100644
+--- a/arch/arm64/kernel/cpu_errata.c
++++ b/arch/arm64/kernel/cpu_errata.c
+@@ -13,6 +13,11 @@
+ #include <asm/cpufeature.h>
+ #include <asm/kvm_asm.h>
+ #include <asm/smp_plat.h>
++#ifdef CONFIG_HISILICON_ERRATUM_HIP08_RU_PREFETCH
++#include <asm/ptrace.h>
++#include <asm/sysreg.h>
++#include <linux/smp.h>
++#endif
+ 
+ static bool __maybe_unused
+ is_affected_midr_range(const struct arm64_cpu_capabilities *entry, int scope)
+@@ -123,6 +128,48 @@ cpu_enable_cache_maint_trap(const struct arm64_cpu_capabilities *__unused)
+ 	sysreg_clear_set(sctlr_el1, SCTLR_EL1_UCI, 0);
+ }
+ 
++#ifdef CONFIG_HISILICON_ERRATUM_HIP08_RU_PREFETCH
++# ifdef CONFIG_HISILICON_HIP08_RU_PREFETCH_DEFAULT_OFF
++static bool readunique_prefetch_enabled;
++# else
++static bool readunique_prefetch_enabled = true;
++# endif
++static int __init readunique_prefetch_switch(char *data)
++{
++	if (!data)
++		return -EINVAL;
++
++	if (strcmp(data, "off") == 0)
++		readunique_prefetch_enabled = false;
++	else if (strcmp(data, "on") == 0)
++		readunique_prefetch_enabled = true;
++	else
++		return -EINVAL;
++
++	return 0;
++}
++early_param("readunique_prefetch", readunique_prefetch_switch);
++
++static bool
++should_disable_hisi_hip08_ru_prefetch(const struct arm64_cpu_capabilities *entry, int unused)
++{
++	u64 el;
++
++	if (readunique_prefetch_enabled)
++		return false;
++
++	el = read_sysreg(CurrentEL);
++	return el == CurrentEL_EL2;
++}
++
++#define CTLR_HISI_HIP08_RU_PREFETCH    (1L << 40)
++static void __maybe_unused
++hisi_hip08_ru_prefetch_disable(const struct arm64_cpu_capabilities *__unused)
++{
++	sysreg_clear_set(S3_1_c15_c6_4, 0, CTLR_HISI_HIP08_RU_PREFETCH);
++}
++#endif
++
+ #define CAP_MIDR_RANGE(model, v_min, r_min, v_max, r_max)	\
+ 	.matches = is_affected_midr_range,			\
+ 	.midr_range = MIDR_RANGE(model, v_min, r_min, v_max, r_max)
+@@ -534,6 +581,15 @@ const struct arm64_cpu_capabilities arm64_errata[] = {
+ 				  0, 0,
+ 				  1, 0),
+ 	},
++#endif
++#ifdef CONFIG_HISILICON_ERRATUM_HIP08_RU_PREFETCH
++	{
++		.desc = "HiSilicon HIP08 Cache Readunique Prefetch Disable",
++		.capability = ARM64_WORKAROUND_HISI_HIP08_RU_PREFETCH,
++		ERRATA_MIDR_ALL_VERSIONS(MIDR_HISI_TSV110),
++		.matches = should_disable_hisi_hip08_ru_prefetch,
++		.cpu_enable = hisi_hip08_ru_prefetch_disable,
++	},
+ #endif
+ 	{
+ 	}
+-- 
+2.26.2
+

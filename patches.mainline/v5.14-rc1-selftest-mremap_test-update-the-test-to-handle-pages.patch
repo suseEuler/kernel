@@ -1,0 +1,185 @@
+From f27a5c93cdd4dbcd2131099764aa188c7e2a2a88 Mon Sep 17 00:00:00 2001
+From: "Aneesh Kumar K.V" <aneesh.kumar@linux.ibm.com>
+Date: Wed, 7 Jul 2021 18:09:59 -0700
+Subject: [PATCH] selftest/mremap_test: update the test to handle pagesize
+Git-commit: f27a5c93cdd4dbcd2131099764aa188c7e2a2a88
+Patch-mainline: v5.14-rc1
+References: bsn#12
+
+ other than 4K
+
+Patch series "mrermap fixes", v2.
+
+This patch (of 6):
+
+Instead of hardcoding 4K page size fetch it using sysconf().  For the
+performance measurements test still assume 2M and 1G are hugepage sizes.
+
+Link: https://lkml.kernel.org/r/20210616045239.370802-1-aneesh.kumar@linux.ibm.com
+Link: https://lkml.kernel.org/r/20210616045239.370802-2-aneesh.kumar@linux.ibm.com
+Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+Reviewed-by: Kalesh Singh <kaleshsingh@google.com>
+Cc: Michael Ellerman <mpe@ellerman.id.au>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Joel Fernandes <joel@joelfernandes.org>
+Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
+Cc: Kirill A. Shutemov <kirill@shutemov.name>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Stephen Rothwell <sfr@canb.auug.org.au>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ tools/testing/selftests/vm/mremap_test.c | 103 ++++++++++++-----------
+ 1 file changed, 56 insertions(+), 47 deletions(-)
+
+diff --git a/tools/testing/selftests/vm/mremap_test.c b/tools/testing/selftests/vm/mremap_test.c
+index 9c391d016922..c9a5461eb786 100644
+--- a/tools/testing/selftests/vm/mremap_test.c
++++ b/tools/testing/selftests/vm/mremap_test.c
+@@ -45,14 +45,15 @@ enum {
+ 	_4MB = 4ULL << 20,
+ 	_1GB = 1ULL << 30,
+ 	_2GB = 2ULL << 30,
+-	PTE = _4KB,
+ 	PMD = _2MB,
+ 	PUD = _1GB,
+ };
+ 
++#define PTE page_size
++
+ #define MAKE_TEST(source_align, destination_align, size,	\
+ 		  overlaps, should_fail, test_name)		\
+-{								\
++(struct test){							\
+ 	.name = test_name,					\
+ 	.config = {						\
+ 		.src_alignment = source_align,			\
+@@ -252,12 +253,17 @@ static int parse_args(int argc, char **argv, unsigned int *threshold_mb,
+ 	return 0;
+ }
+ 
++#define MAX_TEST 13
++#define MAX_PERF_TEST 3
+ int main(int argc, char **argv)
+ {
+ 	int failures = 0;
+ 	int i, run_perf_tests;
+ 	unsigned int threshold_mb = VALIDATION_DEFAULT_THRESHOLD;
+ 	unsigned int pattern_seed;
++	struct test test_cases[MAX_TEST];
++	struct test perf_test_cases[MAX_PERF_TEST];
++	int page_size;
+ 	time_t t;
+ 
+ 	pattern_seed = (unsigned int) time(&t);
+@@ -268,56 +274,59 @@ int main(int argc, char **argv)
+ 	ksft_print_msg("Test configs:\n\tthreshold_mb=%u\n\tpattern_seed=%u\n\n",
+ 		       threshold_mb, pattern_seed);
+ 
+-	struct test test_cases[] = {
+-		/* Expected mremap failures */
+-		MAKE_TEST(_4KB, _4KB, _4KB, OVERLAPPING, EXPECT_FAILURE,
+-		  "mremap - Source and Destination Regions Overlapping"),
+-		MAKE_TEST(_4KB, _1KB, _4KB, NON_OVERLAPPING, EXPECT_FAILURE,
+-		  "mremap - Destination Address Misaligned (1KB-aligned)"),
+-		MAKE_TEST(_1KB, _4KB, _4KB, NON_OVERLAPPING, EXPECT_FAILURE,
+-		  "mremap - Source Address Misaligned (1KB-aligned)"),
++	page_size = sysconf(_SC_PAGESIZE);
+ 
+-		/* Src addr PTE aligned */
+-		MAKE_TEST(PTE, PTE, _8KB, NON_OVERLAPPING, EXPECT_SUCCESS,
+-		  "8KB mremap - Source PTE-aligned, Destination PTE-aligned"),
++	/* Expected mremap failures */
++	test_cases[0] =	MAKE_TEST(page_size, page_size, page_size,
++				  OVERLAPPING, EXPECT_FAILURE,
++				  "mremap - Source and Destination Regions Overlapping");
+ 
+-		/* Src addr 1MB aligned */
+-		MAKE_TEST(_1MB, PTE, _2MB, NON_OVERLAPPING, EXPECT_SUCCESS,
+-		  "2MB mremap - Source 1MB-aligned, Destination PTE-aligned"),
+-		MAKE_TEST(_1MB, _1MB, _2MB, NON_OVERLAPPING, EXPECT_SUCCESS,
+-		  "2MB mremap - Source 1MB-aligned, Destination 1MB-aligned"),
++	test_cases[1] = MAKE_TEST(page_size, page_size/4, page_size,
++				  NON_OVERLAPPING, EXPECT_FAILURE,
++				  "mremap - Destination Address Misaligned (1KB-aligned)");
++	test_cases[2] = MAKE_TEST(page_size/4, page_size, page_size,
++				  NON_OVERLAPPING, EXPECT_FAILURE,
++				  "mremap - Source Address Misaligned (1KB-aligned)");
+ 
+-		/* Src addr PMD aligned */
+-		MAKE_TEST(PMD, PTE, _4MB, NON_OVERLAPPING, EXPECT_SUCCESS,
+-		  "4MB mremap - Source PMD-aligned, Destination PTE-aligned"),
+-		MAKE_TEST(PMD, _1MB, _4MB, NON_OVERLAPPING, EXPECT_SUCCESS,
+-		  "4MB mremap - Source PMD-aligned, Destination 1MB-aligned"),
+-		MAKE_TEST(PMD, PMD, _4MB, NON_OVERLAPPING, EXPECT_SUCCESS,
+-		  "4MB mremap - Source PMD-aligned, Destination PMD-aligned"),
++	/* Src addr PTE aligned */
++	test_cases[3] = MAKE_TEST(PTE, PTE, PTE * 2,
++				  NON_OVERLAPPING, EXPECT_SUCCESS,
++				  "8KB mremap - Source PTE-aligned, Destination PTE-aligned");
+ 
+-		/* Src addr PUD aligned */
+-		MAKE_TEST(PUD, PTE, _2GB, NON_OVERLAPPING, EXPECT_SUCCESS,
+-		  "2GB mremap - Source PUD-aligned, Destination PTE-aligned"),
+-		MAKE_TEST(PUD, _1MB, _2GB, NON_OVERLAPPING, EXPECT_SUCCESS,
+-		  "2GB mremap - Source PUD-aligned, Destination 1MB-aligned"),
+-		MAKE_TEST(PUD, PMD, _2GB, NON_OVERLAPPING, EXPECT_SUCCESS,
+-		  "2GB mremap - Source PUD-aligned, Destination PMD-aligned"),
+-		MAKE_TEST(PUD, PUD, _2GB, NON_OVERLAPPING, EXPECT_SUCCESS,
+-		  "2GB mremap - Source PUD-aligned, Destination PUD-aligned"),
+-	};
++	/* Src addr 1MB aligned */
++	test_cases[4] = MAKE_TEST(_1MB, PTE, _2MB, NON_OVERLAPPING, EXPECT_SUCCESS,
++				  "2MB mremap - Source 1MB-aligned, Destination PTE-aligned");
++	test_cases[5] = MAKE_TEST(_1MB, _1MB, _2MB, NON_OVERLAPPING, EXPECT_SUCCESS,
++				  "2MB mremap - Source 1MB-aligned, Destination 1MB-aligned");
+ 
+-	struct test perf_test_cases[] = {
+-		/*
+-		 * mremap 1GB region - Page table level aligned time
+-		 * comparison.
+-		 */
+-		MAKE_TEST(PTE, PTE, _1GB, NON_OVERLAPPING, EXPECT_SUCCESS,
+-		  "1GB mremap - Source PTE-aligned, Destination PTE-aligned"),
+-		MAKE_TEST(PMD, PMD, _1GB, NON_OVERLAPPING, EXPECT_SUCCESS,
+-		  "1GB mremap - Source PMD-aligned, Destination PMD-aligned"),
+-		MAKE_TEST(PUD, PUD, _1GB, NON_OVERLAPPING, EXPECT_SUCCESS,
+-		  "1GB mremap - Source PUD-aligned, Destination PUD-aligned"),
+-	};
++	/* Src addr PMD aligned */
++	test_cases[6] = MAKE_TEST(PMD, PTE, _4MB, NON_OVERLAPPING, EXPECT_SUCCESS,
++				  "4MB mremap - Source PMD-aligned, Destination PTE-aligned");
++	test_cases[7] =	MAKE_TEST(PMD, _1MB, _4MB, NON_OVERLAPPING, EXPECT_SUCCESS,
++				  "4MB mremap - Source PMD-aligned, Destination 1MB-aligned");
++	test_cases[8] = MAKE_TEST(PMD, PMD, _4MB, NON_OVERLAPPING, EXPECT_SUCCESS,
++				  "4MB mremap - Source PMD-aligned, Destination PMD-aligned");
++
++	/* Src addr PUD aligned */
++	test_cases[9] = MAKE_TEST(PUD, PTE, _2GB, NON_OVERLAPPING, EXPECT_SUCCESS,
++				  "2GB mremap - Source PUD-aligned, Destination PTE-aligned");
++	test_cases[10] = MAKE_TEST(PUD, _1MB, _2GB, NON_OVERLAPPING, EXPECT_SUCCESS,
++				   "2GB mremap - Source PUD-aligned, Destination 1MB-aligned");
++	test_cases[11] = MAKE_TEST(PUD, PMD, _2GB, NON_OVERLAPPING, EXPECT_SUCCESS,
++				   "2GB mremap - Source PUD-aligned, Destination PMD-aligned");
++	test_cases[12] = MAKE_TEST(PUD, PUD, _2GB, NON_OVERLAPPING, EXPECT_SUCCESS,
++				   "2GB mremap - Source PUD-aligned, Destination PUD-aligned");
++
++	perf_test_cases[0] =  MAKE_TEST(page_size, page_size, _1GB, NON_OVERLAPPING, EXPECT_SUCCESS,
++					"1GB mremap - Source PTE-aligned, Destination PTE-aligned");
++	/*
++	 * mremap 1GB region - Page table level aligned time
++	 * comparison.
++	 */
++	perf_test_cases[1] = MAKE_TEST(PMD, PMD, _1GB, NON_OVERLAPPING, EXPECT_SUCCESS,
++				       "1GB mremap - Source PMD-aligned, Destination PMD-aligned");
++	perf_test_cases[2] = MAKE_TEST(PUD, PUD, _1GB, NON_OVERLAPPING, EXPECT_SUCCESS,
++				       "1GB mremap - Source PUD-aligned, Destination PUD-aligned");
+ 
+ 	run_perf_tests =  (threshold_mb == VALIDATION_NO_THRESHOLD) ||
+ 				(threshold_mb * _1MB >= _1GB);
+-- 
+2.31.1
+

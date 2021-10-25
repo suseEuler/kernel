@@ -1,0 +1,247 @@
+From e1ff5fac8ffc13c44a951e9b848d9d476fcc282b Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Fri, 26 Feb 2021 20:22:01 +0800
+Subject: [PATCH] arm64/mpam: resctrl: Handle cpuhp and resctrl_dom allocation
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: e1ff5fac8ffc13c44a951e9b848d9d476fcc282b
+
+
+hulk inclusion
+category: feature
+feature: ARM MPAM support
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+We implement the cpuhp hooks that allocated and free the resctrl
+domain structures, meanwhile, ctrl_val array in resctrl_resource
+structure are created and destroyed synchronously, so it continuously
+maintains the operations below when cpu online or offline, for
+mpam resctrl, only the cpu mask is needed to know.
+
+Most of this code are borrowed from James's(76814660 "arm_mpam: resctrl:
+Add boilerplate cpuhp and domain allocation").
+
+Link: http://www.linux-arm.org/git?p=linux-jm.git;a=patch;h=768146605a808b379ae3861103f30a792af33ea2
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/kernel/mpam/mpam_internal.h |   3 +
+ arch/arm64/kernel/mpam/mpam_resctrl.c  |  18 +++-
+ arch/arm64/kernel/mpam/mpam_setup.c    | 119 ++++++++++++++++++++++++-
+ include/linux/resctrlfs.h              |   1 +
+ 4 files changed, 138 insertions(+), 3 deletions(-)
+
+diff --git a/arch/arm64/kernel/mpam/mpam_internal.h b/arch/arm64/kernel/mpam/mpam_internal.h
+index 106a67ef687a..ed411d7b0031 100644
+--- a/arch/arm64/kernel/mpam/mpam_internal.h
++++ b/arch/arm64/kernel/mpam/mpam_internal.h
+@@ -132,4 +132,7 @@ mpam_get_raw_resctrl_resource(u32 level);
+ 
+ int __init mpam_resctrl_init(void);
+ 
++int mpam_resctrl_set_default_cpu(unsigned int cpu);
++void mpam_resctrl_clear_default_cpu(unsigned int cpu);
++
+ #endif
+diff --git a/arch/arm64/kernel/mpam/mpam_resctrl.c b/arch/arm64/kernel/mpam/mpam_resctrl.c
+index d15b6b827118..298eb8332676 100644
+--- a/arch/arm64/kernel/mpam/mpam_resctrl.c
++++ b/arch/arm64/kernel/mpam/mpam_resctrl.c
+@@ -77,6 +77,19 @@ bool rdt_alloc_capable;
+  *   AFF2: MPIDR.AFF2
+  */
+ 
++int mpam_resctrl_set_default_cpu(unsigned int cpu)
++{
++    /* The cpu is set in default rdtgroup after online. */
++	cpumask_set_cpu(cpu, &resctrl_group_default.cpu_mask);
++	return 0;
++}
++
++void mpam_resctrl_clear_default_cpu(unsigned int cpu)
++{
++	/* The cpu is set in default rdtgroup after online. */
++	cpumask_clear_cpu(cpu, &resctrl_group_default.cpu_mask);
++}
++
+ static inline void mpam_node_assign_val(struct mpam_node *n,
+ 				char *name,
+ 				u8 type,
+@@ -524,13 +537,14 @@ void closid_free(int closid)
+ 
+ static int mpam_online_cpu(unsigned int cpu)
+ {
+-	cpumask_set_cpu(cpu, &resctrl_group_default.cpu_mask);
+-	return 0;
++	return mpam_resctrl_set_default_cpu(cpu);
+ }
+ 
+ /* remove related resource when cpu offline */
+ static int mpam_offline_cpu(unsigned int cpu)
+ {
++	mpam_resctrl_clear_default_cpu(cpu);
++
+ 	return 0;
+ }
+ 
+diff --git a/arch/arm64/kernel/mpam/mpam_setup.c b/arch/arm64/kernel/mpam/mpam_setup.c
+index c0746a9058b7..38890f0b7f6a 100644
+--- a/arch/arm64/kernel/mpam/mpam_setup.c
++++ b/arch/arm64/kernel/mpam/mpam_setup.c
+@@ -41,16 +41,133 @@
+ struct mpam_resctrl_res mpam_resctrl_exports[RDT_NUM_RESOURCES];
+ struct mpam_resctrl_res mpam_resctrl_events[RESCTRL_NUM_EVENT_IDS];
+ 
+-int mpam_resctrl_cpu_online(unsigned int cpu)
++/* Like resctrl_get_domain_from_cpu(), but for offline CPUs */
++static struct mpam_resctrl_dom *
++mpam_get_domain_from_cpu(int cpu, struct mpam_resctrl_res *res)
+ {
++	struct rdt_domain *d;
++	struct mpam_resctrl_dom *dom;
++
++	list_for_each_entry(d, &res->resctrl_res.domains, list) {
++		dom = container_of(d, struct mpam_resctrl_dom, resctrl_dom);
++
++		if (cpumask_test_cpu(cpu, &dom->comp->fw_affinity))
++			return dom;
++	}
++
++	return NULL;
++}
++
++static int mpam_resctrl_setup_domain(unsigned int cpu,
++				struct mpam_resctrl_res *res)
++{
++	struct mpam_resctrl_dom *dom;
++	struct mpam_class *class = res->class;
++	struct mpam_component *comp_iter, *comp;
++	u32 num_partid;
++	u32 **ctrlval_ptr;
++
++	num_partid = mpam_sysprops_num_partid();
++
++	comp = NULL;
++	list_for_each_entry(comp_iter, &class->components, class_list) {
++		if (cpumask_test_cpu(cpu, &comp_iter->fw_affinity)) {
++			comp = comp_iter;
++			break;
++		}
++	}
++
++	/* cpu with unknown exported component? */
++	if (WARN_ON_ONCE(!comp))
++		return 0;
++
++	dom = kzalloc_node(sizeof(*dom), GFP_KERNEL, cpu_to_node(cpu));
++	if (!dom)
++		return -ENOMEM;
++
++	dom->comp = comp;
++	INIT_LIST_HEAD(&dom->resctrl_dom.list);
++	dom->resctrl_dom.id = comp->comp_id;
++	cpumask_set_cpu(cpu, &dom->resctrl_dom.cpu_mask);
++
++	ctrlval_ptr = &dom->resctrl_dom.ctrl_val;
++	*ctrlval_ptr = kmalloc_array(num_partid,
++			sizeof(**ctrlval_ptr), GFP_KERNEL);
++	if (!*ctrlval_ptr) {
++		kfree(dom);
++		return -ENOMEM;
++	}
++
++	/* TODO: this list should be sorted */
++	list_add_tail(&dom->resctrl_dom.list, &res->resctrl_res.domains);
++	res->resctrl_res.dom_num++;
++
+ 	return 0;
+ }
+ 
++int mpam_resctrl_cpu_online(unsigned int cpu)
++{
++	int ret;
++	struct mpam_resctrl_dom *dom;
++	struct mpam_resctrl_res *res;
++
++	for_each_supported_resctrl_exports(res) {
++		dom = mpam_get_domain_from_cpu(cpu, res);
++		if (dom) {
++			cpumask_set_cpu(cpu, &dom->resctrl_dom.cpu_mask);
++		} else {
++			ret = mpam_resctrl_setup_domain(cpu, res);
++			if (ret)
++				return ret;
++		}
++	}
++
++	return mpam_resctrl_set_default_cpu(cpu);
++}
++
++static inline struct rdt_domain *
++resctrl_get_domain_from_cpu(int cpu, struct resctrl_resource *r)
++{
++	struct rdt_domain *d;
++
++	list_for_each_entry(d, &r->domains, list) {
++		/* Find the domain that contains this CPU */
++		if (cpumask_test_cpu(cpu, &d->cpu_mask))
++			return d;
++	}
++
++	return NULL;
++}
++
+ int mpam_resctrl_cpu_offline(unsigned int cpu)
+ {
++	struct rdt_domain *d;
++	struct mpam_resctrl_res *res;
++	struct mpam_resctrl_dom *dom;
++
++	for_each_supported_resctrl_exports(res) {
++		 d = resctrl_get_domain_from_cpu(cpu, &res->resctrl_res);
++
++		/* cpu with unknown exported component? */
++		if (WARN_ON_ONCE(!d))
++			continue;
++
++		cpumask_clear_cpu(cpu, &d->cpu_mask);
++
++		if (!cpumask_empty(&d->cpu_mask))
++			continue;
++
++		list_del(&d->list);
++		dom = container_of(d, struct mpam_resctrl_dom, resctrl_dom);
++		kfree(dom);
++	}
++
++	mpam_resctrl_clear_default_cpu(cpu);
++
+ 	return 0;
+ }
+ 
++
+ /* Test whether we can export MPAM_CLASS_CACHE:{2,3}? */
+ static void mpam_resctrl_pick_caches(void)
+ {
+diff --git a/include/linux/resctrlfs.h b/include/linux/resctrlfs.h
+index da2be20fd47c..3a5c5dea3288 100644
+--- a/include/linux/resctrlfs.h
++++ b/include/linux/resctrlfs.h
+@@ -48,6 +48,7 @@ struct resctrl_resource {
+ 	bool			mon_capable;
+ 	char			*name;
+ 	struct list_head	domains;
++	u32			dom_num;
+ 	struct list_head	evt_list;
+ 	unsigned long		fflags;
+ 
+-- 
+2.26.2
+

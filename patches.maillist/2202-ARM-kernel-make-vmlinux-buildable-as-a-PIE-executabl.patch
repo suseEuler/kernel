@@ -1,0 +1,138 @@
+From 88072baa367b1228b24362c7a5759d0783ff0380 Mon Sep 17 00:00:00 2001
+From: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+Date: Wed, 24 Feb 2021 04:32:35 -0500
+Subject: [PATCH] ARM: kernel: make vmlinux buildable as a PIE executable
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 88072baa367b1228b24362c7a5759d0783ff0380
+
+
+maillist inclusion
+commit 04be01192973461cdd00ab47908a78f0e2f55ef8
+category: feature
+feature: ARM kaslr support
+bugzilla: 47952
+CVE: NA
+
+Reference: https://git.kernel.org/pub/scm/linux/kernel/git/ardb/linux.git/commit/?h=arm-kaslr-latest&id=04be01192973461cdd00ab47908a78f0e2f55ef8
+
+Update the Kconfig RELOCATABLE depends on !JUMP_LABEL to resolve
+compilation conflicts between fpic and JUMP_LABEL
+
+-------------------------------------------------
+
+Update the build flags and linker script to allow vmlinux to be built
+as a PIE  binary, which retains relocation information about absolute
+symbol references so that they can be fixed up at runtime. This will
+be used for implementing KASLR,
+
+Cc: Russell King <linux@armlinux.org.uk>
+Acked-by: Nicolas Pitre <nico@linaro.org>
+Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+Signed-off-by: Cui GaoSheng <cuigaosheng1@huawei.com>
+Reviewed-by: Xiu Jianfeng <xiujianfeng@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm/Kconfig                   | 5 +++++
+ arch/arm/Makefile                  | 5 +++++
+ arch/arm/include/asm/assembler.h   | 2 +-
+ arch/arm/include/asm/vmlinux.lds.h | 6 +++++-
+ arch/arm/kernel/vmlinux.lds.S      | 6 ++++++
+ scripts/module.lds.S               | 1 +
+ 6 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm/Kconfig b/arch/arm/Kconfig
+index 4ac55d06079a..c2429860dcbf 100644
+--- a/arch/arm/Kconfig
++++ b/arch/arm/Kconfig
+@@ -1678,6 +1678,11 @@ config STACKPROTECTOR_PER_TASK
+ 	  Enable this option to switch to a different method that uses a
+ 	  different canary value for each task.
+ 
++config RELOCATABLE
++	bool
++	depends on !XIP_KERNEL && !JUMP_LABEL
++	select HAVE_ARCH_PREL32_RELOCATIONS
++
+ endmenu
+ 
+ menu "Boot options"
+diff --git a/arch/arm/Makefile b/arch/arm/Makefile
+index e15f76ca2887..4f550fc0e811 100644
+--- a/arch/arm/Makefile
++++ b/arch/arm/Makefile
+@@ -48,6 +48,11 @@ CHECKFLAGS	+= -D__ARMEL__
+ KBUILD_LDFLAGS	+= -EL
+ endif
+ 
++ifeq ($(CONFIG_RELOCATABLE),y)
++KBUILD_CFLAGS		+= -fpic -include $(srctree)/include/linux/hidden.h
++LDFLAGS_vmlinux		+= -pie -shared -Bsymbolic
++endif
++
+ #
+ # The Scalar Replacement of Aggregates (SRA) optimization pass in GCC 4.9 and
+ # later may result in code being generated that handles signed short and signed
+diff --git a/arch/arm/include/asm/assembler.h b/arch/arm/include/asm/assembler.h
+index b6d5c0d83674..20993615087a 100644
+--- a/arch/arm/include/asm/assembler.h
++++ b/arch/arm/include/asm/assembler.h
+@@ -528,7 +528,7 @@ THUMB(	orr	\reg , \reg , #PSR_T_BIT	)
+ 	 * mov_l - move a constant value or [relocated] address into a register
+ 	 */
+ 	.macro		mov_l, dst:req, imm:req
+-	.if		__LINUX_ARM_ARCH__ < 7
++	.if		CONFIG_RELOCATABLE == 1 || __LINUX_ARM_ARCH__ < 7
+ 	ldr		\dst, =\imm
+ 	.else
+ 	movw		\dst, #:lower16:\imm
+diff --git a/arch/arm/include/asm/vmlinux.lds.h b/arch/arm/include/asm/vmlinux.lds.h
+index 4a91428c324d..c1ced85cd8e5 100644
+--- a/arch/arm/include/asm/vmlinux.lds.h
++++ b/arch/arm/include/asm/vmlinux.lds.h
+@@ -50,7 +50,11 @@
+ 		EXIT_CALL						\
+ 		ARM_MMU_DISCARD(*(.text.fixup))				\
+ 		ARM_MMU_DISCARD(*(__ex_table))				\
+-		COMMON_DISCARDS
++		COMMON_DISCARDS						\
++		*(.ARM.exidx.discard.text)				\
++		*(.interp .dynamic)					\
++		*(.dynsym .dynstr .hash)
++
+ 
+ /*
+  * Sections that should stay zero sized, which is safer to explicitly
+diff --git a/arch/arm/kernel/vmlinux.lds.S b/arch/arm/kernel/vmlinux.lds.S
+index f7f4620d59c3..262ba776d32d 100644
+--- a/arch/arm/kernel/vmlinux.lds.S
++++ b/arch/arm/kernel/vmlinux.lds.S
+@@ -115,6 +115,12 @@ SECTIONS
+ 		__smpalt_end = .;
+ 	}
+ #endif
++	.rel.dyn : ALIGN(8) {
++		__rel_begin = .;
++		*(.rel .rel.* .rel.dyn)
++	}
++	__rel_end = ADDR(.rel.dyn) + SIZEOF(.rel.dyn);
++
+ 	.init.pv_table : {
+ 		__pv_table_begin = .;
+ 		*(.pv_table)
+diff --git a/scripts/module.lds.S b/scripts/module.lds.S
+index 69b9b71a6a47..088a5a2c446d 100644
+--- a/scripts/module.lds.S
++++ b/scripts/module.lds.S
+@@ -7,6 +7,7 @@ SECTIONS {
+ 	/DISCARD/ : {
+ 		*(.discard)
+ 		*(.discard.*)
++		*(*.discard.*)
+ 	}
+ 
+ 	__ksymtab		0 : { *(SORT(___ksymtab+*)) }
+-- 
+2.26.2
+

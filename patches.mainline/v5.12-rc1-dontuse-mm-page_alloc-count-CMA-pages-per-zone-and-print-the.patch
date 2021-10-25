@@ -1,0 +1,146 @@
+From 3c381db1fac80373f2cc0d8c1d0bcfbf8bd4fb57 Mon Sep 17 00:00:00 2001
+From: David Hildenbrand <david@redhat.com>
+Date: Thu, 25 Feb 2021 17:16:40 -0800
+Subject: [PATCH] mm/page_alloc: count CMA pages per zone and print them in
+Git-commit: 3c381db1fac80373f2cc0d8c1d0bcfbf8bd4fb57
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+ /proc/zoneinfo
+
+Let's count the number of CMA pages per zone and print them in
+/proc/zoneinfo.
+
+Having access to the total number of CMA pages per zone is helpful for
+debugging purposes to know where exactly the CMA pages ended up, and to
+figure out how many pages of a zone might behave differently, even after
+some of these pages might already have been allocated.
+
+As one example, CMA pages part of a kernel zone cannot be used for
+ordinary kernel allocations but instead behave more like ZONE_MOVABLE.
+
+For now, we are only able to get the global nr+free cma pages from
+/proc/meminfo and the free cma pages per zone from /proc/zoneinfo.
+
+Example after this patch when booting a 6 GiB QEMU VM with
+"hugetlb_cma=2G":
+  # cat /proc/zoneinfo | grep cma
+          cma      0
+        nr_free_cma  0
+          cma      0
+        nr_free_cma  0
+          cma      524288
+        nr_free_cma  493016
+          cma      0
+          cma      0
+  # cat /proc/meminfo | grep Cma
+  CmaTotal:        2097152 kB
+  CmaFree:         1972064 kB
+
+Note: We print even without CONFIG_CMA, just like "nr_free_cma"; this way,
+      one can be sure when spotting "cma 0", that there are definetly no
+      CMA pages located in a zone.
+
+[david@redhat.com: v2]
+  Link: https://lkml.kernel.org/r/20210128164533.18566-1-david@redhat.com
+[david@redhat.com: v3]
+  Link: https://lkml.kernel.org/r/20210129113451.22085-1-david@redhat.com
+
+Link: https://lkml.kernel.org/r/20210127101813.6370-3-david@redhat.com
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Reviewed-by: Oscar Salvador <osalvador@suse.de>
+Acked-by: David Rientjes <rientjes@google.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: "Peter Zijlstra (Intel)" <peterz@infradead.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Wei Yang <richard.weiyang@linux.alibaba.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ include/linux/mmzone.h | 15 +++++++++++++++
+ mm/page_alloc.c        |  1 +
+ mm/vmstat.c            |  6 ++++--
+ 3 files changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+index 9198b7ade85f..5f9c4dad73ed 100644
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -503,6 +503,9 @@ struct zone {
+ 	 * bootmem allocator):
+ 	 *	managed_pages = present_pages - reserved_pages;
+ 	 *
++	 * cma pages is present pages that are assigned for CMA use
++	 * (MIGRATE_CMA).
++	 *
+ 	 * So present_pages may be used by memory hotplug or memory power
+ 	 * management logic to figure out unmanaged pages by checking
+ 	 * (present_pages - managed_pages). And managed_pages should be used
+@@ -527,6 +530,9 @@ struct zone {
+ 	atomic_long_t		managed_pages;
+ 	unsigned long		spanned_pages;
+ 	unsigned long		present_pages;
++#ifdef CONFIG_CMA
++	unsigned long		cma_pages;
++#endif
+ 
+ 	const char		*name;
+ 
+@@ -624,6 +630,15 @@ static inline unsigned long zone_managed_pages(struct zone *zone)
+ 	return (unsigned long)atomic_long_read(&zone->managed_pages);
+ }
+ 
++static inline unsigned long zone_cma_pages(struct zone *zone)
++{
++#ifdef CONFIG_CMA
++	return zone->cma_pages;
++#else
++	return 0;
++#endif
++}
++
+ static inline unsigned long zone_end_pfn(const struct zone *zone)
+ {
+ 	return zone->zone_start_pfn + zone->spanned_pages;
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index ddccc59f2f72..3e4b29ee2b1e 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -2168,6 +2168,7 @@ void __init init_cma_reserved_pageblock(struct page *page)
+ 	}
+ 
+ 	adjust_managed_page_count(page, pageblock_nr_pages);
++	page_zone(page)->cma_pages += pageblock_nr_pages;
+ }
+ #endif
+ 
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index a0e949542204..6cdf789ced5e 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -1637,14 +1637,16 @@ static void zoneinfo_show_print(struct seq_file *m, pg_data_t *pgdat,
+ 		   "\n        high     %lu"
+ 		   "\n        spanned  %lu"
+ 		   "\n        present  %lu"
+-		   "\n        managed  %lu",
++		   "\n        managed  %lu"
++		   "\n        cma      %lu",
+ 		   zone_page_state(zone, NR_FREE_PAGES),
+ 		   min_wmark_pages(zone),
+ 		   low_wmark_pages(zone),
+ 		   high_wmark_pages(zone),
+ 		   zone->spanned_pages,
+ 		   zone->present_pages,
+-		   zone_managed_pages(zone));
++		   zone_managed_pages(zone),
++		   zone_cma_pages(zone));
+ 
+ 	seq_printf(m,
+ 		   "\n        protection: (%ld",
+-- 
+2.31.1
+

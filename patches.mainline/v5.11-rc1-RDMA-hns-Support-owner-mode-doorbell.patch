@@ -1,0 +1,123 @@
+From aba457ca890c6a8042ba941a71129337b858d993 Mon Sep 17 00:00:00 2001
+From: Lang Cheng <chenglang@huawei.com>
+Date: Tue, 20 Oct 2020 20:04:53 +0800
+Subject: [PATCH] RDMA/hns: Support owner mode doorbell
+Git-commit: aba457ca890c6a8042ba941a71129337b858d993
+Patch-mainline: v5.11-rc1
+References: bsn#12
+
+
+The doorbell needs to store PI information into QPC, so the RoCEE should
+wait for the results of storing, that is, it needs two bus operations to
+complete a doorbell. When ROCEE is in SDI mode, multiple doorbells may be
+interlocked because the RoCEE can only handle bus operations serially. So a
+flag to mark if HIP09 is working in SDI mode is added. When the SDI flag is
+set, the ROCEE will ignore the PI information of the doorbell, continue to
+fetch wqe and verify its validity by it's owner_bit.
+
+Link: https://lore.kernel.org/r/1603195493-22741-1-git-send-email-liweihang@huawei.com
+Signed-off-by: Lang Cheng <chenglang@huawei.com>
+Signed-off-by: Weihang Li <liweihang@huawei.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ drivers/infiniband/hw/hns/hns_roce_device.h |    4 +++-
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.c  |   28 ++++++++++++++++++++++------
+ drivers/infiniband/hw/hns/hns_roce_qp.c     |    3 +++
+ 3 files changed, 28 insertions(+), 7 deletions(-)
+
+--- a/drivers/infiniband/hw/hns/hns_roce_device.h
++++ b/drivers/infiniband/hw/hns/hns_roce_device.h
+@@ -129,9 +129,10 @@ enum {
+ 	SERV_TYPE_UD,
+ };
+ 
+-enum {
++enum hns_roce_qp_caps {
+ 	HNS_ROCE_QP_CAP_RQ_RECORD_DB = BIT(0),
+ 	HNS_ROCE_QP_CAP_SQ_RECORD_DB = BIT(1),
++	HNS_ROCE_QP_CAP_OWNER_DB = BIT(2),
+ };
+ 
+ enum hns_roce_cq_flags {
+@@ -221,6 +222,7 @@ enum {
+ 	HNS_ROCE_CAP_FLAG_FRMR                  = BIT(8),
+ 	HNS_ROCE_CAP_FLAG_QP_FLOW_CTRL		= BIT(9),
+ 	HNS_ROCE_CAP_FLAG_ATOMIC		= BIT(10),
++	HNS_ROCE_CAP_FLAG_SDI_MODE		= BIT(14),
+ };
+ 
+ #define HNS_ROCE_DB_TYPE_COUNT			2
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+@@ -461,9 +461,6 @@ static inline int set_ud_wqe(struct hns_
+ 	roce_set_bit(ud_sq_wqe->byte_4, V2_UD_SEND_WQE_BYTE_4_SE_S,
+ 		     (wr->send_flags & IB_SEND_SOLICITED) ? 1 : 0);
+ 
+-	roce_set_bit(ud_sq_wqe->byte_4, V2_UD_SEND_WQE_BYTE_4_OWNER_S,
+-		     owner_bit);
+-
+ 	roce_set_field(ud_sq_wqe->byte_16, V2_UD_SEND_WQE_BYTE_16_PD_M,
+ 		       V2_UD_SEND_WQE_BYTE_16_PD_S, to_hr_pd(qp->ibqp.pd)->pdn);
+ 
+@@ -509,7 +506,18 @@ static inline int set_ud_wqe(struct hns_
+ 
+ 	set_extend_sge(qp, wr->sg_list, &curr_idx, valid_num_sge);
+ 
++	/*
++	 * The pipeline can sequentially post all valid WQEs into WQ buffer,
++	 * including new WQEs waiting for the doorbell to update the PI again.
++	 * Therefore, the owner bit of WQE MUST be updated after all fields
++	 * and extSGEs have been written into DDR instead of cache.
++	 */
++	if (qp->en_flags & HNS_ROCE_QP_CAP_OWNER_DB)
++		dma_wmb();
++
+ 	*sge_idx = curr_idx;
++	roce_set_bit(ud_sq_wqe->byte_4, V2_UD_SEND_WQE_BYTE_4_OWNER_S,
++		     owner_bit);
+ 
+ 	return 0;
+ }
+@@ -583,9 +591,6 @@ static inline int set_rc_wqe(struct hns_
+ 	roce_set_bit(rc_sq_wqe->byte_4, V2_RC_SEND_WQE_BYTE_4_CQE_S,
+ 		     (wr->send_flags & IB_SEND_SIGNALED) ? 1 : 0);
+ 
+-	roce_set_bit(rc_sq_wqe->byte_4, V2_RC_SEND_WQE_BYTE_4_OWNER_S,
+-		     owner_bit);
+-
+ 	if (wr->opcode == IB_WR_ATOMIC_CMP_AND_SWP ||
+ 	    wr->opcode == IB_WR_ATOMIC_FETCH_AND_ADD)
+ 		set_atomic_seg(wr, rc_sq_wqe, valid_num_sge);
+@@ -593,7 +598,18 @@ static inline int set_rc_wqe(struct hns_
+ 		ret = set_rwqe_data_seg(&qp->ibqp, wr, rc_sq_wqe,
+ 					&curr_idx, valid_num_sge);
+ 
++	/*
++	 * The pipeline can sequentially post all valid WQEs into WQ buffer,
++	 * including new WQEs waiting for the doorbell to update the PI again.
++	 * Therefore, the owner bit of WQE MUST be updated after all fields
++	 * and extSGEs have been written into DDR instead of cache.
++	 */
++	if (qp->en_flags & HNS_ROCE_QP_CAP_OWNER_DB)
++		dma_wmb();
++
+ 	*sge_idx = curr_idx;
++	roce_set_bit(rc_sq_wqe->byte_4, V2_RC_SEND_WQE_BYTE_4_OWNER_S,
++		     owner_bit);
+ 
+ 	return ret;
+ }
+--- a/drivers/infiniband/hw/hns/hns_roce_qp.c
++++ b/drivers/infiniband/hw/hns/hns_roce_qp.c
+@@ -730,6 +730,9 @@ static int alloc_qp_db(struct hns_roce_d
+ 	struct ib_device *ibdev = &hr_dev->ib_dev;
+ 	int ret;
+ 
++	if (hr_dev->caps.flags & HNS_ROCE_CAP_FLAG_SDI_MODE)
++		hr_qp->en_flags |= HNS_ROCE_QP_CAP_OWNER_DB;
++
+ 	if (udata) {
+ 		if (user_qp_has_sdb(hr_dev, init_attr, udata, resp, ucmd)) {
+ 			ret = hns_roce_db_map_user(uctx, udata, ucmd->sdb_addr,

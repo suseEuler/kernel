@@ -1,0 +1,76 @@
+From 96a27f9d51d470d1d5925e371296726f4c2e195d Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Fri, 26 Feb 2021 20:22:48 +0800
+Subject: [PATCH] arm64/mpam: resctrl: Use resctrl_group_init_alloc() for
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 96a27f9d51d470d1d5925e371296726f4c2e195d
+
+ default group
+
+hulk inclusion
+category: bugfix
+bugzilla: 48265
+CVE: NA
+
+--------------------------------
+
+When we support configure different types of resources for a resource, the
+wrong history value will be updated in the default group after remounting.
+
+e.g.
+    > mount -t resctrl resctrl /sys/fs/resctrl/ -o mbMax,mbMin && cd resctrl/
+    > echo 'MBMIN:0=2;1=2;2=2;3=2' > schemata
+    > cat schemata
+      L3:0=7fff;1=7fff;2=7fff;3=7fff
+      MBMAX:0=100;1=100;2=100;3=100
+      MBMIN:0=2;1=2;2=2;3=2
+    > cd .. && umount /sys/fs/resctrl/
+    > mount -t resctrl resctrl /sys/fs/resctrl/ -o mbMax,mbMin && cd resctrl/ && cat schemata
+      L3:0=7fff;1=7fff;2=7fff;3=7fff
+      MBMAX:0=100;1=100;2=100;3=100
+      MBMIN:0=0;1=0;2=0;3=0
+    > echo 'MBMAX:0=10;1=10;2=10;3=10' > schemata
+    > cat schemata
+      L3:0=7fff;1=7fff;2=7fff;3=7fff
+      MBMAX:0=10;1=10;2=10;3=10
+      MBMIN:0=2;1=2;2=2;3=2  #update error history value
+
+When writing schemata sysfile, call path like this:
+
+resctrl_group_schemata_write()
+  -=> resctrl_update_groups_config()
+         -=> resctrl_group_update_domains()
+               -=> resctrl_group_update_domain_ctrls()
+                { .../*refresh new_ctrl array of supported conf type once for each resource*/ }
+
+We should refresh new_ctrl field in struct resctrl_staged_config by
+resctrl_group_init_alloc() before calling resctrl_group_update_domain_ctrls().
+
+Fixes: 6b2471f089be ("arm64/mpam: resctrl: Support priority and hardlimit(Memory bandwidth) configuration")
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/resctrlfs.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/fs/resctrlfs.c b/fs/resctrlfs.c
+index 10405e47aafa..b66969b95775 100644
+--- a/fs/resctrlfs.c
++++ b/fs/resctrlfs.c
+@@ -406,6 +406,10 @@ static int resctrl_get_tree(struct fs_context *fc)
+ 	if (ret)
+ 		goto out_schema;
+ 
++	ret = resctrl_group_init_alloc(&resctrl_group_default);
++	if (ret < 0)
++		goto out_schema;
++
+ 	ret = resctrl_group_create_info_dir(resctrl_group_default.kn, &kn_info);
+ 	if (ret)
+ 		goto out_schema;
+-- 
+2.26.2
+

@@ -1,0 +1,227 @@
+From 338fc539bb486bb04b5fc07cbb614100f59b805a Mon Sep 17 00:00:00 2001
+From: Lu Jialin <lujialin4@huawei.com>
+Date: Wed, 17 Mar 2021 20:56:38 +0800
+Subject: [PATCH] fs: fix files.usage bug when move tasks
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 338fc539bb486bb04b5fc07cbb614100f59b805a
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 50779
+CVE: NA
+
+--------
+
+If parent cgroup files.limit is 0, fail to move a task into child
+cgroup. When kill the task, the files.usage of parent cgroup and child
+cgroup is abnormal.
+
+/sys/fs/cgroup/parent # ls
+cgroup.clone_children  files.limit            tasks
+cgroup.procs           files.usage
+child                  notify_on_release
+/sys/fs/cgroup/parent # echo 0 >files.limit
+/sys/fs/cgroup/parent # cd child
+/sys/fs/cgroup/parent/child # ls
+cgroup.clone_children  files.limit            notify_on_release
+cgroup.procs           files.usage            tasks
+/sys/fs/cgroup/parent/child # echo 156 >tasks
+[  879.564728] Open files limit overcommited
+/sys/fs/cgroup/parent/child # kill -9 156
+/sys/fs/cgroup/parent/child # [  886.363690] WARNING: CPU: 0 PID: 156 at mm/page_counter.c:62 page_counter_cancel+0x26/0x30
+[  886.364093] Modules linked in:
+[  886.364093] CPU: 0 PID: 156 Comm: top Not tainted 4.18.0+ #1
+[  886.364093] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.12.1-0-ga5cab58e9a3f-prebuilt.qemu.org 04/01/2014
+[  886.365350] RIP: 0010:page_counter_cancel+0x26/0x30
+[  886.365350] Code: 0f 1f 40 00 66 66 66 66 90 48 89 f0 53 48 f7 d8 f0 48 0f c1 07 48 29 f0 48 89 c3 48 89 c6 e8 61 ff ff ff 48 85 d5
+[  886.365350] RSP: 0018:ffffb754006b7d00 EFLAGS: 00000286
+[  886.365350] RAX: 0000000000000000 RBX: ffffffffffffffff RCX: 0000000000000001
+[  886.365350] RDX: 0000000000000000 RSI: ffffffffffffffff RDI: ffff9ca61888b930
+[  886.365350] RBP: 0000000000000001 R08: 00000000000295c0 R09: ffffffff820597aa
+[  886.365350] R10: ffffffffffffffff R11: ffffd78601823508 R12: 0000000000000000
+[  886.365350] R13: ffff9ca6181c0628 R14: 0000000000000000 R15: ffff9ca663e9d000
+[  886.365350] FS:  0000000000000000(0000) GS:ffff9ca661e00000(0000) knlGS:0000000000000000
+[  886.365350] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[  886.365350] CR2: 0000000000867fb8 CR3: 0000000017a0a000 CR4: 00000000000006f0
+[  886.365350] Call Trace:
+[  886.369392]  page_counter_uncharge+0x1d/0x30
+[  886.369392]  put_files_struct+0x7c/0xe0
+[  886.369392]  do_exit+0x2c7/0xb90
+[  886.369392]  ? __schedule+0x2a1/0x900
+[  886.369392]  do_group_exit+0x3a/0xa0
+[  886.369392]  get_signal+0x15e/0x870
+[  886.369392]  do_signal+0x36/0x610
+[  886.369392]  ? do_vfs_ioctl+0xa4/0x640
+[  886.369392]  ? do_vfs_ioctl+0xa4/0x640
+[  886.369392]  ? dput+0x29/0x110
+[  886.369392]  exit_to_usermode_loop+0x71/0xe0
+[  886.369392]  do_syscall_64+0x181/0x1b0
+[  886.369392]  entry_SYSCALL_64_after_hwframe+0x65/0xca
+[  886.369392] RIP: 0033:0x4b9b5a
+[  886.369392] Code: Bad RIP value.
+[  886.369392] RSP: 002b:00007ffe27221968 EFLAGS: 00000206 ORIG_RAX: 0000000000000010
+[  886.373373] RAX: fffffffffffffe00 RBX: 0000000000000001 RCX: 00000000004b9b5a
+[  886.373373] RDX: 00007ffe27221930 RSI: 0000000000005402 RDI: 0000000000000000
+[  886.373373] RBP: 0000000000000135 R08: 00007ffe272219a4 R09: 0000000000000010
+[  886.373373] R10: 0000000000000000 R11: 0000000000000206 R12: 0000000000000000
+[  886.373373] R13: 0000000000000005 R14: 0000000000000135 R15: 0000000000000000
+[  886.373373] ---[ end trace 56c4971a753a98c5 ]---
+
+[1]+  Killed                     top
+/sys/fs/cgroup/parent/child # ls
+cgroup.clone_children  files.limit            notify_on_release
+cgroup.procs           files.usage            tasks
+/sys/fs/cgroup/parent/child # cat files.usage
+18446744073709551613
+/sys/fs/cgroup/parent/child # cd ..
+/sys/fs/cgroup/parent # ls
+cgroup.clone_children  files.limit            tasks
+cgroup.procs           files.usage
+child                  notify_on_release
+/sys/fs/cgroup/parent # cat files.usage
+18446744073709551613
+
+The reason is when fail to move a task into child cgroup,the files.usage
+of child cgroup and its parent cgroup are the same as before. The struct
+files_cgroup points to the dst_css. Therefore, when kill the task, the
+page_counter_uncharge() will subtract the files.usage of child cgroup and
+its parent cgroup again. The files.usage will be abnormal.
+
+If we just change the struct files_cgroup pointers when charge success in
+files_cgroup_attach, problems will occur in some extreme scenario.
+1)If we add num_files into original page_counter when fail to charge the
+file resource into new cgroup, the files.usage will be larger than
+files.limit of the original cgroup when new task moves into the original
+cgroup at the same time.
+2)If we subtract num_files into original page_counter when success to
+charge the file resource into new cgroup, when the parent files.limit
+equals to the files.usage and there are two child cgroups of the parent,
+it will be failed to move the task from one child cgroup into another
+child cgroup.
+
+The patch implements files_cgroup_attach() into files_cgroup_can_attach()
+and delete files_cgroup_attach(). This will make move file related resource
+into new cgroup before move task. When try_charge is failed, task and its
+file resource will be in the original cgroup.The above problems will be
+solved.
+
+Signed-off-by: Lu Jialin <lujialin4@huawei.com>
+Reviewed-by: Hou Tao <houtao1@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Reviewed-by: Xiu Jianfeng <xiujianfeng@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/filescontrol.c | 63 ++++++++++-------------------------------------
+ 1 file changed, 13 insertions(+), 50 deletions(-)
+
+diff --git a/fs/filescontrol.c b/fs/filescontrol.c
+index db0beee474b2..41abe29fc0f8 100644
+--- a/fs/filescontrol.c
++++ b/fs/filescontrol.c
+@@ -102,56 +102,14 @@ u64 files_cgroup_count_fds(struct files_struct *files)
+ 	return retval;
+ }
+ 
+-static u64 files_in_taskset(struct cgroup_taskset *tset)
+-{
+-	struct task_struct *task;
+-	u64 files = 0;
+-	struct cgroup_subsys_state *css;
+-
+-	cgroup_taskset_for_each(task, css, tset) {
+-		if (!thread_group_leader(task))
+-			continue;
+-
+-		task_lock(task);
+-		files += files_cgroup_count_fds(task->files);
+-		task_unlock(task);
+-	}
+-	return files;
+-}
+-
+ /*
+  * If attaching this cgroup would overcommit the resource then deny
+- * the attach.
++ * the attach. If not, attach the file resource into new cgroup.
+  */
+ static int files_cgroup_can_attach(struct cgroup_taskset *tset)
+-{
+-	struct cgroup_subsys_state *css;
+-	unsigned long margin;
+-	struct page_counter *cnt;
+-	unsigned long counter;
+-	u64 files = files_in_taskset(tset);
+-
+-	cgroup_taskset_first(tset, &css);
+-	cnt = css_res_open_handles(css);
+-
+-	counter = (unsigned long)atomic_long_read(&cnt->usage);
+-	if (cnt->max > counter)
+-		margin = cnt->max - counter;
+-	else
+-		margin = 0;
+-	if (margin < files)
+-		return -ENOMEM;
+-	return 0;
+-}
+-
+-/*
+- * If resource counts have gone up between can_attach and attach then
+- * this may overcommit resources.  In that case just deny further allocation
+- * until the resource usage drops.
+- */
+-static void files_cgroup_attach(struct cgroup_taskset *tset)
+ {
+ 	u64 num_files;
++	bool can_attach;
+ 	struct cgroup_subsys_state *to_css;
+ 	struct cgroup_subsys_state *from_css;
+ 	struct page_counter *from_res;
+@@ -166,7 +124,7 @@ static void files_cgroup_attach(struct cgroup_taskset *tset)
+ 	files = task->files;
+ 	if (!files || files == &init_files) {
+ 		task_unlock(task);
+-		return;
++		return 0;
+ 	}
+ 
+ 	from_css = &files_cgroup_from_files(files)->css;
+@@ -175,14 +133,20 @@ static void files_cgroup_attach(struct cgroup_taskset *tset)
+ 	spin_lock(&files->file_lock);
+ 	num_files = files_cgroup_count_fds(files);
+ 	page_counter_uncharge(from_res, num_files);
+-	css_put(from_css);
+ 
+-	if (!page_counter_try_charge(to_res, num_files, &fail_res))
++	if (!page_counter_try_charge(to_res, num_files, &fail_res)) {
++		page_counter_charge(from_res, num_files);
+ 		pr_err("Open files limit overcommited\n");
+-	css_get(to_css);
+-	task->files->files_cgroup = css_fcg(to_css);
++		can_attach = false;
++	} else {
++		css_put(from_css);
++		css_get(to_css);
++		task->files->files_cgroup = css_fcg(to_css);
++		can_attach = true;
++	}
+ 	spin_unlock(&files->file_lock);
+ 	task_unlock(task);
++	return can_attach ? 0 : -ENOSPC;
+ }
+ 
+ int files_cgroup_alloc_fd(struct files_struct *files, u64 n)
+@@ -312,7 +276,6 @@ struct cgroup_subsys files_cgrp_subsys = {
+ 	.css_alloc = files_cgroup_css_alloc,
+ 	.css_free = files_cgroup_css_free,
+ 	.can_attach = files_cgroup_can_attach,
+-	.attach = files_cgroup_attach,
+ 	.legacy_cftypes = files,
+ 	.dfl_cftypes = files,
+ };
+-- 
+2.26.2
+

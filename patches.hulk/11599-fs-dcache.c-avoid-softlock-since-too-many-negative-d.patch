@@ -1,0 +1,165 @@
+From c44e1f7808737705aa24890a5e501a63c3f44358 Mon Sep 17 00:00:00 2001
+From: yangerkun <yangerkun@huawei.com>
+Date: Mon, 29 Nov 2021 16:28:40 +0800
+Subject: [PATCH] fs/dcache.c: avoid softlock since too many negative dentry
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: c44e1f7808737705aa24890a5e501a63c3f44358
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 185805, https://gitee.com/openeuler/kernel/issues/I4JX0L
+CVE: NA
+
+---------------------------
+
+Parallel thread to add negative dentry under root dir. Sometimes later,
+'systemctl daemon-reload' will report softlockup since
+__fsnotify_update_child_dentry_flags need update all child under root
+dentry without distinguish does it active or not. It will waste so long
+time with catching d_lock of root dentry. And other thread try to
+spin_lock d_lock will run overtime.
+
+Limit negative dentry under dir can avoid this.
+
+Signed-off-by: yangerkun <yangerkun@huawei.com>
+Reviewed-by: Miao Xie <miaoxie@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+
+Conflicts:
+	fs/dcache.c
+	include/linux/dcache.h
+Reviewed-by: Zhang Yi <yi.zhang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/dcache.c            | 43 ++++++++++++++++++++++++++++++++++++++++--
+ include/linux/dcache.h |  4 ++++
+ 2 files changed, 45 insertions(+), 2 deletions(-)
+
+diff --git a/fs/dcache.c b/fs/dcache.c
+index 185d71a1c05b..f5b78cc80a00 100644
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -314,10 +314,18 @@ static inline void __d_set_inode_and_type(struct dentry *dentry,
+ 					  unsigned type_flags)
+ {
+ 	unsigned flags;
++	struct dentry *parent;
++
++	parent = dentry->d_parent;
++	if ((dentry->d_flags & DCACHE_NEGATIVE_ACCOUNT) && parent) {
++		WARN_ON(!inode);
++		atomic_dec(&parent->d_neg_dnum);
++	}
+ 
+ 	dentry->d_inode = inode;
+ 	flags = READ_ONCE(dentry->d_flags);
+-	flags &= ~(DCACHE_ENTRY_TYPE | DCACHE_FALLTHRU);
++	flags &= ~(DCACHE_ENTRY_TYPE | DCACHE_FALLTHRU |
++			DCACHE_NEGATIVE_ACCOUNT);
+ 	flags |= type_flags;
+ 	smp_store_release(&dentry->d_flags, flags);
+ }
+@@ -336,6 +344,7 @@ static inline void __d_clear_type_and_inode(struct dentry *dentry)
+ static void dentry_free(struct dentry *dentry)
+ {
+ 	WARN_ON(!hlist_unhashed(&dentry->d_u.d_alias));
++	WARN_ON(dentry->d_flags & DCACHE_NEGATIVE_ACCOUNT);
+ 	if (unlikely(dname_external(dentry))) {
+ 		struct external_name *p = external_name(dentry);
+ 		if (likely(atomic_dec_and_test(&p->u.count))) {
+@@ -573,8 +582,14 @@ static void __dentry_kill(struct dentry *dentry)
+ 	/* if it was on the hash then remove it */
+ 	__d_drop(dentry);
+ 	dentry_unlist(dentry, parent);
+-	if (parent)
++	if (parent) {
++		if (dentry->d_flags & DCACHE_NEGATIVE_ACCOUNT) {
++			atomic_dec(&parent->d_neg_dnum);
++			dentry->d_flags &= ~DCACHE_NEGATIVE_ACCOUNT;
++		}
++
+ 		spin_unlock(&parent->d_lock);
++	}
+ 	if (dentry->d_inode)
+ 		dentry_unlink_inode(dentry);
+ 	else
+@@ -634,6 +649,8 @@ static inline struct dentry *lock_parent(struct dentry *dentry)
+ 
+ static inline bool retain_dentry(struct dentry *dentry)
+ {
++	struct dentry *parent;
++
+ 	WARN_ON(d_in_lookup(dentry));
+ 
+ 	/* Unreachable? Get rid of it */
+@@ -651,6 +668,27 @@ static inline bool retain_dentry(struct dentry *dentry)
+ 	if (unlikely(dentry->d_flags & DCACHE_DONTCACHE))
+ 		return false;
+ 
++	if (unlikely(!dentry->d_parent))
++		goto noparent;
++
++	parent = dentry->d_parent;
++	/* Return false if it's negative */
++	WARN_ON((atomic_read(&parent->d_neg_dnum) < 0));
++	if (!dentry->d_inode) {
++		if (!(dentry->d_flags & DCACHE_NEGATIVE_ACCOUNT)) {
++			unsigned int flags = READ_ONCE(dentry->d_flags);
++
++			flags |= DCACHE_NEGATIVE_ACCOUNT;
++			WRITE_ONCE(dentry->d_flags, flags);
++			atomic_inc(&parent->d_neg_dnum);
++		}
++	}
++
++	if (!dentry->d_inode &&
++	    atomic_read(&parent->d_neg_dnum) >= NEG_DENTRY_LIMIT)
++		return false;
++
++noparent:
+ 	/* retain; LRU fodder */
+ 	dentry->d_lockref.count--;
+ 	if (unlikely(!(dentry->d_flags & DCACHE_LRU_LIST)))
+@@ -1749,6 +1787,7 @@ static struct dentry *__d_alloc(struct super_block *sb, const struct qstr *name)
+ 	seqcount_spinlock_init(&dentry->d_seq, &dentry->d_lock);
+ 	dentry->d_inode = NULL;
+ 	dentry->d_parent = dentry;
++	atomic_set(&dentry->d_neg_dnum, 0);
+ 	dentry->d_sb = sb;
+ 	dentry->d_op = NULL;
+ 	dentry->d_fsdata = NULL;
+diff --git a/include/linux/dcache.h b/include/linux/dcache.h
+index 6f95c3300cbb..edb5efeff11a 100644
+--- a/include/linux/dcache.h
++++ b/include/linux/dcache.h
+@@ -84,6 +84,7 @@ extern struct dentry_stat_t dentry_stat;
+ # endif
+ #endif
+ 
++#define NEG_DENTRY_LIMIT 16384
+ #define d_lock	d_lockref.lock
+ 
+ struct dentry {
+@@ -118,6 +119,8 @@ struct dentry {
+ 		struct hlist_bl_node d_in_lookup_hash;	/* only for in-lookup ones */
+ 	 	struct rcu_head d_rcu;
+ 	} d_u;
++	/* negative dentry under this dentry, if it's dir */
++	atomic_t d_neg_dnum;
+ } __randomize_layout;
+ 
+ /*
+@@ -219,6 +222,7 @@ struct dentry_operations {
+ #define DCACHE_PAR_LOOKUP		0x10000000 /* being looked up (with parent locked shared) */
+ #define DCACHE_DENTRY_CURSOR		0x20000000
+ #define DCACHE_NORCU			0x40000000 /* No RCU delay for freeing */
++#define DCACHE_NEGATIVE_ACCOUNT		0x80000000
+ 
+ extern seqlock_t rename_lock;
+ 
+-- 
+2.26.2
+

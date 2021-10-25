@@ -1,0 +1,205 @@
+From ce7fa1af7a38b77b1e0e59ab7bb4aed7b1979a97 Mon Sep 17 00:00:00 2001
+From: Jing Xiangfeng <jingxiangfeng@huawei.com>
+Date: Tue, 6 Jul 2021 16:51:04 +0800
+Subject: [PATCH] memcg: Add static key for memcg priority
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: ce7fa1af7a38b77b1e0e59ab7bb4aed7b1979a97
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I3ZN3O
+CVE: NA
+
+--------------------------------------
+
+This patch adds a default-false static key to disable memcg priority
+feature. If you want to enable it by writing 1:
+
+echo 1 > /proc/sys/vm/memcg_qos_enable
+
+Signed-off-by: Jing Xiangfeng <jingxiangfeng@huawei.com>
+Reviewed-by: Liu Shixin <liushixin2@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/memcontrol.h |  7 +++++
+ kernel/sysctl.c            | 11 ++++++++
+ mm/memcontrol.c            | 52 ++++++++++++++++++++++++++++++++++++++
+ mm/oom_kill.c              |  7 +++--
+ 4 files changed, 73 insertions(+), 4 deletions(-)
+
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index 5440fcb38e06..d29cb949568c 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -342,9 +342,16 @@ struct mem_cgroup {
+ };
+ 
+ #ifdef CONFIG_MEMCG_QOS
++#define ENABLE_MEMCG_QOS	1
++#define DISABLE_MEMCG_QOS	0
++extern int sysctl_memcg_qos_stat;
++DECLARE_STATIC_KEY_FALSE(memcg_qos_stat_key);
++
+ bool memcg_low_priority_scan_tasks(int (*)(struct task_struct *, void *),
+ 				   void *);
+ void memcg_print_bad_task(void *arg, int ret);
++extern int sysctl_memcg_qos_handler(struct ctl_table *table,
++		int write, void __user *buffer, size_t *length, loff_t *ppos);
+ #endif
+ 
+ /*
+diff --git a/kernel/sysctl.c b/kernel/sysctl.c
+index b9306d2bb426..e2729e82bf9b 100644
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -2825,6 +2825,17 @@ static struct ctl_table vm_table[] = {
+ 		.mode		= 0644,
+ 		.proc_handler	= hugetlb_overcommit_handler,
+ 	},
++#endif
++#ifdef CONFIG_MEMCG_QOS
++	{
++		.procname	= "memcg_qos_enable",
++		.data		= &sysctl_memcg_qos_stat,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= sysctl_memcg_qos_handler,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
++	},
+ #endif
+ 	{
+ 		.procname	= "lowmem_reserve_ratio",
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index e1eb2ffbd131..2bdd40397e9f 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -3957,10 +3957,16 @@ static int mem_cgroup_move_charge_write(struct cgroup_subsys_state *css,
+ #endif
+ 
+ #ifdef CONFIG_MEMCG_QOS
++int sysctl_memcg_qos_stat = DISABLE_MEMCG_QOS;
++DEFINE_STATIC_KEY_FALSE(memcg_qos_stat_key);
++
+ static void memcg_qos_init(struct mem_cgroup *memcg)
+ {
+ 	struct mem_cgroup *parent = parent_mem_cgroup(memcg);
+ 
++	if (!static_branch_likely(&memcg_qos_stat_key))
++		return;
++
+ 	if (!parent)
+ 		return;
+ 
+@@ -3971,6 +3977,9 @@ static void memcg_qos_init(struct mem_cgroup *memcg)
+ static s64 memcg_qos_read(struct cgroup_subsys_state *css,
+ 				      struct cftype *cft)
+ {
++	if (!static_branch_likely(&memcg_qos_stat_key))
++		return 0;
++
+ 	return mem_cgroup_from_css(css)->memcg_priority;
+ }
+ 
+@@ -3979,6 +3988,9 @@ static int memcg_qos_write(struct cgroup_subsys_state *css,
+ {
+ 	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+ 
++	if (!static_branch_likely(&memcg_qos_stat_key))
++		return -EACCES;
++
+ 	if (val >= 0)
+ 		memcg->memcg_priority = 0;
+ 	else
+@@ -4022,6 +4034,8 @@ bool memcg_low_priority_scan_tasks(int (*fn)(struct task_struct *, void *),
+ 	int ret = 0;
+ 	bool retry = true;
+ 
++	if (!static_branch_likely(&memcg_qos_stat_key))
++		return false;
+ retry:
+ 	max = memcg_find_max_usage(last);
+ 	if (!max)
+@@ -4058,6 +4072,9 @@ void memcg_print_bad_task(void *arg, int ret)
+ {
+ 	struct oom_control *oc = arg;
+ 
++	if (!static_branch_likely(&memcg_qos_stat_key))
++		return;
++
+ 	if (!ret && oc->chosen) {
+ 		struct mem_cgroup *memcg;
+ 
+@@ -4067,6 +4084,41 @@ void memcg_print_bad_task(void *arg, int ret)
+ 				oc->chosen->pid, oc->chosen->comm);
+ 	}
+ }
++
++static void memcg_qos_reset(void)
++{
++	struct mem_cgroup *iter;
++	struct cgroup_subsys_state *css;
++
++	rcu_read_lock();
++	css_for_each_descendant_pre(css, &root_mem_cgroup->css) {
++		iter = mem_cgroup_from_css(css);
++		iter->memcg_priority = 0;
++	}
++	rcu_read_unlock();
++}
++
++int sysctl_memcg_qos_handler(struct ctl_table *table, int write,
++		void __user *buffer, size_t *length, loff_t *ppos)
++{
++	int ret;
++
++	ret = proc_dointvec_minmax(table, write, buffer, length, ppos);
++	if (ret)
++		return ret;
++	if (write) {
++		if (sysctl_memcg_qos_stat == ENABLE_MEMCG_QOS) {
++			static_branch_enable(&memcg_qos_stat_key);
++			pr_info("enable memcg priority.\n");
++		} else {
++			static_branch_disable(&memcg_qos_stat_key);
++			memcg_qos_reset();
++			pr_info("disable memcg priority.\n");
++		}
++	}
++
++	return ret;
++}
+ #endif
+ 
+ #ifdef CONFIG_NUMA
+diff --git a/mm/oom_kill.c b/mm/oom_kill.c
+index 275c2bdb20d2..41668bd37f52 100644
+--- a/mm/oom_kill.c
++++ b/mm/oom_kill.c
+@@ -316,6 +316,8 @@ static bool oom_next_task(struct task_struct *task, struct oom_control *oc,
+ 	struct mem_cgroup *cur_memcg;
+ 	struct mem_cgroup *oc_memcg;
+ 
++	if (!static_branch_likely(&memcg_qos_stat_key))
++		return !points || points < oc->chosen_points;
+ 
+ 	if (!points)
+ 		return true;
+@@ -341,10 +343,7 @@ static bool oom_next_task(struct task_struct *task, struct oom_control *oc,
+ static inline bool oom_next_task(struct task_struct *task,
+ 				struct oom_control *oc, unsigned long points)
+ {
+-	if (!points || points < oc->chosen_points)
+-		return true;
+-
+-	return false;
++	return !points || points < oc->chosen_points;
+ }
+ #endif
+ 
+-- 
+2.26.2
+

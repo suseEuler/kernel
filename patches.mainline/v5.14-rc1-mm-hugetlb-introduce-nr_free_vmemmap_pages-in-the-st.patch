@@ -1,0 +1,168 @@
+From 774905878fc9b0b9a5ee4a889b97f773a077aeee Mon Sep 17 00:00:00 2001
+From: Muchun Song <songmuchun@bytedance.com>
+Date: Wed, 30 Jun 2021 18:47:33 -0700
+Subject: [PATCH] mm: hugetlb: introduce nr_free_vmemmap_pages in the struct
+Git-commit: 774905878fc9b0b9a5ee4a889b97f773a077aeee
+Patch-mainline: v5.14-rc1
+References: bsn#12
+
+ hstate
+
+All the infrastructure is ready, so we introduce nr_free_vmemmap_pages
+field in the hstate to indicate how many vmemmap pages associated with a
+HugeTLB page that can be freed to buddy allocator.  And initialize it in
+the hugetlb_vmemmap_init().  This patch is actual enablement of the
+feature.
+
+There are only (RESERVE_VMEMMAP_SIZE / sizeof(struct page)) struct page
+structs that can be used when CONFIG_HUGETLB_PAGE_FREE_VMEMMAP, so add a
+BUILD_BUG_ON to catch invalid usage of the tail struct page.
+
+Link: https://lkml.kernel.org/r/20210510030027.56044-10-songmuchun@bytedance.com
+Signed-off-by: Muchun Song <songmuchun@bytedance.com>
+Acked-by: Mike Kravetz <mike.kravetz@oracle.com>
+Reviewed-by: Oscar Salvador <osalvador@suse.de>
+Reviewed-by: Miaohe Lin <linmiaohe@huawei.com>
+Tested-by: Chen Huang <chenhuang5@huawei.com>
+Tested-by: Bodeddula Balasubramaniam <bodeddub@amazon.com>
+Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: Balbir Singh <bsingharora@gmail.com>
+Cc: Barry Song <song.bao.hua@hisilicon.com>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: HORIGUCHI NAOYA <naoya.horiguchi@nec.com>
+Cc: "H. Peter Anvin" <hpa@zytor.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Joao Martins <joao.m.martins@oracle.com>
+Cc: Joerg Roedel <jroedel@suse.de>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mina Almasry <almasrymina@google.com>
+Cc: Oliver Neukum <oneukum@suse.com>
+Cc: Paul E. McKenney <paulmck@kernel.org>
+Cc: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Randy Dunlap <rdunlap@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Xiongchun Duan <duanxiongchun@bytedance.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ include/linux/hugetlb.h |  3 +++
+ mm/hugetlb.c            |  1 +
+ mm/hugetlb_vmemmap.c    | 33 +++++++++++++++++++++++++++++++++
+ mm/hugetlb_vmemmap.h    | 10 ++++++----
+ 4 files changed, 43 insertions(+), 4 deletions(-)
+
+diff --git a/include/linux/hugetlb.h b/include/linux/hugetlb.h
+index 9ad99848f9f0..8c1920844236 100644
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -608,6 +608,9 @@ struct hstate {
+ 	unsigned int nr_huge_pages_node[MAX_NUMNODES];
+ 	unsigned int free_huge_pages_node[MAX_NUMNODES];
+ 	unsigned int surplus_huge_pages_node[MAX_NUMNODES];
++#ifdef CONFIG_HUGETLB_PAGE_FREE_VMEMMAP
++	unsigned int nr_free_vmemmap_pages;
++#endif
+ #ifdef CONFIG_CGROUP_HUGETLB
+ 	/* cgroup control files */
+ 	struct cftype cgroup_files_dfl[7];
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 778db5de6232..dd9c90c082fc 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -3585,6 +3585,7 @@ void __init hugetlb_add_hstate(unsigned int order)
+ 	h->next_nid_to_free = first_memory_node;
+ 	snprintf(h->name, HSTATE_NAME_LEN, "hugepages-%lukB",
+ 					huge_page_size(h)/1024);
++	hugetlb_vmemmap_init(h);
+ 
+ 	parsed_hstate = h;
+ }
+diff --git a/mm/hugetlb_vmemmap.c b/mm/hugetlb_vmemmap.c
+index 3070e1465b1b..f9f9bb212319 100644
+--- a/mm/hugetlb_vmemmap.c
++++ b/mm/hugetlb_vmemmap.c
+@@ -262,3 +262,36 @@ void free_huge_page_vmemmap(struct hstate *h, struct page *head)
+ 
+ 	SetHPageVmemmapOptimized(head);
+ }
++
++void __init hugetlb_vmemmap_init(struct hstate *h)
++{
++	unsigned int nr_pages = pages_per_huge_page(h);
++	unsigned int vmemmap_pages;
++
++	/*
++	 * There are only (RESERVE_VMEMMAP_SIZE / sizeof(struct page)) struct
++	 * page structs that can be used when CONFIG_HUGETLB_PAGE_FREE_VMEMMAP,
++	 * so add a BUILD_BUG_ON to catch invalid usage of the tail struct page.
++	 */
++	BUILD_BUG_ON(__NR_USED_SUBPAGE >=
++		     RESERVE_VMEMMAP_SIZE / sizeof(struct page));
++
++	if (!hugetlb_free_vmemmap_enabled)
++		return;
++
++	vmemmap_pages = (nr_pages * sizeof(struct page)) >> PAGE_SHIFT;
++	/*
++	 * The head page and the first tail page are not to be freed to buddy
++	 * allocator, the other pages will map to the first tail page, so they
++	 * can be freed.
++	 *
++	 * Could RESERVE_VMEMMAP_NR be greater than @vmemmap_pages? It is true
++	 * on some architectures (e.g. aarch64). See Documentation/arm64/
++	 * hugetlbpage.rst for more details.
++	 */
++	if (likely(vmemmap_pages > RESERVE_VMEMMAP_NR))
++		h->nr_free_vmemmap_pages = vmemmap_pages - RESERVE_VMEMMAP_NR;
++
++	pr_info("can free %d vmemmap pages for %s\n", h->nr_free_vmemmap_pages,
++		h->name);
++}
+diff --git a/mm/hugetlb_vmemmap.h b/mm/hugetlb_vmemmap.h
+index a37771b0b82a..cb2bef8f9e73 100644
+--- a/mm/hugetlb_vmemmap.h
++++ b/mm/hugetlb_vmemmap.h
+@@ -13,17 +13,15 @@
+ #ifdef CONFIG_HUGETLB_PAGE_FREE_VMEMMAP
+ int alloc_huge_page_vmemmap(struct hstate *h, struct page *head);
+ void free_huge_page_vmemmap(struct hstate *h, struct page *head);
++void hugetlb_vmemmap_init(struct hstate *h);
+ 
+ /*
+  * How many vmemmap pages associated with a HugeTLB page that can be freed
+  * to the buddy allocator.
+- *
+- * Todo: Returns zero for now, which means the feature is disabled. We will
+- * enable it once all the infrastructure is there.
+  */
+ static inline unsigned int free_vmemmap_pages_per_hpage(struct hstate *h)
+ {
+-	return 0;
++	return h->nr_free_vmemmap_pages;
+ }
+ #else
+ static inline int alloc_huge_page_vmemmap(struct hstate *h, struct page *head)
+@@ -35,6 +33,10 @@ static inline void free_huge_page_vmemmap(struct hstate *h, struct page *head)
+ {
+ }
+ 
++static inline void hugetlb_vmemmap_init(struct hstate *h)
++{
++}
++
+ static inline unsigned int free_vmemmap_pages_per_hpage(struct hstate *h)
+ {
+ 	return 0;
+-- 
+2.31.1
+

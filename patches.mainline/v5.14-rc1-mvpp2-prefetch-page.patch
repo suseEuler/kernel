@@ -1,0 +1,78 @@
+From 2f128eb3308a74ef478286b75e26aa6d0ed3c6a6 Mon Sep 17 00:00:00 2001
+From: Matteo Croce <mcroce@microsoft.com>
+Date: Wed, 9 Jun 2021 15:47:14 +0200
+Subject: [PATCH] mvpp2: prefetch page
+Git-commit: 2f128eb3308a74ef478286b75e26aa6d0ed3c6a6
+Patch-mainline: v5.14-rc1
+References: bsn#12
+
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Most of the time during the RX is caused by the compound_head() call
+done at the end of the RX loop:
+
+       │     build_skb():
+       [...]
+       │     static inline struct page *compound_head(struct page *page)
+       │     {
+       │     unsigned long head = READ_ONCE(page->compound_head);
+ 65.23 │       ldr  x2, [x1, #8]
+
+Prefetch the page struct as soon as possible, to speedup the RX path
+noticeabily by a ~3-4% packet rate in a drop test.
+
+       │     build_skb():
+       [...]
+       │     static inline struct page *compound_head(struct page *page)
+       │     {
+       │     unsigned long head = READ_ONCE(page->compound_head);
+ 17.92 │       ldr  x2, [x1, #8]
+
+Signed-off-by: Matteo Croce <mcroce@microsoft.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+index 07d8f3e31b52..9bca8c8f9f8d 100644
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+@@ -3900,15 +3900,19 @@ static int mvpp2_rx(struct mvpp2_port *port, struct napi_struct *napi,
+ 		phys_addr_t phys_addr;
+ 		u32 rx_status, timestamp;
+ 		int pool, rx_bytes, err, ret;
++		struct page *page;
+ 		void *data;
+ 
++		phys_addr = mvpp2_rxdesc_cookie_get(port, rx_desc);
++		data = (void *)phys_to_virt(phys_addr);
++		page = virt_to_page(data);
++		prefetch(page);
++
+ 		rx_done++;
+ 		rx_status = mvpp2_rxdesc_status_get(port, rx_desc);
+ 		rx_bytes = mvpp2_rxdesc_size_get(port, rx_desc);
+ 		rx_bytes -= MVPP2_MH_SIZE;
+ 		dma_addr = mvpp2_rxdesc_dma_addr_get(port, rx_desc);
+-		phys_addr = mvpp2_rxdesc_cookie_get(port, rx_desc);
+-		data = (void *)phys_to_virt(phys_addr);
+ 
+ 		pool = (rx_status & MVPP2_RXD_BM_POOL_ID_MASK) >>
+ 			MVPP2_RXD_BM_POOL_ID_OFFS;
+@@ -3997,7 +4001,7 @@ static int mvpp2_rx(struct mvpp2_port *port, struct napi_struct *napi,
+ 		}
+ 
+ 		if (pp)
+-			skb_mark_for_recycle(skb, virt_to_page(data), pp);
++			skb_mark_for_recycle(skb, page, pp);
+ 		else
+ 			dma_unmap_single_attrs(dev->dev.parent, dma_addr,
+ 					       bm_pool->buf_size, DMA_FROM_DEVICE,
+-- 
+2.31.1
+

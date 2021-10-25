@@ -1,0 +1,149 @@
+From 7834e94cd8b7d3832c3f07fd1bbd3ff4688ec475 Mon Sep 17 00:00:00 2001
+From: Cheng Jian <cj.chengjian@huawei.com>
+Date: Sat, 29 May 2021 14:42:44 +0800
+Subject: [PATCH] livepatch/arm64: Fix func size less than limit
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 7834e94cd8b7d3832c3f07fd1bbd3ff4688ec475
+
+
+euler inclusion
+category: feature
+bugzilla: 51921
+CVE: N/A
+
+----------------------------------------
+
+We need to modify the first 4 instructions of a livepatch function to
+complete the long jump if offset out of short-range. So it's important
+that this function must have more than 4 instructions, so we checked it
+when the livepatch module insmod.
+
+In fact, this corner case is highly unlikely to occur on arm64, but it's
+still an effective and meaningful check to avoid crash by doing this.
+
+Signed-off-by: Cheng Jian <cj.chengjian@huawei.com>
+Reviewed-by: Li Bin <huawei.libin@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Signed-off-by: Dong Kai <dongkai11@huawei.com>
+
+Signed-off-by: Ye Weihua <yeweihua4@huawei.com>
+Reviewed-by: Yang Jihong <yangjihong1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/kernel/livepatch.c | 26 ++++++++++++++++++++++++++
+ kernel/livepatch/core.c       | 34 ++++++++++++++++++++++++++++++----
+ 2 files changed, 56 insertions(+), 4 deletions(-)
+
+diff --git a/arch/arm64/kernel/livepatch.c b/arch/arm64/kernel/livepatch.c
+index f593fadbea69..e112a6908b8a 100644
+--- a/arch/arm64/kernel/livepatch.c
++++ b/arch/arm64/kernel/livepatch.c
+@@ -32,6 +32,7 @@
+ #include <asm/ptrace.h>
+ #include <linux/ftrace.h>
+ #include <linux/sched/debug.h>
++#include <linux/kallsyms.h>
+ 
+ #ifdef CONFIG_ARM64_MODULE_PLTS
+ static inline bool offset_in_range(unsigned long pc, unsigned long addr,
+@@ -295,3 +296,28 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ #endif
+ 	}
+ }
++
++#ifdef CONFIG_ARM64_MODULE_PLTS
++/* return 0 if the func can be patched */
++int arch_klp_func_can_patch(struct klp_func *func)
++{
++	unsigned long pc = (unsigned long)func->old_func;
++	unsigned long new_addr = (unsigned long)func->new_func;
++	unsigned long old_size = func->old_size;
++
++	if ((long)old_size <= 0)
++		return -EINVAL;
++
++	if (!offset_in_range(pc, new_addr, SZ_128M) &&
++	  (old_size < LJMP_INSN_SIZE * sizeof(u32))) {
++		pr_err("func %s size less than limit\n", func->old_name);
++		return -EPERM;
++	}
++	return 0;
++}
++#else
++int arch_klp_func_can_patch(struct klp_func *func)
++{
++	return 0;
++}
++#endif
+diff --git a/kernel/livepatch/core.c b/kernel/livepatch/core.c
+index 699def19b4c8..0a7fbd1468a8 100644
+--- a/kernel/livepatch/core.c
++++ b/kernel/livepatch/core.c
+@@ -878,8 +878,19 @@ void klp_free_replaced_patches_async(struct klp_patch *new_patch)
+ 	}
+ }
+ 
++#ifdef CONFIG_LIVEPATCH_WO_FTRACE
++int __weak arch_klp_func_can_patch(struct klp_func *func)
++{
++	return 0;
++}
++#endif
++
+ static int klp_init_func(struct klp_object *obj, struct klp_func *func)
+ {
++#ifdef CONFIG_LIVEPATCH_WO_FTRACE
++	int ret;
++#endif
++
+ 	if (!func->old_name)
+ 		return -EINVAL;
+ 
+@@ -895,6 +906,12 @@ static int klp_init_func(struct klp_object *obj, struct klp_func *func)
+ 
+ 	INIT_LIST_HEAD(&func->stack_node);
+ 	func->patched = false;
++
++#ifdef CONFIG_LIVEPATCH_WO_FTRACE
++	ret = arch_klp_func_can_patch(func);
++	if (ret)
++		return ret;
++#endif
+ #ifdef CONFIG_LIVEPATCH_PER_TASK_CONSISTENCY
+ 	func->transition = false;
+ #endif
+@@ -1002,14 +1019,23 @@ static int klp_init_object(struct klp_patch *patch, struct klp_object *obj)
+ 	if (ret)
+ 		goto out;
+ 
+-	klp_for_each_func(obj, func) {
+-		ret = klp_init_func(obj, func);
++	/*
++	 * For livepatch without ftrace, we need to modify the first N
++	 * instructions of the to-be-patched func. So should check if the
++	 * func length enough to allow this modification.
++	 *
++	 * We add check hook in klp_init_func and will using the old_size
++	 * internally, so the klp_init_object_loaded should called first
++	 * to fill the klp_func struct.
++	 */
++	if (klp_is_object_loaded(obj)) {
++		ret = klp_init_object_loaded(patch, obj);
+ 		if (ret)
+ 			goto out;
+ 	}
+ 
+-	if (klp_is_object_loaded(obj)) {
+-		ret = klp_init_object_loaded(patch, obj);
++	klp_for_each_func(obj, func) {
++		ret = klp_init_func(obj, func);
+ 		if (ret)
+ 			goto out;
+ 	}
+-- 
+2.26.2
+

@@ -1,0 +1,175 @@
+From a0b95bdf6a0b2d5a96a28b1f728a6abad51dbaec Mon Sep 17 00:00:00 2001
+From: Zengruan Ye <yezengruan@huawei.com>
+Date: Tue, 2 Feb 2021 17:44:48 +0800
+Subject: [PATCH] KVM: arm64: Implement PV_SCHED_FEATURES call
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: a0b95bdf6a0b2d5a96a28b1f728a6abad51dbaec
+
+
+virt inclusion
+category: feature
+bugzilla: 47624
+CVE: NA
+
+--------------------------------
+
+This provides a mechanism for querying which paravirtualized sched
+features are available in this hypervisor.
+
+Add some SMCCC compatible hypercalls for PV sched features:
+  PV_SCHED_FEATURES:       0xC5000090
+  PV_SCHED_IPA_INIT:       0xC5000091
+  PV_SCHED_IPA_RELEASE:    0xC5000092
+
+Also add the header file which defines the ABI for the paravirtualized
+sched features we're about to add.
+
+Signed-off-by: Zengruan Ye <yezengruan@huawei.com>
+Reviewed-by: Zhanghailiang <zhang.zhanghailiang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/kvm_host.h    |  2 ++
+ arch/arm64/include/asm/pvsched-abi.h | 16 ++++++++++++++++
+ arch/arm64/kvm/Makefile              |  2 +-
+ arch/arm64/kvm/hypercalls.c          |  6 ++++++
+ arch/arm64/kvm/pvsched.c             | 23 +++++++++++++++++++++++
+ include/linux/arm-smccc.h            | 19 +++++++++++++++++++
+ 6 files changed, 67 insertions(+), 1 deletion(-)
+ create mode 100644 arch/arm64/include/asm/pvsched-abi.h
+ create mode 100644 arch/arm64/kvm/pvsched.c
+
+diff --git a/arch/arm64/include/asm/kvm_host.h b/arch/arm64/include/asm/kvm_host.h
+index e771fae29ef0..872fb601d92a 100644
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@ -589,6 +589,8 @@ static inline bool kvm_arm_is_pvtime_enabled(struct kvm_vcpu_arch *vcpu_arch)
+ 	return (vcpu_arch->steal.base != GPA_INVALID);
+ }
+ 
++long kvm_hypercall_pvsched_features(struct kvm_vcpu *vcpu);
++
+ void kvm_set_sei_esr(struct kvm_vcpu *vcpu, u64 syndrome);
+ 
+ struct kvm_vcpu *kvm_mpidr_to_vcpu(struct kvm *kvm, unsigned long mpidr);
+diff --git a/arch/arm64/include/asm/pvsched-abi.h b/arch/arm64/include/asm/pvsched-abi.h
+new file mode 100644
+index 000000000000..80e50e7a1a31
+--- /dev/null
++++ b/arch/arm64/include/asm/pvsched-abi.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright(c) 2019 Huawei Technologies Co., Ltd
++ * Author: Zengruan Ye <yezengruan@huawei.com>
++ */
++
++#ifndef __ASM_PVSCHED_ABI_H
++#define __ASM_PVSCHED_ABI_H
++
++struct pvsched_vcpu_state {
++	__le32 preempted;
++	/* Structure must be 64 byte aligned, pad to that size */
++	u8 padding[60];
++} __packed;
++
++#endif
+diff --git a/arch/arm64/kvm/Makefile b/arch/arm64/kvm/Makefile
+index 1504c81fbf5d..02f25d63a6f9 100644
+--- a/arch/arm64/kvm/Makefile
++++ b/arch/arm64/kvm/Makefile
+@@ -12,7 +12,7 @@ obj-$(CONFIG_KVM) += hyp/
+ 
+ kvm-y := $(KVM)/kvm_main.o $(KVM)/coalesced_mmio.o $(KVM)/eventfd.o \
+ 	 $(KVM)/vfio.o $(KVM)/irqchip.o \
+-	 arm.o mmu.o mmio.o psci.o perf.o hypercalls.o pvtime.o \
++	 arm.o mmu.o mmio.o psci.o perf.o hypercalls.o pvtime.o pvsched.o \
+ 	 inject_fault.o regmap.o va_layout.o handle_exit.o \
+ 	 guest.o debug.o reset.o sys_regs.o \
+ 	 vgic-sys-reg-v3.o fpsimd.o pmu.o \
+diff --git a/arch/arm64/kvm/hypercalls.c b/arch/arm64/kvm/hypercalls.c
+index 25ea4ecb6449..24624adf6bf8 100644
+--- a/arch/arm64/kvm/hypercalls.c
++++ b/arch/arm64/kvm/hypercalls.c
+@@ -61,6 +61,9 @@ int kvm_hvc_call_handler(struct kvm_vcpu *vcpu)
+ 		case ARM_SMCCC_HV_PV_TIME_FEATURES:
+ 			val = SMCCC_RET_SUCCESS;
+ 			break;
++		case ARM_SMCCC_HV_PV_SCHED_FEATURES:
++			val = SMCCC_RET_SUCCESS;
++			break;
+ 		}
+ 		break;
+ 	case ARM_SMCCC_HV_PV_TIME_FEATURES:
+@@ -71,6 +74,9 @@ int kvm_hvc_call_handler(struct kvm_vcpu *vcpu)
+ 		if (gpa != GPA_INVALID)
+ 			val = gpa;
+ 		break;
++	case ARM_SMCCC_HV_PV_SCHED_FEATURES:
++		val = kvm_hypercall_pvsched_features(vcpu);
++		break;
+ 	default:
+ 		return kvm_psci_call(vcpu);
+ 	}
+diff --git a/arch/arm64/kvm/pvsched.c b/arch/arm64/kvm/pvsched.c
+new file mode 100644
+index 000000000000..3d96122fcf9e
+--- /dev/null
++++ b/arch/arm64/kvm/pvsched.c
+@@ -0,0 +1,23 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright(c) 2019 Huawei Technologies Co., Ltd
++ * Author: Zengruan Ye <yezengruan@huawei.com>
++ */
++
++#include <linux/arm-smccc.h>
++
++#include <kvm/arm_hypercalls.h>
++
++long kvm_hypercall_pvsched_features(struct kvm_vcpu *vcpu)
++{
++	u32 feature = smccc_get_arg1(vcpu);
++	long val = SMCCC_RET_NOT_SUPPORTED;
++
++	switch (feature) {
++	case ARM_SMCCC_HV_PV_SCHED_FEATURES:
++		val = SMCCC_RET_SUCCESS;
++		break;
++	}
++
++	return val;
++}
+diff --git a/include/linux/arm-smccc.h b/include/linux/arm-smccc.h
+index f860645f6512..16c776d8ee8d 100644
+--- a/include/linux/arm-smccc.h
++++ b/include/linux/arm-smccc.h
+@@ -391,5 +391,24 @@ asmlinkage void __arm_smccc_hvc(unsigned long a0, unsigned long a1,
+ 		method;							\
+ 	})
+ 
++/* Paravirtualised sched calls */
++#define ARM_SMCCC_HV_PV_SCHED_FEATURES					\
++	ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL,				\
++			   ARM_SMCCC_SMC_64,				\
++			   ARM_SMCCC_OWNER_STANDARD_HYP,		\
++			   0x90)
++
++#define ARM_SMCCC_HV_PV_SCHED_IPA_INIT					\
++	ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL,				\
++			   ARM_SMCCC_SMC_64,				\
++			   ARM_SMCCC_OWNER_STANDARD_HYP,		\
++			   0x91)
++
++#define ARM_SMCCC_HV_PV_SCHED_IPA_RELEASE				\
++	ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL,				\
++			   ARM_SMCCC_SMC_64,				\
++			   ARM_SMCCC_OWNER_STANDARD_HYP,		\
++			   0x92)
++
+ #endif /*__ASSEMBLY__*/
+ #endif /*__LINUX_ARM_SMCCC_H*/
+-- 
+2.26.2
+

@@ -1,0 +1,133 @@
+From ca122fe40eb463c8c11c3bfc1914f0048ca5c268 Mon Sep 17 00:00:00 2001
+From: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+Date: Thu, 25 Feb 2021 17:16:00 -0800
+Subject: [PATCH] mm: add an 'end' parameter to find_get_entries
+Git-commit: ca122fe40eb463c8c11c3bfc1914f0048ca5c268
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+This simplifies the callers and leads to a more efficient implementation
+since the XArray has this functionality already.
+
+Link: https://lkml.kernel.org/r/20201112212641.27837-11-willy@infradead.org
+Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Reviewed-by: William Kucharski <william.kucharski@oracle.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Cc: Dave Chinner <dchinner@redhat.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Yang Shi <yang.shi@linux.alibaba.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Guoqing Jiang <Guoqing.Jiang@suse.com>
+---
+ include/linux/pagemap.h |  4 ++--
+ mm/filemap.c            |  9 +++++----
+ mm/shmem.c              | 10 ++--------
+ mm/swap.c               |  2 +-
+ 4 files changed, 10 insertions(+), 15 deletions(-)
+
+diff --git a/include/linux/pagemap.h b/include/linux/pagemap.h
+index 3608993428d9..fdb2c4e44851 100644
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@ -451,8 +451,8 @@ static inline struct page *find_subpage(struct page *head, pgoff_t index)
+ }
+ 
+ unsigned find_get_entries(struct address_space *mapping, pgoff_t start,
+-			  unsigned int nr_entries, struct page **entries,
+-			  pgoff_t *indices);
++		pgoff_t end, unsigned int nr_entries, struct page **entries,
++		pgoff_t *indices);
+ unsigned find_get_pages_range(struct address_space *mapping, pgoff_t *start,
+ 			pgoff_t end, unsigned int nr_pages,
+ 			struct page **pages);
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 61fdcdc75275..65cfdff17ac6 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -1865,6 +1865,7 @@ static inline struct page *find_get_entry(struct xa_state *xas, pgoff_t max,
+  * find_get_entries - gang pagecache lookup
+  * @mapping:	The address_space to search
+  * @start:	The starting page cache index
++ * @end:	The final page index (inclusive).
+  * @nr_entries:	The maximum number of entries
+  * @entries:	Where the resulting entries are placed
+  * @indices:	The cache indices corresponding to the entries in @entries
+@@ -1888,9 +1889,9 @@ static inline struct page *find_get_entry(struct xa_state *xas, pgoff_t max,
+  *
+  * Return: the number of pages and shadow entries which were found.
+  */
+-unsigned find_get_entries(struct address_space *mapping,
+-			  pgoff_t start, unsigned int nr_entries,
+-			  struct page **entries, pgoff_t *indices)
++unsigned find_get_entries(struct address_space *mapping, pgoff_t start,
++		pgoff_t end, unsigned int nr_entries, struct page **entries,
++		pgoff_t *indices)
+ {
+ 	XA_STATE(xas, &mapping->i_pages, start);
+ 	struct page *page;
+@@ -1900,7 +1901,7 @@ unsigned find_get_entries(struct address_space *mapping,
+ 		return 0;
+ 
+ 	rcu_read_lock();
+-	while ((page = find_get_entry(&xas, ULONG_MAX, XA_PRESENT))) {
++	while ((page = find_get_entry(&xas, end, XA_PRESENT))) {
+ 		/*
+ 		 * Terminate early on finding a THP, to allow the caller to
+ 		 * handle it all at once; but continue if this is hugetlbfs.
+diff --git a/mm/shmem.c b/mm/shmem.c
+index 86b1f5bc502c..4aac760aa2d4 100644
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -913,8 +913,6 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, loff_t lend,
+ 			struct page *page = pvec.pages[i];
+ 
+ 			index = indices[i];
+-			if (index >= end)
+-				break;
+ 
+ 			if (xa_is_value(page)) {
+ 				if (unfalloc)
+@@ -967,9 +965,8 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, loff_t lend,
+ 	while (index < end) {
+ 		cond_resched();
+ 
+-		pvec.nr = find_get_entries(mapping, index,
+-				min(end - index, (pgoff_t)PAGEVEC_SIZE),
+-				pvec.pages, indices);
++		pvec.nr = find_get_entries(mapping, index, end - 1,
++				PAGEVEC_SIZE, pvec.pages, indices);
+ 		if (!pvec.nr) {
+ 			/* If all gone or hole-punch or unfalloc, we're done */
+ 			if (index == start || end != -1)
+@@ -982,9 +979,6 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, loff_t lend,
+ 			struct page *page = pvec.pages[i];
+ 
+ 			index = indices[i];
+-			if (index >= end)
+-				break;
+-
+ 			if (xa_is_value(page)) {
+ 				if (unfalloc)
+ 					continue;
+diff --git a/mm/swap.c b/mm/swap.c
+index ab3258afcbeb..c5773a84feab 100644
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@ -1046,7 +1046,7 @@ unsigned pagevec_lookup_entries(struct pagevec *pvec,
+ 				pgoff_t start, unsigned nr_entries,
+ 				pgoff_t *indices)
+ {
+-	pvec->nr = find_get_entries(mapping, start, nr_entries,
++	pvec->nr = find_get_entries(mapping, start, ULONG_MAX, nr_entries,
+ 				    pvec->pages, indices);
+ 	return pagevec_count(pvec);
+ }
+-- 
+2.31.1
+

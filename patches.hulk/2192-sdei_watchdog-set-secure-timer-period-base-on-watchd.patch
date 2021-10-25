@@ -1,0 +1,128 @@
+From 13ddc12768ca98d36ec03bfa21a30b3ebc91673d Mon Sep 17 00:00:00 2001
+From: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Date: Sat, 20 Feb 2021 11:01:01 +0800
+Subject: [PATCH] sdei_watchdog: set secure timer period base on
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 13ddc12768ca98d36ec03bfa21a30b3ebc91673d
+
+ 'watchdog_thresh'
+
+hulk inclusion
+category: feature
+bugzilla: 48046
+CVE: NA
+
+-------------------------------------------------------------------------
+
+The period of the secure timer is set to 3s by BIOS. That means the
+secure timer interrupt will trigger every 3 seconds. To further decrease
+the NMI watchdog's effect on performance, this patch set the period of
+the secure timer base on 'watchdog_thresh'. This variable is initiallized
+to 10s. We can also set the period at runtime by modifying
+'/proc/sys/kernel/watchdog_thresh'
+
+Signed-off-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Hanjun Guo <guohanjun@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/kernel/watchdog_sdei.c | 15 +++++++++++++++
+ drivers/firmware/arm_sdei.c       |  6 ++++++
+ include/linux/arm_sdei.h          |  1 +
+ include/uapi/linux/arm_sdei.h     |  1 +
+ lib/Kconfig.debug                 |  1 -
+ 5 files changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/kernel/watchdog_sdei.c b/arch/arm64/kernel/watchdog_sdei.c
+index 99ab9bdfdee6..c342f86560d5 100644
+--- a/arch/arm64/kernel/watchdog_sdei.c
++++ b/arch/arm64/kernel/watchdog_sdei.c
+@@ -30,7 +30,11 @@ int watchdog_nmi_enable(unsigned int cpu)
+ 	if (!sdei_watchdog_registered)
+ 		return -EINVAL;
+ 
++#ifdef CONFIG_HARDLOCKUP_CHECK_TIMESTAMP
+ 	refresh_hld_last_timestamp();
++#endif
++
++	sdei_api_set_secure_timer_period(watchdog_thresh);
+ 
+ 	ret = sdei_api_event_enable(sdei_watchdog_event_num);
+ 	if (ret) {
+@@ -104,6 +108,17 @@ int __init watchdog_nmi_probe(void)
+ 		return sdei_watchdog_event_num;
+ 	}
+ 
++	/*
++	 * After we introduced 'sdei_api_set_secure_timer_period', we disselect
++	 * 'CONFIG_HARDLOCKUP_CHECK_TIMESTAMP'. So we need to make sure that
++	 * firmware can set the period of the secure timer and the timer
++	 * interrupt doesn't trigger too soon.
++	 */
++	if (sdei_api_set_secure_timer_period(watchdog_thresh)) {
++		pr_err("Firmware doesn't support setting the secure timer period, please update your BIOS !\n");
++		return -EINVAL;
++	}
++
+ 	on_each_cpu(sdei_nmi_watchdog_bind, NULL, true);
+ 
+ 	ret = sdei_event_register(sdei_watchdog_event_num,
+diff --git a/drivers/firmware/arm_sdei.c b/drivers/firmware/arm_sdei.c
+index 8f354769e4f8..49443541d7f1 100644
+--- a/drivers/firmware/arm_sdei.c
++++ b/drivers/firmware/arm_sdei.c
+@@ -203,6 +203,12 @@ int sdei_api_clear_eoi(int hwirq)
+ 			NULL);
+ }
+ 
++int sdei_api_set_secure_timer_period(int sec)
++{
++	return invoke_sdei_fn(SDEI_1_0_FN_SET_SECURE_TIMER_PERIOD, sec, 0, 0, 0,
++			0, NULL);
++}
++
+ static int sdei_api_event_get_info(u32 event, u32 info, u64 *result)
+ {
+ 	return invoke_sdei_fn(SDEI_1_0_FN_SDEI_EVENT_GET_INFO, event, info, 0,
+diff --git a/include/linux/arm_sdei.h b/include/linux/arm_sdei.h
+index 7ca9aad9d3a5..f3027342c964 100644
+--- a/include/linux/arm_sdei.h
++++ b/include/linux/arm_sdei.h
+@@ -40,6 +40,7 @@ int sdei_api_event_interrupt_bind(int hwirq);
+ int sdei_api_event_disable(u32 event_num);
+ int sdei_api_event_enable(u32 event_num);
+ int sdei_api_clear_eoi(int hwirq);
++int sdei_api_set_secure_timer_period(int sec);
+ 
+ /* GHES register/unregister helpers */
+ int sdei_register_ghes(struct ghes *ghes, sdei_event_callback *normal_cb,
+diff --git a/include/uapi/linux/arm_sdei.h b/include/uapi/linux/arm_sdei.h
+index 1187b1b49c87..a5375679dd50 100644
+--- a/include/uapi/linux/arm_sdei.h
++++ b/include/uapi/linux/arm_sdei.h
+@@ -25,6 +25,7 @@
+ #define SDEI_1_0_FN_SDEI_PRIVATE_RESET			SDEI_1_0_FN(0x11)
+ #define SDEI_1_0_FN_SDEI_SHARED_RESET			SDEI_1_0_FN(0x12)
+ #define SDEI_1_0_FN_SDEI_CLEAR_EOI			SDEI_1_0_FN(0x18)
++#define SDEI_1_0_FN_SET_SECURE_TIMER_PERIOD		SDEI_1_0_FN(0x19)
+ 
+ #define SDEI_VERSION_MAJOR_SHIFT			48
+ #define SDEI_VERSION_MAJOR_MASK				0x7fff
+diff --git a/lib/Kconfig.debug b/lib/Kconfig.debug
+index fdadaeccf79c..4afca654db57 100644
+--- a/lib/Kconfig.debug
++++ b/lib/Kconfig.debug
+@@ -968,7 +968,6 @@ config SDEI_WATCHDOG
+ 	bool "SDEI NMI Watchdog support"
+ 	depends on ARM_SDE_INTERFACE
+ 	select HAVE_HARDLOCKUP_DETECTOR_ARCH
+-	select HARDLOCKUP_CHECK_TIMESTAMP
+ 	select HARDLOCKUP_DETECTOR
+ 
+ #
+-- 
+2.26.2
+
