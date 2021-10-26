@@ -333,6 +333,13 @@ class HeaderChecker(patch.PatchChecker):
                 if tag.name not in tag_map:
                     continue;
 
+                # Only the first 'References' line is
+                # meaningful for us, since it could
+                # appear in commit header more than
+                # one time
+                if tag.name == 'References' and tag.name in {_.name for _ in self.tags}:
+                    continue
+
                 if re.match("\s*$", tag.value):
                     self.errors.append(EmptyTagError(tag.name))
                     continue
