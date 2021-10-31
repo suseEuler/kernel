@@ -103,6 +103,7 @@ sub new {
 	$self->{ua} = LWP::UserAgent->new;
 	my $realm = "Use your developer account";
 	$realm = "Use your SUSE developer account" if $api_url =~ /opensuse/;
+	$realm = "API login" if $api_url =~ /suseeuler/;
 	$self->{ua}->credentials($self->{url}->host_port, $realm,
 		$cred{user}, $cred{pass});
 	if ($self->{ua}->can('ssl_opts')) {
