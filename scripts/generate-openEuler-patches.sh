@@ -63,6 +63,19 @@ if [ -n "$2" ]; then
 	OVER=$2
 fi
 
+# If the file which includes the last handled commit exists, then
+# generate patches for that commit.
+FILE_WITH_LAST_COMMIT=$PWD/fwlc-$OVER
+LAST_COMMIT=$(git log --no-merges --pretty="format:%H" -n1 $OVER)
+if [ -e $FILE_WITH_LAST_COMMIT ]; then
+	UVER=$(cat $FILE_WITH_LAST_COMMIT)
+	# in case openEuler kernel is not updated since last run
+	if [[ $LAST_COMMIT == $UVER* ]]; then
+		echo "No changes since last run"
+		exit 1
+	fi
+fi
+
 PATCHDIR=patches.others
 # The series file which record all the patches in order
 rm -rf series.$OVER
@@ -81,6 +94,9 @@ if [ $? != 0 ]; then
 	echo "Error: either upstream version ($UVER) or openEuler version ($OVER) is not correct!"
 	exit 1;
 fi
+
+# Update the last commit
+echo $LAST_COMMIT > FILE_WITH_LAST_COMMIT_FILE
 
 # $1 - COMMIT. $2 - f (file name + folder name)
 mainline_commit_handle() {
