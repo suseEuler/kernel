@@ -21,7 +21,9 @@
  *  Copyright (C) 2007 Red Hat, Inc., Peter Zijlstra
  */
 #include "sched.h"
+#ifdef CONFIG_SCHED_STEAL
 #include "sparsemask.h"
+#endif
 
 /*
  * Targeted preemption latency for CPU-bound tasks:
@@ -4109,6 +4111,8 @@ static inline void rq_idle_stamp_clear(struct rq *rq)
 	rq->idle_stamp = 0;
 }
 
+#ifdef CONFIG_SCHED_STEAL
+
 static inline bool steal_enabled(void)
 {
 #ifdef CONFIG_NUMA
@@ -4133,7 +4137,7 @@ static void overload_clear(struct rq *rq)
 	if (overload_cpus)
 		sparsemask_clear_elem(overload_cpus, rq->cpu);
 	rcu_read_unlock();
-	schedstat_end_time(rq->find_time, time);
+	schedstat_end_time(rq, time);
 }
 
 static void overload_set(struct rq *rq)
@@ -4150,10 +4154,15 @@ static void overload_set(struct rq *rq)
 	if (overload_cpus)
 		sparsemask_set_elem(overload_cpus, rq->cpu);
 	rcu_read_unlock();
-	schedstat_end_time(rq->find_time, time);
+	schedstat_end_time(rq, time);
 }
 
 static int try_steal(struct rq *this_rq, struct rq_flags *rf);
+#else
+static inline int try_steal(struct rq *this_rq, struct rq_flags *rf) { return 0; }
+static inline void overload_clear(struct rq *rq) {}
+static inline void overload_set(struct rq *rq) {}
+#endif
 
 #else /* CONFIG_SMP */
 
@@ -6329,6 +6338,7 @@ static inline bool asym_fits_capacity(int task_util, int cpu)
 	return true;
 }
 
+#ifdef CONFIG_SCHED_STEAL
 #define SET_STAT(STAT)							\
 	do {								\
 		if (schedstat_enabled()) {				\
@@ -6338,6 +6348,9 @@ static inline bool asym_fits_capacity(int task_util, int cpu)
 				__schedstat_inc(rq->STAT);		\
 		}							\
 	} while (0)
+#else
+#define SET_STAT(STAT)
+#endif
 
 /*
  * Try and locate an idle core/thread in the LLC cache domain.
@@ -6834,12 +6847,14 @@ fail:
 static int
 select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_flags)
 {
-	unsigned long time = schedstat_start_time();
+	unsigned long time;
 	struct sched_domain *tmp, *sd = NULL;
 	int cpu = smp_processor_id();
 	int new_cpu = prev_cpu;
 	int want_affine = 0;
 	int sync = (wake_flags & WF_SYNC) && !(current->flags & PF_EXITING);
+
+	time = schedstat_start_time();
 
 	if (sd_flag & SD_BALANCE_WAKE) {
 		record_wakee(p);
@@ -6887,7 +6902,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_f
 			current->recent_used_cpu = cpu;
 	}
 	rcu_read_unlock();
-	schedstat_end_time(cpu_rq(cpu)->find_time, time);
+	schedstat_end_time(cpu_rq(cpu), time);
 
 	return new_cpu;
 }
@@ -7418,11 +7433,10 @@ idle:
 	new_tasks = newidle_balance(rq, rf);
 	if (new_tasks == 0)
 		new_tasks = try_steal(rq, rf);
+	schedstat_end_time(rq, time);
 
 	if (new_tasks)
 		rq_idle_stamp_clear(rq);
-
-	schedstat_end_time(rq->find_time, time);
 
 
 	/*
@@ -7906,6 +7920,7 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 	return 0;
 }
 
+#ifdef CONFIG_SCHED_STEAL
 /*
  * Return true if task @p can migrate from @rq to @dst_rq in the same LLC.
  * No need to test for co-locality, and no need to test task_hot(), as sharing
@@ -7933,6 +7948,7 @@ can_migrate_task_llc(struct task_struct *p, struct rq *rq, struct rq *dst_rq)
 
 	return true;
 }
+#endif
 
 /*
  * detach_task() -- detach the task for the migration from @src_rq to @dst_cpu.
@@ -11015,6 +11031,7 @@ void trigger_load_balance(struct rq *rq)
 	nohz_balancer_kick(rq);
 }
 
+#ifdef CONFIG_SCHED_STEAL
 /*
  * Search the runnable tasks in @cfs_rq in order of next to run, and find
  * the first one that can be migrated to @dst_rq.  @cfs_rq is locked on entry.
@@ -11163,6 +11180,7 @@ out:
 		schedstat_inc(dst_rq->steal_fail);
 	return stolen;
 }
+#endif
 
 static void rq_online_fair(struct rq *rq)
 {
