@@ -1635,6 +1635,30 @@ static void init_numa_topology_type(void)
 
 #define NR_DISTANCE_VALUES (1 << DISTANCE_BITS)
 
+DEFINE_STATIC_KEY_TRUE(sched_steal_allow);
+static int sched_steal_node_limit;
+#define SCHED_STEAL_NODE_LIMIT_DEFAULT 2
+
+static int __init steal_node_limit_setup(char *buf)
+{
+	get_option(&buf, &sched_steal_node_limit);
+	return 0;
+}
+
+early_param("sched_steal_node_limit", steal_node_limit_setup);
+
+static void check_node_limit(void)
+{
+	int n = num_possible_nodes();
+
+	if (sched_steal_node_limit == 0)
+		sched_steal_node_limit = SCHED_STEAL_NODE_LIMIT_DEFAULT;
+	if (n > sched_steal_node_limit) {
+		static_branch_disable(&sched_steal_allow);
+		pr_debug("Suppressing sched STEAL. To enable, reboot with sched_steal_node_limit=%d", n);
+	}
+}
+
 void sched_init_numa(void)
 {
 	struct sched_domain_topology_level *tl;
@@ -1777,6 +1801,7 @@ void sched_init_numa(void)
 	sched_max_numa_distance = sched_domains_numa_distance[nr_levels - 1];
 
 	init_numa_topology_type();
+	check_node_limit();
 }
 
 void sched_domains_numa_masks_set(unsigned int cpu)
