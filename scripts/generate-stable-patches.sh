@@ -35,8 +35,11 @@ for v in $(eval echo {$KSTART..$KEND}); do
 		mv "$f" $(echo $f | sed -e "s|^0|v$VTHIS-0|")
 	done
 
+	# Some patches have "References:" line in their commit messages, which may
+	# interfere with the "References:" header and make some scripts not happy.
+	# So we check for such lines below 10th line and change it a little bit.
 	sed -i -E -e '1s|^From ([0-9a-z]{40}) (.*)|Git-commit: \1|' \
-			-e 's|^References:|  References:|' *.patch
+			-e '10,$s|^References:|  References:|' *.patch
 
 	mv *.patch ..
 	cd -
