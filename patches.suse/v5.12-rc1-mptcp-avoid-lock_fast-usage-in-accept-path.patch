@@ -1,0 +1,110 @@
+Git-commit: 4d54cc32112d8d8b0667559c9309f1a6f764f70b
+Message-Id: <4d54cc32112d8d8b0667559c9309f1a6f764f70b.1637074203.git.geliang.tang@suse.com>
+From: Florian Westphal <fw@strlen.de>
+Date: Fri, 12 Feb 2021 15:59:59 -0800
+Subject: [PATCH] mptcp: avoid lock_fast usage in accept path
+References: bsn#2
+Patch-mainline: v5.12-rc1
+
+Once event support is added this may need to allocate memory while msk
+lock is held with softirqs disabled.
+
+Not using lock_fast also allows to do the allocation with GFP_KERNEL.
+
+Signed-off-by: Florian Westphal <fw@strlen.de>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ include/net/genetlink.h |  1 +
+ net/mptcp/protocol.c    |  5 ++---
+ net/netlink/genetlink.c | 32 ++++++++++++++++++++++++++++++++
+ 3 files changed, 35 insertions(+), 3 deletions(-)
+
+diff --git a/include/net/genetlink.h b/include/net/genetlink.h
+index e55ec1597ce7..7cb3fa8310ed 100644
+--- a/include/net/genetlink.h
++++ b/include/net/genetlink.h
+@@ -14,6 +14,7 @@
+  */
+ struct genl_multicast_group {
+ 	char			name[GENL_NAMSIZ];
++	u8			flags;
+ };
+ 
+ struct genl_ops;
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index 56240b87d464..fe6da1b77723 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -3260,9 +3260,8 @@ static int mptcp_stream_accept(struct socket *sock, struct socket *newsock,
+ 		struct mptcp_sock *msk = mptcp_sk(newsock->sk);
+ 		struct mptcp_subflow_context *subflow;
+ 		struct sock *newsk = newsock->sk;
+-		bool slowpath;
+ 
+-		slowpath = lock_sock_fast(newsk);
++		lock_sock(newsk);
+ 
+ 		/* PM/worker can now acquire the first subflow socket
+ 		 * lock without racing with listener queue cleanup,
+@@ -3288,7 +3287,7 @@ static int mptcp_stream_accept(struct socket *sock, struct socket *newsock,
+ 			if (!ssk->sk_socket)
+ 				mptcp_sock_graft(ssk, newsock);
+ 		}
+-		unlock_sock_fast(newsk, slowpath);
++		release_sock(newsk);
+ 	}
+ 
+ 	if (inet_csk_listen_poll(ssock->sk))
+diff --git a/net/netlink/genetlink.c b/net/netlink/genetlink.c
+index c992424e4d63..2d6fdf40df66 100644
+--- a/net/netlink/genetlink.c
++++ b/net/netlink/genetlink.c
+@@ -1360,11 +1360,43 @@ static struct genl_family genl_ctrl __ro_after_init = {
+ 	.netnsok = true,
+ };
+ 
++static int genl_bind(struct net *net, int group)
++{
++	const struct genl_family *family;
++	unsigned int id;
++	int ret = 0;
++
++	genl_lock_all();
++
++	idr_for_each_entry(&genl_fam_idr, family, id) {
++		const struct genl_multicast_group *grp;
++		int i;
++
++		if (family->n_mcgrps == 0)
++			continue;
++
++		i = group - family->mcgrp_offset;
++		if (i < 0 || i >= family->n_mcgrps)
++			continue;
++
++		grp = &family->mcgrps[i];
++		if ((grp->flags & GENL_UNS_ADMIN_PERM) &&
++		    !ns_capable(net->user_ns, CAP_NET_ADMIN))
++			ret = -EPERM;
++
++		break;
++	}
++
++	genl_unlock_all();
++	return ret;
++}
++
+ static int __net_init genl_pernet_init(struct net *net)
+ {
+ 	struct netlink_kernel_cfg cfg = {
+ 		.input		= genl_rcv,
+ 		.flags		= NL_CFG_F_NONROOT_RECV,
++		.bind		= genl_bind,
+ 	};
+ 
+ 	/* we'll bump the group number right afterwards */
+-- 
+2.26.2
+

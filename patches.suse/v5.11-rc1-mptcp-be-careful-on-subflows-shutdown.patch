@@ -1,0 +1,69 @@
+Git-commit: d7b1bfd0832c1d005f571203306b6c50e9805150
+Message-Id: <d7b1bfd0832c1d005f571203306b6c50e9805150.1637074967.git.geliang.tang@suse.com>
+From: Paolo Abeni <pabeni@redhat.com>
+Date: Wed, 9 Dec 2020 12:03:31 +0100
+Subject: [PATCH] mptcp: be careful on subflows shutdown
+References: bsn#2
+Patch-mainline: v5.11-rc1
+
+When the workqueue disposes of the msk, the subflows can still
+receive some data from the peer after __mptcp_close_ssk()
+completes.
+
+The above could trigger a race between the msk receive path and the
+msk destruction. Acquiring the mptcp_data_lock() in __mptcp_destroy_sock()
+will not save the day: the rx path could be reached even after msk
+destruction completes.
+
+Instead use the subflow 'disposable' flag to prevent entering
+the msk receive path after __mptcp_close_ssk().
+
+Fixes: e16163b6e2b7 ("mptcp: refactor shutdown and close")
+Reviewed-by: Matthieu Baerts <matthieu.baerts@tessares.net>
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ net/mptcp/protocol.c | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index 4e29dcf17ecd..2540d82742ac 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -701,6 +701,13 @@ void mptcp_data_ready(struct sock *sk, struct sock *ssk)
+ 	int sk_rbuf, ssk_rbuf;
+ 	bool wake;
+ 
++	/* The peer can send data while we are shutting down this
++	 * subflow at msk destruction time, but we must avoid enqueuing
++	 * more data to the msk receive queue
++	 */
++	if (unlikely(subflow->disposable))
++		return;
++
+ 	/* move_skbs_to_msk below can legitly clear the data_avail flag,
+ 	 * but we will need later to properly woke the reader, cache its
+ 	 * value
+@@ -2119,6 +2126,8 @@ void __mptcp_close_ssk(struct sock *sk, struct sock *ssk,
+ 		sock_orphan(ssk);
+ 	}
+ 
++	subflow->disposable = 1;
++
+ 	/* if ssk hit tcp_done(), tcp_cleanup_ulp() cleared the related ops
+ 	 * the ssk has been already destroyed, we just need to release the
+ 	 * reference owned by msk;
+@@ -2126,8 +2135,7 @@ void __mptcp_close_ssk(struct sock *sk, struct sock *ssk,
+ 	if (!inet_csk(ssk)->icsk_ulp_ops) {
+ 		kfree_rcu(subflow, rcu);
+ 	} else {
+-		/* otherwise ask tcp do dispose of ssk and subflow ctx */
+-		subflow->disposable = 1;
++		/* otherwise tcp will dispose of the ssk and subflow ctx */
+ 		__tcp_close(ssk, 0);
+ 
+ 		/* close acquired an extra ref */
+-- 
+2.26.2
+

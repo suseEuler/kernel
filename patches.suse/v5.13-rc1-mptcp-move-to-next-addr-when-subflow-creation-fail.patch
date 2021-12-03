@@ -1,0 +1,84 @@
+Git-commit: 557963c383e8209b14de91bf2a0301a41b94d8c4
+Message-Id: <557963c383e8209b14de91bf2a0301a41b94d8c4.1637073562.git.geliang.tang@suse.com>
+From: Geliang Tang <geliangtang@gmail.com>
+Date: Fri, 26 Mar 2021 11:26:38 -0700
+Subject: [PATCH] mptcp: move to next addr when subflow creation fail
+References: bsn#2
+Patch-mainline: v5.13-rc1
+
+When an invalid address was announced, the subflow couldn't be created
+for this address. Therefore mptcp_pm_nl_subflow_established couldn't be
+invoked. Then the next addresses in the local address list didn't have a
+chance to be announced.
+
+This patch invokes the new function mptcp_pm_add_addr_echoed when the
+address is echoed. In it, use mptcp_lookup_anno_list_by_saddr to check
+whether this address is in the anno_list. If it is, PM schedules the
+status MPTCP_PM_SUBFLOW_ESTABLISHED to invoke
+mptcp_pm_create_subflow_or_signal_addr to deal with the next address in
+the local address list.
+
+Signed-off-by: Geliang Tang <geliangtang@gmail.com>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ net/mptcp/options.c  |  1 +
+ net/mptcp/pm.c       | 15 +++++++++++++++
+ net/mptcp/protocol.h |  2 ++
+ 3 files changed, 18 insertions(+)
+
+diff --git a/net/mptcp/options.c b/net/mptcp/options.c
+index 2d2340b22f61..69cafaacc31b 100644
+--- a/net/mptcp/options.c
++++ b/net/mptcp/options.c
+@@ -1040,6 +1040,7 @@ void mptcp_incoming_options(struct sock *sk, struct sk_buff *skb)
+ 			mptcp_pm_add_addr_received(msk, &addr);
+ 			MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_ADDADDR);
+ 		} else {
++			mptcp_pm_add_addr_echoed(msk, &addr);
+ 			mptcp_pm_del_add_timer(msk, &addr);
+ 			MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_ECHOADD);
+ 		}
+diff --git a/net/mptcp/pm.c b/net/mptcp/pm.c
+index 0a06d5947a73..966942d1013f 100644
+--- a/net/mptcp/pm.c
++++ b/net/mptcp/pm.c
+@@ -196,6 +196,21 @@ void mptcp_pm_add_addr_received(struct mptcp_sock *msk,
+ 	spin_unlock_bh(&pm->lock);
+ }
+ 
++void mptcp_pm_add_addr_echoed(struct mptcp_sock *msk,
++			      struct mptcp_addr_info *addr)
++{
++	struct mptcp_pm_data *pm = &msk->pm;
++
++	pr_debug("msk=%p", msk);
++
++	spin_lock_bh(&pm->lock);
++
++	if (mptcp_lookup_anno_list_by_saddr(msk, addr) && READ_ONCE(pm->work_pending))
++		mptcp_pm_schedule_work(msk, MPTCP_PM_SUBFLOW_ESTABLISHED);
++
++	spin_unlock_bh(&pm->lock);
++}
++
+ void mptcp_pm_add_addr_send_ack(struct mptcp_sock *msk)
+ {
+ 	if (!mptcp_pm_should_add_signal(msk))
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index 9c51444b26cf..b417b3591e07 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -647,6 +647,8 @@ void mptcp_pm_subflow_established(struct mptcp_sock *msk);
+ void mptcp_pm_subflow_closed(struct mptcp_sock *msk, u8 id);
+ void mptcp_pm_add_addr_received(struct mptcp_sock *msk,
+ 				const struct mptcp_addr_info *addr);
++void mptcp_pm_add_addr_echoed(struct mptcp_sock *msk,
++			      struct mptcp_addr_info *addr);
+ void mptcp_pm_add_addr_send_ack(struct mptcp_sock *msk);
+ void mptcp_pm_rm_addr_received(struct mptcp_sock *msk,
+ 			       const struct mptcp_rm_list *rm_list);
+-- 
+2.26.2
+

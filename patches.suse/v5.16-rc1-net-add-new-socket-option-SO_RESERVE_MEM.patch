@@ -1,0 +1,261 @@
+Git-commit: 2bb2f5fb21b0486ff69b7b4a1fe03a760527d133
+Message-Id: <2bb2f5fb21b0486ff69b7b4a1fe03a760527d133.1637135481.git.geliang.tang@suse.com>
+From: Wei Wang <weiwan@google.com>
+Date: Wed, 29 Sep 2021 10:25:11 -0700
+Subject: [PATCH] net: add new socket option SO_RESERVE_MEM
+References: bsn#2
+Patch-mainline: v5.16-rc1
+
+This socket option provides a mechanism for users to reserve a certain
+amount of memory for the socket to use. When this option is set, kernel
+charges the user specified amount of memory to memcg, as well as
+sk_forward_alloc. This amount of memory is not reclaimable and is
+available in sk_forward_alloc for this socket.
+With this socket option set, the networking stack spends less cycles
+doing forward alloc and reclaim, which should lead to better system
+performance, with the cost of an amount of pre-allocated and
+unreclaimable memory, even under memory pressure.
+
+Note:
+This socket option is only available when memory cgroup is enabled and we
+require this reserved memory to be charged to the user's memcg. We hope
+this could avoid mis-behaving users to abused this feature to reserve a
+large amount on certain sockets and cause unfairness for others.
+
+Signed-off-by: Wei Wang <weiwan@google.com>
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ include/net/sock.h                | 44 +++++++++++++++++---
+ include/uapi/asm-generic/socket.h |  2 +
+ net/core/sock.c                   | 69 +++++++++++++++++++++++++++++++
+ net/core/stream.c                 |  2 +-
+ net/ipv4/af_inet.c                |  2 +-
+ 5 files changed, 112 insertions(+), 7 deletions(-)
+
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -269,6 +269,7 @@ struct bpf_local_storage;
+   *	@sk_omem_alloc: "o" is "option" or "other"
+   *	@sk_wmem_queued: persistent queue size
+   *	@sk_forward_alloc: space allocated forward
++  *	@sk_reserved_mem: space reserved and non-reclaimable for the socket
+   *	@sk_napi_id: id of the last napi context to receive data for sk
+   *	@sk_ll_usec: usecs to busypoll when there is no data
+   *	@sk_allocation: allocation mode
+@@ -411,6 +412,7 @@ struct sock {
+ #define sk_rmem_alloc sk_backlog.rmem_alloc
+ 
+ 	int			sk_forward_alloc;
++	u32			sk_reserved_mem;
+ #ifdef CONFIG_NET_RX_BUSY_POLL
+ 	unsigned int		sk_ll_usec;
+ 	/* ===== mostly read cache line ===== */
+@@ -1493,20 +1495,49 @@ sk_rmem_schedule(struct sock *sk, struct
+ 		skb_pfmemalloc(skb);
+ }
+ 
++static inline int sk_unused_reserved_mem(const struct sock *sk)
++{
++	int unused_mem;
++
++	if (likely(!sk->sk_reserved_mem))
++		return 0;
++
++	unused_mem = sk->sk_reserved_mem - sk->sk_wmem_queued -
++			atomic_read(&sk->sk_rmem_alloc);
++
++	return unused_mem > 0 ? unused_mem : 0;
++}
++
+ static inline void sk_mem_reclaim(struct sock *sk)
+ {
++	int reclaimable;
++
+ 	if (!sk_has_account(sk))
+ 		return;
+-	if (sk->sk_forward_alloc >= SK_MEM_QUANTUM)
+-		__sk_mem_reclaim(sk, sk->sk_forward_alloc);
++
++	reclaimable = sk->sk_forward_alloc - sk_unused_reserved_mem(sk);
++
++	if (reclaimable >= SK_MEM_QUANTUM)
++		__sk_mem_reclaim(sk, reclaimable);
++}
++
++static inline void sk_mem_reclaim_final(struct sock *sk)
++{
++	sk->sk_reserved_mem = 0;
++	sk_mem_reclaim(sk);
+ }
+ 
+ static inline void sk_mem_reclaim_partial(struct sock *sk)
+ {
++	int reclaimable;
++
+ 	if (!sk_has_account(sk))
+ 		return;
+-	if (sk->sk_forward_alloc > SK_MEM_QUANTUM)
+-		__sk_mem_reclaim(sk, sk->sk_forward_alloc - 1);
++
++	reclaimable = sk->sk_forward_alloc - sk_unused_reserved_mem(sk);
++
++	if (reclaimable > SK_MEM_QUANTUM)
++		__sk_mem_reclaim(sk, reclaimable - 1);
+ }
+ 
+ static inline void sk_mem_charge(struct sock *sk, int size)
+@@ -1518,9 +1549,12 @@ static inline void sk_mem_charge(struct
+ 
+ static inline void sk_mem_uncharge(struct sock *sk, int size)
+ {
++	int reclaimable;
++
+ 	if (!sk_has_account(sk))
+ 		return;
+ 	sk->sk_forward_alloc += size;
++	reclaimable = sk->sk_forward_alloc - sk_unused_reserved_mem(sk);
+ 
+ 	/* Avoid a possible overflow.
+ 	 * TCP send queues can make this happen, if sk_mem_reclaim()
+@@ -1529,7 +1563,7 @@ static inline void sk_mem_uncharge(struc
+ 	 * If we reach 2 MBytes, reclaim 1 MBytes right now, there is
+ 	 * no need to hold that much forward allocation anyway.
+ 	 */
+-	if (unlikely(sk->sk_forward_alloc >= 1 << 21))
++	if (unlikely(reclaimable >= 1 << 21))
+ 		__sk_mem_reclaim(sk, 1 << 20);
+ }
+ 
+--- a/include/uapi/asm-generic/socket.h
++++ b/include/uapi/asm-generic/socket.h
+@@ -122,6 +122,8 @@
+ #define SO_PREFER_BUSY_POLL	69
+ #define SO_BUSY_POLL_BUDGET	70
+ 
++#define SO_RESERVE_MEM		73
++
+ #if !defined(__KERNEL__)
+ 
+ #if __BITS_PER_LONG == 64 || (defined(__x86_64__) && defined(__ILP32__))
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -922,6 +922,52 @@ void sock_set_mark(struct sock *sk, u32
+ }
+ EXPORT_SYMBOL(sock_set_mark);
+ 
++static void sock_release_reserved_memory(struct sock *sk, int bytes)
++{
++	/* Round down bytes to multiple of pages */
++	bytes &= ~(SK_MEM_QUANTUM - 1);
++
++	WARN_ON(bytes > sk->sk_reserved_mem);
++	sk->sk_reserved_mem -= bytes;
++	sk_mem_reclaim(sk);
++}
++
++static int sock_reserve_memory(struct sock *sk, int bytes)
++{
++	long allocated;
++	bool charged;
++	int pages;
++
++	if (!mem_cgroup_sockets_enabled || !sk->sk_memcg)
++		return -EOPNOTSUPP;
++
++	if (!bytes)
++		return 0;
++
++	pages = sk_mem_pages(bytes);
++
++	/* pre-charge to memcg */
++	charged = mem_cgroup_charge_skmem(sk->sk_memcg, pages);
++	if (!charged)
++		return -ENOMEM;
++
++	/* pre-charge to forward_alloc */
++	allocated = sk_memory_allocated_add(sk, pages);
++	/* If the system goes into memory pressure with this
++	 * precharge, give up and return error.
++	 */
++	if (allocated > sk_prot_mem_limits(sk, 1)) {
++		sk_memory_allocated_sub(sk, pages);
++		mem_cgroup_uncharge_skmem(sk->sk_memcg, pages);
++		return -ENOMEM;
++	}
++	sk->sk_forward_alloc += pages << SK_MEM_QUANTUM_SHIFT;
++
++	sk->sk_reserved_mem += pages << SK_MEM_QUANTUM_SHIFT;
++
++	return 0;
++}
++
+ /*
+  *	This is meant for all protocols to use and covers goings on
+  *	at the socket level. Everything here is generic.
+@@ -1331,6 +1377,23 @@ set_sndbuf:
+ 		ret = sock_bindtoindex_locked(sk, val);
+ 		break;
+ 
++	case SO_RESERVE_MEM:
++	{
++		int delta;
++
++		if (val < 0) {
++			ret = -EINVAL;
++			break;
++		}
++
++		delta = val - sk->sk_reserved_mem;
++		if (delta < 0)
++			sock_release_reserved_memory(sk, -delta);
++		else
++			ret = sock_reserve_memory(sk, delta);
++		break;
++	}
++
+ 	default:
+ 		ret = -ENOPROTOOPT;
+ 		break;
+@@ -1703,6 +1766,10 @@ int sock_getsockopt(struct socket *sock,
+ 		v.val = sk->sk_bound_dev_if;
+ 		break;
+ 
++	case SO_RESERVE_MEM:
++		v.val = sk->sk_reserved_mem;
++		break;
++
+ 	default:
+ 		/* We implement the SO_SNDLOWAT etc to not be settable
+ 		 * (1003.1g 7).
+@@ -2009,6 +2076,7 @@ struct sock *sk_clone_lock(const struct
+ 	newsk->sk_dst_pending_confirm = 0;
+ 	newsk->sk_wmem_queued	= 0;
+ 	newsk->sk_forward_alloc = 0;
++	newsk->sk_reserved_mem	= 0;
+ 	atomic_set(&newsk->sk_drops, 0);
+ 	newsk->sk_send_head	= NULL;
+ 	newsk->sk_userlocks	= sk->sk_userlocks & ~SOCK_BINDPORT_LOCK;
+--- a/net/core/stream.c
++++ b/net/core/stream.c
+@@ -199,7 +199,7 @@ void sk_stream_kill_queues(struct sock *
+ 	WARN_ON(!skb_queue_empty(&sk->sk_write_queue));
+ 
+ 	/* Account for returned memory. */
+-	sk_mem_reclaim(sk);
++	sk_mem_reclaim_final(sk);
+ 
+ 	WARN_ON(sk->sk_wmem_queued);
+ 	WARN_ON(sk->sk_forward_alloc);
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -139,7 +139,7 @@ void inet_sock_destruct(struct sock *sk)
+ 	}
+ 	__skb_queue_purge(&sk->sk_error_queue);
+ 
+-	sk_mem_reclaim(sk);
++	sk_mem_reclaim_final(sk);
+ 
+ 	if (sk->sk_type == SOCK_STREAM && sk->sk_state != TCP_CLOSE) {
+ 		pr_err("Attempt to release TCP socket in state %d %p\n",

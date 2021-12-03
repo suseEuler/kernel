@@ -1,0 +1,266 @@
+Git-commit: ff5a0b421cb23bf6b2898939ffef5b683045d9d3
+Message-Id: <ff5a0b421cb23bf6b2898939ffef5b683045d9d3.1637072157.git.geliang.tang@suse.com>
+From: Paolo Abeni <pabeni@redhat.com>
+Date: Fri, 13 Aug 2021 15:15:45 -0700
+Subject: [PATCH] mptcp: faster active backup recovery
+References: bsn#2
+Patch-mainline: v5.15-rc1
+
+The msk can use backup subflows to transmit in-sequence data
+only if there are no other active subflow. On active backup
+scenario, the MPTCP connection can do forward progress only
+due to MPTCP retransmissions - rtx can pick backup subflows.
+
+This patch introduces a new flag flow MPTCP subflows: if the
+underlying TCP connection made no progresses for long time,
+and there are other less problematic subflows available, the
+given subflow become stale.
+
+Stale subflows are not considered active: if all non backup
+subflows become stale, the MPTCP scheduler can pick backup
+subflows for plain transmissions.
+
+Stale subflows can return in active state, as soon as any reply
+from the peer is observed.
+
+Active backup scenarios can now leverage the available b/w
+with no restrinction.
+
+Closes: https://github.com/multipath-tcp/mptcp_net-next/issues/207
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ Documentation/networking/mptcp-sysctl.rst | 12 +++++++
+ net/mptcp/ctrl.c                          | 14 +++++++++
+ net/mptcp/pm.c                            |  2 ++
+ net/mptcp/pm_netlink.c                    | 38 +++++++++++++++++++++++
+ net/mptcp/protocol.c                      | 27 ++++++++++++++--
+ net/mptcp/protocol.h                      | 12 +++++--
+ 6 files changed, 100 insertions(+), 5 deletions(-)
+
+--- a/net/mptcp/ctrl.c
++++ b/net/mptcp/ctrl.c
+@@ -22,6 +22,7 @@ struct mptcp_pernet {
+ #endif
+ 
+ 	unsigned int add_addr_timeout;
++	unsigned int stale_loss_cnt;
+ 	u8 mptcp_enabled;
+ 	u8 checksum_enabled;
+ 	u8 allow_join_initial_addr_port;
+@@ -52,12 +53,18 @@ int mptcp_allow_join_id0(const struct ne
+ 	return mptcp_get_pernet(net)->allow_join_initial_addr_port;
+ }
+ 
++unsigned int mptcp_stale_loss_cnt(const struct net *net)
++{
++	return mptcp_get_pernet(net)->stale_loss_cnt;
++}
++
+ static void mptcp_pernet_set_defaults(struct mptcp_pernet *pernet)
+ {
+ 	pernet->mptcp_enabled = 1;
+ 	pernet->add_addr_timeout = TCP_RTO_MAX;
+ 	pernet->checksum_enabled = 0;
+ 	pernet->allow_join_initial_addr_port = 1;
++	pernet->stale_loss_cnt = 4;
+ }
+ 
+ #ifdef CONFIG_SYSCTL
+@@ -95,6 +102,12 @@ static struct ctl_table mptcp_sysctl_tab
+ 		.extra1       = SYSCTL_ZERO,
+ 		.extra2       = SYSCTL_ONE
+ 	},
++	{
++		.procname = "stale_loss_cnt",
++		.maxlen = sizeof(unsigned int),
++		.mode = 0644,
++		.proc_handler = proc_douintvec_minmax,
++	},
+ 	{}
+ };
+ 
+@@ -114,6 +127,7 @@ static int mptcp_pernet_new_table(struct
+ 	table[1].data = &pernet->add_addr_timeout;
+ 	table[2].data = &pernet->checksum_enabled;
+ 	table[3].data = &pernet->allow_join_initial_addr_port;
++	table[4].data = &pernet->stale_loss_cnt;
+ 
+ 	hdr = register_net_sysctl(net, MPTCP_SYSCTL_PATH, table);
+ 	if (!hdr)
+--- a/net/mptcp/pm.c
++++ b/net/mptcp/pm.c
+@@ -320,8 +320,10 @@ void mptcp_pm_subflow_chk_stale(const st
+ 	} else if (subflow->stale_rcv_tstamp == rcv_tstamp) {
+ 		if (subflow->stale_count < U8_MAX)
+ 			subflow->stale_count++;
++		mptcp_pm_nl_subflow_chk_stale(msk, ssk);
+ 	} else {
+ 		subflow->stale_count = 0;
++		mptcp_subflow_set_active(subflow);
+ 	}
+ }
+ 
+--- a/net/mptcp/pm_netlink.c
++++ b/net/mptcp/pm_netlink.c
+@@ -46,6 +46,7 @@ struct pm_nl_pernet {
+ 	spinlock_t		lock;
+ 	struct list_head	local_addr_list;
+ 	unsigned int		addrs;
++	unsigned int		stale_loss_cnt;
+ 	unsigned int		add_addr_signal_max;
+ 	unsigned int		add_addr_accept_max;
+ 	unsigned int		local_addr_max;
+@@ -899,6 +900,42 @@ static const struct nla_policy mptcp_pm_
+ 	[MPTCP_PM_ATTR_SUBFLOWS]	= { .type	= NLA_U32,	},
+ };
+ 
++void mptcp_pm_nl_subflow_chk_stale(const struct mptcp_sock *msk, struct sock *ssk)
++{
++	struct mptcp_subflow_context *iter, *subflow = mptcp_subflow_ctx(ssk);
++	struct sock *sk = (struct sock *)msk;
++	unsigned int active_max_loss_cnt;
++	struct net *net = sock_net(sk);
++	unsigned int stale_loss_cnt;
++	bool slow;
++
++	stale_loss_cnt = mptcp_stale_loss_cnt(net);
++	if (subflow->stale || !stale_loss_cnt || subflow->stale_count <= stale_loss_cnt)
++		return;
++
++	/* look for another available subflow not in loss state */
++	active_max_loss_cnt = max_t(int, stale_loss_cnt - 1, 1);
++	mptcp_for_each_subflow(msk, iter) {
++		if (iter != subflow && mptcp_subflow_active(iter) &&
++		    iter->stale_count < active_max_loss_cnt) {
++			/* we have some alternatives, try to mark this subflow as idle ...*/
++			slow = lock_sock_fast(ssk);
++			if (!tcp_rtx_and_write_queues_empty(ssk)) {
++				subflow->stale = 1;
++				__mptcp_retransmit_pending_data(sk);
++			}
++			unlock_sock_fast(ssk, slow);
++
++			/* always try to push the pending data regarless of re-injections:
++			 * we can possibly use backup subflows now, and subflow selection
++			 * is cheap under the msk socket lock
++			 */
++			__mptcp_push_pending(sk, 0);
++			return;
++		}
++	}
++}
++
+ static int mptcp_pm_family_to_addr(int family)
+ {
+ #if IS_ENABLED(CONFIG_MPTCP_IPV6)
+@@ -1901,6 +1938,7 @@ static int __net_init pm_nl_init_net(str
+ 
+ 	INIT_LIST_HEAD_RCU(&pernet->local_addr_list);
+ 	pernet->next_id = 1;
++	pernet->stale_loss_cnt = 4;
+ 	spin_lock_init(&pernet->lock);
+ 
+ 	/* No need to initialize other pernet fields, the struct is zeroed at
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -1365,6 +1365,27 @@ struct subflow_send_info {
+ 	u64 ratio;
+ };
+ 
++void mptcp_subflow_set_active(struct mptcp_subflow_context *subflow)
++{
++	if (!subflow->stale)
++		return;
++
++	subflow->stale = 0;
++}
++
++bool mptcp_subflow_active(struct mptcp_subflow_context *subflow)
++{
++	if (unlikely(subflow->stale)) {
++		u32 rcv_tstamp = READ_ONCE(tcp_sk(mptcp_subflow_tcp_sock(subflow))->rcv_tstamp);
++
++		if (subflow->stale_rcv_tstamp == rcv_tstamp)
++			return false;
++
++		mptcp_subflow_set_active(subflow);
++	}
++	return __mptcp_subflow_active(subflow);
++}
++
+ /* implement the mptcp packet scheduler;
+  * returns the subflow that will transmit the next DSS
+  * additionally updates the rtx timeout
+@@ -2093,7 +2114,7 @@ static void mptcp_timeout_timer(struct t
+  *
+  * A backup subflow is returned only if that is the only kind available.
+  */
+-static struct sock *mptcp_subflow_get_retrans(const struct mptcp_sock *msk)
++static struct sock *mptcp_subflow_get_retrans(struct mptcp_sock *msk)
+ {
+ 	struct sock *backup = NULL, *pick = NULL;
+ 	struct mptcp_subflow_context *subflow;
+@@ -2107,7 +2128,7 @@ static struct sock *mptcp_subflow_get_re
+ 	mptcp_for_each_subflow(msk, subflow) {
+ 		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
+ 
+-		if (!mptcp_subflow_active(subflow))
++		if (!__mptcp_subflow_active(subflow))
+ 			continue;
+ 
+ 		/* still data outstanding at TCP level? skip this */
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -431,7 +431,8 @@ struct mptcp_subflow_context {
+ 		send_mp_prio : 1,
+ 		rx_eof : 1,
+ 		can_ack : 1,        /* only after processing the remote a key */
+-		disposable : 1;	    /* ctx can be free at ulp release time */
++		disposable : 1,	    /* ctx can be free at ulp release time */
++		stale : 1;	    /* unable to snd/rcv data, do not use for xmit */
+ 	enum mptcp_data_avail data_avail;
+ 	u32	remote_nonce;
+ 	u64	thmac;
+@@ -558,9 +559,11 @@ int mptcp_is_enabled(const struct net *n
+ unsigned int mptcp_get_add_addr_timeout(const struct net *net);
+ int mptcp_is_checksum_enabled(const struct net *net);
+ int mptcp_allow_join_id0(const struct net *net);
++unsigned int mptcp_stale_loss_cnt(const struct net *net);
+ void mptcp_subflow_fully_established(struct mptcp_subflow_context *subflow,
+ 				     struct mptcp_options_received *mp_opt);
+ bool __mptcp_retransmit_pending_data(struct sock *sk);
++void __mptcp_push_pending(struct sock *sk, unsigned int flags);
+ bool mptcp_subflow_data_available(struct sock *sk);
+ void __init mptcp_subflow_init(void);
+ void mptcp_subflow_shutdown(struct sock *sk, struct sock *ssk, int how);
+@@ -579,7 +582,7 @@ void mptcp_info2sockaddr(const struct mp
+ 			 struct sockaddr_storage *addr,
+ 			 unsigned short family);
+ 
+-static inline bool mptcp_subflow_active(struct mptcp_subflow_context *subflow)
++static inline bool __mptcp_subflow_active(struct mptcp_subflow_context *subflow)
+ {
+ 	struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
+ 
+@@ -591,6 +594,10 @@ static inline bool mptcp_subflow_active(
+ 	return ((1 << ssk->sk_state) & (TCPF_ESTABLISHED | TCPF_CLOSE_WAIT));
+ }
+ 
++void mptcp_subflow_set_active(struct mptcp_subflow_context *subflow);
++
++bool mptcp_subflow_active(struct mptcp_subflow_context *subflow);
++
+ static inline void mptcp_subflow_tcp_fallback(struct sock *sk,
+ 					      struct mptcp_subflow_context *ctx)
+ {
+@@ -695,6 +702,7 @@ void mptcp_crypto_hmac_sha(u64 key1, u64
+ void __init mptcp_pm_init(void);
+ void mptcp_pm_data_init(struct mptcp_sock *msk);
+ void mptcp_pm_subflow_chk_stale(const struct mptcp_sock *msk, struct sock *ssk);
++void mptcp_pm_nl_subflow_chk_stale(const struct mptcp_sock *msk, struct sock *ssk);
+ void mptcp_pm_new_connection(struct mptcp_sock *msk, const struct sock *ssk, int server_side);
+ void mptcp_pm_fully_established(struct mptcp_sock *msk, const struct sock *ssk, gfp_t gfp);
+ bool mptcp_pm_allow_new_subflow(struct mptcp_sock *msk);

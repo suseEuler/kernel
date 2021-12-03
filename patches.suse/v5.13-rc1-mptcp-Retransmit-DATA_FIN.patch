@@ -1,0 +1,80 @@
+Git-commit: 6477dd39e62c3a67cfa368ddc127410b4ae424c6
+Message-Id: <6477dd39e62c3a67cfa368ddc127410b4ae424c6.1637073045.git.geliang.tang@suse.com>
+From: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Date: Fri, 23 Apr 2021 09:40:33 -0700
+Subject: [PATCH] mptcp: Retransmit DATA_FIN
+References: bsn#2
+Patch-mainline: v5.13-rc1
+
+With this change, the MPTCP-level retransmission timer is used to resend
+DATA_FIN. The retranmit timer is not stopped while waiting for a
+MPTCP-level ACK of DATA_FIN, and retransmitted DATA_FINs are sent on all
+subflows. The retry interval starts at TCP_RTO_MIN and then doubles on
+each attempt, up to TCP_RTO_MAX.
+
+Closes: https://github.com/multipath-tcp/mptcp_net-next/issues/146
+Fixes: 43b54c6ee382 ("mptcp: Use full MPTCP-level disconnect state machine")
+Acked-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ net/mptcp/protocol.c | 25 +++++++++++++++++++++++--
+ 1 file changed, 23 insertions(+), 2 deletions(-)
+
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -392,6 +392,14 @@ static bool mptcp_pending_data_fin(struc
+ 	return false;
+ }
+ 
++static void mptcp_set_datafin_timeout(const struct sock *sk)
++{
++	struct inet_connection_sock *icsk = inet_csk(sk);
++
++	mptcp_sk(sk)->timer_ival = min(TCP_RTO_MAX,
++				       TCP_RTO_MIN << icsk->icsk_retransmits);
++}
++
+ static void mptcp_set_timeout(const struct sock *sk, const struct sock *ssk)
+ {
+ 	long tout = ssk && inet_csk(ssk)->icsk_pending ?
+@@ -1062,7 +1070,7 @@ out:
+ 	}
+ 
+ 	if (snd_una == READ_ONCE(msk->snd_nxt)) {
+-		if (msk->timer_ival)
++		if (msk->timer_ival && !mptcp_data_fin_enabled(msk))
+ 			mptcp_stop_timer(sk);
+ 	} else {
+ 		mptcp_reset_timer(sk);
+@@ -2294,8 +2302,19 @@ static void __mptcp_retrans(struct sock
+ 
+ 	__mptcp_clean_una_wakeup(sk);
+ 	dfrag = mptcp_rtx_head(sk);
+-	if (!dfrag)
++	if (!dfrag) {
++		if (mptcp_data_fin_enabled(msk)) {
++			struct inet_connection_sock *icsk = inet_csk(sk);
++
++			icsk->icsk_retransmits++;
++			mptcp_set_datafin_timeout(sk);
++			mptcp_send_ack(msk);
++
++			goto reset_timer;
++		}
++
+ 		return;
++	}
+ 
+ 	ssk = mptcp_subflow_get_retrans(msk);
+ 	if (!ssk)
+@@ -2481,6 +2500,8 @@ void mptcp_subflow_shutdown(struct sock
+ 			pr_debug("Sending DATA_FIN on subflow %p", ssk);
+ 			mptcp_set_timeout(sk, ssk);
+ 			tcp_send_ack(ssk);
++			if (!mptcp_timer_pending(sk))
++				mptcp_reset_timer(sk);
+ 		}
+ 		break;
+ 	}

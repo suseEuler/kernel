@@ -1,0 +1,87 @@
+Git-commit: a16195e35cd013fc10023e79640bb1612e5d4457
+Message-Id: <a16195e35cd013fc10023e79640bb1612e5d4457.1637073419.git.geliang.tang@suse.com>
+From: Paolo Abeni <pabeni@redhat.com>
+Date: Thu, 1 Apr 2021 16:19:41 -0700
+Subject: [PATCH] mptcp: add mib for token creation fallback
+References: bsn#2
+Patch-mainline: v5.13-rc1
+
+If the MPTCP protocol is unable to create a new token,
+the socket fallback to plain TCP, let's keep track
+of such events via a specific MIB.
+
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ net/mptcp/mib.c      | 1 +
+ net/mptcp/mib.h      | 1 +
+ net/mptcp/protocol.c | 4 +++-
+ net/mptcp/subflow.c  | 3 +++
+ 4 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/net/mptcp/mib.c b/net/mptcp/mib.c
+index 3780c29c321d..b0429aca4f76 100644
+--- a/net/mptcp/mib.c
++++ b/net/mptcp/mib.c
+@@ -13,6 +13,7 @@ static const struct snmp_mib mptcp_snmp_list[] = {
+ 	SNMP_MIB_ITEM("MPCapableACKRX", MPTCP_MIB_MPCAPABLEPASSIVEACK),
+ 	SNMP_MIB_ITEM("MPCapableFallbackACK", MPTCP_MIB_MPCAPABLEPASSIVEFALLBACK),
+ 	SNMP_MIB_ITEM("MPCapableFallbackSYNACK", MPTCP_MIB_MPCAPABLEACTIVEFALLBACK),
++	SNMP_MIB_ITEM("MPFallbackTokenInit", MPTCP_MIB_TOKENFALLBACKINIT),
+ 	SNMP_MIB_ITEM("MPTCPRetrans", MPTCP_MIB_RETRANSSEGS),
+ 	SNMP_MIB_ITEM("MPJoinNoTokenFound", MPTCP_MIB_JOINNOTOKEN),
+ 	SNMP_MIB_ITEM("MPJoinSynRx", MPTCP_MIB_JOINSYNRX),
+diff --git a/net/mptcp/mib.h b/net/mptcp/mib.h
+index 72afbc135f8e..50e1668c9a01 100644
+--- a/net/mptcp/mib.h
++++ b/net/mptcp/mib.h
+@@ -6,6 +6,7 @@ enum linux_mptcp_mib_field {
+ 	MPTCP_MIB_MPCAPABLEPASSIVEACK,	/* Received third ACK with MP_CAPABLE */
+ 	MPTCP_MIB_MPCAPABLEPASSIVEFALLBACK,/* Server-side fallback during 3-way handshake */
+ 	MPTCP_MIB_MPCAPABLEACTIVEFALLBACK, /* Client-side fallback during 3-way handshake */
++	MPTCP_MIB_TOKENFALLBACKINIT,	/* Could not init/allocate token */
+ 	MPTCP_MIB_RETRANSSEGS,		/* Segments retransmitted at the MPTCP-level */
+ 	MPTCP_MIB_JOINNOTOKEN,		/* Received MP_JOIN but the token was not found */
+ 	MPTCP_MIB_JOINSYNRX,		/* Received a SYN + MP_JOIN */
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index 171b77537dcb..3b50e8cc0c5f 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -3224,8 +3224,10 @@ static int mptcp_stream_connect(struct socket *sock, struct sockaddr *uaddr,
+ 	if (rcu_access_pointer(tcp_sk(ssock->sk)->md5sig_info))
+ 		mptcp_subflow_early_fallback(msk, subflow);
+ #endif
+-	if (subflow->request_mptcp && mptcp_token_new_connect(ssock->sk))
++	if (subflow->request_mptcp && mptcp_token_new_connect(ssock->sk)) {
++		MPTCP_INC_STATS(sock_net(ssock->sk), MPTCP_MIB_TOKENFALLBACKINIT);
+ 		mptcp_subflow_early_fallback(msk, subflow);
++	}
+ 
+ do_connect:
+ 	err = ssock->ops->connect(ssock, uaddr, addr_len, flags);
+diff --git a/net/mptcp/subflow.c b/net/mptcp/subflow.c
+index 6c074d3db0ed..b96e8dc01f08 100644
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@ -165,6 +165,7 @@ static int subflow_check_req(struct request_sock *req,
+ 			if (mptcp_token_exists(subflow_req->token)) {
+ 				if (retries-- > 0)
+ 					goto again;
++				SUBFLOW_REQ_INC_STATS(req, MPTCP_MIB_TOKENFALLBACKINIT);
+ 			} else {
+ 				subflow_req->mp_capable = 1;
+ 			}
+@@ -176,6 +177,8 @@ static int subflow_check_req(struct request_sock *req,
+ 			subflow_req->mp_capable = 1;
+ 		else if (retries-- > 0)
+ 			goto again;
++		else
++			SUBFLOW_REQ_INC_STATS(req, MPTCP_MIB_TOKENFALLBACKINIT);
+ 
+ 	} else if (mp_opt.mp_join && listener->request_mptcp) {
+ 		subflow_req->ssn_offset = TCP_SKB_CB(skb)->seq;
+-- 
+2.26.2
+

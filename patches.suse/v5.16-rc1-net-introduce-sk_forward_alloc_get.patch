@@ -1,0 +1,98 @@
+Git-commit: 292e6077b04091d138bae6010fb9fdc958170d64
+Message-Id: <292e6077b04091d138bae6010fb9fdc958170d64.1637151459.git.geliang.tang@suse.com>
+From: Paolo Abeni <pabeni@redhat.com>
+Date: Tue, 26 Oct 2021 16:29:14 -0700
+Subject: [PATCH] net: introduce sk_forward_alloc_get()
+References: bsn#2
+Patch-mainline: v5.16-rc1
+
+A later patch will change the MPTCP memory accounting schema
+in such a way that MPTCP sockets will encode the total amount of
+forward allocated memory in two separate fields (one for tx and
+one for rx).
+
+MPTCP sockets will use their own helper to provide the accurate
+amount of fwd allocated memory.
+
+To allow the above, this patch adds a new, optional, sk method to
+fetch the fwd memory, wrap the call in a new helper and use it
+where it is appropriate.
+
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ include/net/sock.h   | 11 +++++++++++
+ net/ipv4/af_inet.c   |  2 +-
+ net/ipv4/inet_diag.c |  2 +-
+ net/sched/em_meta.c  |  2 +-
+ 4 files changed, 14 insertions(+), 3 deletions(-)
+
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -1190,6 +1190,8 @@ struct proto {
+ 	unsigned int		inuse_idx;
+ #endif
+ 
++	int			(*forward_alloc_get)(const struct sock *sk);
++
+ 	bool			(*stream_memory_free)(const struct sock *sk, int wake);
+ 	bool			(*stream_memory_read)(const struct sock *sk);
+ 	/* Memory pressure */
+@@ -1197,6 +1199,7 @@ struct proto {
+ 	void			(*leave_memory_pressure)(struct sock *sk);
+ 	atomic_long_t		*memory_allocated;	/* Current allocated memory. */
+ 	struct percpu_counter	*sockets_allocated;	/* Current number of sockets. */
++
+ 	/*
+ 	 * Pressure flag: try to collapse.
+ 	 * Technical note: it is used by multiple contexts non atomically.
+@@ -1272,6 +1275,14 @@ static inline void sk_refcnt_debug_relea
+ #define sk_refcnt_debug_release(sk) do { } while (0)
+ #endif /* SOCK_REFCNT_DEBUG */
+ 
++static inline int sk_forward_alloc_get(const struct sock *sk)
++{
++	if (!sk->sk_prot->forward_alloc_get)
++		return sk->sk_forward_alloc;
++
++	return sk->sk_prot->forward_alloc_get(sk);
++}
++
+ static inline bool __sk_stream_memory_free(const struct sock *sk, int wake)
+ {
+ 	if (READ_ONCE(sk->sk_wmem_queued) >= READ_ONCE(sk->sk_sndbuf))
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -154,7 +154,7 @@ void inet_sock_destruct(struct sock *sk)
+ 	WARN_ON(atomic_read(&sk->sk_rmem_alloc));
+ 	WARN_ON(refcount_read(&sk->sk_wmem_alloc));
+ 	WARN_ON(sk->sk_wmem_queued);
+-	WARN_ON(sk->sk_forward_alloc);
++	WARN_ON(sk_forward_alloc_get(sk));
+ 
+ 	kfree(rcu_dereference_protected(inet->inet_opt, 1));
+ 	dst_release(rcu_dereference_protected(sk->sk_dst_cache, 1));
+--- a/net/ipv4/inet_diag.c
++++ b/net/ipv4/inet_diag.c
+@@ -271,7 +271,7 @@ int inet_sk_diag_fill(struct sock *sk, s
+ 		struct inet_diag_meminfo minfo = {
+ 			.idiag_rmem = sk_rmem_alloc_get(sk),
+ 			.idiag_wmem = READ_ONCE(sk->sk_wmem_queued),
+-			.idiag_fmem = sk->sk_forward_alloc,
++			.idiag_fmem = sk_forward_alloc_get(sk),
+ 			.idiag_tmem = sk_wmem_alloc_get(sk),
+ 		};
+ 
+--- a/net/sched/em_meta.c
++++ b/net/sched/em_meta.c
+@@ -457,7 +457,7 @@ META_COLLECTOR(int_sk_fwd_alloc)
+ 		*err = -1;
+ 		return;
+ 	}
+-	dst->value = sk->sk_forward_alloc;
++	dst->value = sk_forward_alloc_get(sk);
+ }
+ 
+ META_COLLECTOR(int_sk_sndbuf)

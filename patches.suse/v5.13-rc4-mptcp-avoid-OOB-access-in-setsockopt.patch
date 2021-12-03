@@ -1,0 +1,112 @@
+Git-commit: 20b5759f21cf53a0e03031bd3fe539e332b13568
+Message-Id: <20b5759f21cf53a0e03031bd3fe539e332b13568.1637072935.git.geliang.tang@suse.com>
+From: Paolo Abeni <pabeni@redhat.com>
+Date: Tue, 25 May 2021 14:23:10 -0700
+Subject: [PATCH] mptcp: avoid OOB access in setsockopt()
+References: bsn#2
+Patch-mainline: v5.13-rc4
+
+We can't use tcp_set_congestion_control() on an mptcp socket, as
+such function can end-up accessing a tcp-specific field -
+prior_ssthresh - causing an OOB access.
+
+To allow propagating the correct ca algo on subflow, cache the ca
+name at initialization time.
+
+Additionally avoid overriding the user-selected CA (if any) at
+clone time.
+
+Closes: https://github.com/multipath-tcp/mptcp_net-next/issues/182
+Fixes: aa1fbd94e5c7 ("mptcp: sockopt: add TCP_CONGESTION and TCP_INFO")
+Acked-by: Florian Westphal <fw@strlen.de>
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ net/mptcp/protocol.c | 14 +++++++++++---
+ net/mptcp/protocol.h |  1 +
+ net/mptcp/sockopt.c  |  4 ++--
+ 3 files changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index 2d21a4793d9d..2bc199549a88 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -2424,13 +2424,12 @@ static int __mptcp_init_sock(struct sock *sk)
+ 	timer_setup(&msk->sk.icsk_retransmit_timer, mptcp_retransmit_timer, 0);
+ 	timer_setup(&sk->sk_timer, mptcp_timeout_timer, 0);
+ 
+-	tcp_assign_congestion_control(sk);
+-
+ 	return 0;
+ }
+ 
+ static int mptcp_init_sock(struct sock *sk)
+ {
++	struct inet_connection_sock *icsk = inet_csk(sk);
+ 	struct net *net = sock_net(sk);
+ 	int ret;
+ 
+@@ -2448,6 +2447,16 @@ static int mptcp_init_sock(struct sock *sk)
+ 	if (ret)
+ 		return ret;
+ 
++	/* fetch the ca name; do it outside __mptcp_init_sock(), so that clone will
++	 * propagate the correct value
++	 */
++	tcp_assign_congestion_control(sk);
++	strcpy(mptcp_sk(sk)->ca_name, icsk->icsk_ca_ops->name);
++
++	/* no need to keep a reference to the ops, the name will suffice */
++	tcp_cleanup_congestion_control(sk);
++	icsk->icsk_ca_ops = NULL;
++
+ 	sk_sockets_allocated_inc(sk);
+ 	sk->sk_rcvbuf = sock_net(sk)->ipv4.sysctl_tcp_rmem[1];
+ 	sk->sk_sndbuf = sock_net(sk)->ipv4.sysctl_tcp_wmem[1];
+@@ -2622,7 +2631,6 @@ static void __mptcp_destroy_sock(struct sock *sk)
+ 	sk_stream_kill_queues(sk);
+ 	xfrm_sk_free_policy(sk);
+ 
+-	tcp_cleanup_congestion_control(sk);
+ 	sk_refcnt_debug_release(sk);
+ 	mptcp_dispose_initial_subflow(msk);
+ 	sock_put(sk);
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index edc0128730df..165c8b40b384 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -258,6 +258,7 @@ struct mptcp_sock {
+ 	} rcvq_space;
+ 
+ 	u32 setsockopt_seq;
++	char		ca_name[TCP_CA_NAME_MAX];
+ };
+ 
+ #define mptcp_lock_sock(___sk, cb) do {					\
+diff --git a/net/mptcp/sockopt.c b/net/mptcp/sockopt.c
+index 00d941b66c1e..a79798189599 100644
+--- a/net/mptcp/sockopt.c
++++ b/net/mptcp/sockopt.c
+@@ -547,7 +547,7 @@ static int mptcp_setsockopt_sol_tcp_congestion(struct mptcp_sock *msk, sockptr_t
+ 	}
+ 
+ 	if (ret == 0)
+-		tcp_set_congestion_control(sk, name, false, cap_net_admin);
++		strcpy(msk->ca_name, name);
+ 
+ 	release_sock(sk);
+ 	return ret;
+@@ -705,7 +705,7 @@ static void sync_socket_options(struct mptcp_sock *msk, struct sock *ssk)
+ 	sock_valbool_flag(ssk, SOCK_DBG, sock_flag(sk, SOCK_DBG));
+ 
+ 	if (inet_csk(sk)->icsk_ca_ops != inet_csk(ssk)->icsk_ca_ops)
+-		tcp_set_congestion_control(ssk, inet_csk(sk)->icsk_ca_ops->name, false, true);
++		tcp_set_congestion_control(ssk, msk->ca_name, false, true);
+ }
+ 
+ static void __mptcp_sockopt_sync(struct mptcp_sock *msk, struct sock *ssk)
+-- 
+2.26.2
+

@@ -1,0 +1,96 @@
+Git-commit: 3241a9c029344ca4aa0ef1fa9f0f010d5bbc2a85
+Message-Id: <3241a9c029344ca4aa0ef1fa9f0f010d5bbc2a85.1637071648.git.geliang.tang@suse.com>
+From: Florian Westphal <fw@strlen.de>
+Date: Fri, 24 Sep 2021 14:12:38 -0700
+Subject: [PATCH] mptcp: re-arm retransmit timer if data is pending
+References: bsn#2
+Patch-mainline: v5.16-rc1
+
+The retransmit head will be NULL in case there is no in-flight data
+(meaning all data injected into network has been acked).
+
+In that case the retransmit timer is stopped.
+
+This is only correct if there is no more pending, not-yet-sent data.
+
+If there is, the retransmit timer needs to set the PENDING bit again so
+that mptcp tries to send the remaining (new) data once a subflow can accept
+more data.
+
+Also, mptcp_subflow_get_retrans() has to be called unconditionally.
+
+This function checks for subflows that have become unresponsive and marks
+them as stale, so in the case where the rtx queue is empty, subflows
+will never be marked stale which prevents available backup subflows from
+becoming eligible for transmit.
+
+Closes: https://github.com/multipath-tcp/mptcp_net-next/issues/226
+Acked-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Florian Westphal <fw@strlen.de>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ net/mptcp/protocol.c | 21 ++++++++++++++++++---
+ 1 file changed, 18 insertions(+), 3 deletions(-)
+
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -1098,7 +1098,8 @@ out:
+ 	if (cleaned && tcp_under_memory_pressure(sk))
+ 		__mptcp_mem_reclaim_partial(sk);
+ 
+-	if (snd_una == READ_ONCE(msk->snd_nxt) && !msk->recovery) {
++	if (snd_una == READ_ONCE(msk->snd_nxt) &&
++	    snd_una == READ_ONCE(msk->write_seq)) {
+ 		if (mptcp_timer_pending(sk) && !mptcp_data_fin_enabled(msk))
+ 			mptcp_stop_timer(sk);
+ 	} else {
+@@ -1541,6 +1542,13 @@ static void mptcp_update_post_push(struc
+ 		msk->snd_nxt = snd_nxt_new;
+ }
+ 
++static void mptcp_check_and_set_pending(struct sock *sk)
++{
++	if (mptcp_send_head(sk) &&
++	    !test_bit(MPTCP_PUSH_PENDING, &mptcp_sk(sk)->flags))
++		set_bit(MPTCP_PUSH_PENDING, &mptcp_sk(sk)->flags);
++}
++
+ void __mptcp_push_pending(struct sock *sk, unsigned int flags)
+ {
+ 	struct sock *prev_ssk = NULL, *ssk = NULL;
+@@ -2384,6 +2392,9 @@ static void __mptcp_retrans(struct sock
+ 	int ret;
+ 
+ 	mptcp_clean_una_wakeup(sk);
++
++	/* first check ssk: need to kick "stale" logic */
++	ssk = mptcp_subflow_get_retrans(msk);
+ 	dfrag = mptcp_rtx_head(sk);
+ 	if (!dfrag) {
+ 		if (mptcp_data_fin_enabled(msk)) {
+@@ -2396,10 +2407,12 @@ static void __mptcp_retrans(struct sock
+ 			goto reset_timer;
+ 		}
+ 
+-		return;
++		if (!mptcp_send_head(sk))
++			return;
++
++		goto reset_timer;
+ 	}
+ 
+-	ssk = mptcp_subflow_get_retrans(msk);
+ 	if (!ssk)
+ 		goto reset_timer;
+ 
+@@ -2426,6 +2439,8 @@ static void __mptcp_retrans(struct sock
+ 	release_sock(ssk);
+ 
+ reset_timer:
++	mptcp_check_and_set_pending(sk);
++
+ 	if (!mptcp_timer_pending(sk))
+ 		mptcp_reset_timer(sk);
+ }

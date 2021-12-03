@@ -1,0 +1,105 @@
+Git-commit: d0cc298745f5abb3c43319cb9485daf3471d6f94
+Message-Id: <d0cc298745f5abb3c43319cb9485daf3471d6f94.1637072659.git.geliang.tang@suse.com>
+From: Geliang Tang <geliangtang@gmail.com>
+Date: Thu, 17 Jun 2021 16:46:08 -0700
+Subject: [PATCH] mptcp: generate the data checksum
+References: bsn#2
+Patch-mainline: v5.14-rc1
+
+This patch added a new member named csum in struct mptcp_ext, implemented
+a new function named mptcp_generate_data_checksum().
+
+Generate the data checksum in mptcp_sendmsg_frag, save it in mpext->csum.
+
+Note that we must generate the csum for zero window probe, too.
+
+Do the csum update incrementally, to avoid multiple csum computation
+when the data is appended to existing skb.
+
+Note that in a later patch we will skip unneeded csum related operation.
+Changes not included here to keep the delta small.
+
+Co-developed-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Geliang Tang <geliangtang@gmail.com>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ include/net/mptcp.h  |  1 +
+ net/mptcp/protocol.c | 18 +++++++++++++++++-
+ net/mptcp/protocol.h |  7 +++++++
+ 3 files changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/include/net/mptcp.h b/include/net/mptcp.h
+index 83f23774b908..23bbd439e115 100644
+--- a/include/net/mptcp.h
++++ b/include/net/mptcp.h
+@@ -23,6 +23,7 @@ struct mptcp_ext {
+ 	u64		data_seq;
+ 	u32		subflow_seq;
+ 	u16		data_len;
++	__sum16		csum;
+ 	u8		use_map:1,
+ 			dsn64:1,
+ 			data_fin:1,
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index 2caca0dc2c1c..f0da067301f6 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -1308,6 +1308,18 @@ static bool mptcp_alloc_tx_skb(struct sock *sk, struct sock *ssk)
+ 	return __mptcp_alloc_tx_skb(sk, ssk, sk->sk_allocation);
+ }
+ 
++/* note: this always recompute the csum on the whole skb, even
++ * if we just appended a single frag. More status info needed
++ */
++static void mptcp_update_data_checksum(struct sk_buff *skb, int added)
++{
++	struct mptcp_ext *mpext = mptcp_get_ext(skb);
++	__wsum csum = ~csum_unfold(mpext->csum);
++	int offset = skb->len - added;
++
++	mpext->csum = csum_fold(csum_block_add(csum, skb_checksum(skb, offset, added, 0), offset));
++}
++
+ static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
+ 			      struct mptcp_data_frag *dfrag,
+ 			      struct mptcp_sendmsg_info *info)
+@@ -1402,10 +1414,14 @@ static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
+ 	if (zero_window_probe) {
+ 		mptcp_subflow_ctx(ssk)->rel_write_seq += ret;
+ 		mpext->frozen = 1;
+-		ret = 0;
++		if (READ_ONCE(msk->csum_enabled))
++			mptcp_update_data_checksum(tail, ret);
+ 		tcp_push_pending_frames(ssk);
++		return 0;
+ 	}
+ out:
++	if (READ_ONCE(msk->csum_enabled))
++		mptcp_update_data_checksum(tail, ret);
+ 	mptcp_subflow_ctx(ssk)->rel_write_seq += ret;
+ 	return ret;
+ }
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index 1fc6693e257e..4913ac7b6d19 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -336,6 +336,13 @@ static inline struct mptcp_data_frag *mptcp_rtx_head(const struct sock *sk)
+ 	return list_first_entry_or_null(&msk->rtx_queue, struct mptcp_data_frag, list);
+ }
+ 
++struct csum_pseudo_header {
++	__be64 data_seq;
++	__be32 subflow_seq;
++	__be16 data_len;
++	__sum16 csum;
++};
++
+ struct mptcp_subflow_request_sock {
+ 	struct	tcp_request_sock sk;
+ 	u16	mp_capable : 1,
+-- 
+2.26.2
+

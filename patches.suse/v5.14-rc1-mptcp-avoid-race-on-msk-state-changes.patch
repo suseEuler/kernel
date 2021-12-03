@@ -1,0 +1,145 @@
+Git-commit: 490274b47468793e3e157c2df6b2da0e646cc4a9
+Message-Id: <490274b47468793e3e157c2df6b2da0e646cc4a9.1637072414.git.geliang.tang@suse.com>
+From: Paolo Abeni <pabeni@redhat.com>
+Date: Mon, 21 Jun 2021 17:33:08 -0700
+Subject: [PATCH] mptcp: avoid race on msk state changes
+References: bsn#2
+Patch-mainline: v5.14-rc1
+
+The msk socket state is currently updated in a few spots without
+owning the msk socket lock itself.
+
+Some of such operations are safe, as they happens before exposing
+the msk socket to user-space and can't race with other changes.
+
+A couple of them, at connect time, can actually race with close()
+or shutdown(), leaving breaking the socket state machine.
+
+This change addresses the issue moving such update under the msk
+socket lock with the usual:
+
+<acquire spinlock>
+<check sk lock onwers>
+<ev defer to release_cb>
+
+scheme.
+
+Closes: https://github.com/multipath-tcp/mptcp_net-next/issues/56
+Fixes: 8fd738049ac3 ("mptcp: fallback in case of simultaneous connect")
+Fixes: c3c123d16c0e ("net: mptcp: don't hang in mptcp_sendmsg() after TCP fallback")
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ net/mptcp/protocol.c |  5 +++++
+ net/mptcp/protocol.h |  2 ++
+ net/mptcp/subflow.c  | 30 ++++++++++++++++++++++--------
+ 3 files changed, 29 insertions(+), 8 deletions(-)
+
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -2896,6 +2896,11 @@ static void mptcp_release_cb(struct sock
+ 		spin_lock_bh(&sk->sk_lock.slock);
+ 	}
+ 
++	/* be sure to set the current sk state before tacking actions
++	 * depending on sk_state
++	 */
++	if (test_and_clear_bit(MPTCP_CONNECTED, &mptcp_sk(sk)->flags))
++		__mptcp_set_connected(sk);
+ 	if (test_and_clear_bit(MPTCP_CLEAN_UNA, &mptcp_sk(sk)->flags))
+ 		__mptcp_clean_una_wakeup(sk);
+ 	if (test_and_clear_bit(MPTCP_ERROR_REPORT, &mptcp_sk(sk)->flags))
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -113,6 +113,7 @@
+ #define MPTCP_RETRANSMIT	9
+ 
+ #define MPTCP_WORK_SYNC_SETSOCKOPT 10
++#define MPTCP_CONNECTED		11
+ 
+ static inline bool before64(__u64 seq1, __u64 seq2)
+ {
+@@ -601,6 +602,7 @@ void mptcp_get_options(const struct sock
+ 		       struct mptcp_options_received *mp_opt);
+ 
+ void mptcp_finish_connect(struct sock *sk);
++void __mptcp_set_connected(struct sock *sk);
+ static inline bool mptcp_is_fully_established(struct sock *sk)
+ {
+ 	return inet_sk_state_load(sk) == TCP_ESTABLISHED &&
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@ -373,6 +373,24 @@ static bool subflow_use_different_dport(
+ 	return inet_sk(sk)->inet_dport != inet_sk((struct sock *)msk)->inet_dport;
+ }
+ 
++void __mptcp_set_connected(struct sock *sk)
++{
++	if (sk->sk_state == TCP_SYN_SENT) {
++		inet_sk_state_store(sk, TCP_ESTABLISHED);
++		sk->sk_state_change(sk);
++	}
++}
++
++static void mptcp_set_connected(struct sock *sk)
++{
++	mptcp_data_lock(sk);
++	if (!sock_owned_by_user(sk))
++		__mptcp_set_connected(sk);
++	else
++		set_bit(MPTCP_CONNECTED, &mptcp_sk(sk)->flags);
++	mptcp_data_unlock(sk);
++}
++
+ static void subflow_finish_connect(struct sock *sk, const struct sk_buff *skb)
+ {
+ 	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(sk);
+@@ -381,10 +399,6 @@ static void subflow_finish_connect(struc
+ 
+ 	subflow->icsk_af_ops->sk_rx_dst_set(sk, skb);
+ 
+-	if (inet_sk_state_load(parent) == TCP_SYN_SENT) {
+-		inet_sk_state_store(parent, TCP_ESTABLISHED);
+-		parent->sk_state_change(parent);
+-	}
+ 
+ 	/* be sure no special action on any packet other than syn-ack */
+ 	if (subflow->conn_finished)
+@@ -417,6 +431,7 @@ static void subflow_finish_connect(struc
+ 			 subflow->remote_key);
+ 		MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_MPCAPABLEACTIVEACK);
+ 		mptcp_finish_connect(sk);
++		mptcp_set_connected(parent);
+ 	} else if (subflow->request_join) {
+ 		u8 hmac[SHA256_DIGEST_SIZE];
+ 
+@@ -457,6 +472,7 @@ static void subflow_finish_connect(struc
+ 	} else if (mptcp_check_fallback(sk)) {
+ fallback:
+ 		mptcp_rcv_space_init(mptcp_sk(parent), sk);
++		mptcp_set_connected(parent);
+ 	}
+ 	return;
+ 
+@@ -564,6 +580,7 @@ static void mptcp_sock_destruct(struct s
+ 
+ static void mptcp_force_close(struct sock *sk)
+ {
++	/* the msk is not yet exposed to user-space */
+ 	inet_sk_state_store(sk, TCP_CLOSE);
+ 	sk_common_release(sk);
+ }
+@@ -1577,10 +1594,7 @@ static void subflow_state_change(struct
+ 		mptcp_rcv_space_init(mptcp_sk(parent), sk);
+ 		pr_fallback(mptcp_sk(parent));
+ 		subflow->conn_finished = 1;
+-		if (inet_sk_state_load(parent) == TCP_SYN_SENT) {
+-			inet_sk_state_store(parent, TCP_ESTABLISHED);
+-			parent->sk_state_change(parent);
+-		}
++		mptcp_set_connected(parent);
+ 	}
+ 
+ 	/* as recvmsg() does not acquire the subflow socket for ssk selection

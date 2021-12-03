@@ -1,0 +1,134 @@
+Git-commit: ee285257a9c1bc73ad095d8a3aa5d04b7da4990f
+Message-Id: <ee285257a9c1bc73ad095d8a3aa5d04b7da4990f.1637072116.git.geliang.tang@suse.com>
+From: Geliang Tang <geliangtang@xiaomi.com>
+Date: Tue, 17 Aug 2021 15:07:22 -0700
+Subject: [PATCH] mptcp: drop flags and ifindex arguments
+References: bsn#2
+Patch-mainline: v5.15-rc1
+
+This patch added a new helper mptcp_pm_get_flags_and_ifindex_by_id(),
+and used it in __mptcp_subflow_connect() to get the flags and ifindex
+values.
+
+Then the two arguments flags and ifindex of __mptcp_subflow_connect()
+can be dropped.
+
+Signed-off-by: Geliang Tang <geliangtang@xiaomi.com>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ net/mptcp/pm_netlink.c | 26 +++++++++++++++++++++++---
+ net/mptcp/protocol.h   |  5 +++--
+ net/mptcp/subflow.c    |  7 +++++--
+ 3 files changed, 31 insertions(+), 7 deletions(-)
+
+diff --git a/net/mptcp/pm_netlink.c b/net/mptcp/pm_netlink.c
+index ac0aa6faacfa..64a39f30659f 100644
+--- a/net/mptcp/pm_netlink.c
++++ b/net/mptcp/pm_netlink.c
+@@ -462,8 +462,7 @@ static void mptcp_pm_create_subflow_or_signal_addr(struct mptcp_sock *msk)
+ 			check_work_pending(msk);
+ 			remote_address((struct sock_common *)sk, &remote);
+ 			spin_unlock_bh(&msk->pm.lock);
+-			__mptcp_subflow_connect(sk, &local->addr, &remote,
+-						local->flags, local->ifindex);
++			__mptcp_subflow_connect(sk, &local->addr, &remote);
+ 			spin_lock_bh(&msk->pm.lock);
+ 			return;
+ 		}
+@@ -518,7 +517,7 @@ static void mptcp_pm_nl_add_addr_received(struct mptcp_sock *msk)
+ 	local.family = remote.family;
+ 
+ 	spin_unlock_bh(&msk->pm.lock);
+-	__mptcp_subflow_connect(sk, &local, &remote, 0, 0);
++	__mptcp_subflow_connect(sk, &local, &remote);
+ 	spin_lock_bh(&msk->pm.lock);
+ 
+ add_addr_echo:
+@@ -1105,6 +1104,27 @@ __lookup_addr_by_id(struct pm_nl_pernet *pernet, unsigned int id)
+ 	return NULL;
+ }
+ 
++int mptcp_pm_get_flags_and_ifindex_by_id(struct net *net, unsigned int id,
++					 u8 *flags, int *ifindex)
++{
++	struct mptcp_pm_addr_entry *entry;
++
++	*flags = 0;
++	*ifindex = 0;
++
++	if (id) {
++		rcu_read_lock();
++		entry = __lookup_addr_by_id(net_generic(net, pm_nl_pernet_id), id);
++		if (entry) {
++			*flags = entry->flags;
++			*ifindex = entry->ifindex;
++		}
++		rcu_read_unlock();
++	}
++
++	return 0;
++}
++
+ static bool remove_anno_list_by_saddr(struct mptcp_sock *msk,
+ 				      struct mptcp_addr_info *addr)
+ {
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index 8bdd038def38..bc1bfd7ac9c1 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -577,8 +577,7 @@ struct socket *__mptcp_nmpc_socket(const struct mptcp_sock *msk);
+ 
+ /* called with sk socket lock held */
+ int __mptcp_subflow_connect(struct sock *sk, const struct mptcp_addr_info *loc,
+-			    const struct mptcp_addr_info *remote,
+-			    u8 flags, int ifindex);
++			    const struct mptcp_addr_info *remote);
+ int mptcp_subflow_create_socket(struct sock *sk, struct socket **new_sock);
+ void mptcp_info2sockaddr(const struct mptcp_addr_info *info,
+ 			 struct sockaddr_storage *addr,
+@@ -733,6 +732,8 @@ mptcp_pm_del_add_timer(struct mptcp_sock *msk,
+ struct mptcp_pm_add_entry *
+ mptcp_lookup_anno_list_by_saddr(struct mptcp_sock *msk,
+ 				struct mptcp_addr_info *addr);
++int mptcp_pm_get_flags_and_ifindex_by_id(struct net *net, unsigned int id,
++					 u8 *flags, int *ifindex);
+ 
+ int mptcp_pm_announce_addr(struct mptcp_sock *msk,
+ 			   const struct mptcp_addr_info *addr,
+diff --git a/net/mptcp/subflow.c b/net/mptcp/subflow.c
+index 1151926d335b..8c43aa14897a 100644
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@ -1355,8 +1355,7 @@ void mptcp_info2sockaddr(const struct mptcp_addr_info *info,
+ }
+ 
+ int __mptcp_subflow_connect(struct sock *sk, const struct mptcp_addr_info *loc,
+-			    const struct mptcp_addr_info *remote,
+-			    u8 flags, int ifindex)
++			    const struct mptcp_addr_info *remote)
+ {
+ 	struct mptcp_sock *msk = mptcp_sk(sk);
+ 	struct mptcp_subflow_context *subflow;
+@@ -1367,6 +1366,8 @@ int __mptcp_subflow_connect(struct sock *sk, const struct mptcp_addr_info *loc,
+ 	struct sock *ssk;
+ 	u32 remote_token;
+ 	int addrlen;
++	int ifindex;
++	u8 flags;
+ 	int err;
+ 
+ 	if (!mptcp_is_fully_established(sk))
+@@ -1390,6 +1391,8 @@ int __mptcp_subflow_connect(struct sock *sk, const struct mptcp_addr_info *loc,
+ 		local_id = err;
+ 	}
+ 
++	mptcp_pm_get_flags_and_ifindex_by_id(sock_net(sk), local_id,
++					     &flags, &ifindex);
+ 	subflow->remote_key = msk->remote_key;
+ 	subflow->local_key = msk->local_key;
+ 	subflow->token = msk->token;
+-- 
+2.26.2
+

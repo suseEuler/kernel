@@ -1,0 +1,102 @@
+Git-commit: 0625118115cf2ee8e435bf86d1c1f0bfdee9d7c8
+Message-Id: <0625118115cf2ee8e435bf86d1c1f0bfdee9d7c8.1637072608.git.geliang.tang@suse.com>
+From: Geliang Tang <geliangtang@gmail.com>
+Date: Thu, 17 Jun 2021 16:46:13 -0700
+Subject: [PATCH] mptcp: add csum_reqd in mptcp_options_received
+References: bsn#2
+Patch-mainline: v5.14-rc1
+
+This patch added a new flag csum_reqd in struct mptcp_options_received, if
+the flag MPTCP_CAP_CHECKSUM_REQD is set in the receiving MP_CAPABLE
+suboption, set this flag.
+
+In mptcp_sk_clone and subflow_finish_connect, if the csum_reqd flag is set,
+enable the msk->csum_enabled flag.
+
+Acked-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Geliang Tang <geliangtang@gmail.com>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ net/mptcp/options.c  | 7 ++++---
+ net/mptcp/protocol.c | 2 ++
+ net/mptcp/protocol.h | 1 +
+ net/mptcp/subflow.c  | 2 ++
+ 4 files changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/net/mptcp/options.c b/net/mptcp/options.c
+index ae69059583a7..2e2551590ecd 100644
+--- a/net/mptcp/options.c
++++ b/net/mptcp/options.c
+@@ -71,11 +71,9 @@ static void mptcp_parse_option(const struct sk_buff *skb,
+ 		 * "If a checksum is not present when its use has been
+ 		 * negotiated, the receiver MUST close the subflow with a RST as
+ 		 * it is considered broken."
+-		 *
+-		 * We don't implement DSS checksum - fall back to TCP.
+ 		 */
+ 		if (flags & MPTCP_CAP_CHECKSUM_REQD)
+-			break;
++			mp_opt->csum_reqd = 1;
+ 
+ 		mp_opt->mp_capable = 1;
+ 		if (opsize >= TCPOLEN_MPTCP_MPC_SYNACK) {
+@@ -327,6 +325,8 @@ void mptcp_get_options(const struct sock *sk,
+ 		       const struct sk_buff *skb,
+ 		       struct mptcp_options_received *mp_opt)
+ {
++	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(sk);
++	struct mptcp_sock *msk = mptcp_sk(subflow->conn);
+ 	const struct tcphdr *th = tcp_hdr(skb);
+ 	const unsigned char *ptr;
+ 	int length;
+@@ -342,6 +342,7 @@ void mptcp_get_options(const struct sock *sk,
+ 	mp_opt->dss = 0;
+ 	mp_opt->mp_prio = 0;
+ 	mp_opt->reset = 0;
++	mp_opt->csum_reqd = READ_ONCE(msk->csum_enabled);
+ 
+ 	length = (th->doff * 4) - sizeof(struct tcphdr);
+ 	ptr = (const unsigned char *)(th + 1);
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index f0da067301f6..b6e5c0930533 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -2810,6 +2810,8 @@ struct sock *mptcp_sk_clone(const struct sock *sk,
+ 	msk->token = subflow_req->token;
+ 	msk->subflow = NULL;
+ 	WRITE_ONCE(msk->fully_established, false);
++	if (mp_opt->csum_reqd)
++		WRITE_ONCE(msk->csum_enabled, true);
+ 
+ 	msk->write_seq = subflow_req->idsn + 1;
+ 	msk->snd_nxt = msk->write_seq;
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index a7ed0b8eb9bc..66e5063ac6c9 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -133,6 +133,7 @@ struct mptcp_options_received {
+ 		rm_addr : 1,
+ 		mp_prio : 1,
+ 		echo : 1,
++		csum_reqd : 1,
+ 		backup : 1;
+ 	u32	token;
+ 	u32	nonce;
+diff --git a/net/mptcp/subflow.c b/net/mptcp/subflow.c
+index aa6b307b27c8..9b82ce635c6e 100644
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@ -405,6 +405,8 @@ static void subflow_finish_connect(struct sock *sk, const struct sk_buff *skb)
+ 			goto fallback;
+ 		}
+ 
++		if (mp_opt.csum_reqd)
++			WRITE_ONCE(mptcp_sk(parent)->csum_enabled, true);
+ 		subflow->mp_capable = 1;
+ 		subflow->can_ack = 1;
+ 		subflow->remote_key = mp_opt.sndr_key;
+-- 
+2.26.2
+

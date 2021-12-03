@@ -1,0 +1,76 @@
+Git-commit: 141694df6573b49aa4143c92556544b4b0bbda72
+Message-Id: <141694df6573b49aa4143c92556544b4b0bbda72.1637074928.git.geliang.tang@suse.com>
+From: Geliang Tang <geliangtang@gmail.com>
+Date: Thu, 10 Dec 2020 14:24:59 -0800
+Subject: [PATCH] mptcp: remove address when netlink flushes addrs
+References: bsn#2
+Patch-mainline: v5.11-rc1
+
+When the PM netlink flushes the addresses, invoke the remove address
+function mptcp_nl_remove_subflow_and_signal_addr to remove the addresses
+and the subflows. Since this function should not be invoked under lock,
+move __flush_addrs out of the pernet->lock.
+
+Acked-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Geliang Tang <geliangtang@gmail.com>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ net/mptcp/pm_netlink.c | 15 ++++++++++-----
+ 1 file changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/net/mptcp/pm_netlink.c b/net/mptcp/pm_netlink.c
+index 5151cfcd6962..9cc4eefaf080 100644
+--- a/net/mptcp/pm_netlink.c
++++ b/net/mptcp/pm_netlink.c
+@@ -867,13 +867,14 @@ static int mptcp_nl_cmd_del_addr(struct sk_buff *skb, struct genl_info *info)
+ 	return ret;
+ }
+ 
+-static void __flush_addrs(struct pm_nl_pernet *pernet)
++static void __flush_addrs(struct net *net, struct list_head *list)
+ {
+-	while (!list_empty(&pernet->local_addr_list)) {
++	while (!list_empty(list)) {
+ 		struct mptcp_pm_addr_entry *cur;
+ 
+-		cur = list_entry(pernet->local_addr_list.next,
++		cur = list_entry(list->next,
+ 				 struct mptcp_pm_addr_entry, list);
++		mptcp_nl_remove_subflow_and_signal_addr(net, &cur->addr);
+ 		list_del_rcu(&cur->list);
+ 		kfree_rcu(cur, rcu);
+ 	}
+@@ -890,11 +891,13 @@ static void __reset_counters(struct pm_nl_pernet *pernet)
+ static int mptcp_nl_cmd_flush_addrs(struct sk_buff *skb, struct genl_info *info)
+ {
+ 	struct pm_nl_pernet *pernet = genl_info_pm_nl(info);
++	LIST_HEAD(free_list);
+ 
+ 	spin_lock_bh(&pernet->lock);
+-	__flush_addrs(pernet);
++	list_splice_init(&pernet->local_addr_list, &free_list);
+ 	__reset_counters(pernet);
+ 	spin_unlock_bh(&pernet->lock);
++	__flush_addrs(sock_net(skb->sk), &free_list);
+ 	return 0;
+ }
+ 
+@@ -1156,10 +1159,12 @@ static void __net_exit pm_nl_exit_net(struct list_head *net_list)
+ 	struct net *net;
+ 
+ 	list_for_each_entry(net, net_list, exit_list) {
++		struct pm_nl_pernet *pernet = net_generic(net, pm_nl_pernet_id);
++
+ 		/* net is removed from namespace list, can't race with
+ 		 * other modifiers
+ 		 */
+-		__flush_addrs(net_generic(net, pm_nl_pernet_id));
++		__flush_addrs(net, &pernet->local_addr_list);
+ 	}
+ }
+ 
+-- 
+2.26.2
+

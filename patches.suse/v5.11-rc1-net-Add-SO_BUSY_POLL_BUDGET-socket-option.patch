@@ -1,0 +1,237 @@
+Git-commit: 7c951cafc0cb2e575f1d58677b95ac387ac0a5bd
+Message-Id: <7c951cafc0cb2e575f1d58677b95ac387ac0a5bd.1637152279.git.geliang.tang@suse.com>
+From: =?UTF-8?q?Bj=C3=B6rn=20T=C3=B6pel?= <bjorn.topel@intel.com>
+Date: Mon, 30 Nov 2020 19:51:57 +0100
+Subject: [PATCH] net: Add SO_BUSY_POLL_BUDGET socket option
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+References: bsn#2
+Patch-mainline: v5.11-rc1
+
+This option lets a user set a per socket NAPI budget for
+busy-polling. If the options is not set, it will use the default of 8.
+
+Signed-off-by: Björn Töpel <bjorn.topel@intel.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Reviewed-by: Jakub Kicinski <kuba@kernel.org>
+Link: https://lore.kernel.org/bpf/20201130185205.196029-3-bjorn.topel@gmail.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ arch/alpha/include/uapi/asm/socket.h  |  1 +
+ arch/mips/include/uapi/asm/socket.h   |  1 +
+ arch/parisc/include/uapi/asm/socket.h |  1 +
+ arch/sparc/include/uapi/asm/socket.h  |  1 +
+ fs/eventpoll.c                        |  3 ++-
+ include/net/busy_poll.h               |  7 +++++--
+ include/net/sock.h                    |  2 ++
+ include/uapi/asm-generic/socket.h     |  1 +
+ net/core/dev.c                        | 21 ++++++++++-----------
+ net/core/sock.c                       | 10 ++++++++++
+ 10 files changed, 34 insertions(+), 14 deletions(-)
+
+--- a/arch/alpha/include/uapi/asm/socket.h
++++ b/arch/alpha/include/uapi/asm/socket.h
+@@ -125,6 +125,7 @@
+ #define SO_DETACH_REUSEPORT_BPF 68
+ 
+ #define SO_PREFER_BUSY_POLL	69
++#define SO_BUSY_POLL_BUDGET	70
+ 
+ #if !defined(__KERNEL__)
+ 
+--- a/arch/mips/include/uapi/asm/socket.h
++++ b/arch/mips/include/uapi/asm/socket.h
+@@ -136,6 +136,7 @@
+ #define SO_DETACH_REUSEPORT_BPF 68
+ 
+ #define SO_PREFER_BUSY_POLL	69
++#define SO_BUSY_POLL_BUDGET	70
+ 
+ #if !defined(__KERNEL__)
+ 
+--- a/arch/parisc/include/uapi/asm/socket.h
++++ b/arch/parisc/include/uapi/asm/socket.h
+@@ -117,6 +117,7 @@
+ #define SO_DETACH_REUSEPORT_BPF 0x4042
+ 
+ #define SO_PREFER_BUSY_POLL	0x4043
++#define SO_BUSY_POLL_BUDGET	0x4044
+ 
+ #if !defined(__KERNEL__)
+ 
+--- a/arch/sparc/include/uapi/asm/socket.h
++++ b/arch/sparc/include/uapi/asm/socket.h
+@@ -118,6 +118,7 @@
+ #define SO_DETACH_REUSEPORT_BPF  0x0047
+ 
+ #define SO_PREFER_BUSY_POLL	 0x0048
++#define SO_BUSY_POLL_BUDGET	 0x0049
+ 
+ #if !defined(__KERNEL__)
+ 
+--- a/fs/eventpoll.c
++++ b/fs/eventpoll.c
+@@ -397,7 +397,8 @@ static void ep_busy_loop(struct eventpol
+ 	unsigned int napi_id = READ_ONCE(ep->napi_id);
+ 
+ 	if ((napi_id >= MIN_NAPI_ID) && net_busy_loop_on())
+-		napi_busy_loop(napi_id, nonblock ? NULL : ep_busy_loop_end, ep, false);
++		napi_busy_loop(napi_id, nonblock ? NULL : ep_busy_loop_end, ep, false,
++			       BUSY_POLL_BUDGET);
+ }
+ 
+ static inline void ep_reset_busy_poll_napi_id(struct eventpoll *ep)
+--- a/include/net/busy_poll.h
++++ b/include/net/busy_poll.h
+@@ -23,6 +23,8 @@
+  */
+ #define MIN_NAPI_ID ((unsigned int)(NR_CPUS + 1))
+ 
++#define BUSY_POLL_BUDGET 8
++
+ #ifdef CONFIG_NET_RX_BUSY_POLL
+ 
+ struct napi_struct;
+@@ -43,7 +45,7 @@ bool sk_busy_loop_end(void *p, unsigned
+ 
+ void napi_busy_loop(unsigned int napi_id,
+ 		    bool (*loop_end)(void *, unsigned long),
+-		    void *loop_end_arg, bool prefer_busy_poll);
++		    void *loop_end_arg, bool prefer_busy_poll, u16 budget);
+ 
+ #else /* CONFIG_NET_RX_BUSY_POLL */
+ static inline unsigned long net_busy_loop_on(void)
+@@ -106,7 +108,8 @@ static inline void sk_busy_loop(struct s
+ 
+ 	if (napi_id >= MIN_NAPI_ID)
+ 		napi_busy_loop(napi_id, nonblock ? NULL : sk_busy_loop_end, sk,
+-			       READ_ONCE(sk->sk_prefer_busy_poll));
++			       READ_ONCE(sk->sk_prefer_busy_poll),
++			       READ_ONCE(sk->sk_busy_poll_budget) ?: BUSY_POLL_BUDGET);
+ #endif
+ }
+ 
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -302,6 +302,7 @@ struct bpf_local_storage;
+   *	@sk_max_ack_backlog: listen backlog set in listen()
+   *	@sk_uid: user id of owner
+   *	@sk_prefer_busy_poll: prefer busypolling over softirq processing
++  *	@sk_busy_poll_budget: napi processing budget when busypolling
+   *	@sk_priority: %SO_PRIORITY setting
+   *	@sk_type: socket type (%SOCK_STREAM, etc)
+   *	@sk_protocol: which protocol this socket belongs in this network family
+@@ -482,6 +483,7 @@ struct sock {
+ 	kuid_t			sk_uid;
+ #ifdef CONFIG_NET_RX_BUSY_POLL
+ 	u8			sk_prefer_busy_poll;
++	u16			sk_busy_poll_budget;
+ #endif
+ 	spinlock_t		sk_peer_lock;
+ 	struct pid		*sk_peer_pid;
+--- a/include/uapi/asm-generic/socket.h
++++ b/include/uapi/asm-generic/socket.h
+@@ -120,6 +120,7 @@
+ #define SO_DETACH_REUSEPORT_BPF 68
+ 
+ #define SO_PREFER_BUSY_POLL	69
++#define SO_BUSY_POLL_BUDGET	70
+ 
+ #if !defined(__KERNEL__)
+ 
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -6557,8 +6557,6 @@ static struct napi_struct *napi_by_id(un
+ 
+ #if defined(CONFIG_NET_RX_BUSY_POLL)
+ 
+-#define BUSY_POLL_BUDGET 8
+-
+ static void __busy_poll_stop(struct napi_struct *napi, bool skip_schedule)
+ {
+ 	if (!skip_schedule) {
+@@ -6578,7 +6576,8 @@ static void __busy_poll_stop(struct napi
+ 	clear_bit(NAPI_STATE_SCHED, &napi->state);
+ }
+ 
+-static void busy_poll_stop(struct napi_struct *napi, void *have_poll_lock, bool prefer_busy_poll)
++static void busy_poll_stop(struct napi_struct *napi, void *have_poll_lock, bool prefer_busy_poll,
++			   u16 budget)
+ {
+ 	bool skip_schedule = false;
+ 	unsigned long timeout;
+@@ -6610,21 +6609,21 @@ static void busy_poll_stop(struct napi_s
+ 	/* All we really want here is to re-enable device interrupts.
+ 	 * Ideally, a new ndo_busy_poll_stop() could avoid another round.
+ 	 */
+-	rc = napi->poll(napi, BUSY_POLL_BUDGET);
++	rc = napi->poll(napi, budget);
+ 	/* We can't gro_normal_list() here, because napi->poll() might have
+ 	 * rearmed the napi (napi_complete_done()) in which case it could
+ 	 * already be running on another CPU.
+ 	 */
+-	trace_napi_poll(napi, rc, BUSY_POLL_BUDGET);
++	trace_napi_poll(napi, rc, budget);
+ 	netpoll_poll_unlock(have_poll_lock);
+-	if (rc == BUSY_POLL_BUDGET)
++	if (rc == budget)
+ 		__busy_poll_stop(napi, skip_schedule);
+ 	local_bh_enable();
+ }
+ 
+ void napi_busy_loop(unsigned int napi_id,
+ 		    bool (*loop_end)(void *, unsigned long),
+-		    void *loop_end_arg, bool prefer_busy_poll)
++		    void *loop_end_arg, bool prefer_busy_poll, u16 budget)
+ {
+ 	unsigned long start_time = loop_end ? busy_loop_current_time() : 0;
+ 	int (*napi_poll)(struct napi_struct *napi, int budget);
+@@ -6667,8 +6666,8 @@ restart:
+ 			have_poll_lock = netpoll_poll_lock(napi);
+ 			napi_poll = napi->poll;
+ 		}
+-		work = napi_poll(napi, BUSY_POLL_BUDGET);
+-		trace_napi_poll(napi, work, BUSY_POLL_BUDGET);
++		work = napi_poll(napi, budget);
++		trace_napi_poll(napi, work, budget);
+ 		gro_normal_list(napi);
+ count:
+ 		if (work > 0)
+@@ -6681,7 +6680,7 @@ count:
+ 
+ 		if (unlikely(need_resched())) {
+ 			if (napi_poll)
+-				busy_poll_stop(napi, have_poll_lock, prefer_busy_poll);
++				busy_poll_stop(napi, have_poll_lock, prefer_busy_poll, budget);
+ 			preempt_enable();
+ 			rcu_read_unlock();
+ 			cond_resched();
+@@ -6692,7 +6691,7 @@ count:
+ 		cpu_relax();
+ 	}
+ 	if (napi_poll)
+-		busy_poll_stop(napi, have_poll_lock, prefer_busy_poll);
++		busy_poll_stop(napi, have_poll_lock, prefer_busy_poll, budget);
+ 	preempt_enable();
+ out:
+ 	rcu_read_unlock();
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -1173,6 +1173,16 @@ set_sndbuf:
+ 		else
+ 			WRITE_ONCE(sk->sk_prefer_busy_poll, valbool);
+ 		break;
++	case SO_BUSY_POLL_BUDGET:
++		if (val > READ_ONCE(sk->sk_busy_poll_budget) && !capable(CAP_NET_ADMIN)) {
++			ret = -EPERM;
++		} else {
++			if (val < 0 || val > U16_MAX)
++				ret = -EINVAL;
++			else
++				WRITE_ONCE(sk->sk_busy_poll_budget, val);
++		}
++		break;
+ #endif
+ 
+ 	case SO_MAX_PACING_RATE:

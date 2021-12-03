@@ -1,0 +1,104 @@
+Git-commit: 18fc1a922e2416998c5d37c26c69aab940c07ffb
+Message-Id: <18fc1a922e2416998c5d37c26c69aab940c07ffb.1637072012.git.geliang.tang@suse.com>
+From: Yonglong Li <liyonglong@chinatelecom.cn>
+Date: Mon, 23 Aug 2021 18:05:40 -0700
+Subject: [PATCH] mptcp: make MPTCP_ADD_ADDR_SIGNAL and MPTCP_ADD_ADDR_ECHO
+ separate
+References: bsn#2
+Patch-mainline: v5.15-rc1
+
+Use MPTCP_ADD_ADDR_SIGNAL only for the action of sending ADD_ADDR, and
+use MPTCP_ADD_ADDR_ECHO only for the action of sending ADD_ADDR echo.
+
+Use msk->pm.local to save the announced ADD_ADDR address only, and reuse
+msk->pm.remote to save the announced ADD_ADDR_ECHO address.
+
+To prepare for the next patch.
+
+Co-developed-by: Geliang Tang <geliangtang@gmail.com>
+Signed-off-by: Geliang Tang <geliangtang@gmail.com>
+Signed-off-by: Yonglong Li <liyonglong@chinatelecom.cn>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ net/mptcp/pm.c         | 16 ++++++++++------
+ net/mptcp/pm_netlink.c |  4 ++--
+ net/mptcp/protocol.h   |  6 ++++++
+ 3 files changed, 18 insertions(+), 8 deletions(-)
+
+diff --git a/net/mptcp/pm.c b/net/mptcp/pm.c
+index 24e2f6f6178b..b1727cef1cfd 100644
+--- a/net/mptcp/pm.c
++++ b/net/mptcp/pm.c
+@@ -20,19 +20,23 @@ int mptcp_pm_announce_addr(struct mptcp_sock *msk,
+ {
+ 	u8 add_addr = READ_ONCE(msk->pm.addr_signal);
+ 
+-	pr_debug("msk=%p, local_id=%d", msk, addr->id);
++	pr_debug("msk=%p, local_id=%d, echo=%d", msk, addr->id, echo);
+ 
+ 	lockdep_assert_held(&msk->pm.lock);
+ 
+-	if (add_addr) {
+-		pr_warn("addr_signal error, add_addr=%d", add_addr);
++	if (add_addr &
++	    (echo ? BIT(MPTCP_ADD_ADDR_ECHO) : BIT(MPTCP_ADD_ADDR_SIGNAL))) {
++		pr_warn("addr_signal error, add_addr=%d, echo=%d", add_addr, echo);
+ 		return -EINVAL;
+ 	}
+ 
+-	msk->pm.local = *addr;
+-	add_addr |= BIT(MPTCP_ADD_ADDR_SIGNAL);
+-	if (echo)
++	if (echo) {
++		msk->pm.remote = *addr;
+ 		add_addr |= BIT(MPTCP_ADD_ADDR_ECHO);
++	} else {
++		msk->pm.local = *addr;
++		add_addr |= BIT(MPTCP_ADD_ADDR_SIGNAL);
++	}
+ 	if (addr->family == AF_INET6)
+ 		add_addr |= BIT(MPTCP_ADD_ADDR_IPV6);
+ 	if (addr->port)
+diff --git a/net/mptcp/pm_netlink.c b/net/mptcp/pm_netlink.c
+index 480f43ec1bfb..d8dfd872a6dd 100644
+--- a/net/mptcp/pm_netlink.c
++++ b/net/mptcp/pm_netlink.c
+@@ -317,14 +317,14 @@ static void mptcp_pm_add_timer(struct timer_list *timer)
+ 	if (!entry->addr.id)
+ 		return;
+ 
+-	if (mptcp_pm_should_add_signal(msk)) {
++	if (mptcp_pm_should_add_signal_addr(msk)) {
+ 		sk_reset_timer(sk, timer, jiffies + TCP_RTO_MAX / 8);
+ 		goto out;
+ 	}
+ 
+ 	spin_lock_bh(&msk->pm.lock);
+ 
+-	if (!mptcp_pm_should_add_signal(msk)) {
++	if (!mptcp_pm_should_add_signal_addr(msk)) {
+ 		pr_debug("retransmit ADD_ADDR id=%d", entry->addr.id);
+ 		mptcp_pm_announce_addr(msk, &entry->addr, false);
+ 		mptcp_pm_add_addr_send_ack(msk);
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index 40bc9d31e1fa..3c388c1a9de4 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -747,6 +747,12 @@ void mptcp_event_addr_announced(const struct mptcp_sock *msk, const struct mptcp
+ void mptcp_event_addr_removed(const struct mptcp_sock *msk, u8 id);
+ 
+ static inline bool mptcp_pm_should_add_signal(struct mptcp_sock *msk)
++{
++	return READ_ONCE(msk->pm.addr_signal) &
++		(BIT(MPTCP_ADD_ADDR_SIGNAL) | BIT(MPTCP_ADD_ADDR_ECHO));
++}
++
++static inline bool mptcp_pm_should_add_signal_addr(struct mptcp_sock *msk)
+ {
+ 	return READ_ONCE(msk->pm.addr_signal) & BIT(MPTCP_ADD_ADDR_SIGNAL);
+ }
+-- 
+2.26.2
+

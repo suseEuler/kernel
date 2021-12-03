@@ -1,0 +1,117 @@
+Git-commit: b7f653b297a4b2ed16a11883044077e6bf3e3481
+Message-Id: <b7f653b297a4b2ed16a11883044077e6bf3e3481.1637072760.git.geliang.tang@suse.com>
+From: Florian Westphal <fw@strlen.de>
+Date: Thu, 3 Jun 2021 16:24:32 -0700
+Subject: [PATCH] mptcp: receive path cmsg support
+References: bsn#2
+Patch-mainline: v5.14-rc1
+
+This adds support for SO_TIMESTAMP(NS).  Timestamps are passed to
+userspace in the same way as for plain tcp sockets.
+
+Acked-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Florian Westphal <fw@strlen.de>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ net/mptcp/protocol.c | 28 +++++++++++++++++++++++++---
+ 1 file changed, 25 insertions(+), 3 deletions(-)
+
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -39,10 +39,15 @@ struct mptcp_skb_cb {
+ 	u64 map_seq;
+ 	u64 end_seq;
+ 	u32 offset;
++	u8  has_rxtstamp:1;
+ };
+ 
+ #define MPTCP_SKB_CB(__skb)	((struct mptcp_skb_cb *)&((__skb)->cb[0]))
+ 
++enum {
++	MPTCP_CMSG_TS = BIT(0),
++};
++
+ static struct percpu_counter mptcp_sockets_allocated;
+ 
+ static void __mptcp_destroy_sock(struct sock *sk);
+@@ -272,6 +277,7 @@ static bool __mptcp_move_skb(struct mptc
+ 	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(ssk);
+ 	struct sock *sk = (struct sock *)msk;
+ 	struct sk_buff *tail;
++	bool has_rxtstamp;
+ 
+ 	__skb_unlink(skb, &ssk->sk_receive_queue);
+ 
+@@ -289,6 +295,8 @@ static bool __mptcp_move_skb(struct mptc
+ 		sk->sk_forward_alloc += amount;
+ 	}
+ 
++	has_rxtstamp = TCP_SKB_CB(skb)->has_rxtstamp;
++
+ 	/* the skb map_seq accounts for the skb offset:
+ 	 * mptcp_subflow_get_mapped_dsn() is based on the current tp->copied_seq
+ 	 * value
+@@ -296,6 +304,7 @@ static bool __mptcp_move_skb(struct mptc
+ 	MPTCP_SKB_CB(skb)->map_seq = mptcp_subflow_get_mapped_dsn(subflow);
+ 	MPTCP_SKB_CB(skb)->end_seq = MPTCP_SKB_CB(skb)->map_seq + copy_len;
+ 	MPTCP_SKB_CB(skb)->offset = offset;
++	MPTCP_SKB_CB(skb)->has_rxtstamp = has_rxtstamp;
+ 
+ 	if (MPTCP_SKB_CB(skb)->map_seq == msk->ack_seq) {
+ 		/* in sequence */
+@@ -1744,7 +1753,9 @@ static void mptcp_wait_data(struct sock
+ 
+ static int __mptcp_recvmsg_mskq(struct mptcp_sock *msk,
+ 				struct msghdr *msg,
+-				size_t len, int flags)
++				size_t len, int flags,
++				struct scm_timestamping_internal *tss,
++				int *cmsg_flags)
+ {
+ 	struct sk_buff *skb, *tmp;
+ 	int copied = 0;
+@@ -1764,6 +1775,11 @@ static int __mptcp_recvmsg_mskq(struct m
+ 			}
+ 		}
+ 
++		if (MPTCP_SKB_CB(skb)->has_rxtstamp) {
++			tcp_update_recv_tstamps(skb, tss);
++			*cmsg_flags |= MPTCP_CMSG_TS;
++		}
++
+ 		copied += count;
+ 
+ 		if (count < data_len) {
+@@ -1951,7 +1967,8 @@ static int mptcp_recvmsg(struct sock *sk
+ 			 int nonblock, int flags, int *addr_len)
+ {
+ 	struct mptcp_sock *msk = mptcp_sk(sk);
+-	int copied = 0;
++	struct scm_timestamping_internal tss;
++	int copied = 0, cmsg_flags = 0;
+ 	int target;
+ 	long timeo;
+ 
+@@ -1973,7 +1990,7 @@ static int mptcp_recvmsg(struct sock *sk
+ 	while (copied < len) {
+ 		int bytes_read;
+ 
+-		bytes_read = __mptcp_recvmsg_mskq(msk, msg, len - copied, flags);
++		bytes_read = __mptcp_recvmsg_mskq(msk, msg, len - copied, flags, &tss, &cmsg_flags);
+ 		if (unlikely(bytes_read < 0)) {
+ 			if (!copied)
+ 				copied = bytes_read;
+@@ -2054,6 +2071,11 @@ static int mptcp_recvmsg(struct sock *sk
+ 		set_bit(MPTCP_DATA_READY, &msk->flags);
+ 	}
+ out_err:
++	if (cmsg_flags && copied >= 0) {
++		if (cmsg_flags & MPTCP_CMSG_TS)
++			tcp_recv_timestamp(msg, sk, &tss);
++	}
++
+ 	pr_debug("msk=%p data_ready=%d rx queue empty=%d copied=%d",
+ 		 msk, test_bit(MPTCP_DATA_READY, &msk->flags),
+ 		 skb_queue_empty_lockless(&sk->sk_receive_queue), copied);
