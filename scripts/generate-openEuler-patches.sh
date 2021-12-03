@@ -39,6 +39,7 @@ ANOLISDIR=patches.anolis
 # Where the mainline kernel git is. SUSE kernel-source scripts use this $LINUX_GIT
 # env var for this location so we reuse it.
 MAINLINE_PWD=$LINUX_GIT
+OE_BUG_ID=22
 
 rm -rf $MAINLINEDIR $STABLEDIR $EULERDIR $HULKDIR $DRIVERDIR $MAILLISTDIR $VIRTDIR \
        $ZHAOXINDIR $RTOSDIR $ASCENDDIR $ANOLISDIR $UNIONDIR
@@ -98,12 +99,67 @@ fi
 # Update the last commit
 echo $LAST_COMMIT > FILE_WITH_LAST_COMMIT_FILE
 
+# insert metadata after "Subject: [PATCH]*" line
+# if 4 parameters are passed to the function:
+#	$1 - file name. $2 - message. $3 - OE_BUG_ID. $4 - OE commit
+# if 3 parameters are passed to the function:
+#	$1 - file name. $2 - commit. $3 - kernel version
+# if 2 parameters are passed to the function:
+#	$1 - file name. $2 - message
+insert_meta() {
+		LINE_AFTER_SUBJECT=$(grep -A 1 "^Subject" $f|tail -1|sed -e 's/ //g')
+		# if LINE_AFTER_SUBJECT is not empty, then Subject line is wrapped
+		if [ -z $LINE_AFTER_SUBJECT ]
+		then
+			if [ $# -eq 4 ]
+			then
+				sed -i -E -e "/^Subject: [PATCH]*/ a\Patch-mainline: $2\nReferences: bsn#$3\nopenEuler-commit: $4\n" $1
+			elif [ $# -eq 3 ]
+			then
+				sed -i -E -e "/^Subject: [PATCH]*/ a\Git-commit: $2\nPatch-mainline: $3\nReferences: $OVER\n" $1
+			elif [ $# -eq 2 ]
+			then
+				sed -i -E -e "/^Subject: [PATCH]*/ a\Patch-mainline: NO, $2\nReferences: $OVER\n" $1
+			fi
+		else
+			#sed -i -E -e "6i\Git-commit: $COMMIT\nPatch-mainline: $KERNELVERSION\nReferences: $OVER\n" $f
+			SUBJECT_LINENUM=$(sed -n -E '/^Subject/=' $f)
+			NEXT_SUBJECT_LINENUM=$(($SUBJECT_LINENUM+1))
+			if [ $# -eq 4 ]
+			then
+				sed -i -E -e "$NEXT_SUBJECT_LINENUM a\Patch-mainline: $2\nReferences: bsn#$3\nopenEuler-commit: $4\n" $1
+			elif [ $# -eq 3 ]
+			then
+				sed -i -E -e "$NEXT_SUBJECT_LINENUM a\Git-commit: $2\nPatch-mainline: $3\nReferences: $OVER\n" $1
+			elif [ $# -eq 2 ]
+			then
+				sed -i -E -e "$NEXT_SUBJECT_LINENUM a\Patch-mainline: NO, $2\nReferences: $OVER\n" $1
+			fi
+		fi
+}
+
 # $1 - COMMIT. $2 - f (file name + folder name)
 mainline_commit_handle() {
-		# insert new lines which start with "Git-commit:", "Patch-mainline:" and "References:"
-		# after "Subject: [PATCH]*" line
 		COMMIT=$1
 		f=$2
+
+		# in case the patch is from stable kernel though it claims "mainline inclusion" with
+		# the commit which is actually SHA1 in stable kernel!!!
+		COMMITLINE=$(head -30 $f | grep -A 2  "\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-" | grep -v revert | grep -E "[cC]ommit")
+		COL_STYLE=$(echo $COMMITLINE | awk '{print NF}')
+		if [ -n "$COMMITLINE" ] && [ $COL_STYLE -le 5 ]; then
+			# get SHA1 after split one line to multiple lines
+			UPDATE_COMMIT=$(echo $COMMITLINE | sed 's/ /\n/g' | grep '[a-f0-9]\{40\}')
+			if [ -n "$COMMIT" ]; then
+				COMMIT=$UPDATE_COMMIT
+			fi
+		fi
+
+		if [ -z $COMMIT ]; then
+			echo XXX no mainline commit!
+			echo -e "\t$f" >> $SERIES
+			return
+		fi
 
 		CURR_PWD=$PWD
 		cd $MAINLINE_PWD
@@ -117,15 +173,13 @@ mainline_commit_handle() {
 
 		KERNELVERSION=$(git tag --sort=taggerdate --contain $COMMIT|head -1)
 		if [ -z $KERNELVERSION ]; then
-			echo "Commit "$COMMIT" has empty KERNELVERSION!"
-			# the value can't be empty otherwise script would complain
-			KERNELVERSION=v5.55
+			echo "XXX $f Commit "$COMMIT" has empty KERNELVERSION!"
 		fi
 		cd $CURR_PWD
 
 		echo $KERNELVERSION in mainline tree
-		# Some commit (e.g. 21afaf181362) has "Subject:" in comments so need to match "^Subject:"...
-		sed -i -E -e "/^Subject: [PATCH]*/ a\Git-commit: $COMMIT\nPatch-mainline: $KERNELVERSION\nReferences: $OVER\n" $f
+
+		insert_meta $f $COMMIT $KERNELVERSION
 		# get patch file's name without directory
 		PURE_PATCH_NAME=$(echo $f | cut -d "/" -f 2-)
 		# get digit number from PURE_PATCH_NAME, eg, 0001 from 0001-aaa.patch
@@ -141,26 +195,26 @@ mainline_commit_handle() {
 		echo $NEW_PATCH_NAME
 		mv $f $MAINLINEDIR/$NEW_PATCH_NAME
 		echo $MAINLINEDIR/$NEW_PATCH_NAME
-		echo "        $MAINLINEDIR/$NEW_PATCH_NAME" >> $SERIES
+		echo -e "\t$MAINLINEDIR/$NEW_PATCH_NAME" >> $SERIES
 }
 
 rm $SERIES
 
 # patches in patches.rpmify (kernel-source tree) are necessary
-echo "        ########################################################"  >> $SERIES
-echo "        # Build fixes that apply to the vanilla kernel too." >> $SERIES
-echo "        # Patches in patches.rpmify are applied to both -vanilla" >> $SERIES
-echo "        # and patched flavors." >> $SERIES
-echo "        ########################################################"  >> $SERIES
+echo -e "\t########################################################"  >> $SERIES
+echo -e "\t# Build fixes that apply to the vanilla kernel too." >> $SERIES
+echo -e "\t# Patches in patches.rpmify are applied to both -vanilla" >> $SERIES
+echo -e "\t# and patched flavors." >> $SERIES
+echo -e "\t########################################################"  >> $SERIES
 
 # tar-up.sh checks this part
 echo -e >> $SERIES
-echo "        ########################################################"  >> $SERIES
-echo "        # sorted patches" >> $SERIES
-echo "        ########################################################"  >> $SERIES
-echo "        ########################################################"  >> $SERIES
-echo "        # end of sorted patches" >> $SERIES
-echo "        ########################################################"  >> $SERIES
+echo -e "\t########################################################"  >> $SERIES
+echo -e "\t# sorted patches" >> $SERIES
+echo -e "\t########################################################"  >> $SERIES
+echo -e "\t########################################################"  >> $SERIES
+echo -e "\t# end of sorted patches" >> $SERIES
+echo -e "\t########################################################"  >> $SERIES
 echo -e >> $SERIES
 
 cat $PATCH_FILES | while read line
@@ -185,104 +239,126 @@ do
 	UNION_INCLUSION=$(head -20 "$f" | grep  -m 1 -E "union inclusion")
 
 	if [ -n "$STABLE_INCLUSION" ]; then
+		# most stable patches are from mainline kernel
+		COMMITLINE=$(head -30 $f | grep -A 2  "\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-" | grep -v revert | grep -E "[cC]ommit")
+		if [ -n "$COMMITLINE" ]; then
+			# get SHA1 after split one line to multiple lines
+			COMMIT=$(echo $COMMITLINE | sed 's/ /\n/g' | grep '[a-f0-9]\{40\}')
+			if [ -n "$COMMIT" ]; then
+				echo $COMMIT
+				mainline_commit_handle $COMMIT $f
+				continue
+			fi
+		fi
+
 		echo $f STABLE_INCLUSION
-		sed -i -E -e "/^Subject: [PATCH]*/ a\Patch-mainline: NO, STABLE INCLUSION\nReferences: $OVER\n" $f
+		insert_meta $f 'STABLE INCLUSION'
 		if [ ! -d $STABLEDIR ]; then
 			mkdir $STABLEDIR
 		fi
 		mv $f $STABLEDIR
 		f=$(echo $f|awk -F '/' '{print $2}')
-		echo "        $STABLEDIR/$f" >> $SERIES
+		echo -e "\t$STABLEDIR/$f" >> $SERIES
 	elif [ -n "$ANOLIS_INCLUSION" ]; then
 		echo $f ANOLIS_INCLUSION
-		sed -i -E -e "/^Subject: [PATCH]*/ a\Patch-mainline: No, ANOLIS INCLUSION\nReferences: $OVER\n" $f
+		OECOMMIT=$(head -1 $f | awk '{print $2}')
+		insert_meta $f 'Not yet, from openEuler' $OE_BUG_ID $OECOMMIT
 		if [ ! -d $ANOLISDIR ]; then
 			mkdir $ANOLISDIR
 		fi
 		mv $f $ANOLISDIR
 		f=$(echo $f|awk -F '/' '{print $2}')
-		echo "        $ANOLISDIR/$f" >> $SERIES
+		echo -e "\t$ANOLISDIR/$f" >> $SERIES
 	elif [ -n "$UNION_INCLUSION" ]; then
 		echo $f UNION_INCLUSION
-		sed -i -E -e "/^Subject: [PATCH]*/ a\Patch-mainline: No, UNION INCLUSION\nReferences: $OVER\n" $f
+		OECOMMIT=$(head -1 $f | awk '{print $2}')
+		insert_meta $f 'Not yet, from openEuler' $OE_BUG_ID $OECOMMIT
 		if [ ! -d $UNIONDIR ]; then
 			mkdir $UNIONDIR
 		fi
 		mv $f $UNIONDIR
 		f=$(echo $f|awk -F '/' '{print $2}')
-		echo "        $UNIONDIR/$f" >> $SERIES
+		echo -e "\t$UNIONDIR/$f" >> $SERIES
 	elif [ -n "$EULER_INCLUSION" ]; then
 		echo $f EULER_INCLUSION
-		sed -i -E -e "/^Subject: [PATCH]*/ a\Patch-mainline: No, EULER INCLUSION\nReferences: $OVER\n" $f
+		OECOMMIT=$(head -1 $f | awk '{print $2}')
+		insert_meta $f 'Not yet, from openEuler' $OE_BUG_ID $OECOMMIT
 		if [ ! -d $EULERDIR ]; then
 			mkdir $EULERDIR
 		fi
 		mv $f $EULERDIR
 		f=$(echo $f|awk -F '/' '{print $2}')
-		echo "        $EULERDIR/$f" >> $SERIES
+		echo -e "\t$EULERDIR/$f" >> $SERIES
 	elif [ -n "$HULK_INCLUSION" ]; then
 		echo $f EULER_INCLUSION
-		sed -i -E -e "/^Subject: [PATCH]*/ a\Patch-mainline: No, HULK INCLUSION\nReferences: $OVER\n" $f
+		OECOMMIT=$(head -1 $f | awk '{print $2}')
+		insert_meta $f 'Not yet, from openEuler' $OE_BUG_ID $OECOMMIT
 		if [ ! -d $HULKDIR ]; then
 			mkdir $HULKDIR
 		fi
 		mv $f $HULKDIR
 		f=$(echo $f|awk -F '/' '{print $2}')
-		echo "        $HULKDIR/$f" >> $SERIES
+		echo -e "\t$HULKDIR/$f" >> $SERIES
 	elif [ -n "$DRIVER_INCLUSION" ]; then
 		echo $f DRIVER_INCLUSION
-		sed -i -E -e "/^Subject: [PATCH]*/ a\Patch-mainline: No, DRIVER INCLUSION\nReferences: $OVER\n" $f
+		OECOMMIT=$(head -1 $f | awk '{print $2}')
+		insert_meta $f 'Not yet, from openEuler' $OE_BUG_ID $OECOMMIT
 		if [ ! -d $DRIVERDIR ]; then
 			mkdir $DRIVERDIR
 		fi
 		mv $f $DRIVERDIR
 		f=$(echo $f|awk -F '/' '{print $2}')
-		echo "        $DRIVERDIR/$f" >> $SERIES
+		echo -e "\t$DRIVERDIR/$f" >> $SERIES
 	elif [ -n "$MAILLIST_INCLUSION" ]; then
 		echo $f MAILLIST_INCLUSION
-		sed -i -E -e "/^Subject: [PATCH]*/ a\Patch-mainline: No, MAILLIST INCLUSION\nReferences: $OVER\n" $f
+		OECOMMIT=$(head -1 $f | awk '{print $2}')
+		insert_meta $f 'Not yet, from openEuler' $OE_BUG_ID $OECOMMIT
 		if [ ! -d $MAILLISTDIR ]; then
 			mkdir $MAILLISTDIR
 		fi
 		mv $f $MAILLISTDIR
 		f=$(echo $f|awk -F '/' '{print $2}')
-		echo "        $MAILLISTDIR/$f" >> $SERIES
+		echo -e "\t$MAILLISTDIR/$f" >> $SERIES
 	elif [ -n "$VIRT_INCLUSION" ]; then
 		echo $f VIRT_INCLUSION
-		sed -i -E -e "/^Subject: [PATCH]*/ a\Patch-mainline: No, VIRT INCLUSION\nReferences: $OVER\n" $f
+		OECOMMIT=$(head -1 $f | awk '{print $2}')
+		insert_meta $f 'Not yet, from openEuler' $OE_BUG_ID $OECOMMIT
 		if [ ! -d $VIRTDIR ]; then
 			mkdir $VIRTDIR
 		fi
 		mv $f $VIRTDIR
 		f=$(echo $f|awk -F '/' '{print $2}')
-		echo "        $VIRTDIR/$f" >> $SERIES
+		echo -e "\t$VIRTDIR/$f" >> $SERIES
 	elif [ -n "$ZHAOXIN_INCLUSION" ]; then
 		echo $f ZHAOXIN_INCLUSION
-		sed -i -E -e "/^Subject: [PATCH]*/ a\Patch-mainline: No, ZHAOXIN INCLUSION\nReferences: $OVER\n" $f
+		OECOMMIT=$(head -1 $f | awk '{print $2}')
+		insert_meta $f 'Not yet, from openEuler' $OE_BUG_ID $OECOMMIT
 		if [ ! -d $ZHAOXINDIR ]; then
 			mkdir $ZHAOXINDIR
 		fi
 		mv $f $ZHAOXINDIR
 		f=$(echo $f|awk -F '/' '{print $2}')
-		echo "        $ZHAOXINDIR/$f" >> $SERIES
+		echo -e "\t$ZHAOXINDIR/$f" >> $SERIES
 	elif [ -n "$RTOS_INCLUSION" ]; then
 		echo $f RTOS_INCLUSION
-		sed -i -E -e "/^Subject: [PATCH]*/ a\Patch-mainline: No, RTOS INCLUSION\nReferences: $OVER\n" $f
+		OECOMMIT=$(head -1 $f | awk '{print $2}')
+		insert_meta $f 'Not yet, from openEuler' $OE_BUG_ID $OECOMMIT
 		if [ ! -d $RTOSDIR ]; then
 			mkdir $RTOSDIR
 		fi
 		mv $f $RTOSDIR
 		f=$(echo $f|awk -F '/' '{print $2}')
-		echo "        $RTOSDIR/$f" >> $SERIES
+		echo -e "\t$RTOSDIR/$f" >> $SERIES
 	elif [ -n "$ASCEND_INCLUSION" ]; then
 		echo $f ASCEND_INCLUSION
-		sed -i -E -e "/^Subject: [PATCH]*/ a\Patch-mainline: No, ASCEND INCLUSION\nReferences: $OVER\n" $f
+		OECOMMIT=$(head -1 $f | awk '{print $2}')
+		insert_meta $f 'Not yet, from openEuler' $OE_BUG_ID $OECOMMIT
 		if [ ! -d $ASCENDDIR ]; then
 			mkdir $ASCENDDIR
 		fi
 		mv $f $ASCENDDIR
 		f=$(echo $f|awk -F '/' '{print $2}')
-		echo "        $ASCENDDIR/$f" >> $SERIES
+		echo -e "\t$ASCENDDIR/$f" >> $SERIES
 	elif [ -n "$MAINLINE_INCLUSION" ]; then
 
 		COMMIT=$(head -20 $f | grep -v Subject | grep -m 1 -E "^commit [0-9a-z]{10}" "$f" | cut -d' ' -f2)
@@ -300,13 +376,13 @@ do
 			grep -m 1 -E "(nline inclusion)|(nline  inclusion)|(mainline-next inclusion)")
 		if [ -n "$STYLE0" ]; then
 			COMMITLINE=$(head -20 "$f" | grep -v Subject | \
-				     grep -m 1 -E "(commit:)|(commit)" | cut -d' ' -f2)
+				     grep -m 1 -E "(commit:)|(commit)" | awk '{print $2}')
 			NOT_YET_READY=$(echo $COMMITLINE | grep not-yet-available)
 			HTTP=$(echo $COMMITLINE | grep http)
 			FROM_KERNEL=$(echo $COMMITLINE | grep "from kernel")
 			if [ -n "$NOT_YET_READY" ] || [ -n "$HTTP" ]; then
-				echo "        $f" >> $SERIES
-				sed -i -E -e "/^Subject: [PATCH]*/ a\Patch-mainline: No, check it manually\nReferences: $OVER\n" $f
+				echo -e "\t$f" >> $SERIES
+				insert_meta $f 'check it manually'
 				echo $f is not in mainline tree yet!!!
 				continue
 			fi
@@ -324,8 +400,8 @@ do
 		if [ $COL_STYLE != 5 ] && [ $COL_STYLE != 4 ] && [ $COL_STYLE != 3 ]; then
 			echo $COL_STYLE
 			echo need XXX to handle the un-categorized $f manually!!!
-			echo "        $f" >> $SERIES
-			sed -i -E -e "/^Subject: [PATCH]*/ a\Patch-mainline: No, check it manually\nReferences: $OVER\n" $f
+			echo -e "\t$f" >> $SERIES
+			insert_meta $f 'check it manually'
 			continue;
 		fi
 
@@ -355,8 +431,8 @@ do
 				mainline_commit_handle $COMMIT $f
 			else
 				# [ commit 4f7b3e82589e0de723780198ec7983e427144c0a upstream ]
-				echo "        $f" >> $SERIES
-				sed -i -E -e "/^Subject: [PATCH]*/ a\Patch-mainline: No, check it manually\nReferences: $OVER\n" $f
+				echo -e "\t$f" >> $SERIES
+				insert_meta $f 'check it manually'
 				echo cannot find commit for $f do it manually
 			fi
 			continue
@@ -377,17 +453,17 @@ do
 		# style like "This reverts commit a6a0d7f89b3ecd0fd96540222f3f2ff8397a5c9b."
 		if [ -n "$COMMIT" ]; then
 			echo $f is not mainline commit
-			echo "        $f" >> $SERIES
-			sed -i -E -e "/^Subject: [PATCH]*/ a\Patch-mainline: No, check it manually\nReferences: $OVER\n" $f
+			echo -e "\t$f" >> $SERIES
+			insert_meta $f 'check it manually'
 			continue
 		fi
 
-		sed -i -E -e "/^Subject: [PATCH]*/ a\Patch-mainline: No, check it manually\nReferences: $OVER\n" $f
+		insert_meta $f 'check it manually'
 		echo XXX fuck another type for $f $COMMIT $KERNELVERSION!
 		continue
 	else
-		sed -i -E -e "/^Subject: [PATCH]*/ a\Patch-mainline: No, OTHERS\nReferences: $OVER\n" $f
-		echo "        $f" >> $SERIES
+		insert_meta $f 'OTHERS'
+		echo -e "\t$f" >> $SERIES
 		echo need to handle the un-categorized $f manually!!!
 	fi
 done
@@ -395,6 +471,6 @@ done
 echo -e >> $SERIES
 
 # patches in patches.suse (kernel-source tree) are necessary
-echo "        ########################################################"  >> $SERIES
-echo "        # kbuild/module infrastructure fixes" >> $SERIES
-echo "        ########################################################"  >> $SERIES
+echo -e "\t########################################################" >> $SERIES
+echo -e "\t# kbuild/module infrastructure fixes" >> $SERIES
+echo -e "\t########################################################" >> $SERIES
