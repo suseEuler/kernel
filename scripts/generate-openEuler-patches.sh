@@ -68,13 +68,17 @@ fi
 # generate patches for that commit.
 FILE_WITH_LAST_COMMIT=$PWD/fwlc-$OVER
 LAST_COMMIT=$(git log --no-merges --pretty="format:%H" -n1 $OVER)
+START_NUM=1
 if [ -e $FILE_WITH_LAST_COMMIT ]; then
-	UVER=$(cat $FILE_WITH_LAST_COMMIT)
+	# it contains two lines start with "last_commit=" and "last_num="
+	source $FILE_WITH_LAST_COMMIT
+	UVER=$last_commit
 	# in case openEuler kernel is not updated since last run
 	if [[ $LAST_COMMIT == $UVER* ]]; then
 		echo "No changes since last run"
 		exit 1
 	fi
+	START_NUM=$(($last_num+1))
 fi
 
 PATCHDIR=patches.others
@@ -90,7 +94,7 @@ PATCH_FILES=patches-file
 
 # Generate the patches
 # Need --no-renames as scripts/check-patchfmt requires it, and it's called by git commit hook
-git format-patch $UVER..$OVER -o $PATCHDIR --no-numbered --no-renames --signoff | tee $PATCH_FILES
+git format-patch $UVER..$OVER --start-number=$START_NUM -o $PATCHDIR --no-numbered --no-renames --signoff | tee $PATCH_FILES
 if [ $? != 0 ]; then
 	echo "Error: either upstream version ($UVER) or openEuler version ($OVER) is not correct!"
 	exit 1;
