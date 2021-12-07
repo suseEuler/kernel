@@ -1,0 +1,163 @@
+From 786998050cbc8ead32e6e9fcda2facb3bf3d198d Mon Sep 17 00:00:00 2001
+From: Lutz Pogrell <lutz.pogrell@cloud.ionos.com>
+Date: Thu, 26 Nov 2020 11:47:20 +0100
+Subject: [PATCH] block/rnbd-srv: close a mapped device from server side.
+Git-commit: 786998050cbc8ead32e6e9fcda2facb3bf3d198d
+Patch-mainline: v5.11-rc1
+References: bsn#1
+
+
+The forceful close of an exported device is required
+for the use case, when the client side hangs, is crashed,
+or is not accessible.
+
+There have been cases observed, where only some of
+the devices are to be cleaned up, but the session shall
+remain.
+
+When the device is to be exported to a different
+client host, server side cleanup is required.
+
+Signed-off-by: Lutz Pogrell <lutz.pogrell@cloud.ionos.com>
+Signed-off-by: Jack Wang <jinpu.wang@cloud.ionos.com>
+Reviewed-by: Gioh Kim <gi-oh.kim@cloud.ionos.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/block/rnbd/rnbd-srv-sysfs.c | 38 ++++++++++++++++++++++++++++-
+ drivers/block/rnbd/rnbd-srv.c       | 19 +++++++++++++--
+ drivers/block/rnbd/rnbd-srv.h       |  4 ++-
+ 3 files changed, 57 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/block/rnbd/rnbd-srv-sysfs.c b/drivers/block/rnbd/rnbd-srv-sysfs.c
+index 106775c074d1..08ffb492ebfa 100644
+--- a/drivers/block/rnbd/rnbd-srv-sysfs.c
++++ b/drivers/block/rnbd/rnbd-srv-sysfs.c
+@@ -120,10 +120,46 @@ static ssize_t mapping_path_show(struct kobject *kobj,
+ static struct kobj_attribute rnbd_srv_dev_session_mapping_path_attr =
+ 	__ATTR_RO(mapping_path);
+ 
++static ssize_t rnbd_srv_dev_session_force_close_show(struct kobject *kobj,
++					struct kobj_attribute *attr, char *page)
++{
++	return scnprintf(page, PAGE_SIZE, "Usage: echo 1 > %s\n",
++			 attr->attr.name);
++}
++
++static ssize_t rnbd_srv_dev_session_force_close_store(struct kobject *kobj,
++					struct kobj_attribute *attr,
++					const char *buf, size_t count)
++{
++	struct rnbd_srv_sess_dev *sess_dev;
++
++	sess_dev = container_of(kobj, struct rnbd_srv_sess_dev, kobj);
++
++	if (!sysfs_streq(buf, "1")) {
++		rnbd_srv_err(sess_dev, "%s: invalid value: '%s'\n",
++			      attr->attr.name, buf);
++		return -EINVAL;
++	}
++
++	rnbd_srv_info(sess_dev, "force close requested\n");
++
++	/* first remove sysfs itself to avoid deadlock */
++	sysfs_remove_file_self(&sess_dev->kobj, &attr->attr);
++	rnbd_srv_sess_dev_force_close(sess_dev);
++
++	return count;
++}
++
++static struct kobj_attribute rnbd_srv_dev_session_force_close_attr =
++	__ATTR(force_close, 0644,
++	       rnbd_srv_dev_session_force_close_show,
++	       rnbd_srv_dev_session_force_close_store);
++
+ static struct attribute *rnbd_srv_default_dev_sessions_attrs[] = {
+ 	&rnbd_srv_dev_session_access_mode_attr.attr,
+ 	&rnbd_srv_dev_session_ro_attr.attr,
+ 	&rnbd_srv_dev_session_mapping_path_attr.attr,
++	&rnbd_srv_dev_session_force_close_attr.attr,
+ 	NULL,
+ };
+ 
+@@ -145,7 +181,7 @@ static void rnbd_srv_sess_dev_release(struct kobject *kobj)
+ 	struct rnbd_srv_sess_dev *sess_dev;
+ 
+ 	sess_dev = container_of(kobj, struct rnbd_srv_sess_dev, kobj);
+-	rnbd_destroy_sess_dev(sess_dev);
++	rnbd_destroy_sess_dev(sess_dev, sess_dev->keep_id);
+ }
+ 
+ static struct kobj_type rnbd_srv_sess_dev_ktype = {
+diff --git a/drivers/block/rnbd/rnbd-srv.c b/drivers/block/rnbd/rnbd-srv.c
+index e1bc8b4cd592..d1ee72ed8384 100644
+--- a/drivers/block/rnbd/rnbd-srv.c
++++ b/drivers/block/rnbd/rnbd-srv.c
+@@ -212,12 +212,20 @@ static void rnbd_put_srv_dev(struct rnbd_srv_dev *dev)
+ 	kref_put(&dev->kref, destroy_device_cb);
+ }
+ 
+-void rnbd_destroy_sess_dev(struct rnbd_srv_sess_dev *sess_dev)
++void rnbd_destroy_sess_dev(struct rnbd_srv_sess_dev *sess_dev, bool keep_id)
+ {
+ 	DECLARE_COMPLETION_ONSTACK(dc);
+ 
+-	xa_erase(&sess_dev->sess->index_idr, sess_dev->device_id);
++	if (keep_id)
++		/* free the resources for the id but don't  */
++		/* allow to re-use the id itself because it */
++		/* is still used by the client              */
++		xa_cmpxchg(&sess_dev->sess->index_idr, sess_dev->device_id,
++			   sess_dev, NULL, 0);
++	else
++		xa_erase(&sess_dev->sess->index_idr, sess_dev->device_id);
+ 	synchronize_rcu();
++
+ 	sess_dev->destroy_comp = &dc;
+ 	rnbd_put_sess_dev(sess_dev);
+ 	wait_for_completion(&dc); /* wait for inflights to drop to zero */
+@@ -328,6 +336,13 @@ static int rnbd_srv_link_ev(struct rtrs_srv *rtrs,
+ 	}
+ }
+ 
++void rnbd_srv_sess_dev_force_close(struct rnbd_srv_sess_dev *sess_dev)
++{
++	rnbd_srv_destroy_dev_session_sysfs(sess_dev);
++	sess_dev->keep_id = true;
++
++}
++
+ static int process_msg_close(struct rtrs_srv *rtrs,
+ 			     struct rnbd_srv_session *srv_sess,
+ 			     void *data, size_t datalen, const void *usr,
+diff --git a/drivers/block/rnbd/rnbd-srv.h b/drivers/block/rnbd/rnbd-srv.h
+index 5a8544b5e74f..b157371c25ed 100644
+--- a/drivers/block/rnbd/rnbd-srv.h
++++ b/drivers/block/rnbd/rnbd-srv.h
+@@ -56,6 +56,7 @@ struct rnbd_srv_sess_dev {
+ 	struct rnbd_srv_dev		*dev;
+ 	struct kobject                  kobj;
+ 	u32                             device_id;
++	bool				keep_id;
+ 	fmode_t                         open_flags;
+ 	struct kref			kref;
+ 	struct completion               *destroy_comp;
+@@ -63,6 +64,7 @@ struct rnbd_srv_sess_dev {
+ 	enum rnbd_access_mode		access_mode;
+ };
+ 
++void rnbd_srv_sess_dev_force_close(struct rnbd_srv_sess_dev *sess_dev);
+ /* rnbd-srv-sysfs.c */
+ 
+ int rnbd_srv_create_dev_sysfs(struct rnbd_srv_dev *dev,
+@@ -73,6 +75,6 @@ int rnbd_srv_create_dev_session_sysfs(struct rnbd_srv_sess_dev *sess_dev);
+ void rnbd_srv_destroy_dev_session_sysfs(struct rnbd_srv_sess_dev *sess_dev);
+ int rnbd_srv_create_sysfs_files(void);
+ void rnbd_srv_destroy_sysfs_files(void);
+-void rnbd_destroy_sess_dev(struct rnbd_srv_sess_dev *sess_dev);
++void rnbd_destroy_sess_dev(struct rnbd_srv_sess_dev *sess_dev, bool keep_id);
+ 
+ #endif /* RNBD_SRV_H */
+-- 
+2.26.2
+

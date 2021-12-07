@@ -1,0 +1,235 @@
+From 2ece9ec62e5b276b4635d391c844b2ffcd10bbf1 Mon Sep 17 00:00:00 2001
+From: Jack Wang <jinpu.wang@cloud.ionos.com>
+Date: Mon, 21 Jun 2021 07:53:37 +0200
+Subject: [PATCH] RDMA/rtrs-clt: Write path fast memory registration
+Git-commit: 2ece9ec62e5b276b4635d391c844b2ffcd10bbf1
+Patch-mainline: v5.14-rc1
+References: bsn#1
+
+
+With fast memory registration in write path, we can reduce
+the memory consumption by using less max_send_sge, support IO bigger
+than 116 KB (29 segments * 4 KB) without splitting, and it also
+make the IO path more symmetric.
+
+To avoid some times MR reg failed, waiting for the invalidation to finish
+before the new mr reg. Introduce a refcount, only finish the request
+when both local invalidation and io reply are there.
+
+Link: https://lore.kernel.org/r/20210621055340.11789-3-jinpu.wang@ionos.com
+Signed-off-by: Jack Wang <jinpu.wang@cloud.ionos.com>
+Signed-off-by: Md Haris Iqbal <haris.iqbal@ionos.com>
+Signed-off-by: Dima Stepanov <dmitrii.stepanov@ionos.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/infiniband/ulp/rtrs/rtrs-clt.c | 100 ++++++++++++++++++-------
+ drivers/infiniband/ulp/rtrs/rtrs-clt.h |   1 +
+ 2 files changed, 74 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/infiniband/ulp/rtrs/rtrs-clt.c b/drivers/infiniband/ulp/rtrs/rtrs-clt.c
+index c451fae5a2b7..82c4a1273321 100644
+--- a/drivers/infiniband/ulp/rtrs/rtrs-clt.c
++++ b/drivers/infiniband/ulp/rtrs/rtrs-clt.c
+@@ -412,6 +412,7 @@ static void complete_rdma_req(struct rtrs_clt_io_req *req, int errno,
+ 				req->inv_errno = errno;
+ 			}
+ 
++			refcount_inc(&req->ref);
+ 			err = rtrs_inv_rkey(req);
+ 			if (unlikely(err)) {
+ 				rtrs_err(con->c.sess, "Send INV WR key=%#x: %d\n",
+@@ -427,10 +428,14 @@ static void complete_rdma_req(struct rtrs_clt_io_req *req, int errno,
+ 
+ 				return;
+ 			}
++			if (!refcount_dec_and_test(&req->ref))
++				return;
+ 		}
+ 		ib_dma_unmap_sg(sess->s.dev->ib_dev, req->sglist,
+ 				req->sg_cnt, req->dir);
+ 	}
++	if (!refcount_dec_and_test(&req->ref))
++		return;
+ 	if (sess->clt->mp_policy == MP_POLICY_MIN_INFLIGHT)
+ 		atomic_dec(&sess->stats->inflight);
+ 
+@@ -438,10 +443,9 @@ static void complete_rdma_req(struct rtrs_clt_io_req *req, int errno,
+ 	req->con = NULL;
+ 
+ 	if (errno) {
+-		rtrs_err_rl(con->c.sess,
+-			    "IO request failed: error=%d path=%s [%s:%u]\n",
++		rtrs_err_rl(con->c.sess, "IO request failed: error=%d path=%s [%s:%u] notify=%d\n",
+ 			    errno, kobject_name(&sess->kobj), sess->hca_name,
+-			    sess->hca_port);
++			    sess->hca_port, notify);
+ 	}
+ 
+ 	if (notify)
+@@ -956,6 +960,7 @@ static void rtrs_clt_init_req(struct rtrs_clt_io_req *req,
+ 	req->need_inv = false;
+ 	req->need_inv_comp = false;
+ 	req->inv_errno = 0;
++	refcount_set(&req->ref, 1);
+ 
+ 	iov_iter_kvec(&iter, READ, vec, 1, usr_len);
+ 	len = _copy_from_iter(req->iu->buf, usr_len, &iter);
+@@ -1000,7 +1005,7 @@ rtrs_clt_get_copy_req(struct rtrs_clt_sess *alive_sess,
+ 
+ static int rtrs_post_rdma_write_sg(struct rtrs_clt_con *con,
+ 				   struct rtrs_clt_io_req *req,
+-				   struct rtrs_rbuf *rbuf,
++				   struct rtrs_rbuf *rbuf, bool fr_en,
+ 				   u32 size, u32 imm, struct ib_send_wr *wr,
+ 				   struct ib_send_wr *tail)
+ {
+@@ -1012,17 +1017,26 @@ static int rtrs_post_rdma_write_sg(struct rtrs_clt_con *con,
+ 	int i;
+ 	struct ib_send_wr *ptail = NULL;
+ 
+-	for_each_sg(req->sglist, sg, req->sg_cnt, i) {
+-		sge[i].addr   = sg_dma_address(sg);
+-		sge[i].length = sg_dma_len(sg);
+-		sge[i].lkey   = sess->s.dev->ib_pd->local_dma_lkey;
++	if (fr_en) {
++		i = 0;
++		sge[i].addr   = req->mr->iova;
++		sge[i].length = req->mr->length;
++		sge[i].lkey   = req->mr->lkey;
++		i++;
++		num_sge = 2;
++		ptail = tail;
++	} else {
++		for_each_sg(req->sglist, sg, req->sg_cnt, i) {
++			sge[i].addr   = sg_dma_address(sg);
++			sge[i].length = sg_dma_len(sg);
++			sge[i].lkey   = sess->s.dev->ib_pd->local_dma_lkey;
++		}
++		num_sge = 1 + req->sg_cnt;
+ 	}
+ 	sge[i].addr   = req->iu->dma_addr;
+ 	sge[i].length = size;
+ 	sge[i].lkey   = sess->s.dev->ib_pd->local_dma_lkey;
+ 
+-	num_sge = 1 + req->sg_cnt;
+-
+ 	/*
+ 	 * From time to time we have to post signalled sends,
+ 	 * or send queue will fill up and only QP reset can help.
+@@ -1038,6 +1052,21 @@ static int rtrs_post_rdma_write_sg(struct rtrs_clt_con *con,
+ 					    flags, wr, ptail);
+ }
+ 
++static int rtrs_map_sg_fr(struct rtrs_clt_io_req *req, size_t count)
++{
++	int nr;
++
++	/* Align the MR to a 4K page size to match the block virt boundary */
++	nr = ib_map_mr_sg(req->mr, req->sglist, count, NULL, SZ_4K);
++	if (nr < 0)
++		return nr;
++	if (unlikely(nr < req->sg_cnt))
++		return -EINVAL;
++	ib_update_fast_reg_key(req->mr, ib_inc_rkey(req->mr->rkey));
++
++	return nr;
++}
++
+ static int rtrs_clt_write_req(struct rtrs_clt_io_req *req)
+ {
+ 	struct rtrs_clt_con *con = req->con;
+@@ -1048,6 +1077,10 @@ static int rtrs_clt_write_req(struct rtrs_clt_io_req *req)
+ 	struct rtrs_rbuf *rbuf;
+ 	int ret, count = 0;
+ 	u32 imm, buf_id;
++	struct ib_reg_wr rwr;
++	struct ib_send_wr inv_wr;
++	struct ib_send_wr *wr = NULL;
++	bool fr_en = false;
+ 
+ 	const size_t tsize = sizeof(*msg) + req->data_len + req->usr_len;
+ 
+@@ -1076,15 +1109,43 @@ static int rtrs_clt_write_req(struct rtrs_clt_io_req *req)
+ 	req->sg_size = tsize;
+ 	rbuf = &sess->rbufs[buf_id];
+ 
++	if (count) {
++		ret = rtrs_map_sg_fr(req, count);
++		if (ret < 0) {
++			rtrs_err_rl(s,
++				    "Write request failed, failed to map fast reg. data, err: %d\n",
++				    ret);
++			ib_dma_unmap_sg(sess->s.dev->ib_dev, req->sglist,
++					req->sg_cnt, req->dir);
++			return ret;
++		}
++		inv_wr = (struct ib_send_wr) {
++			.opcode		    = IB_WR_LOCAL_INV,
++			.wr_cqe		    = &req->inv_cqe,
++			.send_flags	    = IB_SEND_SIGNALED,
++			.ex.invalidate_rkey = req->mr->rkey,
++		};
++		req->inv_cqe.done = rtrs_clt_inv_rkey_done;
++		rwr = (struct ib_reg_wr) {
++			.wr.opcode = IB_WR_REG_MR,
++			.wr.wr_cqe = &fast_reg_cqe,
++			.mr = req->mr,
++			.key = req->mr->rkey,
++			.access = (IB_ACCESS_LOCAL_WRITE),
++		};
++		wr = &rwr.wr;
++		fr_en = true;
++		refcount_inc(&req->ref);
++	}
+ 	/*
+ 	 * Update stats now, after request is successfully sent it is not
+ 	 * safe anymore to touch it.
+ 	 */
+ 	rtrs_clt_update_all_stats(req, WRITE);
+ 
+-	ret = rtrs_post_rdma_write_sg(req->con, req, rbuf,
++	ret = rtrs_post_rdma_write_sg(req->con, req, rbuf, fr_en,
+ 				      req->usr_len + sizeof(*msg),
+-				      imm, NULL, NULL);
++				      imm, wr, &inv_wr);
+ 	if (unlikely(ret)) {
+ 		rtrs_err_rl(s,
+ 			    "Write request failed: error=%d path=%s [%s:%u]\n",
+@@ -1100,21 +1161,6 @@ static int rtrs_clt_write_req(struct rtrs_clt_io_req *req)
+ 	return ret;
+ }
+ 
+-static int rtrs_map_sg_fr(struct rtrs_clt_io_req *req, size_t count)
+-{
+-	int nr;
+-
+-	/* Align the MR to a 4K page size to match the block virt boundary */
+-	nr = ib_map_mr_sg(req->mr, req->sglist, count, NULL, SZ_4K);
+-	if (nr < 0)
+-		return nr;
+-	if (unlikely(nr < req->sg_cnt))
+-		return -EINVAL;
+-	ib_update_fast_reg_key(req->mr, ib_inc_rkey(req->mr->rkey));
+-
+-	return nr;
+-}
+-
+ static int rtrs_clt_read_req(struct rtrs_clt_io_req *req)
+ {
+ 	struct rtrs_clt_con *con = req->con;
+diff --git a/drivers/infiniband/ulp/rtrs/rtrs-clt.h b/drivers/infiniband/ulp/rtrs/rtrs-clt.h
+index eed2a20ee9be..e276a2dfcf7c 100644
+--- a/drivers/infiniband/ulp/rtrs/rtrs-clt.h
++++ b/drivers/infiniband/ulp/rtrs/rtrs-clt.h
+@@ -116,6 +116,7 @@ struct rtrs_clt_io_req {
+ 	int			inv_errno;
+ 	bool			need_inv_comp;
+ 	bool			need_inv;
++	refcount_t		ref;
+ };
+ 
+ struct rtrs_rbuf {
+-- 
+2.26.2
+

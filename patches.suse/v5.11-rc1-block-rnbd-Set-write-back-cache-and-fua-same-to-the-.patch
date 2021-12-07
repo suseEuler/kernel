@@ -1,0 +1,147 @@
+From 512c781fd28cb401ee9f2843e32bf4640732c671 Mon Sep 17 00:00:00 2001
+From: Gioh Kim <gi-oh.kim@cloud.ionos.com>
+Date: Thu, 10 Dec 2020 11:18:24 +0100
+Subject: [PATCH] block/rnbd: Set write-back cache and fua same to the target
+ device
+Git-commit: 512c781fd28cb401ee9f2843e32bf4640732c671
+Patch-mainline: v5.11-rc1
+References: bsn#1
+
+
+The rnbd-client always sets the write-back cache and fua attributes
+of the rnbd device queue regardless of the target device on the server.
+That generates IO hang issue when the target device does not
+support both of write-back cacne and fua.
+
+This patch adds more fields for the cache policy and fua into the
+device opening message. The rnbd-server sends the information
+if the target device supports the write-back cache and fua
+and rnbd-client recevives it and set the device queue accordingly.
+
+Signed-off-by: Gioh Kim <gi-oh.kim@cloud.ionos.com>
+[jwang: some minor change, rename a few varables, remove unrelated comments.]
+Signed-off-by: Jack Wang <jinpu.wang@cloud.ionos.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/block/rnbd/rnbd-clt.c   | 8 +++++---
+ drivers/block/rnbd/rnbd-clt.h   | 2 ++
+ drivers/block/rnbd/rnbd-proto.h | 9 ++++++++-
+ drivers/block/rnbd/rnbd-srv.c   | 9 +++++++--
+ 4 files changed, 22 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/block/rnbd/rnbd-clt.c b/drivers/block/rnbd/rnbd-clt.c
+index 3a2e6e8ed6b1..b5fffbdeb263 100644
+--- a/drivers/block/rnbd/rnbd-clt.c
++++ b/drivers/block/rnbd/rnbd-clt.c
+@@ -88,6 +88,8 @@ static int rnbd_clt_set_dev_attr(struct rnbd_clt_dev *dev,
+ 	dev->discard_alignment	    = le32_to_cpu(rsp->discard_alignment);
+ 	dev->secure_discard	    = le16_to_cpu(rsp->secure_discard);
+ 	dev->rotational		    = rsp->rotational;
++	dev->wc 		    = !!(rsp->cache_policy & RNBD_WRITEBACK);
++	dev->fua		    = !!(rsp->cache_policy & RNBD_FUA);
+ 
+ 	dev->max_hw_sectors = sess->max_io_size / SECTOR_SIZE;
+ 	dev->max_segments = BMAX_SEGMENTS;
+@@ -1305,7 +1307,7 @@ static void setup_request_queue(struct rnbd_clt_dev *dev)
+ 	blk_queue_max_segments(dev->queue, dev->max_segments);
+ 	blk_queue_io_opt(dev->queue, dev->sess->max_io_size);
+ 	blk_queue_virt_boundary(dev->queue, SZ_4K - 1);
+-	blk_queue_write_cache(dev->queue, true, true);
++	blk_queue_write_cache(dev->queue, dev->wc, dev->fua);
+ 	dev->queue->queuedata = dev;
+ }
+ 
+@@ -1528,13 +1530,13 @@ struct rnbd_clt_dev *rnbd_clt_map_device(const char *sessname,
+ 	}
+ 
+ 	rnbd_clt_info(dev,
+-		       "map_device: Device mapped as %s (nsectors: %zu, logical_block_size: %d, physical_block_size: %d, max_write_same_sectors: %d, max_discard_sectors: %d, discard_granularity: %d, discard_alignment: %d, secure_discard: %d, max_segments: %d, max_hw_sectors: %d, rotational: %d)\n",
++		       "map_device: Device mapped as %s (nsectors: %zu, logical_block_size: %d, physical_block_size: %d, max_write_same_sectors: %d, max_discard_sectors: %d, discard_granularity: %d, discard_alignment: %d, secure_discard: %d, max_segments: %d, max_hw_sectors: %d, rotational: %d, wc: %d, fua: %d)\n",
+ 		       dev->gd->disk_name, dev->nsectors,
+ 		       dev->logical_block_size, dev->physical_block_size,
+ 		       dev->max_write_same_sectors, dev->max_discard_sectors,
+ 		       dev->discard_granularity, dev->discard_alignment,
+ 		       dev->secure_discard, dev->max_segments,
+-		       dev->max_hw_sectors, dev->rotational);
++		       dev->max_hw_sectors, dev->rotational, dev->wc, dev->fua);
+ 
+ 	mutex_unlock(&dev->lock);
+ 
+diff --git a/drivers/block/rnbd/rnbd-clt.h b/drivers/block/rnbd/rnbd-clt.h
+index b193d5904050..efd67ae286ca 100644
+--- a/drivers/block/rnbd/rnbd-clt.h
++++ b/drivers/block/rnbd/rnbd-clt.h
+@@ -112,6 +112,8 @@ struct rnbd_clt_dev {
+ 	enum rnbd_access_mode	access_mode;
+ 	bool			read_only;
+ 	bool			rotational;
++	bool			wc;
++	bool			fua;
+ 	u32			max_hw_sectors;
+ 	u32			max_write_same_sectors;
+ 	u32			max_discard_sectors;
+diff --git a/drivers/block/rnbd/rnbd-proto.h b/drivers/block/rnbd/rnbd-proto.h
+index ca166241452c..c1bc5c0fef71 100644
+--- a/drivers/block/rnbd/rnbd-proto.h
++++ b/drivers/block/rnbd/rnbd-proto.h
+@@ -108,6 +108,11 @@ struct rnbd_msg_close {
+ 	__le32		device_id;
+ };
+ 
++enum rnbd_cache_policy {
++	RNBD_FUA = 1 << 0,
++	RNBD_WRITEBACK = 1 << 1,
++};
++
+ /**
+  * struct rnbd_msg_open_rsp - response message to RNBD_MSG_OPEN
+  * @hdr:		message header
+@@ -124,6 +129,7 @@ struct rnbd_msg_close {
+  * @max_segments:	max segments hardware support in one transfer
+  * @secure_discard:	supports secure discard
+  * @rotation:		is a rotational disc?
++ * @cache_policy: 	support write-back caching or FUA?
+  */
+ struct rnbd_msg_open_rsp {
+ 	struct rnbd_msg_hdr	hdr;
+@@ -139,7 +145,8 @@ struct rnbd_msg_open_rsp {
+ 	__le16			max_segments;
+ 	__le16			secure_discard;
+ 	u8			rotational;
+-	u8			reserved[11];
++	u8			cache_policy;
++	u8			reserved[10];
+ };
+ 
+ /**
+diff --git a/drivers/block/rnbd/rnbd-srv.c b/drivers/block/rnbd/rnbd-srv.c
+index 066411cce5e2..b8e44331e494 100644
+--- a/drivers/block/rnbd/rnbd-srv.c
++++ b/drivers/block/rnbd/rnbd-srv.c
+@@ -550,6 +550,7 @@ static void rnbd_srv_fill_msg_open_rsp(struct rnbd_msg_open_rsp *rsp,
+ 					struct rnbd_srv_sess_dev *sess_dev)
+ {
+ 	struct rnbd_dev *rnbd_dev = sess_dev->rnbd_dev;
++	struct request_queue *q = bdev_get_queue(rnbd_dev->bdev);
+ 
+ 	rsp->hdr.type = cpu_to_le16(RNBD_MSG_OPEN_RSP);
+ 	rsp->device_id =
+@@ -574,8 +575,12 @@ static void rnbd_srv_fill_msg_open_rsp(struct rnbd_msg_open_rsp *rsp,
+ 		cpu_to_le32(rnbd_dev_get_discard_alignment(rnbd_dev));
+ 	rsp->secure_discard =
+ 		cpu_to_le16(rnbd_dev_get_secure_discard(rnbd_dev));
+-	rsp->rotational =
+-		!blk_queue_nonrot(bdev_get_queue(rnbd_dev->bdev));
++	rsp->rotational = !blk_queue_nonrot(q);
++	rsp->cache_policy = 0;
++	if (test_bit(QUEUE_FLAG_WC, &q->queue_flags))
++		rsp->cache_policy |= RNBD_WRITEBACK;
++	if (blk_queue_fua(q))
++		rsp->cache_policy |= RNBD_FUA;
+ }
+ 
+ static struct rnbd_srv_sess_dev *
+-- 
+2.26.2
+

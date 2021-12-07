@@ -1,0 +1,97 @@
+From 07c14027295a320cbc38869ed54b7472f155b2a6 Mon Sep 17 00:00:00 2001
+From: Gioh Kim <gi-oh.kim@cloud.ionos.com>
+Date: Fri, 28 May 2021 13:30:14 +0200
+Subject: [PATCH] RDMA/rtrs-srv: Duplicated session name is not allowed
+Git-commit: 07c14027295a320cbc38869ed54b7472f155b2a6
+Patch-mainline: v5.14-rc1
+References: bsn#1
+
+
+If two clients try to use the same session name, rtrs-server generates a
+kernel error that it failed to create the sysfs because the filename
+is duplicated.
+
+This patch adds code to check if there already exists the same session
+name with the different UUID. If a client tries to add more session,
+it sends the UUID and the session name. Therefore it is ok if there is
+already same session name with the same UUID. The rtrs-server must fail
+only-if there is the same session name with the different UUID.
+
+Link: https://lore.kernel.org/r/20210528113018.52290-17-jinpu.wang@ionos.com
+Signed-off-by: Gioh Kim <gi-oh.kim@ionos.com>
+Signed-off-by: Aleksei Marov <aleksei.marov@ionos.com>
+Signed-off-by: Jack Wang <jinpu.wang@ionos.com>
+Signed-off-by: Md Haris Iqbal <haris.iqbal@ionos.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/infiniband/ulp/rtrs/rtrs-srv.c | 42 +++++++++++++++++++++++++-
+ 1 file changed, 41 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/infiniband/ulp/rtrs/rtrs-srv.c b/drivers/infiniband/ulp/rtrs/rtrs-srv.c
+index 631d37976518..78a861843705 100644
+--- a/drivers/infiniband/ulp/rtrs/rtrs-srv.c
++++ b/drivers/infiniband/ulp/rtrs/rtrs-srv.c
+@@ -753,7 +753,40 @@ static void rtrs_srv_sess_down(struct rtrs_srv_sess *sess)
+ 	mutex_unlock(&srv->paths_ev_mutex);
+ }
+ 
++static bool exist_sessname(struct rtrs_srv_ctx *ctx,
++			   const char *sessname, const uuid_t *path_uuid)
++{
++	struct rtrs_srv *srv;
++	struct rtrs_srv_sess *sess;
++	bool found = false;
++
++	mutex_lock(&ctx->srv_mutex);
++	list_for_each_entry(srv, &ctx->srv_list, ctx_list) {
++		mutex_lock(&srv->paths_mutex);
++
++		/* when a client with same uuid and same sessname tried to add a path */
++		if (uuid_equal(&srv->paths_uuid, path_uuid)) {
++			mutex_unlock(&srv->paths_mutex);
++			continue;
++		}
++
++		list_for_each_entry(sess, &srv->paths_list, s.entry) {
++			if (strlen(sess->s.sessname) == strlen(sessname) &&
++			    !strcmp(sess->s.sessname, sessname)) {
++				found = true;
++				break;
++			}
++		}
++		mutex_unlock(&srv->paths_mutex);
++		if (found)
++			break;
++	}
++	mutex_unlock(&ctx->srv_mutex);
++	return found;
++}
++
+ static int post_recv_sess(struct rtrs_srv_sess *sess);
++static int rtrs_rdma_do_reject(struct rdma_cm_id *cm_id, int errno);
+ 
+ static int process_info_req(struct rtrs_srv_con *con,
+ 			    struct rtrs_msg_info_req *msg)
+@@ -772,10 +805,17 @@ static int process_info_req(struct rtrs_srv_con *con,
+ 		rtrs_err(s, "post_recv_sess(), err: %d\n", err);
+ 		return err;
+ 	}
++
++	if (exist_sessname(sess->srv->ctx,
++			   msg->sessname, &sess->srv->paths_uuid)) {
++		rtrs_err(s, "sessname is duplicated: %s\n", msg->sessname);
++		return -EPERM;
++	}
++	strscpy(sess->s.sessname, msg->sessname, sizeof(sess->s.sessname));
++
+ 	rwr = kcalloc(sess->mrs_num, sizeof(*rwr), GFP_KERNEL);
+ 	if (unlikely(!rwr))
+ 		return -ENOMEM;
+-	strscpy(sess->s.sessname, msg->sessname, sizeof(sess->s.sessname));
+ 
+ 	tx_sz  = sizeof(*rsp);
+ 	tx_sz += sizeof(rsp->desc[0]) * sess->mrs_num;
+-- 
+2.26.2
+

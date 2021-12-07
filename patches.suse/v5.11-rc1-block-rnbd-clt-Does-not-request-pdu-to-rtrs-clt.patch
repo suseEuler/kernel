@@ -1,0 +1,120 @@
+From 9aaf9a2aba0c2b5f0fc6dfeb011f0b4c8e224a73 Mon Sep 17 00:00:00 2001
+From: Gioh Kim <gi-oh.kim@cloud.ionos.com>
+Date: Thu, 10 Dec 2020 11:18:26 +0100
+Subject: [PATCH] block/rnbd-clt: Does not request pdu to rtrs-clt
+Git-commit: 9aaf9a2aba0c2b5f0fc6dfeb011f0b4c8e224a73
+Patch-mainline: v5.11-rc1
+References: bsn#1
+
+
+Previously the rnbd client requested the rtrs to allocate rnbd_iu
+just after the rtrs_iu. So the rnbd client passes the size of
+rnbd_iu for rtrs_clt_open() and rtrs creates an array of
+rnbd_iu and rtrs_iu.
+
+For IO handling, rnbd_iu exists after the request because we pass
+the size of rnbd_iu when setting the tag-set. Therefore we do not
+use the rnbd_iu allocated by rtrs for IO handling.
+We only use the rnbd_iu allocated by rtrs when doing session
+initialization. Almost all rnbd_iu allocated by rtrs are wasted.
+
+By this patch the rnbd client does not request rnbd_iu allocation
+to rtrs but allocate it for itself when doing session initialization.
+
+Also remove unused rtrs_permit_to_pdu from rtrs.
+
+Signed-off-by: Gioh Kim <gi-oh.kim@cloud.ionos.com>
+Signed-off-by: Jack Wang <jinpu.wang@cloud.ionos.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/block/rnbd/rnbd-clt.c          | 17 +++++++++++++----
+ drivers/infiniband/ulp/rtrs/rtrs-clt.c |  6 ------
+ drivers/infiniband/ulp/rtrs/rtrs.h     |  7 -------
+ 3 files changed, 13 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/block/rnbd/rnbd-clt.c b/drivers/block/rnbd/rnbd-clt.c
+index 5941ff7c83a8..96e3f9fe8241 100644
+--- a/drivers/block/rnbd/rnbd-clt.c
++++ b/drivers/block/rnbd/rnbd-clt.c
+@@ -349,12 +349,19 @@ static struct rnbd_iu *rnbd_get_iu(struct rnbd_clt_session *sess,
+ 	struct rnbd_iu *iu;
+ 	struct rtrs_permit *permit;
+ 
++	iu = kzalloc(sizeof(*iu), GFP_KERNEL);
++	if (!iu) {
++		return NULL;
++	}
++
+ 	permit = rnbd_get_permit(sess, con_type,
+ 				  wait ? RTRS_PERMIT_WAIT :
+ 				  RTRS_PERMIT_NOWAIT);
+-	if (unlikely(!permit))
++	if (unlikely(!permit)) {
++		kfree(iu);
+ 		return NULL;
+-	iu = rtrs_permit_to_pdu(permit);
++	}
++
+ 	iu->permit = permit;
+ 	/*
+ 	 * 1st reference is dropped after finishing sending a "user" message,
+@@ -373,8 +380,10 @@ static struct rnbd_iu *rnbd_get_iu(struct rnbd_clt_session *sess,
+ 
+ static void rnbd_put_iu(struct rnbd_clt_session *sess, struct rnbd_iu *iu)
+ {
+-	if (atomic_dec_and_test(&iu->refcount))
++	if (atomic_dec_and_test(&iu->refcount)) {
+ 		rnbd_put_permit(sess, iu->permit);
++		kfree(iu);
++	}
+ }
+ 
+ static void rnbd_softirq_done_fn(struct request *rq)
+@@ -1218,7 +1227,7 @@ find_and_get_or_create_sess(const char *sessname,
+ 	 */
+ 	sess->rtrs = rtrs_clt_open(&rtrs_ops, sessname,
+ 				   paths, path_cnt, port_nr,
+-				   sizeof(struct rnbd_iu),
++				   0, /* Do not use pdu of rtrs */
+ 				   RECONNECT_DELAY, BMAX_SEGMENTS,
+ 				   BLK_MAX_SEGMENT_SIZE,
+ 				   MAX_RECONNECTS);
+diff --git a/drivers/infiniband/ulp/rtrs/rtrs-clt.c b/drivers/infiniband/ulp/rtrs/rtrs-clt.c
+index 560865f65dc4..67f86c405a26 100644
+--- a/drivers/infiniband/ulp/rtrs/rtrs-clt.c
++++ b/drivers/infiniband/ulp/rtrs/rtrs-clt.c
+@@ -157,12 +157,6 @@ void rtrs_clt_put_permit(struct rtrs_clt *clt, struct rtrs_permit *permit)
+ }
+ EXPORT_SYMBOL(rtrs_clt_put_permit);
+ 
+-void *rtrs_permit_to_pdu(struct rtrs_permit *permit)
+-{
+-	return permit + 1;
+-}
+-EXPORT_SYMBOL(rtrs_permit_to_pdu);
+-
+ /**
+  * rtrs_permit_to_clt_con() - returns RDMA connection pointer by the permit
+  * @sess: client session pointer
+diff --git a/drivers/infiniband/ulp/rtrs/rtrs.h b/drivers/infiniband/ulp/rtrs/rtrs.h
+index 9af750f4d783..8738e90e715a 100644
+--- a/drivers/infiniband/ulp/rtrs/rtrs.h
++++ b/drivers/infiniband/ulp/rtrs/rtrs.h
+@@ -63,13 +63,6 @@ struct rtrs_clt *rtrs_clt_open(struct rtrs_clt_ops *ops,
+ 
+ void rtrs_clt_close(struct rtrs_clt *sess);
+ 
+-/**
+- * rtrs_permit_to_pdu() - converts rtrs_permit to opaque pdu pointer
+- * @permit: RTRS permit pointer, it associates the memory allocation for future
+- *          RDMA operation.
+- */
+-void *rtrs_permit_to_pdu(struct rtrs_permit *permit);
+-
+ enum {
+ 	RTRS_PERMIT_NOWAIT = 0,
+ 	RTRS_PERMIT_WAIT   = 1,
+-- 
+2.26.2
+

@@ -1,0 +1,168 @@
+From 630e438f040c3838206b5e6717b9b5c29edf3548 Mon Sep 17 00:00:00 2001
+From: Jack Wang <jinpu.wang@cloud.ionos.com>
+Date: Mon, 21 Jun 2021 07:53:36 +0200
+Subject: [PATCH] RDMA/rtrs: Introduce head/tail wr
+Git-commit: 630e438f040c3838206b5e6717b9b5c29edf3548
+Patch-mainline: v5.14-rc1
+References: bsn#1
+
+
+Introduce tail wr, we can send as the last wr, we want to send the local
+invalidate wr after rdma wr in later patch.
+
+While at it, also fix coding style issue.
+
+Link: https://lore.kernel.org/r/20210621055340.11789-2-jinpu.wang@ionos.com
+Signed-off-by: Jack Wang <jinpu.wang@cloud.ionos.com>
+Reviewed-by: Md Haris Iqbal <haris.iqbal@cloud.ionos.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/infiniband/ulp/rtrs/rtrs-clt.c | 16 ++++++++-------
+ drivers/infiniband/ulp/rtrs/rtrs-pri.h |  3 ++-
+ drivers/infiniband/ulp/rtrs/rtrs.c     | 28 +++++++++++++++-----------
+ 3 files changed, 27 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/infiniband/ulp/rtrs/rtrs-clt.c b/drivers/infiniband/ulp/rtrs/rtrs-clt.c
+index cc530e09d778..c451fae5a2b7 100644
+--- a/drivers/infiniband/ulp/rtrs/rtrs-clt.c
++++ b/drivers/infiniband/ulp/rtrs/rtrs-clt.c
+@@ -480,7 +480,7 @@ static int rtrs_post_send_rdma(struct rtrs_clt_con *con,
+ 
+ 	return rtrs_iu_post_rdma_write_imm(&con->c, req->iu, &sge, 1,
+ 					    rbuf->rkey, rbuf->addr + off,
+-					    imm, flags, wr);
++					    imm, flags, wr, NULL);
+ }
+ 
+ static void process_io_rsp(struct rtrs_clt_sess *sess, u32 msg_id,
+@@ -999,9 +999,10 @@ rtrs_clt_get_copy_req(struct rtrs_clt_sess *alive_sess,
+ }
+ 
+ static int rtrs_post_rdma_write_sg(struct rtrs_clt_con *con,
+-				    struct rtrs_clt_io_req *req,
+-				    struct rtrs_rbuf *rbuf,
+-				    u32 size, u32 imm)
++				   struct rtrs_clt_io_req *req,
++				   struct rtrs_rbuf *rbuf,
++				   u32 size, u32 imm, struct ib_send_wr *wr,
++				   struct ib_send_wr *tail)
+ {
+ 	struct rtrs_clt_sess *sess = to_clt_sess(con->c.sess);
+ 	struct ib_sge *sge = req->sge;
+@@ -1009,6 +1010,7 @@ static int rtrs_post_rdma_write_sg(struct rtrs_clt_con *con,
+ 	struct scatterlist *sg;
+ 	size_t num_sge;
+ 	int i;
++	struct ib_send_wr *ptail = NULL;
+ 
+ 	for_each_sg(req->sglist, sg, req->sg_cnt, i) {
+ 		sge[i].addr   = sg_dma_address(sg);
+@@ -1033,7 +1035,7 @@ static int rtrs_post_rdma_write_sg(struct rtrs_clt_con *con,
+ 
+ 	return rtrs_iu_post_rdma_write_imm(&con->c, req->iu, sge, num_sge,
+ 					    rbuf->rkey, rbuf->addr, imm,
+-					    flags, NULL);
++					    flags, wr, ptail);
+ }
+ 
+ static int rtrs_clt_write_req(struct rtrs_clt_io_req *req)
+@@ -1081,8 +1083,8 @@ static int rtrs_clt_write_req(struct rtrs_clt_io_req *req)
+ 	rtrs_clt_update_all_stats(req, WRITE);
+ 
+ 	ret = rtrs_post_rdma_write_sg(req->con, req, rbuf,
+-				       req->usr_len + sizeof(*msg),
+-				       imm);
++				      req->usr_len + sizeof(*msg),
++				      imm, NULL, NULL);
+ 	if (unlikely(ret)) {
+ 		rtrs_err_rl(s,
+ 			    "Write request failed: error=%d path=%s [%s:%u]\n",
+diff --git a/drivers/infiniband/ulp/rtrs/rtrs-pri.h b/drivers/infiniband/ulp/rtrs/rtrs-pri.h
+index 76cca2058f6f..36f184a3b676 100644
+--- a/drivers/infiniband/ulp/rtrs/rtrs-pri.h
++++ b/drivers/infiniband/ulp/rtrs/rtrs-pri.h
+@@ -305,7 +305,8 @@ int rtrs_iu_post_rdma_write_imm(struct rtrs_con *con, struct rtrs_iu *iu,
+ 				struct ib_sge *sge, unsigned int num_sge,
+ 				u32 rkey, u64 rdma_addr, u32 imm_data,
+ 				enum ib_send_flags flags,
+-				struct ib_send_wr *head);
++				struct ib_send_wr *head,
++				struct ib_send_wr *tail);
+ 
+ int rtrs_post_recv_empty(struct rtrs_con *con, struct ib_cqe *cqe);
+ int rtrs_post_rdma_write_imm_empty(struct rtrs_con *con, struct ib_cqe *cqe,
+diff --git a/drivers/infiniband/ulp/rtrs/rtrs.c b/drivers/infiniband/ulp/rtrs/rtrs.c
+index 08e1f7d82c95..61919ebd92b2 100644
+--- a/drivers/infiniband/ulp/rtrs/rtrs.c
++++ b/drivers/infiniband/ulp/rtrs/rtrs.c
+@@ -105,18 +105,21 @@ int rtrs_post_recv_empty(struct rtrs_con *con, struct ib_cqe *cqe)
+ EXPORT_SYMBOL_GPL(rtrs_post_recv_empty);
+ 
+ static int rtrs_post_send(struct ib_qp *qp, struct ib_send_wr *head,
+-			     struct ib_send_wr *wr)
++			  struct ib_send_wr *wr, struct ib_send_wr *tail)
+ {
+ 	if (head) {
+-		struct ib_send_wr *tail = head;
++		struct ib_send_wr *next = head;
+ 
+-		while (tail->next)
+-			tail = tail->next;
+-		tail->next = wr;
++		while (next->next)
++			next = next->next;
++		next->next = wr;
+ 	} else {
+ 		head = wr;
+ 	}
+ 
++	if (tail)
++		wr->next = tail;
++
+ 	return ib_post_send(qp, head, NULL);
+ }
+ 
+@@ -142,15 +145,16 @@ int rtrs_iu_post_send(struct rtrs_con *con, struct rtrs_iu *iu, size_t size,
+ 		.send_flags = IB_SEND_SIGNALED,
+ 	};
+ 
+-	return rtrs_post_send(con->qp, head, &wr);
++	return rtrs_post_send(con->qp, head, &wr, NULL);
+ }
+ EXPORT_SYMBOL_GPL(rtrs_iu_post_send);
+ 
+ int rtrs_iu_post_rdma_write_imm(struct rtrs_con *con, struct rtrs_iu *iu,
+-				 struct ib_sge *sge, unsigned int num_sge,
+-				 u32 rkey, u64 rdma_addr, u32 imm_data,
+-				 enum ib_send_flags flags,
+-				 struct ib_send_wr *head)
++				struct ib_sge *sge, unsigned int num_sge,
++				u32 rkey, u64 rdma_addr, u32 imm_data,
++				enum ib_send_flags flags,
++				struct ib_send_wr *head,
++				struct ib_send_wr *tail)
+ {
+ 	struct ib_rdma_wr wr;
+ 	int i;
+@@ -174,7 +178,7 @@ int rtrs_iu_post_rdma_write_imm(struct rtrs_con *con, struct rtrs_iu *iu,
+ 		if (WARN_ON(sge[i].length == 0))
+ 			return -EINVAL;
+ 
+-	return rtrs_post_send(con->qp, head, &wr.wr);
++	return rtrs_post_send(con->qp, head, &wr.wr, tail);
+ }
+ EXPORT_SYMBOL_GPL(rtrs_iu_post_rdma_write_imm);
+ 
+@@ -191,7 +195,7 @@ int rtrs_post_rdma_write_imm_empty(struct rtrs_con *con, struct ib_cqe *cqe,
+ 		.wr.ex.imm_data	= cpu_to_be32(imm_data),
+ 	};
+ 
+-	return rtrs_post_send(con->qp, head, &wr.wr);
++	return rtrs_post_send(con->qp, head, &wr.wr, NULL);
+ }
+ EXPORT_SYMBOL_GPL(rtrs_post_rdma_write_imm_empty);
+ 
+-- 
+2.26.2
+

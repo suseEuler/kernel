@@ -1,0 +1,180 @@
+From 3b89e92c2a95a39c38a3808f4528e502a39bd94d Mon Sep 17 00:00:00 2001
+From: Jack Wang <jinpu.wang@cloud.ionos.com>
+Date: Mon, 22 Feb 2021 15:15:50 +0100
+Subject: [PATCH] RDMA/rtrs: Use new shared CQ mechanism
+Git-commit: 3b89e92c2a95a39c38a3808f4528e502a39bd94d
+Patch-mainline: v5.13-rc1
+References: bsn#1
+
+
+Have the driver use shared CQs which provids a ~10%-20% improvement during
+test.
+
+Instead of opening a CQ for each QP per connection, a CQ for each QP will
+be provided by the RDMA core driver that will be shared between the QPs on
+that core reducing interrupt overhead.
+
+Link: https://lore.kernel.org/r/20210222141551.54345-1-jinpu.wang@cloud.ionos.com
+Signed-off-by: Jack Wang <jinpu.wang@cloud.ionos.com>
+Reviewed-by: Leon Romanovsky <leonro@nvidia.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/infiniband/ulp/rtrs/rtrs-clt.c | 10 +++++-----
+ drivers/infiniband/ulp/rtrs/rtrs-pri.h |  1 +
+ drivers/infiniband/ulp/rtrs/rtrs-srv.c | 10 +++++-----
+ drivers/infiniband/ulp/rtrs/rtrs.c     |  8 ++++----
+ 4 files changed, 15 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/infiniband/ulp/rtrs/rtrs-clt.c b/drivers/infiniband/ulp/rtrs/rtrs-clt.c
+index 0a08b4b742a3..4e9cf06cc17a 100644
+--- a/drivers/infiniband/ulp/rtrs/rtrs-clt.c
++++ b/drivers/infiniband/ulp/rtrs/rtrs-clt.c
+@@ -325,7 +325,7 @@ static void rtrs_rdma_error_recovery(struct rtrs_clt_con *con)
+ 
+ static void rtrs_clt_fast_reg_done(struct ib_cq *cq, struct ib_wc *wc)
+ {
+-	struct rtrs_clt_con *con = cq->cq_context;
++	struct rtrs_clt_con *con = to_clt_con(wc->qp->qp_context);
+ 
+ 	if (unlikely(wc->status != IB_WC_SUCCESS)) {
+ 		rtrs_err(con->c.sess, "Failed IB_WR_REG_MR: %s\n",
+@@ -345,7 +345,7 @@ static void rtrs_clt_inv_rkey_done(struct ib_cq *cq, struct ib_wc *wc)
+ {
+ 	struct rtrs_clt_io_req *req =
+ 		container_of(wc->wr_cqe, typeof(*req), inv_cqe);
+-	struct rtrs_clt_con *con = cq->cq_context;
++	struct rtrs_clt_con *con = to_clt_con(wc->qp->qp_context);
+ 
+ 	if (unlikely(wc->status != IB_WC_SUCCESS)) {
+ 		rtrs_err(con->c.sess, "Failed IB_WR_LOCAL_INV: %s\n",
+@@ -586,7 +586,7 @@ static int rtrs_post_recv_empty_x2(struct rtrs_con *con, struct ib_cqe *cqe)
+ 
+ static void rtrs_clt_rdma_done(struct ib_cq *cq, struct ib_wc *wc)
+ {
+-	struct rtrs_clt_con *con = cq->cq_context;
++	struct rtrs_clt_con *con = to_clt_con(wc->qp->qp_context);
+ 	struct rtrs_clt_sess *sess = to_clt_sess(con->c.sess);
+ 	u32 imm_type, imm_payload;
+ 	bool w_inval = false;
+@@ -2241,7 +2241,7 @@ static int init_conns(struct rtrs_clt_sess *sess)
+ 
+ static void rtrs_clt_info_req_done(struct ib_cq *cq, struct ib_wc *wc)
+ {
+-	struct rtrs_clt_con *con = cq->cq_context;
++	struct rtrs_clt_con *con = to_clt_con(wc->qp->qp_context);
+ 	struct rtrs_clt_sess *sess = to_clt_sess(con->c.sess);
+ 	struct rtrs_iu *iu;
+ 
+@@ -2323,7 +2323,7 @@ static int process_info_rsp(struct rtrs_clt_sess *sess,
+ 
+ static void rtrs_clt_info_rsp_done(struct ib_cq *cq, struct ib_wc *wc)
+ {
+-	struct rtrs_clt_con *con = cq->cq_context;
++	struct rtrs_clt_con *con = to_clt_con(wc->qp->qp_context);
+ 	struct rtrs_clt_sess *sess = to_clt_sess(con->c.sess);
+ 	struct rtrs_msg_info_rsp *msg;
+ 	enum rtrs_clt_state state;
+diff --git a/drivers/infiniband/ulp/rtrs/rtrs-pri.h b/drivers/infiniband/ulp/rtrs/rtrs-pri.h
+index 8caad0a2322b..1b31bda9ca78 100644
+--- a/drivers/infiniband/ulp/rtrs/rtrs-pri.h
++++ b/drivers/infiniband/ulp/rtrs/rtrs-pri.h
+@@ -91,6 +91,7 @@ struct rtrs_con {
+ 	struct ib_cq		*cq;
+ 	struct rdma_cm_id	*cm_id;
+ 	unsigned int		cid;
++	u16                     cq_size;
+ };
+ 
+ struct rtrs_sess {
+diff --git a/drivers/infiniband/ulp/rtrs/rtrs-srv.c b/drivers/infiniband/ulp/rtrs/rtrs-srv.c
+index d071809e3ed2..37ba121564a2 100644
+--- a/drivers/infiniband/ulp/rtrs/rtrs-srv.c
++++ b/drivers/infiniband/ulp/rtrs/rtrs-srv.c
+@@ -199,7 +199,7 @@ static void rtrs_srv_wait_ops_ids(struct rtrs_srv_sess *sess)
+ 
+ static void rtrs_srv_reg_mr_done(struct ib_cq *cq, struct ib_wc *wc)
+ {
+-	struct rtrs_srv_con *con = cq->cq_context;
++	struct rtrs_srv_con *con = to_srv_con(wc->qp->qp_context);
+ 	struct rtrs_sess *s = con->c.sess;
+ 	struct rtrs_srv_sess *sess = to_srv_sess(s);
+ 
+@@ -720,7 +720,7 @@ static void rtrs_srv_stop_hb(struct rtrs_srv_sess *sess)
+ 
+ static void rtrs_srv_info_rsp_done(struct ib_cq *cq, struct ib_wc *wc)
+ {
+-	struct rtrs_srv_con *con = cq->cq_context;
++	struct rtrs_srv_con *con = to_srv_con(wc->qp->qp_context);
+ 	struct rtrs_sess *s = con->c.sess;
+ 	struct rtrs_srv_sess *sess = to_srv_sess(s);
+ 	struct rtrs_iu *iu;
+@@ -862,7 +862,7 @@ static int process_info_req(struct rtrs_srv_con *con,
+ 
+ static void rtrs_srv_info_req_done(struct ib_cq *cq, struct ib_wc *wc)
+ {
+-	struct rtrs_srv_con *con = cq->cq_context;
++	struct rtrs_srv_con *con = to_srv_con(wc->qp->qp_context);
+ 	struct rtrs_sess *s = con->c.sess;
+ 	struct rtrs_srv_sess *sess = to_srv_sess(s);
+ 	struct rtrs_msg_info_req *msg;
+@@ -1110,7 +1110,7 @@ static void rtrs_srv_inv_rkey_done(struct ib_cq *cq, struct ib_wc *wc)
+ {
+ 	struct rtrs_srv_mr *mr =
+ 		container_of(wc->wr_cqe, typeof(*mr), inv_cqe);
+-	struct rtrs_srv_con *con = cq->cq_context;
++	struct rtrs_srv_con *con = to_srv_con(wc->qp->qp_context);
+ 	struct rtrs_sess *s = con->c.sess;
+ 	struct rtrs_srv_sess *sess = to_srv_sess(s);
+ 	struct rtrs_srv *srv = sess->srv;
+@@ -1167,7 +1167,7 @@ static void rtrs_rdma_process_wr_wait_list(struct rtrs_srv_con *con)
+ 
+ static void rtrs_srv_rdma_done(struct ib_cq *cq, struct ib_wc *wc)
+ {
+-	struct rtrs_srv_con *con = cq->cq_context;
++	struct rtrs_srv_con *con = to_srv_con(wc->qp->qp_context);
+ 	struct rtrs_sess *s = con->c.sess;
+ 	struct rtrs_srv_sess *sess = to_srv_sess(s);
+ 	struct rtrs_srv *srv = sess->srv;
+diff --git a/drivers/infiniband/ulp/rtrs/rtrs.c b/drivers/infiniband/ulp/rtrs/rtrs.c
+index d13aff0aa816..5822cb088eef 100644
+--- a/drivers/infiniband/ulp/rtrs/rtrs.c
++++ b/drivers/infiniband/ulp/rtrs/rtrs.c
+@@ -218,14 +218,14 @@ static int create_cq(struct rtrs_con *con, int cq_vector, u16 cq_size,
+ 	struct rdma_cm_id *cm_id = con->cm_id;
+ 	struct ib_cq *cq;
+ 
+-	cq = ib_alloc_cq(cm_id->device, con, cq_size,
+-			 cq_vector, poll_ctx);
++	cq = ib_cq_pool_get(cm_id->device, cq_size, cq_vector, poll_ctx);
+ 	if (IS_ERR(cq)) {
+ 		rtrs_err(con->sess, "Creating completion queue failed, errno: %ld\n",
+ 			  PTR_ERR(cq));
+ 		return PTR_ERR(cq);
+ 	}
+ 	con->cq = cq;
++	con->cq_size = cq_size;
+ 
+ 	return 0;
+ }
+@@ -273,7 +273,7 @@ int rtrs_cq_qp_create(struct rtrs_sess *sess, struct rtrs_con *con,
+ 	err = create_qp(con, sess->dev->ib_pd, max_send_wr, max_recv_wr,
+ 			max_send_sge);
+ 	if (err) {
+-		ib_free_cq(con->cq);
++		ib_cq_pool_put(con->cq, con->cq_size);
+ 		con->cq = NULL;
+ 		return err;
+ 	}
+@@ -290,7 +290,7 @@ void rtrs_cq_qp_destroy(struct rtrs_con *con)
+ 		con->qp = NULL;
+ 	}
+ 	if (con->cq) {
+-		ib_free_cq(con->cq);
++		ib_cq_pool_put(con->cq, con->cq_size);
+ 		con->cq = NULL;
+ 	}
+ }
+-- 
+2.26.2
+

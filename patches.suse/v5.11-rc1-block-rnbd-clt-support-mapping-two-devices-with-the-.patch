@@ -1,0 +1,102 @@
+From 91f4acb2801ce4985483b0fa174bbe995d105417 Mon Sep 17 00:00:00 2001
+From: Guoqing Jiang <guoqing.jiang@cloud.ionos.com>
+Date: Thu, 26 Nov 2020 11:47:17 +0100
+Subject: [PATCH] block/rnbd-clt: support mapping two devices with the same
+ name from different servers
+Git-commit: 91f4acb2801ce4985483b0fa174bbe995d105417
+Patch-mainline: v5.11-rc1
+References: bsn#1
+
+
+Previously, we can't map same device name from different sessions
+due to the limitation of sysfs naming mechanism.
+
+root@clt2:~# ls -l /sys/class/rnbd-client/ctl/devices/
+total 0
+lrwxrwxrwx 1 root 0 Sep  2 16:31 !dev!nullb1 -> ../../../block/rnbd0
+
+We only use the device name in above, which caused device with
+the same name can't be mapped from another server. To address
+the issue, the sessname is appended to the node to differentiate
+where the device comes from.
+
+Also, we need to check if the pathname is existed in a specific
+session instead of search it in global sess_list.
+
+Signed-off-by: Guoqing Jiang <guoqing.jiang@cloud.ionos.com>
+Signed-off-by: Gioh Kim <gi-oh.kim@cloud.ionos.com>
+Signed-off-by: Jack Wang <jinpu.wang@cloud.ionos.com>
+Reviewed-by: Md Haris Iqbal <haris.iqbal@cloud.ionos.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/block/rnbd/rnbd-clt-sysfs.c |    4 ++++
+ drivers/block/rnbd/rnbd-clt.c       |   13 ++++++++-----
+ 2 files changed, 12 insertions(+), 5 deletions(-)
+
+--- a/drivers/block/rnbd/rnbd-clt-sysfs.c
++++ b/drivers/block/rnbd/rnbd-clt-sysfs.c
+@@ -485,6 +485,10 @@ static int rnbd_clt_get_path_name(struct
+ 	if (ret >= len)
+ 		return -ENAMETOOLONG;
+ 
++	ret = snprintf(buf, len, "%s@%s", buf, dev->sess->sessname);
++	if (ret >= len)
++		return -ENAMETOOLONG;
++
+ 	return 0;
+ }
+ 
+--- a/drivers/block/rnbd/rnbd-clt.c
++++ b/drivers/block/rnbd/rnbd-clt.c
+@@ -1424,13 +1424,16 @@ out_alloc:
+ 	return ERR_PTR(ret);
+ }
+ 
+-static bool __exists_dev(const char *pathname)
++static bool __exists_dev(const char *pathname, const char *sessname)
+ {
+ 	struct rnbd_clt_session *sess;
+ 	struct rnbd_clt_dev *dev;
+ 	bool found = false;
+ 
+ 	list_for_each_entry(sess, &sess_list, list) {
++		if (sessname && strncmp(sess->sessname, sessname,
++					sizeof(sess->sessname)))
++			continue;
+ 		mutex_lock(&sess->lock);
+ 		list_for_each_entry(dev, &sess->devs_list, list) {
+ 			if (strlen(dev->pathname) == strlen(pathname) &&
+@@ -1447,12 +1450,12 @@ static bool __exists_dev(const char *pat
+ 	return found;
+ }
+ 
+-static bool exists_devpath(const char *pathname)
++static bool exists_devpath(const char *pathname, const char *sessname)
+ {
+ 	bool found;
+ 
+ 	mutex_lock(&sess_lock);
+-	found = __exists_dev(pathname);
++	found = __exists_dev(pathname, sessname);
+ 	mutex_unlock(&sess_lock);
+ 
+ 	return found;
+@@ -1465,7 +1468,7 @@ static bool insert_dev_if_not_exists_dev
+ 	bool found;
+ 
+ 	mutex_lock(&sess_lock);
+-	found = __exists_dev(pathname);
++	found = __exists_dev(pathname, sess->sessname);
+ 	if (!found) {
+ 		mutex_lock(&sess->lock);
+ 		list_add_tail(&dev->list, &sess->devs_list);
+@@ -1495,7 +1498,7 @@ struct rnbd_clt_dev *rnbd_clt_map_device
+ 	struct rnbd_clt_dev *dev;
+ 	int ret;
+ 
+-	if (exists_devpath(pathname))
++	if (unlikely(exists_devpath(pathname, sessname)))
+ 		return ERR_PTR(-EEXIST);
+ 
+ 	sess = find_and_get_or_create_sess(sessname, paths, path_cnt, port_nr);

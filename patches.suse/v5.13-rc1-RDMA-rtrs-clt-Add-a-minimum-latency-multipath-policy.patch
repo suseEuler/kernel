@@ -1,0 +1,201 @@
+From dc3b66a0ce70ec40fd60884a835b9ef976765914 Mon Sep 17 00:00:00 2001
+From: Gioh Kim <gi-oh.kim@cloud.ionos.com>
+Date: Wed, 7 Apr 2021 13:34:41 +0200
+Subject: [PATCH] RDMA/rtrs-clt: Add a minimum latency multipath policy
+Git-commit: dc3b66a0ce70ec40fd60884a835b9ef976765914
+Patch-mainline: v5.13-rc1
+References: bsn#1
+
+
+This patch adds new multipath policy: min-latency.  Client checks the
+latency of each path when it sends the heart-beat.  And it sends IO to the
+path with the minimum latency.
+
+Link: https://lore.kernel.org/r/20210407113444.150961-2-gi-oh.kim@ionos.com
+Signed-off-by: Gioh Kim <gi-oh.kim@ionos.com>
+Signed-off-by: Jack Wang <jinpu.wang@ionos.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/infiniband/ulp/rtrs/rtrs-clt-sysfs.c | 19 +++++--
+ drivers/infiniband/ulp/rtrs/rtrs-clt.c       | 57 +++++++++++++++++++-
+ drivers/infiniband/ulp/rtrs/rtrs-clt.h       |  1 +
+ drivers/infiniband/ulp/rtrs/rtrs-pri.h       |  2 +
+ drivers/infiniband/ulp/rtrs/rtrs.c           |  3 ++
+ 5 files changed, 78 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/infiniband/ulp/rtrs/rtrs-clt-sysfs.c b/drivers/infiniband/ulp/rtrs/rtrs-clt-sysfs.c
+index eb92ec13cb57..a5bf12aced24 100644
+--- a/drivers/infiniband/ulp/rtrs/rtrs-clt-sysfs.c
++++ b/drivers/infiniband/ulp/rtrs/rtrs-clt-sysfs.c
+@@ -101,6 +101,9 @@ static ssize_t mpath_policy_show(struct device *dev,
+ 	case MP_POLICY_MIN_INFLIGHT:
+ 		return sysfs_emit(page, "min-inflight (MI: %d)\n",
+ 				  clt->mp_policy);
++	case MP_POLICY_MIN_LATENCY:
++		return sysfs_emit(page, "min-latency (ML: %d)\n",
++				  clt->mp_policy);
+ 	default:
+ 		return sysfs_emit(page, "Unknown (%d)\n", clt->mp_policy);
+ 	}
+@@ -114,22 +117,32 @@ static ssize_t mpath_policy_store(struct device *dev,
+ 	struct rtrs_clt *clt;
+ 	int value;
+ 	int ret;
++	size_t len = 0;
+ 
+ 	clt = container_of(dev, struct rtrs_clt, dev);
+ 
+ 	ret = kstrtoint(buf, 10, &value);
+ 	if (!ret && (value == MP_POLICY_RR ||
+-		     value == MP_POLICY_MIN_INFLIGHT)) {
++		     value == MP_POLICY_MIN_INFLIGHT ||
++		     value == MP_POLICY_MIN_LATENCY)) {
+ 		clt->mp_policy = value;
+ 		return count;
+ 	}
+ 
++	/* distinguish "mi" and "min-latency" with length */
++	len = strnlen(buf, NAME_MAX);
++	if (buf[len - 1] == '\n')
++		len--;
++
+ 	if (!strncasecmp(buf, "round-robin", 11) ||
+-	    !strncasecmp(buf, "rr", 2))
++	    (len == 2 && !strncasecmp(buf, "rr", 2)))
+ 		clt->mp_policy = MP_POLICY_RR;
+ 	else if (!strncasecmp(buf, "min-inflight", 12) ||
+-		 !strncasecmp(buf, "mi", 2))
++		 (len == 2 && !strncasecmp(buf, "mi", 2)))
+ 		clt->mp_policy = MP_POLICY_MIN_INFLIGHT;
++	else if (!strncasecmp(buf, "min-latency", 11) ||
++		 (len == 2 && !strncasecmp(buf, "ml", 2)))
++		clt->mp_policy = MP_POLICY_MIN_LATENCY;
+ 	else
+ 		return -EINVAL;
+ 
+diff --git a/drivers/infiniband/ulp/rtrs/rtrs-clt.c b/drivers/infiniband/ulp/rtrs/rtrs-clt.c
+index cb1731a4483d..8139c790ba7d 100644
+--- a/drivers/infiniband/ulp/rtrs/rtrs-clt.c
++++ b/drivers/infiniband/ulp/rtrs/rtrs-clt.c
+@@ -628,6 +628,8 @@ static void rtrs_clt_rdma_done(struct ib_cq *cq, struct ib_wc *wc)
+ 		} else if (imm_type == RTRS_HB_ACK_IMM) {
+ 			WARN_ON(con->c.cid);
+ 			sess->s.hb_missed_cnt = 0;
++			sess->s.hb_cur_latency =
++				ktime_sub(ktime_get(), sess->s.hb_last_sent);
+ 			if (sess->flags & RTRS_MSG_NEW_RKEY_F)
+ 				return  rtrs_clt_recv_done(con, wc);
+ 		} else {
+@@ -826,6 +828,57 @@ static struct rtrs_clt_sess *get_next_path_min_inflight(struct path_it *it)
+ 	return min_path;
+ }
+ 
++/**
++ * get_next_path_min_latency() - Returns path with minimal latency.
++ * @it:	the path pointer
++ *
++ * Return: a path with the lowest latency or NULL if all paths are tried
++ *
++ * Locks:
++ *    rcu_read_lock() must be hold.
++ *
++ * Related to @MP_POLICY_MIN_LATENCY
++ *
++ * This DOES skip an already-tried path.
++ * There is a skip-list to skip a path if the path has tried but failed.
++ * It will try the minimum latency path and then the second minimum latency
++ * path and so on. Finally it will return NULL if all paths are tried.
++ * Therefore the caller MUST check the returned
++ * path is NULL and trigger the IO error.
++ */
++static struct rtrs_clt_sess *get_next_path_min_latency(struct path_it *it)
++{
++	struct rtrs_clt_sess *min_path = NULL;
++	struct rtrs_clt *clt = it->clt;
++	struct rtrs_clt_sess *sess;
++	ktime_t min_latency = INT_MAX;
++	ktime_t latency;
++
++	list_for_each_entry_rcu(sess, &clt->paths_list, s.entry) {
++		if (unlikely(READ_ONCE(sess->state) != RTRS_CLT_CONNECTED))
++			continue;
++
++		if (unlikely(!list_empty(raw_cpu_ptr(sess->mp_skip_entry))))
++			continue;
++
++		latency = sess->s.hb_cur_latency;
++
++		if (latency < min_latency) {
++			min_latency = latency;
++			min_path = sess;
++		}
++	}
++
++	/*
++	 * add the path to the skip list, so that next time we can get
++	 * a different one
++	 */
++	if (min_path)
++		list_add(raw_cpu_ptr(min_path->mp_skip_entry), &it->skip_list);
++
++	return min_path;
++}
++
+ static inline void path_it_init(struct path_it *it, struct rtrs_clt *clt)
+ {
+ 	INIT_LIST_HEAD(&it->skip_list);
+@@ -834,8 +887,10 @@ static inline void path_it_init(struct path_it *it, struct rtrs_clt *clt)
+ 
+ 	if (clt->mp_policy == MP_POLICY_RR)
+ 		it->next_path = get_next_path_rr;
+-	else
++	else if (clt->mp_policy == MP_POLICY_MIN_INFLIGHT)
+ 		it->next_path = get_next_path_min_inflight;
++	else
++		it->next_path = get_next_path_min_latency;
+ }
+ 
+ static inline void path_it_deinit(struct path_it *it)
+diff --git a/drivers/infiniband/ulp/rtrs/rtrs-clt.h b/drivers/infiniband/ulp/rtrs/rtrs-clt.h
+index 692bc83e1f09..ef15927dfeda 100644
+--- a/drivers/infiniband/ulp/rtrs/rtrs-clt.h
++++ b/drivers/infiniband/ulp/rtrs/rtrs-clt.h
+@@ -29,6 +29,7 @@ enum rtrs_clt_state {
+ enum rtrs_mp_policy {
+ 	MP_POLICY_RR,
+ 	MP_POLICY_MIN_INFLIGHT,
++	MP_POLICY_MIN_LATENCY,
+ };
+ 
+ /* see Documentation/ABI/testing/sysfs-class-rtrs-client for details */
+diff --git a/drivers/infiniband/ulp/rtrs/rtrs-pri.h b/drivers/infiniband/ulp/rtrs/rtrs-pri.h
+index 1b31bda9ca78..bcad5e2168c5 100644
+--- a/drivers/infiniband/ulp/rtrs/rtrs-pri.h
++++ b/drivers/infiniband/ulp/rtrs/rtrs-pri.h
+@@ -112,6 +112,8 @@ struct rtrs_sess {
+ 	unsigned int		hb_interval_ms;
+ 	unsigned int		hb_missed_cnt;
+ 	unsigned int		hb_missed_max;
++	ktime_t			hb_last_sent;
++	ktime_t			hb_cur_latency;
+ };
+ 
+ /* rtrs information unit */
+diff --git a/drivers/infiniband/ulp/rtrs/rtrs.c b/drivers/infiniband/ulp/rtrs/rtrs.c
+index bc08b7f6e5e2..a7847282a2eb 100644
+--- a/drivers/infiniband/ulp/rtrs/rtrs.c
++++ b/drivers/infiniband/ulp/rtrs/rtrs.c
+@@ -337,6 +337,9 @@ static void hb_work(struct work_struct *work)
+ 		schedule_hb(sess);
+ 		return;
+ 	}
++
++	sess->hb_last_sent = ktime_get();
++
+ 	imm = rtrs_to_imm(RTRS_HB_MSG_IMM, 0);
+ 	err = rtrs_post_rdma_write_imm_empty(usr_con, sess->hb_cqe, imm,
+ 					     0, NULL);
+-- 
+2.26.2
+

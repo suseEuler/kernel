@@ -1,0 +1,175 @@
+From 1e31016b6926c996e9113619c2ce1f42ad74ddd1 Mon Sep 17 00:00:00 2001
+From: Gioh Kim <gi-oh.kim@ionos.com>
+Date: Wed, 28 Apr 2021 08:13:59 +0200
+Subject: [PATCH] block/rnbd: Remove all likely and unlikely
+Git-commit: 1e31016b6926c996e9113619c2ce1f42ad74ddd1
+Patch-mainline: v5.13-rc1
+References: bsn#1
+
+
+The IO performance test with fio after removing the likely and
+unlikely macros in all if-statement shows no performance drop.
+They do not help for the performance of rnbd.
+
+The fio test did random read on 32 rnbd devices and 64 processes.
+Test environment:
+- AMD Opteron(tm) Processor 6386 SE
+- 125G memory
+- kernel version: 5.4.86
+- gcc version: gcc (Debian 8.3.0-6) 8.3.0
+- Infiniband controller: InfiniBand: Mellanox Technologies MT26428
+[ConnectX VPI PCIe 2.0 5GT/s - IB QDR / 10GigE] (rev b0)
+
+before
+read: IOPS=549k, BW=2146MiB/s
+read: IOPS=544k, BW=2125MiB/s
+read: IOPS=553k, BW=2158MiB/s
+read: IOPS=535k, BW=2089MiB/s
+read: IOPS=543k, BW=2122MiB/s
+read: IOPS=552k, BW=2154MiB/s
+average: IOPS=546k, BW=2132MiB/s
+
+after
+read: IOPS=556k, BW=2172MiB/s
+read: IOPS=561k, BW=2191MiB/s
+read: IOPS=552k, BW=2156MiB/s
+read: IOPS=551k, BW=2154MiB/s
+read: IOPS=562k, BW=2194MiB/s
+-----------
+average: IOPS=556k, BW=2173MiB/s
+
+The IOPS and bandwidth got better slightly after removing
+likely/unlikely. (IOPS= +1.8% BW= +1.9%) But we cannot make sure
+that removing the likely/unlikely help the performance because it
+depends on various situations. We only make sure that removing the
+likely/unlikely does not drop the performance.
+
+Signed-off-by: Gioh Kim <gi-oh.kim@ionos.com>
+Reviewed-by: Md Haris Iqbal <haris.iqbal@ionos.com>
+Link: https://lore.kernel.org/r/20210428061359.206794-5-gi-oh.kim@ionos.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/block/rnbd/rnbd-clt.c | 24 ++++++++++++------------
+ drivers/block/rnbd/rnbd-srv.c |  2 +-
+ 2 files changed, 13 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/block/rnbd/rnbd-clt.c b/drivers/block/rnbd/rnbd-clt.c
+index f855bf1fa8d5..c604a402cd5c 100644
+--- a/drivers/block/rnbd/rnbd-clt.c
++++ b/drivers/block/rnbd/rnbd-clt.c
+@@ -241,7 +241,7 @@ static bool rnbd_rerun_if_needed(struct rnbd_clt_session *sess)
+ 	     cpu_q = rnbd_get_cpu_qlist(sess, nxt_cpu(cpu_q->cpu))) {
+ 		if (!spin_trylock_irqsave(&cpu_q->requeue_lock, flags))
+ 			continue;
+-		if (unlikely(!test_bit(cpu_q->cpu, sess->cpu_queues_bm)))
++		if (!test_bit(cpu_q->cpu, sess->cpu_queues_bm))
+ 			goto unlock;
+ 		q = list_first_entry_or_null(&cpu_q->requeue_list,
+ 					     typeof(*q), requeue_list);
+@@ -320,7 +320,7 @@ static struct rtrs_permit *rnbd_get_permit(struct rnbd_clt_session *sess,
+ 	struct rtrs_permit *permit;
+ 
+ 	permit = rtrs_clt_get_permit(sess->rtrs, con_type, wait);
+-	if (likely(permit))
++	if (permit)
+ 		/* We have a subtle rare case here, when all permits can be
+ 		 * consumed before busy counter increased.  This is safe,
+ 		 * because loser will get NULL as a permit, observe 0 busy
+@@ -355,7 +355,7 @@ static struct rnbd_iu *rnbd_get_iu(struct rnbd_clt_session *sess,
+ 		return NULL;
+ 
+ 	permit = rnbd_get_permit(sess, con_type, wait);
+-	if (unlikely(!permit)) {
++	if (!permit) {
+ 		kfree(iu);
+ 		return NULL;
+ 	}
+@@ -1050,7 +1050,7 @@ static int rnbd_client_xfer_request(struct rnbd_clt_dev *dev,
+ 	};
+ 	err = rtrs_clt_request(rq_data_dir(rq), &req_ops, rtrs, permit,
+ 			       &vec, 1, size, iu->sgt.sgl, sg_cnt);
+-	if (unlikely(err)) {
++	if (err) {
+ 		rnbd_clt_err_rl(dev, "RTRS failed to transfer IO, err: %d\n",
+ 				 err);
+ 		return err;
+@@ -1081,7 +1081,7 @@ static bool rnbd_clt_dev_add_to_requeue(struct rnbd_clt_dev *dev,
+ 	cpu_q = get_cpu_ptr(sess->cpu_queues);
+ 	spin_lock_irqsave(&cpu_q->requeue_lock, flags);
+ 
+-	if (likely(!test_and_set_bit_lock(0, &q->in_list))) {
++	if (!test_and_set_bit_lock(0, &q->in_list)) {
+ 		if (WARN_ON(!list_empty(&q->requeue_list)))
+ 			goto unlock;
+ 
+@@ -1093,7 +1093,7 @@ static bool rnbd_clt_dev_add_to_requeue(struct rnbd_clt_dev *dev,
+ 			 */
+ 			smp_mb__before_atomic();
+ 		}
+-		if (likely(atomic_read(&sess->busy))) {
++		if (atomic_read(&sess->busy)) {
+ 			list_add_tail(&q->requeue_list, &cpu_q->requeue_list);
+ 		} else {
+ 			/* Very unlikely, but possible: busy counter was
+@@ -1121,7 +1121,7 @@ static void rnbd_clt_dev_kick_mq_queue(struct rnbd_clt_dev *dev,
+ 
+ 	if (delay != RNBD_DELAY_IFBUSY)
+ 		blk_mq_delay_run_hw_queue(hctx, delay);
+-	else if (unlikely(!rnbd_clt_dev_add_to_requeue(dev, q)))
++	else if (!rnbd_clt_dev_add_to_requeue(dev, q))
+ 		/*
+ 		 * If session is not busy we have to restart
+ 		 * the queue ourselves.
+@@ -1138,12 +1138,12 @@ static blk_status_t rnbd_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 	int err;
+ 	blk_status_t ret = BLK_STS_IOERR;
+ 
+-	if (unlikely(dev->dev_state != DEV_STATE_MAPPED))
++	if (dev->dev_state != DEV_STATE_MAPPED)
+ 		return BLK_STS_IOERR;
+ 
+ 	iu->permit = rnbd_get_permit(dev->sess, RTRS_IO_CON,
+ 				      RTRS_PERMIT_NOWAIT);
+-	if (unlikely(!iu->permit)) {
++	if (!iu->permit) {
+ 		rnbd_clt_dev_kick_mq_queue(dev, hctx, RNBD_DELAY_IFBUSY);
+ 		return BLK_STS_RESOURCE;
+ 	}
+@@ -1165,9 +1165,9 @@ static blk_status_t rnbd_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 
+ 	blk_mq_start_request(rq);
+ 	err = rnbd_client_xfer_request(dev, rq, iu);
+-	if (likely(err == 0))
++	if (err == 0)
+ 		return BLK_STS_OK;
+-	if (unlikely(err == -EAGAIN || err == -ENOMEM)) {
++	if (err == -EAGAIN || err == -ENOMEM) {
+ 		rnbd_clt_dev_kick_mq_queue(dev, hctx, 10/*ms*/);
+ 		ret = BLK_STS_RESOURCE;
+ 	}
+@@ -1584,7 +1584,7 @@ struct rnbd_clt_dev *rnbd_clt_map_device(const char *sessname,
+ 	struct rnbd_clt_dev *dev;
+ 	int ret;
+ 
+-	if (unlikely(exists_devpath(pathname, sessname)))
++	if (exists_devpath(pathname, sessname))
+ 		return ERR_PTR(-EEXIST);
+ 
+ 	sess = find_and_get_or_create_sess(sessname, paths, path_cnt, port_nr, nr_poll_queues);
+diff --git a/drivers/block/rnbd/rnbd-srv.c b/drivers/block/rnbd/rnbd-srv.c
+index 899dd9d7c10b..aafecfe97055 100644
+--- a/drivers/block/rnbd/rnbd-srv.c
++++ b/drivers/block/rnbd/rnbd-srv.c
+@@ -104,7 +104,7 @@ rnbd_get_sess_dev(int dev_id, struct rnbd_srv_session *srv_sess)
+ 
+ 	rcu_read_lock();
+ 	sess_dev = xa_load(&srv_sess->index_idr, dev_id);
+-	if (likely(sess_dev))
++	if (sess_dev)
+ 		ret = kref_get_unless_zero(&sess_dev->kref);
+ 	rcu_read_unlock();
+ 
+-- 
+2.26.2
+
