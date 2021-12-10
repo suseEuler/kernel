@@ -1,0 +1,96 @@
+From 6ab918569ad40a0853765b649514b31e480b054b Mon Sep 17 00:00:00 2001
+From: Wei Li <liwei391@huawei.com>
+Date: Fri, 3 Dec 2021 18:15:22 +0800
+Subject: [PATCH] watchdog: Fix check_preemption_disabled() error
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 6ab918569ad40a0853765b649514b31e480b054b
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4JUZZ
+
+-------------------------------------------------
+
+When enabling CONFIG_DEBUG_PREEMPT and CONFIG_PREEMPT, it triggers a 'BUG'
+in the pmu based nmi_watchdog initializaion:
+
+[    3.341853] BUG: using smp_processor_id() in preemptible [00000000] code: swapper/0/1
+[    3.344392] caller is debug_smp_processor_id+0x17/0x20
+[    3.344395] CPU: 1 PID: 1 Comm: swapper/0 Not tainted 5.10.0+ #398
+[    3.344397] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.10.2-0-g5f4c7b1-prebuilt.qemu-project.org 04/01/2014
+[    3.344399] Call Trace:
+[    3.344410]  dump_stack+0x60/0x76
+[    3.344412]  check_preemption_disabled+0xba/0xc0
+[    3.344415]  debug_smp_processor_id+0x17/0x20
+[    3.344422]  hardlockup_detector_event_create+0xf/0x60
+[    3.344427]  hardlockup_detector_perf_init+0xf/0x41
+[    3.344430]  watchdog_nmi_probe+0xe/0x10
+[    3.344432]  lockup_detector_init+0x22/0x5b
+[    3.344437]  kernel_init_freeable+0x20c/0x245
+[    3.344439]  ? rest_init+0xd0/0xd0
+[    3.344441]  kernel_init+0xe/0x110
+[    3.344446]  ret_from_fork+0x22/0x30
+
+This issue was introduced by commit a79050434b45, which move down
+lockup_detector_init() after do_basic_setup(), after sched_init_smp() too.
+
+  hardlockup_detector_event_create
+    |- hardlockup_detector_perf_init	(unsafe)
+      |- watchdog_nmi_probe
+        |- lockup_detector_init
+    |- hardlockup_detector_perf_enable
+      |- watchdog_nmi_enable
+        |- watchdog_enable
+          |- lockup_detector_online_cpu
+          |- softlockup_start_fn
+            |- softlockup_start_all
+              |- lockup_detector_reconfigure
+                |- lockup_detector_setup
+                  |- lockup_detector_init
+
+After analysing the calling context, it's only unsafe to use
+smp_processor_id() in hardlockup_detector_perf_init() as the thread
+'kernel_init' is preemptible after sched_init_smp().
+
+While it is just a test if we can enable the pmu based nmi_watchdog, the
+real enabling process is in softlockup_start_fn() later which ensures
+that watchdog_enable() is called on all cores. So it's free to disable
+preempt to fix this 'BUG'.
+
+Fixes: a79050434b45 ("lockup_detector: init lockup detector after all the init_calls")
+Signed-off-by: Wei Li <liwei391@huawei.com>
+Reviewed-by: wangxiongfeng <wangxiongfeng2@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/watchdog_hld.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/watchdog_hld.c b/kernel/watchdog_hld.c
+index 060873ff8a6d..f535ddd76315 100644
+--- a/kernel/watchdog_hld.c
++++ b/kernel/watchdog_hld.c
+@@ -504,14 +504,17 @@ void __init hardlockup_detector_perf_restart(void)
+  */
+ int __init hardlockup_detector_perf_init(void)
+ {
+-	int ret = hardlockup_detector_event_create();
++	int ret;
+ 
++	preempt_disable();
++	ret = hardlockup_detector_event_create();
+ 	if (ret) {
+ 		pr_info("Perf NMI watchdog permanently disabled\n");
+ 	} else {
+ 		perf_event_release_kernel(this_cpu_read(watchdog_ev));
+ 		this_cpu_write(watchdog_ev, NULL);
+ 	}
++	preempt_enable();
+ 	return ret;
+ }
+ #endif /* CONFIG_HARDLOCKUP_DETECTOR_PERF */
+-- 
+2.26.2
+

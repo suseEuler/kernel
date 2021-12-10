@@ -1,0 +1,93 @@
+From d7e879dd55763a84ba286c4c15252dae52edd1a6 Mon Sep 17 00:00:00 2001
+From: yangerkun <yangerkun@huawei.com>
+Date: Fri, 3 Dec 2021 18:15:21 +0800
+Subject: [PATCH] ext4: stop IO for page without buffer_head
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: d7e879dd55763a84ba286c4c15252dae52edd1a6
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 185810, https://gitee.com/openeuler/kernel/issues/I4JX1G
+CVE: NA
+
+---------------------------
+
+dio_bio_complete will set page dirty without consider is there still
+buffer_head valid with this page. This will trigger some problem while
+ext4 try to writeback this page. For ext4, we fix it by skip writeback
+the page without buffer_head.
+
+[1] https://lwn.net/Articles/774411/ : "DMA and get_user_pages()"
+[2] https://lwn.net/Articles/753027/ : "The Trouble with get_user_pages()"
+[3] https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=fc1d8e7cca2daa18
+
+Signed-off-by: yangerkun <yangerkun@huawei.com>
+Reviewed-by: zhangyi (F) <yi.zhang@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Xie XiuQi <xiexiuqi@huawei.com>
+
+Conflicts:
+	fs/ext4/inode.c
+Reviewed-by: Zhang Yi <yi.zhang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/ext4/inode.c | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 0415548afc71..164161e4c144 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -1940,6 +1940,20 @@ static int __ext4_journalled_writepage(struct page *page,
+ 	return ret;
+ }
+ 
++static void cancel_page_dirty_status(struct page *page)
++{
++	struct address_space *mapping = page_mapping(page);
++	unsigned long flags;
++
++	cancel_dirty_page(page);
++	xa_lock_irqsave(&mapping->i_pages, flags);
++	__xa_clear_mark(&mapping->i_pages, page_index(page),
++			PAGECACHE_TAG_DIRTY);
++	__xa_clear_mark(&mapping->i_pages, page_index(page),
++			PAGECACHE_TAG_TOWRITE);
++	xa_unlock_irqrestore(&mapping->i_pages, flags);
++}
++
+ /*
+  * Note that we don't need to start a transaction unless we're journaling data
+  * because we should have holes filled from ext4_page_mkwrite(). We even don't
+@@ -1998,6 +2012,12 @@ static int ext4_writepage(struct page *page,
+ 		return -EIO;
+ 	}
+ 
++	if (WARN_ON(!page_has_buffers(page))) {
++		cancel_page_dirty_status(page);
++		unlock_page(page);
++		return 0;
++	}
++
+ 	trace_ext4_writepage(page);
+ 	size = i_size_read(inode);
+ 	if (page->index == size >> PAGE_SHIFT &&
+@@ -2606,6 +2626,12 @@ static int mpage_prepare_extent_to_map(struct mpage_da_data *mpd)
+ 				continue;
+ 			}
+ 
++			if (WARN_ON(!page_has_buffers(page))) {
++				cancel_page_dirty_status(page);
++				unlock_page(page);
++				continue;
++			}
++
+ 			wait_on_page_writeback(page);
+ 			BUG_ON(PageWriteback(page));
+ 
+-- 
+2.26.2
+

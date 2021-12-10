@@ -1,0 +1,125 @@
+From a9aa05fe0ba265c80488723ca7bc4d390d1da7f9 Mon Sep 17 00:00:00 2001
+From: Lijun Fang <fanglijun3@huawei.com>
+Date: Fri, 3 Dec 2021 18:15:29 +0800
+Subject: [PATCH] svm: implement svm bind and unbind
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: a9aa05fe0ba265c80488723ca7bc4d390d1da7f9
+
+
+ascend inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4JMM0
+CVE: NA
+
+--------
+
+implement svm bind core, the process
+can call ioctl to bind the device.
+
+Signed-off-by: Lijun Fang <fanglijun3@huawei.com>
+Reviewed-by: Weilong Chen <chenweilong@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/char/svm.c | 71 +++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 64 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/char/svm.c b/drivers/char/svm.c
+index da5c2a2be1c3..213134ae76c5 100644
+--- a/drivers/char/svm.c
++++ b/drivers/char/svm.c
+@@ -158,14 +158,76 @@ static struct svm_device *file_to_sdev(struct file *file)
+ 			struct svm_device, miscdev);
+ }
+ 
++static inline struct core_device *to_core_device(struct device *d)
++{
++	return container_of(d, struct core_device, dev);
++}
++
++static int svm_acpi_bind_core(struct core_device *cdev,	void *data)
++{
++	struct task_struct *task = NULL;
++	struct svm_process *process = data;
++
++	if (cdev->smmu_bypass)
++		return 0;
++
++	task = get_pid_task(process->pid, PIDTYPE_PID);
++	if (!task) {
++		pr_err("failed to get task_struct\n");
++		return -ESRCH;
++	}
++
++	process->sva = iommu_sva_bind_device(&cdev->dev, task->mm, NULL);
++	if (!process->sva) {
++		pr_err("failed to bind device\n");
++		return PTR_ERR(process->sva);
++	}
++
++	process->pasid = task->mm->pasid;
++	put_task_struct(task);
++
++	return 0;
++}
++
++static int svm_dt_bind_core(struct device *dev, void *data)
++{
++	struct task_struct *task = NULL;
++	struct svm_process *process = data;
++	struct core_device *cdev = to_core_device(dev);
++
++	if (cdev->smmu_bypass)
++		return 0;
++
++	task = get_pid_task(process->pid, PIDTYPE_PID);
++	if (!task) {
++		pr_err("failed to get task_struct\n");
++		return -ESRCH;
++	}
++
++	process->sva = iommu_sva_bind_device(dev, task->mm, NULL);
++	if (!process->sva) {
++		pr_err("failed to bind device\n");
++		return PTR_ERR(process->sva);
++	}
++
++	process->pasid = task->mm->pasid;
++	put_task_struct(task);
++
++	return 0;
++}
++
+ static void svm_dt_bind_cores(struct svm_process *process)
+ {
+-	/* TODO */
++	device_for_each_child(process->sdev->dev, process, svm_dt_bind_core);
+ }
+ 
+ static void svm_acpi_bind_cores(struct svm_process *process)
+ {
+-	/* TODO */
++	struct core_device *pos = NULL;
++
++	list_for_each_entry(pos, &child_list, entry) {
++		svm_acpi_bind_core(pos, process);
++	}
+ }
+ 
+ static void svm_process_free(struct mmu_notifier *mn)
+@@ -410,11 +472,6 @@ static const struct file_operations svm_fops = {
+ 	.unlocked_ioctl		= svm_ioctl,
+ };
+ 
+-static inline struct core_device *to_core_device(struct device *d)
+-{
+-	return container_of(d, struct core_device, dev);
+-}
+-
+ static void cdev_device_release(struct device *dev)
+ {
+ 	struct core_device *cdev = to_core_device(dev);
+-- 
+2.26.2
+

@@ -1,0 +1,97 @@
+From 42bd45065025ff95926d5b1db78e6ea7756372e3 Mon Sep 17 00:00:00 2001
+From: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Date: Fri, 3 Dec 2021 18:15:57 +0800
+Subject: [PATCH] ntp: Avoid undefined behaviour in second_overflow()
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 42bd45065025ff95926d5b1db78e6ea7756372e3
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4KCU2
+CVE: NA
+
+----------------------------------------
+
+When I ran Syzkaller testsuite, I got the following call trace.
+Reviewed-by: Yang Yingliang <yangyingliang@huawei.com>
+Reviewed-by: Xie XiuQi <xiexiuqi@huawei.com>
+
+================================================================================
+UBSAN: Undefined behaviour in kernel/time/ntp.c:457:16
+signed integer overflow:
+9223372036854775807 + 500 cannot be represented in type 'long int'
+CPU: 3 PID: 0 Comm: swapper/3 Not tainted 4.19.25-dirty #2
+Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.10.2-1ubuntu1 04/01/2014
+Call Trace:
+ <IRQ>
+ __dump_stack lib/dump_stack.c:77 [inline]
+ dump_stack+0xca/0x13e lib/dump_stack.c:113
+ ubsan_epilogue+0xe/0x81 lib/ubsan.c:159
+ handle_overflow+0x193/0x1e2 lib/ubsan.c:190
+ second_overflow+0x403/0x540 kernel/time/ntp.c:457
+ accumulate_nsecs_to_secs kernel/time/timekeeping.c:2002 [inline]
+ logarithmic_accumulation kernel/time/timekeeping.c:2046 [inline]
+ timekeeping_advance+0x2bb/0xec0 kernel/time/timekeeping.c:2114
+ tick_do_update_jiffies64.part.2+0x1a0/0x350 kernel/time/tick-sched.c:97
+ tick_do_update_jiffies64 kernel/time/tick-sched.c:1229 [inline]
+ tick_nohz_update_jiffies kernel/time/tick-sched.c:499 [inline]
+ tick_nohz_irq_enter kernel/time/tick-sched.c:1232 [inline]
+ tick_irq_enter+0x1fd/0x240 kernel/time/tick-sched.c:1249
+ irq_enter+0xc4/0x100 kernel/softirq.c:353
+ entering_irq arch/x86/include/asm/apic.h:517 [inline]
+ entering_ack_irq arch/x86/include/asm/apic.h:523 [inline]
+ smp_apic_timer_interrupt+0x20/0x480 arch/x86/kernel/apic/apic.c:1052
+ apic_timer_interrupt+0xf/0x20 arch/x86/entry/entry_64.S:864
+ </IRQ>
+RIP: 0010:native_safe_halt+0x2/0x10 arch/x86/include/asm/irqflags.h:58
+Code: 01 f0 0f 82 bc fd ff ff 48 c7 c7 c0 21 b1 83 e8 a1 0a 02 ff e9 ab fd ff ff 4c 89 e7 e8 77 b6 a5 fe e9 6a ff ff ff 90 90 fb f4 <c3> 0f 1f 00 66 2e 0f 1f 84 00 00 00 00 00 f4 c3 90 90 90 90 90 90
+RSP: 0018:ffff888106307d20 EFLAGS: 00000246 ORIG_RAX: ffffffffffffff13
+RAX: 0000000000000007 RBX: dffffc0000000000 RCX: 0000000000000000
+RDX: 0000000000000000 RSI: 0000000000000001 RDI: ffff8881062e4f1c
+RBP: 0000000000000003 R08: ffffed107c5dc77b R09: 0000000000000000
+R10: 0000000000000000 R11: 0000000000000000 R12: ffffffff848c78a0
+R13: 0000000000000003 R14: 1ffff11020c60fae R15: 0000000000000000
+ arch_safe_halt arch/x86/include/asm/paravirt.h:94 [inline]
+ default_idle+0x24/0x2b0 arch/x86/kernel/process.c:561
+ cpuidle_idle_call kernel/sched/idle.c:153 [inline]
+ do_idle+0x2ca/0x420 kernel/sched/idle.c:262
+ cpu_startup_entry+0xcb/0xe0 kernel/sched/idle.c:368
+ start_secondary+0x421/0x570 arch/x86/kernel/smpboot.c:271
+ secondary_startup_64+0xa4/0xb0 arch/x86/kernel/head_64.S:243
+================================================================================
+
+It is because time_maxerror is set as 0x7FFFFFFFFFFFFFFF by user. It
+overflows when we add it with 'MAXFREQ / NSEC_PER_USEC' in
+'second_overflow()'.
+
+This patch add a limit check and saturate it when the user set
+'time_maxerror'.
+
+Signed-off-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/time/ntp.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/kernel/time/ntp.c b/kernel/time/ntp.c
+index 069ca78fb0bf..4fa664b26e16 100644
+--- a/kernel/time/ntp.c
++++ b/kernel/time/ntp.c
+@@ -680,6 +680,8 @@ static inline void process_adjtimex_modes(const struct __kernel_timex *txc,
+ 
+ 	if (txc->modes & ADJ_MAXERROR)
+ 		time_maxerror = txc->maxerror;
++	if (time_maxerror > NTP_PHASE_LIMIT)
++		time_maxerror = NTP_PHASE_LIMIT;
+ 
+ 	if (txc->modes & ADJ_ESTERROR)
+ 		time_esterror = txc->esterror;
+-- 
+2.26.2
+

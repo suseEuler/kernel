@@ -1,0 +1,141 @@
+From 3662006884d195d0ccbaa30818eea04dc9928716 Mon Sep 17 00:00:00 2001
+From: Weilong Chen <chenweilong@huawei.com>
+Date: Fri, 3 Dec 2021 18:15:50 +0800
+Subject: [PATCH] cache: Workaround HiSilicon Taishan DC CVAU
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 3662006884d195d0ccbaa30818eea04dc9928716
+
+
+ascend inclusion
+category: feature
+bugzilla: 46922
+CVE: NA
+
+-------------------------------------
+
+Taishan's L1/L2 cache is inclusive, and the data is consistent.
+Any change of L1 does not require DC operation to brush CL in L1 to L2.
+It's safe that don't clean data cache by address to point of unification.
+
+Without IDC featrue, kernel needs to flush icache as well as dcache,
+causes performance degradation.
+
+The flaw refers to V110/V200 variant 1.
+
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Reviewed-by: Ding Tianhong <dingtianhong@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Weilong Chen <chenweilong@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Reviewed-by: Weilong Chen <chenweilong@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ Documentation/arm64/silicon-errata.rst |  2 ++
+ arch/arm64/Kconfig                     |  9 ++++++++
+ arch/arm64/include/asm/cpucaps.h       |  3 ++-
+ arch/arm64/kernel/cpu_errata.c         | 32 ++++++++++++++++++++++++++
+ 4 files changed, 45 insertions(+), 1 deletion(-)
+
+diff --git a/Documentation/arm64/silicon-errata.rst b/Documentation/arm64/silicon-errata.rst
+index 719510247292..616570593704 100644
+--- a/Documentation/arm64/silicon-errata.rst
++++ b/Documentation/arm64/silicon-errata.rst
+@@ -143,6 +143,8 @@ stable kernels.
+ +----------------+-----------------+-----------------+-----------------------------+
+ | Hisilicon      | Hip08 SMMU PMCG | #162001800      | N/A                         |
+ +----------------+-----------------+-----------------+-----------------------------+
++| Hisilicon      | TSV{110,200}    | #1980005        | HISILICON_ERRATUM_1980005   |
+++----------------+-----------------+-----------------+-----------------------------+
+ +----------------+-----------------+-----------------+-----------------------------+
+ | Qualcomm Tech. | Kryo/Falkor v1  | E1003           | QCOM_FALKOR_ERRATUM_1003    |
+ +----------------+-----------------+-----------------+-----------------------------+
+diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
+index 507fdcb74153..08a93ca8f0d9 100644
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -771,6 +771,15 @@ config HISILICON_ERRATUM_161600802
+ 
+ 	  If unsure, say Y.
+ 
++config HISILICON_ERRATUM_1980005
++	bool "Hisilicon erratum IDC support"
++	default n
++	help
++	  The HiSilicon TSV100/200 SoC support idc but report wrong value to
++	  kernel.
++
++	  If unsure, say N.
++
+ config QCOM_FALKOR_ERRATUM_1003
+ 	bool "Falkor E1003: Incorrect translation due to ASID change"
+ 	default y
+diff --git a/arch/arm64/include/asm/cpucaps.h b/arch/arm64/include/asm/cpucaps.h
+index aba1209a684c..93bae3795165 100644
+--- a/arch/arm64/include/asm/cpucaps.h
++++ b/arch/arm64/include/asm/cpucaps.h
+@@ -70,7 +70,8 @@
+ #define ARM64_WORKAROUND_HISI_HIP08_RU_PREFETCH 60
+ #define ARM64_CLEARPAGE_STNP			61
+ #define ARM64_HAS_TWED				62
++#define ARM64_WORKAROUND_HISILICON_1980005	63
+ 
+-#define ARM64_NCAPS				63
++#define ARM64_NCAPS				64
+ 
+ #endif /* __ASM_CPUCAPS_H */
+diff --git a/arch/arm64/kernel/cpu_errata.c b/arch/arm64/kernel/cpu_errata.c
+index 3a427d9f0ef6..abb6c903abef 100644
+--- a/arch/arm64/kernel/cpu_errata.c
++++ b/arch/arm64/kernel/cpu_errata.c
+@@ -60,6 +60,29 @@ is_kryo_midr(const struct arm64_cpu_capabilities *entry, int scope)
+ 	return model == entry->midr_range.model;
+ }
+ 
++#ifdef CONFIG_HISILICON_ERRATUM_1980005
++static bool
++hisilicon_1980005_match(const struct arm64_cpu_capabilities *entry,
++		int scope)
++{
++	static const struct midr_range idc_support_list[] = {
++		MIDR_ALL_VERSIONS(MIDR_HISI_TSV110),
++		MIDR_REV(MIDR_HISI_TSV200, 1, 0),
++		{ /* sentinel */ }
++	};
++
++	return  is_midr_in_range_list(read_cpuid_id(), idc_support_list);
++}
++
++static void
++hisilicon_1980005_enable(const struct arm64_cpu_capabilities *__unused)
++{
++	cpus_set_cap(ARM64_HAS_CACHE_IDC);
++	arm64_ftr_reg_ctrel0.sys_val |= BIT(CTR_IDC_SHIFT);
++	sysreg_clear_set(sctlr_el1, SCTLR_EL1_UCT, 0);
++}
++#endif
++
+ static bool
+ has_mismatched_cache_type(const struct arm64_cpu_capabilities *entry,
+ 			  int scope)
+@@ -473,6 +496,15 @@ const struct arm64_cpu_capabilities arm64_errata[] = {
+ 		.type = ARM64_CPUCAP_LOCAL_CPU_ERRATUM,
+ 		.cpu_enable = cpu_enable_trap_ctr_access,
+ 	},
++#ifdef CONFIG_HISILICON_ERRATUM_1980005
++	{
++		.desc = "Taishan IDC coherence workaround",
++		.capability = ARM64_WORKAROUND_HISILICON_1980005,
++		.matches = hisilicon_1980005_match,
++		.type = ARM64_CPUCAP_SYSTEM_FEATURE,
++		.cpu_enable = hisilicon_1980005_enable,
++	},
++#endif
+ #ifdef CONFIG_QCOM_FALKOR_ERRATUM_1003
+ 	{
+ 		.desc = "Qualcomm Technologies Falkor/Kryo erratum 1003",
+-- 
+2.26.2
+

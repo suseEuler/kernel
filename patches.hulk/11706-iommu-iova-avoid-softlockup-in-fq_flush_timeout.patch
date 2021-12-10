@@ -1,0 +1,136 @@
+From 2bc1b6e158c6687fa78d55351ef10ff5404c484f Mon Sep 17 00:00:00 2001
+From: Li Bin <huawei.libin@huawei.com>
+Date: Fri, 3 Dec 2021 18:15:40 +0800
+Subject: [PATCH] iommu/iova: avoid softlockup in fq_flush_timeout
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 2bc1b6e158c6687fa78d55351ef10ff5404c484f
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 30859, https://gitee.com/openeuler/kernel/issues/I4K6FB
+CVE: NA
+
+Reference: http://openeuler.huawei.com/bugzilla/show_bug.cgi?id=30859
+
+---------------------------
+
+There is softlockup under fio pressure test with smmu enabled:
+watchdog: BUG: soft lockup - CPU#81 stuck for 22s!  [swapper/81:0]
+...
+Call trace:
+ fq_flush_timeout+0xc0/0x110
+ call_timer_fn+0x34/0x178
+ expire_timers+0xec/0x158
+ run_timer_softirq+0xc0/0x1f8
+ __do_softirq+0x120/0x324
+ irq_exit+0x11c/0x140
+ __handle_domain_irq+0x6c/0xc0
+ gic_handle_irq+0x6c/0x170
+ el1_irq+0xb8/0x140
+ arch_cpu_idle+0x38/0x1c0
+ default_idle_call+0x24/0x44
+ do_idle+0x1f4/0x2d8
+ cpu_startup_entry+0x2c/0x30
+ secondary_start_kernel+0x17c/0x1c8
+
+This is because the timer callback fq_flush_timeout may run more than
+10ms, and timer may be processed continuously in the softirq so trigger
+softlockup. We can use work to deal with fq_ring_free for each cpu which
+may take long time, that to avoid triggering softlockup.
+
+Signed-off-by: Li Bin <huawei.libin@huawei.com>
+Signed-off-by: Peng Wu <wupeng58@huawei.com>
+Reviewed-By: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/iommu/iova.c | 31 +++++++++++++++++++++----------
+ include/linux/iova.h |  1 +
+ 2 files changed, 22 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/iommu/iova.c b/drivers/iommu/iova.c
+index 30d969a4c5fd..2782a5be8df4 100644
+--- a/drivers/iommu/iova.c
++++ b/drivers/iommu/iova.c
+@@ -67,6 +67,7 @@ static void free_iova_flush_queue(struct iova_domain *iovad)
+ 	if (timer_pending(&iovad->fq_timer))
+ 		del_timer(&iovad->fq_timer);
+ 
++	flush_work(&iovad->free_iova_work);
+ 	fq_destroy_all_entries(iovad);
+ 
+ 	free_percpu(iovad->fq);
+@@ -76,6 +77,24 @@ static void free_iova_flush_queue(struct iova_domain *iovad)
+ 	iovad->entry_dtor = NULL;
+ }
+ 
++static void fq_ring_free(struct iova_domain *iovad, struct iova_fq *fq);
++static void free_iova_work_func(struct work_struct *work)
++{
++	struct iova_domain *iovad;
++	int cpu;
++
++	iovad = container_of(work, struct iova_domain, free_iova_work);
++	for_each_possible_cpu(cpu) {
++		unsigned long flags;
++		struct iova_fq *fq;
++
++		fq = per_cpu_ptr(iovad->fq, cpu);
++		spin_lock_irqsave(&fq->lock, flags);
++		fq_ring_free(iovad, fq);
++		spin_unlock_irqrestore(&fq->lock, flags);
++	}
++}
++
+ int init_iova_flush_queue(struct iova_domain *iovad,
+ 			  iova_flush_cb flush_cb, iova_entry_dtor entry_dtor)
+ {
+@@ -106,6 +125,7 @@ int init_iova_flush_queue(struct iova_domain *iovad,
+ 
+ 	iovad->fq = queue;
+ 
++	INIT_WORK(&iovad->free_iova_work, free_iova_work_func);
+ 	timer_setup(&iovad->fq_timer, fq_flush_timeout, 0);
+ 	atomic_set(&iovad->fq_timer_on, 0);
+ 
+@@ -530,20 +550,11 @@ static void fq_destroy_all_entries(struct iova_domain *iovad)
+ static void fq_flush_timeout(struct timer_list *t)
+ {
+ 	struct iova_domain *iovad = from_timer(iovad, t, fq_timer);
+-	int cpu;
+ 
+ 	atomic_set(&iovad->fq_timer_on, 0);
+ 	iova_domain_flush(iovad);
+ 
+-	for_each_possible_cpu(cpu) {
+-		unsigned long flags;
+-		struct iova_fq *fq;
+-
+-		fq = per_cpu_ptr(iovad->fq, cpu);
+-		spin_lock_irqsave(&fq->lock, flags);
+-		fq_ring_free(iovad, fq);
+-		spin_unlock_irqrestore(&fq->lock, flags);
+-	}
++	schedule_work(&iovad->free_iova_work);
+ }
+ 
+ void queue_iova(struct iova_domain *iovad,
+diff --git a/include/linux/iova.h b/include/linux/iova.h
+index a0637abffee8..56a05c92820c 100644
+--- a/include/linux/iova.h
++++ b/include/linux/iova.h
+@@ -95,6 +95,7 @@ struct iova_domain {
+ 						   flush-queues */
+ 	atomic_t fq_timer_on;			/* 1 when timer is active, 0
+ 						   when not */
++	struct work_struct free_iova_work;
+ };
+ 
+ static inline unsigned long iova_size(struct iova *iova)
+-- 
+2.26.2
+

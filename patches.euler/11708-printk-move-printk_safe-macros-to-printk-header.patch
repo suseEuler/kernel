@@ -1,0 +1,173 @@
+From 827138d48db50406707f139a6c2d245583b531a9 Mon Sep 17 00:00:00 2001
+From: Sergey Senozhatsky <sergey.senozhatsky.work@gmail.com>
+Date: Fri, 3 Dec 2021 18:15:42 +0800
+Subject: [PATCH] printk: move printk_safe macros to printk header
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 827138d48db50406707f139a6c2d245583b531a9
+
+
+euler inclusion
+category: bugfix
+bugzilla: 9509, https://gitee.com/openeuler/kernel/issues/I4K61K
+CVE: NA
+
+Reference: https://lore.kernel.org/lkml/20181017044843.GD1068@jagdpanzerIV/T/
+
+-------------------------------------------------
+
+Make printk_safe_enter_irqsave()/etc macros available to the
+rest of the kernel.
+
+Signed-off-by: Sergey Senozhatsky <sergey.senozhatsky.work@gmail.com>
+Signed-off-by: Hongbo Yao <yaohongbo@huawei.com>
+Signed-off-by: Peng Wu <wupeng58@huawei.com>
+Reviewed-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/printk.h      | 40 +++++++++++++++++++++++++++++++++++++
+ kernel/printk/internal.h    | 37 ----------------------------------
+ kernel/printk/printk_safe.c |  6 ++++--
+ 3 files changed, 44 insertions(+), 39 deletions(-)
+
+diff --git a/include/linux/printk.h b/include/linux/printk.h
+index e6a8ee6db68e..7d787f91db92 100644
+--- a/include/linux/printk.h
++++ b/include/linux/printk.h
+@@ -161,6 +161,46 @@ static inline void printk_nmi_direct_enter(void) { }
+ static inline void printk_nmi_direct_exit(void) { }
+ #endif /* PRINTK_NMI */
+ 
++#ifdef CONFIG_PRINTK
++extern void printk_safe_enter(void);
++extern void printk_safe_exit(void);
++
++#define printk_safe_enter_irqsave(flags)	\
++	do {					\
++		local_irq_save(flags);		\
++		printk_safe_enter();		\
++	} while (0)
++
++#define printk_safe_exit_irqrestore(flags)	\
++	do {					\
++		printk_safe_exit();		\
++		local_irq_restore(flags);	\
++	} while (0)
++
++#define printk_safe_enter_irq()			\
++	do {					\
++		local_irq_disable();		\
++		printk_safe_enter();		\
++	} while (0)
++
++#define printk_safe_exit_irq()			\
++	do {					\
++		printk_safe_exit();		\
++		local_irq_enable();		\
++	} while (0)
++#else
++/*
++ * On !PRINTK builds we still export console output related locks
++ * and some functions (console_unlock()/tty/etc.), so printk-safe
++ * must preserve the existing local IRQ guarantees.
++ */
++#define printk_safe_enter_irqsave(flags) local_irq_save(flags)
++#define printk_safe_exit_irqrestore(flags) local_irq_restore(flags)
++
++#define printk_safe_enter_irq() local_irq_disable()
++#define printk_safe_exit_irq() local_irq_enable()
++#endif
++
+ struct dev_printk_info;
+ 
+ #ifdef CONFIG_PRINTK
+diff --git a/kernel/printk/internal.h b/kernel/printk/internal.h
+index 3a8fd491758c..b1c155328b04 100644
+--- a/kernel/printk/internal.h
++++ b/kernel/printk/internal.h
+@@ -22,53 +22,16 @@ int vprintk_store(int facility, int level,
+ __printf(1, 0) int vprintk_default(const char *fmt, va_list args);
+ __printf(1, 0) int vprintk_deferred(const char *fmt, va_list args);
+ __printf(1, 0) int vprintk_func(const char *fmt, va_list args);
+-void __printk_safe_enter(void);
+-void __printk_safe_exit(void);
+ 
+ void printk_safe_init(void);
+ bool printk_percpu_data_ready(void);
+ 
+-#define printk_safe_enter_irqsave(flags)	\
+-	do {					\
+-		local_irq_save(flags);		\
+-		__printk_safe_enter();		\
+-	} while (0)
+-
+-#define printk_safe_exit_irqrestore(flags)	\
+-	do {					\
+-		__printk_safe_exit();		\
+-		local_irq_restore(flags);	\
+-	} while (0)
+-
+-#define printk_safe_enter_irq()		\
+-	do {					\
+-		local_irq_disable();		\
+-		__printk_safe_enter();		\
+-	} while (0)
+-
+-#define printk_safe_exit_irq()			\
+-	do {					\
+-		__printk_safe_exit();		\
+-		local_irq_enable();		\
+-	} while (0)
+-
+ void defer_console_output(void);
+ 
+ #else
+ 
+ __printf(1, 0) int vprintk_func(const char *fmt, va_list args) { return 0; }
+ 
+-/*
+- * In !PRINTK builds we still export logbuf_lock spin_lock, console_sem
+- * semaphore and some of console functions (console_unlock()/etc.), so
+- * printk-safe must preserve the existing local IRQ guarantees.
+- */
+-#define printk_safe_enter_irqsave(flags) local_irq_save(flags)
+-#define printk_safe_exit_irqrestore(flags) local_irq_restore(flags)
+-
+-#define printk_safe_enter_irq() local_irq_disable()
+-#define printk_safe_exit_irq() local_irq_enable()
+-
+ static inline void printk_safe_init(void) { }
+ static inline bool printk_percpu_data_ready(void) { return false; }
+ #endif /* CONFIG_PRINTK */
+diff --git a/kernel/printk/printk_safe.c b/kernel/printk/printk_safe.c
+index 2e9e3ed7d63e..d03c36565e0d 100644
+--- a/kernel/printk/printk_safe.c
++++ b/kernel/printk/printk_safe.c
+@@ -356,16 +356,18 @@ static __printf(1, 0) int vprintk_safe(const char *fmt, va_list args)
+ }
+ 
+ /* Can be preempted by NMI. */
+-void __printk_safe_enter(void)
++void printk_safe_enter(void)
+ {
+ 	this_cpu_inc(printk_context);
+ }
++EXPORT_SYMBOL_GPL(printk_safe_enter);
+ 
+ /* Can be preempted by NMI. */
+-void __printk_safe_exit(void)
++void printk_safe_exit(void)
+ {
+ 	this_cpu_dec(printk_context);
+ }
++EXPORT_SYMBOL_GPL(printk_safe_exit);
+ 
+ __printf(1, 0) int vprintk_func(const char *fmt, va_list args)
+ {
+-- 
+2.26.2
+

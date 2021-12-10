@@ -1,0 +1,616 @@
+From 8db55d707eae69d3b13f5d46d7b91f515f71f313 Mon Sep 17 00:00:00 2001
+From: Lijun Fang <fanglijun3@huawei.com>
+Date: Fri, 3 Dec 2021 18:15:37 +0800
+Subject: [PATCH] svm: add set l2 cache read count functions
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 8db55d707eae69d3b13f5d46d7b91f515f71f313
+
+
+ascend inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4JMM0
+CVE: NA
+
+--------
+
+implement set l2 cache read count, svm drv will
+modify the page table pte to set read count for
+smmu
+
+Signed-off-by: Lijun Fang <fanglijun3@huawei.com>
+Reviewed-by: Weilong Chen <chenweilong@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/char/svm.c | 524 +++++++++++++++++++++++++--------------------
+ 1 file changed, 291 insertions(+), 233 deletions(-)
+
+diff --git a/drivers/char/svm.c b/drivers/char/svm.c
+index 19d36bddeb05..bc31724fb730 100644
+--- a/drivers/char/svm.c
++++ b/drivers/char/svm.c
+@@ -42,6 +42,7 @@
+ #define SVM_IOCTL_PIN_MEMORY		0xfff7
+ #define SVM_IOCTL_GET_PHYMEMINFO	0xfff8
+ #define SVM_IOCTL_LOAD_FLAG			0xfffa
++#define SVM_IOCTL_SET_RC			0xfffc
+ #define SVM_IOCTL_PROCESS_BIND		0xffff
+ 
+ #define CORE_SID		0
+@@ -140,6 +141,8 @@ static char *svm_cmd_to_string(unsigned int cmd)
+ 	switch (cmd) {
+ 	case SVM_IOCTL_PROCESS_BIND:
+ 		return "bind";
++	case SVM_IOCTL_SET_RC:
++		return "set rc";
+ 	case SVM_IOCTL_PIN_MEMORY:
+ 		return "pin memory";
+ 	case SVM_IOCTL_UNPIN_MEMORY:
+@@ -221,6 +224,270 @@ static inline struct core_device *to_core_device(struct device *d)
+ 	return container_of(d, struct core_device, dev);
+ }
+ 
++static struct svm_sdma *svm_find_sdma(struct svm_process *process,
++				unsigned long addr, int nr_pages)
++{
++	struct rb_node *node = process->sdma_list.rb_node;
++
++	while (node) {
++		struct svm_sdma *sdma = NULL;
++
++		sdma = rb_entry(node, struct svm_sdma, node);
++		if (addr < sdma->addr)
++			node = node->rb_left;
++		else if (addr > sdma->addr)
++			node = node->rb_right;
++		else if (nr_pages < sdma->nr_pages)
++			node = node->rb_left;
++		else if (nr_pages > sdma->nr_pages)
++			node = node->rb_right;
++		else
++			return sdma;
++	}
++
++	return NULL;
++}
++
++static int svm_insert_sdma(struct svm_process *process, struct svm_sdma *sdma)
++{
++	struct rb_node **p = &process->sdma_list.rb_node;
++	struct rb_node *parent = NULL;
++
++	while (*p) {
++		struct svm_sdma *tmp_sdma = NULL;
++
++		parent = *p;
++		tmp_sdma = rb_entry(parent, struct svm_sdma, node);
++		if (sdma->addr < tmp_sdma->addr)
++			p = &(*p)->rb_left;
++		else if (sdma->addr > tmp_sdma->addr)
++			p = &(*p)->rb_right;
++		else if (sdma->nr_pages < tmp_sdma->nr_pages)
++			p = &(*p)->rb_left;
++		else if (sdma->nr_pages > tmp_sdma->nr_pages)
++			p = &(*p)->rb_right;
++		else {
++			/*
++			 * add reference count and return -EBUSY
++			 * to free former alloced one.
++			 */
++			atomic64_inc(&tmp_sdma->ref);
++			return -EBUSY;
++		}
++	}
++
++	rb_link_node(&sdma->node, parent, p);
++	rb_insert_color(&sdma->node, &process->sdma_list);
++
++	return 0;
++}
++
++static void svm_remove_sdma(struct svm_process *process,
++			    struct svm_sdma *sdma, bool try_rm)
++{
++	int null_count = 0;
++
++	if (try_rm && (!atomic64_dec_and_test(&sdma->ref)))
++		return;
++
++	rb_erase(&sdma->node, &process->sdma_list);
++	RB_CLEAR_NODE(&sdma->node);
++
++	while (sdma->nr_pages--) {
++		if (sdma->pages[sdma->nr_pages] == NULL) {
++			pr_err("null pointer, nr_pages:%d.\n", sdma->nr_pages);
++			null_count++;
++			continue;
++		}
++
++		put_page(sdma->pages[sdma->nr_pages]);
++	}
++
++	if (null_count)
++		dump_stack();
++
++	kvfree(sdma->pages);
++	kfree(sdma);
++}
++
++static int svm_pin_pages(unsigned long addr, int nr_pages,
++			 struct page **pages)
++{
++	int err;
++
++	err = get_user_pages_fast(addr, nr_pages, 1, pages);
++	if (err > 0 && err < nr_pages) {
++		while (err--)
++			put_page(pages[err]);
++		err = -EFAULT;
++	} else if (err == 0) {
++		err = -EFAULT;
++	}
++
++	return err;
++}
++
++static int svm_add_sdma(struct svm_process *process,
++			unsigned long addr, unsigned long size)
++{
++	int err;
++	struct svm_sdma *sdma = NULL;
++
++	sdma = kzalloc(sizeof(struct svm_sdma), GFP_KERNEL);
++	if (sdma == NULL)
++		return -ENOMEM;
++
++	atomic64_set(&sdma->ref, 1);
++	sdma->addr = addr & PAGE_MASK;
++	sdma->nr_pages = (PAGE_ALIGN(size + addr) >> PAGE_SHIFT) -
++			 (sdma->addr >> PAGE_SHIFT);
++	sdma->pages = kvcalloc(sdma->nr_pages, sizeof(char *), GFP_KERNEL);
++	if (sdma->pages == NULL) {
++		err = -ENOMEM;
++		goto err_free_sdma;
++	}
++
++	/*
++	 * If always pin the same addr with the same nr_pages, pin pages
++	 * maybe should move after insert sdma with mutex lock.
++	 */
++	err = svm_pin_pages(sdma->addr, sdma->nr_pages, sdma->pages);
++	if (err < 0) {
++		pr_err("%s: failed to pin pages addr 0x%pK, size 0x%lx\n",
++		       __func__, (void *)addr, size);
++		goto err_free_pages;
++	}
++
++	err = svm_insert_sdma(process, sdma);
++	if (err < 0) {
++		err = 0;
++		pr_debug("%s: sdma already exist!\n", __func__);
++		goto err_unpin_pages;
++	}
++
++	return err;
++
++err_unpin_pages:
++	while (sdma->nr_pages--)
++		put_page(sdma->pages[sdma->nr_pages]);
++err_free_pages:
++	kvfree(sdma->pages);
++err_free_sdma:
++	kfree(sdma);
++
++	return err;
++}
++
++static int svm_pin_memory(unsigned long __user *arg)
++{
++	int err;
++	struct svm_process *process = NULL;
++	unsigned long addr, size, asid;
++
++	if (!acpi_disabled)
++		return -EPERM;
++
++	if (arg == NULL)
++		return -EINVAL;
++
++	if (get_user(addr, arg))
++		return -EFAULT;
++
++	if (get_user(size, arg + 1))
++		return -EFAULT;
++
++	if ((addr + size <= addr) || (size >= (u64)UINT_MAX) || (addr == 0))
++		return -EINVAL;
++
++	asid = arm64_mm_context_get(current->mm);
++	if (!asid)
++		return -ENOSPC;
++
++	mutex_lock(&svm_process_mutex);
++	process = find_svm_process(asid);
++	if (process == NULL) {
++		mutex_unlock(&svm_process_mutex);
++		err = -ESRCH;
++		goto out;
++	}
++	mutex_unlock(&svm_process_mutex);
++
++	mutex_lock(&process->mutex);
++	err = svm_add_sdma(process, addr, size);
++	mutex_unlock(&process->mutex);
++
++out:
++	arm64_mm_context_put(current->mm);
++
++	return err;
++}
++
++static int svm_unpin_memory(unsigned long __user *arg)
++{
++	int err = 0, nr_pages;
++	struct svm_sdma *sdma = NULL;
++	unsigned long addr, size, asid;
++	struct svm_process *process = NULL;
++
++	if (!acpi_disabled)
++		return -EPERM;
++
++	if (arg == NULL)
++		return -EINVAL;
++
++	if (get_user(addr, arg))
++		return -EFAULT;
++
++	if (get_user(size, arg + 1))
++		return -EFAULT;
++
++	if (ULONG_MAX - addr < size)
++		return -EINVAL;
++
++	asid = arm64_mm_context_get(current->mm);
++	if (!asid)
++		return -ENOSPC;
++
++	nr_pages = (PAGE_ALIGN(size + addr) >> PAGE_SHIFT) -
++		   ((addr & PAGE_MASK) >> PAGE_SHIFT);
++	addr &= PAGE_MASK;
++
++	mutex_lock(&svm_process_mutex);
++	process = find_svm_process(asid);
++	if (process == NULL) {
++		mutex_unlock(&svm_process_mutex);
++		err = -ESRCH;
++		goto out;
++	}
++	mutex_unlock(&svm_process_mutex);
++
++	mutex_lock(&process->mutex);
++	sdma = svm_find_sdma(process, addr, nr_pages);
++	if (sdma == NULL) {
++		mutex_unlock(&process->mutex);
++		err = -ESRCH;
++		goto out;
++	}
++
++	svm_remove_sdma(process, sdma, true);
++	mutex_unlock(&process->mutex);
++
++out:
++	arm64_mm_context_put(current->mm);
++
++	return err;
++}
++
++static void svm_unpin_all(struct svm_process *process)
++{
++	struct rb_node *node = NULL;
++
++	while ((node = rb_first(&process->sdma_list)))
++		svm_remove_sdma(process,
++				rb_entry(node, struct svm_sdma, node),
++				false);
++}
++
+ static int svm_acpi_bind_core(struct core_device *cdev,	void *data)
+ {
+ 	struct task_struct *task = NULL;
+@@ -293,6 +560,7 @@ static void svm_process_free(struct mmu_notifier *mn)
+ 	struct svm_process *process = NULL;
+ 
+ 	process = container_of(mn, struct svm_process, notifier);
++	svm_unpin_all(process);
+ 	arm64_mm_context_put(process->mm);
+ 	kfree(process);
+ }
+@@ -546,167 +814,14 @@ static int svm_open(struct inode *inode, struct file *file)
+ 	return 0;
+ }
+ 
+-static struct svm_sdma *svm_find_sdma(struct svm_process *process,
+-				unsigned long addr, int nr_pages)
++static int svm_set_rc(unsigned long __user *arg)
+ {
+-	struct rb_node *node = process->sdma_list.rb_node;
+-
+-	while (node) {
+-		struct svm_sdma *sdma = NULL;
+-
+-		sdma = rb_entry(node, struct svm_sdma, node);
+-		if (addr < sdma->addr)
+-			node = node->rb_left;
+-		else if (addr > sdma->addr)
+-			node = node->rb_right;
+-		else if (nr_pages < sdma->nr_pages)
+-			node = node->rb_left;
+-		else if (nr_pages > sdma->nr_pages)
+-			node = node->rb_right;
+-		else
+-			return sdma;
+-	}
+-
+-	return NULL;
+-}
+-
+-static int svm_insert_sdma(struct svm_process *process, struct svm_sdma *sdma)
+-{
+-	struct rb_node **p = &process->sdma_list.rb_node;
+-	struct rb_node *parent = NULL;
+-
+-	while (*p) {
+-		struct svm_sdma *tmp_sdma = NULL;
+-
+-		parent = *p;
+-		tmp_sdma = rb_entry(parent, struct svm_sdma, node);
+-		if (sdma->addr < tmp_sdma->addr)
+-			p = &(*p)->rb_left;
+-		else if (sdma->addr > tmp_sdma->addr)
+-			p = &(*p)->rb_right;
+-		else if (sdma->nr_pages < tmp_sdma->nr_pages)
+-			p = &(*p)->rb_left;
+-		else if (sdma->nr_pages > tmp_sdma->nr_pages)
+-			p = &(*p)->rb_right;
+-		else {
+-			/*
+-			 * add reference count and return -EBUSY
+-			 * to free former alloced one.
+-			 */
+-			atomic64_inc(&tmp_sdma->ref);
+-			return -EBUSY;
+-		}
+-	}
+-
+-	rb_link_node(&sdma->node, parent, p);
+-	rb_insert_color(&sdma->node, &process->sdma_list);
+-
+-	return 0;
+-}
+-
+-static void svm_remove_sdma(struct svm_process *process,
+-			    struct svm_sdma *sdma, bool try_rm)
+-{
+-	int null_count = 0;
+-
+-	if (try_rm && (!atomic64_dec_and_test(&sdma->ref)))
+-		return;
+-
+-	rb_erase(&sdma->node, &process->sdma_list);
+-	RB_CLEAR_NODE(&sdma->node);
+-
+-	while (sdma->nr_pages--) {
+-		if (sdma->pages[sdma->nr_pages] == NULL) {
+-			pr_err("null pointer, nr_pages:%d.\n", sdma->nr_pages);
+-			null_count++;
+-			continue;
+-		}
+-
+-		put_page(sdma->pages[sdma->nr_pages]);
+-	}
+-
+-	if (null_count)
+-		dump_stack();
+-
+-	kvfree(sdma->pages);
+-	kfree(sdma);
+-}
+-
+-static int svm_pin_pages(unsigned long addr, int nr_pages,
+-			 struct page **pages)
+-{
+-	int err;
+-
+-	err = get_user_pages_fast(addr, nr_pages, 1, pages);
+-	if (err > 0 && err < nr_pages) {
+-		while (err--)
+-			put_page(pages[err]);
+-		err = -EFAULT;
+-	} else if (err == 0) {
+-		err = -EFAULT;
+-	}
+-
+-	return err;
+-}
+-
+-static int svm_add_sdma(struct svm_process *process,
+-			unsigned long addr, unsigned long size)
+-{
+-	int err;
+-	struct svm_sdma *sdma = NULL;
+-
+-	sdma = kzalloc(sizeof(struct svm_sdma), GFP_KERNEL);
+-	if (sdma == NULL)
+-		return -ENOMEM;
+-
+-	atomic64_set(&sdma->ref, 1);
+-	sdma->addr = addr & PAGE_MASK;
+-	sdma->nr_pages = (PAGE_ALIGN(size + addr) >> PAGE_SHIFT) -
+-			 (sdma->addr >> PAGE_SHIFT);
+-	sdma->pages = kvcalloc(sdma->nr_pages, sizeof(char *), GFP_KERNEL);
+-	if (sdma->pages == NULL) {
+-		err = -ENOMEM;
+-		goto err_free_sdma;
+-	}
+-
+-	/*
+-	 * If always pin the same addr with the same nr_pages, pin pages
+-	 * maybe should move after insert sdma with mutex lock.
+-	 */
+-	err = svm_pin_pages(sdma->addr, sdma->nr_pages, sdma->pages);
+-	if (err < 0) {
+-		pr_err("%s: failed to pin pages addr 0x%pK, size 0x%lx\n",
+-		       __func__, (void *)addr, size);
+-		goto err_free_pages;
+-	}
+-
+-	err = svm_insert_sdma(process, sdma);
+-	if (err < 0) {
+-		err = 0;
+-		pr_debug("%s: sdma already exist!\n", __func__);
+-		goto err_unpin_pages;
+-	}
+-
+-	return err;
+-
+-err_unpin_pages:
+-	while (sdma->nr_pages--)
+-		put_page(sdma->pages[sdma->nr_pages]);
+-err_free_pages:
+-	kvfree(sdma->pages);
+-err_free_sdma:
+-	kfree(sdma);
+-
+-	return err;
+-}
+-
+-static int svm_pin_memory(unsigned long __user *arg)
+-{
+-	int err;
+-	struct svm_process *process = NULL;
+-	unsigned long addr, size, asid;
++	unsigned long addr, size, rc;
++	unsigned long end, page_size, offset;
++	pte_t *pte = NULL;
++	struct mm_struct *mm = current->mm;
+ 
+-	if (!acpi_disabled)
++	if (acpi_disabled)
+ 		return -EPERM;
+ 
+ 	if (arg == NULL)
+@@ -718,86 +833,26 @@ static int svm_pin_memory(unsigned long __user *arg)
+ 	if (get_user(size, arg + 1))
+ 		return -EFAULT;
+ 
+-	if ((addr + size <= addr) || (size >= (u64)UINT_MAX) || (addr == 0))
+-		return -EINVAL;
+-
+-	asid = arm64_mm_context_get(current->mm);
+-	if (!asid)
+-		return -ENOSPC;
+-
+-	mutex_lock(&svm_process_mutex);
+-	process = find_svm_process(asid);
+-	if (process == NULL) {
+-		mutex_unlock(&svm_process_mutex);
+-		err = -ESRCH;
+-		goto out;
+-	}
+-	mutex_unlock(&svm_process_mutex);
+-
+-	mutex_lock(&process->mutex);
+-	err = svm_add_sdma(process, addr, size);
+-	mutex_unlock(&process->mutex);
+-
+-out:
+-	arm64_mm_context_put(current->mm);
+-
+-	return err;
+-}
+-
+-static int svm_unpin_memory(unsigned long __user *arg)
+-{
+-	int err = 0, nr_pages;
+-	struct svm_sdma *sdma = NULL;
+-	unsigned long addr, size, asid;
+-	struct svm_process *process = NULL;
+-
+-	if (!acpi_disabled)
+-		return -EPERM;
+-
+-	if (arg == NULL)
+-		return -EINVAL;
+-
+-	if (get_user(addr, arg))
+-		return -EFAULT;
+-
+-	if (get_user(size, arg + 1))
++	if (get_user(rc, arg + 2))
+ 		return -EFAULT;
+ 
+-	if (ULONG_MAX - addr < size)
++	end = addr + size;
++	if (addr >= end)
+ 		return -EINVAL;
+ 
+-	asid = arm64_mm_context_get(current->mm);
+-	if (!asid)
+-		return -ENOSPC;
+-
+-	nr_pages = (PAGE_ALIGN(size + addr) >> PAGE_SHIFT) -
+-		   ((addr & PAGE_MASK) >> PAGE_SHIFT);
+-	addr &= PAGE_MASK;
+-
+-	mutex_lock(&svm_process_mutex);
+-	process = find_svm_process(asid);
+-	if (process == NULL) {
+-		mutex_unlock(&svm_process_mutex);
+-		err = -ESRCH;
+-		goto out;
+-	}
+-	mutex_unlock(&svm_process_mutex);
+-
+-	mutex_lock(&process->mutex);
+-	sdma = svm_find_sdma(process, addr, nr_pages);
+-	if (sdma == NULL) {
+-		mutex_unlock(&process->mutex);
+-		err = -ESRCH;
+-		goto out;
++	down_read(&mm->mmap_lock);
++	while (addr < end) {
++		pte = svm_walk_pt(addr, &page_size, &offset);
++		if (!pte) {
++			up_read(&mm->mmap_lock);
++			return -ESRCH;
++		}
++		pte->pte |= (rc & (u64)0x0f) << 59;
++		addr += page_size - offset;
+ 	}
++	up_read(&mm->mmap_lock);
+ 
+-	svm_remove_sdma(process, sdma, true);
+-	mutex_unlock(&process->mutex);
+-
+-out:
+-	arm64_mm_context_put(current->mm);
+-
+-	return err;
++	return 0;
+ }
+ 
+ static long svm_get_hugeinfo(unsigned long __user *arg)
+@@ -1248,6 +1303,9 @@ static long svm_ioctl(struct file *file, unsigned int cmd,
+ 			return -EFAULT;
+ 		}
+ 		break;
++	case SVM_IOCTL_SET_RC:
++		err = svm_set_rc((unsigned long __user *)arg);
++		break;
+ 	case SVM_IOCTL_PIN_MEMORY:
+ 		err = svm_pin_memory((unsigned long __user *)arg);
+ 		break;
+-- 
+2.26.2
+

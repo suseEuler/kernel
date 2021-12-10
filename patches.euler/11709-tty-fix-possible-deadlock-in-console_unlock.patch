@@ -1,0 +1,79 @@
+From 923efc4dc37c1a7cc91f0dd5dbdc87e0943ad1ae Mon Sep 17 00:00:00 2001
+From: Hongbo Yao <yaohongbo@huawei.com>
+Date: Fri, 3 Dec 2021 18:15:43 +0800
+Subject: [PATCH] tty: fix possible deadlock in console_unlock
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 923efc4dc37c1a7cc91f0dd5dbdc87e0943ad1ae
+
+
+euler inclusion
+category: bugfix
+bugzilla: 9509, https://gitee.com/openeuler/kernel/issues/I4K61K
+CVE: NA
+
+Reference: http://openeuler.huawei.com/bugzilla/show_bug.cgi?id=9509
+
+------------------------------------------------
+
+Syzkaller hit 'possible deadlock in console_unlock' for several times.
+Possible unsafe locking scenario:
+
+       CPU0                    CPU1
+       ----                    ----
+  lock(&(&port->lock)->rlock);
+                               lock(&port_lock_key);
+                               lock(&(&port->lock)->rlock);
+  lock(console_owner);
+
+The problem is that call_console_driver->console_driver also can do
+this thing
+
+   uart_port->lock
+    tty_wakeup
+     tty_port->lock
+
+So we can have the following:
+
+tty_write
+ tty_port->lock
+  printk
+   call_console_driver
+    console_driver
+     uart_port->lock
+      tty_wakeup
+       tty_port->lock      << deadlock
+
+To solve this problem,  switch to printk_safe mode around that kmalloc(),
+this will redirect all printk()-s from kmalloc() to a special per-CPU
+buffer, which will be flushed later from a safe context (irq work).
+
+Signed-off-by: Hongbo Yao <yaohongbo@huawei.com>
+Signed-off-by: Peng Wu <wupeng58@huawei.com>
+Reviewed-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/tty/tty_buffer.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/drivers/tty/tty_buffer.c b/drivers/tty/tty_buffer.c
+index bd2d91546e32..1831738b33f4 100644
+--- a/drivers/tty/tty_buffer.c
++++ b/drivers/tty/tty_buffer.c
+@@ -172,7 +172,9 @@ static struct tty_buffer *tty_buffer_alloc(struct tty_port *port, size_t size)
+ 	   have queued and recycle that ? */
+ 	if (atomic_read(&port->buf.mem_used) > port->buf.mem_limit)
+ 		return NULL;
++	printk_safe_enter();
+ 	p = kmalloc(sizeof(struct tty_buffer) + 2 * size, GFP_ATOMIC);
++	printk_safe_exit();
+ 	if (p == NULL)
+ 		return NULL;
+ 
+-- 
+2.26.2
+
