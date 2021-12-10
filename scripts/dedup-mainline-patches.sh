@@ -19,7 +19,7 @@ while read -r line; do
 	SUBJECT=$(head -10 $line | grep Subject |  cut -d " " -f 3-)
 	echo $SUBJECT
 	cd $LINUX_STABLE_GIT; #stable tree, 5.10.y branch for OE OLK-5.10
-	EXISTED=$(git log --oneline $START_STABLE_VERSION..$END_STABLE_VERSION | grep "$SUBJECT")
+	EXISTED=$(git log --oneline $START_STABLE_VERSION..$END_STABLE_VERSION | grep -F -i "$SUBJECT")
     	echo $EXISTED
 	cd $CURR_PWD
 	if [ -n "$EXISTED" ]; then
