@@ -1,0 +1,97 @@
+From baff4b7b05f311141ba9afcd264468a428b0faeb Mon Sep 17 00:00:00 2001
+From: Trond Myklebust <trond.myklebust@hammerspace.com>
+Date: Fri, 10 Dec 2021 18:22:56 +0800
+Subject: [PATCH] SUNRPC: Close a race with transport setup and module put
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: baff4b7b05f311141ba9afcd264468a428b0faeb
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4IL3P
+CVE: NA
+
+--------------------------------
+
+After we've looked up the transport module, we need to ensure it can't
+go away until we've finished running the transport setup code.
+
+Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+Signed-off-by: Lu Wei <luwei32@huawei.com>
+Reviewed-by: Wei Yongjun <weiyongjun1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ net/sunrpc/xprt.c | 44 +++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 33 insertions(+), 11 deletions(-)
+
+diff --git a/net/sunrpc/xprt.c b/net/sunrpc/xprt.c
+index 04aaca4b8bf9..cdf5cc67a005 100644
+--- a/net/sunrpc/xprt.c
++++ b/net/sunrpc/xprt.c
+@@ -158,6 +158,32 @@ xprt_class_release(const struct xprt_class *t)
+ 	module_put(t->owner);
+ }
+ 
++static const struct xprt_class *
++xprt_class_find_by_ident_locked(int ident)
++{
++	const struct xprt_class *t;
++
++	list_for_each_entry(t, &xprt_list, list) {
++		if (t->ident != ident)
++			continue;
++		if (!try_module_get(t->owner))
++			continue;
++		return t;
++	}
++	return NULL;
++}
++
++static const struct xprt_class *
++xprt_class_find_by_ident(int ident)
++{
++	const struct xprt_class *t;
++
++	spin_lock(&xprt_list_lock);
++	t = xprt_class_find_by_ident_locked(ident);
++	spin_unlock(&xprt_list_lock);
++	return t;
++}
++
+ static const struct xprt_class *
+ xprt_class_find_by_netid_locked(const char *netid)
+ {
+@@ -1959,21 +1985,17 @@ static void xprt_init(struct rpc_xprt *xprt, struct net *net)
+ struct rpc_xprt *xprt_create_transport(struct xprt_create *args)
+ {
+ 	struct rpc_xprt	*xprt;
+-	struct xprt_class *t;
++	const struct xprt_class *t;
+ 
+-	spin_lock(&xprt_list_lock);
+-	list_for_each_entry(t, &xprt_list, list) {
+-		if (t->ident == args->ident) {
+-			spin_unlock(&xprt_list_lock);
+-			goto found;
+-		}
++	t = xprt_class_find_by_ident(args->ident);
++	if (!t) {
++		dprintk("RPC: transport (%d) not supported\n", args->ident);
++		return ERR_PTR(-EIO);
+ 	}
+-	spin_unlock(&xprt_list_lock);
+-	dprintk("RPC: transport (%d) not supported\n", args->ident);
+-	return ERR_PTR(-EIO);
+ 
+-found:
+ 	xprt = t->setup(args);
++	xprt_class_release(t);
++
+ 	if (IS_ERR(xprt))
+ 		goto out;
+ 	if (args->flags & XPRT_CREATE_NO_IDLE_TIMEOUT)
+-- 
+2.26.2
+

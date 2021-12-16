@@ -1,0 +1,316 @@
+From a41f60f032643b0a1bf1f3b8a5d674cd4ef46b7b Mon Sep 17 00:00:00 2001
+From: Zheng Zucheng <zhengzucheng@huawei.com>
+Date: Fri, 10 Dec 2021 18:22:55 +0800
+Subject: [PATCH] sched: Introduce handle priority reversion mechanism
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: a41f60f032643b0a1bf1f3b8a5d674cd4ef46b7b
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4LH1X
+CVE: NA
+
+--------------------------------
+
+When online tasks occupy cpu long time, offline task will not get cpu to run,
+the priority inversion issue may be triggered in this case. If the above case
+occurs, we will unthrottle offline tasks and let its get a chance to run.
+When online tasks occupy cpu over 5s(defaule value), we will unthrottle offline
+tasks and enter a msleep loop before exit to usermode util the cpu goto idle.
+
+Signed-off-by: Zhang Qiao <zhangqiao22@huawei.com>
+Signed-off-by: Zheng Zucheng <zhengzucheng@huawei.com>
+Reviewed-by: Chen Hui <judy.chenhui@huawei.com>
+Reviewed-by: Xiu Jianfeng <xiujianfeng@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/sched.h        |  7 +++
+ include/linux/sched/sysctl.h |  5 +++
+ kernel/entry/common.c        |  7 ++-
+ kernel/sched/core.c          |  3 ++
+ kernel/sched/fair.c          | 84 ++++++++++++++++++++++++++++++++++--
+ kernel/sched/sched.h         |  3 ++
+ kernel/sysctl.c              | 23 ++++++++++
+ 7 files changed, 128 insertions(+), 4 deletions(-)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 9e9c0bd4197d..b977f07ed41c 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -2120,6 +2120,13 @@ const struct cpumask *sched_trace_rd_span(struct root_domain *rd);
+ 
+ #ifdef CONFIG_QOS_SCHED
+ void sched_move_offline_task(struct task_struct *p);
++void sched_qos_offline_wait(void);
++int sched_qos_cpu_overload(void);
++#else
++static inline int sched_qos_cpu_overload(void)
++{
++	return 0;
++}
+ #endif
+ 
+ #endif
+diff --git a/include/linux/sched/sysctl.h b/include/linux/sched/sysctl.h
+index 525d73dd8ef9..cd2b767bbff8 100644
+--- a/include/linux/sched/sysctl.h
++++ b/include/linux/sched/sysctl.h
+@@ -74,6 +74,11 @@ extern unsigned int sysctl_sched_uclamp_util_min_rt_default;
+ extern unsigned int sysctl_sched_cfs_bandwidth_slice;
+ #endif
+ 
++#ifdef CONFIG_QOS_SCHED
++extern unsigned int sysctl_overload_detect_period;
++extern unsigned int sysctl_offline_wait_interval;
++#endif
++
+ #ifdef CONFIG_SCHED_AUTOGROUP
+ extern unsigned int sysctl_sched_autogroup_enabled;
+ #endif
+diff --git a/kernel/entry/common.c b/kernel/entry/common.c
+index 8a4dd7027e90..df3c534dc138 100644
+--- a/kernel/entry/common.c
++++ b/kernel/entry/common.c
+@@ -160,6 +160,10 @@ static unsigned long exit_to_user_mode_loop(struct pt_regs *regs,
+ 		if (ti_work & _TIF_SIGPENDING)
+ 			arch_do_signal(regs);
+ 
++#ifdef CONFIG_QOS_SCHED
++		sched_qos_offline_wait();
++#endif
++
+ 		if (ti_work & _TIF_NOTIFY_RESUME) {
+ 			tracehook_notify_resume(regs);
+ 			rseq_handle_notify_resume(NULL, regs);
+@@ -187,7 +191,8 @@ static void exit_to_user_mode_prepare(struct pt_regs *regs)
+ 
+ 	lockdep_assert_irqs_disabled();
+ 
+-	if (unlikely(ti_work & EXIT_TO_USER_MODE_WORK))
++	if (unlikely((ti_work & EXIT_TO_USER_MODE_WORK) ||
++		      sched_qos_cpu_overload()))
+ 		ti_work = exit_to_user_mode_loop(regs, ti_work);
+ 
+ 	arch_exit_to_user_mode_prepare(regs, ti_work);
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 856c4123e92a..b46717970ab9 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -7394,6 +7394,9 @@ void __init sched_init(void)
+ 		 * We achieve this by letting root_task_group's tasks sit
+ 		 * directly in rq->cfs (i.e root_task_group->se[] = NULL).
+ 		 */
++#ifdef CONFIG_QOS_SCHED
++		init_qos_hrtimer(i);
++#endif
+ 		init_tg_cfs_entry(&root_task_group, &rq->cfs, NULL, i, NULL);
+ #endif /* CONFIG_FAIR_GROUP_SCHED */
+ 
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 1a0cb9a4161e..e5cf15fb9e84 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -24,6 +24,9 @@
+ #ifdef CONFIG_SCHED_STEAL
+ #include "sparsemask.h"
+ #endif
++#ifdef CONFIG_QOS_SCHED
++#include <linux/delay.h>
++#endif
+ 
+ /*
+  * Targeted preemption latency for CPU-bound tasks:
+@@ -153,6 +156,10 @@ int __weak arch_asym_cpu_priority(int cpu)
+ 
+ #ifdef CONFIG_QOS_SCHED
+ static DEFINE_PER_CPU_SHARED_ALIGNED(struct list_head, qos_throttled_cfs_rq);
++static DEFINE_PER_CPU_SHARED_ALIGNED(struct hrtimer, qos_overload_timer);
++static DEFINE_PER_CPU(int, qos_cpu_overload);
++unsigned int sysctl_overload_detect_period = 5000;  /* in ms */
++unsigned int sysctl_offline_wait_interval = 100;  /* in ms */
+ static int unthrottle_qos_cfs_rqs(int cpu);
+ #endif
+ 
+@@ -7245,6 +7252,7 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
+ }
+ 
+ #ifdef CONFIG_QOS_SCHED
++static void start_qos_hrtimer(int cpu);
+ static void throttle_qos_cfs_rq(struct cfs_rq *cfs_rq)
+ {
+ 	struct rq *rq = rq_of(cfs_rq);
+@@ -7283,6 +7291,9 @@ static void throttle_qos_cfs_rq(struct cfs_rq *cfs_rq)
+ 
+ 	}
+ 
++	if (list_empty(&per_cpu(qos_throttled_cfs_rq, cpu_of(rq))))
++		start_qos_hrtimer(cpu_of(rq));
++
+ 	cfs_rq->throttled = 1;
+ 	cfs_rq->throttled_clock = rq_clock(rq);
+ 
+@@ -7342,7 +7353,7 @@ static void unthrottle_qos_cfs_rq(struct cfs_rq *cfs_rq)
+ 		resched_curr(rq);
+ }
+ 
+-static int unthrottle_qos_cfs_rqs(int cpu)
++static int __unthrottle_qos_cfs_rqs(int cpu)
+ {
+ 	struct cfs_rq *cfs_rq, *tmp_rq;
+ 	int res = 0;
+@@ -7358,11 +7369,26 @@ static int unthrottle_qos_cfs_rqs(int cpu)
+ 	return res;
+ }
+ 
++static int unthrottle_qos_cfs_rqs(int cpu)
++{
++	int res;
++
++	res = __unthrottle_qos_cfs_rqs(cpu);
++	if (res)
++		hrtimer_cancel(&(per_cpu(qos_overload_timer, cpu)));
++
++	return res;
++}
++
+ static bool check_qos_cfs_rq(struct cfs_rq *cfs_rq)
+ {
++	if (unlikely(__this_cpu_read(qos_cpu_overload))) {
++		return false;
++	}
++
+ 	if (unlikely(cfs_rq && cfs_rq->tg->qos_level < 0 &&
+-		     !sched_idle_cpu(smp_processor_id()) &&
+-		     cfs_rq->h_nr_running == cfs_rq->idle_h_nr_running)) {
++		!sched_idle_cpu(smp_processor_id()) &&
++		cfs_rq->h_nr_running == cfs_rq->idle_h_nr_running)) {
+ 		throttle_qos_cfs_rq(cfs_rq);
+ 		return true;
+ 	}
+@@ -7380,6 +7406,56 @@ static inline void unthrottle_qos_sched_group(struct cfs_rq *cfs_rq)
+ 		unthrottle_qos_cfs_rq(cfs_rq);
+ 	rq_unlock_irqrestore(rq, &rf);
+ }
++
++void sched_qos_offline_wait(void)
++{
++	long qos_level;
++
++	while (unlikely(this_cpu_read(qos_cpu_overload))) {
++		rcu_read_lock();
++		qos_level = task_group(current)->qos_level;
++		rcu_read_unlock();
++		if (qos_level != -1 || signal_pending(current))
++			break;
++		msleep_interruptible(sysctl_offline_wait_interval);
++	}
++}
++
++int sched_qos_cpu_overload(void)
++{
++	return __this_cpu_read(qos_cpu_overload);
++}
++
++static enum hrtimer_restart qos_overload_timer_handler(struct hrtimer *timer)
++{
++	struct rq_flags rf;
++	struct rq *rq = this_rq();
++
++	rq_lock_irqsave(rq, &rf);
++	if (__unthrottle_qos_cfs_rqs(smp_processor_id()))
++		__this_cpu_write(qos_cpu_overload, 1);
++	rq_unlock_irqrestore(rq, &rf);
++
++	return HRTIMER_NORESTART;
++}
++
++static void start_qos_hrtimer(int cpu)
++{
++	ktime_t time;
++	struct hrtimer *hrtimer = &(per_cpu(qos_overload_timer, cpu));
++
++	time = ktime_add_ms(hrtimer->base->get_time(), (u64)sysctl_overload_detect_period);
++	hrtimer_set_expires(hrtimer, time);
++	hrtimer_start_expires(hrtimer, HRTIMER_MODE_ABS_PINNED);
++}
++
++void init_qos_hrtimer(int cpu)
++{
++	struct hrtimer *hrtimer = &(per_cpu(qos_overload_timer, cpu));
++
++	hrtimer_init(hrtimer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS_PINNED);
++	hrtimer->function = qos_overload_timer_handler;
++}
+ #endif
+ 
+ struct task_struct *
+@@ -7548,6 +7624,8 @@ done: __maybe_unused;
+ 		rq->idle_stamp = 0;
+ 		goto again;
+ 	}
++
++	__this_cpu_write(qos_cpu_overload, 0);
+ #endif
+ 	/*
+ 	 * rq is about to be idle, check if we need to update the
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 9ec230220ee3..4c58086cf080 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1100,6 +1100,9 @@ static inline int cpu_of(struct rq *rq)
+ #endif
+ }
+ 
++#ifdef CONFIG_QOS_SCHED
++void init_qos_hrtimer(int cpu);
++#endif
+ 
+ #ifdef CONFIG_SCHED_SMT
+ extern void __update_idle_core(struct rq *rq);
+diff --git a/kernel/sysctl.c b/kernel/sysctl.c
+index 261787cebd8e..749ef59224e2 100644
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -128,6 +128,9 @@ static int one_thousand = 1000;
+ #ifdef CONFIG_PRINTK
+ static int ten_thousand = 10000;
+ #endif
++#ifdef CONFIG_QOS_SCHED
++static int hundred_thousand = 100000;
++#endif
+ #ifdef CONFIG_PERF_EVENTS
+ static int six_hundred_forty_kb = 640 * 1024;
+ #endif
+@@ -2725,6 +2728,26 @@ static struct ctl_table kern_table[] = {
+ 		.mode		= 0555,
+ 		.child		= ias_table,
+ 	},
++#ifdef CONFIG_QOS_SCHED
++	{
++		.procname	= "qos_overload_detect_period_ms",
++		.data		= &sysctl_overload_detect_period,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= &one_thousand,
++		.extra2		= &hundred_thousand,
++	},
++	{
++		.procname	= "qos_offline_wait_interval_ms",
++		.data		= &sysctl_offline_wait_interval,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= &one_hundred,
++		.extra2		= &one_thousand,
++	},
++#endif
+ 	{ }
+ };
+ 
+-- 
+2.26.2
+
