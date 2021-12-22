@@ -1,0 +1,74 @@
+From 1d3cb90cb0101bb44254d295a421a89f3b73f6e8 Mon Sep 17 00:00:00 2001
+Message-Id: <1d3cb90cb0101bb44254d295a421a89f3b73f6e8.1640138099.git.geliang.tang@suse.com>
+From: Grzegorz Siwik <grzegorz.siwik@intel.com>
+Date: Tue, 23 Feb 2021 15:15:27 +0100
+Subject: [PATCH] igb: Add double-check MTA_REGISTER for i210 and i211
+Git-commit: 1d3cb90cb0101bb44254d295a421a89f3b73f6e8
+Patch-mainline: v5.13-rc1
+References: bsn#47
+
+
+Add new function which checks MTA_REGISTER if its filled correctly.
+If not then writes again to same register.
+There is possibility that i210 and i211 could not accept
+MTA_REGISTER settings, specially when you add and remove
+many of multicast addresses in short time.
+Without this patch there is possibility that multicast settings will be
+not always set correctly in hardware.
+
+Signed-off-by: Grzegorz Siwik <grzegorz.siwik@intel.com>
+Tested-by: Dave Switzer <david.switzer@intel.com>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ drivers/net/ethernet/intel/igb/e1000_mac.c | 27 ++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/drivers/net/ethernet/intel/igb/e1000_mac.c b/drivers/net/ethernet/intel/igb/e1000_mac.c
+index fd8eb2f9ab9d..e63ee3cca5ea 100644
+--- a/drivers/net/ethernet/intel/igb/e1000_mac.c
++++ b/drivers/net/ethernet/intel/igb/e1000_mac.c
+@@ -483,6 +483,31 @@ static u32 igb_hash_mc_addr(struct e1000_hw *hw, u8 *mc_addr)
+ 	return hash_value;
+ }
+ 
++/**
++ * igb_i21x_hw_doublecheck - double checks potential HW issue in i21X
++ * @hw: pointer to the HW structure
++ *
++ * Checks if multicast array is wrote correctly
++ * If not then rewrites again to register
++ **/
++static void igb_i21x_hw_doublecheck(struct e1000_hw *hw)
++{
++	bool is_failed;
++	int i;
++
++	do {
++		is_failed = false;
++		for (i = hw->mac.mta_reg_count - 1; i >= 0; i--) {
++			if (array_rd32(E1000_MTA, i) != hw->mac.mta_shadow[i]) {
++				is_failed = true;
++				array_wr32(E1000_MTA, i, hw->mac.mta_shadow[i]);
++				wrfl();
++				break;
++			}
++		}
++	} while (is_failed);
++}
++
+ /**
+  *  igb_update_mc_addr_list - Update Multicast addresses
+  *  @hw: pointer to the HW structure
+@@ -516,6 +541,8 @@ void igb_update_mc_addr_list(struct e1000_hw *hw,
+ 	for (i = hw->mac.mta_reg_count - 1; i >= 0; i--)
+ 		array_wr32(E1000_MTA, i, hw->mac.mta_shadow[i]);
+ 	wrfl();
++	if (hw->mac.type == e1000_i210 || hw->mac.type == e1000_i211)
++		igb_i21x_hw_doublecheck(hw);
+ }
+ 
+ /**
+-- 
+2.31.1
+

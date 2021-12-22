@@ -1,0 +1,108 @@
+From 847cbfc014adafeac401e19e349b0fd524f201c3 Mon Sep 17 00:00:00 2001
+Message-Id: <847cbfc014adafeac401e19e349b0fd524f201c3.1640138202.git.geliang.tang@suse.com>
+From: Vladimir Oltean <olteanv@gmail.com>
+Date: Wed, 10 Mar 2021 16:50:44 +0200
+Subject: [PATCH] net: add a helper to avoid issues with HW TX timestamping and
+ SO_TXTIME
+Git-commit: 847cbfc014adafeac401e19e349b0fd524f201c3
+Patch-mainline: v5.13-rc1
+References: bsn#47
+
+
+As explained in commit 29d98f54a4fe ("net: enetc: allow hardware
+timestamping on TX queues with tc-etf enabled"), hardware TX
+timestamping requires an skb with skb->tstamp = 0. When a packet is sent
+with SO_TXTIME, the skb->skb_mstamp_ns corrupts the value of skb->tstamp,
+so the drivers need to explicitly reset skb->tstamp to zero after
+consuming the TX time.
+
+Create a helper named skb_txtime_consumed() which does just that. All
+drivers which offload TC_SETUP_QDISC_ETF should implement it, and it
+would make it easier to assess during review whether they do the right
+thing in order to be compatible with hardware timestamping or not.
+
+Suggested-by: Vinicius Costa Gomes <vinicius.gomes@intel.com>
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Acked-by: Vinicius Costa Gomes <vinicius.gomes@intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ drivers/net/ethernet/freescale/enetc/enetc.c | 8 ++------
+ drivers/net/ethernet/intel/igb/igb_main.c    | 2 +-
+ drivers/net/ethernet/intel/igc/igc_main.c    | 2 +-
+ include/net/pkt_sched.h                      | 9 +++++++++
+ 4 files changed, 13 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc.c b/drivers/net/ethernet/freescale/enetc/enetc.c
+index 09471329f3a3..89d2cb348271 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc.c
++++ b/drivers/net/ethernet/freescale/enetc/enetc.c
+@@ -5,6 +5,7 @@
+ #include <linux/tcp.h>
+ #include <linux/udp.h>
+ #include <linux/vmalloc.h>
++#include <net/pkt_sched.h>
+ 
+ /* ENETC overhead: optional extension BD + 1 BD gap */
+ #define ENETC_TXBDS_NEEDED(val)	((val) + 2)
+@@ -344,12 +345,7 @@ static void enetc_tstamp_tx(struct sk_buff *skb, u64 tstamp)
+ 	if (skb_shinfo(skb)->tx_flags & SKBTX_IN_PROGRESS) {
+ 		memset(&shhwtstamps, 0, sizeof(shhwtstamps));
+ 		shhwtstamps.hwtstamp = ns_to_ktime(tstamp);
+-		/* Ensure skb_mstamp_ns, which might have been populated with
+-		 * the txtime, is not mistaken for a software timestamp,
+-		 * because this will prevent the dispatch of our hardware
+-		 * timestamp to the socket.
+-		 */
+-		skb->tstamp = ktime_set(0, 0);
++		skb_txtime_consumed(skb);
+ 		skb_tstamp_tx(skb, &shhwtstamps);
+ 	}
+ }
+diff --git a/drivers/net/ethernet/intel/igb/igb_main.c b/drivers/net/ethernet/intel/igb/igb_main.c
+index 878b31d534ec..369533feb4f2 100644
+--- a/drivers/net/ethernet/intel/igb/igb_main.c
++++ b/drivers/net/ethernet/intel/igb/igb_main.c
+@@ -5856,7 +5856,7 @@ static void igb_tx_ctxtdesc(struct igb_ring *tx_ring,
+ 	 */
+ 	if (tx_ring->launchtime_enable) {
+ 		ts = ktime_to_timespec64(first->skb->tstamp);
+-		first->skb->tstamp = ktime_set(0, 0);
++		skb_txtime_consumed(first->skb);
+ 		context_desc->seqnum_seed = cpu_to_le32(ts.tv_nsec / 32);
+ 	} else {
+ 		context_desc->seqnum_seed = 0;
+diff --git a/drivers/net/ethernet/intel/igc/igc_main.c b/drivers/net/ethernet/intel/igc/igc_main.c
+index 7ac9597ddb84..059ffcfb0bda 100644
+--- a/drivers/net/ethernet/intel/igc/igc_main.c
++++ b/drivers/net/ethernet/intel/igc/igc_main.c
+@@ -941,7 +941,7 @@ static void igc_tx_ctxtdesc(struct igc_ring *tx_ring,
+ 		struct igc_adapter *adapter = netdev_priv(tx_ring->netdev);
+ 		ktime_t txtime = first->skb->tstamp;
+ 
+-		first->skb->tstamp = ktime_set(0, 0);
++		skb_txtime_consumed(first->skb);
+ 		context_desc->launch_time = igc_tx_launchtime(adapter,
+ 							      txtime);
+ 	} else {
+diff --git a/include/net/pkt_sched.h b/include/net/pkt_sched.h
+index 15b1b30f454e..f5c1bee0cd6a 100644
+--- a/include/net/pkt_sched.h
++++ b/include/net/pkt_sched.h
+@@ -188,4 +188,13 @@ struct tc_taprio_qopt_offload *taprio_offload_get(struct tc_taprio_qopt_offload
+ 						  *offload);
+ void taprio_offload_free(struct tc_taprio_qopt_offload *offload);
+ 
++/* Ensure skb_mstamp_ns, which might have been populated with the txtime, is
++ * not mistaken for a software timestamp, because this will otherwise prevent
++ * the dispatch of hardware timestamps to the socket.
++ */
++static inline void skb_txtime_consumed(struct sk_buff *skb)
++{
++	skb->tstamp = ktime_set(0, 0);
++}
++
+ #endif
+-- 
+2.31.1
+
