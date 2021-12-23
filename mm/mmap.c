@@ -2415,6 +2415,10 @@ arch_get_unmapped_area(struct file *filp, unsigned long addr,
 
 	if (addr) {
 		addr = PAGE_ALIGN(addr);
+
+		if (dvpp_mmap_check(addr, len, flags))
+			return -ENOMEM;
+
 		vma = find_vma_prev(mm, addr, &prev);
 		if (mmap_end - len >= addr && addr >= mmap_min_addr &&
 		    (!vma || addr + len <= vm_start_gap(vma)) &&
@@ -2428,6 +2432,10 @@ arch_get_unmapped_area(struct file *filp, unsigned long addr,
 	info.high_limit = mmap_end;
 	info.align_mask = 0;
 	info.align_offset = 0;
+
+	if (enable_mmap_dvpp)
+		dvpp_mmap_get_area(&info, flags);
+
 	return vm_unmapped_area(&info);
 }
 #endif
@@ -2457,6 +2465,10 @@ arch_get_unmapped_area_topdown(struct file *filp, unsigned long addr,
 	/* requesting a specific address */
 	if (addr) {
 		addr = PAGE_ALIGN(addr);
+
+		if (dvpp_mmap_check(addr, len, flags))
+			return -ENOMEM;
+
 		vma = find_vma_prev(mm, addr, &prev);
 		if (mmap_end - len >= addr && addr >= mmap_min_addr &&
 				(!vma || addr + len <= vm_start_gap(vma)) &&
@@ -2470,6 +2482,10 @@ arch_get_unmapped_area_topdown(struct file *filp, unsigned long addr,
 	info.high_limit = arch_get_mmap_base(addr, mm->mmap_base);
 	info.align_mask = 0;
 	info.align_offset = 0;
+
+	if (enable_mmap_dvpp)
+		dvpp_mmap_get_area(&info, flags);
+
 	addr = vm_unmapped_area(&info);
 
 	/*
@@ -2483,6 +2499,10 @@ arch_get_unmapped_area_topdown(struct file *filp, unsigned long addr,
 		info.flags = 0;
 		info.low_limit = TASK_UNMAPPED_BASE;
 		info.high_limit = mmap_end;
+
+		if (enable_mmap_dvpp)
+			dvpp_mmap_get_area(&info, flags);
+
 		addr = vm_unmapped_area(&info);
 	}
 
@@ -4075,3 +4095,23 @@ static int __meminit init_reserve_notifier(void)
 	return 0;
 }
 subsys_initcall(init_reserve_notifier);
+
+
+/*
+ *  Enable the MAP_32BIT (mmaps and hugetlb).
+ */
+int enable_mmap_dvpp __read_mostly;
+
+#ifdef CONFIG_ASCEND_DVPP_MMAP
+
+static int __init ascend_enable_mmap_dvpp(char *s)
+{
+	enable_mmap_dvpp = 1;
+
+	pr_info("Ascend enable dvpp mmap features\n");
+
+	return 1;
+}
+__setup("enable_mmap_dvpp", ascend_enable_mmap_dvpp);
+
+#endif
