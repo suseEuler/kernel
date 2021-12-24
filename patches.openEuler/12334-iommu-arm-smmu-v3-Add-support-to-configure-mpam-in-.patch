@@ -1,0 +1,280 @@
+From ae86d53ea068e83d163b647733ecb4bf12d9e7df Mon Sep 17 00:00:00 2001
+From: Xingang Wang <wangxingang5@huawei.com>
+Date: Thu, 23 Dec 2021 21:32:00 +0800
+Subject: [PATCH] iommu/arm-smmu-v3: Add support to configure mpam in STE/CD
+ context
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: ae86d53ea068e83d163b647733ecb4bf12d9e7df
+
+
+ascend inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4L735
+CVE: NA
+
+-------------------------------------------------
+
+To support limiting qos of device, the partid and pmg need to be set
+into the SMMU STE/CD context. This introduce support of SMMU mpam
+feature and add interface to set mpam configuration in STE/CD.
+
+Signed-off-by: Xingang Wang <wangxingang5@huawei.com>
+Reviewed-by: Zhen Lei <thunder.leizhen@huawei.com>
+Reviewed-by: Weilong Chen <chenweilong@huawei.com>
+Acked-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c | 116 ++++++++++++++++++++
+ drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h |  19 ++++
+ include/linux/arm-smmu.h                    |  17 +++
+ 3 files changed, 152 insertions(+)
+ create mode 100644 include/linux/arm-smmu.h
+
+diff --git a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+index be4b66ccdd05..b8595658ad33 100644
+--- a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
++++ b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+@@ -11,6 +11,7 @@
+ 
+ #include <linux/acpi.h>
+ #include <linux/acpi_iort.h>
++#include <linux/arm-smmu.h>
+ #include <linux/bitops.h>
+ #include <linux/crash_dump.h>
+ #include <linux/delay.h>
+@@ -4081,6 +4082,111 @@ static int arm_smmu_device_domain_type(struct device *dev)
+ }
+ #endif
+ 
++static int arm_smmu_set_mpam(struct arm_smmu_device *smmu,
++		int sid, int ssid, int partid, int pmg, int s1mpam)
++{
++	struct arm_smmu_master *master = arm_smmu_find_master(smmu, sid);
++	struct arm_smmu_domain *domain = master ? master->domain : NULL;
++	u64 val;
++	__le64 *ste, *cd;
++
++	struct arm_smmu_cmdq_ent prefetch_cmd = {
++		.opcode		= CMDQ_OP_PREFETCH_CFG,
++		.prefetch	= {
++			.sid	= sid,
++		},
++	};
++
++	if (WARN_ON(!domain))
++		return -EINVAL;
++	if (WARN_ON(!domain->s1_cfg.set))
++		return -EINVAL;
++	if (WARN_ON(ssid >= (1 << domain->s1_cfg.s1cdmax)))
++		return -E2BIG;
++
++	if (!(smmu->features & ARM_SMMU_FEAT_MPAM))
++		return -ENODEV;
++
++	if (partid > smmu->mpam_partid_max || pmg > smmu->mpam_pmg_max) {
++		dev_err(smmu->dev,
++			"mpam rmid out of range: partid[0, %d] pmg[0, %d]\n",
++			smmu->mpam_partid_max, smmu->mpam_pmg_max);
++		return -ERANGE;
++	}
++
++	/* get ste ptr */
++	ste = arm_smmu_get_step_for_sid(smmu, sid);
++
++	/* write s1mpam to ste */
++	val = le64_to_cpu(ste[1]);
++	val &= ~STRTAB_STE_1_S1MPAM;
++	val |= FIELD_PREP(STRTAB_STE_1_S1MPAM, s1mpam);
++	WRITE_ONCE(ste[1], cpu_to_le64(val));
++
++	val = le64_to_cpu(ste[4]);
++	val &= ~STRTAB_STE_4_PARTID_MASK;
++	val |= FIELD_PREP(STRTAB_STE_4_PARTID_MASK, partid);
++	WRITE_ONCE(ste[4], cpu_to_le64(val));
++
++	val = le64_to_cpu(ste[5]);
++	val &= ~STRTAB_STE_5_PMG_MASK;
++	val |= FIELD_PREP(STRTAB_STE_5_PMG_MASK, pmg);
++	WRITE_ONCE(ste[5], cpu_to_le64(val));
++	arm_smmu_sync_ste_for_sid(smmu, sid);
++
++	/* do not modify cd table which owned by guest */
++	if (domain->stage == ARM_SMMU_DOMAIN_NESTED) {
++		dev_err(smmu->dev,
++			"mpam: smmu cd is owned by guest, not modified\n");
++		return 0;
++	}
++
++	/* get cd ptr */
++	cd = arm_smmu_get_cd_ptr(domain, ssid);
++	if (s1mpam && WARN_ON(!cd))
++		return -ENOMEM;
++
++	val = le64_to_cpu(cd[5]);
++	val &= ~CTXDESC_CD_5_PARTID_MASK;
++	val &= ~CTXDESC_CD_5_PMG_MASK;
++	val |= FIELD_PREP(CTXDESC_CD_5_PARTID_MASK, partid);
++	val |= FIELD_PREP(CTXDESC_CD_5_PMG_MASK, pmg);
++	WRITE_ONCE(cd[5], cpu_to_le64(val));
++	arm_smmu_sync_cd(domain, ssid, true);
++
++	/* It's likely that we'll want to use the new STE soon */
++	if (!(smmu->options & ARM_SMMU_OPT_SKIP_PREFETCH))
++		arm_smmu_cmdq_issue_cmd(smmu, &prefetch_cmd);
++
++	dev_info(smmu->dev, "partid %d, pmg %d\n", partid, pmg);
++
++	return 0;
++}
++
++static int arm_smmu_device_set_mpam(struct device *dev,
++				    struct arm_smmu_mpam *mpam)
++{
++	struct arm_smmu_master *master = dev_iommu_priv_get(dev);
++	int ret;
++
++	if (WARN_ON(!master) || WARN_ON(!mpam))
++		return -EINVAL;
++
++	if (mpam->flags & ARM_SMMU_DEV_SET_MPAM) {
++		ret = arm_smmu_set_mpam(master->domain->smmu,
++					master->streams->id,
++					mpam->pasid,
++					mpam->partid,
++					mpam->pmg,
++					mpam->s1mpam);
++		if (ret < 0)
++			return ret;
++	}
++
++	return 0;
++
++}
++
+ static int arm_smmu_device_get_config(struct device *dev, int type, void *data)
+ {
+ 	switch (type) {
+@@ -4092,6 +4198,8 @@ static int arm_smmu_device_get_config(struct device *dev, int type, void *data)
+ static int arm_smmu_device_set_config(struct device *dev, int type, void *data)
+ {
+ 	switch (type) {
++	case ARM_SMMU_MPAM:
++		return arm_smmu_device_set_mpam(dev, data);
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -5210,6 +5318,14 @@ static int arm_smmu_device_hw_probe(struct arm_smmu_device *smmu)
+ 	if (FIELD_GET(IDR3_RIL, reg))
+ 		smmu->features |= ARM_SMMU_FEAT_RANGE_INV;
+ 
++	if (reg & IDR3_MPAM) {
++		reg = readl_relaxed(smmu->base + ARM_SMMU_MPAMIDR);
++		smmu->mpam_partid_max = FIELD_GET(MPAMIDR_PARTID_MAX, reg);
++		smmu->mpam_pmg_max = FIELD_GET(MPAMIDR_PMG_MAX, reg);
++		if (smmu->mpam_partid_max || smmu->mpam_pmg_max)
++			smmu->features |= ARM_SMMU_FEAT_MPAM;
++	}
++
+ 	/* IDR5 */
+ 	reg = readl_relaxed(smmu->base + ARM_SMMU_IDR5);
+ 
+diff --git a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h
+index 785451c62730..7ea791a13e9b 100644
+--- a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h
++++ b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h
+@@ -61,6 +61,8 @@
+ #define IDR3_BBML1			1
+ #define IDR3_BBML2			2
+ #define IDR3_RIL			(1 << 10)
++#define IDR3_MPAM			(1 << 7)
++#define ARM_SMMU_IDR3_CFG		0x140C
+ 
+ #define ARM_SMMU_IDR5			0x14
+ #define IDR5_STALL_MAX			GENMASK(31, 16)
+@@ -162,6 +164,10 @@
+ #define ARM_SMMU_PRIQ_IRQ_CFG1		0xd8
+ #define ARM_SMMU_PRIQ_IRQ_CFG2		0xdc
+ 
++#define ARM_SMMU_MPAMIDR		0x130
++#define MPAMIDR_PMG_MAX			GENMASK(23, 16)
++#define MPAMIDR_PARTID_MAX		GENMASK(15, 0)
++
+ #define ARM_SMMU_IDR6			0x190
+ #define IDR6_LOG2NUMP			GENMASK(27, 24)
+ #define IDR6_LOG2NUMQ			GENMASK(19, 16)
+@@ -258,6 +264,7 @@
+ #define STRTAB_STE_1_S1CSH		GENMASK_ULL(7, 6)
+ 
+ #define STRTAB_STE_1_PPAR		(1UL << 18)
++#define STRTAB_STE_1_S1MPAM		(1UL << 26)
+ #define STRTAB_STE_1_S1STALLD		(1UL << 27)
+ 
+ #define STRTAB_STE_1_EATS		GENMASK_ULL(29, 28)
+@@ -290,6 +297,11 @@
+ 
+ #define STRTAB_STE_3_S2TTB_MASK		GENMASK_ULL(51, 4)
+ 
++#define STRTAB_STE_4_PARTID_MASK	GENMASK_ULL(31, 16)
++
++#define STRTAB_STE_5_MPAM_NS		(1UL << 8)
++#define STRTAB_STE_5_PMG_MASK		GENMASK_ULL(7, 0)
++
+ /*
+  * Context descriptors.
+  *
+@@ -331,6 +343,9 @@
+ 
+ #define CTXDESC_CD_1_TTB0_MASK		GENMASK_ULL(51, 4)
+ 
++#define CTXDESC_CD_5_PARTID_MASK	GENMASK_ULL(47, 32)
++#define CTXDESC_CD_5_PMG_MASK		GENMASK_ULL(55, 48)
++
+ /*
+  * When the SMMU only supports linear context descriptor tables, pick a
+  * reasonable size limit (64kB).
+@@ -698,6 +713,7 @@ struct arm_smmu_device {
+ #define ARM_SMMU_FEAT_BBML1		(1 << 21)
+ #define ARM_SMMU_FEAT_BBML2		(1 << 22)
+ #define ARM_SMMU_FEAT_ECMDQ		(1 << 23)
++#define ARM_SMMU_FEAT_MPAM		(1 << 24)
+ 	u32				features;
+ 
+ #define ARM_SMMU_OPT_SKIP_PREFETCH	(1 << 0)
+@@ -739,6 +755,9 @@ struct arm_smmu_device {
+ 
+ 	struct rb_root			streams;
+ 	struct mutex			streams_mutex;
++
++	unsigned int			mpam_partid_max;
++	unsigned int			mpam_pmg_max;
+ };
+ 
+ struct arm_smmu_stream {
+diff --git a/include/linux/arm-smmu.h b/include/linux/arm-smmu.h
+new file mode 100644
+index 000000000000..f1f0dfda7d70
+--- /dev/null
++++ b/include/linux/arm-smmu.h
+@@ -0,0 +1,17 @@
++#ifndef _ARM_SMMU_H_
++#define _ARM_SMMU_H_
++
++enum arm_smmu_device_config_type {
++	ARM_SMMU_MPAM = 0,
++};
++
++struct arm_smmu_mpam {
++#define ARM_SMMU_DEV_SET_MPAM	(1 << 0)
++	int flags;
++	int pasid;
++	int partid;
++	int pmg;
++	int s1mpam;
++};
++
++#endif
+-- 
+2.26.2
+

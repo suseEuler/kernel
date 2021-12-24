@@ -1,0 +1,326 @@
+From ff8da7398fb989f1172ba3b2a0f30fcf011bed75 Mon Sep 17 00:00:00 2001
+From: Lijun Fang <fanglijun3@huawei.com>
+Date: Thu, 23 Dec 2021 21:31:55 +0800
+Subject: [PATCH] arm64/ascend: Enable DvPP mmap features for Ascend Platform
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: ff8da7398fb989f1172ba3b2a0f30fcf011bed75
+
+
+ascend inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4M24Q
+CVE: NA
+
+-------------------------------------------------
+
+The DvPP means Davinci Video Pre-Processor, add new config
+ASCEND_FEATURES and DVPP_MMAP to enable the DvPP features
+for Ascend platform.
+
+The DvPP could only use a limit range of virtual address, just like the
+Ascend310/910 could only use the 4 GB range of virtual address, so add
+a new mmap flag which is named MAP_DVPP to use the DvPP processor by
+mmap syscall, the new flag is only valid for Ascend platform.
+
+You should alloc the memory for dvpp like this:
+
+addr = mmap(NULL, length, PROT_READ, MAP_ANONYMOUS | MAP_DVPP, -1, 0);
+
+Signed-off-by: Lijun Fang <fanglijun3@huawei.com>
+Reviewed-by: Weilong Chen <chenweilong@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/Kconfig   | 29 ++++++++++++++++++++
+ drivers/char/svm.c   | 11 ++++++--
+ fs/hugetlbfs/inode.c | 16 +++++++++++
+ include/linux/mman.h | 64 ++++++++++++++++++++++++++++++++++++++++++++
+ mm/mmap.c            | 40 +++++++++++++++++++++++++++
+ 5 files changed, 158 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
+index 08a93ca8f0d9..df90a6e05ad2 100644
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -1994,6 +1994,35 @@ config STACKPROTECTOR_PER_TASK
+ 	def_bool y
+ 	depends on STACKPROTECTOR && CC_HAVE_STACKPROTECTOR_SYSREG
+ 
++menuconfig ASCEND_FEATURES
++	bool "Support Ascend Features"
++	depends on ARM64
++	help
++	  The Ascend chip use the Hisilicon DaVinci architecture, and mainly
++	  focus on AI and machine leanring area, contains many external features.
++
++	  Enable this config to enable selective list of these features.
++
++	  If unsure, say Y
++
++if ASCEND_FEATURES
++
++config ASCEND_DVPP_MMAP
++	bool "Enable support for the DvPP mmap"
++	default y
++	help
++	  The DvPP means Davinci Video Pre-Processor, are mainly consist of VDEC
++	  (Video Decode), VENC(Video Encode), JPEG D/E (Decode/Encode), PNGD
++	  (PNG Decode) and VPC (Video Process) processors.
++
++	  The DvPP could only use a limit range of virtual address, just like the
++	  Ascend310/910 could only use the limit range of virtual address (default
++	  4 GB), so add a new mmap flag which is named MAP_DVPP to allocate the
++	  special memory for DvPP processor, the new flag is only valid for Ascend
++	  platform.
++
++endif
++
+ endmenu
+ 
+ menu "Boot options"
+diff --git a/drivers/char/svm.c b/drivers/char/svm.c
+index 531c765e4415..b85283118417 100644
+--- a/drivers/char/svm.c
++++ b/drivers/char/svm.c
+@@ -1433,6 +1433,9 @@ static unsigned long svm_get_unmapped_area(struct file *file,
+ 
+ 		addr = ALIGN(addr, len);
+ 
++		if (dvpp_mmap_check(addr, len, flags))
++			return -ENOMEM;
++
+ 		vma = find_vma(mm, addr);
+ 		if (TASK_SIZE - len >= addr && addr >= mmap_min_addr &&
+ 		   (vma == NULL || addr + len <= vm_start_gap(vma)))
+@@ -1442,7 +1445,8 @@ static unsigned long svm_get_unmapped_area(struct file *file,
+ 	info.flags = VM_UNMAPPED_AREA_TOPDOWN;
+ 	info.length = len;
+ 	info.low_limit = max(PAGE_SIZE, mmap_min_addr);
+-	info.high_limit = mm->mmap_base;
++	info.high_limit = ((mm->mmap_base <= DVPP_MMAP_BASE) ?
++				mm->mmap_base : DVPP_MMAP_BASE);
+ 	info.align_mask = ((len >> PAGE_SHIFT) - 1) << PAGE_SHIFT;
+ 	info.align_offset = pgoff << PAGE_SHIFT;
+ 
+@@ -1452,7 +1456,10 @@ static unsigned long svm_get_unmapped_area(struct file *file,
+ 		VM_BUG_ON(addr != -ENOMEM);
+ 		info.flags = 0;
+ 		info.low_limit = TASK_UNMAPPED_BASE;
+-		info.high_limit = TASK_SIZE;
++		info.high_limit = DVPP_MMAP_BASE;
++
++		if (enable_mmap_dvpp)
++			dvpp_mmap_get_area(&info, flags);
+ 
+ 		addr = vm_unmapped_area(&info);
+ 	}
+diff --git a/fs/hugetlbfs/inode.c b/fs/hugetlbfs/inode.c
+index 2e2e4983f1ba..246858ea0a52 100644
+--- a/fs/hugetlbfs/inode.c
++++ b/fs/hugetlbfs/inode.c
+@@ -254,6 +254,10 @@ hugetlb_get_unmapped_area_bottomup(struct file *file, unsigned long addr,
+ 	info.high_limit = TASK_SIZE;
+ 	info.align_mask = PAGE_MASK & ~huge_page_mask(h);
+ 	info.align_offset = 0;
++
++	if (enable_mmap_dvpp)
++		dvpp_mmap_get_area(&info, flags);
++
+ 	return vm_unmapped_area(&info);
+ }
+ 
+@@ -270,6 +274,10 @@ hugetlb_get_unmapped_area_topdown(struct file *file, unsigned long addr,
+ 	info.high_limit = current->mm->mmap_base;
+ 	info.align_mask = PAGE_MASK & ~huge_page_mask(h);
+ 	info.align_offset = 0;
++
++	if (enable_mmap_dvpp)
++		dvpp_mmap_get_area(&info, flags);
++
+ 	addr = vm_unmapped_area(&info);
+ 
+ 	/*
+@@ -283,6 +291,10 @@ hugetlb_get_unmapped_area_topdown(struct file *file, unsigned long addr,
+ 		info.flags = 0;
+ 		info.low_limit = current->mm->mmap_base;
+ 		info.high_limit = TASK_SIZE;
++
++		if (enable_mmap_dvpp)
++			dvpp_mmap_get_area(&info, flags);
++
+ 		addr = vm_unmapped_area(&info);
+ 	}
+ 
+@@ -310,6 +322,10 @@ hugetlb_get_unmapped_area(struct file *file, unsigned long addr,
+ 
+ 	if (addr) {
+ 		addr = ALIGN(addr, huge_page_size(h));
++
++		if (dvpp_mmap_check(addr, len, flags))
++			return -ENOMEM;
++
+ 		vma = find_vma(mm, addr);
+ 		if (TASK_SIZE - len >= addr &&
+ 		    (!vma || addr + len <= vm_start_gap(vma)))
+diff --git a/include/linux/mman.h b/include/linux/mman.h
+index 7908bf3e5696..f13546c357e1 100644
+--- a/include/linux/mman.h
++++ b/include/linux/mman.h
+@@ -23,6 +23,70 @@ static inline void set_vm_checknode(vm_flags_t *vm_flags, unsigned long flags)
+ {}
+ #endif
+ 
++extern int enable_mmap_dvpp;
++/*
++ * Enable MAP_32BIT for Ascend Platform
++ */
++#ifdef CONFIG_ASCEND_DVPP_MMAP
++
++#define MAP_DVPP	0x200
++
++#define DVPP_MMAP_SIZE	(0x100000000UL)
++#define DVPP_MMAP_BASE (TASK_SIZE - DVPP_MMAP_SIZE)
++
++static inline int dvpp_mmap_check(unsigned long addr, unsigned long len,
++								unsigned long flags)
++{
++	if (enable_mmap_dvpp && (flags & MAP_DVPP) &&
++		(addr < DVPP_MMAP_BASE + DVPP_MMAP_SIZE) &&
++			(addr > DVPP_MMAP_BASE))
++		return -EINVAL;
++	else
++		return 0;
++}
++
++static inline void dvpp_mmap_get_area(struct vm_unmapped_area_info *info,
++									unsigned long flags)
++{
++	if (flags & MAP_DVPP) {
++		info->low_limit = DVPP_MMAP_BASE;
++		info->high_limit = DVPP_MMAP_BASE + DVPP_MMAP_SIZE;
++	} else {
++		info->low_limit = max(info->low_limit, TASK_UNMAPPED_BASE);
++		info->high_limit = min(info->high_limit, DVPP_MMAP_BASE);
++	}
++}
++
++static inline int dvpp_mmap_zone(unsigned long addr)
++{
++	if (addr >= DVPP_MMAP_BASE)
++		return 1;
++	else
++		return 0;
++}
++#else
++
++#define MAP_DVPP (0)
++
++static inline int dvpp_mmap_check(unsigned long addr, unsigned long len,
++								unsigned long flags)
++{
++	return 0;
++}
++
++static inline void dvpp_mmap_get_area(struct vm_unmapped_area_info *info,
++									unsigned long flags)
++{
++}
++
++static inline int dvpp_mmap_zone(unsigned long addr) { return 0; }
++
++#define DVPP_MMAP_BASE (0)
++
++#define DVPP_MMAP_SIZE (0)
++
++#endif
++
+ /*
+  * Arrange for legacy / undefined architecture specific flags to be
+  * ignored by mmap handling code.
+diff --git a/mm/mmap.c b/mm/mmap.c
+index a208057be6f1..3991634121d7 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -2409,6 +2409,10 @@ arch_get_unmapped_area(struct file *filp, unsigned long addr,
+ 
+ 	if (addr) {
+ 		addr = PAGE_ALIGN(addr);
++
++		if (dvpp_mmap_check(addr, len, flags))
++			return -ENOMEM;
++
+ 		vma = find_vma_prev(mm, addr, &prev);
+ 		if (mmap_end - len >= addr && addr >= mmap_min_addr &&
+ 		    (!vma || addr + len <= vm_start_gap(vma)) &&
+@@ -2422,6 +2426,10 @@ arch_get_unmapped_area(struct file *filp, unsigned long addr,
+ 	info.high_limit = mmap_end;
+ 	info.align_mask = 0;
+ 	info.align_offset = 0;
++
++	if (enable_mmap_dvpp)
++		dvpp_mmap_get_area(&info, flags);
++
+ 	return vm_unmapped_area(&info);
+ }
+ #endif
+@@ -2451,6 +2459,10 @@ arch_get_unmapped_area_topdown(struct file *filp, unsigned long addr,
+ 	/* requesting a specific address */
+ 	if (addr) {
+ 		addr = PAGE_ALIGN(addr);
++
++		if (dvpp_mmap_check(addr, len, flags))
++			return -ENOMEM;
++
+ 		vma = find_vma_prev(mm, addr, &prev);
+ 		if (mmap_end - len >= addr && addr >= mmap_min_addr &&
+ 				(!vma || addr + len <= vm_start_gap(vma)) &&
+@@ -2464,6 +2476,10 @@ arch_get_unmapped_area_topdown(struct file *filp, unsigned long addr,
+ 	info.high_limit = arch_get_mmap_base(addr, mm->mmap_base);
+ 	info.align_mask = 0;
+ 	info.align_offset = 0;
++
++	if (enable_mmap_dvpp)
++		dvpp_mmap_get_area(&info, flags);
++
+ 	addr = vm_unmapped_area(&info);
+ 
+ 	/*
+@@ -2477,6 +2493,10 @@ arch_get_unmapped_area_topdown(struct file *filp, unsigned long addr,
+ 		info.flags = 0;
+ 		info.low_limit = TASK_UNMAPPED_BASE;
+ 		info.high_limit = mmap_end;
++
++		if (enable_mmap_dvpp)
++			dvpp_mmap_get_area(&info, flags);
++
+ 		addr = vm_unmapped_area(&info);
+ 	}
+ 
+@@ -4069,3 +4089,23 @@ static int __meminit init_reserve_notifier(void)
+ 	return 0;
+ }
+ subsys_initcall(init_reserve_notifier);
++
++
++/*
++ *  Enable the MAP_32BIT (mmaps and hugetlb).
++ */
++int enable_mmap_dvpp __read_mostly;
++
++#ifdef CONFIG_ASCEND_DVPP_MMAP
++
++static int __init ascend_enable_mmap_dvpp(char *s)
++{
++	enable_mmap_dvpp = 1;
++
++	pr_info("Ascend enable dvpp mmap features\n");
++
++	return 1;
++}
++__setup("enable_mmap_dvpp", ascend_enable_mmap_dvpp);
++
++#endif
+-- 
+2.26.2
+

@@ -1,0 +1,149 @@
+From 708520e61ddd29477e48359b02ba61742615a17b Mon Sep 17 00:00:00 2001
+From: Xingang Wang <wangxingang5@huawei.com>
+Date: Thu, 23 Dec 2021 21:32:02 +0800
+Subject: [PATCH] iommu/arm-smmu-v3: Add support to enable/disable SMMU
+ user_mpam_en
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 708520e61ddd29477e48359b02ba61742615a17b
+
+
+ascend inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4L735
+CVE: NA
+
+-------------------------------------------------
+
+The user_mpam_en configuration is used to enable/disable
+whether SMMU mpam configuration will be used. If user_mpam_en
+is 1, the memory requests across SMMU will not carry the
+SMMU mpam configuration.
+
+Signed-off-by: Xingang Wang <wangxingang5@huawei.com>
+Reviewed-by: Zhen Lei <thunder.leizhen@huawei.com>
+Reviewed-by: Weilong Chen <chenweilong@huawei.com>
+Acked-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c | 47 +++++++++++++++++++++
+ drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h |  3 ++
+ include/linux/arm-smmu.h                    |  3 ++
+ 3 files changed, 53 insertions(+)
+
+diff --git a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+index 7d5ba739b22b..5a7e141d39cc 100644
+--- a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
++++ b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+@@ -4163,6 +4163,25 @@ static int arm_smmu_set_mpam(struct arm_smmu_device *smmu,
+ 	return 0;
+ }
+ 
++static int arm_smmu_set_dev_user_mpam_en(struct device *dev, int user_mpam_en)
++{
++	struct arm_smmu_master *master = dev_iommu_priv_get(dev);
++	struct arm_smmu_device *smmu;
++	u32 reg, __iomem *cfg;
++
++	if (WARN_ON(!master))
++		return -EINVAL;
++
++	smmu = master->domain->smmu;
++	cfg = smmu->base + ARM_SMMU_USER_CFG0;
++
++	reg = readl_relaxed(cfg);
++	reg &= ~ARM_SMMU_USER_MPAM_EN;
++	reg |= FIELD_PREP(ARM_SMMU_USER_MPAM_EN, user_mpam_en);
++	writel(reg, cfg);
++	return 0;
++}
++
+ static int arm_smmu_device_set_mpam(struct device *dev,
+ 				    struct arm_smmu_mpam *mpam)
+ {
+@@ -4183,6 +4202,12 @@ static int arm_smmu_device_set_mpam(struct device *dev,
+ 			return ret;
+ 	}
+ 
++	if (mpam->flags & ARM_SMMU_DEV_SET_USER_MPAM_EN) {
++		ret = arm_smmu_set_dev_user_mpam_en(dev, mpam->user_mpam_en);
++		if (ret < 0)
++			return ret;
++	}
++
+ 	return 0;
+ 
+ }
+@@ -4232,6 +4257,22 @@ static int arm_smmu_get_mpam(struct arm_smmu_device *smmu,
+ 	return 0;
+ }
+ 
++static int arm_smmu_get_dev_user_mpam_en(struct device *dev, int *user_mpam_en)
++{
++	struct arm_smmu_master *master = dev_iommu_priv_get(dev);
++	struct arm_smmu_device *smmu;
++	u32 reg;
++
++	if (WARN_ON(!master))
++		return -EINVAL;
++
++	smmu = master->domain->smmu;
++
++	reg = readl_relaxed(smmu->base + ARM_SMMU_USER_CFG0);
++	*user_mpam_en = FIELD_GET(ARM_SMMU_USER_MPAM_EN, reg);
++	return 0;
++}
++
+ static int arm_smmu_device_get_mpam(struct device *dev,
+ 				    struct arm_smmu_mpam *mpam)
+ {
+@@ -4252,6 +4293,12 @@ static int arm_smmu_device_get_mpam(struct device *dev,
+ 			return ret;
+ 	}
+ 
++	if (mpam->flags & ARM_SMMU_DEV_GET_USER_MPAM_EN) {
++		ret = arm_smmu_get_dev_user_mpam_en(dev, &mpam->user_mpam_en);
++		if (ret < 0)
++			return ret;
++	}
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h
+index 7ea791a13e9b..0be76a9c15c0 100644
+--- a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h
++++ b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h
+@@ -168,6 +168,9 @@
+ #define MPAMIDR_PMG_MAX			GENMASK(23, 16)
+ #define MPAMIDR_PARTID_MAX		GENMASK(15, 0)
+ 
++#define ARM_SMMU_USER_CFG0		0xe00
++#define ARM_SMMU_USER_MPAM_EN		(1UL << 30)
++
+ #define ARM_SMMU_IDR6			0x190
+ #define IDR6_LOG2NUMP			GENMASK(27, 24)
+ #define IDR6_LOG2NUMQ			GENMASK(19, 16)
+diff --git a/include/linux/arm-smmu.h b/include/linux/arm-smmu.h
+index 52982fd3d723..502b86e7834a 100644
+--- a/include/linux/arm-smmu.h
++++ b/include/linux/arm-smmu.h
+@@ -8,11 +8,14 @@ enum arm_smmu_device_config_type {
+ struct arm_smmu_mpam {
+ #define ARM_SMMU_DEV_SET_MPAM	(1 << 0)
+ #define ARM_SMMU_DEV_GET_MPAM	(1 << 1)
++#define ARM_SMMU_DEV_SET_USER_MPAM_EN	(1 << 2)
++#define ARM_SMMU_DEV_GET_USER_MPAM_EN	(1 << 3)
+ 	int flags;
+ 	int pasid;
+ 	int partid;
+ 	int pmg;
+ 	int s1mpam;
++	int user_mpam_en;
+ };
+ 
+ #endif
+-- 
+2.26.2
+

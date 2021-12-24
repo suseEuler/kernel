@@ -1,0 +1,215 @@
+From 08127bbfcfae02c693c240487bceae1bae3a063f Mon Sep 17 00:00:00 2001
+From: Xingang Wang <wangxingang5@huawei.com>
+Date: Thu, 23 Dec 2021 21:32:05 +0800
+Subject: [PATCH] mpam: update monitor rmid and group configuration
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 08127bbfcfae02c693c240487bceae1bae3a063f
+
+
+ascend inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4L735
+CVE: NA
+
+-------------------------------------------------
+
+When group rmid changes, as introduced by 6bbf2791b ("mpam: Add
+support for group rmid modify") the sysfs monitor data file rmid
+needs to update as well. This add support for updating rmid for
+monitoring, and then resync the group configuration. When update
+failed, roll back to the previous rmid.
+
+Signed-off-by: Xingang Wang <wangxingang5@huawei.com>
+Reviewed-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Weilong Chen <chenweilong@huawei.com>
+Acked-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/resctrl.h      |  1 +
+ arch/arm64/kernel/mpam/mpam_ctrlmon.c | 93 +++++++++++++++++++++++----
+ arch/arm64/kernel/mpam/mpam_resctrl.c | 21 ++++++
+ 3 files changed, 102 insertions(+), 13 deletions(-)
+
+diff --git a/arch/arm64/include/asm/resctrl.h b/arch/arm64/include/asm/resctrl.h
+index f2157df661af..f43fee368098 100644
+--- a/arch/arm64/include/asm/resctrl.h
++++ b/arch/arm64/include/asm/resctrl.h
+@@ -162,6 +162,7 @@ struct rdtgroup {
+ 	atomic_t        waitcount;
+ 	enum rdt_group_type type;
+ 	struct mongroup     mon;
++	int                 resync;
+ };
+ 
+ enum resctrl_ctrl_type {
+diff --git a/arch/arm64/kernel/mpam/mpam_ctrlmon.c b/arch/arm64/kernel/mpam/mpam_ctrlmon.c
+index b1d32d432556..724bed6a8e2c 100644
+--- a/arch/arm64/kernel/mpam/mpam_ctrlmon.c
++++ b/arch/arm64/kernel/mpam/mpam_ctrlmon.c
+@@ -185,6 +185,55 @@ resctrl_dom_ctrl_config(bool cdp_both_ctrl, struct resctrl_resource *r,
+ 	}
+ }
+ 
++/**
++ * Resync resctrl group domain ctrls, use rdtgrp->resync to indicate
++ * whether the resync procedure will be called. When resync==1, all
++ * domain ctrls of this group be synchronized again. This happens
++ * when rmid of this group is changed, and all configurations need to
++ * be remapped again accordingly.
++ */
++static void resctrl_group_resync_domain_ctrls(struct rdtgroup *rdtgrp,
++			struct resctrl_resource *r, struct rdt_domain *dom)
++{
++	int i;
++	int staged_start, staged_end;
++	struct resctrl_staged_config *cfg;
++	struct sd_closid closid;
++	struct list_head *head;
++	struct rdtgroup *entry;
++	struct msr_param para;
++	bool cdp_both_ctrl;
++
++	cfg = dom->staged_cfg;
++	para.closid = &closid;
++
++	staged_start = (r->cdp_enable) ? CDP_CODE : CDP_BOTH;
++	staged_end = (r->cdp_enable) ? CDP_DATA : CDP_BOTH;
++
++	for (i = staged_start; i <= staged_end; i++) {
++		cdp_both_ctrl = cfg[i].cdp_both_ctrl;
++		/*
++		 * for ctrl group configuration, hw_closid of cfg[i] equals
++		 * to rdtgrp->closid.intpartid.
++		 */
++		closid.intpartid = hw_closid_val(cfg[i].hw_closid);
++		resctrl_cdp_mpamid_map_val(rdtgrp->closid.reqpartid,
++				cfg[i].conf_type, closid.reqpartid);
++		resctrl_dom_ctrl_config(cdp_both_ctrl, r, dom, &para);
++
++		/*
++		 * we should synchronize all child mon groups'
++		 * configuration from this ctrl rdtgrp
++		 */
++		head = &rdtgrp->mon.crdtgrp_list;
++		list_for_each_entry(entry, head, mon.crdtgrp_list) {
++			resctrl_cdp_mpamid_map_val(entry->closid.reqpartid,
++					cfg[i].conf_type, closid.reqpartid);
++			resctrl_dom_ctrl_config(cdp_both_ctrl, r, dom, &para);
++		}
++	}
++}
++
+ static void resctrl_group_update_domain_ctrls(struct rdtgroup *rdtgrp,
+ 			struct resctrl_resource *r, struct rdt_domain *dom)
+ {
+@@ -247,8 +296,12 @@ static int resctrl_group_update_domains(struct rdtgroup *rdtgrp,
+ {
+ 	struct rdt_domain *d;
+ 
+-	list_for_each_entry(d, &r->domains, list)
+-		resctrl_group_update_domain_ctrls(rdtgrp, r, d);
++	list_for_each_entry(d, &r->domains, list) {
++		if (rdtgrp->resync)
++			resctrl_group_resync_domain_ctrls(rdtgrp, r, d);
++		else
++			resctrl_group_update_domain_ctrls(rdtgrp, r, d);
++	}
+ 
+ 	return 0;
+ }
+@@ -663,20 +716,31 @@ static int resctrl_mkdir_mondata_dom(struct kernfs_node *parent_kn,
+ 
+ 	md.u.cdp_both_mon = s->cdp_mc_both;
+ 
++	if (!parent_kn) {
++		pr_err("%s: error parent_kn null\n", __func__);
++		return -EINVAL;
++	}
++
+ 	snprintf(name, sizeof(name), "mon_%s_%02d", s->name, d->id);
+-	kn = __kernfs_create_file(parent_kn, name, 0444,
+-				  GLOBAL_ROOT_UID, GLOBAL_ROOT_GID, 0,
+-				  &kf_mondata_ops, md.priv, NULL, NULL);
+-	if (IS_ERR(kn))
+-		return PTR_ERR(kn);
+-
+-	ret = resctrl_group_kn_set_ugid(kn);
+-	if (ret) {
+-		pr_info("%s: create name %s, error ret %d\n", __func__, name, ret);
+-		kernfs_remove(kn);
+-		return ret;
++	kn = kernfs_find_and_get(parent_kn, name);
++	if (!kn) {
++		kn = __kernfs_create_file(parent_kn, name, 0444,
++					  GLOBAL_ROOT_UID, GLOBAL_ROOT_GID, 0,
++					  &kf_mondata_ops, md.priv, NULL, NULL);
++		if (IS_ERR(kn))
++			return PTR_ERR(kn);
++
++		ret = resctrl_group_kn_set_ugid(kn);
++		if (ret) {
++			pr_info("%s: create name %s, error ret %d\n",
++					__func__, name, ret);
++			kernfs_remove(kn);
++			return ret;
++		}
+ 	}
+ 
++	kn->priv = md.priv;
++
+ 	/* Could we remove the MATCH_* param ? */
+ 	rr->mon_write(d, md.priv);
+ 
+@@ -954,5 +1018,8 @@ int resctrl_update_groups_config(struct rdtgroup *rdtgrp)
+ 		}
+ 	}
+ 
++	/* after resync all configurations, restore resync to 0 */
++	rdtgrp->resync = 0;
++
+ 	return ret;
+ }
+diff --git a/arch/arm64/kernel/mpam/mpam_resctrl.c b/arch/arm64/kernel/mpam/mpam_resctrl.c
+index 7b8d77666516..a9b99a0f347f 100644
+--- a/arch/arm64/kernel/mpam/mpam_resctrl.c
++++ b/arch/arm64/kernel/mpam/mpam_resctrl.c
+@@ -1882,6 +1882,21 @@ static ssize_t resctrl_group_rmid_write(struct kernfs_open_file *of,
+ 	rdtgrp->closid.reqpartid = partid;
+ 	rdtgrp->mon.rmid = rmid;
+ 
++	/* update rmid for mondata */
++	ret = resctrl_mkdir_mondata_all_subdir(rdtgrp->mon.mon_data_kn, rdtgrp);
++	if (ret) {
++		rdt_last_cmd_puts("update rmid for mondata failed\n");
++		goto rollback;
++	}
++
++	/* resync groups configuration */
++	rdtgrp->resync = 1;
++	ret = resctrl_update_groups_config(rdtgrp);
++	if (ret) {
++		rdt_last_cmd_puts("update groups config failed\n");
++		goto rollback;
++	}
++
+ 	read_lock(&tasklist_lock);
+ 	for_each_process_thread(p, t) {
+ 		if (t->closid == rdtgrp->closid.intpartid) {
+@@ -1908,6 +1923,12 @@ static ssize_t resctrl_group_rmid_write(struct kernfs_open_file *of,
+ 	rdtgrp->mon.rmid = old_rmid;
+ 	rdtgrp->closid.reqpartid = old_reqpartid;
+ 
++	/* the old rmid is valid, so mkdir mondata here won't fail */
++	resctrl_mkdir_mondata_all_subdir(rdtgrp->mon.mon_data_kn, rdtgrp);
++
++	rdtgrp->resync = 1;
++	WARN_ON_ONCE(resctrl_update_groups_config(rdtgrp));
++
+ 	read_lock(&tasklist_lock);
+ 	for_each_process_thread(p, t) {
+ 		if (t->closid == rdtgrp->closid.intpartid)
+-- 
+2.26.2
+
