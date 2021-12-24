@@ -39,7 +39,7 @@ generate_patch_from_file() {
 
 		# check it the SUBJECT is existed in stable kernel
 		cd $LINUX_STABLE_GIT
-		EXISTED=$(git log --oneline $START_VERSION..$END_STABLE_VERSION | grep "$SUBJECT")
+		EXISTED=$(git log --oneline $START_VERSION..$END_STABLE_VERSION | grep -F -i "$SUBJECT")
 		cd $LINUX_GIT
 		if [ -n "$EXISTED" ]; then
 			rm $MPF
