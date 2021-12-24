@@ -19,6 +19,9 @@ while read -r line; do
 	i=$[$i+1]
 	COMMIT=$(head -10 $line | grep Git-commit | awk '{print $2}')
 	KERNELVERSION=$(head -10 $line | grep Patch-mainline | awk '{print $2}')
+	if [ "$KERNELVERSION" = "v5.12-rc1-dontuse" ]; then
+		KERNELVERSION=v5.12-rc2
+	fi
 	# Mainline patch file
 	MPF=$(git format-patch -1 --no-numbered --no-renames --signoff $COMMIT)
 	FOLDER=$(echo $MPF | awk -F '/' '{print $1}')

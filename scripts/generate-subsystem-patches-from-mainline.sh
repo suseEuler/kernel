@@ -29,6 +29,9 @@ generate_patch_from_file() {
 		echo $i = "$line"
 		COMMIT=$(echo $line|awk '{print $1}')
 		KERNELVERSION=$(git tag --sort=taggerdate --contains $COMMIT|head -1)
+		if [ "$KERNELVERSION" = "v5.12-rc1-dontuse" ]; then
+			KERNELVERSION=v5.12-rc2
+		fi
 		echo 000 $KERNELVERSION
 		MPF=$(git format-patch -1 --no-numbered --no-renames --signoff $COMMIT)
 		echo 111 $MPF

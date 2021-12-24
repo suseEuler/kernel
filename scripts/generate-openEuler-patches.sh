@@ -179,6 +179,10 @@ mainline_commit_handle() {
 		if [ -z $KERNELVERSION ]; then
 			echo "XXX $f Commit "$COMMIT" has empty KERNELVERSION!"
 		fi
+		if [ "$KERNELVERSION" = "v5.12-rc1-dontuse" ]; then
+			KERNELVERSION=v5.12-rc2
+		fi
+
 		cd $CURR_PWD
 
 		echo $KERNELVERSION in mainline tree
