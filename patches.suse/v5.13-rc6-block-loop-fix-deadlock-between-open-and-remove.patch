@@ -1,0 +1,108 @@
+From 990e78116d38059c9306cf0560c1c4ed1cf358d3 Mon Sep 17 00:00:00 2001
+From: Christoph Hellwig <hch@lst.de>
+Date: Sat, 5 Jun 2021 17:09:50 +0300
+Subject: [PATCH] block: loop: fix deadlock between open and remove
+Git-commit: 990e78116d38059c9306cf0560c1c4ed1cf358d3
+Patch-mainline: v5.13-rc6
+References: git-fixes
+
+
+Commit c76f48eb5c08 ("block: take bd_mutex around delete_partitions in
+del_gendisk") adds disk->part0->bd_mutex in del_gendisk(), this way
+causes the following AB/BA deadlock between removing loop and opening
+loop:
+
+ 1) loop_control_ioctl(LOOP_CTL_REMOVE)
+     -> mutex_lock(&loop_ctl_mutex)
+     -> del_gendisk
+         -> mutex_lock(&disk->part0->bd_mutex)
+
+ 2) blkdev_get_by_dev
+     -> mutex_lock(&disk->part0->bd_mutex)
+     -> lo_open
+         -> mutex_lock(&loop_ctl_mutex)
+
+Add a new Lo_deleting state to remove the need for clearing
+->private_data and thus holding loop_ctl_mutex in the ioctl
+LOOP_CTL_REMOVE path.
+
+Based on an analysis and earlier patch from
+Ming Lei <ming.lei@redhat.com>.
+
+Reported-by: Colin Ian King <colin.king@canonical.com>
+Fixes: c76f48eb5c08 ("block: take bd_mutex around delete_partitions in del_gendisk")
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Tested-by: Colin Ian King <colin.king@canonical.com>
+Reviewed-by: Ming Lei <ming.lei@redhat.com>
+Link: https://lore.kernel.org/r/20210605140950.5800-1-hch@lst.de
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/block/loop.c | 25 +++++++------------------
+ drivers/block/loop.h |  1 +
+ 2 files changed, 8 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/block/loop.c b/drivers/block/loop.c
+index a370cde3ddd4..f280a96d4de2 100644
+--- a/drivers/block/loop.c
++++ b/drivers/block/loop.c
+@@ -1878,29 +1878,18 @@ static int lo_compat_ioctl(struct block_device *bdev, fmode_t mode,
+ 
+ static int lo_open(struct block_device *bdev, fmode_t mode)
+ {
+-	struct loop_device *lo;
++	struct loop_device *lo = bdev->bd_disk->private_data;
+ 	int err;
+ 
+-	/*
+-	 * take loop_ctl_mutex to protect lo pointer from race with
+-	 * loop_control_ioctl(LOOP_CTL_REMOVE), however, to reduce contention
+-	 * release it prior to updating lo->lo_refcnt.
+-	 */
+-	err = mutex_lock_killable(&loop_ctl_mutex);
+-	if (err)
+-		return err;
+-	lo = bdev->bd_disk->private_data;
+-	if (!lo) {
+-		mutex_unlock(&loop_ctl_mutex);
+-		return -ENXIO;
+-	}
+ 	err = mutex_lock_killable(&lo->lo_mutex);
+-	mutex_unlock(&loop_ctl_mutex);
+ 	if (err)
+ 		return err;
+-	atomic_inc(&lo->lo_refcnt);
++	if (lo->lo_state == Lo_deleting)
++		err = -ENXIO;
++	else
++		atomic_inc(&lo->lo_refcnt);
+ 	mutex_unlock(&lo->lo_mutex);
+-	return 0;
++	return err;
+ }
+ 
+ static void lo_release(struct gendisk *disk, fmode_t mode)
+@@ -2284,7 +2273,7 @@ static long loop_control_ioctl(struct file *file, unsigned int cmd,
+ 			mutex_unlock(&lo->lo_mutex);
+ 			break;
+ 		}
+-		lo->lo_disk->private_data = NULL;
++		lo->lo_state = Lo_deleting;
+ 		mutex_unlock(&lo->lo_mutex);
+ 		idr_remove(&loop_index_idr, lo->lo_number);
+ 		loop_remove(lo);
+diff --git a/drivers/block/loop.h b/drivers/block/loop.h
+index a3c04f310672..5beb959b94d3 100644
+--- a/drivers/block/loop.h
++++ b/drivers/block/loop.h
+@@ -22,6 +22,7 @@ enum {
+ 	Lo_unbound,
+ 	Lo_bound,
+ 	Lo_rundown,
++	Lo_deleting,
+ };
+ 
+ struct loop_func_table;
+-- 
+2.26.2
+

@@ -1,0 +1,346 @@
+From 6cc8e7430801fa238bd7d3acae1eb406c6e02fe1 Mon Sep 17 00:00:00 2001
+From: Pavel Tatashin <pasha.tatashin@soleen.com>
+Date: Tue, 26 Jan 2021 09:46:30 -0500
+Subject: [PATCH] loop: scale loop device by introducing per device lock
+Git-commit: 6cc8e7430801fa238bd7d3acae1eb406c6e02fe1
+Patch-mainline: v5.12-rc2
+References: git-fixes
+
+
+Currently, loop device has only one global lock: loop_ctl_mutex.
+
+This becomes hot in scenarios where many loop devices are used.
+
+Scale it by introducing per-device lock: lo_mutex that protects
+modifications of all fields in struct loop_device.
+
+Keep loop_ctl_mutex to protect global data: loop_index_idr, loop_lookup,
+loop_add.
+
+The new lock ordering requirement is that loop_ctl_mutex must be taken
+before lo_mutex.
+
+Signed-off-by: Pavel Tatashin <pasha.tatashin@soleen.com>
+Reviewed-by: Tyler Hicks <tyhicks@linux.microsoft.com>
+Reviewed-by: Petr Vorel <pvorel@suse.cz>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/block/loop.c |   93 +++++++++++++++++++++++++++++----------------------
+ drivers/block/loop.h |    1 
+ 2 files changed, 54 insertions(+), 40 deletions(-)
+
+--- a/drivers/block/loop.c
++++ b/drivers/block/loop.c
+@@ -695,7 +695,7 @@ static int loop_change_fd(struct loop_de
+ 	int		error;
+ 	bool		partscan;
+ 
+-	error = mutex_lock_killable(&loop_ctl_mutex);
++	error = mutex_lock_killable(&lo->lo_mutex);
+ 	if (error)
+ 		return error;
+ 	error = -ENXIO;
+@@ -734,9 +734,9 @@ static int loop_change_fd(struct loop_de
+ 	loop_update_dio(lo);
+ 	blk_mq_unfreeze_queue(lo->lo_queue);
+ 	partscan = lo->lo_flags & LO_FLAGS_PARTSCAN;
+-	mutex_unlock(&loop_ctl_mutex);
++	mutex_unlock(&lo->lo_mutex);
+ 	/*
+-	 * We must drop file reference outside of loop_ctl_mutex as dropping
++	 * We must drop file reference outside of lo_mutex as dropping
+ 	 * the file ref can take bd_mutex which creates circular locking
+ 	 * dependency.
+ 	 */
+@@ -746,7 +746,7 @@ static int loop_change_fd(struct loop_de
+ 	return 0;
+ 
+ out_err:
+-	mutex_unlock(&loop_ctl_mutex);
++	mutex_unlock(&lo->lo_mutex);
+ 	if (file)
+ 		fput(file);
+ 	return error;
+@@ -1087,7 +1087,7 @@ static int loop_configure(struct loop_de
+ 			goto out_putf;
+ 	}
+ 
+-	error = mutex_lock_killable(&loop_ctl_mutex);
++	error = mutex_lock_killable(&lo->lo_mutex);
+ 	if (error)
+ 		goto out_bdev;
+ 
+@@ -1170,7 +1170,7 @@ static int loop_configure(struct loop_de
+ 	 * put /dev/loopXX inode. Later in __loop_clr_fd() we bdput(bdev).
+ 	 */
+ 	bdgrab(bdev);
+-	mutex_unlock(&loop_ctl_mutex);
++	mutex_unlock(&lo->lo_mutex);
+ 	if (partscan)
+ 		loop_reread_partitions(lo, bdev);
+ 	if (claimed_bdev)
+@@ -1178,7 +1178,7 @@ static int loop_configure(struct loop_de
+ 	return 0;
+ 
+ out_unlock:
+-	mutex_unlock(&loop_ctl_mutex);
++	mutex_unlock(&lo->lo_mutex);
+ out_bdev:
+ 	if (claimed_bdev)
+ 		bd_abort_claiming(bdev, claimed_bdev, loop_configure);
+@@ -1199,7 +1199,7 @@ static int __loop_clr_fd(struct loop_dev
+ 	bool partscan = false;
+ 	int lo_number;
+ 
+-	mutex_lock(&loop_ctl_mutex);
++	mutex_lock(&lo->lo_mutex);
+ 	if (WARN_ON_ONCE(lo->lo_state != Lo_rundown)) {
+ 		err = -ENXIO;
+ 		goto out_unlock;
+@@ -1256,7 +1256,7 @@ static int __loop_clr_fd(struct loop_dev
+ 	lo_number = lo->lo_number;
+ 	loop_unprepare_queue(lo);
+ out_unlock:
+-	mutex_unlock(&loop_ctl_mutex);
++	mutex_unlock(&lo->lo_mutex);
+ 	if (partscan) {
+ 		/*
+ 		 * bd_mutex has been held already in release path, so don't
+@@ -1287,18 +1287,17 @@ out_unlock:
+ 	 * protects us from all the other places trying to change the 'lo'
+ 	 * device.
+ 	 */
+-	mutex_lock(&loop_ctl_mutex);
++	mutex_lock(&lo->lo_mutex);
+ 	lo->lo_flags = 0;
+ 	if (!part_shift)
+ 		lo->lo_disk->flags |= GENHD_FL_NO_PART_SCAN;
+ 	lo->lo_state = Lo_unbound;
+-	mutex_unlock(&loop_ctl_mutex);
++	mutex_unlock(&lo->lo_mutex);
+ 
+ 	/*
+-	 * Need not hold loop_ctl_mutex to fput backing file.
+-	 * Calling fput holding loop_ctl_mutex triggers a circular
+-	 * lock dependency possibility warning as fput can take
+-	 * bd_mutex which is usually taken before loop_ctl_mutex.
++	 * Need not hold lo_mutex to fput backing file. Calling fput holding
++	 * lo_mutex triggers a circular lock dependency possibility warning as
++	 * fput can take bd_mutex which is usually taken before lo_mutex.
+ 	 */
+ 	if (filp)
+ 		fput(filp);
+@@ -1309,11 +1308,11 @@ static int loop_clr_fd(struct loop_devic
+ {
+ 	int err;
+ 
+-	err = mutex_lock_killable(&loop_ctl_mutex);
++	err = mutex_lock_killable(&lo->lo_mutex);
+ 	if (err)
+ 		return err;
+ 	if (lo->lo_state != Lo_bound) {
+-		mutex_unlock(&loop_ctl_mutex);
++		mutex_unlock(&lo->lo_mutex);
+ 		return -ENXIO;
+ 	}
+ 	/*
+@@ -1328,11 +1327,11 @@ static int loop_clr_fd(struct loop_devic
+ 	 */
+ 	if (atomic_read(&lo->lo_refcnt) > 1) {
+ 		lo->lo_flags |= LO_FLAGS_AUTOCLEAR;
+-		mutex_unlock(&loop_ctl_mutex);
++		mutex_unlock(&lo->lo_mutex);
+ 		return 0;
+ 	}
+ 	lo->lo_state = Lo_rundown;
+-	mutex_unlock(&loop_ctl_mutex);
++	mutex_unlock(&lo->lo_mutex);
+ 
+ 	return __loop_clr_fd(lo, false);
+ }
+@@ -1347,7 +1346,7 @@ loop_set_status(struct loop_device *lo,
+ 	bool partscan = false;
+ 	bool size_changed = false;
+ 
+-	err = mutex_lock_killable(&loop_ctl_mutex);
++	err = mutex_lock_killable(&lo->lo_mutex);
+ 	if (err)
+ 		return err;
+ 	if (lo->lo_encrypt_key_size &&
+@@ -1414,7 +1413,7 @@ out_unfreeze:
+ 		partscan = true;
+ 	}
+ out_unlock:
+-	mutex_unlock(&loop_ctl_mutex);
++	mutex_unlock(&lo->lo_mutex);
+ 	if (partscan)
+ 		loop_reread_partitions(lo, bdev);
+ 
+@@ -1428,11 +1427,11 @@ loop_get_status(struct loop_device *lo,
+ 	struct kstat stat;
+ 	int ret;
+ 
+-	ret = mutex_lock_killable(&loop_ctl_mutex);
++	ret = mutex_lock_killable(&lo->lo_mutex);
+ 	if (ret)
+ 		return ret;
+ 	if (lo->lo_state != Lo_bound) {
+-		mutex_unlock(&loop_ctl_mutex);
++		mutex_unlock(&lo->lo_mutex);
+ 		return -ENXIO;
+ 	}
+ 
+@@ -1451,10 +1450,10 @@ loop_get_status(struct loop_device *lo,
+ 		       lo->lo_encrypt_key_size);
+ 	}
+ 
+-	/* Drop loop_ctl_mutex while we call into the filesystem. */
++	/* Drop lo_mutex while we call into the filesystem. */
+ 	path = lo->lo_backing_file->f_path;
+ 	path_get(&path);
+-	mutex_unlock(&loop_ctl_mutex);
++	mutex_unlock(&lo->lo_mutex);
+ 	ret = vfs_getattr(&path, &stat, STATX_INO, AT_STATX_SYNC_AS_STAT);
+ 	if (!ret) {
+ 		info->lo_device = huge_encode_dev(stat.dev);
+@@ -1640,7 +1639,7 @@ static int lo_simple_ioctl(struct loop_d
+ {
+ 	int err;
+ 
+-	err = mutex_lock_killable(&loop_ctl_mutex);
++	err = mutex_lock_killable(&lo->lo_mutex);
+ 	if (err)
+ 		return err;
+ 	switch (cmd) {
+@@ -1656,7 +1655,7 @@ static int lo_simple_ioctl(struct loop_d
+ 	default:
+ 		err = lo->ioctl ? lo->ioctl(lo, cmd, arg) : -EINVAL;
+ 	}
+-	mutex_unlock(&loop_ctl_mutex);
++	mutex_unlock(&lo->lo_mutex);
+ 	return err;
+ }
+ 
+@@ -1882,27 +1881,33 @@ static int lo_open(struct block_device *
+ 	struct loop_device *lo;
+ 	int err;
+ 
++	/*
++	 * take loop_ctl_mutex to protect lo pointer from race with
++	 * loop_control_ioctl(LOOP_CTL_REMOVE), however, to reduce contention
++	 * release it prior to updating lo->lo_refcnt.
++	 */
+ 	err = mutex_lock_killable(&loop_ctl_mutex);
+ 	if (err)
+ 		return err;
+ 	lo = bdev->bd_disk->private_data;
+ 	if (!lo) {
+-		err = -ENXIO;
+-		goto out;
++		mutex_unlock(&loop_ctl_mutex);
++		return -ENXIO;
+ 	}
+-
+-	atomic_inc(&lo->lo_refcnt);
+-out:
++	err = mutex_lock_killable(&lo->lo_mutex);
+ 	mutex_unlock(&loop_ctl_mutex);
+-	return err;
++	if (err)
++		return err;
++	atomic_inc(&lo->lo_refcnt);
++	mutex_unlock(&lo->lo_mutex);
++	return 0;
+ }
+ 
+ static void lo_release(struct gendisk *disk, fmode_t mode)
+ {
+-	struct loop_device *lo;
++	struct loop_device *lo = disk->private_data;
+ 
+-	mutex_lock(&loop_ctl_mutex);
+-	lo = disk->private_data;
++	mutex_lock(&lo->lo_mutex);
+ 	if (atomic_dec_return(&lo->lo_refcnt))
+ 		goto out_unlock;
+ 
+@@ -1910,7 +1915,7 @@ static void lo_release(struct gendisk *d
+ 		if (lo->lo_state != Lo_bound)
+ 			goto out_unlock;
+ 		lo->lo_state = Lo_rundown;
+-		mutex_unlock(&loop_ctl_mutex);
++		mutex_unlock(&lo->lo_mutex);
+ 		/*
+ 		 * In autoclear mode, stop the loop thread
+ 		 * and remove configuration after last close.
+@@ -1927,7 +1932,7 @@ static void lo_release(struct gendisk *d
+ 	}
+ 
+ out_unlock:
+-	mutex_unlock(&loop_ctl_mutex);
++	mutex_unlock(&lo->lo_mutex);
+ }
+ 
+ static const struct block_device_operations lo_fops = {
+@@ -1966,10 +1971,10 @@ static int unregister_transfer_cb(int id
+ 	struct loop_device *lo = ptr;
+ 	struct loop_func_table *xfer = data;
+ 
+-	mutex_lock(&loop_ctl_mutex);
++	mutex_lock(&lo->lo_mutex);
+ 	if (lo->lo_encryption == xfer)
+ 		loop_release_xfer(lo);
+-	mutex_unlock(&loop_ctl_mutex);
++	mutex_unlock(&lo->lo_mutex);
+ 	return 0;
+ }
+ 
+@@ -2155,6 +2160,7 @@ static int loop_add(struct loop_device *
+ 		disk->flags |= GENHD_FL_NO_PART_SCAN;
+ 	disk->flags |= GENHD_FL_EXT_DEVT;
+ 	atomic_set(&lo->lo_refcnt, 0);
++	mutex_init(&lo->lo_mutex);
+ 	lo->lo_number		= i;
+ 	spin_lock_init(&lo->lo_lock);
+ 	disk->major		= LOOP_MAJOR;
+@@ -2185,6 +2191,7 @@ static void loop_remove(struct loop_devi
+ 	blk_cleanup_queue(lo->lo_queue);
+ 	blk_mq_free_tag_set(&lo->tag_set);
+ 	put_disk(lo->lo_disk);
++	mutex_destroy(&lo->lo_mutex);
+ 	kfree(lo);
+ }
+ 
+@@ -2270,15 +2277,21 @@ static long loop_control_ioctl(struct fi
+ 		ret = loop_lookup(&lo, parm);
+ 		if (ret < 0)
+ 			break;
++		ret = mutex_lock_killable(&lo->lo_mutex);
++		if (ret)
++			break;
+ 		if (lo->lo_state != Lo_unbound) {
+ 			ret = -EBUSY;
++			mutex_unlock(&lo->lo_mutex);
+ 			break;
+ 		}
+ 		if (atomic_read(&lo->lo_refcnt) > 0) {
+ 			ret = -EBUSY;
++			mutex_unlock(&lo->lo_mutex);
+ 			break;
+ 		}
+ 		lo->lo_disk->private_data = NULL;
++		mutex_unlock(&lo->lo_mutex);
+ 		idr_remove(&loop_index_idr, lo->lo_number);
+ 		loop_remove(lo);
+ 		break;
+--- a/drivers/block/loop.h
++++ b/drivers/block/loop.h
+@@ -62,6 +62,7 @@ struct loop_device {
+ 	struct request_queue	*lo_queue;
+ 	struct blk_mq_tag_set	tag_set;
+ 	struct gendisk		*lo_disk;
++	struct mutex		lo_mutex;
+ };
+ 
+ struct loop_cmd {
