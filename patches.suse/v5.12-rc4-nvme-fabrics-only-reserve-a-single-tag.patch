@@ -1,0 +1,138 @@
+From ed01fee283a067c72b2d6500046080dbc1bb9dae Mon Sep 17 00:00:00 2001
+Message-Id: <ed01fee283a067c72b2d6500046080dbc1bb9dae.1640255924.git.geliang.tang@suse.com>
+From: Christoph Hellwig <hch@lst.de>
+Date: Wed, 3 Mar 2021 13:28:22 +0100
+Subject: [PATCH] nvme-fabrics: only reserve a single tag
+Git-commit: ed01fee283a067c72b2d6500046080dbc1bb9dae
+Patch-mainline: v5.12-rc4
+References: bsn#51
+
+
+Fabrics drivers currently reserve two tags on the admin queue.  But
+given that the connect command is only run on a freshly created queue
+or after all commands have been force aborted we only need to reserve
+a single tag.
+
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+Reviewed-by: Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Reviewed-by: Daniel Wagner <dwagner@suse.de>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ drivers/nvme/host/fabrics.h | 7 +++++++
+ drivers/nvme/host/fc.c      | 4 ++--
+ drivers/nvme/host/rdma.c    | 4 ++--
+ drivers/nvme/host/tcp.c     | 4 ++--
+ drivers/nvme/target/loop.c  | 4 ++--
+ 5 files changed, 15 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/nvme/host/fabrics.h b/drivers/nvme/host/fabrics.h
+index 733010d2eafd..888b108d87a4 100644
+--- a/drivers/nvme/host/fabrics.h
++++ b/drivers/nvme/host/fabrics.h
+@@ -18,6 +18,13 @@
+ /* default is -1: the fail fast mechanism is disabled  */
+ #define NVMF_DEF_FAIL_FAST_TMO		-1
+ 
++/*
++ * Reserved one command for internal usage.  This command is used for sending
++ * the connect command, as well as for the keep alive command on the admin
++ * queue once live.
++ */
++#define NVMF_RESERVED_TAGS	1
++
+ /*
+  * Define a host as seen by the target.  We allocate one at boot, but also
+  * allow the override it when creating controllers.  This is both to provide
+diff --git a/drivers/nvme/host/fc.c b/drivers/nvme/host/fc.c
+index 73d073748389..6ffa8de2a0d7 100644
+--- a/drivers/nvme/host/fc.c
++++ b/drivers/nvme/host/fc.c
+@@ -2863,7 +2863,7 @@ nvme_fc_create_io_queues(struct nvme_fc_ctrl *ctrl)
+ 	memset(&ctrl->tag_set, 0, sizeof(ctrl->tag_set));
+ 	ctrl->tag_set.ops = &nvme_fc_mq_ops;
+ 	ctrl->tag_set.queue_depth = ctrl->ctrl.opts->queue_size;
+-	ctrl->tag_set.reserved_tags = 1; /* fabric connect */
++	ctrl->tag_set.reserved_tags = NVMF_RESERVED_TAGS;
+ 	ctrl->tag_set.numa_node = ctrl->ctrl.numa_node;
+ 	ctrl->tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
+ 	ctrl->tag_set.cmd_size =
+@@ -3485,7 +3485,7 @@ nvme_fc_init_ctrl(struct device *dev, struct nvmf_ctrl_options *opts,
+ 	memset(&ctrl->admin_tag_set, 0, sizeof(ctrl->admin_tag_set));
+ 	ctrl->admin_tag_set.ops = &nvme_fc_admin_mq_ops;
+ 	ctrl->admin_tag_set.queue_depth = NVME_AQ_MQ_TAG_DEPTH;
+-	ctrl->admin_tag_set.reserved_tags = 2; /* fabric connect + Keep-Alive */
++	ctrl->admin_tag_set.reserved_tags = NVMF_RESERVED_TAGS;
+ 	ctrl->admin_tag_set.numa_node = ctrl->ctrl.numa_node;
+ 	ctrl->admin_tag_set.cmd_size =
+ 		struct_size((struct nvme_fcp_op_w_sgl *)NULL, priv,
+diff --git a/drivers/nvme/host/rdma.c b/drivers/nvme/host/rdma.c
+index 53ac4d7442ba..7855103e05d2 100644
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@ -798,7 +798,7 @@ static struct blk_mq_tag_set *nvme_rdma_alloc_tagset(struct nvme_ctrl *nctrl,
+ 		memset(set, 0, sizeof(*set));
+ 		set->ops = &nvme_rdma_admin_mq_ops;
+ 		set->queue_depth = NVME_AQ_MQ_TAG_DEPTH;
+-		set->reserved_tags = 2; /* connect + keep-alive */
++		set->reserved_tags = NVMF_RESERVED_TAGS;
+ 		set->numa_node = nctrl->numa_node;
+ 		set->cmd_size = sizeof(struct nvme_rdma_request) +
+ 				NVME_RDMA_DATA_SGL_SIZE;
+@@ -811,7 +811,7 @@ static struct blk_mq_tag_set *nvme_rdma_alloc_tagset(struct nvme_ctrl *nctrl,
+ 		memset(set, 0, sizeof(*set));
+ 		set->ops = &nvme_rdma_mq_ops;
+ 		set->queue_depth = nctrl->sqsize + 1;
+-		set->reserved_tags = 1; /* fabric connect */
++		set->reserved_tags = NVMF_RESERVED_TAGS;
+ 		set->numa_node = nctrl->numa_node;
+ 		set->flags = BLK_MQ_F_SHOULD_MERGE;
+ 		set->cmd_size = sizeof(struct nvme_rdma_request) +
+diff --git a/drivers/nvme/host/tcp.c b/drivers/nvme/host/tcp.c
+index 69f59d2c5799..c535836e7065 100644
+--- a/drivers/nvme/host/tcp.c
++++ b/drivers/nvme/host/tcp.c
+@@ -1575,7 +1575,7 @@ static struct blk_mq_tag_set *nvme_tcp_alloc_tagset(struct nvme_ctrl *nctrl,
+ 		memset(set, 0, sizeof(*set));
+ 		set->ops = &nvme_tcp_admin_mq_ops;
+ 		set->queue_depth = NVME_AQ_MQ_TAG_DEPTH;
+-		set->reserved_tags = 2; /* connect + keep-alive */
++		set->reserved_tags = NVMF_RESERVED_TAGS;
+ 		set->numa_node = nctrl->numa_node;
+ 		set->flags = BLK_MQ_F_BLOCKING;
+ 		set->cmd_size = sizeof(struct nvme_tcp_request);
+@@ -1587,7 +1587,7 @@ static struct blk_mq_tag_set *nvme_tcp_alloc_tagset(struct nvme_ctrl *nctrl,
+ 		memset(set, 0, sizeof(*set));
+ 		set->ops = &nvme_tcp_mq_ops;
+ 		set->queue_depth = nctrl->sqsize + 1;
+-		set->reserved_tags = 1; /* fabric connect */
++		set->reserved_tags = NVMF_RESERVED_TAGS;
+ 		set->numa_node = nctrl->numa_node;
+ 		set->flags = BLK_MQ_F_SHOULD_MERGE | BLK_MQ_F_BLOCKING;
+ 		set->cmd_size = sizeof(struct nvme_tcp_request);
+diff --git a/drivers/nvme/target/loop.c b/drivers/nvme/target/loop.c
+index cb6f86572b24..3e189e753bcf 100644
+--- a/drivers/nvme/target/loop.c
++++ b/drivers/nvme/target/loop.c
+@@ -349,7 +349,7 @@ static int nvme_loop_configure_admin_queue(struct nvme_loop_ctrl *ctrl)
+ 	memset(&ctrl->admin_tag_set, 0, sizeof(ctrl->admin_tag_set));
+ 	ctrl->admin_tag_set.ops = &nvme_loop_admin_mq_ops;
+ 	ctrl->admin_tag_set.queue_depth = NVME_AQ_MQ_TAG_DEPTH;
+-	ctrl->admin_tag_set.reserved_tags = 2; /* connect + keep-alive */
++	ctrl->admin_tag_set.reserved_tags = NVMF_RESERVED_TAGS;
+ 	ctrl->admin_tag_set.numa_node = ctrl->ctrl.numa_node;
+ 	ctrl->admin_tag_set.cmd_size = sizeof(struct nvme_loop_iod) +
+ 		NVME_INLINE_SG_CNT * sizeof(struct scatterlist);
+@@ -520,7 +520,7 @@ static int nvme_loop_create_io_queues(struct nvme_loop_ctrl *ctrl)
+ 	memset(&ctrl->tag_set, 0, sizeof(ctrl->tag_set));
+ 	ctrl->tag_set.ops = &nvme_loop_mq_ops;
+ 	ctrl->tag_set.queue_depth = ctrl->ctrl.opts->queue_size;
+-	ctrl->tag_set.reserved_tags = 1; /* fabric connect */
++	ctrl->tag_set.reserved_tags = NVMF_RESERVED_TAGS;
+ 	ctrl->tag_set.numa_node = ctrl->ctrl.numa_node;
+ 	ctrl->tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
+ 	ctrl->tag_set.cmd_size = sizeof(struct nvme_loop_iod) +
+-- 
+2.31.1
+
