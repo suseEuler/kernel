@@ -1,0 +1,82 @@
+From 4bdf260362b3be529d170b04662638fd6dc52241 Mon Sep 17 00:00:00 2001
+Message-Id: <4bdf260362b3be529d170b04662638fd6dc52241.1640685095.git.geliang.tang@suse.com>
+From: Filippo Sironi <sironi@amazon.de>
+Date: Wed, 10 Feb 2021 01:39:42 +0100
+Subject: [PATCH] nvme: add 48-bit DMA address quirk for Amazon NVMe
+ controllers
+Git-commit: 4bdf260362b3be529d170b04662638fd6dc52241
+Patch-mainline: v5.12-rc2
+References: bsn#51
+
+
+Some Amazon NVMe controllers do not follow the NVMe specification
+and are limited to 48-bit DMA addresses.  Add a quirk to force
+bounce buffering if needed and limit the IOVA allocation for these
+devices.
+
+This affects all current Amazon NVMe controllers that expose EBS
+volumes (0x0061, 0x0065, 0x8061) and local instance storage
+(0xcd00, 0xcd01, 0xcd02).
+
+Signed-off-by: Filippo Sironi <sironi@amazon.de>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ drivers/nvme/host/nvme.h |  6 ++++++
+ drivers/nvme/host/pci.c  | 21 ++++++++++++++++++++-
+ 2 files changed, 26 insertions(+), 1 deletion(-)
+
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -146,6 +146,12 @@ enum nvme_quirks {
+ 	NVME_QUIRK_NO_NS_DESC_LIST		= (1 << 15),
+ 
+ 	/*
++	 * The controller does not properly handle DMA addresses over
++	 * 48 bits.
++	 */
++	NVME_QUIRK_DMA_ADDRESS_BITS_48		= (1 << 16),
++
++	/*
+ 	 * The controller requires the command_id value be be limited, so skip
+ 	 * encoding the generation sequence number.
+ 	 */
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -2362,13 +2362,16 @@ static int nvme_pci_enable(struct nvme_d
+ {
+ 	int result = -ENOMEM;
+ 	struct pci_dev *pdev = to_pci_dev(dev->dev);
++	int dma_address_bits = 64;
+ 
+ 	if (pci_enable_device_mem(pdev))
+ 		return result;
+ 
+ 	pci_set_master(pdev);
+ 
+-	if (dma_set_mask_and_coherent(dev->dev, DMA_BIT_MASK(64)))
++	if (dev->ctrl.quirks & NVME_QUIRK_DMA_ADDRESS_BITS_48)
++		dma_address_bits = 48;
++	if (dma_set_mask_and_coherent(dev->dev, DMA_BIT_MASK(dma_address_bits)))
+ 		goto disable;
+ 
+ 	if (readl(dev->bar + NVME_REG_CSTS) == -1) {
+@@ -3250,6 +3253,18 @@ static const struct pci_device_id nvme_i
+ 		.driver_data = NVME_QUIRK_NO_DEEPEST_PS, },
+ 	{ PCI_DEVICE(0x2646, 0x2263),   /* KINGSTON A2000 NVMe SSD  */
+ 		.driver_data = NVME_QUIRK_NO_DEEPEST_PS, },
++	{ PCI_DEVICE(PCI_VENDOR_ID_AMAZON, 0x0061),
++		.driver_data = NVME_QUIRK_DMA_ADDRESS_BITS_48, },
++	{ PCI_DEVICE(PCI_VENDOR_ID_AMAZON, 0x0065),
++		.driver_data = NVME_QUIRK_DMA_ADDRESS_BITS_48, },
++	{ PCI_DEVICE(PCI_VENDOR_ID_AMAZON, 0x8061),
++		.driver_data = NVME_QUIRK_DMA_ADDRESS_BITS_48, },
++	{ PCI_DEVICE(PCI_VENDOR_ID_AMAZON, 0xcd00),
++		.driver_data = NVME_QUIRK_DMA_ADDRESS_BITS_48, },
++	{ PCI_DEVICE(PCI_VENDOR_ID_AMAZON, 0xcd01),
++		.driver_data = NVME_QUIRK_DMA_ADDRESS_BITS_48, },
++	{ PCI_DEVICE(PCI_VENDOR_ID_AMAZON, 0xcd02),
++		.driver_data = NVME_QUIRK_DMA_ADDRESS_BITS_48, },
+ 	{ PCI_DEVICE(PCI_VENDOR_ID_APPLE, 0x2001),
+ 		.driver_data = NVME_QUIRK_SINGLE_VECTOR },
+ 	{ PCI_DEVICE(PCI_VENDOR_ID_APPLE, 0x2003) },
