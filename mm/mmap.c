@@ -2436,6 +2436,9 @@ arch_get_unmapped_area(struct file *filp, unsigned long addr,
 	if (len > mmap_end - mmap_min_addr)
 		return -ENOMEM;
 
+	if (sp_check_mmap_addr(addr, flags))
+		return -EINVAL;
+
 	if (flags & MAP_FIXED)
 		return addr;
 
@@ -2486,6 +2489,9 @@ arch_get_unmapped_area_topdown(struct file *filp, unsigned long addr,
 	/* requested length too big for entire address space */
 	if (len > mmap_end - mmap_min_addr)
 		return -ENOMEM;
+
+	if (sp_check_mmap_addr(addr, flags))
+		return -EINVAL;
 
 	if (flags & MAP_FIXED)
 		return addr;
@@ -3214,6 +3220,9 @@ static int __vm_munmap(unsigned long start, size_t len, bool downgrade)
 	int ret;
 	struct mm_struct *mm = current->mm;
 	LIST_HEAD(uf);
+
+	if (sp_check_addr(start))
+		return -EINVAL;
 
 	if (mmap_write_lock_killable(mm))
 		return -EINTR;
