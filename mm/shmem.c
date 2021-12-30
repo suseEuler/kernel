@@ -80,6 +80,7 @@ static struct vfsmount *shm_mnt;
 #include <linux/userfaultfd_k.h>
 #include <linux/rmap.h>
 #include <linux/uuid.h>
+#include <linux/share_pool.h>
 
 #include <linux/uaccess.h>
 
@@ -1922,11 +1923,11 @@ repeat:
 
 	huge_gfp = vma_thp_gfp_mask(vma);
 	huge_gfp = limit_gfp_mask(huge_gfp, gfp);
-	page = shmem_alloc_and_acct_page(huge_gfp, inode, index, true, numa_node_id());
+	page = shmem_alloc_and_acct_page(huge_gfp, inode, index, true, sp_node_id(vma));
 	if (IS_ERR(page)) {
 alloc_nohuge:
 		page = shmem_alloc_and_acct_page(gfp, inode,
-						 index, false, numa_node_id());
+						 index, false, sp_node_id(vma));
 	}
 	if (IS_ERR(page)) {
 		int retry = 5;
