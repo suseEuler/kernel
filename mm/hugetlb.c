@@ -4147,8 +4147,13 @@ const struct vm_operations_struct hugetlb_vm_ops = {
 	.pagesize = hugetlb_vm_op_pagesize,
 };
 
+#ifdef CONFIG_ASCEND_SHARE_POOL
+pte_t make_huge_pte(struct vm_area_struct *vma, struct page *page,
+				int writable)
+#else
 static pte_t make_huge_pte(struct vm_area_struct *vma, struct page *page,
 				int writable)
+#endif
 {
 	pte_t entry;
 
@@ -5013,7 +5018,10 @@ vm_fault_t hugetlb_fault(struct mm_struct *mm, struct vm_area_struct *vma,
 
 	entry = huge_ptep_get(ptep);
 	if (huge_pte_none(entry)) {
-		ret = hugetlb_no_page(mm, vma, mapping, idx, address, ptep, flags);
+		if (sp_check_vm_share_pool(vma->vm_flags))
+			ret = sharepool_no_page(mm, vma, mapping, idx, address, ptep, flags);
+		else
+			ret = hugetlb_no_page(mm, vma, mapping, idx, address, ptep, flags);
 		goto out_mutex;
 	}
 
