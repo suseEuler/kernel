@@ -1,0 +1,77 @@
+From b0eb9e1182668b0e9cf81dbf38041cfb8c12887f Mon Sep 17 00:00:00 2001
+From: Brian Foster <bfoster@redhat.com>
+Date: Fri, 22 Jan 2021 16:48:22 -0800
+Subject: [PATCH] xfs: don't reset log idle state on covering checkpoints
+Git-commit: b0eb9e1182668b0e9cf81dbf38041cfb8c12887f
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+Now that log covering occurs on quiesce, we'd like to reuse the
+underlying superblock sync for final superblock updates. This
+includes things like lazy superblock counter updates, log feature
+incompat bits in the future, etc. One quirk to this approach is that
+once the log is in the IDLE (i.e. already covered) state, any
+subsequent log write resets the state back to NEED. This means that
+a final superblock sync to an already covered log requires two more
+sb syncs to return the log back to IDLE again.
+
+For example, if a lazy superblock enabled filesystem is mount cycled
+without any modifications, the unmount path syncs the superblock
+once and writes an unmount record. With the desired log quiesce
+covering behavior, we sync the superblock three times at unmount
+time: once for the lazy superblock counter update and twice more to
+cover the log. By contrast, if the log is active or only partially
+covered at unmount time, a final superblock sync would doubly serve
+as the one or two remaining syncs required to cover the log.
+
+This duplicate covering sequence is unnecessary because the
+filesystem remains consistent if a crash occurs at any point. The
+superblock will either be recovered in the event of a crash or
+written back before the log is quiesced and potentially cleaned with
+an unmount record.
+
+Update the log covering state machine to remain in the IDLE state if
+additional covering checkpoints pass through the log. This
+facilitates final superblock updates (such as lazy superblock
+counters) via a single sb sync without losing covered status. This
+provides some consistency with the active and partially covered
+cases and also avoids harmless, but spurious checkpoints when
+quiescing the log.
+
+Signed-off-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Allison Henderson <allison.henderson@oracle.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/xfs/xfs_log.c | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/fs/xfs/xfs_log.c b/fs/xfs/xfs_log.c
+index e941faea8e98..a613f008b95f 100644
+--- a/fs/xfs/xfs_log.c
++++ b/fs/xfs/xfs_log.c
+@@ -2599,12 +2599,15 @@ xlog_covered_state(
+ 	int			iclogs_changed)
+ {
+ 	/*
+-	 * We usually go to NEED. But we go to NEED2 if the changed indicates we
+-	 * are done writing the dummy record.  If we are done with the second
+-	 * dummy recored (DONE2), then we go to IDLE.
++	 * We go to NEED for any non-covering writes. We go to NEED2 if we just
++	 * wrote the first covering record (DONE). We go to IDLE if we just
++	 * wrote the second covering record (DONE2) and remain in IDLE until a
++	 * non-covering write occurs.
+ 	 */
+ 	switch (prev_state) {
+ 	case XLOG_STATE_COVER_IDLE:
++		if (iclogs_changed == 1)
++			return XLOG_STATE_COVER_IDLE;
+ 	case XLOG_STATE_COVER_NEED:
+ 	case XLOG_STATE_COVER_NEED2:
+ 		break;
+-- 
+2.26.2
+

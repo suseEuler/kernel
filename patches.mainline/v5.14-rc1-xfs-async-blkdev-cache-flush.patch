@@ -1,0 +1,89 @@
+From 0431d926b399d74f1cde2c355d48289c6d7fa882 Mon Sep 17 00:00:00 2001
+From: Dave Chinner <dchinner@redhat.com>
+Date: Fri, 18 Jun 2021 08:21:49 -0700
+Subject: [PATCH] xfs: async blkdev cache flush
+Git-commit: 0431d926b399d74f1cde2c355d48289c6d7fa882
+Patch-mainline: v5.14-rc1
+References: bsn#12
+
+
+The new checkpoint cache flush mechanism requires us to issue an
+unconditional cache flush before we start a new checkpoint. We don't
+want to block for this if we can help it, and we have a fair chunk
+of CPU work to do between starting the checkpoint and issuing the
+first journal IO.
+
+Hence it makes sense to amortise the latency cost of the cache flush
+by issuing it asynchronously and then waiting for it only when we
+need to issue the first IO in the transaction.
+
+To do this, we need async cache flush primitives to submit the cache
+flush bio and to wait on it. The block layer has no such primitives
+for filesystems, so roll our own for the moment.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Allison Henderson <allison.henderson@oracle.com>
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/xfs/xfs_bio_io.c |   35 +++++++++++++++++++++++++++++++++++
+ fs/xfs/xfs_linux.h  |    2 ++
+ 2 files changed, 37 insertions(+)
+
+--- a/fs/xfs/xfs_bio_io.c
++++ b/fs/xfs/xfs_bio_io.c
+@@ -9,6 +9,41 @@ static inline unsigned int bio_max_vecs(
+ 	return min_t(unsigned, howmany(count, PAGE_SIZE), BIO_MAX_PAGES);
+ }
+ 
++static void
++xfs_flush_bdev_async_endio(
++	struct bio	*bio)
++{
++	complete(bio->bi_private);
++}
++
++/*
++ * Submit a request for an async cache flush to run. If the request queue does
++ * not require flush operations, just skip it altogether. If the caller needs
++ * to wait for the flush completion at a later point in time, they must supply a
++ * valid completion. This will be signalled when the flush completes.  The
++ * caller never sees the bio that is issued here.
++ */
++void
++xfs_flush_bdev_async(
++	struct bio		*bio,
++	struct block_device	*bdev,
++	struct completion	*done)
++{
++	struct request_queue	*q = bdev->bd_disk->queue;
++
++	if (!test_bit(QUEUE_FLAG_WC, &q->queue_flags)) {
++		complete(done);
++		return;
++	}
++
++	bio_init(bio, NULL, 0);
++	bio_set_dev(bio, bdev);
++	bio->bi_opf = REQ_OP_WRITE | REQ_PREFLUSH | REQ_SYNC;
++	bio->bi_private = done;
++	bio->bi_end_io = xfs_flush_bdev_async_endio;
++
++	submit_bio(bio);
++}
+ int
+ xfs_rw_bdev(
+ 	struct block_device	*bdev,
+--- a/fs/xfs/xfs_linux.h
++++ b/fs/xfs/xfs_linux.h
+@@ -197,6 +197,8 @@ static inline uint64_t howmany_64(uint64
+ 
+ int xfs_rw_bdev(struct block_device *bdev, sector_t sector, unsigned int count,
+ 		char *data, unsigned int op);
++void xfs_flush_bdev_async(struct bio *bio, struct block_device *bdev,
++		struct completion *done);
+ 
+ #define ASSERT_ALWAYS(expr)	\
+ 	(likely(expr) ? (void)0 : assfail(NULL, #expr, __FILE__, __LINE__))

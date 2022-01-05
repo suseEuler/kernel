@@ -1,0 +1,111 @@
+From a5183862e76fdc25f36b39c2489b816a5c66e2e5 Mon Sep 17 00:00:00 2001
+From: Yunfeng Ye <yeyunfeng@huawei.com>
+Date: Thu, 13 May 2021 01:29:16 +0200
+Subject: [PATCH] tick/nohz: Conditionally restart tick on idle exit
+Git-commit: a5183862e76fdc25f36b39c2489b816a5c66e2e5
+Patch-mainline: v5.14-rc1
+References: bsn#12
+
+
+In nohz_full mode, switching from idle to a task will unconditionally
+issue a tick restart. If the task is alone in the runqueue or is the
+highest priority, the tick will fire once then eventually stop. But that
+alone is still undesired noise.
+
+Therefore, only restart the tick on idle exit when it's strictly
+necessary.
+
+Signed-off-by: Yunfeng Ye <yeyunfeng@huawei.com>
+Signed-off-by: Frederic Weisbecker <frederic@kernel.org>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Acked-by: Peter Zijlstra <peterz@infradead.org>
+Link: https://lore.kernel.org/r/20210512232924.150322-3-frederic@kernel.org
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/time/tick-sched.c | 42 ++++++++++++++++++++++++++--------------
+ 1 file changed, 27 insertions(+), 15 deletions(-)
+
+diff --git a/kernel/time/tick-sched.c b/kernel/time/tick-sched.c
+index 828b091501ca..05c1ce1034d6 100644
+--- a/kernel/time/tick-sched.c
++++ b/kernel/time/tick-sched.c
+@@ -926,22 +926,28 @@ static void tick_nohz_restart_sched_tick(struct tick_sched *ts, ktime_t now)
+ 	tick_nohz_restart(ts, now);
+ }
+ 
+-static void tick_nohz_full_update_tick(struct tick_sched *ts)
++static void __tick_nohz_full_update_tick(struct tick_sched *ts,
++					 ktime_t now)
+ {
+ #ifdef CONFIG_NO_HZ_FULL
+ 	int cpu = smp_processor_id();
+ 
+-	if (!tick_nohz_full_cpu(cpu))
++	if (can_stop_full_tick(cpu, ts))
++		tick_nohz_stop_sched_tick(ts, cpu);
++	else if (ts->tick_stopped)
++		tick_nohz_restart_sched_tick(ts, now);
++#endif
++}
++
++static void tick_nohz_full_update_tick(struct tick_sched *ts)
++{
++	if (!tick_nohz_full_cpu(smp_processor_id()))
+ 		return;
+ 
+ 	if (!ts->tick_stopped && ts->nohz_mode == NOHZ_MODE_INACTIVE)
+ 		return;
+ 
+-	if (can_stop_full_tick(cpu, ts))
+-		tick_nohz_stop_sched_tick(ts, cpu);
+-	else if (ts->tick_stopped)
+-		tick_nohz_restart_sched_tick(ts, ktime_get());
+-#endif
++	__tick_nohz_full_update_tick(ts, ktime_get());
+ }
+ 
+ static bool can_stop_idle_tick(int cpu, struct tick_sched *ts)
+@@ -1209,18 +1215,24 @@ static void tick_nohz_account_idle_ticks(struct tick_sched *ts)
+ #endif
+ }
+ 
+-static void __tick_nohz_idle_restart_tick(struct tick_sched *ts, ktime_t now)
++void tick_nohz_idle_restart_tick(void)
+ {
+-	tick_nohz_restart_sched_tick(ts, now);
+-	tick_nohz_account_idle_ticks(ts);
++	struct tick_sched *ts = this_cpu_ptr(&tick_cpu_sched);
++
++	if (ts->tick_stopped) {
++		tick_nohz_restart_sched_tick(ts, ktime_get());
++		tick_nohz_account_idle_ticks(ts);
++	}
+ }
+ 
+-void tick_nohz_idle_restart_tick(void)
++static void tick_nohz_idle_update_tick(struct tick_sched *ts, ktime_t now)
+ {
+-	struct tick_sched *ts = this_cpu_ptr(&tick_cpu_sched);
++	if (tick_nohz_full_cpu(smp_processor_id()))
++		__tick_nohz_full_update_tick(ts, now);
++	else
++		tick_nohz_restart_sched_tick(ts, now);
+ 
+-	if (ts->tick_stopped)
+-		__tick_nohz_idle_restart_tick(ts, ktime_get());
++	tick_nohz_account_idle_ticks(ts);
+ }
+ 
+ /**
+@@ -1252,7 +1264,7 @@ void tick_nohz_idle_exit(void)
+ 		tick_nohz_stop_idle(ts, now);
+ 
+ 	if (tick_stopped)
+-		__tick_nohz_idle_restart_tick(ts, now);
++		tick_nohz_idle_update_tick(ts, now);
+ 
+ 	local_irq_enable();
+ }
+-- 
+2.26.2
+

@@ -1,0 +1,67 @@
+From 6be001021f0b307c8c1544e8b3ac87de20d711de Mon Sep 17 00:00:00 2001
+From: Dave Chinner <dchinner@redhat.com>
+Date: Fri, 25 Jun 2021 11:21:00 -0700
+Subject: [PATCH] xfs: don't nest icloglock inside ic_callback_lock
+Git-commit: 6be001021f0b307c8c1544e8b3ac87de20d711de
+Patch-mainline: v5.14-rc1
+References: bsn#12
+
+
+It's completely unnecessary because callbacks are added to iclogs
+without holding the icloglock, hence no amount of ordering between
+the icloglock and ic_callback_lock will order the removal of
+callbacks from the iclog.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/xfs/xfs_log.c | 18 ++++--------------
+ 1 file changed, 4 insertions(+), 14 deletions(-)
+
+--- a/fs/xfs/xfs_log.c
++++ b/fs/xfs/xfs_log.c
+@@ -2686,10 +2686,7 @@ static void
+ xlog_state_do_iclog_callbacks(
+ 	struct xlog		*log,
+ 	struct xlog_in_core	*iclog)
+-		__releases(&log->l_icloglock)
+-		__acquires(&log->l_icloglock)
+ {
+-	spin_unlock(&log->l_icloglock);
+ 	spin_lock(&iclog->ic_callback_lock);
+ 	while (!list_empty(&iclog->ic_callbacks)) {
+ 		LIST_HEAD(tmp);
+@@ -2701,12 +2698,6 @@ xlog_state_do_iclog_callbacks(
+ 		spin_lock(&iclog->ic_callback_lock);
+ 	}
+ 
+-	/*
+-	 * Pick up the icloglock while still holding the callback lock so we
+-	 * serialise against anyone trying to add more callbacks to this iclog
+-	 * now we've finished processing.
+-	 */
+-	spin_lock(&log->l_icloglock);
+ 	spin_unlock(&iclog->ic_callback_lock);
+ }
+ 
+@@ -2747,13 +2738,12 @@ xlog_state_do_callback(
+ 				iclog = iclog->ic_next;
+ 				continue;
+ 			}
++			spin_unlock(&log->l_icloglock);
+ 
+-			/*
+-			 * Running callbacks will drop the icloglock which means
+-			 * we'll have to run at least one more complete loop.
+-			 */
+-			cycled_icloglock = true;
+ 			xlog_state_do_iclog_callbacks(log, iclog);
++			cycled_icloglock = true;
++
++			spin_lock(&log->l_icloglock);
+ 			if (XLOG_FORCED_SHUTDOWN(log))
+ 				wake_up_all(&iclog->ic_force_wait);
+ 			else

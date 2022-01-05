@@ -1,0 +1,78 @@
+From 81a448d7b0668ae39c08e6f34a54cc7eafb844f1 Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Mon, 26 Jul 2021 16:43:17 -0700
+Subject: [PATCH] xfs: prevent spoofing of rtbitmap blocks when recovering
+ buffers
+Git-commit: 81a448d7b0668ae39c08e6f34a54cc7eafb844f1
+Patch-mainline: v5.14-rc4
+References: bsn#12
+
+
+While reviewing the buffer item recovery code, the thought occurred to
+me: in V5 filesystems we use log sequence number (LSN) tracking to avoid
+replaying older metadata updates against newer log items.  However, we
+use the magic number of the ondisk buffer to find the LSN of the ondisk
+metadata, which means that if an attacker can control the layout of the
+realtime device precisely enough that the start of an rt bitmap block
+matches the magic and UUID of some other kind of block, they can control
+the purported LSN of that spoofed block and thereby break log replay.
+
+Since realtime bitmap and summary blocks don't have headers at all, we
+have no way to tell if a block really should be replayed.  The best we
+can do is replay unconditionally and hope for the best.
+
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Carlos Maiolino <cmaiolino@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/xfs/xfs_buf_item_recover.c | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/fs/xfs/xfs_buf_item_recover.c b/fs/xfs/xfs_buf_item_recover.c
+index 05fd816edf59..4775485b4062 100644
+--- a/fs/xfs/xfs_buf_item_recover.c
++++ b/fs/xfs/xfs_buf_item_recover.c
+@@ -698,7 +698,8 @@ xlog_recover_do_inode_buffer(
+ static xfs_lsn_t
+ xlog_recover_get_buf_lsn(
+ 	struct xfs_mount	*mp,
+-	struct xfs_buf		*bp)
++	struct xfs_buf		*bp,
++	struct xfs_buf_log_format *buf_f)
+ {
+ 	uint32_t		magic32;
+ 	uint16_t		magic16;
+@@ -706,11 +707,20 @@ xlog_recover_get_buf_lsn(
+ 	void			*blk = bp->b_addr;
+ 	uuid_t			*uuid;
+ 	xfs_lsn_t		lsn = -1;
++	uint16_t		blft;
+ 
+ 	/* v4 filesystems always recover immediately */
+ 	if (!xfs_sb_version_hascrc(&mp->m_sb))
+ 		goto recover_immediately;
+ 
++	/*
++	 * realtime bitmap and summary file blocks do not have magic numbers or
++	 * UUIDs, so we must recover them immediately.
++	 */
++	blft = xfs_blft_from_flags(buf_f);
++	if (blft == XFS_BLFT_RTBITMAP_BUF || blft == XFS_BLFT_RTSUMMARY_BUF)
++		goto recover_immediately;
++
+ 	magic32 = be32_to_cpu(*(__be32 *)blk);
+ 	switch (magic32) {
+ 	case XFS_ABTB_CRC_MAGIC:
+@@ -920,7 +930,7 @@ xlog_recover_buf_commit_pass2(
+ 	 * the verifier will be reset to match whatever recover turns that
+ 	 * buffer into.
+ 	 */
+-	lsn = xlog_recover_get_buf_lsn(mp, bp);
++	lsn = xlog_recover_get_buf_lsn(mp, bp, buf_f);
+ 	if (lsn && lsn != -1 && XFS_LSN_CMP(lsn, current_lsn) >= 0) {
+ 		trace_xfs_log_recover_buf_skip(log, buf_f);
+ 		xlog_recover_validate_buf_type(mp, bp, buf_f, NULLCOMMITLSN);
+-- 
+2.26.2
+

@@ -1,0 +1,129 @@
+From 0a8b4f1d5bf4108cfd2877223bf125b1fa1dc4b1 Mon Sep 17 00:00:00 2001
+From: Vlastimil Babka <vbabka@suse.cz>
+Date: Mon, 14 Dec 2020 19:10:43 -0800
+Subject: [PATCH] mm, page_alloc: calculate pageset high and batch once per
+ zone
+Git-commit: 0a8b4f1d5bf4108cfd2877223bf125b1fa1dc4b1
+Patch-mainline: v5.11-rc1
+References: bsn#12
+
+
+We currently call pageset_set_high_and_batch() for each possible cpu,
+which repeats the same calculations of high and batch values.
+
+Instead call the function just once per zone, and make it apply the
+calculated values to all per-cpu pagesets of the zone.
+
+This also allows removing the zone_pageset_init() and __zone_pcp_update()
+wrappers.
+
+No functional change.
+
+Link: https://lkml.kernel.org/r/20201111092812.11329-3-vbabka@suse.cz
+Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+Reviewed-by: Oscar Salvador <osalvador@suse.de>
+Reviewed-by: David Hildenbrand <david@redhat.com>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Acked-by: Pankaj Gupta <pankaj.gupta@cloud.ionos.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/page_alloc.c | 42 ++++++++++++++++++------------------------
+ 1 file changed, 18 insertions(+), 24 deletions(-)
+
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 569e25b87b9e..ced4366ee3d4 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -6315,13 +6315,14 @@ static void setup_pageset(struct per_cpu_pageset *p)
+ }
+ 
+ /*
+- * Calculate and set new high and batch values for given per-cpu pageset of a
++ * Calculate and set new high and batch values for all per-cpu pagesets of a
+  * zone, based on the zone's size and the percpu_pagelist_fraction sysctl.
+  */
+-static void pageset_set_high_and_batch(struct zone *zone,
+-				       struct per_cpu_pageset *p)
++static void zone_set_pageset_high_and_batch(struct zone *zone)
+ {
+ 	unsigned long new_high, new_batch;
++	struct per_cpu_pageset *p;
++	int cpu;
+ 
+ 	if (percpu_pagelist_fraction) {
+ 		new_high = zone_managed_pages(zone) / percpu_pagelist_fraction;
+@@ -6333,23 +6334,25 @@ static void pageset_set_high_and_batch(struct zone *zone,
+ 		new_high = 6 * new_batch;
+ 		new_batch = max(1UL, 1 * new_batch);
+ 	}
+-	pageset_update(&p->pcp, new_high, new_batch);
+-}
+-
+-static void __meminit zone_pageset_init(struct zone *zone, int cpu)
+-{
+-	struct per_cpu_pageset *pcp = per_cpu_ptr(zone->pageset, cpu);
+ 
+-	pageset_init(pcp);
+-	pageset_set_high_and_batch(zone, pcp);
++	for_each_possible_cpu(cpu) {
++		p = per_cpu_ptr(zone->pageset, cpu);
++		pageset_update(&p->pcp, new_high, new_batch);
++	}
+ }
+ 
+ void __meminit setup_zone_pageset(struct zone *zone)
+ {
++	struct per_cpu_pageset *p;
+ 	int cpu;
++
+ 	zone->pageset = alloc_percpu(struct per_cpu_pageset);
+-	for_each_possible_cpu(cpu)
+-		zone_pageset_init(zone, cpu);
++	for_each_possible_cpu(cpu) {
++		p = per_cpu_ptr(zone->pageset, cpu);
++		pageset_init(p);
++	}
++
++	zone_set_pageset_high_and_batch(zone);
+ }
+ 
+ /*
+@@ -8083,15 +8086,6 @@ int lowmem_reserve_ratio_sysctl_handler(struct ctl_table *table, int write,
+ 	return 0;
+ }
+ 
+-static void __zone_pcp_update(struct zone *zone)
+-{
+-	unsigned int cpu;
+-
+-	for_each_possible_cpu(cpu)
+-		pageset_set_high_and_batch(zone,
+-				per_cpu_ptr(zone->pageset, cpu));
+-}
+-
+ /*
+  * percpu_pagelist_fraction - changes the pcp->high for each zone on each
+  * cpu.  It is the fraction of total pages in each zone that a hot per cpu
+@@ -8124,7 +8118,7 @@ int percpu_pagelist_fraction_sysctl_handler(struct ctl_table *table, int write,
+ 		goto out;
+ 
+ 	for_each_populated_zone(zone)
+-		__zone_pcp_update(zone);
++		zone_set_pageset_high_and_batch(zone);
+ out:
+ 	mutex_unlock(&pcp_batch_high_lock);
+ 	return ret;
+@@ -8731,7 +8725,7 @@ EXPORT_SYMBOL(free_contig_range);
+ void __meminit zone_pcp_update(struct zone *zone)
+ {
+ 	mutex_lock(&pcp_batch_high_lock);
+-	__zone_pcp_update(zone);
++	zone_set_pageset_high_and_batch(zone);
+ 	mutex_unlock(&pcp_batch_high_lock);
+ }
+ 
+-- 
+2.26.2
+

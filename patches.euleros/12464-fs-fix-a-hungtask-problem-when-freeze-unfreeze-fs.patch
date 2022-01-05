@@ -1,0 +1,102 @@
+From 77922e15e096cbe2d255e14c9efda76a1f250508 Mon Sep 17 00:00:00 2001
+From: geruijun <geruijun@huawei.com>
+Date: Mon, 27 Dec 2021 19:43:23 +0800
+Subject: [PATCH] fs: fix a hungtask problem when freeze/unfreeze fs
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 77922e15e096cbe2d255e14c9efda76a1f250508
+
+
+euleros inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4M0EE?from=project-issue
+
+--------------------------------
+
+We found the following deadlock when running xfstests generic/390 with ext4
+filesystem, and simutaneously offlining/onlining the disk we tested. It will
+cause a deadlock whose call trace is like this:
+
+fsstress        D    0 11672  11625 0x00000080
+Call Trace:
+ ? __schedule+0x2fc/0x930
+ ? filename_parentat+0x10b/0x1a0
+ schedule+0x28/0x70
+ rwsem_down_read_failed+0x102/0x1c0
+ ? __percpu_down_read+0x93/0xb0
+ __percpu_down_read+0x93/0xb0
+ __sb_start_write+0x5f/0x70
+ mnt_want_write+0x20/0x50
+ do_renameat2+0x1f3/0x550
+ __x64_sys_rename+0x1c/0x20
+ do_syscall_64+0x5b/0x1b0
+ entry_SYSCALL_64_after_hwframe+0x65/0xca
+
+The root cause is that when ext4 hits IO error due to disk being
+offline, it will switch itself into read-only state. When it is frozen
+at that moment, following thaw_super() call will not unlock percpu
+freeze semaphores (as the fs is read-only) causing the deadlock.
+
+Fix the problem by tracking whether the superblock was read-only at the
+time we were freezing it.
+
+Reported-and-tested-by: Shijie Luo <luoshijie1@huawei.com>
+Signed-off-by: geruijun <geruijun@huawei.com>
+Signed-off-by: Jan Kara <jack@suse.cz>
+Reviewed-by: Zhang Yi <yi.zhang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/super.c         | 9 ++++++++-
+ include/linux/fs.h | 4 +++-
+ 2 files changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/fs/super.c b/fs/super.c
+index 98bb0629ee10..494bfdc6f778 100644
+--- a/fs/super.c
++++ b/fs/super.c
+@@ -1727,10 +1727,12 @@ int freeze_super(struct super_block *sb)
+ 	if (sb_rdonly(sb)) {
+ 		/* Nothing to do really... */
+ 		sb->s_writers.frozen = SB_FREEZE_COMPLETE;
++		sb->s_writers.frozen_ro = 1;
+ 		up_write(&sb->s_umount);
+ 		return 0;
+ 	}
+ 
++	sb->s_writers.frozen_ro = 0;
+ 	sb->s_writers.frozen = SB_FREEZE_WRITE;
+ 	/* Release s_umount to preserve sb_start_write -> s_umount ordering */
+ 	up_write(&sb->s_umount);
+@@ -1786,7 +1788,12 @@ static int thaw_super_locked(struct super_block *sb)
+ 		return -EINVAL;
+ 	}
+ 
+-	if (sb_rdonly(sb)) {
++	/*
++	 * Was the fs frozen in read-only state? Note that we cannot just check
++	 * sb_rdonly(sb) as the filesystem might have switched to read-only
++	 * state due to internal errors or so.
++	 */
++	if (sb->s_writers.frozen_ro) {
+ 		sb->s_writers.frozen = SB_UNFROZEN;
+ 		goto out;
+ 	}
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 243a0987ca2b..a56184847086 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -1413,7 +1413,9 @@ enum {
+ #define SB_FREEZE_LEVELS (SB_FREEZE_COMPLETE - 1)
+ 
+ struct sb_writers {
+-	int				frozen;		/* Is sb frozen? */
++	unsigned short			frozen;		/* Is sb frozen? */
++	unsigned short			frozen_ro;	/* Was sb read-only
++							 * when frozen? */
+ 	wait_queue_head_t		wait_unfrozen;	/* for get_super_thawed() */
+ 	struct percpu_rw_semaphore	rw_sem[SB_FREEZE_LEVELS];
+ };
+-- 
+2.26.2
+

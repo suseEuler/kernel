@@ -1,0 +1,71 @@
+From 4e6b8270c820c8c57a73f869799a0af2b56eff3e Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Fri, 18 Jun 2021 11:57:07 -0700
+Subject: [PATCH] xfs: force the log offline when log intent item recovery
+ fails
+Git-commit: 4e6b8270c820c8c57a73f869799a0af2b56eff3e
+Patch-mainline: v5.14-rc1
+References: bsn#12
+
+
+If any part of log intent item recovery fails, we should shut down the
+log immediately to stop the log from writing a clean unmount record to
+disk, because the metadata is not consistent.  The inability to cancel a
+dirty transaction catches most of these cases, but there are a few
+things that have slipped through the cracks, such as ENOSPC from a
+transaction allocation, or runtime errors that result in cancellation of
+a non-dirty transaction.
+
+This solves some weird behaviors reported by customers where a system
+goes down, the first mount fails, the second succeeds, but then the fs
+goes down later because of inconsistent metadata.
+
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/xfs/xfs_log.c         | 3 +++
+ fs/xfs/xfs_log_recover.c | 5 ++++-
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/fs/xfs/xfs_log.c b/fs/xfs/xfs_log.c
+index 596cd1640bab..e93cac6b5378 100644
+--- a/fs/xfs/xfs_log.c
++++ b/fs/xfs/xfs_log.c
+@@ -755,6 +755,9 @@ xfs_log_mount_finish(
+ 	if (readonly)
+ 		mp->m_flags |= XFS_MOUNT_RDONLY;
+ 
++	/* Make sure the log is dead if we're returning failure. */
++	ASSERT(!error || (mp->m_log->l_flags & XLOG_IO_ERROR));
++
+ 	return error;
+ }
+ 
+diff --git a/fs/xfs/xfs_log_recover.c b/fs/xfs/xfs_log_recover.c
+index 1227503d2246..1721fce2ec94 100644
+--- a/fs/xfs/xfs_log_recover.c
++++ b/fs/xfs/xfs_log_recover.c
+@@ -2458,8 +2458,10 @@ xlog_finish_defer_ops(
+ 
+ 		error = xfs_trans_alloc(mp, &resv, dfc->dfc_blkres,
+ 				dfc->dfc_rtxres, XFS_TRANS_RESERVE, &tp);
+-		if (error)
++		if (error) {
++			xfs_force_shutdown(mp, SHUTDOWN_LOG_IO_ERROR);
+ 			return error;
++		}
+ 
+ 		/*
+ 		 * Transfer to this new transaction all the dfops we captured
+@@ -3449,6 +3451,7 @@ xlog_recover_finish(
+ 			 * this) before we get around to xfs_log_mount_cancel.
+ 			 */
+ 			xlog_recover_cancel_intents(log);
++			xfs_force_shutdown(log->l_mp, SHUTDOWN_LOG_IO_ERROR);
+ 			xfs_alert(log->l_mp, "Failed to recover intents");
+ 			return error;
+ 		}
+-- 
+2.26.2
+

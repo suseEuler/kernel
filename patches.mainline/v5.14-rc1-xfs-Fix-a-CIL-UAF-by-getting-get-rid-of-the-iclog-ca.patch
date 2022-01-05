@@ -1,0 +1,165 @@
+From ec2c2dbd8fa836c4851c5f346bbda6deba215412 Mon Sep 17 00:00:00 2001
+From: Dave Chinner <dchinner@redhat.com>
+Date: Mon, 27 Dec 2021 19:42:54 +0800
+Subject: [PATCH] xfs: Fix a CIL UAF by getting get rid of the iclog callback
+ lock
+Git-commit: a1bb8505e92101df94080f81298e3640f5fbe037
+Patch-mainline: v5.14-rc1
+References: bsn#12
+openEuler-commit: ec2c2dbd8fa836c4851c5f346bbda6deba215412
+
+The iclog callback chain has it's own lock. That was added way back
+in 2008 by myself to alleviate severe lock contention on the
+icloglock in commit 114d23aae512 ("[XFS] Per iclog callback chain
+lock"). This was long before delayed logging took the icloglock out
+of the hot transaction commit path and removed all contention on it.
+Hence the separate ic_callback_lock doesn't serve any scalability
+purpose anymore, and hasn't for close on a decade.
+
+Further, we only attach callbacks to iclogs in one place where we
+are already taking the icloglock soon after attaching the callbacks.
+We also have to drop the icloglock to run callbacks and grab it
+immediately afterwards again. So given that the icloglock is no
+longer hot, making it cover callbacks again doesn't really change
+the locking patterns very much at all.
+
+We also need to extend the icloglock to cover callback addition to
+fix a zero-day UAF in the CIL push code. This occurs when shutdown
+races with xlog_cil_push_work() and the shutdown runs the callbacks
+before the push releases the iclog. This results in the CIL context
+structure attached to the iclog being freed by the callback before
+the CIL push has finished referencing it, leading to UAF bugs.
+
+Hence, to avoid this UAF, we need the callback attachment to be
+atomic with post processing of the commit iclog and references to
+the structures being attached to the iclog. This requires holding
+the icloglock as that's the only way to serialise iclog state
+against a shutdown in progress.
+
+The result is we need to be using the icloglock to protect the
+callback list addition and removal and serialise them with shutdown.
+That makes the ic_callback_lock redundant and so it can be removed.
+
+Fixes: 71e330b59390 ("xfs: Introduce delayed logging core code")
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/xfs/xfs_log.c      | 29 ++++-------------------------
+ fs/xfs/xfs_log_cil.c  | 16 ++++++++++++----
+ fs/xfs/xfs_log_priv.h |  3 ---
+ 3 files changed, 16 insertions(+), 32 deletions(-)
+
+--- a/fs/xfs/xfs_log.c
++++ b/fs/xfs/xfs_log.c
+@@ -1403,7 +1403,6 @@ xlog_alloc_log(
+ 		iclog->ic_state = XLOG_STATE_ACTIVE;
+ 		iclog->ic_log = log;
+ 		atomic_set(&iclog->ic_refcnt, 0);
+-		spin_lock_init(&iclog->ic_callback_lock);
+ 		INIT_LIST_HEAD(&iclog->ic_callbacks);
+ 		iclog->ic_datap = (char *)iclog->ic_data + log->l_iclog_hsize;
+ 
+@@ -2674,28 +2673,6 @@ xlog_state_iodone_process_iclog(
+ 	}
+ }
+ 
+-/*
+- * Keep processing entries in the iclog callback list until we come around and
+- * it is empty.  We need to atomically see that the list is empty and change the
+- * state to DIRTY so that we don't miss any more callbacks being added.
+- *
+- * This function is called with the icloglock held and returns with it held. We
+- * drop it while running callbacks, however, as holding it over thousands of
+- * callbacks is unnecessary and causes excessive contention if we do.
+- */
+-static void
+-xlog_state_do_iclog_callbacks(
+-	struct xlog		*log,
+-	struct xlog_in_core	*iclog)
+-{
+-	LIST_HEAD(tmp);
+-
+-	spin_lock(&iclog->ic_callback_lock);
+-	list_splice_init(&iclog->ic_callbacks, &tmp);
+-	spin_unlock(&iclog->ic_callback_lock);
+-	xlog_cil_process_committed(&tmp);
+-}
+-
+ STATIC void
+ xlog_state_do_callback(
+ 	struct xlog		*log)
+@@ -2724,6 +2701,8 @@ xlog_state_do_callback(
+ 		repeats++;
+ 
+ 		do {
++			LIST_HEAD(cb_list);
++
+ 			if (xlog_state_iodone_process_iclog(log, iclog,
+ 							&ioerror))
+ 				break;
+@@ -2733,9 +2712,10 @@ xlog_state_do_callback(
+ 				iclog = iclog->ic_next;
+ 				continue;
+ 			}
++			list_splice_init(&iclog->ic_callbacks, &cb_list);
+ 			spin_unlock(&log->l_icloglock);
+ 
+-			xlog_state_do_iclog_callbacks(log, iclog);
++			xlog_cil_process_committed(&cb_list);
+ 			cycled_icloglock = true;
+ 
+ 			spin_lock(&log->l_icloglock);
+--- a/fs/xfs/xfs_log_cil.c
++++ b/fs/xfs/xfs_log_cil.c
+@@ -873,15 +873,21 @@ restart:
+ 
+ 	xfs_log_ticket_ungrant(log, tic);
+ 
+-	spin_lock(&commit_iclog->ic_callback_lock);
++	/*
++	 * Once we attach the ctx to the iclog, a shutdown can process the
++	 * iclog, run the callbacks and free the ctx. The only thing preventing
++	 * this potential UAF situation here is that we are holding the
++	 * icloglock. Hence we cannot access the ctx after we have attached the
++	 * callbacks and dropped the icloglock.
++	 */
++	spin_lock(&log->l_icloglock);
+ 	if (commit_iclog->ic_state == XLOG_STATE_IOERROR) {
+-		spin_unlock(&commit_iclog->ic_callback_lock);
++		spin_unlock(&log->l_icloglock);
+ 		goto out_abort;
+ 	}
+ 	ASSERT_ALWAYS(commit_iclog->ic_state == XLOG_STATE_ACTIVE ||
+ 		      commit_iclog->ic_state == XLOG_STATE_WANT_SYNC);
+ 	list_add_tail(&ctx->iclog_entry, &commit_iclog->ic_callbacks);
+-	spin_unlock(&commit_iclog->ic_callback_lock);
+ 
+ 	/*
+ 	 * now the checkpoint commit is complete and we've attached the
+@@ -898,8 +904,10 @@ restart:
+ 	 * iclogs to complete before we submit the commit_iclog. In this case,
+ 	 * the commit_iclog write needs to issue a pre-flush so that the
+ 	 * ordering is correctly preserved down to stable storage.
++	 *
++	 * NOTE: It is not safe to reference the ctx after this check as we drop
++	 * the icloglock if we have to wait for completion of other iclogs.
+ 	 */
+-	spin_lock(&log->l_icloglock);
+ 	if (ctx->start_lsn != commit_lsn) {
+ 		xlog_wait_on_iclog(commit_iclog->ic_prev);
+ 		spin_lock(&log->l_icloglock);
+--- a/fs/xfs/xfs_log_priv.h
++++ b/fs/xfs/xfs_log_priv.h
+@@ -206,9 +206,6 @@ typedef struct xlog_in_core {
+ 	enum xlog_iclog_state	ic_state;
+ 	unsigned int		ic_flags;
+ 	char			*ic_datap;	/* pointer to iclog data */
+-
+-	/* Callback structures need their own cacheline */
+-	spinlock_t		ic_callback_lock ____cacheline_aligned_in_smp;
+ 	struct list_head	ic_callbacks;
+ 
+ 	/* reference counts need their own cacheline */

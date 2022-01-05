@@ -1,0 +1,115 @@
+From c4d3830b8308de60b07cd6ef41aea44d51584cf8 Mon Sep 17 00:00:00 2001
+From: Yunfeng Ye <yeyunfeng@huawei.com>
+Date: Wed, 29 Dec 2021 12:13:55 +0800
+Subject: [PATCH] mm: emit the "free" trace report before freeing memory in
+ kmem_cache_free()
+Git-commit: 9a543f007b702b0be4acacad416a0f90233b4558
+Patch-mainline: v5.16-rc2
+References: bsn#12
+openEuler-commit: c4d3830b8308de60b07cd6ef41aea44d51584cf8
+
+After the memory is freed, it can be immediately allocated by other
+CPUs, before the "free" trace report has been emitted. This causes
+inaccurate traces.
+
+For example, if the following sequence of events occurs:
+
+    CPU 0                 CPU 1
+
+  (1) alloc xxxxxx
+  (2) free  xxxxxx
+                         (3) alloc xxxxxx
+                         (4) free  xxxxxx
+
+Then they will be inaccurately reported via tracing, so that they appear
+to have happened in this order:
+
+    CPU 0                 CPU 1
+
+  (1) alloc xxxxxx
+                         (2) alloc xxxxxx
+  (3) free  xxxxxx
+                         (4) free  xxxxxx
+
+This makes it look like CPU 1 somehow managed to allocate mmemory that
+CPU 0 still had allocated for itself.
+
+In order to avoid this, emit the "free xxxxxx" tracing report just
+before the actual call to free the memory, instead of just after it.
+
+Link: https://lkml.kernel.org/r/374eb75d-7404-8721-4e1e-65b0e5b17279@huawei.com
+Signed-off-by: Yunfeng Ye <yeyunfeng@huawei.com>
+Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+Reviewed-by: John Hubbard <jhubbard@nvidia.com>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: Pekka Enberg <penberg@kernel.org>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/slab.c | 3 +--
+ mm/slob.c | 3 +--
+ mm/slub.c | 2 +-
+ 3 files changed, 3 insertions(+), 5 deletions(-)
+
+diff --git a/mm/slab.c b/mm/slab.c
+index 43104a23ebff..d152f910da26 100644
+--- a/mm/slab.c
++++ b/mm/slab.c
+@@ -3705,14 +3705,13 @@ void kmem_cache_free(struct kmem_cache *cachep, void *objp)
+ 	if (!cachep)
+ 		return;
+ 
++	trace_kmem_cache_free(_RET_IP_, objp);
+ 	local_irq_save(flags);
+ 	debug_check_no_locks_freed(objp, cachep->object_size);
+ 	if (!(cachep->flags & SLAB_DEBUG_OBJECTS))
+ 		debug_check_no_obj_freed(objp, cachep->object_size);
+ 	__cache_free(cachep, objp, _RET_IP_);
+ 	local_irq_restore(flags);
+-
+-	trace_kmem_cache_free(_RET_IP_, objp);
+ }
+ EXPORT_SYMBOL(kmem_cache_free);
+ 
+diff --git a/mm/slob.c b/mm/slob.c
+index 7cc9805c8091..65d790cefd8a 100644
+--- a/mm/slob.c
++++ b/mm/slob.c
+@@ -660,6 +660,7 @@ static void kmem_rcu_free(struct rcu_head *head)
+ void kmem_cache_free(struct kmem_cache *c, void *b)
+ {
+ 	kmemleak_free_recursive(b, c->flags);
++	trace_kmem_cache_free(_RET_IP_, b);
+ 	if (unlikely(c->flags & SLAB_TYPESAFE_BY_RCU)) {
+ 		struct slob_rcu *slob_rcu;
+ 		slob_rcu = b + (c->size - sizeof(struct slob_rcu));
+@@ -668,8 +669,6 @@ void kmem_cache_free(struct kmem_cache *c, void *b)
+ 	} else {
+ 		__kmem_cache_free(b, c->size);
+ 	}
+-
+-	trace_kmem_cache_free(_RET_IP_, b);
+ }
+ EXPORT_SYMBOL(kmem_cache_free);
+ 
+diff --git a/mm/slub.c b/mm/slub.c
+index 5b509cdb37ec..7a7b0bf82b8e 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -3192,8 +3192,8 @@ void kmem_cache_free(struct kmem_cache *s, void *x)
+ 	s = cache_from_obj(s, x);
+ 	if (!s)
+ 		return;
+-	slab_free(s, virt_to_head_page(x), x, NULL, 1, _RET_IP_);
+ 	trace_kmem_cache_free(_RET_IP_, x);
++	slab_free(s, virt_to_head_page(x), x, NULL, 1, _RET_IP_);
+ }
+ EXPORT_SYMBOL(kmem_cache_free);
+ 
+-- 
+2.26.2
+

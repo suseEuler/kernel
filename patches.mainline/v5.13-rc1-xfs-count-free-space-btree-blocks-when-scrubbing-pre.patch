@@ -1,0 +1,90 @@
+From e147a756ab263f9d10eafd08b79b9fac1b08e56c Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Mon, 26 Apr 2021 19:06:58 -0700
+Subject: [PATCH] xfs: count free space btree blocks when scrubbing
+ pre-lazysbcount fses
+Git-commit: e147a756ab263f9d10eafd08b79b9fac1b08e56c
+Patch-mainline: v5.13-rc1
+References: bsn#12
+
+
+Since agf_btreeblks didn't exist before the lazysbcount feature, the fs
+summary count scrubber needs to walk the free space btrees to determine
+the amount of space being used by those btrees.
+
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Gao Xiang <hsiangkao@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/xfs/scrub/fscounters.c | 39 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 38 insertions(+), 1 deletion(-)
+
+diff --git a/fs/xfs/scrub/fscounters.c b/fs/xfs/scrub/fscounters.c
+index 318b81c0f90d..f1d1a8c58853 100644
+--- a/fs/xfs/scrub/fscounters.c
++++ b/fs/xfs/scrub/fscounters.c
+@@ -13,6 +13,7 @@
+ #include "xfs_alloc.h"
+ #include "xfs_ialloc.h"
+ #include "xfs_health.h"
++#include "xfs_btree.h"
+ #include "scrub/scrub.h"
+ #include "scrub/common.h"
+ #include "scrub/trace.h"
+@@ -143,6 +144,35 @@ xchk_setup_fscounters(
+ 	return xchk_trans_alloc(sc, 0);
+ }
+ 
++/* Count free space btree blocks manually for pre-lazysbcount filesystems. */
++static int
++xchk_fscount_btreeblks(
++	struct xfs_scrub	*sc,
++	struct xchk_fscounters	*fsc,
++	xfs_agnumber_t		agno)
++{
++	xfs_extlen_t		blocks;
++	int			error;
++
++	error = xchk_ag_init(sc, agno, &sc->sa);
++	if (error)
++		return error;
++
++	error = xfs_btree_count_blocks(sc->sa.bno_cur, &blocks);
++	if (error)
++		goto out_free;
++	fsc->fdblocks += blocks - 1;
++
++	error = xfs_btree_count_blocks(sc->sa.cnt_cur, &blocks);
++	if (error)
++		goto out_free;
++	fsc->fdblocks += blocks - 1;
++
++out_free:
++	xchk_ag_free(sc, &sc->sa);
++	return error;
++}
++
+ /*
+  * Calculate what the global in-core counters ought to be from the incore
+  * per-AG structure.  Callers can compare this to the actual in-core counters
+@@ -182,8 +212,15 @@ xchk_fscount_aggregate_agcounts(
+ 		/* Add up the free/freelist/bnobt/cntbt blocks */
+ 		fsc->fdblocks += pag->pagf_freeblks;
+ 		fsc->fdblocks += pag->pagf_flcount;
+-		if (xfs_sb_version_haslazysbcount(&sc->mp->m_sb))
++		if (xfs_sb_version_haslazysbcount(&sc->mp->m_sb)) {
+ 			fsc->fdblocks += pag->pagf_btreeblks;
++		} else {
++			error = xchk_fscount_btreeblks(sc, fsc, agno);
++			if (error) {
++				xfs_perag_put(pag);
++				break;
++			}
++		}
+ 
+ 		/*
+ 		 * Per-AG reservations are taken out of the incore counters,
+-- 
+2.26.2
+

@@ -1,0 +1,238 @@
+From bf16c102ee819442bb1a2248da1c0d9d7cec34d6 Mon Sep 17 00:00:00 2001
+From: Keefe LIU <liuqifa@huawei.com>
+Date: Mon, 27 Dec 2021 19:41:21 +0800
+Subject: [PATCH] ipvlan: Introduce local xmit queue for l2e mode
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: bf16c102ee819442bb1a2248da1c0d9d7cec34d6
+
+
+hulk inclusion
+category: feature
+bugzilla: 9511, https://gitee.com/openeuler/kernel/issues/I4IHL1
+CVE: NA
+
+-------------------------------------------------
+
+Consider two IPVlan devices are set up on the same master, when
+they communicate with each other by TCP, the receive part is too
+fast to make the send packets coalesced, so in this case, the
+performace is not as good as we expect.
+
+This patch introduces a local xmit queue for l2e mode, when the
+packets are sent to the IPVlan devices of the same master, the
+packets will be cloned and added to the local xmit queue, this
+operation can make the send packets coalesced and improve the
+TCP performace in this case.
+
+Signed-off-by: Keefe LIU <liuqifa@huawei.com>
+Reviewed-by: Wei Yongjun <weiyongjun1@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Lu Wei <luwei32@huawei.com>
+Reviewed-by: Yue Haibing <yuehaibing@huawei.com>
+Reviewed-by: Wei Yongjun <weiyongjun1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/net/ipvlan/ipvlan.h      |  7 ++++
+ drivers/net/ipvlan/ipvlan_core.c | 34 ++++++++++++++++-
+ drivers/net/ipvlan/ipvlan_main.c | 65 ++++++++++++++++++++++++++++++++
+ 3 files changed, 105 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ipvlan/ipvlan.h b/drivers/net/ipvlan/ipvlan.h
+index 3837c897832e..6796e742c470 100644
+--- a/drivers/net/ipvlan/ipvlan.h
++++ b/drivers/net/ipvlan/ipvlan.h
+@@ -39,6 +39,9 @@
+ 
+ #define IPVLAN_QBACKLOG_LIMIT	1000
+ 
++extern int sysctl_ipvlan_loop_qlen;
++extern int sysctl_ipvlan_loop_delay;
++
+ typedef enum {
+ 	IPVL_IPV6 = 0,
+ 	IPVL_ICMPV6,
+@@ -70,6 +73,10 @@ struct ipvl_dev {
+ 	netdev_features_t	sfeatures;
+ 	u32			msg_enable;
+ 	spinlock_t		addrs_lock;
++	int                     local_packets_cached;
++	unsigned long           local_timeout;
++	struct timer_list       local_free_timer;
++	struct sk_buff_head     local_xmit_queue;
+ };
+ 
+ struct ipvl_addr {
+diff --git a/drivers/net/ipvlan/ipvlan_core.c b/drivers/net/ipvlan/ipvlan_core.c
+index 5b695ec5c650..8de1f58d2fab 100644
+--- a/drivers/net/ipvlan/ipvlan_core.c
++++ b/drivers/net/ipvlan/ipvlan_core.c
+@@ -745,9 +745,37 @@ static int ipvlan_xmit_mode_l2(struct sk_buff *skb, struct net_device *dev)
+ 	return dev_queue_xmit(skb);
+ }
+ 
++static int ipvlan_l2e_local_xmit_event(struct ipvl_dev *ipvlan,
++				       struct sk_buff **pskb)
++{
++	struct sk_buff *nskb, *tskb;
++
++	while ((ipvlan->local_packets_cached >= sysctl_ipvlan_loop_qlen) &&
++	       (tskb = skb_dequeue(&ipvlan->local_xmit_queue))) {
++		ipvlan->local_packets_cached -= tskb->truesize;
++		if (ipvlan->local_packets_cached < 0 ||
++		    skb_queue_empty(&ipvlan->local_xmit_queue))
++			ipvlan->local_packets_cached = 0;
++		kfree_skb(tskb);
++	}
++
++	nskb = skb_clone(*pskb, GFP_ATOMIC);
++	if (!nskb)
++		return NET_XMIT_DROP;
++
++	ipvlan->local_timeout = jiffies
++				+ (sysctl_ipvlan_loop_delay * HZ) / 1000;
++	mod_timer(&ipvlan->local_free_timer, ipvlan->local_timeout);
++	skb_queue_tail(&ipvlan->local_xmit_queue, *pskb);
++	ipvlan->local_packets_cached += (*pskb)->truesize;
++	*pskb = nskb;
++
++	return 0;
++}
++
+ static int ipvlan_xmit_mode_l2e(struct sk_buff *skb, struct net_device *dev)
+ {
+-	const struct ipvl_dev *ipvlan = netdev_priv(dev);
++	struct ipvl_dev *ipvlan = netdev_priv(dev);
+ 	struct ethhdr *eth = eth_hdr(skb);
+ 	struct ipvl_addr *addr;
+ 	void *lyr3h;
+@@ -764,6 +792,10 @@ static int ipvlan_xmit_mode_l2e(struct sk_buff *skb, struct net_device *dev)
+ 					consume_skb(skb);
+ 					return NET_XMIT_DROP;
+ 				}
++
++				if (unlikely(ipvlan_l2e_local_xmit_event(ipvlan,
++									 &skb)))
++					return NET_XMIT_DROP;
+ 				return ipvlan_rcv_frame(addr, &skb, true);
+ 			}
+ 		}
+diff --git a/drivers/net/ipvlan/ipvlan_main.c b/drivers/net/ipvlan/ipvlan_main.c
+index bf750140f45a..de256360b1ac 100644
+--- a/drivers/net/ipvlan/ipvlan_main.c
++++ b/drivers/net/ipvlan/ipvlan_main.c
+@@ -4,10 +4,43 @@
+ 
+ #include "ipvlan.h"
+ 
++int sysctl_ipvlan_loop_qlen = 131072;
++int sysctl_ipvlan_loop_delay = 10;
+ static int ipvlan_default_mode = IPVLAN_MODE_L3;
+ module_param(ipvlan_default_mode, int, 0400);
+ MODULE_PARM_DESC(ipvlan_default_mode, "set ipvlan default mode: 0 for l2, 1 for l3, 2 for l3s, 3 for l2e, others invalid now");
+ 
++static struct ctl_table_header *ipvlan_table_hrd;
++static struct ctl_table ipvlan_table[] = {
++	{
++		.procname       = "loop_delay",
++		.data           = &sysctl_ipvlan_loop_delay,
++		.maxlen         = sizeof(int),
++		.mode           = 0644,
++		.proc_handler   = proc_dointvec,
++	},
++	{
++		.procname       = "loop_qlen",
++		.data           = &sysctl_ipvlan_loop_qlen,
++		.maxlen         = sizeof(int),
++		.mode           = 0644,
++		.proc_handler   = proc_dointvec,
++	},
++	{ }
++};
++
++static int ipvlan_sysctl_init(void)
++{
++	ipvlan_table_hrd = register_net_sysctl(&init_net,
++					       "net/ipvlan", ipvlan_table);
++	return !ipvlan_table_hrd ? -ENOMEM : 0;
++}
++
++static void ipvlan_sysctl_exit(void)
++{
++	unregister_net_sysctl_table(ipvlan_table_hrd);
++}
++
+ static int ipvlan_set_port_mode(struct ipvl_port *port, u16 nval,
+ 				struct netlink_ext_ack *extack)
+ {
+@@ -164,6 +197,32 @@ static int ipvlan_init(struct net_device *dev)
+ 	return 0;
+ }
+ 
++static void ipvlan_local_free_handler(struct timer_list *t)
++{
++	struct ipvl_dev *ipvlan = from_timer(ipvlan, t, local_free_timer);
++
++	skb_queue_purge(&ipvlan->local_xmit_queue);
++	ipvlan->local_packets_cached = 0;
++}
++
++static inline void ipvlan_local_init(struct net_device *dev)
++{
++	struct ipvl_dev *ipvlan = netdev_priv(dev);
++
++	ipvlan->local_packets_cached = 0;
++	skb_queue_head_init(&ipvlan->local_xmit_queue);
++	timer_setup(&ipvlan->local_free_timer,
++		    ipvlan_local_free_handler, 0);
++}
++
++static inline void ipvlan_local_uninit(struct net_device *dev)
++{
++	struct ipvl_dev *ipvlan = netdev_priv(dev);
++
++	del_timer(&ipvlan->local_free_timer);
++	skb_queue_purge(&ipvlan->local_xmit_queue);
++}
++
+ static void ipvlan_uninit(struct net_device *dev)
+ {
+ 	struct ipvl_dev *ipvlan = netdev_priv(dev);
+@@ -189,6 +248,7 @@ static int ipvlan_open(struct net_device *dev)
+ 	else
+ 		dev->flags &= ~IFF_NOARP;
+ 
++	ipvlan_local_init(dev);
+ 	rcu_read_lock();
+ 	list_for_each_entry_rcu(addr, &ipvlan->addrs, anode)
+ 		ipvlan_ht_addr_add(ipvlan, addr);
+@@ -206,6 +266,7 @@ static int ipvlan_stop(struct net_device *dev)
+ 	dev_uc_unsync(phy_dev, dev);
+ 	dev_mc_unsync(phy_dev, dev);
+ 
++	ipvlan_local_uninit(dev);
+ 	rcu_read_lock();
+ 	list_for_each_entry_rcu(addr, &ipvlan->addrs, anode)
+ 		ipvlan_ht_addr_del(addr);
+@@ -1050,6 +1111,9 @@ static int __init ipvlan_init_module(void)
+ 		goto error;
+ 	}
+ 
++	err = ipvlan_sysctl_init();
++	if (err < 0)
++		pr_err("ipvlan proc init failed, continue\n");
+ 	return 0;
+ error:
+ 	unregister_inetaddr_notifier(&ipvlan_addr4_notifier_block);
+@@ -1077,6 +1141,7 @@ static void __exit ipvlan_cleanup_module(void)
+ 	unregister_inet6addr_validator_notifier(
+ 	    &ipvlan_addr6_vtor_notifier_block);
+ #endif
++	ipvlan_sysctl_exit();
+ }
+ 
+ module_init(ipvlan_init_module);
+-- 
+2.26.2
+

@@ -1,0 +1,119 @@
+From 8191d8222c514c69a8e1ac46bd9812b9e0aab7d0 Mon Sep 17 00:00:00 2001
+From: Dave Chinner <dchinner@redhat.com>
+Date: Tue, 27 Jul 2021 16:23:49 -0700
+Subject: [PATCH] xfs: avoid unnecessary waits in xfs_log_force_lsn()
+Git-commit: 8191d8222c514c69a8e1ac46bd9812b9e0aab7d0
+Patch-mainline: v5.14-rc4
+References: bsn#12
+
+
+Before waiting on a iclog in xfs_log_force_lsn(), we don't check to
+see if the iclog has already been completed and the contents on
+stable storage. We check for completed iclogs in xfs_log_force(), so
+we should do the same thing for xfs_log_force_lsn().
+
+This fixed some random up-to-30s pauses seen in unmounting
+filesystems in some tests. A log force ends up waiting on completed
+iclog, and that doesn't then get flushed (and hence the log force
+get completed) until the background log worker issues a log force
+that flushes the iclog in question. Then the unmount unblocks and
+continues.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/xfs/xfs_log.c | 42 +++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 37 insertions(+), 5 deletions(-)
+
+diff --git a/fs/xfs/xfs_log.c b/fs/xfs/xfs_log.c
+index 160b8bb7ee60..1c328efdca66 100644
+--- a/fs/xfs/xfs_log.c
++++ b/fs/xfs/xfs_log.c
+@@ -3143,6 +3143,35 @@ xlog_state_switch_iclogs(
+ 	log->l_iclog = iclog->ic_next;
+ }
+ 
++/*
++ * Force the iclog to disk and check if the iclog has been completed before
++ * xlog_force_iclog() returns. This can happen on synchronous (e.g.
++ * pmem) or fast async storage because we drop the icloglock to issue the IO.
++ * If completion has already occurred, tell the caller so that it can avoid an
++ * unnecessary wait on the iclog.
++ */
++static int
++xlog_force_and_check_iclog(
++	struct xlog_in_core	*iclog,
++	bool			*completed)
++{
++	xfs_lsn_t		lsn = be64_to_cpu(iclog->ic_header.h_lsn);
++	int			error;
++
++	*completed = false;
++	error = xlog_force_iclog(iclog);
++	if (error)
++		return error;
++
++	/*
++	 * If the iclog has already been completed and reused the header LSN
++	 * will have been rewritten by completion
++	 */
++	if (be64_to_cpu(iclog->ic_header.h_lsn) != lsn)
++		*completed = true;
++	return 0;
++}
++
+ /*
+  * Write out all data in the in-core log as of this exact moment in time.
+  *
+@@ -3177,7 +3206,6 @@ xfs_log_force(
+ {
+ 	struct xlog		*log = mp->m_log;
+ 	struct xlog_in_core	*iclog;
+-	xfs_lsn_t		lsn;
+ 
+ 	XFS_STATS_INC(mp, xs_log_force);
+ 	trace_xfs_log_force(mp, 0, _RET_IP_);
+@@ -3206,11 +3234,12 @@ xfs_log_force(
+ 	} else if (iclog->ic_state == XLOG_STATE_ACTIVE) {
+ 		if (atomic_read(&iclog->ic_refcnt) == 0) {
+ 			/* We have exclusive access to this iclog. */
+-			lsn = be64_to_cpu(iclog->ic_header.h_lsn);
+-			if (xlog_force_iclog(iclog))
++			bool	completed;
++
++			if (xlog_force_and_check_iclog(iclog, &completed))
+ 				goto out_error;
+ 
+-			if (be64_to_cpu(iclog->ic_header.h_lsn) != lsn)
++			if (completed)
+ 				goto out_unlock;
+ 		} else {
+ 			/*
+@@ -3250,6 +3279,7 @@ xlog_force_lsn(
+ 	bool			already_slept)
+ {
+ 	struct xlog_in_core	*iclog;
++	bool			completed;
+ 
+ 	spin_lock(&log->l_icloglock);
+ 	iclog = log->l_iclog;
+@@ -3287,10 +3317,12 @@ xlog_force_lsn(
+ 					&log->l_icloglock);
+ 			return -EAGAIN;
+ 		}
+-		if (xlog_force_iclog(iclog))
++		if (xlog_force_and_check_iclog(iclog, &completed))
+ 			goto out_error;
+ 		if (log_flushed)
+ 			*log_flushed = 1;
++		if (completed)
++			goto out_unlock;
+ 		break;
+ 	case XLOG_STATE_WANT_SYNC:
+ 		/*
+-- 
+2.26.2
+
