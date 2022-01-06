@@ -52,7 +52,6 @@ Cc: Dan Carpenter <dan.carpenter@oracle.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
 Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
-[jyang: fixby euler OLK-5.10 commit 1a1d0a85146c32c6b83f0c3f886a5150277087a4]
 Signed-off-by: Jun Yang <jun.yang@suse.com>
 ---
  include/linux/zpool.h |  3 +++
@@ -129,12 +128,12 @@ diff --git a/mm/zswap.c b/mm/zswap.c
 index 1e41c2857068..578d9f256920 100644
 --- a/mm/zswap.c
 +++ b/mm/zswap.c
-@@ -877,13 +877,19 @@ static int zswap_writeback_entry(struct zpool *pool, unsigned long handle)
- 	struct zswap_entry *entry;
- 	struct page *page;
- 	struct crypto_comp *tfm;
--	u8 *src, *dst;
-+	u8 *src, *dst, *tmp = NULL;
+@@ -935,13 +935,19 @@ static int zswap_writeback_entry(struct zpool *pool, unsigned long handle)
+ 	struct scatterlist input, output;
+ 	struct crypto_acomp_ctx *acomp_ctx;
+ 
+-	u8 *src;
++	u8 *src, *tmp = NULL;
  	unsigned int dlen;
  	int ret;
  	struct writeback_control wbc = {
@@ -150,7 +149,7 @@ index 1e41c2857068..578d9f256920 100644
  	/* extract swpentry from data */
  	zhdr = zpool_map_handle(pool, handle, ZPOOL_MM_RO);
  	swpentry = zhdr->swpentry; /* here */
-@@ -897,11 +903,19 @@ static int zswap_writeback_entry(struct zpool *pool, unsigned long handle)
+@@ -955,6 +961,7 @@ static int zswap_writeback_entry(struct zpool *pool, unsigned long handle)
  		/* entry was invalidated */
  		spin_unlock(&tree->lock);
  		zpool_unmap_handle(pool, handle);
@@ -158,27 +157,22 @@ index 1e41c2857068..578d9f256920 100644
  		return 0;
  	}
  	spin_unlock(&tree->lock);
- 	BUG_ON(offset != entry->offset);
- 
-+	src = (u8 *)zhdr + sizeof(struct zswap_header);
-+	if (!zpool_can_sleep_mapped(pool)) {
-+		memcpy(tmp, src, entry->length);
-+		src = tmp;
-+		zpool_unmap_handle(pool, handle);
-+	}
-+
- 	/* try to allocate swap cache page */
- 	switch (zswap_get_swap_cache_page(swpentry, &page)) {
- 	case ZSWAP_SWAPCACHE_FAIL: /* no memory or invalidate happened */
-@@ -917,7 +931,6 @@ static int zswap_writeback_entry(struct zpool *pool, unsigned long handle)
- 	case ZSWAP_SWAPCACHE_NEW: /* page is locked */
- 		/* decompress */
+@@ -979,6 +986,14 @@ static int zswap_writeback_entry(struct zpool *pool, unsigned long handle)
  		dlen = PAGE_SIZE;
--		src = (u8 *)zhdr + sizeof(struct zswap_header);
- 		dst = kmap_atomic(page);
- 		tfm = *get_cpu_ptr(entry->pool->tfm);
- 		ret = crypto_comp_decompress(tfm, src, entry->length,
-@@ -969,7 +982,11 @@ static int zswap_writeback_entry(struct zpool *pool, unsigned long handle)
+ 		src = (u8 *)zhdr + sizeof(struct zswap_header);
+ 
++		if (!zpool_can_sleep_mapped(pool)) {
++
++			memcpy(tmp, src, entry->length);
++			src = tmp;
++
++			zpool_unmap_handle(pool, handle);
++		}
++
+ 		mutex_lock(acomp_ctx->mutex);
+ 		sg_init_one(&input, src, entry->length);
+ 		sg_init_table(&output, 1);
+@@ -1033,7 +1048,11 @@ static int zswap_writeback_entry(struct zpool *pool, unsigned long handle)
  	spin_unlock(&tree->lock);
  
  end:
@@ -191,16 +185,16 @@ index 1e41c2857068..578d9f256920 100644
  	return ret;
  }
  
-@@ -1149,7 +1166,7 @@ static int zswap_frontswap_load(unsigned type, pgoff_t offset,
- 	struct zswap_tree *tree = zswap_trees[type];
+@@ -1235,7 +1254,7 @@ static int zswap_frontswap_load(unsigned type, pgoff_t offset,
  	struct zswap_entry *entry;
- 	struct crypto_comp *tfm;
+ 	struct scatterlist input, output;
+ 	struct crypto_acomp_ctx *acomp_ctx;
 -	u8 *src, *dst;
 +	u8 *src, *dst, *tmp;
  	unsigned int dlen;
  	int ret;
  
-@@ -1167,20 +1184,41 @@ static int zswap_frontswap_load(unsigned type, pgoff_t offset,
+@@ -1253,15 +1272,33 @@ static int zswap_frontswap_load(unsigned type, pgoff_t offset,
  		dst = kmap_atomic(page);
  		zswap_fill_page(dst, entry->value);
  		kunmap_atomic(dst);
@@ -209,6 +203,7 @@ index 1e41c2857068..578d9f256920 100644
  	}
  
 +	if (!zpool_can_sleep_mapped(entry->pool->zpool)) {
++
 +		tmp = kmalloc(entry->length, GFP_ATOMIC);
 +		if (!tmp) {
 +			ret = -ENOMEM;
@@ -221,20 +216,23 @@ index 1e41c2857068..578d9f256920 100644
  	src = zpool_map_handle(entry->pool->zpool, entry->handle, ZPOOL_MM_RO);
  	if (zpool_evictable(entry->pool->zpool))
  		src += sizeof(struct zswap_header);
-+
+ 
 +	if (!zpool_can_sleep_mapped(entry->pool->zpool)) {
++
 +		memcpy(tmp, src, entry->length);
 +		src = tmp;
++
 +		zpool_unmap_handle(entry->pool->zpool, entry->handle);
 +	}
 +
- 	dst = kmap_atomic(page);
- 	tfm = *get_cpu_ptr(entry->pool->tfm);
- 	ret = crypto_comp_decompress(tfm, src, entry->length, dst, &dlen);
- 	put_cpu_ptr(entry->pool->tfm);
- 	kunmap_atomic(dst);
+ 	acomp_ctx = raw_cpu_ptr(entry->pool->acomp_ctx);
+ 	mutex_lock(acomp_ctx->mutex);
+ 	sg_init_one(&input, src, entry->length);
+@@ -1271,7 +1308,11 @@ static int zswap_frontswap_load(unsigned type, pgoff_t offset,
+ 	ret = crypto_wait_req(crypto_acomp_decompress(acomp_ctx->req), &acomp_ctx->wait);
+ 	mutex_unlock(acomp_ctx->mutex);
+ 
 -	zpool_unmap_handle(entry->pool->zpool, entry->handle);
-+
 +	if (zpool_can_sleep_mapped(entry->pool->zpool))
 +		zpool_unmap_handle(entry->pool->zpool, entry->handle);
 +	else

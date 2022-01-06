@@ -1,0 +1,146 @@
+From 12b9f873a5d0e6b3846835ec973bbafa338d0b5a Mon Sep 17 00:00:00 2001
+From: Uladzislau Rezki <urezki@gmail.com>
+Date: Mon, 28 Jun 2021 19:40:23 -0700
+Subject: [PATCH] mm/vmalloc: fallback to a single page allocator
+Git-commit: 12b9f873a5d0e6b3846835ec973bbafa338d0b5a
+Patch-mainline: v5.14-rc1
+References: git-fixes
+
+Currently for order-0 pages we use a bulk-page allocator to get set of
+pages.  From the other hand not allocating all pages is something that
+might occur.  In that case we should fallbak to the single-page allocator
+trying to get missing pages, because it is more permissive(direct reclaim,
+etc).
+
+Introduce a vm_area_alloc_pages() function where the described logic is
+implemented.
+
+Link: https://lkml.kernel.org/r/20210521130718.GA17882@pc638.lan
+Signed-off-by: Uladzislau Rezki (Sony) <urezki@gmail.com>
+Reviewed-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Hillf Danton <hdanton@sina.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Oleksiy Avramchenko <oleksiy.avramchenko@sonymobile.com>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ mm/vmalloc.c | 81 +++++++++++++++++++++++++++++++++-------------------
+ 1 file changed, 52 insertions(+), 29 deletions(-)
+
+diff --git a/mm/vmalloc.c b/mm/vmalloc.c
+index ed0a32ea09ee..0c80caaf041a 100644
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@ -2758,6 +2758,54 @@ void *vmap_pfn(unsigned long *pfns, unsigned int count, pgprot_t prot)
+ EXPORT_SYMBOL_GPL(vmap_pfn);
+ #endif /* CONFIG_VMAP_PFN */
+ 
++static inline unsigned int
++vm_area_alloc_pages(gfp_t gfp, int nid,
++		unsigned int order, unsigned long nr_pages, struct page **pages)
++{
++	unsigned int nr_allocated = 0;
++
++	/*
++	 * For order-0 pages we make use of bulk allocator, if
++	 * the page array is partly or not at all populated due
++	 * to fails, fallback to a single page allocator that is
++	 * more permissive.
++	 */
++	if (!order)
++		nr_allocated = alloc_pages_bulk_array_node(
++			gfp, nid, nr_pages, pages);
++	else
++		/*
++		 * Compound pages required for remap_vmalloc_page if
++		 * high-order pages.
++		 */
++		gfp |= __GFP_COMP;
++
++	/* High-order pages or fallback path if "bulk" fails. */
++	while (nr_allocated < nr_pages) {
++		struct page *page;
++		int i;
++
++		page = alloc_pages_node(nid, gfp, order);
++		if (unlikely(!page))
++			break;
++
++		/*
++		 * Careful, we allocate and map page-order pages, but
++		 * tracking is done per PAGE_SIZE page so as to keep the
++		 * vm_struct APIs independent of the physical/mapped size.
++		 */
++		for (i = 0; i < (1U << order); i++)
++			pages[nr_allocated + i] = page + i;
++
++		if (gfpflags_allow_blocking(gfp))
++			cond_resched();
++
++		nr_allocated += 1U << order;
++	}
++
++	return nr_allocated;
++}
++
+ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
+ 				 pgprot_t prot, unsigned int page_shift,
+ 				 int node)
+@@ -2790,37 +2838,11 @@ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
+ 		return NULL;
+ 	}
+ 
+-	area->nr_pages = 0;
+ 	set_vm_area_page_order(area, page_shift - PAGE_SHIFT);
+ 	page_order = vm_area_page_order(area);
+ 
+-	if (!page_order) {
+-		area->nr_pages = alloc_pages_bulk_array_node(
+-			gfp_mask, node, nr_small_pages, area->pages);
+-	} else {
+-		/*
+-		 * Careful, we allocate and map page_order pages, but tracking is done
+-		 * per PAGE_SIZE page so as to keep the vm_struct APIs independent of
+-		 * the physical/mapped size.
+-		 */
+-		while (area->nr_pages < nr_small_pages) {
+-			struct page *page;
+-			int i;
+-
+-			/* Compound pages required for remap_vmalloc_page */
+-			page = alloc_pages_node(node, gfp_mask | __GFP_COMP, page_order);
+-			if (unlikely(!page))
+-				break;
+-
+-			for (i = 0; i < (1U << page_order); i++)
+-				area->pages[area->nr_pages + i] = page + i;
+-
+-			if (gfpflags_allow_blocking(gfp_mask))
+-				cond_resched();
+-
+-			area->nr_pages += 1U << page_order;
+-		}
+-	}
++	area->nr_pages = vm_area_alloc_pages(gfp_mask, node,
++		page_order, nr_small_pages, area->pages);
+ 
+ 	atomic_long_add(area->nr_pages, &nr_vmalloc_pages);
+ 
+@@ -2835,7 +2857,8 @@ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
+ 		goto fail;
+ 	}
+ 
+-	if (vmap_pages_range(addr, addr + size, prot, area->pages, page_shift) < 0) {
++	if (vmap_pages_range(addr, addr + size, prot, area->pages,
++			page_shift) < 0) {
+ 		warn_alloc(gfp_mask, NULL,
+ 			"vmalloc error: size %lu, failed to map pages",
+ 			area->nr_pages * PAGE_SIZE);
+-- 
+2.31.1
+

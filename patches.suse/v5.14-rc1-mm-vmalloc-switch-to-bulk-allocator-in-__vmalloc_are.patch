@@ -1,0 +1,189 @@
+From 5c1f4e690eecc795b2e4d4408e87302040fceca4 Mon Sep 17 00:00:00 2001
+From: "Uladzislau Rezki (Sony)" <urezki@gmail.com>
+Date: Mon, 28 Jun 2021 19:40:14 -0700
+Subject: [PATCH] mm/vmalloc: switch to bulk allocator in __vmalloc_area_node()
+Git-commit: 5c1f4e690eecc795b2e4d4408e87302040fceca4
+Patch-mainline: v5.14-rc1
+References: git-fixes
+
+Recently there has been introduced a page bulk allocator for users which
+need to get number of pages per one call request.
+
+For order-0 pages switch to an alloc_pages_bulk_array_node() instead of
+alloc_pages_node(), the reason is the former is not capable of allocating
+set of pages, thus a one call is per one page.
+
+Second, according to my tests the bulk allocator uses less cycles even for
+scenarios when only one page is requested.  Running the "perf" on same
+test case shows below difference:
+
+<default>
+  - 45.18% __vmalloc_node
+     - __vmalloc_node_range
+        - 35.60% __alloc_pages
+           - get_page_from_freelist
+                3.36% __list_del_entry_valid
+                3.00% check_preemption_disabled
+                1.42% prep_new_page
+<default>
+
+<patch>
+  - 31.00% __vmalloc_node
+     - __vmalloc_node_range
+        - 14.48% __alloc_pages_bulk
+             3.22% __list_del_entry_valid
+           - 0.83% __alloc_pages
+                get_page_from_freelist
+<patch>
+
+The "test_vmalloc.sh" also shows performance improvements:
+
+fix_size_alloc_test_4MB   loops: 1000000 avg: 89105095 usec
+fix_size_alloc_test       loops: 1000000 avg: 513672   usec
+full_fit_alloc_test       loops: 1000000 avg: 748900   usec
+long_busy_list_alloc_test loops: 1000000 avg: 8043038  usec
+random_size_alloc_test    loops: 1000000 avg: 4028582  usec
+fix_align_alloc_test      loops: 1000000 avg: 1457671  usec
+
+fix_size_alloc_test_4MB   loops: 1000000 avg: 62083711 usec
+fix_size_alloc_test       loops: 1000000 avg: 449207   usec
+full_fit_alloc_test       loops: 1000000 avg: 735985   usec
+long_busy_list_alloc_test loops: 1000000 avg: 5176052  usec
+random_size_alloc_test    loops: 1000000 avg: 2589252  usec
+fix_align_alloc_test      loops: 1000000 avg: 1365009  usec
+
+For example 4MB allocations illustrates ~30% gain, all the
+rest is also better.
+
+Link: https://lkml.kernel.org/r/20210516202056.2120-3-urezki@gmail.com
+Signed-off-by: Uladzislau Rezki (Sony) <urezki@gmail.com>
+Acked-by: Mel Gorman <mgorman@suse.de>
+Cc: Hillf Danton <hdanton@sina.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Oleksiy Avramchenko <oleksiy.avramchenko@sonymobile.com>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ mm/vmalloc.c | 76 +++++++++++++++++++++++++++++-----------------------
+ 1 file changed, 42 insertions(+), 34 deletions(-)
+
+diff --git a/mm/vmalloc.c b/mm/vmalloc.c
+index d0a7d89be091..e630f2cf7900 100644
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@ -2768,8 +2768,6 @@ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
+ 	unsigned long array_size;
+ 	unsigned int nr_small_pages = size >> PAGE_SHIFT;
+ 	unsigned int page_order;
+-	struct page **pages;
+-	unsigned int i;
+ 
+ 	array_size = (unsigned long)nr_small_pages * sizeof(struct page *);
+ 	gfp_mask |= __GFP_NOWARN;
+@@ -2778,13 +2776,13 @@ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
+ 
+ 	/* Please note that the recursion is strictly bounded. */
+ 	if (array_size > PAGE_SIZE) {
+-		pages = __vmalloc_node(array_size, 1, nested_gfp, node,
++		area->pages = __vmalloc_node(array_size, 1, nested_gfp, node,
+ 					area->caller);
+ 	} else {
+-		pages = kmalloc_node(array_size, nested_gfp, node);
++		area->pages = kmalloc_node(array_size, nested_gfp, node);
+ 	}
+ 
+-	if (!pages) {
++	if (!area->pages) {
+ 		free_vm_area(area);
+ 		warn_alloc(gfp_mask, NULL,
+ 			   "vmalloc size %lu allocation failure: "
+@@ -2793,43 +2791,53 @@ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
+ 		return NULL;
+ 	}
+ 
+-	area->pages = pages;
+-	area->nr_pages = nr_small_pages;
++	area->nr_pages = 0;
+ 	set_vm_area_page_order(area, page_shift - PAGE_SHIFT);
+-
+ 	page_order = vm_area_page_order(area);
+ 
+-	/*
+-	 * Careful, we allocate and map page_order pages, but tracking is done
+-	 * per PAGE_SIZE page so as to keep the vm_struct APIs independent of
+-	 * the physical/mapped size.
+-	 */
+-	for (i = 0; i < area->nr_pages; i += 1U << page_order) {
+-		struct page *page;
+-		int p;
+-
+-		/* Compound pages required for remap_vmalloc_page */
+-		page = alloc_pages_node(node, gfp_mask | __GFP_COMP, page_order);
+-		if (unlikely(!page)) {
+-			/* Successfully allocated i pages, free them in __vfree() */
+-			area->nr_pages = i;
+-			atomic_long_add(area->nr_pages, &nr_vmalloc_pages);
+-			warn_alloc(gfp_mask, NULL,
+-				   "vmalloc size %lu allocation failure: "
+-				   "page order %u allocation failed",
+-				   area->nr_pages * PAGE_SIZE, page_order);
+-			goto fail;
+-		}
++	if (!page_order) {
++		area->nr_pages = alloc_pages_bulk_array_node(
++			gfp_mask, node, nr_small_pages, area->pages);
++	} else {
++		/*
++		 * Careful, we allocate and map page_order pages, but tracking is done
++		 * per PAGE_SIZE page so as to keep the vm_struct APIs independent of
++		 * the physical/mapped size.
++		 */
++		while (area->nr_pages < nr_small_pages) {
++			struct page *page;
++			int i;
++
++			/* Compound pages required for remap_vmalloc_page */
++			page = alloc_pages_node(node, gfp_mask | __GFP_COMP, page_order);
++			if (unlikely(!page))
++				break;
+ 
+-		for (p = 0; p < (1U << page_order); p++)
+-			area->pages[i + p] = page + p;
++			for (i = 0; i < (1U << page_order); i++)
++				area->pages[area->nr_pages + i] = page + i;
+ 
+-		if (gfpflags_allow_blocking(gfp_mask))
+-			cond_resched();
++			if (gfpflags_allow_blocking(gfp_mask))
++				cond_resched();
++
++			area->nr_pages += 1U << page_order;
++		}
+ 	}
++
+ 	atomic_long_add(area->nr_pages, &nr_vmalloc_pages);
+ 
+-	if (vmap_pages_range(addr, addr + size, prot, pages, page_shift) < 0) {
++	/*
++	 * If not enough pages were obtained to accomplish an
++	 * allocation request, free them via __vfree() if any.
++	 */
++	if (area->nr_pages != nr_small_pages) {
++		warn_alloc(gfp_mask, NULL,
++			"vmalloc size %lu allocation failure: "
++			"page order %u allocation failed",
++			area->nr_pages * PAGE_SIZE, page_order);
++		goto fail;
++	}
++
++	if (vmap_pages_range(addr, addr + size, prot, area->pages, page_shift) < 0) {
+ 		warn_alloc(gfp_mask, NULL,
+ 			   "vmalloc size %lu allocation failure: "
+ 			   "failed to map pages",
+-- 
+2.31.1
+
