@@ -1,0 +1,112 @@
+From bc9e3f9895ef257b76601291d99c87c13c7c31df Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Thu, 30 Dec 2021 16:26:00 +0800
+Subject: [PATCH] arm64/mpam: Fix mpam corrupt when cpu online
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: bc9e3f9895ef257b76601291d99c87c13c7c31df
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I3YAI3
+CVE: NA
+
+-------------------------------------------------
+
+The following error occurred occasionally on a machine that supports MPAM:
+
+[   13.321386][  T658] Unable to handle kernel paging request at virtual address ffff80001115816c
+[   13.326013][  T684] hid-generic 0003:12D1:0003.0002: input,hidraw1: USB HID v1.10 Mouse [Keyboard/Mouse KVM 1.1.0] on usb-0000:7a:01.0-1.1/input1
+[   13.340558][  T658] Mem abort info:
+[   13.340563][  T658]   ESR = 0x86000007
+[   13.352567][    T5] hub 6-1:1.0: USB hub found
+[   13.364750][  T658]   EC = 0x21: IABT (current EL), IL = 32 bits
+[   13.369891][    T5] hub 6-1:1.0: 4 ports detected
+[   13.373871][  T658]   SET = 0, FnV = 0
+[   13.396107][  T658]   EA = 0, S1PTW = 0
+[   13.400599][  T658] swapper pgtable: 64k pages, 48-bit VAs, pgdp=0000000029540000
+[   13.408726][  T658] [ffff80001115816c] pgd=0000205fffff0003, p4d=0000205fffff0003, pud=0000205fffff0003, pmd=0000205ffffe0003, pte=0000000000000000
+[   13.423346][  T658] Internal error: Oops: 86000007 [#1] SMP
+[   13.429720][  T658] Modules linked in:
+[   13.434243][  T658] CPU: 72 PID: 658 Comm: kworker/72:1 Not tainted 5.10.0-4.17.0.28.oe1.aarch64 #1
+[   13.443966][  T658] Hardware name: Huawei TaiShan 200 (Model 2280)/BC82AMDDA, BIOS 1.70 01/07/2021
+[   13.453683][  T658] Workqueue: events mpam_enable
+[   13.459206][  T658] pstate: 20c00009 (nzCv daif +PAN +UAO -TCO BTYPE=--)
+[   13.466625][  T658] pc : mpam_enable+0x194/0x1d8
+[   13.472019][  T658] lr : mpam_enable+0x194/0x1d8
+[   13.477301][  T658] sp : ffff80004664fd70
+[   13.481937][  T658] x29: ffff80004664fd70 x28: 0000000000000000
+[   13.488578][  T658] x27: ffff00400484a648 x26: ffff800011b71080
+[   13.495306][  T658] x25: 0000000000000000 x24: ffff800011b6cda0
+[   13.502001][  T658] x23: ffff800011646f18 x22: ffff800011b6cd80
+[   13.508684][  T658] x21: ffff800011b6c000 x20: ffff800011646f08
+[   13.515425][  T658] x19: ffff800011646f70 x18: 0000000000000020
+[   13.522075][  T658] x17: 000000001790b332 x16: 0000000000000001
+[   13.528785][  T658] x15: ffffffffffffffff x14: ff00000000000000
+[   13.535464][  T658] x13: ffffffffffffffff x12: 0000000000000006
+[   13.542045][  T658] x11: 00000091cea718e2 x10: 0000000000000b90
+[   13.548735][  T658] x9 : ffff80001009ebac x8 : ffff2040061aabf0
+[   13.555383][  T658] x7 : ffffa05f8dca0000 x6 : 000000000000000f
+[   13.561924][  T658] x5 : 0000000000000000 x4 : ffff2040061aa000
+[   13.568613][  T658] x3 : ffff80001164dfa0 x2 : 00000000ffffffff
+[   13.575267][  T658] x1 : ffffa05f8dca0000 x0 : 00000000000000c1
+[   13.581813][  T658] Call trace:
+[   13.585600][  T658]  mpam_enable+0x194/0x1d8
+[   13.590450][  T658]  process_one_work+0x1cc/0x390
+[   13.595654][  T658]  worker_thread+0x70/0x2f0
+[   13.600499][  T658]  kthread+0x118/0x120
+[   13.604935][  T658]  ret_from_fork+0x10/0x18
+[   13.609717][  T658] Code: bad PC value
+[   13.613944][  T658] ---[ end trace f1e305d2c339f67f ]---
+[   13.753818][  T658] Kernel panic - not syncing: Oops: Fatal exception
+[   13.760885][  T658] SMP: stopping secondary CPUs
+[   13.765933][  T658] Kernel Offset: disabled
+[   13.770516][  T658] CPU features: 0x8040002,22208a38
+[   13.775862][  T658] Memory Limit: none
+[   13.913929][  T658] ---[ end Kernel panic - not syncing:
+
+The process of MPAM devices initialization is like this:
+
+mpam_discovery_start()
+       ...                           // discover devices
+mpam_discovery_complete()            // hang up the mpam_online/offline_cpu callbacks
+   -=> mpam_cpu_online()             // probe all devices
+       -=> mpam_enable()             // prepare for resctrl
+       (1) -=> cpuhp_remove_state()  // clean resctrl internal structure
+       (2) -=> cpuhp_setup_state()   // rehang mpam_online/offline_cpu callbacks
+               -=> mpam_cpu_online() // it does not call mpam_enable again
+                   -=> mpam_resctrl_cpu_online() // pull up resctrl
+
+Re-hang process of mpam_cpu_online/offline callbacks should not be
+disturbed by irqs, to ensure that CPU context is reliable before
+re-entering mpam_cpu_online(), which always happens between (1) and (2).
+
+Fixes: 2ab89c893faf ("arm64/mpam: resctrl: Re-synchronise resctrl's view of online CPUs")
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/kernel/mpam/mpam_device.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/arch/arm64/kernel/mpam/mpam_device.c b/arch/arm64/kernel/mpam/mpam_device.c
+index 86aaf52146bc..890db6a0ccaf 100644
+--- a/arch/arm64/kernel/mpam/mpam_device.c
++++ b/arch/arm64/kernel/mpam/mpam_device.c
+@@ -593,9 +593,11 @@ static void __init mpam_enable(struct work_struct *work)
+ 		pr_err("Failed to setup/init resctrl\n");
+ 	mutex_unlock(&mpam_devices_lock);
+ 
++	local_irq_disable();
+ 	mpam_cpuhp_state = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN,
+ 						"mpam:online", mpam_cpu_online,
+ 						mpam_cpu_offline);
++	local_irq_enable();
+ 	if (mpam_cpuhp_state <= 0)
+ 		pr_err("Failed to re-register 'dyn' cpuhp callbacks");
+ 	mutex_unlock(&mpam_cpuhp_lock);
+-- 
+2.26.2
+

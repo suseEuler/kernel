@@ -1,0 +1,184 @@
+From 54f7815efef7fad935fdf73dfd8b3116568f2f35 Mon Sep 17 00:00:00 2001
+From: Leo Yan <leo.yan@linaro.org>
+Date: Thu, 11 Feb 2021 15:38:54 +0200
+Subject: [PATCH] perf arm-spe: Fill address info for samples
+Git-commit: 54f7815efef7fad935fdf73dfd8b3116568f2f35
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+To properly handle memory and branch samples, this patch divides into
+two functions for generating samples: arm_spe__synth_mem_sample() is for
+synthesizing memory and TLB samples; arm_spe__synth_branch_sample() is
+to synthesize branch samples.
+
+Arm SPE backend decoder has passed virtual and physical address through
+packets, the address info is stored into the synthesize samples in the
+function arm_spe__synth_mem_sample().
+
+Committer notes:
+
+Fixed this:
+
+  36    46.77 fedora:27                     : FAIL clang version 5.0.2 (tags/RELEASE_502/final)
+
+    util/arm-spe.c:269:34: error: missing field 'pid' initializer [-Werror,-Wmissing-field-initializers]
+            struct perf_sample sample = { 0 };
+                                            ^
+    util/arm-spe.c:288:34: error: missing field 'pid' initializer [-Werror,-Wmissing-field-initializers]
+            struct perf_sample sample = { 0 };
+
+By using = { .ip = 0, };
+
+Signed-off-by: Leo Yan <leo.yan@linaro.org>
+Reviewed-by: James Clark <james.clark@arm.com>
+Tested-by: James Clark <james.clark@arm.com>
+Cc: Adrian Hunter <adrian.hunter@intel.com>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Al Grant <al.grant@arm.com>
+Cc: Andre Przywara <andre.przywara@arm.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Jiri Olsa <jolsa@redhat.com>
+Cc: John Garry <john.garry@huawei.com>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Mathieu Poirier <mathieu.poirier@linaro.org>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Wei Li <liwei391@huawei.com>
+Cc: Will Deacon <will@kernel.org>
+Signed-off-by: James Clark <james.clark@arm.com>
+Link: https://lore.kernel.org/r/20210211133856.2137-4-james.clark@arm.com
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ tools/perf/util/arm-spe.c | 50 +++++++++++++++++++++++----------------
+ 1 file changed, 30 insertions(+), 20 deletions(-)
+
+diff --git a/tools/perf/util/arm-spe.c b/tools/perf/util/arm-spe.c
+index b134516e890b..de70a8f3ff36 100644
+--- a/tools/perf/util/arm-spe.c
++++ b/tools/perf/util/arm-spe.c
+@@ -235,7 +235,6 @@ static void arm_spe_prep_sample(struct arm_spe *spe,
+ 	sample->cpumode = arm_spe_cpumode(spe, sample->ip);
+ 	sample->pid = speq->pid;
+ 	sample->tid = speq->tid;
+-	sample->addr = record->to_ip;
+ 	sample->period = 1;
+ 	sample->cpu = speq->cpu;
+ 
+@@ -259,11 +258,29 @@ arm_spe_deliver_synth_event(struct arm_spe *spe,
+ 	return ret;
+ }
+ 
+-static int
+-arm_spe_synth_spe_events_sample(struct arm_spe_queue *speq,
+-				u64 spe_events_id)
++static int arm_spe__synth_mem_sample(struct arm_spe_queue *speq,
++				     u64 spe_events_id)
++{
++	struct arm_spe *spe = speq->spe;
++	struct arm_spe_record *record = &speq->decoder->record;
++	union perf_event *event = speq->event_buf;
++	struct perf_sample sample = { .ip = 0, };
++
++	arm_spe_prep_sample(spe, speq, event, &sample);
++
++	sample.id = spe_events_id;
++	sample.stream_id = spe_events_id;
++	sample.addr = record->virt_addr;
++	sample.phys_addr = record->phys_addr;
++
++	return arm_spe_deliver_synth_event(spe, speq, event, &sample);
++}
++
++static int arm_spe__synth_branch_sample(struct arm_spe_queue *speq,
++					u64 spe_events_id)
+ {
+ 	struct arm_spe *spe = speq->spe;
++	struct arm_spe_record *record = &speq->decoder->record;
+ 	union perf_event *event = speq->event_buf;
+ 	struct perf_sample sample = { .ip = 0, };
+ 
+@@ -271,6 +288,7 @@ arm_spe_synth_spe_events_sample(struct arm_spe_queue *speq,
+ 
+ 	sample.id = spe_events_id;
+ 	sample.stream_id = spe_events_id;
++	sample.addr = record->to_ip;
+ 
+ 	return arm_spe_deliver_synth_event(spe, speq, event, &sample);
+ }
+@@ -283,15 +301,13 @@ static int arm_spe_sample(struct arm_spe_queue *speq)
+ 
+ 	if (spe->sample_flc) {
+ 		if (record->type & ARM_SPE_L1D_MISS) {
+-			err = arm_spe_synth_spe_events_sample(
+-					speq, spe->l1d_miss_id);
++			err = arm_spe__synth_mem_sample(speq, spe->l1d_miss_id);
+ 			if (err)
+ 				return err;
+ 		}
+ 
+ 		if (record->type & ARM_SPE_L1D_ACCESS) {
+-			err = arm_spe_synth_spe_events_sample(
+-					speq, spe->l1d_access_id);
++			err = arm_spe__synth_mem_sample(speq, spe->l1d_access_id);
+ 			if (err)
+ 				return err;
+ 		}
+@@ -299,15 +315,13 @@ static int arm_spe_sample(struct arm_spe_queue *speq)
+ 
+ 	if (spe->sample_llc) {
+ 		if (record->type & ARM_SPE_LLC_MISS) {
+-			err = arm_spe_synth_spe_events_sample(
+-					speq, spe->llc_miss_id);
++			err = arm_spe__synth_mem_sample(speq, spe->llc_miss_id);
+ 			if (err)
+ 				return err;
+ 		}
+ 
+ 		if (record->type & ARM_SPE_LLC_ACCESS) {
+-			err = arm_spe_synth_spe_events_sample(
+-					speq, spe->llc_access_id);
++			err = arm_spe__synth_mem_sample(speq, spe->llc_access_id);
+ 			if (err)
+ 				return err;
+ 		}
+@@ -315,31 +329,27 @@ static int arm_spe_sample(struct arm_spe_queue *speq)
+ 
+ 	if (spe->sample_tlb) {
+ 		if (record->type & ARM_SPE_TLB_MISS) {
+-			err = arm_spe_synth_spe_events_sample(
+-					speq, spe->tlb_miss_id);
++			err = arm_spe__synth_mem_sample(speq, spe->tlb_miss_id);
+ 			if (err)
+ 				return err;
+ 		}
+ 
+ 		if (record->type & ARM_SPE_TLB_ACCESS) {
+-			err = arm_spe_synth_spe_events_sample(
+-					speq, spe->tlb_access_id);
++			err = arm_spe__synth_mem_sample(speq, spe->tlb_access_id);
+ 			if (err)
+ 				return err;
+ 		}
+ 	}
+ 
+ 	if (spe->sample_branch && (record->type & ARM_SPE_BRANCH_MISS)) {
+-		err = arm_spe_synth_spe_events_sample(speq,
+-						      spe->branch_miss_id);
++		err = arm_spe__synth_branch_sample(speq, spe->branch_miss_id);
+ 		if (err)
+ 			return err;
+ 	}
+ 
+ 	if (spe->sample_remote_access &&
+ 	    (record->type & ARM_SPE_REMOTE_ACCESS)) {
+-		err = arm_spe_synth_spe_events_sample(speq,
+-						      spe->remote_access_id);
++		err = arm_spe__synth_mem_sample(speq, spe->remote_access_id);
+ 		if (err)
+ 			return err;
+ 	}
+-- 
+2.26.2
+

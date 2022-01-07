@@ -1,0 +1,129 @@
+From b14f4568d391c3b9bda9c078a32977e3f939f020 Mon Sep 17 00:00:00 2001
+From: Daniel Bristot de Oliveira <bristot@kernel.org>
+Date: Sun, 31 Oct 2021 19:05:03 +0100
+Subject: [PATCH] tracing/osnoise: Remove STACKTRACE ifdefs from inside
+ functions
+Git-commit: b14f4568d391c3b9bda9c078a32977e3f939f020
+Patch-mainline: v5.16-rc1
+References: bsn#12
+
+
+Remove CONFIG_STACKTRACE from inside functions, avoiding
+compilation problems in the future.
+
+Link: https://lkml.kernel.org/r/3465cca2f28e1ba602a1fc8bdb28d12950b5226e.1635702894.git.bristot@kernel.org
+
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Tom Zanussi <zanussi@kernel.org>
+Cc: Masami Hiramatsu <mhiramat@kernel.org>
+Cc: Juri Lelli <juri.lelli@redhat.com>
+Cc: Clark Williams <williams@redhat.com>
+Cc: John Kacur <jkacur@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Cc: Daniel Bristot de Oliveira <bristot@kernel.org>
+Cc: linux-rt-users@vger.kernel.org
+Cc: linux-trace-devel@vger.kernel.org
+Cc: linux-kernel@vger.kernel.org
+Suggested-by: Steven Rostedt <rostedt@goodmis.org>
+Signed-off-by: Daniel Bristot de Oliveira <bristot@kernel.org>
+Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/trace/trace_osnoise.c | 44 ++++++++++++++++++++++++------------
+ 1 file changed, 29 insertions(+), 15 deletions(-)
+
+--- a/kernel/trace/trace_osnoise.c
++++ b/kernel/trace/trace_osnoise.c
+@@ -626,13 +626,19 @@ __timerlat_dump_stack(struct trace_buffe
+ /*
+  * timerlat_dump_stack - dump a stack trace previously saved
+  */
+-static void timerlat_dump_stack(void)
++static void timerlat_dump_stack(u64 latency)
+ {
+ 	struct osnoise_instance *inst;
+ 	struct trace_buffer *buffer;
+ 	struct trace_stack *fstack;
+ 	unsigned int size;
+ 
++	/*
++	 * trace only if latency > print_stack config, if enabled.
++	 */
++	if (!osnoise_data.print_stack || osnoise_data.print_stack > latency)
++		return;
++
+ 	preempt_disable_notrace();
+ 	fstack = this_cpu_ptr(&trace_stack);
+ 	size = fstack->stack_size;
+@@ -646,8 +652,8 @@ static void timerlat_dump_stack(void)
+ 	rcu_read_unlock();
+ 	preempt_enable_notrace();
+ }
+-#else
+-#define timerlat_dump_stack() do {} while (0)
++#else /* CONFIG_STACKTRACE */
++#define timerlat_dump_stack(u64 latency) do {} while (0)
+ #define timerlat_save_stack(a) do {} while (0)
+ #endif /* CONFIG_STACKTRACE */
+ #endif /* CONFIG_TIMERLAT_TRACER */
+@@ -1612,11 +1618,7 @@ static int timerlat_main(void *data)
+ 
+ 		trace_timerlat_sample(&s);
+ 
+-#ifdef CONFIG_STACKTRACE
+-	if (osnoise_data.print_stack)
+-		if (osnoise_data.print_stack <= time_to_us(diff))
+-			timerlat_dump_stack();
+-#endif /* CONFIG_STACKTRACE */
++		timerlat_dump_stack(time_to_us(diff));
+ 
+ 		tlat->tracing_thread = false;
+ 		if (osnoise_data.stop_tracing_total)
+@@ -1977,26 +1979,38 @@ static const struct file_operations cpus
+ };
+ 
+ #ifdef CONFIG_TIMERLAT_TRACER
+-/*
+- * init_timerlat_tracefs - A function to initialize the timerlat interface files
+- */
+-static int init_timerlat_tracefs(struct dentry *top_dir)
++#ifdef CONFIG_STACKTRACE
++static int init_timerlat_stack_tracefs(struct dentry *top_dir)
+ {
+ 	struct dentry *tmp;
+ 
+-#ifdef CONFIG_STACKTRACE
+ 	tmp = tracefs_create_file("print_stack", TRACE_MODE_WRITE, top_dir,
+ 				  &osnoise_print_stack, &trace_min_max_fops);
+ 	if (!tmp)
+ 		return -ENOMEM;
+-#endif
++
++	return 0;
++}
++#else /* CONFIG_STACKTRACE */
++static int init_timerlat_stack_tracefs(struct dentry *top_dir)
++{
++	return 0;
++}
++#endif /* CONFIG_STACKTRACE */
++
++/*
++ * init_timerlat_tracefs - A function to initialize the timerlat interface files
++ */
++static int init_timerlat_tracefs(struct dentry *top_dir)
++{
++	struct dentry *tmp;
+ 
+ 	tmp = tracefs_create_file("timerlat_period_us", TRACE_MODE_WRITE, top_dir,
+ 				  &timerlat_period, &trace_min_max_fops);
+ 	if (!tmp)
+ 		return -ENOMEM;
+ 
+-	return 0;
++	return init_timerlat_stack_tracefs(top_dir);
+ }
+ #else /* CONFIG_TIMERLAT_TRACER */
+ static int init_timerlat_tracefs(struct dentry *top_dir)

@@ -1,0 +1,492 @@
+From 601aca9f4aa3211c0c114348002069c94a9fc61f Mon Sep 17 00:00:00 2001
+From: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Date: Fri, 31 Dec 2021 13:32:54 +0800
+Subject: [PATCH] pciehp: fix a race between pciehp and removing operations by
+ sysfs
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 601aca9f4aa3211c0c114348002069c94a9fc61f
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 16100,20881,https://gitee.com/openeuler/kernel/issues/I4OG3O?from=project-issue
+CVE: NA
+
+-------------------------------------------------
+
+When I run a stress test about pcie hotplug and removing operations by
+sysfs, I got a hange task, and the following call trace is printed.
+
+ INFO: task irq/746-pciehp:41551 blocked for more than 120 seconds.
+       Tainted: P        W  OE     4.19.25-
+ "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+ irq/746-pciehp  D    0 41551      2 0x00000228
+ Call trace:
+  __switch_to+0x94/0xe8
+  __schedule+0x270/0x8b0
+  schedule+0x2c/0x88
+  schedule_preempt_disabled+0x14/0x20
+  __mutex_lock.isra.1+0x1fc/0x540
+  __mutex_lock_slowpath+0x24/0x30
+  mutex_lock+0x80/0xa8
+  pci_lock_rescan_remove+0x20/0x28
+  pciehp_configure_device+0x30/0x140
+  pciehp_handle_presence_or_link_change+0x35c/0x4b0
+  pciehp_ist+0x1cc/0x1d0
+  irq_thread_fn+0x30/0x80
+  irq_thread+0x128/0x200
+  kthread+0x134/0x138
+  ret_from_fork+0x10/0x18
+ INFO: task bash:6424 blocked for more than 120 seconds.
+       Tainted: P        W  OE     4.19.25-
+ "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+ bash            D    0  6424   2231 0x00000200
+ Call trace:
+  __switch_to+0x94/0xe8
+  __schedule+0x270/0x8b0
+  schedule+0x2c/0x88
+  schedule_timeout+0x224/0x448
+  wait_for_common+0x198/0x2a0
+  wait_for_completion+0x28/0x38
+  kthread_stop+0x60/0x190
+  __free_irq+0x1c0/0x348
+  free_irq+0x40/0x88
+  pcie_shutdown_notification+0x54/0x80
+  pciehp_remove+0x30/0x50
+  pcie_port_remove_service+0x3c/0x58
+  device_release_driver_internal+0x1b4/0x250
+  device_release_driver+0x28/0x38
+  bus_remove_device+0xd4/0x160
+  device_del+0x128/0x348
+  device_unregister+0x24/0x78
+  remove_iter+0x48/0x58
+  device_for_each_child+0x6c/0xb8
+  pcie_port_device_remove+0x2c/0x48
+  pcie_portdrv_remove+0x5c/0x68
+  pci_device_remove+0x48/0xd8
+  device_release_driver_internal+0x1b4/0x250
+  device_release_driver+0x28/0x38
+  pci_stop_bus_device+0x84/0xb8
+  pci_stop_and_remove_bus_device_locked+0x24/0x40
+  remove_store+0xa4/0xb8
+  dev_attr_store+0x44/0x60
+  sysfs_kf_write+0x58/0x80
+  kernfs_fop_write+0xe8/0x1f0
+  __vfs_write+0x60/0x190
+  vfs_write+0xac/0x1c0
+  ksys_write+0x6c/0xd8
+  __arm64_sys_write+0x24/0x30
+  el0_svc_common+0xa0/0x180
+  el0_svc_handler+0x38/0x78
+  el0_svc+0x8/0xc
+
+When we remove a slot by sysfs.
+'pci_stop_and_remove_bus_device_locked()' will be called. This function
+will get the global mutex lock 'pci_rescan_remove_lock', and remove the
+slot. If the irq thread 'pciehp_ist' is still running, we will wait
+until it exits.
+
+If a pciehp interrupt happens immediately after we remove the slot by
+sysfs, but before we free the pciehp irq in
+'pci_stop_and_remove_bus_device_locked()'. 'pciehp_ist' will hung
+because the global mutex lock 'pci_rescan_remove_lock' is held by the
+sysfs operation. But the sysfs operation is waiting for the pciehp irq
+thread 'pciehp_ist' ends. Then a hung task occurs.
+
+So this two kinds of operation, removing through attention buttion and
+removing through /sys/devices/pci***/remove, should not be excuted at
+the same time. This patch add a global variable to mark that one of these
+operations is under processing. When this variable is set,  if another
+operation is requested, it will be rejected.
+
+We use a global variable 'slot_being_removed_rescaned' to mark whether a
+slot is being removed or rescaned. This will cause a slot hotplug
+operation is delayed if another slot is being remove or rescaned. But
+if these two slots are under different root ports, they should not
+influence each other. This patch make the flag
+'slot_being_removed_rescanned' per root port so that one slot hotplug
+operation doesn't influence slots below another root port.
+
+We record the root port in struct pci_dev when the pci device is
+initialized and added into the system instead of using
+'pcie_find_root_port()' to find the root port when we need it. Because
+iterating the pci tree needs the protection of
+'pci_lock_rescan_remove()'. This will make the problem more complexed
+because the lock is very coarse-grained. We don't need to worry about
+'use-after-free' because child pci devices are always removed before the
+root port device is removed.
+
+Signed-off-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Hanjun Guo <guohanjun@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Jialin Zhang <zhangjialin11@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/pci/hotplug/pciehp.h      |  5 ++
+ drivers/pci/hotplug/pciehp_ctrl.c | 40 ++++++++++++++++
+ drivers/pci/hotplug/pciehp_hpc.c  | 76 +++++++++++++++++++++++++++----
+ drivers/pci/pci-sysfs.c           | 22 +++++++++
+ drivers/pci/probe.c               |  5 ++
+ include/linux/pci.h               |  7 +++
+ include/linux/workqueue.h         |  2 +
+ 7 files changed, 147 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/pci/hotplug/pciehp.h b/drivers/pci/hotplug/pciehp.h
+index 4fd200d8b0a9..5b17becc17c8 100644
+--- a/drivers/pci/hotplug/pciehp.h
++++ b/drivers/pci/hotplug/pciehp.h
+@@ -191,6 +191,11 @@ static inline const char *slot_name(struct controller *ctrl)
+ 	return hotplug_slot_name(&ctrl->hotplug_slot);
+ }
+ 
++static inline struct pci_dev *ctrl_dev(struct controller *ctrl)
++{
++	return ctrl->pcie->port;
++}
++
+ static inline struct controller *to_ctrl(struct hotplug_slot *hotplug_slot)
+ {
+ 	return container_of(hotplug_slot, struct controller, hotplug_slot);
+diff --git a/drivers/pci/hotplug/pciehp_ctrl.c b/drivers/pci/hotplug/pciehp_ctrl.c
+index 529c34808440..c0f621cfef2e 100644
+--- a/drivers/pci/hotplug/pciehp_ctrl.c
++++ b/drivers/pci/hotplug/pciehp_ctrl.c
+@@ -143,6 +143,8 @@ void pciehp_queue_pushbutton_work(struct work_struct *work)
+ {
+ 	struct controller *ctrl = container_of(work, struct controller,
+ 					       button_work.work);
++	int events = ctrl->button_work.data;
++	struct pci_dev *rpdev = ctrl_dev(ctrl)->rpdev;
+ 
+ 	mutex_lock(&ctrl->state_lock);
+ 	switch (ctrl->state) {
+@@ -153,6 +155,15 @@ void pciehp_queue_pushbutton_work(struct work_struct *work)
+ 		pciehp_request(ctrl, PCI_EXP_SLTSTA_PDC);
+ 		break;
+ 	default:
++		if (events) {
++			atomic_or(events, &ctrl->pending_events);
++			if (!pciehp_poll_mode)
++				irq_wake_thread(ctrl->pcie->irq, ctrl);
++		} else {
++			if (rpdev)
++				clear_bit(0,
++					  &rpdev->slot_being_removed_rescanned);
++		}
+ 		break;
+ 	}
+ 	mutex_unlock(&ctrl->state_lock);
+@@ -160,6 +171,8 @@ void pciehp_queue_pushbutton_work(struct work_struct *work)
+ 
+ void pciehp_handle_button_press(struct controller *ctrl)
+ {
++	struct pci_dev *rpdev = ctrl_dev(ctrl)->rpdev;
++
+ 	mutex_lock(&ctrl->state_lock);
+ 	switch (ctrl->state) {
+ 	case OFF_STATE:
+@@ -176,6 +189,7 @@ void pciehp_handle_button_press(struct controller *ctrl)
+ 		/* blink power indicator and turn off attention */
+ 		pciehp_set_indicators(ctrl, PCI_EXP_SLTCTL_PWR_IND_BLINK,
+ 				      PCI_EXP_SLTCTL_ATTN_IND_OFF);
++		ctrl->button_work.data = 0;
+ 		schedule_delayed_work(&ctrl->button_work, 5 * HZ);
+ 		break;
+ 	case BLINKINGOFF_STATE:
+@@ -198,10 +212,14 @@ void pciehp_handle_button_press(struct controller *ctrl)
+ 		}
+ 		ctrl_info(ctrl, "Slot(%s): Action canceled due to button press\n",
+ 			  slot_name(ctrl));
++		if (rpdev)
++			clear_bit(0, &rpdev->slot_being_removed_rescanned);
+ 		break;
+ 	default:
+ 		ctrl_err(ctrl, "Slot(%s): Ignoring invalid state %#x\n",
+ 			 slot_name(ctrl), ctrl->state);
++		if (rpdev)
++			clear_bit(0, &rpdev->slot_being_removed_rescanned);
+ 		break;
+ 	}
+ 	mutex_unlock(&ctrl->state_lock);
+@@ -209,6 +227,8 @@ void pciehp_handle_button_press(struct controller *ctrl)
+ 
+ void pciehp_handle_disable_request(struct controller *ctrl)
+ {
++	struct pci_dev *rpdev = ctrl_dev(ctrl)->rpdev;
++
+ 	mutex_lock(&ctrl->state_lock);
+ 	switch (ctrl->state) {
+ 	case BLINKINGON_STATE:
+@@ -220,11 +240,14 @@ void pciehp_handle_disable_request(struct controller *ctrl)
+ 	mutex_unlock(&ctrl->state_lock);
+ 
+ 	ctrl->request_result = pciehp_disable_slot(ctrl, SAFE_REMOVAL);
++	if (rpdev)
++		clear_bit(0, &rpdev->slot_being_removed_rescanned);
+ }
+ 
+ void pciehp_handle_presence_or_link_change(struct controller *ctrl, u32 events)
+ {
+ 	int present, link_active;
++	struct pci_dev *rpdev = ctrl_dev(ctrl)->rpdev;
+ 
+ 	/*
+ 	 * If the slot is on and presence or link has changed, turn it off.
+@@ -257,6 +280,8 @@ void pciehp_handle_presence_or_link_change(struct controller *ctrl, u32 events)
+ 	link_active = pciehp_check_link_active(ctrl);
+ 	if (present <= 0 && link_active <= 0) {
+ 		mutex_unlock(&ctrl->state_lock);
++		if (rpdev)
++			clear_bit(0, &rpdev->slot_being_removed_rescanned);
+ 		return;
+ 	}
+ 
+@@ -279,6 +304,8 @@ void pciehp_handle_presence_or_link_change(struct controller *ctrl, u32 events)
+ 		mutex_unlock(&ctrl->state_lock);
+ 		break;
+ 	}
++	if (rpdev)
++		clear_bit(0, &rpdev->slot_being_removed_rescanned);
+ }
+ 
+ static int __pciehp_enable_slot(struct controller *ctrl)
+@@ -399,6 +426,14 @@ int pciehp_sysfs_enable_slot(struct hotplug_slot *hotplug_slot)
+ int pciehp_sysfs_disable_slot(struct hotplug_slot *hotplug_slot)
+ {
+ 	struct controller *ctrl = to_ctrl(hotplug_slot);
++	struct pci_dev *rpdev = ctrl_dev(ctrl)->rpdev;
++
++	if (rpdev && test_and_set_bit(0,
++				&rpdev->slot_being_removed_rescanned)) {
++		ctrl_info(ctrl, "Slot(%s): Slot is being removed or rescanned, please try later!\n",
++			  slot_name(ctrl));
++		return -EINVAL;
++	}
+ 
+ 	mutex_lock(&ctrl->state_lock);
+ 	switch (ctrl->state) {
+@@ -409,6 +444,8 @@ int pciehp_sysfs_disable_slot(struct hotplug_slot *hotplug_slot)
+ 		wait_event(ctrl->requester,
+ 			   !atomic_read(&ctrl->pending_events) &&
+ 			   !ctrl->ist_running);
++		if (rpdev)
++			clear_bit(0, &rpdev->slot_being_removed_rescanned);
+ 		return ctrl->request_result;
+ 	case POWEROFF_STATE:
+ 		ctrl_info(ctrl, "Slot(%s): Already in powering off state\n",
+@@ -427,5 +464,8 @@ int pciehp_sysfs_disable_slot(struct hotplug_slot *hotplug_slot)
+ 	}
+ 	mutex_unlock(&ctrl->state_lock);
+ 
++	if (rpdev)
++		clear_bit(0, &rpdev->slot_being_removed_rescanned);
++
+ 	return -ENODEV;
+ }
+diff --git a/drivers/pci/hotplug/pciehp_hpc.c b/drivers/pci/hotplug/pciehp_hpc.c
+index 9d06939736c0..b0a132265a39 100644
+--- a/drivers/pci/hotplug/pciehp_hpc.c
++++ b/drivers/pci/hotplug/pciehp_hpc.c
+@@ -45,11 +45,6 @@ static const struct dmi_system_id inband_presence_disabled_dmi_table[] = {
+ 	{}
+ };
+ 
+-static inline struct pci_dev *ctrl_dev(struct controller *ctrl)
+-{
+-	return ctrl->pcie->port;
+-}
+-
+ static irqreturn_t pciehp_isr(int irq, void *dev_id);
+ static irqreturn_t pciehp_ist(int irq, void *dev_id);
+ static int pciehp_poll(void *data);
+@@ -696,6 +691,7 @@ static irqreturn_t pciehp_ist(int irq, void *dev_id)
+ {
+ 	struct controller *ctrl = (struct controller *)dev_id;
+ 	struct pci_dev *pdev = ctrl_dev(ctrl);
++	struct pci_dev *rpdev = pdev->rpdev;
+ 	irqreturn_t ret;
+ 	u32 events;
+ 
+@@ -721,7 +717,18 @@ static irqreturn_t pciehp_ist(int irq, void *dev_id)
+ 	if (events & PCI_EXP_SLTSTA_ABP) {
+ 		ctrl_info(ctrl, "Slot(%s): Attention button pressed\n",
+ 			  slot_name(ctrl));
+-		pciehp_handle_button_press(ctrl);
++		if (!rpdev || (rpdev && !test_and_set_bit(0,
++					&rpdev->slot_being_removed_rescanned)))
++			pciehp_handle_button_press(ctrl);
++		else {
++			if (ctrl->state == BLINKINGOFF_STATE ||
++					ctrl->state == BLINKINGON_STATE)
++				pciehp_handle_button_press(ctrl);
++			else
++				ctrl_info(ctrl, "Slot(%s): Slot operation failed because a remove or"
++					  " rescan operation is under processing, please try later!\n",
++					  slot_name(ctrl));
++		}
+ 	}
+ 
+ 	/* Check Power Fault Detected */
+@@ -747,10 +754,59 @@ static irqreturn_t pciehp_ist(int irq, void *dev_id)
+ 	 * or Data Link Layer State Changed events.
+ 	 */
+ 	down_read(&ctrl->reset_lock);
+-	if (events & DISABLE_SLOT)
+-		pciehp_handle_disable_request(ctrl);
+-	else if (events & (PCI_EXP_SLTSTA_PDC | PCI_EXP_SLTSTA_DLLSC))
+-		pciehp_handle_presence_or_link_change(ctrl, events);
++	if (events & DISABLE_SLOT) {
++		if (!rpdev || (rpdev && !test_and_set_bit(0,
++					&rpdev->slot_being_removed_rescanned)))
++			pciehp_handle_disable_request(ctrl);
++		else {
++			if (ctrl->state == BLINKINGOFF_STATE ||
++					ctrl->state == BLINKINGON_STATE)
++				pciehp_handle_disable_request(ctrl);
++			else {
++				ctrl_info(ctrl, "Slot(%s): DISABLE_SLOT event in remove or rescan process!\n",
++						slot_name(ctrl));
++				/*
++				 * we use the work_struct private data to store
++				 * the event type
++				 */
++				ctrl->button_work.data = DISABLE_SLOT;
++				/*
++				 * If 'work.timer' is pending, schedule the work will
++				 * cause BUG_ON().
++				 */
++				if (!timer_pending(&ctrl->button_work.timer))
++					schedule_delayed_work(&ctrl->button_work, 3 * HZ);
++				else
++					ctrl_info(ctrl, "Slot(%s): Didn't schedule delayed_work because timer is pending!\n",
++							slot_name(ctrl));
++			}
++		}
++	} else if (events & (PCI_EXP_SLTSTA_PDC | PCI_EXP_SLTSTA_DLLSC)) {
++		if (!rpdev || (rpdev && !test_and_set_bit(0,
++					&rpdev->slot_being_removed_rescanned)))
++			pciehp_handle_presence_or_link_change(ctrl, events);
++		else {
++			if (ctrl->state == BLINKINGOFF_STATE ||
++					ctrl->state == BLINKINGON_STATE)
++				pciehp_handle_presence_or_link_change(ctrl,
++						events);
++			else {
++				/*
++				 * When we are removing or rescanning through
++				 * sysfs, suprise link down/up happens. So we
++				 * will handle this event 3 seconds later.
++				 */
++				ctrl_info(ctrl, "Slot(%s): Surprise link down/up in remove or rescan process!\n",
++						slot_name(ctrl));
++				ctrl->button_work.data = events & (PCI_EXP_SLTSTA_PDC | PCI_EXP_SLTSTA_DLLSC);
++				if (!timer_pending(&ctrl->button_work.timer))
++					schedule_delayed_work(&ctrl->button_work, 3 * HZ);
++				else
++					ctrl_info(ctrl, "Slot(%s): Didn't schedule delayed_work because timer is pending!\n",
++							slot_name(ctrl));
++			}
++		}
++	}
+ 	up_read(&ctrl->reset_lock);
+ 
+ 	ret = IRQ_HANDLED;
+diff --git a/drivers/pci/pci-sysfs.c b/drivers/pci/pci-sysfs.c
+index d15c881e2e7e..8b8776189e81 100644
+--- a/drivers/pci/pci-sysfs.c
++++ b/drivers/pci/pci-sysfs.c
+@@ -454,12 +454,34 @@ static ssize_t remove_store(struct device *dev, struct device_attribute *attr,
+ 			    const char *buf, size_t count)
+ {
+ 	unsigned long val;
++	struct pci_dev *rpdev = to_pci_dev(dev)->rpdev;
+ 
+ 	if (kstrtoul(buf, 0, &val) < 0)
+ 		return -EINVAL;
+ 
++	if (rpdev && test_and_set_bit(0,
++				&rpdev->slot_being_removed_rescanned)) {
++		pr_info("Slot is being removed or rescanned, please try later!\n");
++		return -EINVAL;
++	}
++
++	/*
++	 * if 'dev' is root port itself, 'pci_stop_and_remove_bus_device()' may
++	 * free the 'rpdev', but we need to clear
++	 * 'rpdev->slot_being_removed_rescanned' in the end. So get 'rpdev' to
++	 * avoid possible 'use-after-free'.
++	 */
++	if (rpdev)
++		pci_dev_get(rpdev);
++
+ 	if (val && device_remove_file_self(dev, attr))
+ 		pci_stop_and_remove_bus_device_locked(to_pci_dev(dev));
++
++	if (rpdev) {
++		clear_bit(0, &rpdev->slot_being_removed_rescanned);
++		pci_dev_put(rpdev);
++	}
++
+ 	return count;
+ }
+ static DEVICE_ATTR_IGNORE_LOCKDEP(remove, 0220, NULL,
+diff --git a/drivers/pci/probe.c b/drivers/pci/probe.c
+index 0187fe60b7d8..6a54bdcd5631 100644
+--- a/drivers/pci/probe.c
++++ b/drivers/pci/probe.c
+@@ -2513,6 +2513,11 @@ void pci_device_add(struct pci_dev *dev, struct pci_bus *bus)
+ 	/* Set up MSI IRQ domain */
+ 	pci_set_msi_domain(dev);
+ 
++	if (pci_pcie_type(dev) == PCI_EXP_TYPE_ROOT_PORT)
++		dev->rpdev = dev;
++	else
++		dev->rpdev = pcie_find_root_port(dev);
++
+ 	/* Notifier could use PCI capabilities */
+ 	dev->match_driver = false;
+ 	ret = device_add(&dev->dev);
+diff --git a/include/linux/pci.h b/include/linux/pci.h
+index 774cf41565a5..7d4e52256e3a 100644
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@ -503,6 +503,12 @@ struct pci_dev {
+ 	char		*driver_override; /* Driver name to force a match */
+ 
+ 	unsigned long	priv_flags;	/* Private flags for the PCI driver */
++	/*
++	 * This flag is only set on root ports. When a slot below a root port
++	 * is being removed or rescanned, this flag is set.
++	 */
++	unsigned long   slot_being_removed_rescanned;
++	struct pci_dev  *rpdev; /* root port pci_dev */
+ };
+ 
+ static inline struct pci_dev *pci_physfn(struct pci_dev *dev)
+@@ -989,6 +995,7 @@ extern struct bus_type pci_bus_type;
+ /* Do NOT directly access these two variables, unless you are arch-specific PCI
+  * code, or PCI core code. */
+ extern struct list_head pci_root_buses;	/* List of all known PCI buses */
++
+ /* Some device drivers need know if PCI is initiated */
+ int no_pci_devices(void);
+ 
+diff --git a/include/linux/workqueue.h b/include/linux/workqueue.h
+index 0c35ad697a7b..a48e8ea06d74 100644
+--- a/include/linux/workqueue.h
++++ b/include/linux/workqueue.h
+@@ -119,6 +119,8 @@ struct delayed_work {
+ 	/* target workqueue and CPU ->timer uses to queue ->work */
+ 	struct workqueue_struct *wq;
+ 	int cpu;
++	/* delayed_work private data, only used in pciehp now */
++	unsigned long data;
+ };
+ 
+ struct rcu_work {
+-- 
+2.26.2
+

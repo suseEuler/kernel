@@ -1,0 +1,237 @@
+From 6d494d7f8f03fdd29afd8304aadd88add045b62b Mon Sep 17 00:00:00 2001
+From: Weilong Chen <chenweilong@huawei.com>
+Date: Thu, 30 Dec 2021 16:26:07 +0800
+Subject: [PATCH] arm64/ascend: Add new enable_oom_killer interface for oom
+ contrl
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 6d494d7f8f03fdd29afd8304aadd88add045b62b
+
+
+ascend inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4K2U5
+CVE: NA
+
+-------------------------------------------------
+
+Support disable oom-killer, and report oom events to bbox
+vm.enable_oom_killer:
+	0: disable oom killer
+	1: enable oom killer (default,compatible with mainline)
+
+Signed-off-by: Weilong Chen <chenweilong@huawei.com>
+Signed-off-by: Zhang Jian <zhangjian210@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/Kconfig  | 12 ++++++++++++
+ include/linux/oom.h | 26 ++++++++++++++++++++++++++
+ kernel/sysctl.c     | 11 +++++++++++
+ mm/memcontrol.c     |  5 ++++-
+ mm/oom_kill.c       | 45 +++++++++++++++++++++++++++++++++++++++++++++
+ mm/util.c           |  2 ++
+ 6 files changed, 100 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
+index df6176b55fc8..3afabc81551c 100644
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -2010,6 +2010,18 @@ config ASCEND_CLEAN_CDM
+ 	  cause the kernel crash if the essential structures went wrong. So move
+ 	  the management structures for hbm nodes to the ddr nodes of the same
+ 	  partion to reduce the probability of kernel crashes.
++
++config ASCEND_OOM
++	bool "Enable support for disable oom killer"
++	default y
++	help
++	  In some cases we hopes that the oom will not kill the process when it occurs,
++	  be able to notify the black box to report the event, and be able to trigger
++	  the panic to locate the problem.
++	  vm.enable_oom_killer:
++		0: disable oom killer
++		1: enable oom killer (default,compatible with mainline)
++
+ endif
+ 
+ endmenu
+diff --git a/include/linux/oom.h b/include/linux/oom.h
+index 2db9a1432511..d57de7b1e75a 100644
+--- a/include/linux/oom.h
++++ b/include/linux/oom.h
+@@ -127,4 +127,30 @@ extern struct task_struct *find_lock_task_mm(struct task_struct *p);
+ extern int sysctl_oom_dump_tasks;
+ extern int sysctl_oom_kill_allocating_task;
+ extern int sysctl_panic_on_oom;
++extern int sysctl_enable_oom_killer;
++
++#define OOM_TYPE_NOMEM		0
++#define OOM_TYPE_OVERCOMMIT	1
++#define OOM_TYPE_CGROUP		2
++
++#ifdef CONFIG_ASCEND_OOM
++extern int register_hisi_oom_notifier(struct notifier_block *nb);
++extern int unregister_hisi_oom_notifier(struct notifier_block *nb);
++int oom_type_notifier_call(unsigned int type, struct oom_control *oc);
++#else
++static inline int register_hisi_oom_notifier(struct notifier_block *nb)
++{
++	return -EINVAL;
++}
++
++static inline int unregister_hisi_oom_notifier(struct notifier_block *nb)
++{
++	return -EINVAL;
++}
++
++static inline int oom_type_notifier_call(unsigned int type, struct oom_control *oc)
++{
++	return -EINVAL;
++}
++#endif
+ #endif /* _INCLUDE_LINUX_OOM_H */
+diff --git a/kernel/sysctl.c b/kernel/sysctl.c
+index 6eb2b1e88f0c..ce200213ccbd 100644
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -2761,6 +2761,17 @@ static struct ctl_table vm_table[] = {
+ 		.extra1		= SYSCTL_ZERO,
+ 		.extra2		= &two,
+ 	},
++#ifdef CONFIG_ASCEND_OOM
++	{
++		.procname	= "enable_oom_killer",
++		.data		= &sysctl_enable_oom_killer,
++		.maxlen		= sizeof(sysctl_enable_oom_killer),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
++	},
++#endif
+ 	{
+ 		.procname	= "oom_kill_allocating_task",
+ 		.data		= &sysctl_oom_kill_allocating_task,
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index b5ba2dd2d468..99cfd840e3bd 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -1895,6 +1895,7 @@ static enum oom_status mem_cgroup_oom(struct mem_cgroup *memcg, gfp_t mask, int
+ 		current->memcg_in_oom = memcg;
+ 		current->memcg_oom_gfp_mask = mask;
+ 		current->memcg_oom_order = order;
++		oom_type_notifier_call(OOM_TYPE_CGROUP, NULL);
+ 
+ 		return OOM_ASYNC;
+ 	}
+@@ -1962,12 +1963,14 @@ bool mem_cgroup_oom_synchronize(bool handle)
+ 	if (locked)
+ 		mem_cgroup_oom_notify(memcg);
+ 
+-	if (locked && !memcg->oom_kill_disable) {
++	if (locked && !memcg->oom_kill_disable && sysctl_enable_oom_killer) {
+ 		mem_cgroup_unmark_under_oom(memcg);
+ 		finish_wait(&memcg_oom_waitq, &owait.wait);
+ 		mem_cgroup_out_of_memory(memcg, current->memcg_oom_gfp_mask,
+ 					 current->memcg_oom_order);
+ 	} else {
++		oom_type_notifier_call(OOM_TYPE_CGROUP, NULL);
++
+ 		schedule();
+ 		mem_cgroup_unmark_under_oom(memcg);
+ 		finish_wait(&memcg_oom_waitq, &owait.wait);
+diff --git a/mm/oom_kill.c b/mm/oom_kill.c
+index 57300369efe3..ffbe8fe2bbf6 100644
+--- a/mm/oom_kill.c
++++ b/mm/oom_kill.c
+@@ -54,6 +54,7 @@
+ int sysctl_panic_on_oom;
+ int sysctl_oom_kill_allocating_task;
+ int sysctl_oom_dump_tasks = 1;
++int sysctl_enable_oom_killer = 1;
+ 
+ /*
+  * Serializes oom killer invocations (out_of_memory()) from all contexts to
+@@ -1081,6 +1082,45 @@ int unregister_oom_notifier(struct notifier_block *nb)
+ }
+ EXPORT_SYMBOL_GPL(unregister_oom_notifier);
+ 
++#ifdef CONFIG_ASCEND_OOM
++static BLOCKING_NOTIFIER_HEAD(oom_type_notify_list);
++
++int register_hisi_oom_notifier(struct notifier_block *nb)
++{
++	return blocking_notifier_chain_register(&oom_type_notify_list, nb);
++}
++EXPORT_SYMBOL_GPL(register_hisi_oom_notifier);
++
++int unregister_hisi_oom_notifier(struct notifier_block *nb)
++{
++	return blocking_notifier_chain_unregister(&oom_type_notify_list, nb);
++}
++EXPORT_SYMBOL_GPL(unregister_hisi_oom_notifier);
++
++int oom_type_notifier_call(unsigned int type, struct oom_control *oc)
++{
++	struct oom_control oc_tmp = { 0 };
++	static unsigned long caller_jiffies;
++
++	if (sysctl_enable_oom_killer)
++		return -EINVAL;
++
++	if (oc)
++		type = is_memcg_oom(oc) ? OOM_TYPE_CGROUP : OOM_TYPE_NOMEM;
++	else
++		oc = &oc_tmp;
++
++	if (printk_timed_ratelimit(&caller_jiffies, 10000)) {
++		pr_err("OOM_NOTIFIER: oom type %u\n", type);
++		dump_stack();
++		show_mem(SHOW_MEM_FILTER_NODES, NULL);
++		dump_tasks(oc);
++	}
++
++	return blocking_notifier_call_chain(&oom_type_notify_list, type, NULL);
++}
++#endif
++
+ /**
+  * out_of_memory - kill the "best" process when we run out of memory
+  * @oc: pointer to struct oom_control
+@@ -1097,6 +1137,11 @@ bool out_of_memory(struct oom_control *oc)
+ 	if (oom_killer_disabled)
+ 		return false;
+ 
++	if (!sysctl_enable_oom_killer) {
++		oom_type_notifier_call(0, oc);
++		return false;
++	}
++
+ 	if (!is_memcg_oom(oc)) {
+ 		blocking_notifier_call_chain(&oom_notify_list, 0, &freed);
+ 		if (freed > 0)
+diff --git a/mm/util.c b/mm/util.c
+index 47d074912630..2350c064abc6 100644
+--- a/mm/util.c
++++ b/mm/util.c
+@@ -25,6 +25,7 @@
+ #include <linux/compat.h>
+ 
+ #include <linux/uaccess.h>
++#include <linux/oom.h>
+ 
+ #include "internal.h"
+ 
+@@ -913,6 +914,7 @@ int __vm_enough_memory(struct mm_struct *mm, long pages, int cap_sys_admin)
+ 	if (percpu_counter_read_positive(&vm_committed_as) < allowed)
+ 		return 0;
+ error:
++	oom_type_notifier_call(OOM_TYPE_OVERCOMMIT, NULL);
+ 	vm_unacct_memory(pages);
+ 
+ 	return -ENOMEM;
+-- 
+2.26.2
+

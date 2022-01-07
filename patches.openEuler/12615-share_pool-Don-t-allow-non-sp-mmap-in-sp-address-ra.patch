@@ -1,0 +1,140 @@
+From ed054598b84f7884eb78670ce0e26314b53a4c3e Mon Sep 17 00:00:00 2001
+From: Wang Wensheng <wangwensheng4@huawei.com>
+Date: Thu, 30 Dec 2021 16:27:13 +0800
+Subject: [PATCH] share_pool: Don't allow non-sp mmap in sp address range
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: ed054598b84f7884eb78670ce0e26314b53a4c3e
+
+
+ascend inclusion
+category: Feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4NDAW
+CVE: NA
+
+-------------------
+
+The situation below is not allowed:
+
+int *result = mmap(ADDR, sizeof(int), PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+
+As share pool uses an independent UVA allocation algorithm, it may
+produce an address that is conflicted with user-specified address.
+
+Signed-off-by: Tang Yizhou <tangyizhou@huawei.com>
+Signed-off-by: Wang Wensheng <wangwensheng4@huawei.com>
+Reviewed-by: Kefeng Wang<wangkefeng.wang@huawei.com>
+Reviewed-by: Weilong Chen <chenweilong@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/share_pool.h |  2 ++
+ mm/mmap.c                  |  9 +++++++++
+ mm/mremap.c                |  4 ++++
+ mm/share_pool.c            | 20 ++++++++++++++++++++
+ 4 files changed, 35 insertions(+)
+
+diff --git a/include/linux/share_pool.h b/include/linux/share_pool.h
+index ac637359e158..0254ea95f034 100644
+--- a/include/linux/share_pool.h
++++ b/include/linux/share_pool.h
+@@ -260,6 +260,8 @@ extern int sp_group_add_task(int pid, int spg_id);
+ extern void sp_area_drop(struct vm_area_struct *vma);
+ extern int sp_group_exit(struct mm_struct *mm);
+ extern void sp_group_post_exit(struct mm_struct *mm);
++extern bool sp_check_addr(unsigned long addr);
++extern bool sp_check_mmap_addr(unsigned long addr, unsigned long flags);
+ 
+ static inline bool sp_is_enabled(void)
+ {
+diff --git a/mm/mmap.c b/mm/mmap.c
+index c616e99e7672..36ef4c2b93a9 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -2430,6 +2430,9 @@ arch_get_unmapped_area(struct file *filp, unsigned long addr,
+ 	if (len > mmap_end - mmap_min_addr)
+ 		return -ENOMEM;
+ 
++	if (sp_check_mmap_addr(addr, flags))
++		return -EINVAL;
++
+ 	if (flags & MAP_FIXED)
+ 		return addr;
+ 
+@@ -2481,6 +2484,9 @@ arch_get_unmapped_area_topdown(struct file *filp, unsigned long addr,
+ 	if (len > mmap_end - mmap_min_addr)
+ 		return -ENOMEM;
+ 
++	if (sp_check_mmap_addr(addr, flags))
++		return -EINVAL;
++
+ 	if (flags & MAP_FIXED)
+ 		return addr;
+ 
+@@ -3209,6 +3215,9 @@ static int __vm_munmap(unsigned long start, size_t len, bool downgrade)
+ 	struct mm_struct *mm = current->mm;
+ 	LIST_HEAD(uf);
+ 
++	if (sp_check_addr(start))
++		return -EINVAL;
++
+ 	if (mmap_write_lock_killable(mm))
+ 		return -EINTR;
+ 
+diff --git a/mm/mremap.c b/mm/mremap.c
+index d4d66d1b6ec7..ecfca97b97ae 100644
+--- a/mm/mremap.c
++++ b/mm/mremap.c
+@@ -24,6 +24,7 @@
+ #include <linux/uaccess.h>
+ #include <linux/mm-arch-hooks.h>
+ #include <linux/userfaultfd_k.h>
++#include <linux/share_pool.h>
+ 
+ #include <asm/cacheflush.h>
+ #include <asm/tlb.h>
+@@ -929,6 +930,9 @@ SYSCALL_DEFINE5(mremap, unsigned long, addr, unsigned long, old_len,
+ 	if (offset_in_page(addr))
+ 		return ret;
+ 
++	if (sp_check_addr(addr) || sp_check_addr(new_addr))
++		return ret;
++
+ 	old_len = PAGE_ALIGN(old_len);
+ 	new_len = PAGE_ALIGN(new_len);
+ 
+diff --git a/mm/share_pool.c b/mm/share_pool.c
+index 96fc899617a5..7853054ed005 100644
+--- a/mm/share_pool.c
++++ b/mm/share_pool.c
+@@ -4139,6 +4139,26 @@ static void __init proc_sharepool_init(void)
+ 
+ /*** End of tatistical and maintenance functions ***/
+ 
++bool sp_check_addr(unsigned long addr)
++{
++	if (sp_is_enabled() && is_sharepool_addr(addr) &&
++	    !check_aoscore_process(current)) {
++		sp_dump_stack();
++		return true;
++	} else
++		return false;
++}
++
++bool sp_check_mmap_addr(unsigned long addr, unsigned long flags)
++{
++	if (sp_is_enabled() && is_sharepool_addr(addr) &&
++	    !check_aoscore_process(current) && !(flags & MAP_SHARE_POOL)) {
++		sp_dump_stack();
++		return true;
++	} else
++		return false;
++}
++
+ #define MM_WOULD_FREE	1
+ 
+ /*
+-- 
+2.26.2
+

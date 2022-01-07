@@ -1,0 +1,247 @@
+From ea5b5eee5fb05c9c25339e5fae89038ec0102ca1 Mon Sep 17 00:00:00 2001
+From: Wang Wensheng <wangwensheng4@huawei.com>
+Date: Thu, 30 Dec 2021 16:27:12 +0800
+Subject: [PATCH] share_pool: support fork() and exit() to handle the mm
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: ea5b5eee5fb05c9c25339e5fae89038ec0102ca1
+
+
+ascend inclusion
+category: Feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4NDAW
+CVE: NA
+
+-------------------
+
+The fork() will create the new mm for new process, the mm should not
+take any information from the parent process, so need to clean it.
+
+The exit() will mmput the mm and free the memory, if the mm is alrready
+be used for sp_group, need to clean the group first.
+
+Signed-off-by: Wang Wensheng <wangwensheng4@huawei.com>
+Signed-off-by: Tang Yizhou <tangyizhou@huawei.com>
+Signed-off-by: Peng Wu <wupeng58@huawei.com>
+Signed-off-by: Zhou Guanghui <zhouguanghui1@huawei.com>
+Reviewed-by: Kefeng Wang<wangkefeng.wang@huawei.com>
+Reviewed-by: Weilong Chen <chenweilong@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/share_pool.h |   2 +
+ kernel/fork.c              |   7 ++
+ mm/mmap.c                  |   5 ++
+ mm/share_pool.c            | 128 +++++++++++++++++++++++++++++++++++++
+ 4 files changed, 142 insertions(+)
+
+diff --git a/include/linux/share_pool.h b/include/linux/share_pool.h
+index 6ec844708f83..ac637359e158 100644
+--- a/include/linux/share_pool.h
++++ b/include/linux/share_pool.h
+@@ -258,6 +258,8 @@ extern int mg_sp_group_add_task(int pid, unsigned long prot, int spg_id);
+ extern int sp_group_add_task(int pid, int spg_id);
+ 
+ extern void sp_area_drop(struct vm_area_struct *vma);
++extern int sp_group_exit(struct mm_struct *mm);
++extern void sp_group_post_exit(struct mm_struct *mm);
+ 
+ static inline bool sp_is_enabled(void)
+ {
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 454b42af1de8..bf27ee90ad23 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -98,6 +98,7 @@
+ #include <linux/io_uring.h>
+ #include <linux/share_pool.h>
+ 
++#include <linux/share_pool.h>
+ #include <asm/pgalloc.h>
+ #include <linux/uaccess.h>
+ #include <asm/mmu_context.h>
+@@ -1092,6 +1093,9 @@ static inline void __mmput(struct mm_struct *mm)
+ 	ksm_exit(mm);
+ 	khugepaged_exit(mm); /* must run before exit_mmap */
+ 	exit_mmap(mm);
++
++	sp_group_post_exit(mm);
++
+ 	mm_put_huge_zero_page(mm);
+ 	set_mm_exe_file(mm, NULL);
+ 	if (!list_empty(&mm->mmlist)) {
+@@ -1111,6 +1115,9 @@ void mmput(struct mm_struct *mm)
+ {
+ 	might_sleep();
+ 
++	if (sp_group_exit(mm))
++		return;
++
+ 	if (atomic_dec_and_test(&mm->mm_users))
+ 		__mmput(mm);
+ }
+diff --git a/mm/mmap.c b/mm/mmap.c
+index d5a97a56dca7..c616e99e7672 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -183,6 +183,7 @@ static struct vm_area_struct *remove_vma(struct vm_area_struct *vma)
+ 	if (vma->vm_file)
+ 		fput(vma->vm_file);
+ 	mpol_put(vma_policy(vma));
++	sp_area_drop(vma);
+ 	vm_area_free(vma);
+ 	return next;
+ }
+@@ -1174,6 +1175,10 @@ struct vm_area_struct *vma_merge(struct mm_struct *mm,
+ 	if (vm_flags & VM_SPECIAL)
+ 		return NULL;
+ 
++	/* don't merge this kind of vma as sp_area couldn't be merged */
++	if (sp_check_vm_share_pool(vm_flags))
++		return NULL;
++
+ 	next = vma_next(mm, prev);
+ 	area = next;
+ 	if (area && area->vm_end == end)		/* cases 6, 7, 8 */
+diff --git a/mm/share_pool.c b/mm/share_pool.c
+index 8dc64232f0db..96fc899617a5 100644
+--- a/mm/share_pool.c
++++ b/mm/share_pool.c
+@@ -4139,6 +4139,134 @@ static void __init proc_sharepool_init(void)
+ 
+ /*** End of tatistical and maintenance functions ***/
+ 
++#define MM_WOULD_FREE	1
++
++/*
++ * Recall we add mm->users by 1 deliberately in sp_group_add_task().
++ * If the mm_users == sp_group_master->count + 1, it means that the mm is ready
++ * to be freed because the last owner of this mm is in exiting procedure:
++ * do_exit() -> exit_mm() -> mmput() -> sp_group_exit -> THIS function.
++ */
++static bool need_free_sp_group(struct mm_struct *mm,
++			      struct sp_group_master *master)
++{
++	/* thread exits but process is still alive */
++	if ((unsigned int)atomic_read(&mm->mm_users) != master->count + MM_WOULD_FREE) {
++		if (atomic_dec_and_test(&mm->mm_users))
++			WARN(1, "Invalid user counting\n");
++		return false;
++	}
++
++	return true;
++}
++
++/*
++ * Return:
++ * 1	- let mmput() return immediately
++ * 0	- let mmput() decrease mm_users and try __mmput()
++ */
++int sp_group_exit(struct mm_struct *mm)
++{
++	struct sp_group *spg;
++	struct sp_group_master *master;
++	struct sp_group_node *spg_node, *tmp;
++	bool is_alive = true;
++
++	if (!sp_is_enabled())
++		return 0;
++
++	down_write(&sp_group_sem);
++
++	master = mm->sp_group_master;
++	if (!master) {
++		up_write(&sp_group_sem);
++		return 0;
++	}
++
++	if (!need_free_sp_group(mm, master)) {
++		up_write(&sp_group_sem);
++		return 1;
++	}
++
++	list_for_each_entry_safe(spg_node, tmp, &master->node_list, group_node) {
++		spg = spg_node->spg;
++
++		down_write(&spg->rw_lock);
++		/* a dead group should NOT be reactive again */
++		if (spg_valid(spg) && list_is_singular(&spg->procs))
++			is_alive = spg->is_alive = false;
++		spg->proc_num--;
++		list_del(&spg_node->proc_node);
++		up_write(&spg->rw_lock);
++
++		if (!is_alive)
++			blocking_notifier_call_chain(&sp_notifier_chain, 0,
++						     spg);
++	}
++
++	/* match with get_task_mm() in sp_group_add_task() */
++	if (atomic_sub_and_test(master->count, &mm->mm_users)) {
++		up_write(&sp_group_sem);
++		WARN(1, "Invalid user counting\n");
++		return 1;
++	}
++
++	up_write(&sp_group_sem);
++	return 0;
++}
++
++void sp_group_post_exit(struct mm_struct *mm)
++{
++	struct sp_proc_stat *stat;
++	long alloc_size, k2u_size;
++	/* lockless visit */
++	struct sp_group_master *master = mm->sp_group_master;
++	struct sp_group_node *spg_node, *tmp;
++	struct sp_group *spg;
++
++	if (!sp_is_enabled() || !master)
++		return;
++
++	/*
++	 * There are two basic scenarios when a process in the share pool is
++	 * exiting but its share pool memory usage is not 0.
++	 * 1. Process A called sp_alloc(), but it terminates without calling
++	 *    sp_free(). Then its share pool memory usage is a positive number.
++	 * 2. Process A never called sp_alloc(), and process B in the same spg
++	 *    called sp_alloc() to get an addr u. Then A gets u somehow and
++	 *    called sp_free(u). Now A's share pool memory usage is a negative
++	 *    number. Notice B's memory usage will be a positive number.
++	 *
++	 * We decide to print an info when seeing both of the scenarios.
++	 *
++	 * A process not in an sp group doesn't need to print because there
++	 * wont't be any memory which is not freed.
++	 */
++	stat = sp_get_proc_stat(mm);
++	if (stat) {
++		alloc_size = atomic64_read(&stat->alloc_size);
++		k2u_size = atomic64_read(&stat->k2u_size);
++
++		if (alloc_size != 0 || k2u_size != 0)
++			pr_info("process %s(%d) exits. It applied %ld aligned KB, k2u shared %ld aligned KB\n",
++				stat->comm, stat->tgid,
++				byte2kb(alloc_size), byte2kb(k2u_size));
++
++		/* match with sp_init_proc_stat, we expect stat is released after this call */
++		sp_proc_stat_drop(stat);
++	}
++
++	/* lockless traverse */
++	list_for_each_entry_safe(spg_node, tmp, &master->node_list, group_node) {
++		spg = spg_node->spg;
++		/* match with refcount inc in sp_group_add_task */
++		sp_group_drop(spg);
++		kfree(spg_node);
++	}
++
++	kfree(master);
++}
++
+ DEFINE_STATIC_KEY_FALSE(share_pool_enabled_key);
+ 
+ static int __init enable_share_pool(char *s)
+-- 
+2.26.2
+

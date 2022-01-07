@@ -1,0 +1,215 @@
+From c533562a2802206135467a06384ba33cff42b18a Mon Sep 17 00:00:00 2001
+From: Wang Wensheng <wangwensheng4@huawei.com>
+Date: Thu, 30 Dec 2021 16:27:17 +0800
+Subject: [PATCH] share_pool: Use sharepool_no_page to alloc hugepage
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: c533562a2802206135467a06384ba33cff42b18a
+
+
+ascend inclusion
+category: Feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4NDAW
+CVE: NA
+
+-------------------
+
+Sharepool applies for a dedicated interface for large pages,
+which optimizes the efficiency of memory application
+
+Signed-off-by: Weilong Chen <chenweilong@huawei.com>
+Signed-off-by: Wang Wensheng <wangwensheng4@huawei.com>
+Reviewed-by: Kefeng Wang<wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/hugetlb.h    |  4 ++
+ include/linux/share_pool.h | 12 +++++
+ mm/hugetlb.c               | 10 +++-
+ mm/share_pool.c            | 97 ++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 122 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/hugetlb.h b/include/linux/hugetlb.h
+index 397e6bfa8268..1b586a324b8e 100644
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -1120,4 +1120,8 @@ static inline __init void hugetlb_cma_check(void)
+ }
+ #endif
+ 
++#ifdef CONFIG_ASCEND_SHARE_POOL
++pte_t make_huge_pte(struct vm_area_struct *vma, struct page *page, int writable);
++#endif
++
+ #endif /* _LINUX_HUGETLB_H */
+diff --git a/include/linux/share_pool.h b/include/linux/share_pool.h
+index ca9fcde90211..6f294911c6af 100644
+--- a/include/linux/share_pool.h
++++ b/include/linux/share_pool.h
+@@ -260,6 +260,10 @@ extern int sp_group_add_task(int pid, int spg_id);
+ extern void sp_area_drop(struct vm_area_struct *vma);
+ extern int sp_group_exit(struct mm_struct *mm);
+ extern void sp_group_post_exit(struct mm_struct *mm);
++vm_fault_t sharepool_no_page(struct mm_struct *mm,
++			     struct vm_area_struct *vma,
++			     struct address_space *mapping, pgoff_t idx,
++			     unsigned long address, pte_t *ptep, unsigned int flags);
+ extern bool sp_check_addr(unsigned long addr);
+ extern bool sp_check_mmap_addr(unsigned long addr, unsigned long flags);
+ extern int sp_node_id(struct vm_area_struct *vma);
+@@ -515,6 +519,14 @@ static inline bool sp_check_mmap_addr(unsigned long addr, unsigned long flags)
+ 	return false;
+ }
+ 
++static inline vm_fault_t sharepool_no_page(struct mm_struct *mm,
++			struct vm_area_struct *vma,
++			struct address_space *mapping, pgoff_t idx,
++			unsigned long address, pte_t *ptep, unsigned int flags)
++{
++	return VM_FAULT_SIGBUS;
++}
++
+ #endif /* !CONFIG_ASCEND_SHARE_POOL */
+ 
+ #endif /* LINUX_SHARE_POOL_H */
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 74d23542f9f2..44691ce8a9b8 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -3861,8 +3861,13 @@ const struct vm_operations_struct hugetlb_vm_ops = {
+ 	.pagesize = hugetlb_vm_op_pagesize,
+ };
+ 
++#ifdef CONFIG_ASCEND_SHARE_POOL
++pte_t make_huge_pte(struct vm_area_struct *vma, struct page *page,
++				int writable)
++#else
+ static pte_t make_huge_pte(struct vm_area_struct *vma, struct page *page,
+ 				int writable)
++#endif
+ {
+ 	pte_t entry;
+ 
+@@ -4727,7 +4732,10 @@ vm_fault_t hugetlb_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+ 
+ 	entry = huge_ptep_get(ptep);
+ 	if (huge_pte_none(entry)) {
+-		ret = hugetlb_no_page(mm, vma, mapping, idx, address, ptep, flags);
++		if (sp_check_vm_share_pool(vma->vm_flags))
++			ret = sharepool_no_page(mm, vma, mapping, idx, address, ptep, flags);
++		else
++			ret = hugetlb_no_page(mm, vma, mapping, idx, address, ptep, flags);
+ 		goto out_mutex;
+ 	}
+ 
+diff --git a/mm/share_pool.c b/mm/share_pool.c
+index 05218c6dd250..494a829d6f3a 100644
+--- a/mm/share_pool.c
++++ b/mm/share_pool.c
+@@ -4177,6 +4177,103 @@ bool sp_check_mmap_addr(unsigned long addr, unsigned long flags)
+ 		return false;
+ }
+ 
++vm_fault_t sharepool_no_page(struct mm_struct *mm,
++			struct vm_area_struct *vma,
++			struct address_space *mapping, pgoff_t idx,
++			unsigned long address, pte_t *ptep, unsigned int flags)
++{
++	struct hstate *h = hstate_vma(vma);
++	vm_fault_t ret = VM_FAULT_SIGBUS;
++	unsigned long size;
++	struct page *page;
++	pte_t new_pte;
++	spinlock_t *ptl;
++	unsigned long haddr = address & huge_page_mask(h);
++	bool new_page = false;
++	int err;
++	int node_id;
++	struct sp_area *spa;
++
++	spa = __find_sp_area(vma->vm_start);
++	if (!spa) {
++		pr_err("share pool: vma is invalid, not from sp mmap\n");
++		return ret;
++	}
++	node_id = spa->node_id;
++	__sp_area_drop(spa);
++
++retry:
++	page = find_lock_page(mapping, idx);
++	if (!page) {
++		size = i_size_read(mapping->host) >> huge_page_shift(h);
++		if (idx >= size)
++			goto out;
++
++		page = alloc_huge_page(vma, haddr, 0);
++		if (IS_ERR(page)) {
++			page = alloc_huge_page_nodemask(hstate_file(vma->vm_file),
++						    node_id, NULL, GFP_KERNEL);
++			if (!page)
++				page = ERR_PTR(-ENOMEM);
++		}
++		if (IS_ERR(page)) {
++			ptl = huge_pte_lock(h, mm, ptep);
++			if (!huge_pte_none(huge_ptep_get(ptep))) {
++				ret = 0;
++				spin_unlock(ptl);
++				goto out;
++			}
++			spin_unlock(ptl);
++			ret = vmf_error(PTR_ERR(page));
++			goto out;
++		}
++		__SetPageUptodate(page);
++		new_page = true;
++
++		/* sharepool pages are all shared */
++		err = huge_add_to_page_cache(page, mapping, idx);
++		if (err) {
++			put_page(page);
++			if (err == -EEXIST)
++				goto retry;
++			goto out;
++		}
++	}
++
++
++	ptl = huge_pte_lock(h, mm, ptep);
++	size = i_size_read(mapping->host) >> huge_page_shift(h);
++	if (idx >= size)
++		goto backout;
++
++	ret = 0;
++	if (!huge_pte_none(huge_ptep_get(ptep)))
++		goto backout;
++
++	page_dup_rmap(page, true);
++	new_pte = make_huge_pte(vma, page, ((vma->vm_flags & VM_WRITE)
++				&& (vma->vm_flags & VM_SHARED)));
++	set_huge_pte_at(mm, haddr, ptep, new_pte);
++
++	hugetlb_count_add(pages_per_huge_page(h), mm);
++
++	spin_unlock(ptl);
++
++	if (new_page) {
++		SetPagePrivate(&page[1]);
++	}
++
++	unlock_page(page);
++out:
++	return ret;
++
++backout:
++	spin_unlock(ptl);
++	unlock_page(page);
++	put_page(page);
++	goto out;
++}
++
+ #define MM_WOULD_FREE	1
+ 
+ /*
+-- 
+2.26.2
+

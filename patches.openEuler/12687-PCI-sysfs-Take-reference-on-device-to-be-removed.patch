@@ -1,0 +1,172 @@
+From 3415adad2ea435d4a26e0e23cfc839f832e4ea17 Mon Sep 17 00:00:00 2001
+From: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Date: Fri, 31 Dec 2021 13:32:55 +0800
+Subject: [PATCH] PCI/sysfs: Take reference on device to be removed
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 3415adad2ea435d4a26e0e23cfc839f832e4ea17
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4OG3O?from=project-issue
+CVE: NA
+
+------------------------------------
+
+When I do some aer-inject and sysfs remove stress tests, I got the
+following use-after-free Calltrace:
+
+ ==================================================================
+ BUG: KASAN: use-after-free in pci_stop_bus_device+0x174/0x178
+ Read of size 8 at addr fffffc3e2e402218 by task bash/26311
+
+ CPU: 38 PID: 26311 Comm: bash Tainted: G        W         4.19.105+ #82
+ Hardware name: Huawei TaiShan 2280 V2/BC82AMDC, BIOS 2280-V2 CS V5.B161.01 06/10/2021
+ Call trace:
+  dump_backtrace+0x0/0x360
+  show_stack+0x24/0x30
+  dump_stack+0x130/0x164
+  print_address_description+0x68/0x278
+  kasan_report+0x204/0x330
+  __asan_report_load8_noabort+0x30/0x40
+  pci_stop_bus_device+0x174/0x178
+  pci_stop_and_remove_bus_device_locked+0x24/0x40
+  remove_store+0x1c8/0x1e0
+  dev_attr_store+0x60/0x80
+  sysfs_kf_write+0x104/0x170
+  kernfs_fop_write+0x23c/0x430
+  __vfs_write+0xec/0x4e0
+  vfs_write+0x12c/0x3d0
+  ksys_write+0xe8/0x208
+  __arm64_sys_write+0x70/0xa0
+  el0_svc_common+0x10c/0x450
+  el0_svc_handler+0x50/0xc0
+  el0_svc+0x10/0x14
+
+ Allocated by task 684:
+  kasan_kmalloc+0xe0/0x190
+  kmem_cache_alloc_trace+0x110/0x240
+  pci_alloc_dev+0x4c/0x110
+  pci_scan_single_device+0x100/0x218
+  pci_scan_slot+0x8c/0x2d8
+  pci_scan_child_bus_extend+0x90/0x628
+  pci_scan_child_bus+0x24/0x30
+  pci_scan_bridge_extend+0x3b8/0xb28
+  pci_scan_child_bus_extend+0x350/0x628
+  pci_rescan_bus+0x24/0x48
+  pcie_do_fatal_recovery+0x390/0x4b0
+  handle_error_source+0x124/0x158
+  aer_isr+0x5a0/0x800
+  process_one_work+0x598/0x1250
+  worker_thread+0x384/0xf08
+  kthread+0x2a4/0x320
+  ret_from_fork+0x10/0x18
+
+ Freed by task 685:
+  __kasan_slab_free+0x120/0x228
+  kasan_slab_free+0x10/0x18
+  kfree+0x88/0x218
+  pci_release_dev+0xb4/0xd8
+  device_release+0x6c/0x1c0
+  kobject_put+0x12c/0x400
+  put_device+0x24/0x30
+  pci_dev_put+0x24/0x30
+  handle_error_source+0x12c/0x158
+  aer_isr+0x5a0/0x800
+  process_one_work+0x598/0x1250
+  worker_thread+0x384/0xf08
+  kthread+0x2a4/0x320
+  ret_from_fork+0x10/0x18
+
+ The buggy address belongs to the object at fffffc3e2e402200
+  which belongs to the cache kmalloc-4096 of size 4096
+ The buggy address is located 24 bytes inside of
+  4096-byte region [fffffc3e2e402200, fffffc3e2e403200)
+ The buggy address belongs to the page:
+ page:ffff7ff0f8b90000 count:1 mapcount:0 mapping:ffffdc365f016e00 index:0x0 compound_mapcount: 0
+ flags: 0x6ffffe0000008100(slab|head)
+ raw: 6ffffe0000008100 ffff7f70d83aae00 0000000300000003 ffffdc365f016e00
+ raw: 0000000000000000 0000000080070007 00000001ffffffff 0000000000000000
+ page dumped because: kasan: bad access detected
+
+ Memory state around the buggy address:
+  fffffc3e2e402100: fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc
+  fffffc3e2e402180: fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc
+ >fffffc3e2e402200: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+                             ^
+  fffffc3e2e402280: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+  fffffc3e2e402300: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+ ==================================================================
+
+It is caused by the following race condition:
+
+	CPU0					CPU1
+remove_store()				aer_isr()
+ device_remove_file_self()		 handle_error_source()
+ pci_stop_and_remove_bus_device_locked	  pcie_do_fatal_recovery()
+  (blocked)				   pci_lock_rescan_remove()	#CPU1 acquire the lock
+					   pci_stop_and_remove_bus_device()
+					   pci_unlock_rescan_remove()   #CPU1 release the lock
+  pci_lock_rescan_remove()						#CPU0 acquire the lock
+					  pci_dev_put()			#free pci_dev
+  pci_stop_and_remove_bus_device()
+   pci_stop_bus_device()						#use-after-free
+  pci_unlock_rescan_remove()
+
+An AER interrupt is triggered on CPU1. CPU1 starts to process it. A work
+'aer_isr()' is scheduled on CPU1. It calling into
+pcie_do_fatal_recovery(), and aquire lock 'pci_rescan_remove_lock'.
+Before it removes the sysfs corresponding to the error pci device, a
+sysfs remove operation is executed on CPU0. CPU0 use
+device_remove_file_self() to remove the sysfs directory and wait for the
+lock to be released. After CPU1 finish pci_stop_and_remove_bus_device(),
+it release the lock and free the 'pci_dev' in pci_dev_put(). CPU0 acquire
+the lock and access the 'pci_dev'. Then a use-after-free is triggered.
+
+To fix this issue, we increase the reference count in remove_store()
+before remove the device and decrease the reference count in the end.
+
+Signed-off-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Reviewed-by: Hanjun Guo <guohanjun@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Jialin Zhang <zhangjialin11@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/pci/pci-sysfs.c | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/pci/pci-sysfs.c b/drivers/pci/pci-sysfs.c
+index 8b8776189e81..d012fbe7a113 100644
+--- a/drivers/pci/pci-sysfs.c
++++ b/drivers/pci/pci-sysfs.c
+@@ -454,7 +454,8 @@ static ssize_t remove_store(struct device *dev, struct device_attribute *attr,
+ 			    const char *buf, size_t count)
+ {
+ 	unsigned long val;
+-	struct pci_dev *rpdev = to_pci_dev(dev)->rpdev;
++	struct pci_dev *pdev = to_pci_dev(dev);
++	struct pci_dev *rpdev = pdev->rpdev;
+ 
+ 	if (kstrtoul(buf, 0, &val) < 0)
+ 		return -EINVAL;
+@@ -474,8 +475,12 @@ static ssize_t remove_store(struct device *dev, struct device_attribute *attr,
+ 	if (rpdev)
+ 		pci_dev_get(rpdev);
+ 
+-	if (val && device_remove_file_self(dev, attr))
+-		pci_stop_and_remove_bus_device_locked(to_pci_dev(dev));
++	if (val) {
++		pci_dev_get(pdev);
++		if (device_remove_file_self(dev, attr))
++			pci_stop_and_remove_bus_device_locked(pdev);
++		pci_dev_put(pdev);
++	}
+ 
+ 	if (rpdev) {
+ 		clear_bit(0, &rpdev->slot_being_removed_rescanned);
+-- 
+2.26.2
+

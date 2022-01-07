@@ -1,0 +1,100 @@
+From f9c82a4ea89c384d49ce03768ba88d049ed3f1f0 Mon Sep 17 00:00:00 2001
+From: Alexey Gladkov <legion@kernel.org>
+Date: Thu, 22 Apr 2021 14:27:08 +0200
+Subject: [PATCH] Increase size of ucounts to atomic_long_t
+Git-commit: f9c82a4ea89c384d49ce03768ba88d049ed3f1f0
+Patch-mainline: v5.14-rc1
+References: bsn#12
+
+
+RLIMIT_MSGQUEUE and RLIMIT_MEMLOCK use unsigned long to store their
+counters. As a preparation for moving rlimits based on ucounts, we need
+to increase the size of the variable to long.
+
+Signed-off-by: Alexey Gladkov <legion@kernel.org>
+Link: https://lkml.kernel.org/r/257aa5fb1a7d81cf0f4c34f39ada2320c4284771.1619094428.git.legion@kernel.org
+Signed-off-by: Eric W. Biederman <ebiederm@xmission.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/user_namespace.h |  4 ++--
+ kernel/ucount.c                | 16 ++++++++--------
+ 2 files changed, 10 insertions(+), 10 deletions(-)
+
+diff --git a/include/linux/user_namespace.h b/include/linux/user_namespace.h
+index f6c5f784be5a..c242c10906c5 100644
+--- a/include/linux/user_namespace.h
++++ b/include/linux/user_namespace.h
+@@ -88,7 +88,7 @@ struct user_namespace {
+ 	struct ctl_table_header *sysctls;
+ #endif
+ 	struct ucounts		*ucounts;
+-	int ucount_max[UCOUNT_COUNTS];
++	long ucount_max[UCOUNT_COUNTS];
+ } __randomize_layout;
+ 
+ struct ucounts {
+@@ -96,7 +96,7 @@ struct ucounts {
+ 	struct user_namespace *ns;
+ 	kuid_t uid;
+ 	int count;
+-	atomic_t ucount[UCOUNT_COUNTS];
++	atomic_long_t ucount[UCOUNT_COUNTS];
+ };
+ 
+ extern struct user_namespace init_user_ns;
+diff --git a/kernel/ucount.c b/kernel/ucount.c
+index 11b1596e2542..04c561751af1 100644
+--- a/kernel/ucount.c
++++ b/kernel/ucount.c
+@@ -175,14 +175,14 @@ static void put_ucounts(struct ucounts *ucounts)
+ 	kfree(ucounts);
+ }
+ 
+-static inline bool atomic_inc_below(atomic_t *v, int u)
++static inline bool atomic_long_inc_below(atomic_long_t *v, int u)
+ {
+-	int c, old;
+-	c = atomic_read(v);
++	long c, old;
++	c = atomic_long_read(v);
+ 	for (;;) {
+ 		if (unlikely(c >= u))
+ 			return false;
+-		old = atomic_cmpxchg(v, c, c+1);
++		old = atomic_long_cmpxchg(v, c, c+1);
+ 		if (likely(old == c))
+ 			return true;
+ 		c = old;
+@@ -196,17 +196,17 @@ struct ucounts *inc_ucount(struct user_namespace *ns, kuid_t uid,
+ 	struct user_namespace *tns;
+ 	ucounts = get_ucounts(ns, uid);
+ 	for (iter = ucounts; iter; iter = tns->ucounts) {
+-		int max;
++		long max;
+ 		tns = iter->ns;
+ 		max = READ_ONCE(tns->ucount_max[type]);
+-		if (!atomic_inc_below(&iter->ucount[type], max))
++		if (!atomic_long_inc_below(&iter->ucount[type], max))
+ 			goto fail;
+ 	}
+ 	return ucounts;
+ fail:
+ 	bad = iter;
+ 	for (iter = ucounts; iter != bad; iter = iter->ns->ucounts)
+-		atomic_dec(&iter->ucount[type]);
++		atomic_long_dec(&iter->ucount[type]);
+ 
+ 	put_ucounts(ucounts);
+ 	return NULL;
+@@ -216,7 +216,7 @@ void dec_ucount(struct ucounts *ucounts, enum ucount_type type)
+ {
+ 	struct ucounts *iter;
+ 	for (iter = ucounts; iter; iter = iter->ns->ucounts) {
+-		int dec = atomic_dec_if_positive(&iter->ucount[type]);
++		long dec = atomic_long_dec_if_positive(&iter->ucount[type]);
+ 		WARN_ON_ONCE(dec < 0);
+ 	}
+ 	put_ucounts(ucounts);
+-- 
+2.26.2
+

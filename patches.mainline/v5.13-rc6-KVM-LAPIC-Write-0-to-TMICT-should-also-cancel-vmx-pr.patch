@@ -1,0 +1,75 @@
+From e898da784aed0ea65f7672d941c01dc9b79e6299 Mon Sep 17 00:00:00 2001
+From: Wanpeng Li <wanpengli@tencent.com>
+Date: Mon, 7 Jun 2021 00:19:43 -0700
+Subject: [PATCH] KVM: LAPIC: Write 0 to TMICT should also cancel
+ vmx-preemption timer
+Git-commit: e898da784aed0ea65f7672d941c01dc9b79e6299
+Patch-mainline: v5.13-rc6
+References: bsn#12
+
+
+According to the SDM 10.5.4.1:
+
+  A write of 0 to the initial-count register effectively stops the local
+  APIC timer, in both one-shot and periodic mode.
+
+However, the lapic timer oneshot/periodic mode which is emulated by vmx-preemption
+timer doesn't stop by writing 0 to TMICT since vmx->hv_deadline_tsc is still
+programmed and the guest will receive the spurious timer interrupt later. This
+patch fixes it by also cancelling the vmx-preemption timer when writing 0 to
+the initial-count register.
+
+Reviewed-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Wanpeng Li <wanpengli@tencent.com>
+Message-Id: <1623050385-100988-1-git-send-email-wanpengli@tencent.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/kvm/lapic.c | 17 +++++++++++------
+ 1 file changed, 11 insertions(+), 6 deletions(-)
+
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 8120e8614b92..6d72d8f43310 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -1494,6 +1494,15 @@ static void limit_periodic_timer_frequency(struct kvm_lapic *apic)
+ 
+ static void cancel_hv_timer(struct kvm_lapic *apic);
+ 
++static void cancel_apic_timer(struct kvm_lapic *apic)
++{
++	hrtimer_cancel(&apic->lapic_timer.timer);
++	preempt_disable();
++	if (apic->lapic_timer.hv_timer_in_use)
++		cancel_hv_timer(apic);
++	preempt_enable();
++}
++
+ static void apic_update_lvtt(struct kvm_lapic *apic)
+ {
+ 	u32 timer_mode = kvm_lapic_get_reg(apic, APIC_LVTT) &
+@@ -1502,11 +1511,7 @@ static void apic_update_lvtt(struct kvm_lapic *apic)
+ 	if (apic->lapic_timer.timer_mode != timer_mode) {
+ 		if (apic_lvtt_tscdeadline(apic) != (timer_mode ==
+ 				APIC_LVT_TIMER_TSCDEADLINE)) {
+-			hrtimer_cancel(&apic->lapic_timer.timer);
+-			preempt_disable();
+-			if (apic->lapic_timer.hv_timer_in_use)
+-				cancel_hv_timer(apic);
+-			preempt_enable();
++			cancel_apic_timer(apic);
+ 			kvm_lapic_set_reg(apic, APIC_TMICT, 0);
+ 			apic->lapic_timer.period = 0;
+ 			apic->lapic_timer.tscdeadline = 0;
+@@ -2092,7 +2097,7 @@ int kvm_lapic_reg_write(struct kvm_lapic *apic, u32 reg, u32 val)
+ 		if (apic_lvtt_tscdeadline(apic))
+ 			break;
+ 
+-		hrtimer_cancel(&apic->lapic_timer.timer);
++		cancel_apic_timer(apic);
+ 		kvm_lapic_set_reg(apic, APIC_TMICT, val);
+ 		start_apic_timer(apic);
+ 		break;
+-- 
+2.26.2
+
