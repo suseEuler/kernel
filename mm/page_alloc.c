@@ -9164,6 +9164,19 @@ bool take_page_off_buddy(struct page *page)
 }
 #endif
 
+#ifdef CONFIG_NUMA
+enum node_type nodes_type[MAX_NUMNODES];
+
+void set_node_type(int nid, enum node_type type)
+{
+	nodes_type[nid] = type;
+}
+enum node_type get_node_type(int nid)
+{
+	return nodes_type[nid];
+}
+#endif
+
 #ifdef CONFIG_ZONE_DMA
 bool has_managed_dma(void)
 {
