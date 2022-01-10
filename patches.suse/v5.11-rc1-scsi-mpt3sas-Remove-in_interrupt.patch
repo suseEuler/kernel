@@ -1,0 +1,72 @@
+From 547c0d1aeb76fead5177cc30b95e914b498675bd Mon Sep 17 00:00:00 2001
+From: "Ahmed S. Darwish" <a.darwish@linutronix.de>
+Date: Thu, 26 Nov 2020 14:29:47 +0100
+Subject: [PATCH] scsi: mpt3sas: Remove in_interrupt()
+Git-commit: 547c0d1aeb76fead5177cc30b95e914b498675bd
+Patch-mainline: v5.11-rc1
+References: bsn#59
+
+
+_scsih_fw_event_cleanup_queue() waits for all outstanding firmware events
+wokrqueue handlers to finish. If in_interrupt() is true, it cancels itself
+and return early.
+
+That in_interrupt() check is ill-defined and does not provide what the name
+suggests: it does not cover all states in which it is safe to block and
+call functions like cancel_work_sync().
+
+That check is also not needed: _scsih_fw_event_cleanup_queue() is always
+invoked from process context. Below is an analysis of its callers:
+
+  - scsih_remove(), bound to PCI ->remove(), process context
+
+  - scsih_shutdown(), bound to PCI ->shutdown(), process context
+
+  - mpt3sas_scsih_clear_outstanding_scsi_tm_commands(), called by
+      => _base_clear_outstanding_commands(), called by
+        =>_base_fault_reset_work(), workqueue
+        => mpt3sas_base_hard_reset_handler(), locks mutex
+
+Remove the in_interrupt() check. Change _scsih_fw_event_cleanup_queue()
+specification to a purely process-context function and mark it with
+"Context: task, can sleep".
+
+Link: https://lore.kernel.org/r/20201126132952.2287996-10-bigeasy@linutronix.de
+Cc: Sathya Prakash <sathya.prakash@broadcom.com>
+Cc: Sreekanth Reddy <sreekanth.reddy@broadcom.com>
+Cc: Suganath Prabu Subramani <suganath-prabu.subramani@broadcom.com>
+Cc: <MPT-FusionLinux.pdl@broadcom.com>
+Reviewed-by: Daniel Wagner <dwagner@suse.de>
+Signed-off-by: Ahmed S. Darwish <a.darwish@linutronix.de>
+Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/scsi/mpt3sas/mpt3sas_scsih.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_scsih.c b/drivers/scsi/mpt3sas/mpt3sas_scsih.c
+index a3ee5bf715f9..c8b09a81834d 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_scsih.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_scsih.c
+@@ -3673,6 +3673,8 @@ static struct fw_event_work *dequeue_next_fw_event(struct MPT3SAS_ADAPTER *ioc)
+  *
+  * Walk the firmware event queue, either killing timers, or waiting
+  * for outstanding events to complete
++ *
++ * Context: task, can sleep
+  */
+ static void
+ _scsih_fw_event_cleanup_queue(struct MPT3SAS_ADAPTER *ioc)
+@@ -3680,7 +3682,7 @@ _scsih_fw_event_cleanup_queue(struct MPT3SAS_ADAPTER *ioc)
+ 	struct fw_event_work *fw_event;
+ 
+ 	if ((list_empty(&ioc->fw_event_list) && !ioc->current_event) ||
+-	     !ioc->firmware_event_thread || in_interrupt())
++	    !ioc->firmware_event_thread)
+ 		return;
+ 
+ 	ioc->fw_events_cleanup = 1;
+-- 
+2.26.2
+
