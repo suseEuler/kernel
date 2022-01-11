@@ -1,0 +1,64 @@
+From 7740b615b6665e47f162e261d805f1bbbac15876 Mon Sep 17 00:00:00 2001
+From: James Smart <jsmart2021@gmail.com>
+Date: Fri, 30 Jul 2021 09:33:09 -0700
+Subject: [PATCH] scsi: lpfc: Fix possible ABBA deadlock in nvmet_xri_aborted()
+Git-commit: 7740b615b6665e47f162e261d805f1bbbac15876
+Patch-mainline: v5.15-rc1
+References: bsn#61
+
+
+The lpfc_sli4_nvmet_xri_aborted() routine takes out the abts_buf_list_lock
+and traverses the buffer contexts to match the xri. Upon match, it then
+takes the context lock before potentially removing the context from the
+associated buffer list. This violates the lock hierarchy used elsewhere in
+the driver of locking context, then the abts_buf_list_lock - thus a
+possible deadlock.
+
+Resolve by: after matching, release the abts_buf_list_lock, then take the
+context lock, and if to be deleted from the list, retake the
+abts_buf_list_lock, maintaining lock hierarchy. This matches same list lock
+hierarchy as elsewhere in the driver
+
+Link: https://lore.kernel.org/r/20210730163309.25809-1-jsmart2021@gmail.com
+Reported-by: Jia-Ju Bai <baijiaju1990@gmail.com>
+Signed-off-by: James Smart <jsmart2021@gmail.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/scsi/lpfc/lpfc_nvmet.c | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/scsi/lpfc/lpfc_nvmet.c b/drivers/scsi/lpfc/lpfc_nvmet.c
+index f2d9a3580887..6e3dd0b9bcfa 100644
+--- a/drivers/scsi/lpfc/lpfc_nvmet.c
++++ b/drivers/scsi/lpfc/lpfc_nvmet.c
+@@ -1797,19 +1797,22 @@ lpfc_sli4_nvmet_xri_aborted(struct lpfc_hba *phba,
+ 		if (ctxp->ctxbuf->sglq->sli4_xritag != xri)
+ 			continue;
+ 
+-		spin_lock(&ctxp->ctxlock);
++		spin_unlock_irqrestore(&phba->sli4_hba.abts_nvmet_buf_list_lock,
++				       iflag);
++
++		spin_lock_irqsave(&ctxp->ctxlock, iflag);
+ 		/* Check if we already received a free context call
+ 		 * and we have completed processing an abort situation.
+ 		 */
+ 		if (ctxp->flag & LPFC_NVME_CTX_RLS &&
+ 		    !(ctxp->flag & LPFC_NVME_ABORT_OP)) {
++			spin_lock(&phba->sli4_hba.abts_nvmet_buf_list_lock);
+ 			list_del_init(&ctxp->list);
++			spin_unlock(&phba->sli4_hba.abts_nvmet_buf_list_lock);
+ 			released = true;
+ 		}
+ 		ctxp->flag &= ~LPFC_NVME_XBUSY;
+-		spin_unlock(&ctxp->ctxlock);
+-		spin_unlock_irqrestore(&phba->sli4_hba.abts_nvmet_buf_list_lock,
+-				       iflag);
++		spin_unlock_irqrestore(&ctxp->ctxlock, iflag);
+ 
+ 		rrq_empty = list_empty(&phba->active_rrq_list);
+ 		ndlp = lpfc_findnode_did(phba->pport, ctxp->sid);
+-- 
+2.26.2
+
