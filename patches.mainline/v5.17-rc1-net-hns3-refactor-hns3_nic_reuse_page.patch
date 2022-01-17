@@ -1,0 +1,104 @@
+From e74a726da2c4dcedb8b0631f423d0044c7901a20 Mon Sep 17 00:00:00 2001
+From: Hao Chen <chenhao288@hisilicon.com>
+Date: Mon, 29 Nov 2021 22:00:19 +0800
+Subject: [PATCH] net: hns3: refactor hns3_nic_reuse_page()
+Git-commit: e74a726da2c4dcedb8b0631f423d0044c7901a20
+Patch-mainline: v5.17-rc1
+References: bsn#12
+
+
+Split rx copybreak handle into a separate function from function
+hns3_nic_reuse_page() to improve code simplicity.
+
+Signed-off-by: Hao Chen <chenhao288@hisilicon.com>
+Signed-off-by: Guangbin Huang <huangguangbin2@huawei.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ .../net/ethernet/hisilicon/hns3/hns3_enet.c   | 55 ++++++++++++-------
+ 1 file changed, 35 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3_enet.c b/drivers/net/ethernet/hisilicon/hns3/hns3_enet.c
+index 3eb2985b9c8d..731cefb3563c 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3_enet.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3_enet.c
+@@ -3546,6 +3546,38 @@ static bool hns3_can_reuse_page(struct hns3_desc_cb *cb)
+ 	return page_count(cb->priv) == cb->pagecnt_bias;
+ }
+ 
++static int hns3_handle_rx_copybreak(struct sk_buff *skb, int i,
++				    struct hns3_enet_ring *ring,
++				    int pull_len,
++				    struct hns3_desc_cb *desc_cb)
++{
++	struct hns3_desc *desc = &ring->desc[ring->next_to_clean];
++	u32 frag_offset = desc_cb->page_offset + pull_len;
++	int size = le16_to_cpu(desc->rx.size);
++	u32 frag_size = size - pull_len;
++	void *frag = napi_alloc_frag(frag_size);
++
++	if (unlikely(!frag)) {
++		u64_stats_update_begin(&ring->syncp);
++		ring->stats.frag_alloc_err++;
++		u64_stats_update_end(&ring->syncp);
++
++		hns3_rl_err(ring_to_netdev(ring),
++			    "failed to allocate rx frag\n");
++		return -ENOMEM;
++	}
++
++	desc_cb->reuse_flag = 1;
++	memcpy(frag, desc_cb->buf + frag_offset, frag_size);
++	skb_add_rx_frag(skb, i, virt_to_page(frag),
++			offset_in_page(frag), frag_size, frag_size);
++
++	u64_stats_update_begin(&ring->syncp);
++	ring->stats.frag_alloc++;
++	u64_stats_update_end(&ring->syncp);
++	return 0;
++}
++
+ static void hns3_nic_reuse_page(struct sk_buff *skb, int i,
+ 				struct hns3_enet_ring *ring, int pull_len,
+ 				struct hns3_desc_cb *desc_cb)
+@@ -3555,6 +3587,7 @@ static void hns3_nic_reuse_page(struct sk_buff *skb, int i,
+ 	int size = le16_to_cpu(desc->rx.size);
+ 	u32 truesize = hns3_buf_size(ring);
+ 	u32 frag_size = size - pull_len;
++	int ret = 0;
+ 	bool reused;
+ 
+ 	if (ring->page_pool) {
+@@ -3589,27 +3622,9 @@ static void hns3_nic_reuse_page(struct sk_buff *skb, int i,
+ 		desc_cb->page_offset = 0;
+ 		desc_cb->reuse_flag = 1;
+ 	} else if (frag_size <= ring->rx_copybreak) {
+-		void *frag = napi_alloc_frag(frag_size);
+-
+-		if (unlikely(!frag)) {
+-			u64_stats_update_begin(&ring->syncp);
+-			ring->stats.frag_alloc_err++;
+-			u64_stats_update_end(&ring->syncp);
+-
+-			hns3_rl_err(ring_to_netdev(ring),
+-				    "failed to allocate rx frag\n");
++		ret = hns3_handle_rx_copybreak(skb, i, ring, pull_len, desc_cb);
++		if (ret)
+ 			goto out;
+-		}
+-
+-		desc_cb->reuse_flag = 1;
+-		memcpy(frag, desc_cb->buf + frag_offset, frag_size);
+-		skb_add_rx_frag(skb, i, virt_to_page(frag),
+-				offset_in_page(frag), frag_size, frag_size);
+-
+-		u64_stats_update_begin(&ring->syncp);
+-		ring->stats.frag_alloc++;
+-		u64_stats_update_end(&ring->syncp);
+-		return;
+ 	}
+ 
+ out:
+-- 
+2.26.2
+
