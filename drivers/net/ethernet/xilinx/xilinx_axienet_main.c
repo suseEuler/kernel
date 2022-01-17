@@ -1359,8 +1359,11 @@ static void axienet_ethtools_get_regs(struct net_device *ndev,
 	data[39] = axienet_dma_in32(lp, XAXIDMA_RX_TDESC_OFFSET);
 }
 
-static void axienet_ethtools_get_ringparam(struct net_device *ndev,
-					   struct ethtool_ringparam *ering)
+static void
+axienet_ethtools_get_ringparam(struct net_device *ndev,
+			       struct ethtool_ringparam *ering,
+			       struct kernel_ethtool_ringparam *kernel_ering,
+			       struct netlink_ext_ack *extack)
 {
 	struct axienet_local *lp = netdev_priv(ndev);
 
@@ -1374,8 +1377,11 @@ static void axienet_ethtools_get_ringparam(struct net_device *ndev,
 	ering->tx_pending = lp->tx_bd_num;
 }
 
-static int axienet_ethtools_set_ringparam(struct net_device *ndev,
-					  struct ethtool_ringparam *ering)
+static int
+axienet_ethtools_set_ringparam(struct net_device *ndev,
+			       struct ethtool_ringparam *ering,
+			       struct kernel_ethtool_ringparam *kernel_ering,
+			       struct netlink_ext_ack *extack)
 {
 	struct axienet_local *lp = netdev_priv(ndev);
 
