@@ -1,0 +1,109 @@
+From c646236344e9054cc84cd5a9f763163b9654cf7e Mon Sep 17 00:00:00 2001
+From: Like Xu <like.xu@linux.intel.com>
+Date: Mon, 1 Feb 2021 13:10:31 +0800
+Subject: [PATCH] KVM: vmx/pmu: Add PMU_CAP_LBR_FMT check when guest LBR is
+ enabled
+Git-commit: c646236344e9054cc84cd5a9f763163b9654cf7e
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+Usespace could set the bits [0, 5] of the IA32_PERF_CAPABILITIES
+MSR which tells about the record format stored in the LBR records.
+
+The LBR will be enabled on the guest if host perf supports LBR
+(checked via x86_perf_get_lbr()) and the vcpu model is compatible
+with the host one.
+
+Signed-off-by: Like Xu <like.xu@linux.intel.com>
+Message-Id: <20210201051039.255478-4-like.xu@linux.intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/kvm/vmx/capabilities.h |  7 ++++++-
+ arch/x86/kvm/vmx/pmu_intel.c    |  7 +++++++
+ arch/x86/kvm/vmx/vmx.c          | 12 +++++++++++-
+ arch/x86/kvm/vmx/vmx.h          |  1 +
+ 4 files changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/arch/x86/kvm/vmx/capabilities.h b/arch/x86/kvm/vmx/capabilities.h
+index da3db1a37b34..787edd8c1fc7 100644
+--- a/arch/x86/kvm/vmx/capabilities.h
++++ b/arch/x86/kvm/vmx/capabilities.h
+@@ -387,7 +387,12 @@ static inline u64 vmx_get_perf_capabilities(void)
+ 
+ static inline u64 vmx_supported_debugctl(void)
+ {
+-	return 0;
++	u64 debugctl = 0;
++
++	if (vmx_get_perf_capabilities() & PMU_CAP_LBR_FMT)
++		debugctl |= DEBUGCTLMSR_LBR;
++
++	return debugctl;
+ }
+ 
+ #endif /* __KVM_X86_VMX_CAPS_H */
+diff --git a/arch/x86/kvm/vmx/pmu_intel.c b/arch/x86/kvm/vmx/pmu_intel.c
+index d21104e6f9ec..48529dd127bb 100644
+--- a/arch/x86/kvm/vmx/pmu_intel.c
++++ b/arch/x86/kvm/vmx/pmu_intel.c
+@@ -183,6 +183,13 @@ bool intel_pmu_lbr_is_compatible(struct kvm_vcpu *vcpu)
+ 	return boot_cpu_data.x86_model == guest_cpuid_model(vcpu);
+ }
+ 
++bool intel_pmu_lbr_is_enabled(struct kvm_vcpu *vcpu)
++{
++	struct x86_pmu_lbr *lbr = vcpu_to_lbr_records(vcpu);
++
++	return lbr->nr && (vcpu_get_perf_capabilities(vcpu) & PMU_CAP_LBR_FMT);
++}
++
+ static bool intel_is_valid_msr(struct kvm_vcpu *vcpu, u32 msr)
+ {
+ 	struct kvm_pmu *pmu = vcpu_to_pmu(vcpu);
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 9a978a49721b..c5cbef2402b8 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -1950,6 +1950,16 @@ static u64 nested_vmx_truncate_sysenter_addr(struct kvm_vcpu *vcpu,
+ 	return (unsigned long)data;
+ }
+ 
++static u64 vcpu_supported_debugctl(struct kvm_vcpu *vcpu)
++{
++	u64 debugctl = vmx_supported_debugctl();
++
++	if (!intel_pmu_lbr_is_enabled(vcpu))
++		debugctl &= ~DEBUGCTLMSR_LBR;
++
++	return debugctl;
++}
++
+ /*
+  * Writes msr value into the appropriate "register".
+  * Returns 0 on success, non-0 otherwise.
+@@ -2001,7 +2011,7 @@ static int vmx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 		vmcs_writel(GUEST_SYSENTER_ESP, data);
+ 		break;
+ 	case MSR_IA32_DEBUGCTLMSR: {
+-		u64 invalid = data & ~vmx_supported_debugctl();
++		u64 invalid = data & ~vcpu_supported_debugctl(vcpu);
+ 		if (invalid & (DEBUGCTLMSR_BTF|DEBUGCTLMSR_LBR)) {
+ 			if (report_ignored_msrs)
+ 				vcpu_unimpl(vcpu, "%s: BTF|LBR in IA32_DEBUGCTLMSR 0x%llx, nop\n",
+diff --git a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
+index df61b0d09eb7..3836daf7d489 100644
+--- a/arch/x86/kvm/vmx/vmx.h
++++ b/arch/x86/kvm/vmx/vmx.h
+@@ -97,6 +97,7 @@ union vmx_exit_reason {
+ #define vcpu_to_lbr_records(vcpu) (&to_vmx(vcpu)->lbr_desc.records)
+ 
+ bool intel_pmu_lbr_is_compatible(struct kvm_vcpu *vcpu);
++bool intel_pmu_lbr_is_enabled(struct kvm_vcpu *vcpu);
+ 
+ struct lbr_desc {
+ 	/* Basic info about guest LBR records. */
+-- 
+2.26.2
+

@@ -1,0 +1,137 @@
+From d8a6de61e51f6433c7f0f8ab81b20dc43161a8a5 Mon Sep 17 00:00:00 2001
+From: Wang Yufen <wangyufen@huawei.com>
+Date: Fri, 7 Jan 2022 23:07:18 +0800
+Subject: [PATCH] tcp_comp: only enable compression for give server ports
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: d8a6de61e51f6433c7f0f8ab81b20dc43161a8a5
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4PNEK
+CVE: NA
+
+-------------------------------------------------
+
+Only enable compression for give server ports, this means we will
+check either dport when send SYN or sport when send SYN-ACK.
+
+Signed-off-by: Wei Yongjun <weiyongjun1@huawei.com>
+Signed-off-by: Wang Yufen <wangyufen@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Lu Wei <luwei32@huawei.com>
+Reviewed-by: Wei Yongjun <weiyongjun1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/net/tcp.h     |  2 +-
+ net/ipv4/tcp_comp.c   | 18 ++++++++++++++++--
+ net/ipv4/tcp_output.c | 12 ++++++------
+ 3 files changed, 23 insertions(+), 9 deletions(-)
+
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index 9725b1038c84..353a0d9e4c8e 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -2385,7 +2385,7 @@ extern struct static_key_false tcp_have_comp;
+ 
+ extern unsigned long *sysctl_tcp_compression_ports;
+ 
+-bool tcp_syn_comp_enabled(const struct tcp_sock *tp);
++bool tcp_syn_comp_enabled(const struct sock *sk, bool active);
+ void tcp_init_compression(struct sock *sk);
+ void tcp_cleanup_compression(struct sock *sk);
+ #else
+diff --git a/net/ipv4/tcp_comp.c b/net/ipv4/tcp_comp.c
+index 3493255d34df..fb76813aa106 100644
+--- a/net/ipv4/tcp_comp.c
++++ b/net/ipv4/tcp_comp.c
+@@ -11,13 +11,27 @@ static unsigned long tcp_compression_ports[65536 / 8];
+ 
+ unsigned long *sysctl_tcp_compression_ports = tcp_compression_ports;
+ 
+-bool tcp_syn_comp_enabled(const struct tcp_sock *tp)
++bool tcp_syn_comp_enabled(const struct sock *sk, bool active)
+ {
+-	return true;
++	struct inet_sock *inet = inet_sk(sk);
++	int port;
++
++	if (active)
++		port = ntohs(inet->inet_dport);
++	else
++		port = ntohs(inet->inet_sport);
++
++	return test_bit(port, sysctl_tcp_compression_ports);
+ }
+ 
+ void tcp_init_compression(struct sock *sk)
+ {
++	struct tcp_sock *tp = tcp_sk(sk);
++
++	if (!tp->rx_opt.comp_ok)
++		return;
++
++	sock_set_flag(sk, SOCK_COMP);
+ }
+ 
+ void tcp_cleanup_compression(struct sock *sk)
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index 7e95af49acba..3ef6b1186f45 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -736,13 +736,13 @@ static void smc_set_option(const struct tcp_sock *tp,
+ #endif
+ }
+ 
+-static void comp_set_option(const struct tcp_sock *tp,
++static void comp_set_option(const struct sock *sk,
+ 			    struct tcp_out_options *opts,
+ 			    unsigned int *remaining)
+ {
+ #if IS_ENABLED(CONFIG_TCP_COMP)
+ 	if (static_branch_unlikely(&tcp_have_comp)) {
+-		if (tcp_syn_comp_enabled(tp)) {
++		if (tcp_syn_comp_enabled(sk, true)) {
+ 			if (*remaining >= TCPOLEN_EXP_COMP_BASE) {
+ 				opts->options |= OPTION_COMP;
+ 				*remaining -= TCPOLEN_EXP_COMP_BASE;
+@@ -752,14 +752,14 @@ static void comp_set_option(const struct tcp_sock *tp,
+ #endif
+ }
+ 
+-static void comp_set_option_cond(const struct tcp_sock *tp,
++static void comp_set_option_cond(const struct sock *sk,
+ 				 const struct inet_request_sock *ireq,
+ 				 struct tcp_out_options *opts,
+ 				 unsigned int *remaining)
+ {
+ #if IS_ENABLED(CONFIG_TCP_COMP)
+ 	if (static_branch_unlikely(&tcp_have_comp)) {
+-		if (tcp_syn_comp_enabled(tp) && ireq->comp_ok) {
++		if (tcp_syn_comp_enabled(sk, false) && ireq->comp_ok) {
+ 			if (*remaining >= TCPOLEN_EXP_COMP_BASE) {
+ 				opts->options |= OPTION_COMP;
+ 				*remaining -= TCPOLEN_EXP_COMP_BASE;
+@@ -870,7 +870,7 @@ static unsigned int tcp_syn_options(struct sock *sk, struct sk_buff *skb,
+ 	}
+ 
+ 	smc_set_option(tp, opts, &remaining);
+-	comp_set_option(tp, opts, &remaining);
++	comp_set_option(sk, opts, &remaining);
+ 
+ 	if (sk_is_mptcp(sk)) {
+ 		unsigned int size;
+@@ -951,7 +951,7 @@ static unsigned int tcp_synack_options(const struct sock *sk,
+ 
+ 	smc_set_option_cond(tcp_sk(sk), ireq, opts, &remaining);
+ 
+-	comp_set_option_cond(tcp_sk(sk), ireq, opts, &remaining);
++	comp_set_option_cond(sk, ireq, opts, &remaining);
+ 
+ 	bpf_skops_hdr_opt_len((struct sock *)sk, skb, req, syn_skb,
+ 			      synack_type, opts, &remaining);
+-- 
+2.26.2
+

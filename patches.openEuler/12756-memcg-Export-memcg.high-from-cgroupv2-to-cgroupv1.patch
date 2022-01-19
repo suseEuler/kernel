@@ -1,0 +1,166 @@
+From 6a7b3e981e49ee12d3d0108fd8dd77d599889085 Mon Sep 17 00:00:00 2001
+From: Lu Jialin <lujialin4@huawei.com>
+Date: Fri, 7 Jan 2022 23:05:25 +0800
+Subject: [PATCH] memcg: Export memcg.high from cgroupv2 to cgroupv1
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 6a7b3e981e49ee12d3d0108fd8dd77d599889085
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4IMAK?from=project-issue
+CVE: NA
+
+--------
+
+Export memory.high from cgroupv2 to cgroupv1. Therefore, when the usage
+of the memcg is larger than memory.high, some pages will be reclaimed
+before return to userland, which will throttle the process.
+
+Only export memory.high number in mem_cgroup_legacy_files and move
+related functions in front of mem_cgroup_legacy_files. There is no need
+to other changes.
+
+Signed-off-by: Lu Jialin <lujialin4@huawei.com>
+Reviewed-by: weiyang wang <wangweiyang2@huawei.com>
+Reviewed-by: weiyang wang <wangweiyang2@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/memcontrol.c | 104 +++++++++++++++++++++++++-----------------------
+ 1 file changed, 55 insertions(+), 49 deletions(-)
+
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index e0efdbbddd80..f93bfe1659a3 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -5069,6 +5069,55 @@ static ssize_t memory_low_write(struct kernfs_open_file *of,
+ 	return nbytes;
+ }
+ 
++static int memory_high_show(struct seq_file *m, void *v)
++{
++	return seq_puts_memcg_tunable(m,
++		READ_ONCE(mem_cgroup_from_seq(m)->memory.high));
++}
++
++static ssize_t memory_high_write(struct kernfs_open_file *of,
++				 char *buf, size_t nbytes, loff_t off)
++{
++	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
++	unsigned int nr_retries = MAX_RECLAIM_RETRIES;
++	bool drained = false;
++	unsigned long high;
++	int err;
++
++	buf = strstrip(buf);
++	err = page_counter_memparse(buf, "max", &high);
++	if (err)
++		return err;
++
++	page_counter_set_high(&memcg->memory, high);
++
++	for (;;) {
++		unsigned long nr_pages = page_counter_read(&memcg->memory);
++		unsigned long reclaimed;
++
++		if (nr_pages <= high)
++			break;
++
++		if (signal_pending(current))
++			break;
++
++		if (!drained) {
++			drain_all_stock(memcg);
++			drained = true;
++			continue;
++		}
++
++		reclaimed = try_to_free_mem_cgroup_pages(memcg, nr_pages - high,
++							 GFP_KERNEL, true);
++
++		if (!reclaimed && !nr_retries--)
++			break;
++	}
++
++	memcg_wb_domain_size_changed(memcg);
++	return nbytes;
++}
++
+ static struct cftype mem_cgroup_legacy_files[] = {
+ 	{
+ 		.name = "usage_in_bytes",
+@@ -5214,6 +5263,12 @@ static struct cftype mem_cgroup_legacy_files[] = {
+ 		.seq_show = memory_low_show,
+ 		.write = memory_low_write,
+ 	},
++	{
++		.name = "high",
++		.flags = CFTYPE_NOT_ON_ROOT,
++		.seq_show = memory_high_show,
++		.write = memory_high_write,
++	},
+ 	{ },	/* terminate */
+ };
+ 
+@@ -6417,55 +6472,6 @@ static u64 memory_current_read(struct cgroup_subsys_state *css,
+ 	return (u64)page_counter_read(&memcg->memory) * PAGE_SIZE;
+ }
+ 
+-static int memory_high_show(struct seq_file *m, void *v)
+-{
+-	return seq_puts_memcg_tunable(m,
+-		READ_ONCE(mem_cgroup_from_seq(m)->memory.high));
+-}
+-
+-static ssize_t memory_high_write(struct kernfs_open_file *of,
+-				 char *buf, size_t nbytes, loff_t off)
+-{
+-	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
+-	unsigned int nr_retries = MAX_RECLAIM_RETRIES;
+-	bool drained = false;
+-	unsigned long high;
+-	int err;
+-
+-	buf = strstrip(buf);
+-	err = page_counter_memparse(buf, "max", &high);
+-	if (err)
+-		return err;
+-
+-	page_counter_set_high(&memcg->memory, high);
+-
+-	for (;;) {
+-		unsigned long nr_pages = page_counter_read(&memcg->memory);
+-		unsigned long reclaimed;
+-
+-		if (nr_pages <= high)
+-			break;
+-
+-		if (signal_pending(current))
+-			break;
+-
+-		if (!drained) {
+-			drain_all_stock(memcg);
+-			drained = true;
+-			continue;
+-		}
+-
+-		reclaimed = try_to_free_mem_cgroup_pages(memcg, nr_pages - high,
+-							 GFP_KERNEL, true);
+-
+-		if (!reclaimed && !nr_retries--)
+-			break;
+-	}
+-
+-	memcg_wb_domain_size_changed(memcg);
+-	return nbytes;
+-}
+-
+ static int memory_max_show(struct seq_file *m, void *v)
+ {
+ 	return seq_puts_memcg_tunable(m,
+-- 
+2.26.2
+

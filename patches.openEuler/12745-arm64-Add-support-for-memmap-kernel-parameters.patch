@@ -1,0 +1,150 @@
+From d05cfbd95ab2e4186721be1cfb4a15e0d80dbc47 Mon Sep 17 00:00:00 2001
+From: Peng Liu <liupeng256@huawei.com>
+Date: Fri, 7 Jan 2022 18:00:18 +0800
+Subject: [PATCH] arm64: Add support for memmap kernel parameters
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: d05cfbd95ab2e4186721be1cfb4a15e0d80dbc47
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4NYPZ
+CVE: NA
+
+-------------------------------------------------
+
+Add support for memmap kernel parameters for ARM64. The three below
+modes are supported:
+
+memmap=exactmap
+Enable setting of an exact memory map, as specified by the user.
+
+memmap=nn[KMG]@ss[KMG]
+Force usage of a specific region of memory.
+
+memmap=nn[KMG]$ss[KMG]
+Region of memory to be reserved is from ss to ss+nn, the region must
+be in the range of existed memory, otherwise will be ignored.
+
+If users set memmap=exactmap before memmap=nn[KMG]@ss[KMG], they will
+get the exact memory specified by memmap=nn[KMG]@ss[KMG]. For example,
+on one machine with 4GB memory, "memmap=exactmap memmap=1G@1G" will
+make kernel use the memory from 1GB to 2GB only.
+
+Signed-off-by: Peng Liu <liupeng256@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ .../admin-guide/kernel-parameters.txt         |  9 ++-
+ arch/arm64/mm/init.c                          | 59 +++++++++++++++++++
+ 2 files changed, 65 insertions(+), 3 deletions(-)
+
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index de8f7d447295..64be32ba4373 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -2794,8 +2794,8 @@
+ 			option.
+ 			See Documentation/admin-guide/mm/memory-hotplug.rst.
+ 
+-	memmap=exactmap	[KNL,X86] Enable setting of an exact
+-			E820 memory map, as specified by the user.
++	memmap=exactmap	[KNL,X86,ARM64] Enable setting of an exact
++			E820 and ARM64 memory map, as specified by the user.
+ 			Such memmap=exactmap lines can be constructed based on
+ 			BIOS output or other requirements. See the memmap=nn@ss
+ 			option description.
+@@ -2806,7 +2806,8 @@
+ 			If @ss[KMG] is omitted, it is equivalent to mem=nn[KMG],
+ 			which limits max address to nn[KMG].
+ 			Multiple different regions can be specified,
+-			comma delimited.
++			comma delimited, example as follows is not supported to
++			ARM64.
+ 			Example:
+ 				memmap=100M@2G,100M#3G,1G!1024G
+ 
+@@ -2817,6 +2818,8 @@
+ 	memmap=nn[KMG]$ss[KMG]
+ 			[KNL,ACPI] Mark specific memory as reserved.
+ 			Region of memory to be reserved is from ss to ss+nn.
++			For ARM64, reserved memory must be in the range of
++			existed memory.
+ 			Example: Exclude memory from 0x18690000-0x1869ffff
+ 			         memmap=64K$0x18690000
+ 			         or
+diff --git a/arch/arm64/mm/init.c b/arch/arm64/mm/init.c
+index e8d446164c76..f59546d3b0de 100644
+--- a/arch/arm64/mm/init.c
++++ b/arch/arm64/mm/init.c
+@@ -404,6 +404,65 @@ static int __init reserve_park_mem(void)
+ }
+ #endif
+ 
++static int need_remove_real_memblock __initdata;
++
++static int __init parse_memmap_one(char *p)
++{
++	char *oldp;
++	u64 start_at, mem_size;
++
++	if (!p)
++		return -EINVAL;
++
++	if (!strncmp(p, "exactmap", 8)) {
++		need_remove_real_memblock = 1;
++		return -EINVAL;
++	}
++
++	oldp = p;
++	mem_size = memparse(p, &p);
++	if (p == oldp)
++		return -EINVAL;
++
++	if (!mem_size)
++		return -EINVAL;
++
++	if (*p == '@') {
++		start_at = memparse(p + 1, &p);
++		/*
++		 * use the exactmap defined by nn[KMG]@ss[KMG], remove
++		 * memblock populated by DT etc.
++		 */
++		if (need_remove_real_memblock) {
++			need_remove_real_memblock = 0;
++			memblock_remove(0, ULLONG_MAX);
++		}
++		memblock_add(start_at, mem_size);
++	} else if (*p == '$') {
++		start_at = memparse(p + 1, &p);
++		memblock_reserve(start_at, mem_size);
++	} else
++		pr_info("Unrecognized memmap option, please check the parameter.\n");
++
++	return *p == '\0' ? 0 : -EINVAL;
++}
++
++static int __init parse_memmap_opt(char *str)
++{
++	while (str) {
++		char *k = strchr(str, ',');
++
++		if (k)
++			*k++ = 0;
++
++		parse_memmap_one(str);
++		str = k;
++	}
++
++	return 0;
++}
++early_param("memmap", parse_memmap_opt);
++
+ void __init arm64_memblock_init(void)
+ {
+ 	const s64 linear_region_size = BIT(vabits_actual - 1);
+-- 
+2.26.2
+

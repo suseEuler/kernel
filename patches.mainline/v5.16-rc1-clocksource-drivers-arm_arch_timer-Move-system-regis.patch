@@ -1,0 +1,167 @@
+From a38b71b0833eb2fabd2b1fa37d665c0a88b8b7e4 Mon Sep 17 00:00:00 2001
+From: Marc Zyngier <maz@kernel.org>
+Date: Sun, 17 Oct 2021 13:42:12 +0100
+Subject: [PATCH] clocksource/drivers/arm_arch_timer: Move system register
+ timer programming over to CVAL
+Git-commit: a38b71b0833eb2fabd2b1fa37d665c0a88b8b7e4
+Patch-mainline: v5.16-rc1
+References: bsn#12
+
+
+In order to cope better with high frequency counters, move the
+programming of the timers from the countdown timer (TVAL) over
+to the comparator (CVAL).
+
+The programming model is slightly different, as we now need to
+read the current counter value to have an absolute deadline
+instead of a relative one.
+
+There is a small overhead to this change, which we will address
+in the following patches.
+
+Reviewed-by: Oliver Upton <oupton@google.com>
+Reviewed-by: Mark Rutland <mark.rutland@arm.com>
+Tested-by: Mark Rutland <mark.rutland@arm.com>
+Signed-off-by: Marc Zyngier <maz@kernel.org>
+Link: https://lore.kernel.org/r/20211017124225.3018098-5-maz@kernel.org
+Signed-off-by: Daniel Lezcano <daniel.lezcano@linaro.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm/include/asm/arch_timer.h    |  8 ++++----
+ arch/arm64/include/asm/arch_timer.h  | 10 +++++-----
+ drivers/clocksource/arm_arch_timer.c | 26 +++++++++++++++++++++++---
+ include/clocksource/arm_arch_timer.h |  1 +
+ 4 files changed, 33 insertions(+), 12 deletions(-)
+
+diff --git a/arch/arm/include/asm/arch_timer.h b/arch/arm/include/asm/arch_timer.h
+index 1482e70da7d3..a9b2b721c7f9 100644
+--- a/arch/arm/include/asm/arch_timer.h
++++ b/arch/arm/include/asm/arch_timer.h
+@@ -31,8 +31,8 @@ void arch_timer_reg_write_cp15(int access, enum arch_timer_reg reg, u64 val)
+ 		case ARCH_TIMER_REG_CTRL:
+ 			asm volatile("mcr p15, 0, %0, c14, c2, 1" : : "r" ((u32)val));
+ 			break;
+-		case ARCH_TIMER_REG_TVAL:
+-			asm volatile("mcr p15, 0, %0, c14, c2, 0" : : "r" ((u32)val));
++		case ARCH_TIMER_REG_CVAL:
++			asm volatile("mcrr p15, 2, %Q0, %R0, c14" : : "r" (val));
+ 			break;
+ 		default:
+ 			BUILD_BUG();
+@@ -42,8 +42,8 @@ void arch_timer_reg_write_cp15(int access, enum arch_timer_reg reg, u64 val)
+ 		case ARCH_TIMER_REG_CTRL:
+ 			asm volatile("mcr p15, 0, %0, c14, c3, 1" : : "r" ((u32)val));
+ 			break;
+-		case ARCH_TIMER_REG_TVAL:
+-			asm volatile("mcr p15, 0, %0, c14, c3, 0" : : "r" ((u32)val));
++		case ARCH_TIMER_REG_CVAL:
++			asm volatile("mcrr p15, 3, %Q0, %R0, c14" : : "r" (val));
+ 			break;
+ 		default:
+ 			BUILD_BUG();
+diff --git a/arch/arm64/include/asm/arch_timer.h b/arch/arm64/include/asm/arch_timer.h
+index 43f827b680d0..4f4aa13dd01e 100644
+--- a/arch/arm64/include/asm/arch_timer.h
++++ b/arch/arm64/include/asm/arch_timer.h
+@@ -96,8 +96,8 @@ void arch_timer_reg_write_cp15(int access, enum arch_timer_reg reg, u64 val)
+ 		case ARCH_TIMER_REG_CTRL:
+ 			write_sysreg(val, cntp_ctl_el0);
+ 			break;
+-		case ARCH_TIMER_REG_TVAL:
+-			write_sysreg(val, cntp_tval_el0);
++		case ARCH_TIMER_REG_CVAL:
++			write_sysreg(val, cntp_cval_el0);
+ 			break;
+ 		default:
+ 			BUILD_BUG();
+@@ -107,8 +107,8 @@ void arch_timer_reg_write_cp15(int access, enum arch_timer_reg reg, u64 val)
+ 		case ARCH_TIMER_REG_CTRL:
+ 			write_sysreg(val, cntv_ctl_el0);
+ 			break;
+-		case ARCH_TIMER_REG_TVAL:
+-			write_sysreg(val, cntv_tval_el0);
++		case ARCH_TIMER_REG_CVAL:
++			write_sysreg(val, cntv_cval_el0);
+ 			break;
+ 		default:
+ 			BUILD_BUG();
+@@ -121,7 +121,7 @@ void arch_timer_reg_write_cp15(int access, enum arch_timer_reg reg, u64 val)
+ }
+ 
+ static __always_inline
+-u32 arch_timer_reg_read_cp15(int access, enum arch_timer_reg reg)
++u64 arch_timer_reg_read_cp15(int access, enum arch_timer_reg reg)
+ {
+ 	if (access == ARCH_TIMER_PHYS_ACCESS) {
+ 		switch (reg) {
+diff --git a/drivers/clocksource/arm_arch_timer.c b/drivers/clocksource/arm_arch_timer.c
+index a49bcefaa370..322165468edf 100644
+--- a/drivers/clocksource/arm_arch_timer.c
++++ b/drivers/clocksource/arm_arch_timer.c
+@@ -691,10 +691,18 @@ static __always_inline void set_next_event(const int access, unsigned long evt,
+ 					   struct clock_event_device *clk)
+ {
+ 	unsigned long ctrl;
++	u64 cnt;
++
+ 	ctrl = arch_timer_reg_read(access, ARCH_TIMER_REG_CTRL, clk);
+ 	ctrl |= ARCH_TIMER_CTRL_ENABLE;
+ 	ctrl &= ~ARCH_TIMER_CTRL_IT_MASK;
+-	arch_timer_reg_write(access, ARCH_TIMER_REG_TVAL, evt, clk);
++
++	if (access == ARCH_TIMER_PHYS_ACCESS)
++		cnt = __arch_counter_get_cntpct();
++	else
++		cnt = __arch_counter_get_cntvct();
++
++	arch_timer_reg_write(access, ARCH_TIMER_REG_CVAL, evt + cnt, clk);
+ 	arch_timer_reg_write(access, ARCH_TIMER_REG_CTRL, ctrl, clk);
+ }
+ 
+@@ -712,17 +720,29 @@ static int arch_timer_set_next_event_phys(unsigned long evt,
+ 	return 0;
+ }
+ 
++static __always_inline void set_next_event_mem(const int access, unsigned long evt,
++					   struct clock_event_device *clk)
++{
++	unsigned long ctrl;
++	ctrl = arch_timer_reg_read(access, ARCH_TIMER_REG_CTRL, clk);
++	ctrl |= ARCH_TIMER_CTRL_ENABLE;
++	ctrl &= ~ARCH_TIMER_CTRL_IT_MASK;
++
++	arch_timer_reg_write(access, ARCH_TIMER_REG_TVAL, evt, clk);
++	arch_timer_reg_write(access, ARCH_TIMER_REG_CTRL, ctrl, clk);
++}
++
+ static int arch_timer_set_next_event_virt_mem(unsigned long evt,
+ 					      struct clock_event_device *clk)
+ {
+-	set_next_event(ARCH_TIMER_MEM_VIRT_ACCESS, evt, clk);
++	set_next_event_mem(ARCH_TIMER_MEM_VIRT_ACCESS, evt, clk);
+ 	return 0;
+ }
+ 
+ static int arch_timer_set_next_event_phys_mem(unsigned long evt,
+ 					      struct clock_event_device *clk)
+ {
+-	set_next_event(ARCH_TIMER_MEM_PHYS_ACCESS, evt, clk);
++	set_next_event_mem(ARCH_TIMER_MEM_PHYS_ACCESS, evt, clk);
+ 	return 0;
+ }
+ 
+diff --git a/include/clocksource/arm_arch_timer.h b/include/clocksource/arm_arch_timer.h
+index 73c7139c866f..d59537afb29d 100644
+--- a/include/clocksource/arm_arch_timer.h
++++ b/include/clocksource/arm_arch_timer.h
+@@ -25,6 +25,7 @@
+ enum arch_timer_reg {
+ 	ARCH_TIMER_REG_CTRL,
+ 	ARCH_TIMER_REG_TVAL,
++	ARCH_TIMER_REG_CVAL,
+ };
+ 
+ enum arch_timer_ppi_nr {
+-- 
+2.26.2
+

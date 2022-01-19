@@ -1,0 +1,70 @@
+From 9c7e37e5fbf15437840a716da6dde38040ee0125 Mon Sep 17 00:00:00 2001
+From: yangerkun <yangerkun@huawei.com>
+Date: Fri, 14 Jan 2022 19:29:12 +0800
+Subject: [PATCH] pipe: Fix endless sleep problem due to the out-of-order
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 9c7e37e5fbf15437840a716da6dde38040ee0125
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 185885 https://gitee.com/openeuler/kernel/issues/I4DDEL
+
+---------------------------
+
+Thers is a out-of-order access problem which would cause endless sleep
+when we use pipe with epoll.
+
+The story is following, we assume the ring size is 2, the ring head
+is 1, the ring tail is 0, task0 is write task, task1 is read task,
+task2 is write task.
+Task0                                   Task1           Task2
+epoll_ctl(fd, EPOLL_CTL_ADD, ...)
+  pipe_poll()
+    poll_wait()
+    tail = READ_ONCE(pipe->tail);
+        // Re-order and get tail=0
+                                        pipe_read
+                                        tail++ //tail=1
+                                                        pipe_write
+                                                        head++ //head=2
+    head = READ_ONCE(pipe->head);
+        // head = 2
+    check ring is full by head - tail
+Task0 get head = 2 and tail = 0, so it mistake that the pipe ring is
+full, then task0 is not add into ready list. If the ring is not full
+anymore, task0 would not be woken up forever.
+
+The reason of this problem is that we got inconsistent head/tail value
+of the pipe ring, so we fix the problem by getting them protected.
+
+Signed-off-by: yangerkun <yangerkun@huawei.com>
+Signed-off-by: Zhang Xiaoxu <zhangxiaoxu5@huawei.com>
+Reviewed-by: Zhang Yi <yi.zhang@huawei.com>
+
+Signed-off-by: Chen Jun <chenjun102@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/pipe.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/fs/pipe.c b/fs/pipe.c
+index d6d4019ba32f..f5ae4feb512e 100644
+--- a/fs/pipe.c
++++ b/fs/pipe.c
+@@ -669,8 +669,10 @@ pipe_poll(struct file *filp, poll_table *wait)
+ 	 * if something changes and you got it wrong, the poll
+ 	 * table entry will wake you up and fix it.
+ 	 */
++	spin_lock_irq(&pipe->rd_wait.lock);
+ 	head = READ_ONCE(pipe->head);
+ 	tail = READ_ONCE(pipe->tail);
++	spin_unlock_irq(&pipe->rd_wait.lock);
+ 
+ 	mask = 0;
+ 	if (filp->f_mode & FMODE_READ) {
+-- 
+2.26.2
+

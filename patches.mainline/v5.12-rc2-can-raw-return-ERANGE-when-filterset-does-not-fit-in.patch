@@ -1,0 +1,66 @@
+From 0de70e287b44a0735273919c987313f021cccb72 Mon Sep 17 00:00:00 2001
+From: Oliver Hartkopp <socketcan@hartkopp.net>
+Date: Wed, 16 Dec 2020 18:49:28 +0100
+Subject: [PATCH] can: raw: return -ERANGE when filterset does not fit into
+ user space buffer
+Git-commit: 0de70e287b44a0735273919c987313f021cccb72
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+Multiple filters (struct can_filter) can be set with the setsockopt()
+function, which was originally intended as a write-only operation.
+
+As getsockopt() also provides a CAN_RAW_FILTER option to read back the
+given filters, the caller has to provide an appropriate user space buffer.
+In the case this buffer is too small the getsockopt() silently truncates
+the filter information and gives no information about the needed space.
+This is safe but not convenient for the programmer.
+
+In net/core/sock.c the SO_PEERGROUPS sockopt had a similar requirement
+and solved it by returning -ERANGE in the case that the provided data
+does not fit into the given user space buffer and fills the required size
+into optlen, so that the caller can retry with a matching buffer length.
+
+This patch adopts this approach for CAN_RAW_FILTER getsockopt().
+
+Reported-by: Phillip Schichtel <phillip@schich.tel>
+Signed-off-by: Oliver Hartkopp <socketcan@hartkopp.net>
+Tested-By: Phillip Schichtel <phillip@schich.tel>
+Link: https://lore.kernel.org/r/20201216174928.21663-1-socketcan@hartkopp.net
+Signed-off-by: Marc Kleine-Budde <mkl@pengutronix.de>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ net/can/raw.c | 16 ++++++++++++----
+ 1 file changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/net/can/raw.c b/net/can/raw.c
+index 6ec8aa1d0da4..37b47a39a3ed 100644
+--- a/net/can/raw.c
++++ b/net/can/raw.c
+@@ -665,10 +665,18 @@ static int raw_getsockopt(struct socket *sock, int level, int optname,
+ 		if (ro->count > 0) {
+ 			int fsize = ro->count * sizeof(struct can_filter);
+ 
+-			if (len > fsize)
+-				len = fsize;
+-			if (copy_to_user(optval, ro->filter, len))
+-				err = -EFAULT;
++			/* user space buffer to small for filter list? */
++			if (len < fsize) {
++				/* return -ERANGE and needed space in optlen */
++				err = -ERANGE;
++				if (put_user(fsize, optlen))
++					err = -EFAULT;
++			} else {
++				if (len > fsize)
++					len = fsize;
++				if (copy_to_user(optval, ro->filter, len))
++					err = -EFAULT;
++			}
+ 		} else {
+ 			len = 0;
+ 		}
+-- 
+2.26.2
+

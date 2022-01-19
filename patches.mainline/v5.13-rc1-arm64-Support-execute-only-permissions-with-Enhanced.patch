@@ -1,0 +1,256 @@
+From 18107f8a2df6bf1c6cac8d0713f757f866d5af51 Mon Sep 17 00:00:00 2001
+From: Vladimir Murzin <vladimir.murzin@arm.com>
+Date: Fri, 12 Mar 2021 17:38:10 +0000
+Subject: [PATCH] arm64: Support execute-only permissions with Enhanced PAN
+Git-commit: 18107f8a2df6bf1c6cac8d0713f757f866d5af51
+Patch-mainline: v5.13-rc1
+References: bsn#12
+
+
+Enhanced Privileged Access Never (EPAN) allows Privileged Access Never
+to be used with Execute-only mappings.
+
+Absence of such support was a reason for 24cecc377463 ("arm64: Revert
+support for execute-only user mappings"). Thus now it can be revisited
+and re-enabled.
+
+Cc: Kees Cook <keescook@chromium.org>
+Signed-off-by: Vladimir Murzin <vladimir.murzin@arm.com>
+Acked-by: Will Deacon <will@kernel.org>
+Link: https://lore.kernel.org/r/20210312173811.58284-2-vladimir.murzin@arm.com
+Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/Kconfig                    | 17 +++++++++++++++
+ arch/arm64/include/asm/cpucaps.h      |  3 ++-
+ arch/arm64/include/asm/pgtable-prot.h |  5 +++--
+ arch/arm64/include/asm/pgtable.h      | 31 ++++++++++++++++++++-------
+ arch/arm64/include/asm/sysreg.h       |  3 ++-
+ arch/arm64/kernel/cpufeature.c        | 12 +++++++++++
+ arch/arm64/mm/fault.c                 | 18 +++++++++++++++-
+ mm/mmap.c                             |  6 ++++++
+ 8 files changed, 82 insertions(+), 13 deletions(-)
+
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -1060,6 +1060,9 @@ config ARCH_WANT_HUGE_PMD_SHARE
+ config ARCH_HAS_CACHE_LINE_SIZE
+ 	def_bool y
+ 
++config ARCH_HAS_FILTER_PGPROT
++	def_bool y
++
+ config ARCH_ENABLE_SPLIT_PMD_PTLOCK
+ 	def_bool y if PGTABLE_LEVELS > 2
+ 
+@@ -1697,6 +1700,20 @@ config ARM64_MTE
+ 
+ endmenu
+ 
++menu "ARMv8.7 architectural features"
++
++config ARM64_EPAN
++	bool "Enable support for Enhanced Privileged Access Never (EPAN)"
++	default y
++	depends on ARM64_PAN
++	help
++	 Enhanced Privileged Access Never (EPAN) allows Privileged
++	 Access Never to be used with Execute-only mappings.
++
++	 The feature is detected at runtime, and will remain disabled
++	 if the cpu does not implement the feature.
++endmenu
++
+ config ARM64_SVE
+ 	bool "ARM Scalable Vector Extension support"
+ 	default y
+--- a/arch/arm64/include/asm/cpucaps.h
++++ b/arch/arm64/include/asm/cpucaps.h
+@@ -66,7 +66,8 @@
+ #define ARM64_HAS_TLB_RANGE			56
+ #define ARM64_MTE				57
+ #define ARM64_WORKAROUND_1508412		58
++#define ARM64_HAS_EPAN				65
+ 
+-#define ARM64_NCAPS				59
++#define ARM64_NCAPS				80
+ 
+ #endif /* __ASM_CPUCAPS_H */
+--- a/arch/arm64/include/asm/pgtable-prot.h
++++ b/arch/arm64/include/asm/pgtable-prot.h
+@@ -87,12 +87,13 @@ extern bool arm64_use_ng_mappings;
+ #define PAGE_SHARED_EXEC	__pgprot(_PAGE_DEFAULT | PTE_USER | PTE_RDONLY | PTE_NG | PTE_PXN | PTE_WRITE)
+ #define PAGE_READONLY		__pgprot(_PAGE_DEFAULT | PTE_USER | PTE_RDONLY | PTE_NG | PTE_PXN | PTE_UXN)
+ #define PAGE_READONLY_EXEC	__pgprot(_PAGE_DEFAULT | PTE_USER | PTE_RDONLY | PTE_NG | PTE_PXN)
++#define PAGE_EXECONLY		__pgprot(_PAGE_DEFAULT | PTE_RDONLY | PTE_NG | PTE_PXN)
+ 
+ #define __P000  PAGE_NONE
+ #define __P001  PAGE_READONLY
+ #define __P010  PAGE_READONLY
+ #define __P011  PAGE_READONLY
+-#define __P100  PAGE_READONLY_EXEC
++#define __P100  PAGE_EXECONLY
+ #define __P101  PAGE_READONLY_EXEC
+ #define __P110  PAGE_READONLY_EXEC
+ #define __P111  PAGE_READONLY_EXEC
+@@ -101,7 +102,7 @@ extern bool arm64_use_ng_mappings;
+ #define __S001  PAGE_READONLY
+ #define __S010  PAGE_SHARED
+ #define __S011  PAGE_SHARED
+-#define __S100  PAGE_READONLY_EXEC
++#define __S100  PAGE_EXECONLY
+ #define __S101  PAGE_READONLY_EXEC
+ #define __S110  PAGE_SHARED_EXEC
+ #define __S111  PAGE_SHARED_EXEC
+--- a/arch/arm64/include/asm/pgtable.h
++++ b/arch/arm64/include/asm/pgtable.h
+@@ -119,11 +119,12 @@ static inline pteval_t __phys_to_pte_val
+ #define pte_dirty(pte)		(pte_sw_dirty(pte) || pte_hw_dirty(pte))
+ 
+ #define pte_valid(pte)		(!!(pte_val(pte) & PTE_VALID))
++/*
++ * Execute-only user mappings do not have the PTE_USER bit set. All valid
++ * kernel mappings have the PTE_UXN bit set.
++ */
+ #define pte_valid_not_user(pte) \
+-	((pte_val(pte) & (PTE_VALID | PTE_USER)) == PTE_VALID)
+-#define pte_valid_user(pte) \
+-	((pte_val(pte) & (PTE_VALID | PTE_USER)) == (PTE_VALID | PTE_USER))
+-
++	((pte_val(pte) & (PTE_VALID | PTE_USER | PTE_UXN)) == (PTE_VALID | PTE_UXN))
+ /*
+  * Could the pte be present in the TLB? We must check mm_tlb_flush_pending
+  * so that we don't erroneously return false for pages that have been
+@@ -136,12 +137,14 @@ static inline pteval_t __phys_to_pte_val
+ 	(mm_tlb_flush_pending(mm) ? pte_present(pte) : pte_valid(pte))
+ 
+ /*
+- * p??_access_permitted() is true for valid user mappings (subject to the
+- * write permission check). PROT_NONE mappings do not have the PTE_VALID bit
+- * set.
++ * p??_access_permitted() is true for valid user mappings (PTE_USER
++ * bit set, subject to the write permission check). For execute-only
++ * mappings, like PROT_EXEC with EPAN (both PTE_USER and PTE_UXN bits
++ * not set) must return false. PROT_NONE mappings do not have the
++ * PTE_VALID bit set.
+  */
+ #define pte_access_permitted(pte, write) \
+-	(pte_valid_user(pte) && (!(write) || pte_write(pte)))
++	(((pte_val(pte) & (PTE_VALID | PTE_USER)) == (PTE_VALID | PTE_USER)) && (!(write) || pte_write(pte)))
+ #define pmd_access_permitted(pmd, write) \
+ 	(pte_access_permitted(pmd_pte(pmd), (write)))
+ #define pud_access_permitted(pud, write) \
+@@ -987,6 +990,18 @@ static inline bool arch_faults_on_old_pt
+ }
+ #define arch_faults_on_old_pte arch_faults_on_old_pte
+ 
++static inline pgprot_t arch_filter_pgprot(pgprot_t prot)
++{
++	if (cpus_have_const_cap(ARM64_HAS_EPAN))
++		return prot;
++
++	if (pgprot_val(prot) != pgprot_val(PAGE_EXECONLY))
++		return prot;
++
++	return PAGE_READONLY_EXEC;
++}
++
++
+ #endif /* !__ASSEMBLY__ */
+ 
+ #endif /* __ASM_PGTABLE_H */
+--- a/arch/arm64/include/asm/sysreg.h
++++ b/arch/arm64/include/asm/sysreg.h
+@@ -590,6 +590,7 @@
+ 	(SCTLR_EL2_RES1 | ENDIAN_SET_EL2)
+ 
+ /* SCTLR_EL1 specific flags. */
++#define SCTLR_EL1_EPAN		(BIT(57))
+ #define SCTLR_EL1_ATA0		(BIT(42))
+ 
+ #define SCTLR_EL1_TCF0_SHIFT	38
+@@ -630,7 +631,7 @@
+ 	 SCTLR_EL1_SED  | SCTLR_ELx_I    | SCTLR_EL1_DZE  | SCTLR_EL1_UCT   | \
+ 	 SCTLR_EL1_NTWE | SCTLR_ELx_IESB | SCTLR_EL1_SPAN | SCTLR_ELx_ITFSB | \
+ 	 SCTLR_ELx_ATA  | SCTLR_EL1_ATA0 | ENDIAN_SET_EL1 | SCTLR_EL1_UCI   | \
+-	 SCTLR_EL1_RES1)
++	 SCTLR_EL1_EPAN | SCTLR_EL1_RES1)
+ 
+ /* MAIR_ELx memory attributes (used by Linux) */
+ #define MAIR_ATTR_DEVICE_nGnRnE		UL(0x00)
+--- a/arch/arm64/kernel/cpufeature.c
++++ b/arch/arm64/kernel/cpufeature.c
+@@ -1754,6 +1754,18 @@ static const struct arm64_cpu_capabiliti
+ 		.cpu_enable = cpu_enable_pan,
+ 	},
+ #endif /* CONFIG_ARM64_PAN */
++#ifdef CONFIG_ARM64_EPAN
++	{
++		.desc = "Enhanced Privileged Access Never",
++		.capability = ARM64_HAS_EPAN,
++		.type = ARM64_CPUCAP_SYSTEM_FEATURE,
++		.matches = has_cpuid_feature,
++		.sys_reg = SYS_ID_AA64MMFR1_EL1,
++		.field_pos = ID_AA64MMFR1_PAN_SHIFT,
++		.sign = FTR_UNSIGNED,
++		.min_field_value = 3,
++	},
++#endif /* CONFIG_ARM64_EPAN */
+ #ifdef CONFIG_ARM64_LSE_ATOMICS
+ 	{
+ 		.desc = "LSE atomic instructions",
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@ -458,7 +458,7 @@ static int __kprobes do_page_fault(unsig
+ 	const struct fault_info *inf;
+ 	struct mm_struct *mm = current->mm;
+ 	vm_fault_t fault;
+-	unsigned long vm_flags = VM_ACCESS_FLAGS;
++	unsigned long vm_flags;
+ 	unsigned int mm_flags = FAULT_FLAG_DEFAULT;
+ 
+ 	if (kprobe_page_fault(regs, esr))
+@@ -474,12 +474,28 @@ static int __kprobes do_page_fault(unsig
+ 	if (user_mode(regs))
+ 		mm_flags |= FAULT_FLAG_USER;
+ 
++	/*
++	 * vm_flags tells us what bits we must have in vma->vm_flags
++	 * for the fault to be benign, __do_page_fault() would check
++	 * vma->vm_flags & vm_flags and returns an error if the
++	 * intersection is empty
++	 */
+ 	if (is_el0_instruction_abort(esr)) {
++		/* It was exec fault */
+ 		vm_flags = VM_EXEC;
+ 		mm_flags |= FAULT_FLAG_INSTRUCTION;
+ 	} else if (is_write_abort(esr)) {
++		/* It was write fault */
+ 		vm_flags = VM_WRITE;
+ 		mm_flags |= FAULT_FLAG_WRITE;
++	} else {
++		/* It was read fault */
++		vm_flags = VM_READ;
++		/* Write implies read */
++		vm_flags |= VM_WRITE;
++		/* If EPAN is absent then exec implies read */
++		if (!cpus_have_const_cap(ARM64_HAS_EPAN))
++			vm_flags |= VM_EXEC;
+ 	}
+ 
+ 	if (is_ttbr0_addr(addr) && is_el1_permission_fault(addr, esr, regs)) {
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -93,6 +93,12 @@ static void unmap_region(struct mm_struc
+  * MAP_PRIVATE	r: (no) no	r: (yes) yes	r: (no) yes	r: (no) yes
+  *		w: (no) no	w: (no) no	w: (copy) copy	w: (no) no
+  *		x: (no) no	x: (no) yes	x: (no) yes	x: (yes) yes
++ *
++ * On arm64, PROT_EXEC has the following behaviour for both MAP_SHARED and
++ * MAP_PRIVATE (with Enhanced PAN supported):
++ *								r: (no) no
++ *								w: (no) no
++ *								x: (yes) yes
+  */
+ pgprot_t protection_map[16] __ro_after_init = {
+ 	__P000, __P001, __P010, __P011, __P100, __P101, __P110, __P111,

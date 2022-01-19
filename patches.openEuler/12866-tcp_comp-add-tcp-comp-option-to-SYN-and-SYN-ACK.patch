@@ -1,0 +1,336 @@
+From 7f39947b845d87a4e56064e7e9fff6b9cb3ec12e Mon Sep 17 00:00:00 2001
+From: Wang Yufen <wangyufen@huawei.com>
+Date: Fri, 7 Jan 2022 23:07:15 +0800
+Subject: [PATCH] tcp_comp: add tcp comp option to SYN and SYN-ACK
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 7f39947b845d87a4e56064e7e9fff6b9cb3ec12e
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4PNEK
+CVE: NA
+
+-------------------------------------------------
+
+Add new tcp COMP option to SYN and SYN-ACK when tcp COMP
+is enabled. connection compress payload only when both side
+support it.
+
+Signed-off-by: Wang Yufen <wangyufen@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Lu Wei <luwei32@huawei.com>
+Reviewed-by: Wei Yongjun <weiyongjun1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/tcp.h      |  6 ++++-
+ include/net/inet_sock.h  |  3 ++-
+ include/net/sock.h       |  1 +
+ include/net/tcp.h        | 12 ++++++++++
+ net/ipv4/Makefile        |  1 +
+ net/ipv4/syncookies.c    |  2 ++
+ net/ipv4/tcp.c           |  4 ++++
+ net/ipv4/tcp_comp.c      | 13 ++++++++++
+ net/ipv4/tcp_input.c     | 25 +++++++++++++++++++
+ net/ipv4/tcp_minisocks.c |  3 +++
+ net/ipv4/tcp_output.c    | 52 ++++++++++++++++++++++++++++++++++++++++
+ net/ipv6/syncookies.c    |  2 ++
+ 12 files changed, 122 insertions(+), 2 deletions(-)
+ create mode 100644 net/ipv4/tcp_comp.c
+
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@ -93,7 +93,8 @@ struct tcp_options_received {
+ 		snd_wscale : 4,	/* Window scaling received from sender	*/
+ 		rcv_wscale : 4;	/* Window scaling to send to receiver	*/
+ 	u8	saw_unknown:1,	/* Received unknown option		*/
+-		unused:7;
++		comp_ok:1,	/* COMP seen on SYN packet		*/
++		unused:6;
+ 	u8	num_sacks;	/* Number of SACK blocks		*/
+ 	u16	user_mss;	/* mss requested by user in ioctl	*/
+ 	u16	mss_clamp;	/* Maximal mss, negotiated at connection setup */
+@@ -106,6 +107,9 @@ static inline void tcp_clear_options(str
+ #if IS_ENABLED(CONFIG_SMC)
+ 	rx_opt->smc_ok = 0;
+ #endif
++#if IS_ENABLED(CONFIG_TCP_COMP)
++	rx_opt->comp_ok = 0;
++#endif
+ }
+ 
+ /* This is the max number of SACKS that we'll generate and process. It's safe
+--- a/include/net/inet_sock.h
++++ b/include/net/inet_sock.h
+@@ -87,7 +87,8 @@ struct inet_request_sock {
+ 				ecn_ok	   : 1,
+ 				acked	   : 1,
+ 				no_srccheck: 1,
+-				smc_ok	   : 1;
++				smc_ok	   : 1,
++				comp_ok    : 1;
+ 	u32                     ir_mark;
+ 	union {
+ 		struct ip_options_rcu __rcu	*ireq_opt;
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -881,6 +881,7 @@ enum sock_flags {
+ 	SOCK_TXTIME,
+ 	SOCK_XDP, /* XDP is attached */
+ 	SOCK_TSTAMP_NEW, /* Indicates 64 bit timestamps always */
++	SOCK_COMP,
+ };
+ 
+ #define SK_FLAGS_TIMESTAMP ((1UL << SOCK_TIMESTAMP) | (1UL << SOCK_TIMESTAMPING_RX_SOFTWARE))
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -195,6 +195,7 @@ void tcp_time_wait(struct sock *sk, int
+  */
+ #define TCPOPT_FASTOPEN_MAGIC	0xF989
+ #define TCPOPT_SMC_MAGIC	0xE2D4C3D9
++#define TCPOPT_COMP_MAGIC	0x7954
+ 
+ /*
+  *     TCP option lengths
+@@ -208,6 +209,7 @@ void tcp_time_wait(struct sock *sk, int
+ #define TCPOLEN_FASTOPEN_BASE  2
+ #define TCPOLEN_EXP_FASTOPEN_BASE  4
+ #define TCPOLEN_EXP_SMC_BASE   6
++#define TCPOLEN_EXP_COMP_BASE  4
+ 
+ /* But this is what stacks really send out. */
+ #define TCPOLEN_TSTAMP_ALIGNED		12
+@@ -2387,4 +2389,14 @@ static inline u64 tcp_transmit_time(cons
+ 	return 0;
+ }
+ 
++#if IS_ENABLED(CONFIG_TCP_COMP)
++extern struct static_key_false tcp_have_comp;
++bool tcp_syn_comp_enabled(const struct tcp_sock *tp);
++#else
++static inline bool tcp_syn_comp_enabled(const struct tcp_sock *tp)
++{
++	return false;
++}
++#endif
++
+ #endif	/* _TCP_H */
+--- a/net/ipv4/Makefile
++++ b/net/ipv4/Makefile
+@@ -64,6 +64,7 @@ obj-$(CONFIG_TCP_CONG_ILLINOIS) += tcp_i
+ obj-$(CONFIG_NET_SOCK_MSG) += tcp_bpf.o
+ obj-$(CONFIG_BPF_STREAM_PARSER) += udp_bpf.o
+ obj-$(CONFIG_NETLABEL) += cipso_ipv4.o
++obj-$(CONFIG_TCP_COMP) += tcp_comp.o
+ 
+ obj-$(CONFIG_XFRM) += xfrm4_policy.o xfrm4_state.o xfrm4_input.o \
+ 		      xfrm4_output.o xfrm4_protocol.o
+--- a/net/ipv4/syncookies.c
++++ b/net/ipv4/syncookies.c
+@@ -392,6 +392,8 @@ struct sock *cookie_v4_check(struct sock
+ 
+ 	if (IS_ENABLED(CONFIG_SMC))
+ 		ireq->smc_ok = 0;
++	if (IS_ENABLED(CONFIG_TCP_COMP))
++		ireq->comp_ok = 0;
+ 
+ 	ireq->ir_iif = inet_request_bound_dev_if(sk, skb);
+ 
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -294,6 +294,10 @@ DEFINE_STATIC_KEY_FALSE(tcp_have_smc);
+ EXPORT_SYMBOL(tcp_have_smc);
+ #endif
+ 
++#if IS_ENABLED(CONFIG_TCP_COMP)
++DEFINE_STATIC_KEY_FALSE(tcp_have_comp);
++#endif
++
+ /*
+  * Current number of TCP sockets.
+  */
+--- /dev/null
++++ b/net/ipv4/tcp_comp.c
+@@ -0,0 +1,13 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * TCP compression support
++ *
++ * Copyright(c) 2021 Huawei Technologies Co., Ltd
++ */
++
++#include <net/tcp.h>
++
++bool tcp_syn_comp_enabled(const struct tcp_sock *tp)
++{
++	return true;
++}
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -3905,6 +3905,24 @@ static bool smc_parse_options(const stru
+ 	return false;
+ }
+ 
++static bool tcp_parse_comp_option(const struct tcphdr *th,
++				  struct tcp_options_received *opt_rx,
++				  const unsigned char *ptr,
++				  int opsize)
++{
++#if IS_ENABLED(CONFIG_TCP_COMP)
++	if (static_branch_unlikely(&tcp_have_comp)) {
++		if (th->syn && !(opsize & 1) &&
++		    opsize >= TCPOLEN_EXP_COMP_BASE &&
++		    get_unaligned_be16(ptr) == TCPOPT_COMP_MAGIC) {
++			opt_rx->comp_ok = 1;
++			return true;
++		}
++	}
++#endif
++	return false;
++}
++
+ /* Try to parse the MSS option from the TCP header. Return 0 on failure, clamped
+  * value on success.
+  */
+@@ -4064,6 +4082,10 @@ void tcp_parse_options(const struct net
+ 				if (smc_parse_options(th, opt_rx, ptr, opsize))
+ 					break;
+ 
++				if (tcp_parse_comp_option(th, opt_rx, ptr,
++				    opsize))
++					break;
++
+ 				opt_rx->saw_unknown = 1;
+ 				break;
+ 
+@@ -6642,6 +6664,9 @@ static void tcp_openreq_init(struct requ
+ #if IS_ENABLED(CONFIG_SMC)
+ 	ireq->smc_ok = rx_opt->smc_ok;
+ #endif
++#if IS_ENABLED(CONFIG_TCP_COMP)
++	ireq->comp_ok = rx_opt->comp_ok;
++#endif
+ }
+ 
+ struct request_sock *inet_reqsk_alloc(const struct request_sock_ops *ops,
+--- a/net/ipv4/tcp_minisocks.c
++++ b/net/ipv4/tcp_minisocks.c
+@@ -512,6 +512,9 @@ struct sock *tcp_create_openreq_child(co
+ 	newtp->rcv_ssthresh = req->rsk_rcv_wnd;
+ 	newtp->rcv_wnd = req->rsk_rcv_wnd;
+ 	newtp->rx_opt.wscale_ok = ireq->wscale_ok;
++#if IS_ENABLED(CONFIG_TCP_COMP)
++	newtp->rx_opt.comp_ok = ireq->comp_ok;
++#endif
+ 	if (newtp->rx_opt.wscale_ok) {
+ 		newtp->rx_opt.snd_wscale = ireq->snd_wscale;
+ 		newtp->rx_opt.rcv_wscale = ireq->rcv_wscale;
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -416,6 +416,7 @@ static inline bool tcp_urg_mode(const st
+ #define OPTION_FAST_OPEN_COOKIE	(1 << 8)
+ #define OPTION_SMC		(1 << 9)
+ #define OPTION_MPTCP		(1 << 10)
++#define OPTION_COMP		(1 << 11)
+ 
+ static void smc_options_write(__be32 *ptr, u16 *options)
+ {
+@@ -432,6 +433,19 @@ static void smc_options_write(__be32 *pt
+ #endif
+ }
+ 
++static void comp_options_write(__be32 *ptr, u16 *options)
++{
++#if IS_ENABLED(CONFIG_TCP_COMP)
++	if (static_branch_unlikely(&tcp_have_comp)) {
++		if (unlikely(OPTION_COMP & *options)) {
++			*ptr++ = htonl((TCPOPT_EXP  << 24) |
++				       (TCPOLEN_EXP_COMP_BASE  << 16) |
++				       (TCPOPT_COMP_MAGIC));
++		}
++	}
++#endif
++}
++
+ struct tcp_out_options {
+ 	u16 options;		/* bit field of OPTION_* */
+ 	u16 mss;		/* 0 to disable */
+@@ -703,6 +717,8 @@ static void tcp_options_write(__be32 *pt
+ 	smc_options_write(ptr, &options);
+ 
+ 	mptcp_options_write(ptr, tp, opts);
++
++	comp_options_write(ptr, &options);
+ }
+ 
+ static void smc_set_option(const struct tcp_sock *tp,
+@@ -721,6 +737,39 @@ static void smc_set_option(const struct
+ #endif
+ }
+ 
++static void comp_set_option(const struct tcp_sock *tp,
++			    struct tcp_out_options *opts,
++			    unsigned int *remaining)
++{
++#if IS_ENABLED(CONFIG_TCP_COMP)
++	if (static_branch_unlikely(&tcp_have_comp)) {
++		if (tcp_syn_comp_enabled(tp)) {
++			if (*remaining >= TCPOLEN_EXP_COMP_BASE) {
++				opts->options |= OPTION_COMP;
++				*remaining -= TCPOLEN_EXP_COMP_BASE;
++			}
++		}
++	}
++#endif
++}
++
++static void comp_set_option_cond(const struct tcp_sock *tp,
++				 const struct inet_request_sock *ireq,
++				 struct tcp_out_options *opts,
++				 unsigned int *remaining)
++{
++#if IS_ENABLED(CONFIG_TCP_COMP)
++	if (static_branch_unlikely(&tcp_have_comp)) {
++		if (tcp_syn_comp_enabled(tp) && ireq->comp_ok) {
++			if (*remaining >= TCPOLEN_EXP_COMP_BASE) {
++				opts->options |= OPTION_COMP;
++				*remaining -= TCPOLEN_EXP_COMP_BASE;
++			}
++		}
++	}
++#endif
++}
++
+ static void smc_set_option_cond(const struct tcp_sock *tp,
+ 				const struct inet_request_sock *ireq,
+ 				struct tcp_out_options *opts,
+@@ -822,6 +871,7 @@ static unsigned int tcp_syn_options(stru
+ 	}
+ 
+ 	smc_set_option(tp, opts, &remaining);
++	comp_set_option(tp, opts, &remaining);
+ 
+ 	if (sk_is_mptcp(sk)) {
+ 		unsigned int size;
+@@ -902,6 +952,8 @@ static unsigned int tcp_synack_options(c
+ 
+ 	smc_set_option_cond(tcp_sk(sk), ireq, opts, &remaining);
+ 
++	comp_set_option_cond(tcp_sk(sk), ireq, opts, &remaining);
++
+ 	bpf_skops_hdr_opt_len((struct sock *)sk, skb, req, syn_skb,
+ 			      synack_type, opts, &remaining);
+ 
+--- a/net/ipv6/syncookies.c
++++ b/net/ipv6/syncookies.c
+@@ -214,6 +214,8 @@ struct sock *cookie_v6_check(struct sock
+ 	treq->txhash = net_tx_rndhash();
+ 	if (IS_ENABLED(CONFIG_SMC))
+ 		ireq->smc_ok = 0;
++	if (IS_ENABLED(CONFIG_TCP_COMP))
++		ireq->comp_ok = 0;
+ 
+ 	/*
+ 	 * We need to lookup the dst_entry to get the correct window size.

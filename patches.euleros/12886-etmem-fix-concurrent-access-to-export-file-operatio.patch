@@ -1,0 +1,275 @@
+From 227739107be440efe8c58cda78554648e5c35de0 Mon Sep 17 00:00:00 2001
+From: Kemeng Shi <shikemeng@huawei.com>
+Date: Sat, 8 Jan 2022 18:52:29 +0800
+Subject: [PATCH] etmem: fix concurrent access to export file operations
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 227739107be440efe8c58cda78554648e5c35de0
+
+
+euleros inclusion
+category: feature
+feature: etmem
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4OODH?from=project-issue
+CVE: NA
+
+-------------------------------------------------
+
+Module scan/swap and etmem access export file operations without
+protection.
+Kernel crash can be triggered by following:
+1.insert scan/swap module.
+2.etmem check if exported file operations are set.
+3.remove scan/swap module.
+4.etmem call checked file operation.
+5.kernel crash happens.
+
+Fix this as following:
+Module scan/swap set and clear operations with lock held.
+Etmem in kernel calls try_module_get to with lock held.
+Etmem call read/open/release/ioctl callback without lock held with module
+get.
+
+Another concurrent access situaction is that open for idles_pages and
+swap_pages will success without scan/swap module inserted. If scan/swap
+module is inserteds after open, subsequent call of open/read/close will
+call exported file operations set by scan/swap. This also may trigger
+kernel crash as following:
+1.open idle_pages or swap_pages
+2.modprobe scan/swap module
+3.close idle_pages or swap_pages(module_put is called without
+try_module_get)
+4.modprobe -r scan/swap module found invalid module reference count in
+trace delete_module syscall->try_stop_module->try_release_module_ref
+and report a BUG_ON for ret < 0.
+
+Fix this by only return file successfully with scan/swap module inserted.
+
+Signed-off-by: Kemeng Shi <shikemeng@huawei.com>
+Reviewed-by: louhongxiang <louhongxiang@huawei.com>
+Reviewed-by: Chen Wandun <chenwandun@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/proc/etmem_scan.c | 12 ++++++--
+ fs/proc/etmem_swap.c | 20 +++++++++-----
+ fs/proc/task_mmu.c   | 66 +++++++++++++++++++++++++++++++++++++++++---
+ 3 files changed, 85 insertions(+), 13 deletions(-)
+
+diff --git a/fs/proc/etmem_scan.c b/fs/proc/etmem_scan.c
+index 6253d4e5a556..e6419904e49b 100644
+--- a/fs/proc/etmem_scan.c
++++ b/fs/proc/etmem_scan.c
+@@ -1248,18 +1248,26 @@ extern struct file_operations proc_page_scan_operations;
+ 
+ static int page_scan_entry(void)
+ {
++	proc_page_scan_operations.flock(NULL, 1, NULL);
+ 	proc_page_scan_operations.owner = THIS_MODULE;
+ 	proc_page_scan_operations.read = page_scan_read;
+ 	proc_page_scan_operations.open = page_scan_open;
+ 	proc_page_scan_operations.release = page_scan_release;
+ 	proc_page_scan_operations.unlocked_ioctl = page_scan_ioctl;
++	proc_page_scan_operations.flock(NULL, 0, NULL);
++
+ 	return 0;
+ }
+ 
+ static void page_scan_exit(void)
+ {
+-	memset(&proc_page_scan_operations, 0,
+-			sizeof(proc_page_scan_operations));
++	proc_page_scan_operations.flock(NULL, 1, NULL);
++	proc_page_scan_operations.owner = NULL;
++	proc_page_scan_operations.read = NULL;
++	proc_page_scan_operations.open = NULL;
++	proc_page_scan_operations.release = NULL;
++	proc_page_scan_operations.unlocked_ioctl = NULL;
++	proc_page_scan_operations.flock(NULL, 0, NULL);
+ }
+ 
+ MODULE_LICENSE("GPL");
+diff --git a/fs/proc/etmem_swap.c b/fs/proc/etmem_swap.c
+index b24c706c3b2a..f9f796cfaf97 100644
+--- a/fs/proc/etmem_swap.c
++++ b/fs/proc/etmem_swap.c
+@@ -83,18 +83,24 @@ extern struct file_operations proc_swap_pages_operations;
+ 
+ static int swap_pages_entry(void)
+ {
+-		proc_swap_pages_operations.owner = THIS_MODULE;
+-		proc_swap_pages_operations.write = swap_pages_write;
+-		proc_swap_pages_operations.open = swap_pages_open;
+-		proc_swap_pages_operations.release = swap_pages_release;
++	proc_swap_pages_operations.flock(NULL, 1, NULL);
++	proc_swap_pages_operations.owner = THIS_MODULE;
++	proc_swap_pages_operations.write = swap_pages_write;
++	proc_swap_pages_operations.open = swap_pages_open;
++	proc_swap_pages_operations.release = swap_pages_release;
++	proc_swap_pages_operations.flock(NULL, 0, NULL);
+ 
+-		return 0;
++	return 0;
+ }
+ 
+ static void swap_pages_exit(void)
+ {
+-	memset(&proc_swap_pages_operations, 0,
+-			sizeof(proc_swap_pages_operations));
++	proc_swap_pages_operations.flock(NULL, 1, NULL);
++	proc_swap_pages_operations.owner = NULL;
++	proc_swap_pages_operations.write = NULL;
++	proc_swap_pages_operations.open = NULL;
++	proc_swap_pages_operations.release = NULL;
++	proc_swap_pages_operations.flock(NULL, 0, NULL);
+ }
+ 
+ MODULE_LICENSE("GPL");
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index 2d9510cf30c3..dacdd0a466af 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -19,6 +19,7 @@
+ #include <linux/shmem_fs.h>
+ #include <linux/uaccess.h>
+ #include <linux/pkeys.h>
++#include <linux/module.h>
+ 
+ #include <asm/elf.h>
+ #include <asm/tlb.h>
+@@ -1833,8 +1834,21 @@ const struct file_operations proc_pagemap_operations = {
+ 	.release	= pagemap_release,
+ };
+ 
++static DEFINE_SPINLOCK(scan_lock);
++
++static int page_scan_lock(struct file *file, int is_lock, struct file_lock *flock)
++{
++	if (is_lock)
++		spin_lock(&scan_lock);
++	else
++		spin_unlock(&scan_lock);
++
++	return 0;
++}
++
+ /* will be filled when kvm_ept_idle module loads */
+ struct file_operations proc_page_scan_operations = {
++	.flock = page_scan_lock,
+ };
+ EXPORT_SYMBOL_GPL(proc_page_scan_operations);
+ 
+@@ -1858,10 +1872,22 @@ static ssize_t mm_idle_read(struct file *file, char __user *buf,
+ static int mm_idle_open(struct inode *inode, struct file *file)
+ {
+ 	struct mm_struct *mm = NULL;
++	struct module *module = NULL;
++	int ret = -1;
+ 
+ 	if (!file_ns_capable(file, &init_user_ns, CAP_SYS_ADMIN))
+ 		return -EPERM;
+ 
++	page_scan_lock(NULL, 1, NULL);
++	module = proc_page_scan_operations.owner;
++	if (module != NULL && try_module_get(module))
++		ret = 0;
++	page_scan_lock(NULL, 0, NULL);
++	if (ret != 0) {
++		/* no scan ko installed, avoid to return valid file */
++		return -ENODEV;
++	}
++
+ 	mm = proc_mem_open(inode, PTRACE_MODE_READ);
+ 	if (IS_ERR(mm))
+ 		return PTR_ERR(mm);
+@@ -1877,6 +1903,7 @@ static int mm_idle_open(struct inode *inode, struct file *file)
+ static int mm_idle_release(struct inode *inode, struct file *file)
+ {
+ 	struct mm_struct *mm = file->private_data;
++	int ret = 0;
+ 
+ 	if (mm) {
+ 		if (!mm_kvm(mm))
+@@ -1885,9 +1912,12 @@ static int mm_idle_release(struct inode *inode, struct file *file)
+ 	}
+ 
+ 	if (proc_page_scan_operations.release)
+-		return proc_page_scan_operations.release(inode, file);
++		ret = proc_page_scan_operations.release(inode, file);
+ 
+-	return 0;
++	if (proc_page_scan_operations.owner)
++		module_put(proc_page_scan_operations.owner);
++
++	return ret;
+ }
+ 
+ static long mm_idle_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+@@ -1906,8 +1936,20 @@ const struct file_operations proc_mm_idle_operations = {
+ 	.unlocked_ioctl = mm_idle_ioctl,
+ };
+ 
++static DEFINE_SPINLOCK(swap_lock);
++
++static int page_swap_lock(struct file *file, int is_lock, struct file_lock *flock)
++{
++	if (is_lock)
++		spin_lock(&swap_lock);
++	else
++		spin_unlock(&swap_lock);
++
++	return 0;
++}
+ /*swap pages*/
+ struct file_operations proc_swap_pages_operations = {
++	.flock = page_swap_lock,
+ };
+ EXPORT_SYMBOL_GPL(proc_swap_pages_operations);
+ 
+@@ -1923,10 +1965,22 @@ static ssize_t mm_swap_write(struct file *file, const char __user *buf,
+ static int mm_swap_open(struct inode *inode, struct file *file)
+ {
+ 	struct mm_struct *mm = NULL;
++	struct module *module = NULL;
++	int ret = -1;
+ 
+ 	if (!file_ns_capable(file, &init_user_ns, CAP_SYS_ADMIN))
+ 		return -EPERM;
+ 
++	page_swap_lock(NULL, 1, NULL);
++	module = proc_swap_pages_operations.owner;
++	if (module != NULL && try_module_get(module))
++		ret = 0;
++	page_swap_lock(NULL, 0, NULL);
++	if (ret != 0) {
++		/* no swap ko installed, avoid to return valid file */
++		return -ENODEV;
++	}
++
+ 	mm = proc_mem_open(inode, PTRACE_MODE_READ);
+ 	if (IS_ERR(mm))
+ 		return PTR_ERR(mm);
+@@ -1942,14 +1996,18 @@ static int mm_swap_open(struct inode *inode, struct file *file)
+ static int mm_swap_release(struct inode *inode, struct file *file)
+ {
+ 	struct mm_struct *mm = file->private_data;
++	int ret = 0;
+ 
+ 	if (mm)
+ 		mmdrop(mm);
+ 
+ 	if (proc_swap_pages_operations.release)
+-		return proc_swap_pages_operations.release(inode, file);
++		ret = proc_swap_pages_operations.release(inode, file);
+ 
+-	return 0;
++	if (proc_swap_pages_operations.owner)
++		module_put(proc_swap_pages_operations.owner);
++
++	return ret;
+ }
+ 
+ const struct file_operations proc_mm_swap_operations = {
+-- 
+2.26.2
+

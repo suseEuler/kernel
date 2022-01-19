@@ -1,0 +1,232 @@
+From 287db5c40d15cb5ee2d3125133347b73194cba1d Mon Sep 17 00:00:00 2001
+From: Jie Wang <wangjie125@huawei.com>
+Date: Wed, 5 Jan 2022 22:20:12 +0800
+Subject: [PATCH] net: hns3: create new set of common tqp stats APIs for PF and
+ VF reuse
+Git-commit: 287db5c40d15cb5ee2d3125133347b73194cba1d
+Patch-mainline: v5.17-rc1
+References: bsn#12
+
+
+This patch creates new set of common tqp stats structures and APIs for PF
+and VF tqp stats module. Subfunctions such as get tqp stats, update tqp
+stats and reset tqp stats are inclued in this patch.
+
+These new common tqp stats APIs will be used to replace the old PF and VF
+tqp stats APIs in next patches.
+
+Signed-off-by: Jie Wang <wangjie125@huawei.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/net/ethernet/hisilicon/hns3/Makefile  |   5 +-
+ .../hns3/hns3_common/hclge_comm_cmd.h         |   2 +
+ .../hns3/hns3_common/hclge_comm_tqp_stats.c   | 117 ++++++++++++++++++
+ .../hns3/hns3_common/hclge_comm_tqp_stats.h   |  39 ++++++
+ 4 files changed, 161 insertions(+), 2 deletions(-)
+ create mode 100644 drivers/net/ethernet/hisilicon/hns3/hns3_common/hclge_comm_tqp_stats.c
+ create mode 100644 drivers/net/ethernet/hisilicon/hns3/hns3_common/hclge_comm_tqp_stats.h
+
+diff --git a/drivers/net/ethernet/hisilicon/hns3/Makefile b/drivers/net/ethernet/hisilicon/hns3/Makefile
+index 00d0a8e7f234..6efea4662858 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/Makefile
++++ b/drivers/net/ethernet/hisilicon/hns3/Makefile
+@@ -18,11 +18,12 @@ hns3-$(CONFIG_HNS3_DCB) += hns3_dcbnl.o
+ obj-$(CONFIG_HNS3_HCLGEVF) += hclgevf.o
+ 
+ hclgevf-objs = hns3vf/hclgevf_main.o hns3vf/hclgevf_mbx.o  hns3vf/hclgevf_devlink.o \
+-		hns3_common/hclge_comm_cmd.o hns3_common/hclge_comm_rss.o
++		hns3_common/hclge_comm_cmd.o hns3_common/hclge_comm_rss.o hns3_common/hclge_comm_tqp_stats.o
+ 
+ obj-$(CONFIG_HNS3_HCLGE) += hclge.o
+ hclge-objs = hns3pf/hclge_main.o hns3pf/hclge_mdio.o hns3pf/hclge_tm.o \
+ 		hns3pf/hclge_mbx.o hns3pf/hclge_err.o  hns3pf/hclge_debugfs.o hns3pf/hclge_ptp.o hns3pf/hclge_devlink.o \
+-		hns3_common/hclge_comm_cmd.o hns3_common/hclge_comm_rss.o
++		hns3_common/hclge_comm_cmd.o hns3_common/hclge_comm_rss.o hns3_common/hclge_comm_tqp_stats.o
++
+ 
+ hclge-$(CONFIG_HNS3_DCB) += hns3pf/hclge_dcb.o
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3_common/hclge_comm_cmd.h b/drivers/net/ethernet/hisilicon/hns3/hns3_common/hclge_comm_cmd.h
+index eb034f8f87db..72976eed930a 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3_common/hclge_comm_cmd.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3_common/hclge_comm_cmd.h
+@@ -110,6 +110,8 @@ enum HCLGE_COMM_API_CAP_BITS {
+ 
+ enum hclge_comm_opcode_type {
+ 	HCLGE_COMM_OPC_QUERY_FW_VER		= 0x0001,
++	HCLGE_COMM_OPC_QUERY_TX_STATUS		= 0x0B03,
++	HCLGE_COMM_OPC_QUERY_RX_STATUS		= 0x0B13,
+ 	HCLGE_COMM_OPC_RSS_GENERIC_CFG		= 0x0D01,
+ 	HCLGE_COMM_OPC_RSS_INPUT_TUPLE		= 0x0D02,
+ 	HCLGE_COMM_OPC_RSS_INDIR_TABLE		= 0x0D07,
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3_common/hclge_comm_tqp_stats.c b/drivers/net/ethernet/hisilicon/hns3/hns3_common/hclge_comm_tqp_stats.c
+new file mode 100644
+index 000000000000..3a73cbb3eee1
+--- /dev/null
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3_common/hclge_comm_tqp_stats.c
+@@ -0,0 +1,117 @@
++// SPDX-License-Identifier: GPL-2.0+
++// Copyright (c) 2021-2021 Hisilicon Limited.
++
++#include <linux/err.h>
++
++#include "hnae3.h"
++#include "hclge_comm_cmd.h"
++#include "hclge_comm_tqp_stats.h"
++
++u64 *hclge_comm_tqps_get_stats(struct hnae3_handle *handle, u64 *data)
++{
++	struct hnae3_knic_private_info *kinfo = &handle->kinfo;
++	struct hclge_comm_tqp *tqp;
++	u64 *buff = data;
++	u16 i;
++
++	for (i = 0; i < kinfo->num_tqps; i++) {
++		tqp = container_of(kinfo->tqp[i], struct hclge_comm_tqp, q);
++		*buff++ = tqp->tqp_stats.rcb_tx_ring_pktnum_rcd;
++	}
++
++	for (i = 0; i < kinfo->num_tqps; i++) {
++		tqp = container_of(kinfo->tqp[i], struct hclge_comm_tqp, q);
++		*buff++ = tqp->tqp_stats.rcb_rx_ring_pktnum_rcd;
++	}
++
++	return buff;
++}
++
++int hclge_comm_tqps_get_sset_count(struct hnae3_handle *handle)
++{
++	struct hnae3_knic_private_info *kinfo = &handle->kinfo;
++
++	return kinfo->num_tqps * HCLGE_COMM_QUEUE_PAIR_SIZE;
++}
++
++u8 *hclge_comm_tqps_get_strings(struct hnae3_handle *handle, u8 *data)
++{
++	struct hnae3_knic_private_info *kinfo = &handle->kinfo;
++	u8 *buff = data;
++	u16 i;
++
++	for (i = 0; i < kinfo->num_tqps; i++) {
++		struct hclge_comm_tqp *tqp =
++			container_of(kinfo->tqp[i], struct hclge_comm_tqp, q);
++		snprintf(buff, ETH_GSTRING_LEN, "txq%u_pktnum_rcd", tqp->index);
++		buff += ETH_GSTRING_LEN;
++	}
++
++	for (i = 0; i < kinfo->num_tqps; i++) {
++		struct hclge_comm_tqp *tqp =
++			container_of(kinfo->tqp[i], struct hclge_comm_tqp, q);
++		snprintf(buff, ETH_GSTRING_LEN, "rxq%u_pktnum_rcd", tqp->index);
++		buff += ETH_GSTRING_LEN;
++	}
++
++	return buff;
++}
++
++int hclge_comm_tqps_update_stats(struct hnae3_handle *handle,
++				 struct hclge_comm_hw *hw)
++{
++	struct hnae3_knic_private_info *kinfo = &handle->kinfo;
++	struct hclge_comm_tqp *tqp;
++	struct hclge_desc desc;
++	int ret;
++	u16 i;
++
++	for (i = 0; i < kinfo->num_tqps; i++) {
++		tqp = container_of(kinfo->tqp[i], struct hclge_comm_tqp, q);
++		hclge_comm_cmd_setup_basic_desc(&desc,
++						HCLGE_COMM_OPC_QUERY_RX_STATUS,
++						true);
++
++		desc.data[0] = cpu_to_le32(tqp->index);
++		ret = hclge_comm_cmd_send(hw, &desc, 1);
++		if (ret) {
++			dev_err(&hw->cmq.csq.pdev->dev,
++				"failed to get tqp stat, ret = %d, tx = %u.\n",
++				ret, i);
++			return ret;
++		}
++		tqp->tqp_stats.rcb_rx_ring_pktnum_rcd +=
++			le32_to_cpu(desc.data[1]);
++
++		hclge_comm_cmd_setup_basic_desc(&desc,
++						HCLGE_COMM_OPC_QUERY_TX_STATUS,
++						true);
++
++		desc.data[0] = cpu_to_le32(tqp->index & 0x1ff);
++		ret = hclge_comm_cmd_send(hw, &desc, 1);
++		if (ret) {
++			dev_err(&hw->cmq.csq.pdev->dev,
++				"failed to get tqp stat, ret = %d, rx = %u.\n",
++				ret, i);
++			return ret;
++		}
++		tqp->tqp_stats.rcb_tx_ring_pktnum_rcd +=
++			le32_to_cpu(desc.data[1]);
++	}
++
++	return 0;
++}
++
++void hclge_comm_reset_tqp_stats(struct hnae3_handle *handle)
++{
++	struct hnae3_knic_private_info *kinfo = &handle->kinfo;
++	struct hclge_comm_tqp *tqp;
++	struct hnae3_queue *queue;
++	u16 i;
++
++	for (i = 0; i < kinfo->num_tqps; i++) {
++		queue = kinfo->tqp[i];
++		tqp = container_of(queue, struct hclge_comm_tqp, q);
++		memset(&tqp->tqp_stats, 0, sizeof(tqp->tqp_stats));
++	}
++}
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3_common/hclge_comm_tqp_stats.h b/drivers/net/ethernet/hisilicon/hns3/hns3_common/hclge_comm_tqp_stats.h
+new file mode 100644
+index 000000000000..a46350162ee8
+--- /dev/null
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3_common/hclge_comm_tqp_stats.h
+@@ -0,0 +1,39 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++// Copyright (c) 2021-2021 Hisilicon Limited.
++
++#ifndef __HCLGE_COMM_TQP_STATS_H
++#define __HCLGE_COMM_TQP_STATS_H
++#include <linux/types.h>
++#include <linux/etherdevice.h>
++#include "hnae3.h"
++
++/* each tqp has TX & RX two queues */
++#define HCLGE_COMM_QUEUE_PAIR_SIZE 2
++
++/* TQP stats */
++struct hclge_comm_tqp_stats {
++	/* query_tqp_tx_queue_statistics ,opcode id:  0x0B03 */
++	u64 rcb_tx_ring_pktnum_rcd; /* 32bit */
++	/* query_tqp_rx_queue_statistics ,opcode id:  0x0B13 */
++	u64 rcb_rx_ring_pktnum_rcd; /* 32bit */
++};
++
++struct hclge_comm_tqp {
++	/* copy of device pointer from pci_dev,
++	 * used when perform DMA mapping
++	 */
++	struct device *dev;
++	struct hnae3_queue q;
++	struct hclge_comm_tqp_stats tqp_stats;
++	u16 index;	/* Global index in a NIC controller */
++
++	bool alloced;
++};
++
++u64 *hclge_comm_tqps_get_stats(struct hnae3_handle *handle, u64 *data);
++int hclge_comm_tqps_get_sset_count(struct hnae3_handle *handle);
++u8 *hclge_comm_tqps_get_strings(struct hnae3_handle *handle, u8 *data);
++void hclge_comm_reset_tqp_stats(struct hnae3_handle *handle);
++int hclge_comm_tqps_update_stats(struct hnae3_handle *handle,
++				 struct hclge_comm_hw *hw);
++#endif
+-- 
+2.26.2
+

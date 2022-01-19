@@ -1,0 +1,305 @@
+From 50d5bf1b6da9f74bf93f9dec601c09d45d6d8406 Mon Sep 17 00:00:00 2001
+From: Kemeng Shi <shikemeng@huawei.com>
+Date: Sat, 15 Jan 2022 17:10:10 +0800
+Subject: [PATCH] x86: hugepage: use nt copy hugepage to AEP in x86
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 50d5bf1b6da9f74bf93f9dec601c09d45d6d8406
+
+
+euleros inclusion
+category: feature
+feature: etmem
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4OODH?from=project-issue
+CVE: NA
+
+-------------------------------------------------
+
+Add proc/sys/vm/hugepage_nocache_copy switch. Set 1 to copy hugepage
+with movnt SSE instructoin if cpu support it. Set 0 to copy hugepage
+as usual.
+
+Signed-off-by: Kemeng Shi <shikemeng@huawei.com>
+Reviewed-by: louhongxiang <louhongxiang@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/include/asm/page_64.h |   6 ++
+ arch/x86/lib/Makefile          |   1 +
+ arch/x86/lib/copy_highpages.c  | 105 +++++++++++++++++++++++++++++++++
+ arch/x86/lib/copy_page_64.S    |  73 +++++++++++++++++++++++
+ include/linux/highmem.h        |  14 +++++
+ mm/migrate.c                   |   6 +-
+ 6 files changed, 200 insertions(+), 5 deletions(-)
+ create mode 100644 arch/x86/lib/copy_highpages.c
+
+diff --git a/arch/x86/include/asm/page_64.h b/arch/x86/include/asm/page_64.h
+index 939b1cff4a7b..d9fbc486728a 100644
+--- a/arch/x86/include/asm/page_64.h
++++ b/arch/x86/include/asm/page_64.h
+@@ -56,6 +56,12 @@ static inline void clear_page(void *page)
+ 
+ void copy_page(void *to, void *from);
+ 
++void copy_page_nocache(void *to, void *from);
++void copy_page_nocache_barrir(void);
++
++struct page;
++#define __HAVE_ARCH_COPY_HUGEPAGES 1
++void copy_highpages(struct page *to, struct page *from, int nr_pages);
+ #endif	/* !__ASSEMBLY__ */
+ 
+ #ifdef CONFIG_X86_VSYSCALL_EMULATION
+diff --git a/arch/x86/lib/Makefile b/arch/x86/lib/Makefile
+index bad4dee4f0e4..ab0d91b808be 100644
+--- a/arch/x86/lib/Makefile
++++ b/arch/x86/lib/Makefile
+@@ -70,4 +70,5 @@ else
+         lib-y += memmove_64.o memset_64.o
+         lib-y += copy_user_64.o
+ 	lib-y += cmpxchg16b_emu.o
++	lib-y += copy_highpages.o
+ endif
+diff --git a/arch/x86/lib/copy_highpages.c b/arch/x86/lib/copy_highpages.c
+new file mode 100644
+index 000000000000..ed95b8a7b906
+--- /dev/null
++++ b/arch/x86/lib/copy_highpages.c
+@@ -0,0 +1,105 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * accelerate copying page to pmem with non-temproal stroes
++ */
++#include <linux/sched.h>
++#include <linux/mmzone.h>
++#include <linux/highmem.h>
++#include <linux/sysctl.h>
++
++DEFINE_STATIC_KEY_FALSE(hugepage_nocache_copy);
++#ifdef CONFIG_SYSCTL
++static void set_hugepage_nocache_copy(bool enabled)
++{
++	if (enabled)
++		static_branch_enable(&hugepage_nocache_copy);
++	else
++		static_branch_disable(&hugepage_nocache_copy);
++}
++
++int sysctl_hugepage_nocache_copy(struct ctl_table *table, int write,
++		void __user *buffer, size_t *lenp, loff_t *ppos)
++{
++	struct ctl_table t;
++	int err;
++	int state;
++
++	if (write && !capable(CAP_SYS_ADMIN))
++		return -EPERM;
++
++	state = static_branch_unlikely(&hugepage_nocache_copy);
++	t = *table;
++	t.data = &state;
++	err = proc_dointvec_minmax(&t, write, buffer, lenp, ppos);
++	if (err < 0)
++		return err;
++	if (write)
++		set_hugepage_nocache_copy(state);
++	return err;
++}
++
++static struct ctl_table copy_highpages_table[] = {
++        {
++                .procname       = "hugepage_nocache_copy",
++                .data           = NULL,
++                .maxlen         = sizeof(unsigned int),
++                .mode           = 0600,
++                .proc_handler   = sysctl_hugepage_nocache_copy,
++                .extra1         = SYSCTL_ZERO,
++                .extra2         = SYSCTL_ONE,
++        },
++        {}
++};
++
++static struct ctl_table copy_highpages_root_table[] = {
++	{
++		.procname       = "vm",
++		.mode           = 0555,
++		.child          = copy_highpages_table,
++	},
++	{}
++};
++
++static __init int copy_highpages_init(void)
++{
++	return register_sysctl_table(copy_highpages_root_table) ? 0 : -ENOMEM;
++}
++__initcall(copy_highpages_init);
++#endif
++
++static void copy_highpages_nocache(struct page *to, struct page *from, int nr_pages)
++{
++	char *vfrom, *vto;
++	int i;
++
++	for (i = 0; i < nr_pages; i++) {
++		cond_resched();
++		vfrom = kmap_atomic(from);
++		vto = kmap_atomic(to);
++		copy_page_nocache(vto, vfrom);
++		kunmap_atomic(vto);
++		kunmap_atomic(vfrom);
++		to++;
++		from++;
++	}
++	copy_page_nocache_barrir();
++}
++
++static void copy_highpages_cache(struct page *to, struct page *from, int nr_pages)
++{
++	int i;
++
++	for (i = 0; i < nr_pages; i++) {
++		cond_resched();
++		copy_highpage(to + i, from + i);
++	}
++}
++
++void copy_highpages(struct page *to, struct page *from, int nr_pages)
++{
++	if (static_branch_unlikely(&hugepage_nocache_copy) &&
++			get_node_type(page_to_nid(to)) == NODE_TYPE_PMEM)
++		return copy_highpages_nocache(to, from, nr_pages);
++
++	return copy_highpages_cache(to, from, nr_pages);
++}
+diff --git a/arch/x86/lib/copy_page_64.S b/arch/x86/lib/copy_page_64.S
+index 2402d4c489d2..16ca196d349b 100644
+--- a/arch/x86/lib/copy_page_64.S
++++ b/arch/x86/lib/copy_page_64.S
+@@ -87,3 +87,76 @@ SYM_FUNC_START_LOCAL(copy_page_regs)
+ 	addq	$2*8, %rsp
+ 	ret
+ SYM_FUNC_END(copy_page_regs)
++
++SYM_FUNC_START(copy_page_nocache)
++	ALTERNATIVE "jmp copy_page", "", X86_FEATURE_XMM2
++	subq	$2*8,	%rsp
++	movq	%rbx,	(%rsp)
++	movq	%r12,	1*8(%rsp)
++
++	movl	$(4096/64)-5,	%ecx
++	.p2align 4
++.LoopNT64:
++	dec	%rcx
++	movq	0x8*0(%rsi), %rax
++	movq	0x8*1(%rsi), %rbx
++	movq	0x8*2(%rsi), %rdx
++	movq	0x8*3(%rsi), %r8
++	movq	0x8*4(%rsi), %r9
++	movq	0x8*5(%rsi), %r10
++	movq	0x8*6(%rsi), %r11
++	movq	0x8*7(%rsi), %r12
++
++	prefetcht0 5*64(%rsi)
++
++	movnti	%rax, 0x8*0(%rdi)
++	movnti	%rbx, 0x8*1(%rdi)
++	movnti	%rdx, 0x8*2(%rdi)
++	movnti	%r8,  0x8*3(%rdi)
++	movnti	%r9,  0x8*4(%rdi)
++	movnti	%r10, 0x8*5(%rdi)
++	movnti	%r11, 0x8*6(%rdi)
++	movnti	%r12, 0x8*7(%rdi)
++
++	leaq	64 (%rsi), %rsi
++	leaq	64 (%rdi), %rdi
++
++	jnz	.LoopNT64
++
++	movl	$5, %ecx
++	.p2align 4
++.LoopNT2:
++	decl	%ecx
++
++	movq	0x8*0(%rsi), %rax
++	movq	0x8*1(%rsi), %rbx
++	movq	0x8*2(%rsi), %rdx
++	movq	0x8*3(%rsi), %r8
++	movq	0x8*4(%rsi), %r9
++	movq	0x8*5(%rsi), %r10
++	movq	0x8*6(%rsi), %r11
++	movq	0x8*7(%rsi), %r12
++
++	movnti	%rax, 0x8*0(%rdi)
++	movnti	%rbx, 0x8*1(%rdi)
++	movnti	%rdx, 0x8*2(%rdi)
++	movnti	%r8,  0x8*3(%rdi)
++	movnti	%r9,  0x8*4(%rdi)
++	movnti	%r10, 0x8*5(%rdi)
++	movnti	%r11, 0x8*6(%rdi)
++	movnti	%r12, 0x8*7(%rdi)
++
++	leaq	64(%rdi), %rdi
++	leaq	64(%rsi), %rsi
++	jnz	.LoopNT2
++
++	movq	(%rsp), %rbx
++	movq	1*8(%rsp), %r12
++	addq	$2*8, %rsp
++	ret
++SYM_FUNC_END(copy_page_nocache)
++
++SYM_FUNC_START(copy_page_nocache_barrir)
++	ALTERNATIVE "", "sfence", X86_FEATURE_XMM2
++	ret
++SYM_FUNC_END(copy_page_nocache_barrir)
+diff --git a/include/linux/highmem.h b/include/linux/highmem.h
+index 8e21fe82b3a3..6b27af8fe624 100644
+--- a/include/linux/highmem.h
++++ b/include/linux/highmem.h
+@@ -356,4 +356,18 @@ static inline void copy_highpage(struct page *to, struct page *from)
+ 
+ #endif
+ 
++#ifndef __HAVE_ARCH_COPY_HUGEPAGES
++
++static inline void copy_highpages(struct page *to, struct page *from, int nr_pages)
++{
++	int i;
++
++	for (i = 0; i < nr_pages; i++) {
++		cond_resched();
++		copy_highpage(to + i, from + i);
++	}
++}
++
++#endif /* __HAVE_ARCH_COPY_HUGEPAGES */
++
+ #endif /* _LINUX_HIGHMEM_H */
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 8a57a09ad665..14c4db23b3ed 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -578,7 +578,6 @@ static void __copy_gigantic_page(struct page *dst, struct page *src,
+ 
+ static void copy_huge_page(struct page *dst, struct page *src)
+ {
+-	int i;
+ 	int nr_pages;
+ 
+ 	if (PageHuge(src)) {
+@@ -596,10 +595,7 @@ static void copy_huge_page(struct page *dst, struct page *src)
+ 		nr_pages = thp_nr_pages(src);
+ 	}
+ 
+-	for (i = 0; i < nr_pages; i++) {
+-		cond_resched();
+-		copy_highpage(dst + i, src + i);
+-	}
++	copy_highpages(dst, src, nr_pages);
+ }
+ 
+ /*
+-- 
+2.26.2
+

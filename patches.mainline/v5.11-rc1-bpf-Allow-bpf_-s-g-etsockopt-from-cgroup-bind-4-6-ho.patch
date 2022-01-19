@@ -1,0 +1,107 @@
+From 427167c0b064ed898b848209add62b4322ec7840 Mon Sep 17 00:00:00 2001
+From: Stanislav Fomichev <sdf@google.com>
+Date: Wed, 2 Dec 2020 09:25:15 -0800
+Subject: [PATCH] bpf: Allow bpf_{s,g}etsockopt from cgroup bind{4,6} hooks
+Git-commit: 427167c0b064ed898b848209add62b4322ec7840
+Patch-mainline: v5.11-rc1
+References: bsn#12
+
+
+I have to now lock/unlock socket for the bind hook execution.
+That shouldn't cause any overhead because the socket is unbound
+and shouldn't receive any traffic.
+
+Signed-off-by: Stanislav Fomichev <sdf@google.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Andrey Ignatov <rdna@fb.com>
+Link: https://lore.kernel.org/bpf/20201202172516.3483656-3-sdf@google.com
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/bpf-cgroup.h | 12 ++++++------
+ net/core/filter.c          |  4 ++++
+ net/ipv4/af_inet.c         |  2 +-
+ net/ipv6/af_inet6.c        |  2 +-
+ 4 files changed, 12 insertions(+), 8 deletions(-)
+
+diff --git a/include/linux/bpf-cgroup.h b/include/linux/bpf-cgroup.h
+index ed71bd1a0825..72e69a0e1e8c 100644
+--- a/include/linux/bpf-cgroup.h
++++ b/include/linux/bpf-cgroup.h
+@@ -246,11 +246,11 @@ int bpf_percpu_cgroup_storage_update(struct bpf_map *map, void *key,
+ 	__ret;								       \
+ })
+ 
+-#define BPF_CGROUP_RUN_PROG_INET4_BIND(sk, uaddr)			       \
+-	BPF_CGROUP_RUN_SA_PROG(sk, uaddr, BPF_CGROUP_INET4_BIND)
++#define BPF_CGROUP_RUN_PROG_INET4_BIND_LOCK(sk, uaddr)			       \
++	BPF_CGROUP_RUN_SA_PROG_LOCK(sk, uaddr, BPF_CGROUP_INET4_BIND, NULL)
+ 
+-#define BPF_CGROUP_RUN_PROG_INET6_BIND(sk, uaddr)			       \
+-	BPF_CGROUP_RUN_SA_PROG(sk, uaddr, BPF_CGROUP_INET6_BIND)
++#define BPF_CGROUP_RUN_PROG_INET6_BIND_LOCK(sk, uaddr)			       \
++	BPF_CGROUP_RUN_SA_PROG_LOCK(sk, uaddr, BPF_CGROUP_INET6_BIND, NULL)
+ 
+ #define BPF_CGROUP_PRE_CONNECT_ENABLED(sk) (cgroup_bpf_enabled && \
+ 					    sk->sk_prot->pre_connect)
+@@ -434,8 +434,8 @@ static inline int bpf_percpu_cgroup_storage_update(struct bpf_map *map,
+ #define BPF_CGROUP_RUN_PROG_INET_EGRESS(sk,skb) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_INET_SOCK(sk) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_INET_SOCK_RELEASE(sk) ({ 0; })
+-#define BPF_CGROUP_RUN_PROG_INET4_BIND(sk, uaddr) ({ 0; })
+-#define BPF_CGROUP_RUN_PROG_INET6_BIND(sk, uaddr) ({ 0; })
++#define BPF_CGROUP_RUN_PROG_INET4_BIND_LOCK(sk, uaddr) ({ 0; })
++#define BPF_CGROUP_RUN_PROG_INET6_BIND_LOCK(sk, uaddr) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_INET4_POST_BIND(sk) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_INET6_POST_BIND(sk) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_INET4_CONNECT(sk, uaddr) ({ 0; })
+diff --git a/net/core/filter.c b/net/core/filter.c
+index 2ca5eecebacf..21d91dcf0260 100644
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -6995,6 +6995,8 @@ sock_addr_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+ 		return &bpf_sk_storage_delete_proto;
+ 	case BPF_FUNC_setsockopt:
+ 		switch (prog->expected_attach_type) {
++		case BPF_CGROUP_INET4_BIND:
++		case BPF_CGROUP_INET6_BIND:
+ 		case BPF_CGROUP_INET4_CONNECT:
+ 		case BPF_CGROUP_INET6_CONNECT:
+ 			return &bpf_sock_addr_setsockopt_proto;
+@@ -7003,6 +7005,8 @@ sock_addr_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+ 		}
+ 	case BPF_FUNC_getsockopt:
+ 		switch (prog->expected_attach_type) {
++		case BPF_CGROUP_INET4_BIND:
++		case BPF_CGROUP_INET6_BIND:
+ 		case BPF_CGROUP_INET4_CONNECT:
+ 		case BPF_CGROUP_INET6_CONNECT:
+ 			return &bpf_sock_addr_getsockopt_proto;
+diff --git a/net/ipv4/af_inet.c b/net/ipv4/af_inet.c
+index b7260c8cef2e..b94fa8eb831b 100644
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -450,7 +450,7 @@ int inet_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
+ 	/* BPF prog is run before any checks are done so that if the prog
+ 	 * changes context in a wrong way it will be caught.
+ 	 */
+-	err = BPF_CGROUP_RUN_PROG_INET4_BIND(sk, uaddr);
++	err = BPF_CGROUP_RUN_PROG_INET4_BIND_LOCK(sk, uaddr);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/net/ipv6/af_inet6.c b/net/ipv6/af_inet6.c
+index e648fbebb167..a7e3d170af51 100644
+--- a/net/ipv6/af_inet6.c
++++ b/net/ipv6/af_inet6.c
+@@ -451,7 +451,7 @@ int inet6_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
+ 	/* BPF prog is run before any checks are done so that if the prog
+ 	 * changes context in a wrong way it will be caught.
+ 	 */
+-	err = BPF_CGROUP_RUN_PROG_INET6_BIND(sk, uaddr);
++	err = BPF_CGROUP_RUN_PROG_INET6_BIND_LOCK(sk, uaddr);
+ 	if (err)
+ 		return err;
+ 
+-- 
+2.26.2
+

@@ -1,0 +1,147 @@
+From d855066f81726155caf766e47eea58ae10b1fd57 Mon Sep 17 00:00:00 2001
+From: Like Xu <like.xu@linux.intel.com>
+Date: Fri, 8 Jan 2021 09:36:55 +0800
+Subject: [PATCH] KVM: VMX: read/write MSR_IA32_DEBUGCTLMSR from
+ GUEST_IA32_DEBUGCTL
+Git-commit: d855066f81726155caf766e47eea58ae10b1fd57
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+SVM already has specific handlers of MSR_IA32_DEBUGCTLMSR in the
+svm_get/set_msr, so the x86 common part can be safely moved to VMX.
+This allows KVM to store the bits it supports in GUEST_IA32_DEBUGCTL.
+
+Add vmx_supported_debugctl() to refactor the throwing logic of #GP.
+
+Signed-off-by: Like Xu <like.xu@linux.intel.com>
+Reviewed-by: Andi Kleen <ak@linux.intel.com>
+Message-Id: <20210108013704.134985-2-like.xu@linux.intel.com>
+[Merge parts of Chenyi Qiang's "KVM: X86: Expose bus lock debug exception
+ to guest". - Paolo]
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/kvm/vmx/capabilities.h |  5 +++++
+ arch/x86/kvm/vmx/vmx.c          | 23 +++++++++++++++++++----
+ arch/x86/kvm/x86.c              | 16 ++--------------
+ arch/x86/kvm/x86.h              |  2 ++
+ 4 files changed, 28 insertions(+), 18 deletions(-)
+
+diff --git a/arch/x86/kvm/vmx/capabilities.h b/arch/x86/kvm/vmx/capabilities.h
+index 5366ccdd134c..d0f31fcccd2b 100644
+--- a/arch/x86/kvm/vmx/capabilities.h
++++ b/arch/x86/kvm/vmx/capabilities.h
+@@ -384,4 +384,9 @@ static inline u64 vmx_get_perf_capabilities(void)
+ 	return PMU_CAP_FW_WRITES;
+ }
+ 
++static inline u64 vmx_supported_debugctl(void)
++{
++	return 0;
++}
++
+ #endif /* __KVM_X86_VMX_CAPS_H */
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index af8d3a2db3d2..d4145c57438c 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -1924,6 +1924,9 @@ static int vmx_get_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 		    !guest_cpuid_has(vcpu, X86_FEATURE_RDTSCP))
+ 			return 1;
+ 		goto find_uret_msr;
++	case MSR_IA32_DEBUGCTLMSR:
++		msr_info->data = vmcs_read64(GUEST_IA32_DEBUGCTL);
++		break;
+ 	default:
+ 	find_uret_msr:
+ 		msr = vmx_find_uret_msr(vmx, msr_info->index);
+@@ -1997,14 +2000,26 @@ static int vmx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 		}
+ 		vmcs_writel(GUEST_SYSENTER_ESP, data);
+ 		break;
+-	case MSR_IA32_DEBUGCTLMSR:
++	case MSR_IA32_DEBUGCTLMSR: {
++		u64 invalid = data & ~vmx_supported_debugctl();
++		if (invalid & (DEBUGCTLMSR_BTF|DEBUGCTLMSR_LBR)) {
++			if (report_ignored_msrs)
++				vcpu_unimpl(vcpu, "%s: BTF|LBR in IA32_DEBUGCTLMSR 0x%llx, nop\n",
++					    __func__, data);
++			data &= ~(DEBUGCTLMSR_BTF|DEBUGCTLMSR_LBR);
++			invalid &= ~(DEBUGCTLMSR_BTF|DEBUGCTLMSR_LBR);
++		}
++
++		if (invalid)
++			return 1;
++
+ 		if (is_guest_mode(vcpu) && get_vmcs12(vcpu)->vm_exit_controls &
+ 						VM_EXIT_SAVE_DEBUG_CONTROLS)
+ 			get_vmcs12(vcpu)->guest_ia32_debugctl = data;
+ 
+-		ret = kvm_set_msr_common(vcpu, msr_info);
+-		break;
+-
++		vmcs_write64(GUEST_IA32_DEBUGCTL, data);
++		return 0;
++	}
+ 	case MSR_IA32_BNDCFGS:
+ 		if (!kvm_mpx_supported() ||
+ 		    (!msr_info->host_initiated &&
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 8719877fe799..0ecbb4ecc363 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -117,8 +117,9 @@ EXPORT_SYMBOL_GPL(kvm_x86_ops);
+ static bool __read_mostly ignore_msrs = 0;
+ module_param(ignore_msrs, bool, S_IRUGO | S_IWUSR);
+ 
+-static bool __read_mostly report_ignored_msrs = true;
++bool __read_mostly report_ignored_msrs = true;
+ module_param(report_ignored_msrs, bool, S_IRUGO | S_IWUSR);
++EXPORT_SYMBOL_GPL(report_ignored_msrs);
+ 
+ unsigned int min_timer_period_us = 200;
+ module_param(min_timer_period_us, uint, S_IRUGO | S_IWUSR);
+@@ -3073,18 +3074,6 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 			return 1;
+ 		}
+ 		break;
+-	case MSR_IA32_DEBUGCTLMSR:
+-		if (!data) {
+-			/* We support the non-activated case already */
+-			break;
+-		} else if (data & ~(DEBUGCTLMSR_LBR | DEBUGCTLMSR_BTF)) {
+-			/* Values other than LBR and BTF are vendor-specific,
+-			   thus reserved and should throw a #GP */
+-			return 1;
+-		} else if (report_ignored_msrs)
+-			vcpu_unimpl(vcpu, "%s: MSR_IA32_DEBUGCTLMSR 0x%llx, nop\n",
+-				    __func__, data);
+-		break;
+ 	case 0x200 ... 0x2ff:
+ 		return kvm_mtrr_set_msr(vcpu, msr, data);
+ 	case MSR_IA32_APICBASE:
+@@ -3357,7 +3346,6 @@ int kvm_get_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 	switch (msr_info->index) {
+ 	case MSR_IA32_PLATFORM_ID:
+ 	case MSR_IA32_EBL_CR_POWERON:
+-	case MSR_IA32_DEBUGCTLMSR:
+ 	case MSR_IA32_LASTBRANCHFROMIP:
+ 	case MSR_IA32_LASTBRANCHTOIP:
+ 	case MSR_IA32_LASTINTFROMIP:
+diff --git a/arch/x86/kvm/x86.h b/arch/x86/kvm/x86.h
+index 0f727b50bd3d..5214b3be30ad 100644
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@ -296,6 +296,8 @@ extern int pi_inject_timer;
+ 
+ extern struct static_key kvm_no_apic_vcpu;
+ 
++extern bool report_ignored_msrs;
++
+ static inline u64 nsec_to_cycles(struct kvm_vcpu *vcpu, u64 nsec)
+ {
+ 	return pvclock_scale_delta(nsec, vcpu->arch.virtual_tsc_mult,
+-- 
+2.26.2
+

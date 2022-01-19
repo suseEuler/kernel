@@ -1,0 +1,170 @@
+From f4be591f1436afff4a18ddd180f7bf9421ffddfe Mon Sep 17 00:00:00 2001
+From: Calvin Owens <calvinowens@fb.com>
+Date: Fri, 16 Apr 2021 14:18:29 -0700
+Subject: [PATCH] brd: expose number of allocated pages in debugfs
+Git-commit: f4be591f1436afff4a18ddd180f7bf9421ffddfe
+Patch-mainline: v5.13-rc1
+References: bsn#12
+
+
+While the maximum size of each ramdisk is defined either as a module
+parameter, or compile time default, it's impossible to know how many pages
+have currently been allocated by each ram%d device, since they're
+allocated when used and never freed.
+
+This patch creates a new directory at this location:
+
+/sys/kernel/debug/ramdisk_pages/
+
+which will contain a file named "ram%d" for each instantiated ramdisk on
+the system. The file is read-only, and read() will output the number of
+pages currently held by that ramdisk.
+
+We lose track how much memory a ramdisk is using as pages once used are
+simply recycled but never freed.
+
+In instances where we exhaust the size of the ramdisk with a file that
+exceeds it, encounter ENOSPC and delete the file for mitigation; df would
+show decrease in used and increase in available blocks but the since we
+have touched all pages, the memory footprint of the ramdisk does not
+reflect the blocks used/available count
+
+...
+[root@localhost ~]# mkfs.ext2 /dev/ram15
+mke2fs 1.45.6 (20-Mar-2020)
+Creating filesystem with 4096 1k blocks and 1024 inodes
+[root@localhost ~]# mount /dev/ram15 /mnt/ram15/
+
+[root@localhost ~]# cat
+/sys/kernel/debug/ramdisk_pages/ram15
+58
+[root@kerneltest008.06.prn3 ~]# df /dev/ram15
+Filesystem     1K-blocks  Used Available Use% Mounted on
+/dev/ram15          3963    31      3728   1% /mnt/ram15
+[root@kerneltest008.06.prn3 ~]# dd if=/dev/urandom of=/mnt/ram15/test2
+bs=1M count=5
+dd: error writing '/mnt/ram15/test2': No space left on device
+4+0 records in
+3+0 records out
+4005888 bytes (4.0 MB, 3.8 MiB) copied, 0.0446614 s, 89.7 MB/s
+[root@kerneltest008.06.prn3 ~]# df /mnt/ram15/
+Filesystem     1K-blocks  Used Available Use% Mounted on
+/dev/ram15          3963  3960         0 100% /mnt/ram15
+[root@kerneltest008.06.prn3 ~]# cat
+/sys/kernel/debug/ramdisk_pages/ram15
+1024
+[root@kerneltest008.06.prn3 ~]# rm /mnt/ram15/test2
+rm: remove regular file '/mnt/ram15/test2'? y
+[root@kerneltest008.06.prn3 /var]# df /dev/ram15
+Filesystem     1K-blocks  Used Available Use% Mounted on
+/dev/ram15          3963    31      3728   1% /mnt/ram15
+
+# Acutal memory footprint
+[root@kerneltest008.06.prn3 /var]# cat
+/sys/kernel/debug/ramdisk_pages/ram15
+1024
+...
+
+This debugfs counter will always reveal the accurate number of
+permanently allocated pages to the ramdisk.
+
+Signed-off-by: Calvin Owens <calvinowens@fb.com>
+[cleaned up the !CONFIG_DEBUG_FS case and API changes for HEAD]
+Signed-off-by: Kyle McMartin <jkkm@fb.com>
+[rebased]
+Signed-off-by: Saravanan D <saravanand@fb.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/block/brd.c |   19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+--- a/drivers/block/brd.c
++++ b/drivers/block/brd.c
+@@ -22,6 +22,7 @@
+ #include <linux/fs.h>
+ #include <linux/slab.h>
+ #include <linux/backing-dev.h>
++#include <linux/debugfs.h>
+ 
+ #include <linux/uaccess.h>
+ 
+@@ -48,6 +49,7 @@ struct brd_device {
+ 	 */
+ 	spinlock_t		brd_lock;
+ 	struct radix_tree_root	brd_pages;
++	u64			brd_nr_pages;
+ };
+ 
+ /*
+@@ -116,6 +118,8 @@ static struct page *brd_insert_page(stru
+ 		page = radix_tree_lookup(&brd->brd_pages, idx);
+ 		BUG_ON(!page);
+ 		BUG_ON(page->index != idx);
++	} else {
++		brd->brd_nr_pages++;
+ 	}
+ 	spin_unlock(&brd->brd_lock);
+ 
+@@ -369,11 +373,13 @@ __setup("ramdisk_size=", ramdisk_size);
+  */
+ static LIST_HEAD(brd_devices);
+ static DEFINE_MUTEX(brd_devices_mutex);
++static struct dentry *brd_debugfs_dir;
+ 
+ static struct brd_device *brd_alloc(int i)
+ {
+ 	struct brd_device *brd;
+ 	struct gendisk *disk;
++	char buf[DISK_NAME_LEN];
+ 
+ 	brd = kzalloc(sizeof(*brd), GFP_KERNEL);
+ 	if (!brd)
+@@ -386,6 +392,11 @@ static struct brd_device *brd_alloc(int
+ 	if (!brd->brd_queue)
+ 		goto out_free_dev;
+ 
++	snprintf(buf, DISK_NAME_LEN, "ram%d", i);
++	if (!IS_ERR_OR_NULL(brd_debugfs_dir))
++		debugfs_create_u64(buf, 0444, brd_debugfs_dir,
++				&brd->brd_nr_pages);
++
+ 	/* This is so fdisk will align partitions on 4k, because of
+ 	 * direct_access API needing 4k alignment, returning a PFN
+ 	 * (This is only a problem on very small devices <= 4M,
+@@ -401,7 +412,7 @@ static struct brd_device *brd_alloc(int
+ 	disk->fops		= &brd_fops;
+ 	disk->private_data	= brd;
+ 	disk->flags		= GENHD_FL_EXT_DEVT;
+-	sprintf(disk->disk_name, "ram%d", i);
++	strlcpy(disk->disk_name, buf, DISK_NAME_LEN);
+ 	set_capacity(disk, rd_size * 2);
+ 
+ 	/* Tell the block layer that this is not a rotational device */
+@@ -460,6 +471,8 @@ static struct kobject *brd_probe(dev_t d
+ 	struct kobject *kobj;
+ 	bool new;
+ 
++	brd_debugfs_dir = debugfs_create_dir("ramdisk_pages", NULL);
++
+ 	mutex_lock(&brd_devices_mutex);
+ 	brd = brd_init_one(MINOR(dev) / max_part, &new);
+ 	kobj = brd ? get_disk_and_module(brd->brd_disk) : NULL;
+@@ -540,6 +553,8 @@ static int __init brd_init(void)
+ 	return 0;
+ 
+ out_free:
++	debugfs_remove_recursive(brd_debugfs_dir);
++
+ 	list_for_each_entry_safe(brd, next, &brd_devices, brd_list) {
+ 		list_del(&brd->brd_list);
+ 		brd_free(brd);
+@@ -554,6 +569,8 @@ static void __exit brd_exit(void)
+ {
+ 	struct brd_device *brd, *next;
+ 
++	debugfs_remove_recursive(brd_debugfs_dir);
++
+ 	list_for_each_entry_safe(brd, next, &brd_devices, brd_list)
+ 		brd_del_one(brd);
+ 

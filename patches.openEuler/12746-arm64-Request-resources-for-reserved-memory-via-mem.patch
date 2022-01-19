@@ -1,0 +1,141 @@
+From 374db2be8805428b4f54b5ef793b0d3f5069c5f9 Mon Sep 17 00:00:00 2001
+From: Peng Liu <liupeng256@huawei.com>
+Date: Fri, 7 Jan 2022 18:00:19 +0800
+Subject: [PATCH] arm64: Request resources for reserved memory via memmap
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 374db2be8805428b4f54b5ef793b0d3f5069c5f9
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4NYPZ
+CVE: NA
+
+-------------------------------------------------
+
+A new flag MEMBLOCK_MEMMAP is added into memblock_flags, which is
+used to identify reserved memory for memmap. This flag is limited
+for arm64. When memmap memory is reserved by memblock_reserve, it
+is subsequently marked with flag MEMBLOCK_MEMMAP. Therefore,
+for_each_mem_region can find memmap memory and request resources
+for it.
+
+Signed-off-by: Peng Liu <liupeng256@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/kernel/setup.c | 19 +++++++++++++++++++
+ arch/arm64/mm/init.c      |  1 +
+ include/linux/memblock.h  |  7 +++++++
+ mm/memblock.c             | 12 ++++++++++++
+ 4 files changed, 39 insertions(+)
+
+diff --git a/arch/arm64/kernel/setup.c b/arch/arm64/kernel/setup.c
+index 7cd042536d3b..92d75e381bb1 100644
+--- a/arch/arm64/kernel/setup.c
++++ b/arch/arm64/kernel/setup.c
+@@ -215,6 +215,22 @@ static void __init setup_machine_fdt(phys_addr_t dt_phys)
+ 	dump_stack_set_arch_desc("%s (DT)", name);
+ }
+ 
++static void __init request_memmap_resources(struct resource *res)
++{
++	struct resource *memmap_res;
++
++	memmap_res = memblock_alloc(sizeof(*memmap_res), SMP_CACHE_BYTES);
++	if (!memmap_res)
++		panic("%s: Failed to allocate memmap_res\n", __func__);
++
++	memmap_res->name = "memmap reserved";
++	memmap_res->flags = IORESOURCE_MEM;
++	memmap_res->start = res->start;
++	memmap_res->end = res->end;
++
++	request_resource(res, memmap_res);
++}
++
+ static void __init request_standard_resources(void)
+ {
+ 	struct memblock_region *region;
+@@ -253,6 +269,9 @@ static void __init request_standard_resources(void)
+ 		if (kernel_data.start >= res->start &&
+ 		    kernel_data.end <= res->end)
+ 			request_resource(res, &kernel_data);
++		if (memblock_is_memmap(region))
++			request_memmap_resources(res);
++
+ #ifdef CONFIG_KEXEC_CORE
+ 		/*
+ 		 * Userspace will find "Crash kernel" or "Crash kernel (low)"
+diff --git a/arch/arm64/mm/init.c b/arch/arm64/mm/init.c
+index f59546d3b0de..6ebfabde16f3 100644
+--- a/arch/arm64/mm/init.c
++++ b/arch/arm64/mm/init.c
+@@ -441,6 +441,7 @@ static int __init parse_memmap_one(char *p)
+ 	} else if (*p == '$') {
+ 		start_at = memparse(p + 1, &p);
+ 		memblock_reserve(start_at, mem_size);
++		memblock_mark_memmap(start_at, mem_size);
+ 	} else
+ 		pr_info("Unrecognized memmap option, please check the parameter.\n");
+ 
+diff --git a/include/linux/memblock.h b/include/linux/memblock.h
+index 1a8d25f2e041..629bf7de021b 100644
+--- a/include/linux/memblock.h
++++ b/include/linux/memblock.h
+@@ -37,6 +37,7 @@ enum memblock_flags {
+ 	MEMBLOCK_HOTPLUG	= 0x1,	/* hotpluggable region */
+ 	MEMBLOCK_MIRROR		= 0x2,	/* mirrored region */
+ 	MEMBLOCK_NOMAP		= 0x4,	/* don't add to kernel direct mapping */
++	MEMBLOCK_MEMMAP		= 0x8,	/* memmap reserved region */
+ };
+ 
+ /**
+@@ -116,6 +117,7 @@ int memblock_clear_hotplug(phys_addr_t base, phys_addr_t size);
+ int memblock_mark_mirror(phys_addr_t base, phys_addr_t size);
+ int memblock_mark_nomap(phys_addr_t base, phys_addr_t size);
+ int memblock_clear_nomap(phys_addr_t base, phys_addr_t size);
++int memblock_mark_memmap(phys_addr_t base, phys_addr_t size);
+ 
+ unsigned long memblock_free_all(void);
+ void reset_node_managed_pages(pg_data_t *pgdat);
+@@ -248,6 +250,11 @@ static inline bool memblock_is_nomap(struct memblock_region *m)
+ 	return m->flags & MEMBLOCK_NOMAP;
+ }
+ 
++static inline bool memblock_is_memmap(struct memblock_region *m)
++{
++	return m->flags & MEMBLOCK_MEMMAP;
++}
++
+ int memblock_search_pfn_nid(unsigned long pfn, unsigned long *start_pfn,
+ 			    unsigned long  *end_pfn);
+ void __next_mem_pfn_range(int *idx, int nid, unsigned long *out_start_pfn,
+diff --git a/mm/memblock.c b/mm/memblock.c
+index 2a6d1fa13280..d85893ab2f22 100644
+--- a/mm/memblock.c
++++ b/mm/memblock.c
+@@ -925,6 +925,18 @@ int __init_memblock memblock_clear_nomap(phys_addr_t base, phys_addr_t size)
+ 	return memblock_setclr_flag(base, size, 0, MEMBLOCK_NOMAP);
+ }
+ 
++/**
++ * memblock_mark_memmap - Mark a memory region with flag MEMBLOCK_MEMMAP.
++ * @base: the base phys addr of the region
++ * @size: the size of the region
++ *
++ * Return: 0 on success, -errno on failure.
++ */
++int __init_memblock memblock_mark_memmap(phys_addr_t base, phys_addr_t size)
++{
++	return memblock_setclr_flag(base, size, 1, MEMBLOCK_MEMMAP);
++}
++
+ static bool should_skip_region(struct memblock_type *type,
+ 			       struct memblock_region *m,
+ 			       int nid, int flags)
+-- 
+2.26.2
+

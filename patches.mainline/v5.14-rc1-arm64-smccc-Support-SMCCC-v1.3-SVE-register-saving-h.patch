@@ -1,0 +1,181 @@
+From cfa7ff959a789a953eac40c8ac793e2cfc2db931 Mon Sep 17 00:00:00 2001
+From: Mark Brown <broonie@kernel.org>
+Date: Thu, 3 Jun 2021 19:41:18 +0100
+Subject: [PATCH] arm64: smccc: Support SMCCC v1.3 SVE register saving hint
+Git-commit: cfa7ff959a789a953eac40c8ac793e2cfc2db931
+Patch-mainline: v5.14-rc1
+References: bsn#12
+
+
+SMCCC v1.2 requires that all SVE state be preserved over SMC calls which
+introduces substantial overhead in the common case where there is no SVE
+state in the registers. To avoid this SMCCC v1.3 introduces a flag which
+allows the caller to say that there is no state that needs to be preserved
+in the registers. Make use of this flag, setting it if the SMCCC version
+indicates support for it and the TIF_ flags indicate that there is no live
+SVE state in the registers, this avoids placing any constraints on when
+SMCCC calls can be done or triggering extra saving and reloading of SVE
+register state in the kernel.
+
+This would be straightforward enough except for the rather entertaining
+inline assembly we use to do SMCCC v1.1 calls to allow us to take advantage
+of the limited number of registers it clobbers. Deal with this by having a
+function which we call immediately before issuing the SMCCC call to make
+our checks and set the flag. Using alternatives the overhead if SVE is
+supported but not detected at runtime can be reduced to a single NOP.
+
+Signed-off-by: Mark Brown <broonie@kernel.org>
+Reviewed-by: Ard Biesheuvel <ardb@kernel.org>
+Reviewed-by: Marc Zyngier <maz@kernel.org>
+Link: https://lore.kernel.org/r/20210603184118.15090-1-broonie@kernel.org
+Signed-off-by: Will Deacon <will@kernel.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/kernel/smccc-call.S | 26 ++++++++++++++++++++++++++
+ drivers/firmware/smccc/smccc.c |  4 ++++
+ include/linux/arm-smccc.h      | 33 +++++++++++++++++++++++++++++++--
+ 3 files changed, 61 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm64/kernel/smccc-call.S b/arch/arm64/kernel/smccc-call.S
+index 2def9d0dd3dd..d3d37f932b97 100644
+--- a/arch/arm64/kernel/smccc-call.S
++++ b/arch/arm64/kernel/smccc-call.S
+@@ -7,8 +7,34 @@
+ 
+ #include <asm/asm-offsets.h>
+ #include <asm/assembler.h>
++#include <asm/thread_info.h>
++
++/*
++ * If we have SMCCC v1.3 and (as is likely) no SVE state in
++ * the registers then set the SMCCC hint bit to say there's no
++ * need to preserve it.  Do this by directly adjusting the SMCCC
++ * function value which is already stored in x0 ready to be called.
++ */
++SYM_FUNC_START(__arm_smccc_sve_check)
++
++	ldr_l	x16, smccc_has_sve_hint
++	cbz	x16, 2f
++
++	get_current_task x16
++	ldr	x16, [x16, #TSK_TI_FLAGS]
++	tbnz	x16, #TIF_FOREIGN_FPSTATE, 1f	// Any live FP state?
++	tbnz	x16, #TIF_SVE, 2f		// Does that state include SVE?
++
++1:	orr	x0, x0, ARM_SMCCC_1_3_SVE_HINT
++
++2:	ret
++SYM_FUNC_END(__arm_smccc_sve_check)
++EXPORT_SYMBOL(__arm_smccc_sve_check)
+ 
+ 	.macro SMCCC instr
++alternative_if ARM64_SVE
++	bl	__arm_smccc_sve_check
++alternative_else_nop_endif
+ 	\instr	#0
+ 	ldr	x4, [sp]
+ 	stp	x0, x1, [x4, #ARM_SMCCC_RES_X0_OFFS]
+diff --git a/drivers/firmware/smccc/smccc.c b/drivers/firmware/smccc/smccc.c
+index 028f81d702cc..9f937b125ab0 100644
+--- a/drivers/firmware/smccc/smccc.c
++++ b/drivers/firmware/smccc/smccc.c
+@@ -15,6 +15,7 @@ static u32 smccc_version = ARM_SMCCC_VERSION_1_0;
+ static enum arm_smccc_conduit smccc_conduit = SMCCC_CONDUIT_NONE;
+ 
+ bool __ro_after_init smccc_trng_available = false;
++u64 __ro_after_init smccc_has_sve_hint = false;
+ 
+ void __init arm_smccc_version_init(u32 version, enum arm_smccc_conduit conduit)
+ {
+@@ -22,6 +23,9 @@ void __init arm_smccc_version_init(u32 version, enum arm_smccc_conduit conduit)
+ 	smccc_conduit = conduit;
+ 
+ 	smccc_trng_available = smccc_probe_trng();
++	if (IS_ENABLED(CONFIG_ARM64_SVE) &&
++	    smccc_version >= ARM_SMCCC_VERSION_1_3)
++		smccc_has_sve_hint = true;
+ }
+ 
+ enum arm_smccc_conduit arm_smccc_1_1_get_conduit(void)
+diff --git a/include/linux/arm-smccc.h b/include/linux/arm-smccc.h
+index 5cef2b8b0479..7d1cabe15262 100644
+--- a/include/linux/arm-smccc.h
++++ b/include/linux/arm-smccc.h
+@@ -63,6 +63,9 @@
+ #define ARM_SMCCC_VERSION_1_0		0x10000
+ #define ARM_SMCCC_VERSION_1_1		0x10001
+ #define ARM_SMCCC_VERSION_1_2		0x10002
++#define ARM_SMCCC_VERSION_1_3		0x10003
++
++#define ARM_SMCCC_1_3_SVE_HINT		0x10000
+ 
+ #define ARM_SMCCC_VERSION_FUNC_ID					\
+ 	ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL,				\
+@@ -216,6 +219,8 @@ u32 arm_smccc_get_version(void);
+ 
+ void __init arm_smccc_version_init(u32 version, enum arm_smccc_conduit conduit);
+ 
++extern u64 smccc_has_sve_hint;
++
+ /**
+  * struct arm_smccc_res - Result from SMC/HVC call
+  * @a0-a3 result values from registers 0 to 3
+@@ -295,6 +300,15 @@ struct arm_smccc_quirk {
+ 	} state;
+ };
+ 
++/**
++ * __arm_smccc_sve_check() - Set the SVE hint bit when doing SMC calls
++ *
++ * Sets the SMCCC hint bit to indicate if there is live state in the SVE
++ * registers, this modifies x0 in place and should never be called from C
++ * code.
++ */
++asmlinkage unsigned long __arm_smccc_sve_check(unsigned long x0);
++
+ /**
+  * __arm_smccc_smc() - make SMC calls
+  * @a0-a7: arguments passed in registers 0 to 7
+@@ -352,6 +366,20 @@ asmlinkage void __arm_smccc_hvc(unsigned long a0, unsigned long a1,
+ 
+ #endif
+ 
++/* nVHE hypervisor doesn't have a current thread so needs separate checks */
++#if defined(CONFIG_ARM64_SVE) && !defined(__KVM_NVHE_HYPERVISOR__)
++
++#define SMCCC_SVE_CHECK ALTERNATIVE("nop \n",  "bl __arm_smccc_sve_check \n", \
++				    ARM64_SVE)
++#define smccc_sve_clobbers "x16", "x30", "cc",
++
++#else
++
++#define SMCCC_SVE_CHECK
++#define smccc_sve_clobbers
++
++#endif
++
+ #define ___count_args(_0, _1, _2, _3, _4, _5, _6, _7, _8, x, ...) x
+ 
+ #define __count_args(...)						\
+@@ -419,7 +447,7 @@ asmlinkage void __arm_smccc_hvc(unsigned long a0, unsigned long a1,
+ 
+ #define ___constraints(count)						\
+ 	: __constraint_read_ ## count					\
+-	: "memory"
++	: smccc_sve_clobbers "memory"
+ #define __constraints(count)	___constraints(count)
+ 
+ /*
+@@ -434,7 +462,8 @@ asmlinkage void __arm_smccc_hvc(unsigned long a0, unsigned long a1,
+ 		register unsigned long r2 asm("r2");			\
+ 		register unsigned long r3 asm("r3"); 			\
+ 		__declare_args(__count_args(__VA_ARGS__), __VA_ARGS__);	\
+-		asm volatile(inst "\n" :				\
++		asm volatile(SMCCC_SVE_CHECK				\
++			     inst "\n" :				\
+ 			     "=r" (r0), "=r" (r1), "=r" (r2), "=r" (r3)	\
+ 			     __constraints(__count_args(__VA_ARGS__)));	\
+ 		if (___res)						\
+-- 
+2.26.2
+

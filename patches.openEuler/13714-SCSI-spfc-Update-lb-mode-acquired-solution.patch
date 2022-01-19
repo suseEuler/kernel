@@ -1,0 +1,621 @@
+From 481ef9ceb857a477296de0ab82b42d8b31008ee2 Mon Sep 17 00:00:00 2001
+From: Yanling Song <songyl@ramaxel.com>
+Date: Mon, 17 Jan 2022 21:08:02 +0800
+Subject: [PATCH] SCSI: spfc: Update lb mode acquired solution
+Patch-mainline: NO, OTHERS
+References: OLK-5.10
+
+
+Ramaxel inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4QLBP
+CVE: NA
+
+Changes:
+1. Read lb mode from chip
+2. Disable fake vf function
+3. Remove unnecessary code
+
+Signed-off-by: Yanling Song <songyl@ramaxel.com>
+Reviewed-by: Yun Xu <xuyun@ramaxel.com>
+Acked-by: Xie XiuQi <xiexiuqi@huawei.com>
+Acked-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ .../ethernet/ramaxel/spnic/hw/sphw_cfg_cmd.h  |   3 +-
+ .../ethernet/ramaxel/spnic/hw/sphw_hw_cfg.c   |   3 +
+ .../ethernet/ramaxel/spnic/hw/sphw_hw_cfg.h   |   3 +
+ drivers/scsi/spfc/hw/spfc_cqm_bat_cla.c       |  43 +--
+ drivers/scsi/spfc/hw/spfc_cqm_bitmap_table.c  |  10 +-
+ drivers/scsi/spfc/hw/spfc_cqm_main.c          | 299 +-----------------
+ drivers/scsi/spfc/hw/spfc_cqm_main.h          |   3 -
+ drivers/scsi/spfc/hw/spfc_cqm_object.c        |  21 --
+ 8 files changed, 29 insertions(+), 356 deletions(-)
+
+diff --git a/drivers/net/ethernet/ramaxel/spnic/hw/sphw_cfg_cmd.h b/drivers/net/ethernet/ramaxel/spnic/hw/sphw_cfg_cmd.h
+index 23644958e33a..63b89e71c552 100644
+--- a/drivers/net/ethernet/ramaxel/spnic/hw/sphw_cfg_cmd.h
++++ b/drivers/net/ethernet/ramaxel/spnic/hw/sphw_cfg_cmd.h
+@@ -40,7 +40,8 @@ struct cfg_cmd_dev_cap {
+ 
+ 	u8 sf_svc_attr;
+ 	u8 func_sf_en;
+-	u16 rsvd_sf;
++	u8 lb_mode;
++	u8 smf_pg;
+ 
+ 	u32 max_conn_num;
+ 	u16 max_stick2cache_num;
+diff --git a/drivers/net/ethernet/ramaxel/spnic/hw/sphw_hw_cfg.c b/drivers/net/ethernet/ramaxel/spnic/hw/sphw_hw_cfg.c
+index 5d6a53307f0a..4b2674ec66f0 100644
+--- a/drivers/net/ethernet/ramaxel/spnic/hw/sphw_hw_cfg.c
++++ b/drivers/net/ethernet/ramaxel/spnic/hw/sphw_hw_cfg.c
+@@ -112,6 +112,9 @@ static void parse_pub_res_cap(struct sphw_hwdev *hwdev,
+ 	else
+ 		cap->sf_en = false;
+ 
++	cap->lb_mode = dev_cap->lb_mode;
++	cap->smf_pg = dev_cap->smf_pg;
++
+ 	cap->timer_en = (u8)timer_enable; /* timer enable */
+ 	cap->host_oq_id_mask_val = dev_cap->host_oq_id_mask_val;
+ 	cap->max_connect_num = dev_cap->max_conn_num;
+diff --git a/drivers/net/ethernet/ramaxel/spnic/hw/sphw_hw_cfg.h b/drivers/net/ethernet/ramaxel/spnic/hw/sphw_hw_cfg.h
+index 1147beeb76ad..1b48e0991563 100644
+--- a/drivers/net/ethernet/ramaxel/spnic/hw/sphw_hw_cfg.h
++++ b/drivers/net/ethernet/ramaxel/spnic/hw/sphw_hw_cfg.h
+@@ -201,6 +201,9 @@ struct service_cap {
+ 	u8 timer_en;    /* 0:disable, 1:enable */
+ 	u8 bloomfilter_en; /* 0:disable, 1:enable*/
+ 
++	u8 lb_mode;
++	u8 smf_pg;
++
+ 	/* For test */
+ 	u32 test_mode;
+ 	u32 test_qpc_num;
+diff --git a/drivers/scsi/spfc/hw/spfc_cqm_bat_cla.c b/drivers/scsi/spfc/hw/spfc_cqm_bat_cla.c
+index 30fb56a9bfed..0c1d97d9e3e6 100644
+--- a/drivers/scsi/spfc/hw/spfc_cqm_bat_cla.c
++++ b/drivers/scsi/spfc/hw/spfc_cqm_bat_cla.c
+@@ -53,17 +53,6 @@ cqm_bat_fill_cla_common_gpa(struct cqm_handle *cqm_handle,
+ 		gpa.acs_spu_en = 0;
+ 	}
+ 
+-	/* In fake mode, fake_vf_en in the GPA address of the BAT
+-	 * must be set to 1.
+-	 */
+-	if (cqm_handle->func_capability.fake_func_type == CQM_FAKE_FUNC_CHILD) {
+-		gpa.fake_vf_en = 1;
+-		func_attr = &cqm_handle->parent_cqm_handle->func_attribute;
+-		gpa.pf_id = func_attr->func_global_idx;
+-	} else {
+-		gpa.fake_vf_en = 0;
+-	}
+-
+ 	memcpy(&cla_gpa_h, &gpa, sizeof(u32));
+ 	bat_entry_standerd->cla_gpa_h = cla_gpa_h;
+ 
+@@ -379,13 +368,8 @@ s32 cqm_bat_update(struct cqm_handle *cqm_handle)
+ 	CQM_PTR_CHECK_RET(buf_in, CQM_FAIL, CQM_ALLOC_FAIL(buf_in));
+ 	buf_in->size = sizeof(struct cqm_cmdq_bat_update);
+ 
+-	/* In non-fake mode, func_id is set to 0xffff, indicating the current func.
+-	 * In fake mode, the value of func_id is specified. This is a fake func_id.
+-	 */
+-	if (cqm_handle->func_capability.fake_func_type == CQM_FAKE_FUNC_CHILD)
+-		func_id = cqm_handle->func_attribute.func_global_idx;
+-	else
+-		func_id = 0xffff;
++	/* In non-fake mode, func_id is set to 0xffff */
++	func_id = 0xffff;
+ 
+ 	/* The LB scenario is supported.
+ 	 * The normal mode is the traditional mode and is configured on SMF0.
+@@ -545,19 +529,6 @@ s32 cqm_cla_fill_buf(struct cqm_handle *cqm_handle, struct cqm_buf *cla_base_buf
+ 			spu_en = 0;
+ 		}
+ 
+-		/* fake enable */
+-		if (cqm_handle->func_capability.fake_func_type ==
+-		    CQM_FAKE_FUNC_CHILD) {
+-			fake_en = 1ULL << 62;
+-			func_attr =
+-			    &cqm_handle->parent_cqm_handle->func_attribute;
+-			pf_id = func_attr->func_global_idx;
+-			pf_id = (pf_id & 0x1f) << 57;
+-		} else {
+-			fake_en = 0;
+-			pf_id = 0;
+-		}
+-
+ 		*base = (((((cla_sub_buf->buf_list[i].pa & CQM_CHIP_GPA_MASK) |
+ 			    spu_en) |
+ 			   fake_en) |
+@@ -1248,14 +1219,8 @@ s32 cqm_cla_update(struct cqm_handle *cqm_handle, struct cqm_buf_list *buf_node_
+ 		}
+ 	}
+ 
+-	/* In non-fake mode, set func_id to 0xffff.
+-	 * Indicates the current func fake mode, set func_id to the
+-	 * specified value, This is a fake func_id.
+-	 */
+-	if (cqm_handle->func_capability.fake_func_type == CQM_FAKE_FUNC_CHILD)
+-		cmd.func_id = cqm_handle->func_attribute.func_global_idx;
+-	else
+-		cmd.func_id = 0xffff;
++	/* In non-fake mode, set func_id to 0xffff. */
++	cmd.func_id = 0xffff;
+ 
+ 	/* Mode 0 is hashed to 4 SMF engines (excluding PPF) by func ID. */
+ 	if (cqm_handle->func_capability.lb_mode == CQM_LB_MODE_NORMAL ||
+diff --git a/drivers/scsi/spfc/hw/spfc_cqm_bitmap_table.c b/drivers/scsi/spfc/hw/spfc_cqm_bitmap_table.c
+index 4e482776a14f..21100e8db8f4 100644
+--- a/drivers/scsi/spfc/hw/spfc_cqm_bitmap_table.c
++++ b/drivers/scsi/spfc/hw/spfc_cqm_bitmap_table.c
+@@ -405,14 +405,8 @@ s32 cqm_cla_cache_invalid(struct cqm_handle *cqm_handle, dma_addr_t gpa, u32 cac
+ 	cmd.gpa_h = CQM_ADDR_HI(gpa);
+ 	cmd.gpa_l = CQM_ADDR_LW(gpa);
+ 
+-	/* In non-fake mode, set func_id to 0xffff.
+-	 * Indicate the current func fake mode.
+-	 * The value of func_id is a fake func ID.
+-	 */
+-	if (cqm_handle->func_capability.fake_func_type == CQM_FAKE_FUNC_CHILD)
+-		cmd.func_id = cqm_handle->func_attribute.func_global_idx;
+-	else
+-		cmd.func_id = 0xffff;
++	/* In non-fake mode, set func_id to 0xffff. */
++	cmd.func_id = 0xffff;
+ 
+ 	/* Mode 0 is hashed to 4 SMF engines (excluding PPF) by func ID. */
+ 	if (cqm_handle->func_capability.lb_mode == CQM_LB_MODE_NORMAL ||
+diff --git a/drivers/scsi/spfc/hw/spfc_cqm_main.c b/drivers/scsi/spfc/hw/spfc_cqm_main.c
+index a4c8e60971b1..52cc2c7838e9 100644
+--- a/drivers/scsi/spfc/hw/spfc_cqm_main.c
++++ b/drivers/scsi/spfc/hw/spfc_cqm_main.c
+@@ -11,21 +11,8 @@
+ #include "sphw_crm.h"
+ #include "sphw_hw.h"
+ #include "sphw_hw_cfg.h"
+-
+ #include "spfc_cqm_main.h"
+ 
+-static unsigned char cqm_lb_mode = CQM_LB_MODE_NORMAL;
+-module_param(cqm_lb_mode, byte, 0644);
+-MODULE_PARM_DESC(cqm_lb_mode, "for cqm lb mode (default=0xff)");
+-
+-static unsigned char cqm_fake_mode = CQM_FAKE_MODE_DISABLE;
+-module_param(cqm_fake_mode, byte, 0644);
+-MODULE_PARM_DESC(cqm_fake_mode, "for cqm fake mode (default=0 disable)");
+-
+-static unsigned char cqm_platform_mode = CQM_FPGA_MODE;
+-module_param(cqm_platform_mode, byte, 0644);
+-MODULE_PARM_DESC(cqm_platform_mode, "for cqm platform mode (default=0 FPGA)");
+-
+ s32 cqm3_init(void *ex_handle)
+ {
+ 	struct sphw_hwdev *handle = (struct sphw_hwdev *)ex_handle;
+@@ -63,19 +50,6 @@ s32 cqm3_init(void *ex_handle)
+ 		goto err1;
+ 	}
+ 
+-	/* In FAKE mode, only the bitmap of the timer of the function is
+-	 * enabled, and resources are not initialized. Otherwise, the
+-	 * configuration of the fake function is overwritten.
+-	 */
+-	if (cqm_handle->func_capability.fake_func_type == CQM_FAKE_FUNC_CHILD_CONFLICT) {
+-		if (sphw_func_tmr_bitmap_set(ex_handle, true) != CQM_SUCCESS)
+-			cqm_err(handle->dev_hdl, "Timer start: enable timer bitmap failed\n");
+-
+-		handle->cqm_hdl = NULL;
+-		kfree(cqm_handle);
+-		return CQM_SUCCESS;
+-	}
+-
+ 	/* Initialize memory entries such as BAT, CLA, and bitmap. */
+ 	if (cqm_mem_init(ex_handle) != CQM_SUCCESS) {
+ 		cqm_err(handle->dev_hdl, CQM_FUNCTION_FAIL(cqm_mem_init));
+@@ -287,64 +261,6 @@ void cqm_service_capability_init(struct cqm_handle *cqm_handle,
+ 		cqm_service_capability_init_fc(cqm_handle, (void *)service_capability);
+ }
+ 
+-s32 cqm_get_fake_func_type(struct cqm_handle *cqm_handle)
+-{
+-	struct cqm_func_capability *func_cap = &cqm_handle->func_capability;
+-	u32 parent_func, child_func_start, child_func_number, i;
+-	u32 idx = cqm_handle->func_attribute.func_global_idx;
+-
+-	/* Currently, only one set of fake configurations is implemented.
+-	 * fake_cfg_number = 1
+-	 */
+-	for (i = 0; i < func_cap->fake_cfg_number; i++) {
+-		parent_func = func_cap->fake_cfg[i].parent_func;
+-		child_func_start = func_cap->fake_cfg[i].child_func_start;
+-		child_func_number = func_cap->fake_cfg[i].child_func_number;
+-
+-		if (idx == parent_func) {
+-			return CQM_FAKE_FUNC_PARENT;
+-		} else if ((idx >= child_func_start) &&
+-			   (idx < (child_func_start + child_func_number))) {
+-			return CQM_FAKE_FUNC_CHILD_CONFLICT;
+-		}
+-	}
+-
+-	return CQM_FAKE_FUNC_NORMAL;
+-}
+-
+-s32 cqm_get_child_func_start(struct cqm_handle *cqm_handle)
+-{
+-	struct cqm_func_capability *func_cap = &cqm_handle->func_capability;
+-	struct sphw_func_attr *func_attr = &cqm_handle->func_attribute;
+-	u32 i;
+-
+-	/* Currently, only one set of fake configurations is implemented.
+-	 * fake_cfg_number = 1
+-	 */
+-	for (i = 0; i < func_cap->fake_cfg_number; i++) {
+-		if (func_attr->func_global_idx ==
+-		    func_cap->fake_cfg[i].parent_func)
+-			return (s32)(func_cap->fake_cfg[i].child_func_start);
+-	}
+-
+-	return CQM_FAIL;
+-}
+-
+-s32 cqm_get_child_func_number(struct cqm_handle *cqm_handle)
+-{
+-	struct cqm_func_capability *func_cap = &cqm_handle->func_capability;
+-	struct sphw_func_attr *func_attr = &cqm_handle->func_attribute;
+-	u32 i;
+-
+-	for (i = 0; i < func_cap->fake_cfg_number; i++) {
+-		if (func_attr->func_global_idx ==
+-		    func_cap->fake_cfg[i].parent_func)
+-			return (s32)(func_cap->fake_cfg[i].child_func_number);
+-	}
+-
+-	return CQM_FAIL;
+-}
+-
+ /* Set func_type in fake_cqm_handle to ppf, pf, or vf. */
+ void cqm_set_func_type(struct cqm_handle *cqm_handle)
+ {
+@@ -358,41 +274,20 @@ void cqm_set_func_type(struct cqm_handle *cqm_handle)
+ 		cqm_handle->func_attribute.func_type = CQM_VF;
+ }
+ 
+-void cqm_lb_fake_mode_init(struct cqm_handle *cqm_handle)
++void cqm_lb_fake_mode_init(struct cqm_handle *cqm_handle, struct service_cap *svc_cap)
+ {
+ 	struct cqm_func_capability *func_cap = &cqm_handle->func_capability;
+-	struct cqm_fake_cfg *cfg = func_cap->fake_cfg;
+ 
+-	func_cap->lb_mode = cqm_lb_mode;
+-	func_cap->fake_mode = cqm_fake_mode;
++	func_cap->lb_mode = svc_cap->lb_mode;
+ 
+ 	/* Initializing the LB Mode */
+-	if (func_cap->lb_mode == CQM_LB_MODE_NORMAL) {
++	if (func_cap->lb_mode == CQM_LB_MODE_NORMAL)
+ 		func_cap->smf_pg = 0;
+-	} else {
+-		/* The LB mode is tailored on the FPGA.
+-		 * Only SMF0 and SMF2 are instantiated.
+-		 */
+-		if (cqm_platform_mode == CQM_FPGA_MODE)
+-			func_cap->smf_pg = 0x5;
+-		else
+-			func_cap->smf_pg = 0xF;
+-	}
++	else
++		func_cap->smf_pg = svc_cap->smf_pg;
+ 
+-	/* Initializing the FAKE Mode */
+-	if (func_cap->fake_mode == CQM_FAKE_MODE_DISABLE) {
+-		func_cap->fake_cfg_number = 0;
+-		func_cap->fake_func_type = CQM_FAKE_FUNC_NORMAL;
+-	} else {
+-		func_cap->fake_cfg_number = 1;
+-
+-		/* When configuring fake mode, ensure that the parent function
+-		 * cannot be contained in the child function; otherwise, the
+-		 * system will be initialized repeatedly.
+-		 */
+-		cfg[0].child_func_start = CQM_FAKE_CFUNC_START;
+-		func_cap->fake_func_type = cqm_get_fake_func_type(cqm_handle);
+-	}
++	func_cap->fake_cfg_number = 0;
++	func_cap->fake_func_type = CQM_FAKE_FUNC_NORMAL;
+ }
+ 
+ s32 cqm_capability_init(void *ex_handle)
+@@ -465,10 +360,9 @@ s32 cqm_capability_init(void *ex_handle)
+ 
+ 	func_cap->gpa_check_enable = true;
+ 
+-	cqm_lb_fake_mode_init(cqm_handle);
++	cqm_lb_fake_mode_init(cqm_handle, service_capability);
+ 	cqm_info(handle->dev_hdl, "Cap init: lb_mode=%u\n", func_cap->lb_mode);
+ 	cqm_info(handle->dev_hdl, "Cap init: smf_pg=%u\n", func_cap->smf_pg);
+-	cqm_info(handle->dev_hdl, "Cap init: fake_mode=%u\n", func_cap->fake_mode);
+ 	cqm_info(handle->dev_hdl, "Cap init: fake_func_type=%u\n", func_cap->fake_func_type);
+ 	cqm_info(handle->dev_hdl, "Cap init: fake_cfg_number=%u\n", func_cap->fake_cfg_number);
+ 
+@@ -517,153 +411,6 @@ s32 cqm_capability_init(void *ex_handle)
+ 	return err;
+ }
+ 
+-void cqm_fake_uninit(struct cqm_handle *cqm_handle)
+-{
+-	u32 i;
+-
+-	if (cqm_handle->func_capability.fake_func_type !=
+-	    CQM_FAKE_FUNC_PARENT)
+-		return;
+-
+-	for (i = 0; i < CQM_FAKE_FUNC_MAX; i++) {
+-		kfree(cqm_handle->fake_cqm_handle[i]);
+-		cqm_handle->fake_cqm_handle[i] = NULL;
+-	}
+-}
+-
+-s32 cqm_fake_init(struct cqm_handle *cqm_handle)
+-{
+-	struct sphw_hwdev *handle = cqm_handle->ex_handle;
+-	struct cqm_func_capability *func_cap = NULL;
+-	struct cqm_handle *fake_cqm_handle = NULL;
+-	struct sphw_func_attr *func_attr = NULL;
+-	s32 child_func_start, child_func_number;
+-	u32 i;
+-
+-	func_cap = &cqm_handle->func_capability;
+-	if (func_cap->fake_func_type != CQM_FAKE_FUNC_PARENT)
+-		return CQM_SUCCESS;
+-
+-	child_func_start = cqm_get_child_func_start(cqm_handle);
+-	if (child_func_start == CQM_FAIL) {
+-		cqm_err(handle->dev_hdl, CQM_WRONG_VALUE(child_func_start));
+-		return CQM_FAIL;
+-	}
+-
+-	child_func_number = cqm_get_child_func_number(cqm_handle);
+-	if (child_func_number == CQM_FAIL) {
+-		cqm_err(handle->dev_hdl, CQM_WRONG_VALUE(child_func_number));
+-		return CQM_FAIL;
+-	}
+-
+-	for (i = 0; i < (u32)child_func_number; i++) {
+-		fake_cqm_handle = kmalloc(sizeof(*fake_cqm_handle), GFP_KERNEL | __GFP_ZERO);
+-		if (!fake_cqm_handle) {
+-			cqm_err(handle->dev_hdl,
+-				CQM_ALLOC_FAIL(fake_cqm_handle));
+-			goto err;
+-		}
+-
+-		/* Copy the attributes of the parent CQM handle to the child CQM
+-		 * handle and modify the values of function.
+-		 */
+-		memcpy(fake_cqm_handle, cqm_handle, sizeof(struct cqm_handle));
+-		func_attr = &fake_cqm_handle->func_attribute;
+-		func_cap = &fake_cqm_handle->func_capability;
+-		func_attr->func_global_idx = (u16)(child_func_start + i);
+-		cqm_set_func_type(fake_cqm_handle);
+-		func_cap->fake_func_type = CQM_FAKE_FUNC_CHILD;
+-		cqm_info(handle->dev_hdl, "Fake func init: function[%u] type %d(0:PF,1:VF,2:PPF)\n",
+-			 func_attr->func_global_idx, func_attr->func_type);
+-
+-		fake_cqm_handle->parent_cqm_handle = cqm_handle;
+-		cqm_handle->fake_cqm_handle[i] = fake_cqm_handle;
+-	}
+-
+-	return CQM_SUCCESS;
+-
+-err:
+-	cqm_fake_uninit(cqm_handle);
+-	return CQM_FAIL;
+-}
+-
+-void cqm_fake_mem_uninit(struct cqm_handle *cqm_handle)
+-{
+-	struct sphw_hwdev *handle = cqm_handle->ex_handle;
+-	struct cqm_handle *fake_cqm_handle = NULL;
+-	s32 child_func_number;
+-	u32 i;
+-
+-	if (cqm_handle->func_capability.fake_func_type != CQM_FAKE_FUNC_PARENT)
+-		return;
+-
+-	child_func_number = cqm_get_child_func_number(cqm_handle);
+-	if (child_func_number == CQM_FAIL) {
+-		cqm_err(handle->dev_hdl, CQM_WRONG_VALUE(child_func_number));
+-		return;
+-	}
+-
+-	for (i = 0; i < (u32)child_func_number; i++) {
+-		fake_cqm_handle = cqm_handle->fake_cqm_handle[i];
+-		cqm_object_table_uninit(fake_cqm_handle);
+-		cqm_bitmap_uninit(fake_cqm_handle);
+-		cqm_cla_uninit(fake_cqm_handle, CQM_BAT_ENTRY_MAX);
+-		cqm_bat_uninit(fake_cqm_handle);
+-	}
+-}
+-
+-s32 cqm_fake_mem_init(struct cqm_handle *cqm_handle)
+-{
+-	struct sphw_hwdev *handle = cqm_handle->ex_handle;
+-	struct cqm_handle *fake_cqm_handle = NULL;
+-	s32 child_func_number;
+-	u32 i;
+-
+-	if (cqm_handle->func_capability.fake_func_type !=
+-	    CQM_FAKE_FUNC_PARENT)
+-		return CQM_SUCCESS;
+-
+-	child_func_number = cqm_get_child_func_number(cqm_handle);
+-	if (child_func_number == CQM_FAIL) {
+-		cqm_err(handle->dev_hdl, CQM_WRONG_VALUE(child_func_number));
+-		return CQM_FAIL;
+-	}
+-
+-	for (i = 0; i < (u32)child_func_number; i++) {
+-		fake_cqm_handle = cqm_handle->fake_cqm_handle[i];
+-
+-		if (cqm_bat_init(fake_cqm_handle) != CQM_SUCCESS) {
+-			cqm_err(handle->dev_hdl,
+-				CQM_FUNCTION_FAIL(cqm_bat_init));
+-			goto err;
+-		}
+-
+-		if (cqm_cla_init(fake_cqm_handle) != CQM_SUCCESS) {
+-			cqm_err(handle->dev_hdl,
+-				CQM_FUNCTION_FAIL(cqm_cla_init));
+-			goto err;
+-		}
+-
+-		if (cqm_bitmap_init(fake_cqm_handle) != CQM_SUCCESS) {
+-			cqm_err(handle->dev_hdl,
+-				CQM_FUNCTION_FAIL(cqm_bitmap_init));
+-			goto err;
+-		}
+-
+-		if (cqm_object_table_init(fake_cqm_handle) != CQM_SUCCESS) {
+-			cqm_err(handle->dev_hdl,
+-				CQM_FUNCTION_FAIL(cqm_object_table_init));
+-			goto err;
+-		}
+-	}
+-
+-	return CQM_SUCCESS;
+-
+-err:
+-	cqm_fake_mem_uninit(cqm_handle);
+-	return CQM_FAIL;
+-}
+-
+ s32 cqm_mem_init(void *ex_handle)
+ {
+ 	struct sphw_hwdev *handle = (struct sphw_hwdev *)ex_handle;
+@@ -671,49 +418,35 @@ s32 cqm_mem_init(void *ex_handle)
+ 
+ 	cqm_handle = (struct cqm_handle *)(handle->cqm_hdl);
+ 
+-	if (cqm_fake_init(cqm_handle) != CQM_SUCCESS) {
+-		cqm_err(handle->dev_hdl, CQM_FUNCTION_FAIL(cqm_fake_init));
+-		return CQM_FAIL;
+-	}
+-
+-	if (cqm_fake_mem_init(cqm_handle) != CQM_SUCCESS) {
+-		cqm_err(handle->dev_hdl, CQM_FUNCTION_FAIL(cqm_fake_mem_init));
+-		goto err1;
+-	}
+-
+ 	if (cqm_bat_init(cqm_handle) != CQM_SUCCESS) {
+ 		cqm_err(handle->dev_hdl, CQM_FUNCTION_FAIL(cqm_bat_init));
+-		goto err2;
++		return CQM_FAIL;
+ 	}
+ 
+ 	if (cqm_cla_init(cqm_handle) != CQM_SUCCESS) {
+ 		cqm_err(handle->dev_hdl, CQM_FUNCTION_FAIL(cqm_cla_init));
+-		goto err3;
++		goto err1;
+ 	}
+ 
+ 	if (cqm_bitmap_init(cqm_handle) != CQM_SUCCESS) {
+ 		cqm_err(handle->dev_hdl, CQM_FUNCTION_FAIL(cqm_bitmap_init));
+-		goto err4;
++		goto err2;
+ 	}
+ 
+ 	if (cqm_object_table_init(cqm_handle) != CQM_SUCCESS) {
+ 		cqm_err(handle->dev_hdl,
+ 			CQM_FUNCTION_FAIL(cqm_object_table_init));
+-		goto err5;
++		goto err3;
+ 	}
+ 
+ 	return CQM_SUCCESS;
+ 
+-err5:
+-	cqm_bitmap_uninit(cqm_handle);
+-err4:
+-	cqm_cla_uninit(cqm_handle, CQM_BAT_ENTRY_MAX);
+ err3:
+-	cqm_bat_uninit(cqm_handle);
++	cqm_bitmap_uninit(cqm_handle);
+ err2:
+-	cqm_fake_mem_uninit(cqm_handle);
++	cqm_cla_uninit(cqm_handle, CQM_BAT_ENTRY_MAX);
+ err1:
+-	cqm_fake_uninit(cqm_handle);
++	cqm_bat_uninit(cqm_handle);
+ 	return CQM_FAIL;
+ }
+ 
+@@ -728,8 +461,6 @@ void cqm_mem_uninit(void *ex_handle)
+ 	cqm_bitmap_uninit(cqm_handle);
+ 	cqm_cla_uninit(cqm_handle, CQM_BAT_ENTRY_MAX);
+ 	cqm_bat_uninit(cqm_handle);
+-	cqm_fake_mem_uninit(cqm_handle);
+-	cqm_fake_uninit(cqm_handle);
+ }
+ 
+ s32 cqm_event_init(void *ex_handle)
+diff --git a/drivers/scsi/spfc/hw/spfc_cqm_main.h b/drivers/scsi/spfc/hw/spfc_cqm_main.h
+index 1b8cf8bdb3b7..cf10d7f5c339 100644
+--- a/drivers/scsi/spfc/hw/spfc_cqm_main.h
++++ b/drivers/scsi/spfc/hw/spfc_cqm_main.h
+@@ -328,9 +328,6 @@ void cqm_mem_uninit(void *ex_handle);
+ s32 cqm_event_init(void *ex_handle);
+ void cqm_event_uninit(void *ex_handle);
+ u8 cqm_aeq_callback(void *ex_handle, u8 event, u8 *data);
+-s32 cqm_get_fake_func_type(struct cqm_handle *cqm_handle);
+-s32 cqm_get_child_func_start(struct cqm_handle *cqm_handle);
+-s32 cqm_get_child_func_number(struct cqm_handle *cqm_handle);
+ 
+ s32 cqm3_init(void *ex_handle);
+ void cqm3_uninit(void *ex_handle);
+diff --git a/drivers/scsi/spfc/hw/spfc_cqm_object.c b/drivers/scsi/spfc/hw/spfc_cqm_object.c
+index b895d37aebae..165794e9c7e5 100644
+--- a/drivers/scsi/spfc/hw/spfc_cqm_object.c
++++ b/drivers/scsi/spfc/hw/spfc_cqm_object.c
+@@ -155,8 +155,6 @@ struct cqm_qpc_mpt *cqm3_object_qpc_mpt_create(void *ex_handle, u32 service_type
+ 	struct cqm_qpc_mpt_info *qpc_mpt_info = NULL;
+ 	struct cqm_handle *cqm_handle = NULL;
+ 	s32 ret = CQM_FAIL;
+-	u32 relative_index;
+-	u32 fake_func_id;
+ 
+ 	CQM_PTR_CHECK_RET(ex_handle, NULL, CQM_PTR_NULL(ex_handle));
+ 
+@@ -180,25 +178,6 @@ struct cqm_qpc_mpt *cqm3_object_qpc_mpt_create(void *ex_handle, u32 service_type
+ 		return NULL;
+ 	}
+ 
+-	/* fake vf adaption, switch to corresponding VF. */
+-	if (cqm_handle->func_capability.fake_func_type ==
+-	    CQM_FAKE_FUNC_PARENT) {
+-		fake_func_id = index / cqm_handle->func_capability.qpc_number;
+-		relative_index = index % cqm_handle->func_capability.qpc_number;
+-
+-		cqm_info(handle->dev_hdl, "qpc create: fake_func_id=%u, relative_index=%u\n",
+-			 fake_func_id, relative_index);
+-
+-		if ((s32)fake_func_id >=
+-		    cqm_get_child_func_number(cqm_handle)) {
+-			cqm_err(handle->dev_hdl, CQM_WRONG_VALUE(fake_func_id));
+-			return NULL;
+-		}
+-
+-		index = relative_index;
+-		cqm_handle = cqm_handle->fake_cqm_handle[fake_func_id];
+-	}
+-
+ 	qpc_mpt_info = kmalloc(sizeof(*qpc_mpt_info), GFP_ATOMIC | __GFP_ZERO);
+ 	CQM_PTR_CHECK_RET(qpc_mpt_info, NULL, CQM_ALLOC_FAIL(qpc_mpt_info));
+ 
+-- 
+2.26.2
+

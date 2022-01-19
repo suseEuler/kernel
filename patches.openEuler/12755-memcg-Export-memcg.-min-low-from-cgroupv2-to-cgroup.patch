@@ -1,0 +1,191 @@
+From 27c047f48ab4e3abd5dd7f9c3c8fb444fbb00df4 Mon Sep 17 00:00:00 2001
+From: Lu Jialin <lujialin4@huawei.com>
+Date: Fri, 7 Jan 2022 23:05:24 +0800
+Subject: [PATCH] memcg: Export memcg.{min/low} from cgroupv2 to cgroupv1
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 27c047f48ab4e3abd5dd7f9c3c8fb444fbb00df4
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4IMAK?from=project-issue
+CVE: NA
+
+--------
+
+Export memcg.min and memcg.low from cgroupv2 to cgroupv1, in order to reduce
+the negtive impact between cgroups when the system memory is insufficient.
+
+Only export memory.{min/low} numbers in mem_cgroup_legacy_files and move
+related functions in front of mem_cgroup_legacy_files. There is no need
+to other changes.
+
+Signed-off-by: Lu Jialin <lujialin4@huawei.com>
+Reviewed-by: weiyang wang <wangweiyang2@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/memcontrol.c | 124 ++++++++++++++++++++++++++----------------------
+ 1 file changed, 68 insertions(+), 56 deletions(-)
+
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 99cfd840e3bd..e0efdbbddd80 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -5013,6 +5013,62 @@ static ssize_t memcg_write_event_control(struct kernfs_open_file *of,
+ 	return ret;
+ }
+ 
++static int seq_puts_memcg_tunable(struct seq_file *m, unsigned long value)
++{
++	if (value == PAGE_COUNTER_MAX)
++		seq_puts(m, "max\n");
++	else
++		seq_printf(m, "%llu\n", (u64)value * PAGE_SIZE);
++
++	return 0;
++}
++
++static int memory_min_show(struct seq_file *m, void *v)
++{
++	return seq_puts_memcg_tunable(m,
++		READ_ONCE(mem_cgroup_from_seq(m)->memory.min));
++}
++
++static ssize_t memory_min_write(struct kernfs_open_file *of,
++				char *buf, size_t nbytes, loff_t off)
++{
++	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
++	unsigned long min;
++	int err;
++
++	buf = strstrip(buf);
++	err = page_counter_memparse(buf, "max", &min);
++	if (err)
++		return err;
++
++	page_counter_set_min(&memcg->memory, min);
++
++	return nbytes;
++}
++
++static int memory_low_show(struct seq_file *m, void *v)
++{
++	return seq_puts_memcg_tunable(m,
++		READ_ONCE(mem_cgroup_from_seq(m)->memory.low));
++}
++
++static ssize_t memory_low_write(struct kernfs_open_file *of,
++				char *buf, size_t nbytes, loff_t off)
++{
++	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
++	unsigned long low;
++	int err;
++
++	buf = strstrip(buf);
++	err = page_counter_memparse(buf, "max", &low);
++	if (err)
++		return err;
++
++	page_counter_set_low(&memcg->memory, low);
++
++	return nbytes;
++}
++
+ static struct cftype mem_cgroup_legacy_files[] = {
+ 	{
+ 		.name = "usage_in_bytes",
+@@ -5146,6 +5202,18 @@ static struct cftype mem_cgroup_legacy_files[] = {
+ 		.write = mem_cgroup_reset,
+ 		.read_u64 = mem_cgroup_read_u64,
+ 	},
++	{
++		.name = "min",
++		.flags = CFTYPE_NOT_ON_ROOT,
++		.seq_show = memory_min_show,
++		.write = memory_min_write,
++	},
++	{
++		.name = "low",
++		.flags = CFTYPE_NOT_ON_ROOT,
++		.seq_show = memory_low_show,
++		.write = memory_low_write,
++	},
+ 	{ },	/* terminate */
+ };
+ 
+@@ -6341,16 +6409,6 @@ static void mem_cgroup_bind(struct cgroup_subsys_state *root_css)
+ 		root_mem_cgroup->use_hierarchy = false;
+ }
+ 
+-static int seq_puts_memcg_tunable(struct seq_file *m, unsigned long value)
+-{
+-	if (value == PAGE_COUNTER_MAX)
+-		seq_puts(m, "max\n");
+-	else
+-		seq_printf(m, "%llu\n", (u64)value * PAGE_SIZE);
+-
+-	return 0;
+-}
+-
+ static u64 memory_current_read(struct cgroup_subsys_state *css,
+ 			       struct cftype *cft)
+ {
+@@ -6359,52 +6417,6 @@ static u64 memory_current_read(struct cgroup_subsys_state *css,
+ 	return (u64)page_counter_read(&memcg->memory) * PAGE_SIZE;
+ }
+ 
+-static int memory_min_show(struct seq_file *m, void *v)
+-{
+-	return seq_puts_memcg_tunable(m,
+-		READ_ONCE(mem_cgroup_from_seq(m)->memory.min));
+-}
+-
+-static ssize_t memory_min_write(struct kernfs_open_file *of,
+-				char *buf, size_t nbytes, loff_t off)
+-{
+-	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
+-	unsigned long min;
+-	int err;
+-
+-	buf = strstrip(buf);
+-	err = page_counter_memparse(buf, "max", &min);
+-	if (err)
+-		return err;
+-
+-	page_counter_set_min(&memcg->memory, min);
+-
+-	return nbytes;
+-}
+-
+-static int memory_low_show(struct seq_file *m, void *v)
+-{
+-	return seq_puts_memcg_tunable(m,
+-		READ_ONCE(mem_cgroup_from_seq(m)->memory.low));
+-}
+-
+-static ssize_t memory_low_write(struct kernfs_open_file *of,
+-				char *buf, size_t nbytes, loff_t off)
+-{
+-	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
+-	unsigned long low;
+-	int err;
+-
+-	buf = strstrip(buf);
+-	err = page_counter_memparse(buf, "max", &low);
+-	if (err)
+-		return err;
+-
+-	page_counter_set_low(&memcg->memory, low);
+-
+-	return nbytes;
+-}
+-
+ static int memory_high_show(struct seq_file *m, void *v)
+ {
+ 	return seq_puts_memcg_tunable(m,
+-- 
+2.26.2
+

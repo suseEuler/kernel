@@ -1,0 +1,163 @@
+From a801cd2a9d5e730b6254fe41ef6cc6eff499dcc7 Mon Sep 17 00:00:00 2001
+From: Wang Yufen <wangyufen@huawei.com>
+Date: Fri, 7 Jan 2022 23:07:20 +0800
+Subject: [PATCH] tcp_comp: add stub proto ops for tcp compression socket
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: a801cd2a9d5e730b6254fe41ef6cc6eff499dcc7
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4PNEK
+CVE: NA
+
+-------------------------------------------------
+
+Add stub proto ops for tcp compression socket.
+
+Signed-off-by: Wei Yongjun <weiyongjun1@huawei.com>
+Signed-off-by: Wang Yufen <wangyufen@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Lu Wei <luwei32@huawei.com>
+Reviewed-by: Wei Yongjun <weiyongjun1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/net/tcp.h   |  6 +++++
+ net/ipv4/tcp.c      |  1 +
+ net/ipv4/tcp_comp.c | 66 +++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 73 insertions(+)
+
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index cee41cca6d2c..9475e3da53eb 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -2391,6 +2391,7 @@ bool tcp_synack_comp_enabled(const struct sock *sk,
+ 			     const struct inet_request_sock *ireq);
+ void tcp_init_compression(struct sock *sk);
+ void tcp_cleanup_compression(struct sock *sk);
++int tcp_comp_init(void);
+ #else
+ static inline bool tcp_syn_comp_enabled(const struct tcp_sock *tp)
+ {
+@@ -2410,6 +2411,11 @@ static inline void tcp_init_compression(struct sock *sk)
+ static inline void tcp_cleanup_compression(struct sock *sk)
+ {
+ }
++
++static inline int tcp_comp_init(void)
++{
++	return 0;
++}
+ #endif
+ 
+ #endif	/* _TCP_H */
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index 4d7bb05df4e4..1d6efb6c6542 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -4248,5 +4248,6 @@ void __init tcp_init(void)
+ 	tcp_metrics_init();
+ 	BUG_ON(tcp_register_congestion_control(&tcp_reno) != 0);
+ 	tcp_tasklet_init();
++	tcp_comp_init();
+ 	mptcp_init();
+ }
+diff --git a/net/ipv4/tcp_comp.c b/net/ipv4/tcp_comp.c
+index afcd50c89e78..fb90be4d9e9c 100644
+--- a/net/ipv4/tcp_comp.c
++++ b/net/ipv4/tcp_comp.c
+@@ -12,6 +12,13 @@ static unsigned long tcp_compression_ports[65536 / 8];
+ unsigned long *sysctl_tcp_compression_ports = tcp_compression_ports;
+ int sysctl_tcp_compression_local __read_mostly;
+ 
++static struct proto tcp_prot_override;
++
++struct tcp_comp_context {
++	struct proto *sk_proto;
++	struct rcu_head rcu;
++};
++
+ static bool tcp_comp_enabled(__be32 saddr, __be32 daddr, int port)
+ {
+ 	if (!sysctl_tcp_compression_local &&
+@@ -41,16 +48,75 @@ bool tcp_synack_comp_enabled(const struct sock *sk,
+ 				ntohs(inet->inet_sport));
+ }
+ 
++static struct tcp_comp_context *comp_get_ctx(const struct sock *sk)
++{
++	struct inet_connection_sock *icsk = inet_csk(sk);
++
++	return (__force void *)icsk->icsk_ulp_data;
++}
++
++static int tcp_comp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
++{
++	struct tcp_comp_context *ctx = comp_get_ctx(sk);
++
++	return ctx->sk_proto->sendmsg(sk, msg, size);
++}
++
++static int tcp_comp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
++			    int nonblock, int flags, int *addr_len)
++{
++	struct tcp_comp_context *ctx = comp_get_ctx(sk);
++
++	return ctx->sk_proto->recvmsg(sk, msg, len, nonblock, flags, addr_len);
++}
++
+ void tcp_init_compression(struct sock *sk)
+ {
++	struct inet_connection_sock *icsk = inet_csk(sk);
++	struct tcp_comp_context *ctx = NULL;
+ 	struct tcp_sock *tp = tcp_sk(sk);
+ 
+ 	if (!tp->rx_opt.comp_ok)
+ 		return;
+ 
++	ctx = kzalloc(sizeof(*ctx), GFP_ATOMIC);
++	if (!ctx)
++		return;
++
++	ctx->sk_proto = sk->sk_prot;
++	WRITE_ONCE(sk->sk_prot, &tcp_prot_override);
++
++	rcu_assign_pointer(icsk->icsk_ulp_data, ctx);
++
+ 	sock_set_flag(sk, SOCK_COMP);
+ }
+ 
++static void tcp_comp_context_free(struct rcu_head *head)
++{
++	struct tcp_comp_context *ctx;
++
++	ctx = container_of(head, struct tcp_comp_context, rcu);
++
++	kfree(ctx);
++}
++
+ void tcp_cleanup_compression(struct sock *sk)
+ {
++	struct inet_connection_sock *icsk = inet_csk(sk);
++	struct tcp_comp_context *ctx = comp_get_ctx(sk);
++
++	if (!ctx || !sock_flag(sk, SOCK_COMP))
++		return;
++
++	rcu_assign_pointer(icsk->icsk_ulp_data, NULL);
++	call_rcu(&ctx->rcu, tcp_comp_context_free);
++}
++
++int tcp_comp_init(void)
++{
++	tcp_prot_override = tcp_prot;
++	tcp_prot_override.sendmsg = tcp_comp_sendmsg;
++	tcp_prot_override.recvmsg = tcp_comp_recvmsg;
++
++	return 0;
+ }
+-- 
+2.26.2
+

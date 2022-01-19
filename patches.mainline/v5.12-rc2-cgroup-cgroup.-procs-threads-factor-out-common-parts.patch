@@ -1,0 +1,126 @@
+From da70862efe0065bada33d67a903270cdbbaf07d9 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Michal=20Koutn=C3=BD?= <mkoutny@suse.com>
+Date: Thu, 14 Jan 2021 13:44:27 +0100
+Subject: [PATCH] cgroup: cgroup.{procs,threads} factor out common parts
+MIME-Version: 1.0
+Git-commit: da70862efe0065bada33d67a903270cdbbaf07d9
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The functions cgroup_threads_write and cgroup_procs_write are almost
+identical. In order to reduce duplication, factor out the common code in
+similar fashion we already do for other threadgroup/task functions. No
+functional changes are intended.
+
+Suggested-by: Hao Lee <haolee.swjtu@gmail.com>
+Signed-off-by: Michal Koutný <mkoutny@suse.com>
+Reviewed-by: Daniel Jordan <daniel.m.jordan@oracle.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/cgroup/cgroup.c | 55 +++++++++++-------------------------------
+ 1 file changed, 14 insertions(+), 41 deletions(-)
+
+diff --git a/kernel/cgroup/cgroup.c b/kernel/cgroup/cgroup.c
+index 613845769103..f6279df507f4 100644
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@ -4726,8 +4726,8 @@ static int cgroup_attach_permissions(struct cgroup *src_cgrp,
+ 	return ret;
+ }
+ 
+-static ssize_t cgroup_procs_write(struct kernfs_open_file *of,
+-				  char *buf, size_t nbytes, loff_t off)
++static ssize_t __cgroup_procs_write(struct kernfs_open_file *of, char *buf,
++				    bool threadgroup)
+ {
+ 	struct cgroup *src_cgrp, *dst_cgrp;
+ 	struct task_struct *task;
+@@ -4738,7 +4738,7 @@ static ssize_t cgroup_procs_write(struct kernfs_open_file *of,
+ 	if (!dst_cgrp)
+ 		return -ENODEV;
+ 
+-	task = cgroup_procs_write_start(buf, true, &locked);
++	task = cgroup_procs_write_start(buf, threadgroup, &locked);
+ 	ret = PTR_ERR_OR_ZERO(task);
+ 	if (ret)
+ 		goto out_unlock;
+@@ -4748,19 +4748,26 @@ static ssize_t cgroup_procs_write(struct kernfs_open_file *of,
+ 	src_cgrp = task_cgroup_from_root(task, &cgrp_dfl_root);
+ 	spin_unlock_irq(&css_set_lock);
+ 
++	/* process and thread migrations follow same delegation rule */
+ 	ret = cgroup_attach_permissions(src_cgrp, dst_cgrp,
+-					of->file->f_path.dentry->d_sb, true);
++					of->file->f_path.dentry->d_sb, threadgroup);
+ 	if (ret)
+ 		goto out_finish;
+ 
+-	ret = cgroup_attach_task(dst_cgrp, task, true);
++	ret = cgroup_attach_task(dst_cgrp, task, threadgroup);
+ 
+ out_finish:
+ 	cgroup_procs_write_finish(task, locked);
+ out_unlock:
+ 	cgroup_kn_unlock(of->kn);
+ 
+-	return ret ?: nbytes;
++	return ret;
++}
++
++static ssize_t cgroup_procs_write(struct kernfs_open_file *of,
++				  char *buf, size_t nbytes, loff_t off)
++{
++	return __cgroup_procs_write(of, buf, true) ?: nbytes;
+ }
+ 
+ static void *cgroup_threads_start(struct seq_file *s, loff_t *pos)
+@@ -4771,41 +4778,7 @@ static void *cgroup_threads_start(struct seq_file *s, loff_t *pos)
+ static ssize_t cgroup_threads_write(struct kernfs_open_file *of,
+ 				    char *buf, size_t nbytes, loff_t off)
+ {
+-	struct cgroup *src_cgrp, *dst_cgrp;
+-	struct task_struct *task;
+-	ssize_t ret;
+-	bool locked;
+-
+-	buf = strstrip(buf);
+-
+-	dst_cgrp = cgroup_kn_lock_live(of->kn, false);
+-	if (!dst_cgrp)
+-		return -ENODEV;
+-
+-	task = cgroup_procs_write_start(buf, false, &locked);
+-	ret = PTR_ERR_OR_ZERO(task);
+-	if (ret)
+-		goto out_unlock;
+-
+-	/* find the source cgroup */
+-	spin_lock_irq(&css_set_lock);
+-	src_cgrp = task_cgroup_from_root(task, &cgrp_dfl_root);
+-	spin_unlock_irq(&css_set_lock);
+-
+-	/* thread migrations follow the cgroup.procs delegation rule */
+-	ret = cgroup_attach_permissions(src_cgrp, dst_cgrp,
+-					of->file->f_path.dentry->d_sb, false);
+-	if (ret)
+-		goto out_finish;
+-
+-	ret = cgroup_attach_task(dst_cgrp, task, false);
+-
+-out_finish:
+-	cgroup_procs_write_finish(task, locked);
+-out_unlock:
+-	cgroup_kn_unlock(of->kn);
+-
+-	return ret ?: nbytes;
++	return __cgroup_procs_write(of, buf, false) ?: nbytes;
+ }
+ 
+ /* cgroup core interface files for the default hierarchy */
+-- 
+2.26.2
+

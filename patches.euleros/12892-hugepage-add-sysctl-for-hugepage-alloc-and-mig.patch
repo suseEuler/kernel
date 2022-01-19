@@ -1,0 +1,118 @@
+From 80ed6b3203c960b286e1fd5d8db1b39a19cdc40c Mon Sep 17 00:00:00 2001
+From: Kemeng Shi <shikemeng@huawei.com>
+Date: Sat, 8 Jan 2022 18:52:35 +0800
+Subject: [PATCH] hugepage: add sysctl for hugepage alloc and mig
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 80ed6b3203c960b286e1fd5d8db1b39a19cdc40c
+
+
+euleros inclusion
+category: feature
+feature: etmem
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4OODH?from=project-issue
+CVE: NA
+
+-------------------------------------------------
+
+Add /proc/sys/kernel/hugepage_pmem_allocall switch. Set 1 to allowed all
+memory in pmem could alloc for hugepage. Set 0(default) hugepage alloc is
+limited by zone watermark as usual.
+Add /proc/sys/kernel/hugepage_mig_noalloc switch. Set 1 to forbid new
+hugepage alloc in hugepage migration when hugepage in dest node runs
+out. Set 0(default) to allow hugepage alloc in hugepage migration as
+usual.
+
+Signed-off-by: Kemeng Shi <shikemeng@huawei.com>
+Reviewed-by: louhongxiang <louhongxiang@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/hugetlb.h |  5 +++++
+ kernel/sysctl.c         | 20 ++++++++++++++++++++
+ mm/hugetlb.c            |  7 ++++++-
+ 3 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/hugetlb.h b/include/linux/hugetlb.h
+index 1b586a324b8e..50101bbdb7cf 100644
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -176,6 +176,11 @@ struct address_space *hugetlb_page_mapping_lock_write(struct page *hpage);
+ extern int sysctl_hugetlb_shm_group;
+ extern struct list_head huge_boot_pages;
+ 
++#ifdef CONFIG_HUGETLBFS
++extern int sysctl_hugetlb_mig_noalloc;
++extern int sysctl_hugetlb_pmem_allocall;
++#endif
++
+ /* arch callbacks */
+ 
+ pte_t *huge_pte_alloc(struct mm_struct *mm,
+diff --git a/kernel/sysctl.c b/kernel/sysctl.c
+index 8c290fcfa32f..9b0fde36de8c 100644
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -3324,6 +3324,26 @@ static struct ctl_table vm_table[] = {
+ 		.extra1		= SYSCTL_ZERO,
+ 		.extra2		= SYSCTL_ONE,
+ 	},
++#endif
++#ifdef CONFIG_HUGETLBFS
++	{
++		.procname       = "hugepage_mig_noalloc",
++		.data           = &sysctl_hugetlb_mig_noalloc,
++		.maxlen         = sizeof(sysctl_hugetlb_mig_noalloc),
++		.mode           = 0600,
++		.proc_handler   = proc_dointvec_minmax,
++		.extra1         = SYSCTL_ZERO,
++		.extra2         = SYSCTL_ONE,
++	},
++	{
++		.procname       = "hugepage_pmem_allocall",
++		.data           = &sysctl_hugetlb_pmem_allocall,
++		.maxlen         = sizeof(sysctl_hugetlb_pmem_allocall),
++		.mode           = 0600,
++		.proc_handler   = proc_dointvec_minmax,
++		.extra1         = SYSCTL_ZERO,
++		.extra2         = SYSCTL_ONE,
++	},
+ #endif
+ 	{ }
+ };
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 44691ce8a9b8..e553e959bda8 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -81,6 +81,9 @@ DEFINE_SPINLOCK(hugetlb_lock);
+ static int num_fault_mutexes;
+ struct mutex *hugetlb_fault_mutex_table ____cacheline_aligned_in_smp;
+ 
++int sysctl_hugetlb_mig_noalloc;
++int sysctl_hugetlb_pmem_allocall;
++
+ /* Forward declaration */
+ static int hugetlb_acct_memory(struct hstate *h, long delta);
+ 
+@@ -1805,6 +1808,8 @@ static int alloc_pool_huge_page(struct hstate *h, nodemask_t *nodes_allowed,
+ 	gfp_t gfp_mask = htlb_alloc_mask(h) | __GFP_THISNODE;
+ 
+ 	for_each_node_mask_to_alloc(h, nr_nodes, node, nodes_allowed) {
++		if (get_node_type(node) == NODE_TYPE_PMEM && sysctl_hugetlb_pmem_allocall)
++			gfp_mask |= __GFP_MEMALLOC;
+ 		page = alloc_fresh_huge_page(h, gfp_mask, node, nodes_allowed,
+ 						node_alloc_noretry);
+ 		if (page)
+@@ -2064,7 +2069,7 @@ struct page *alloc_huge_page_nodemask(struct hstate *h, int preferred_nid,
+ 		struct page *page;
+ 
+ 		page = dequeue_huge_page_nodemask(h, gfp_mask, preferred_nid, nmask, NULL);
+-		if (page) {
++		if (page || sysctl_hugetlb_mig_noalloc) {
+ 			spin_unlock_irq(&hugetlb_lock);
+ 			return page;
+ 		}
+-- 
+2.26.2
+
