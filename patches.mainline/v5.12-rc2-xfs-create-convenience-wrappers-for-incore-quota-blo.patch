@@ -1,0 +1,122 @@
+From 8554650003b8a66f3dd357692ab73101d088d938 Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Fri, 22 Jan 2021 16:48:34 -0800
+Subject: [PATCH] xfs: create convenience wrappers for incore quota block
+ reservations
+Git-commit: 8554650003b8a66f3dd357692ab73101d088d938
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+Create a couple of convenience wrappers for creating and deleting quota
+block reservations against future changes.
+
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/xfs/libxfs/xfs_bmap.c | 10 ++++------
+ fs/xfs/xfs_quota.h       | 19 +++++++++++++++++++
+ fs/xfs/xfs_reflink.c     |  5 ++---
+ 3 files changed, 25 insertions(+), 9 deletions(-)
+
+diff --git a/fs/xfs/libxfs/xfs_bmap.c b/fs/xfs/libxfs/xfs_bmap.c
+index c730288b5981..94d582a9587d 100644
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@ -4097,8 +4097,7 @@ xfs_bmapi_reserve_delalloc(
+ 	 * blocks.  This number gets adjusted later.  We return if we haven't
+ 	 * allocated blocks already inside this loop.
+ 	 */
+-	error = xfs_trans_reserve_quota_nblks(NULL, ip, (long)alen, 0,
+-						XFS_QMOPT_RES_REGBLKS);
++	error = xfs_quota_reserve_blkres(ip, alen);
+ 	if (error)
+ 		return error;
+ 
+@@ -4144,8 +4143,7 @@ xfs_bmapi_reserve_delalloc(
+ 	xfs_mod_fdblocks(mp, alen, false);
+ out_unreserve_quota:
+ 	if (XFS_IS_QUOTA_ON(mp))
+-		xfs_trans_unreserve_quota_nblks(NULL, ip, (long)alen, 0,
+-						XFS_QMOPT_RES_REGBLKS);
++		xfs_quota_unreserve_blkres(ip, alen);
+ 	return error;
+ }
+ 
+@@ -4937,8 +4935,8 @@ xfs_bmap_del_extent_delay(
+ 	 * sb counters as we might have to borrow some blocks for the
+ 	 * indirect block accounting.
+ 	 */
+-	error = xfs_trans_unreserve_quota_nblks(NULL, ip, del->br_blockcount, 0,
+-			isrt ? XFS_QMOPT_RES_RTBLKS : XFS_QMOPT_RES_REGBLKS);
++	ASSERT(!isrt);
++	error = xfs_quota_unreserve_blkres(ip, del->br_blockcount);
+ 	if (error)
+ 		return error;
+ 	ip->i_delayed_blks -= del->br_blockcount;
+diff --git a/fs/xfs/xfs_quota.h b/fs/xfs/xfs_quota.h
+index 5a62398940d0..1d1a1634ea29 100644
+--- a/fs/xfs/xfs_quota.h
++++ b/fs/xfs/xfs_quota.h
+@@ -108,6 +108,12 @@ extern void xfs_qm_mount_quotas(struct xfs_mount *);
+ extern void xfs_qm_unmount(struct xfs_mount *);
+ extern void xfs_qm_unmount_quotas(struct xfs_mount *);
+ 
++static inline int
++xfs_quota_reserve_blkres(struct xfs_inode *ip, int64_t blocks)
++{
++	return xfs_trans_reserve_quota_nblks(NULL, ip, blocks, 0,
++			XFS_QMOPT_RES_REGBLKS);
++}
+ #else
+ static inline int
+ xfs_qm_vop_dqalloc(struct xfs_inode *ip, kuid_t kuid, kgid_t kgid,
+@@ -136,6 +142,13 @@ static inline int xfs_trans_reserve_quota_bydquots(struct xfs_trans *tp,
+ {
+ 	return 0;
+ }
++
++static inline int
++xfs_quota_reserve_blkres(struct xfs_inode *ip, int64_t blocks)
++{
++	return 0;
++}
++
+ #define xfs_qm_vop_create_dqattach(tp, ip, u, g, p)
+ #define xfs_qm_vop_rename_dqattach(it)					(0)
+ #define xfs_qm_vop_chown(tp, ip, old, new)				(NULL)
+@@ -157,6 +170,12 @@ static inline int xfs_trans_reserve_quota_bydquots(struct xfs_trans *tp,
+ 	xfs_trans_reserve_quota_bydquots(tp, mp, ud, gd, pd, nb, ni, \
+ 				f | XFS_QMOPT_RES_REGBLKS)
+ 
++static inline int
++xfs_quota_unreserve_blkres(struct xfs_inode *ip, int64_t blocks)
++{
++	return xfs_quota_reserve_blkres(ip, -blocks);
++}
++
+ extern int xfs_mount_reset_sbqflags(struct xfs_mount *);
+ 
+ #endif	/* __XFS_QUOTA_H__ */
+diff --git a/fs/xfs/xfs_reflink.c b/fs/xfs/xfs_reflink.c
+index 183142fd0961..bea64ed5a57f 100644
+--- a/fs/xfs/xfs_reflink.c
++++ b/fs/xfs/xfs_reflink.c
+@@ -508,9 +508,8 @@ xfs_reflink_cancel_cow_blocks(
+ 			xfs_bmap_del_extent_cow(ip, &icur, &got, &del);
+ 
+ 			/* Remove the quota reservation */
+-			error = xfs_trans_unreserve_quota_nblks(NULL, ip,
+-					del.br_blockcount, 0,
+-					XFS_QMOPT_RES_REGBLKS);
++			error = xfs_quota_unreserve_blkres(ip,
++					del.br_blockcount);
+ 			if (error)
+ 				break;
+ 		} else {
+-- 
+2.26.2
+

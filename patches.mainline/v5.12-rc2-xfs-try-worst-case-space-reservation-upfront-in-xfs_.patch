@@ -1,0 +1,91 @@
+From 4ca74205685ee3a72ab7fe475f51cc26dea36509 Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Wed, 27 Jan 2021 10:40:00 -0800
+Subject: [PATCH] xfs: try worst case space reservation upfront in
+ xfs_reflink_remap_extent
+Git-commit: 4ca74205685ee3a72ab7fe475f51cc26dea36509
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+Now that we've converted xfs_reflink_remap_extent to use the new
+xfs_trans_alloc_inode API, we can focus on its slightly unusual behavior
+with regard to quota reservations.
+
+Since it's valid to remap written blocks into a hole, we must be able to
+increase the quota count by the number of blocks in the mapping.
+However, the incore space reservation process requires us to supply an
+asymptotic guess before we can gain exclusive access to resources.  We'd
+like to reserve all the quota we need up front, but we also don't want
+to fail a written -> allocated remap operation unnecessarily.
+
+The solution is to make the remap_extents function call the transaction
+allocation function twice.  The first time we ask to reserve enough
+space and quota to handle the absolute worst case situation, but if that
+fails, we can fall back to the old strategy: ask for the bare minimum
+space reservation upfront and increase the quota reservation later if we
+need to.
+
+Later in this patchset we change the transaction and quota code to try
+to reclaim space if we cannot reserve free space or quota.
+Restructuring the remap_extent function in this manner means that if the
+fallback increase fails, we can pass that back to the caller knowing
+that the transaction allocation already tried freeing space.
+
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/xfs/xfs_reflink.c |   23 ++++++++++++++++++++---
+ 1 file changed, 20 insertions(+), 3 deletions(-)
+
+--- a/fs/xfs/xfs_reflink.c
++++ b/fs/xfs/xfs_reflink.c
+@@ -986,6 +986,7 @@ xfs_reflink_remap_extent(
+ 	xfs_off_t		newlen;
+ 	int64_t			qdelta = 0;
+ 	unsigned int		resblks;
++	bool			quota_reserved = true;
+ 	bool			smap_real;
+ 	bool			dmap_written = xfs_bmap_is_written_extent(dmap);
+ 	int			nimaps;
+@@ -1000,10 +1001,26 @@ xfs_reflink_remap_extent(
+ 	 * the same index in the bmap btree, so we only need a reservation for
+ 	 * one bmbt split if either thing is happening.  However, we haven't
+ 	 * locked the inode yet, so we reserve assuming this is the case.
++	 *
++	 * The first allocation call tries to reserve enough space to handle
++	 * mapping dmap into a sparse part of the file plus the bmbt split.  We
++	 * haven't locked the inode or read the existing mapping yet, so we do
++	 * not know for sure that we need the space.  This should succeed most
++	 * of the time.
++	 *
++	 * If the first attempt fails, try again but reserving only enough
++	 * space to handle a bmbt split.  This is the hard minimum requirement,
++	 * and we revisit quota reservations later when we know more about what
++	 * we're remapping.
+ 	 */
+ 	resblks = XFS_EXTENTADD_SPACE_RES(mp, XFS_DATA_FORK);
+-	error = xfs_trans_alloc_inode(ip, &M_RES(mp)->tr_write, resblks, 0,
+-			false, &tp);
++	error = xfs_trans_alloc_inode(ip, &M_RES(mp)->tr_write,
++			resblks + dmap->br_blockcount, 0, false, &tp);
++	if (error == -EDQUOT || error == -ENOSPC) {
++		quota_reserved = false;
++		error = xfs_trans_alloc_inode(ip, &M_RES(mp)->tr_write,
++				resblks, 0, false, &tp);
++	}
+ 	if (error)
+ 		goto out;
+ 
+@@ -1070,7 +1087,7 @@ xfs_reflink_remap_extent(
+ 	 * before we started.  That should have removed all the delalloc
+ 	 * reservations, but we code defensively.
+ 	 */
+-	if (!smap_real && dmap_written) {
++	if (!quota_reserved && !smap_real && dmap_written) {
+ 		error = xfs_trans_reserve_quota_nblks(tp, ip,
+ 				dmap->br_blockcount, 0, false);
+ 		if (error)

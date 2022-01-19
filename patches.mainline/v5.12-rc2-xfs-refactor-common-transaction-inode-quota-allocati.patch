@@ -1,0 +1,200 @@
+From 3a1af6c317d0a55524f39079183be107be4c1f39 Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Tue, 26 Jan 2021 16:33:29 -0800
+Subject: [PATCH] xfs: refactor common transaction/inode/quota allocation idiom
+Git-commit: 3a1af6c317d0a55524f39079183be107be4c1f39
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+Create a new helper xfs_trans_alloc_inode that allocates a transaction,
+locks and joins an inode to it, and then reserves the appropriate amount
+of quota against that transction.  Then replace all the open-coded
+idioms with a single call to this helper.
+
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/xfs/libxfs/xfs_attr.c | 11 +--------
+ fs/xfs/libxfs/xfs_bmap.c | 10 ++-------
+ fs/xfs/xfs_bmap_util.c   | 14 +++---------
+ fs/xfs/xfs_iomap.c       | 11 ++-------
+ fs/xfs/xfs_trans.c       | 48 ++++++++++++++++++++++++++++++++++++++++
+ fs/xfs/xfs_trans.h       |  3 +++
+ 6 files changed, 59 insertions(+), 38 deletions(-)
+
+--- a/fs/xfs/libxfs/xfs_attr.c
++++ b/fs/xfs/libxfs/xfs_attr.c
+@@ -458,14 +458,10 @@ xfs_attr_set(
+ 	 * Root fork attributes can use reserved data blocks for this
+ 	 * operation if necessary
+ 	 */
+-	error = xfs_trans_alloc(mp, &tres, total, 0,
+-			rsvd ? XFS_TRANS_RESERVE : 0, &args->trans);
++	error = xfs_trans_alloc_inode(dp, &tres, total, rsvd, &args->trans);
+ 	if (error)
+ 		return error;
+ 
+-	xfs_ilock(dp, XFS_ILOCK_EXCL);
+-	xfs_trans_ijoin(args->trans, dp, 0);
+-
+ 	if (args->value || xfs_inode_hasattr(dp)) {
+ 		error = xfs_iext_count_may_overflow(dp, XFS_ATTR_FORK,
+ 				XFS_IEXT_ATTR_MANIP_CNT(rmt_blks));
+@@ -474,11 +470,6 @@ xfs_attr_set(
+ 	}
+ 
+ 	if (args->value) {
+-		error = xfs_trans_reserve_quota_nblks(args->trans, dp,
+-				args->total, 0, rsvd);
+-		if (error)
+-			goto out_trans_cancel;
+-
+ 		error = xfs_has_attr(args);
+ 		if (error == -EEXIST && (args->attr_flags & XATTR_CREATE))
+ 			goto out_trans_cancel;
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@ -1079,19 +1079,13 @@ xfs_bmap_add_attrfork(
+ 
+ 	blks = XFS_ADDAFORK_SPACE_RES(mp);
+ 
+-	error = xfs_trans_alloc(mp, &M_RES(mp)->tr_addafork, blks, 0,
+-			rsvd ? XFS_TRANS_RESERVE : 0, &tp);
++	error = xfs_trans_alloc_inode(ip, &M_RES(mp)->tr_addafork, blks,
++			rsvd, &tp);
+ 	if (error)
+ 		return error;
+-
+-	xfs_ilock(ip, XFS_ILOCK_EXCL);
+-	error = xfs_trans_reserve_quota_nblks(tp, ip, blks, 0, rsvd);
+-	if (error)
+-		goto trans_cancel;
+ 	if (XFS_IFORK_Q(ip))
+ 		goto trans_cancel;
+ 
+-	xfs_trans_ijoin(tp, ip, 0);
+ 	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+ 	error = xfs_bmap_set_attrforkoff(ip, size, &version);
+ 	if (error)
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@ -873,18 +873,10 @@ xfs_unmap_extent(
+ 	uint			resblks = XFS_DIOSTRAT_SPACE_RES(mp, 0);
+ 	int			error;
+ 
+-	error = xfs_trans_alloc(mp, &M_RES(mp)->tr_write, resblks, 0, 0, &tp);
+-	if (error) {
+-		ASSERT(error == -ENOSPC || XFS_FORCED_SHUTDOWN(mp));
+-		return error;
+-	}
+-
+-	xfs_ilock(ip, XFS_ILOCK_EXCL);
+-	error = xfs_trans_reserve_quota_nblks(tp, ip, resblks, 0, false);
++	error = xfs_trans_alloc_inode(ip, &M_RES(mp)->tr_write, resblks,
++			false, &tp);
+ 	if (error)
+-		goto out_trans_cancel;
+-
+-	xfs_trans_ijoin(tp, ip, 0);
++		return error;
+ 
+ 	error = xfs_bunmapi(tp, ip, startoffset_fsb, len_fsb, 0, 2, done);
+ 	if (error)
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@ -552,18 +552,11 @@ xfs_iomap_write_unwritten(
+ 		 * here as we might be asked to write out the same inode that we
+ 		 * complete here and might deadlock on the iolock.
+ 		 */
+-		error = xfs_trans_alloc(mp, &M_RES(mp)->tr_write, resblks, 0,
+-				XFS_TRANS_RESERVE, &tp);
++		error = xfs_trans_alloc_inode(ip, &M_RES(mp)->tr_write, resblks,
++				true, &tp);
+ 		if (error)
+ 			return error;
+ 
+-		xfs_ilock(ip, XFS_ILOCK_EXCL);
+-		xfs_trans_ijoin(tp, ip, 0);
+-
+-		error = xfs_trans_reserve_quota_nblks(tp, ip, resblks, 0, true);
+-		if (error)
+-			goto error_on_bmapi_transaction;
+-
+ 		/*
+ 		 * Modify the unwritten extent state of the buffer.
+ 		 */
+--- a/fs/xfs/xfs_trans.c
++++ b/fs/xfs/xfs_trans.c
+@@ -20,6 +20,7 @@
+ #include "xfs_trace.h"
+ #include "xfs_error.h"
+ #include "xfs_defer.h"
++#include "xfs_inode.h"
+ 
+ kmem_zone_t	*xfs_trans_zone;
+ 
+@@ -1024,3 +1025,50 @@ xfs_trans_roll(
+ 	tres.tr_logflags = XFS_TRANS_PERM_LOG_RES;
+ 	return xfs_trans_reserve(*tpp, &tres, 0, 0);
+ }
++
++/*
++ * Allocate an transaction, lock and join the inode to it, and reserve quota.
++ *
++ * The caller must ensure that the on-disk dquots attached to this inode have
++ * already been allocated and initialized.  The caller is responsible for
++ * releasing ILOCK_EXCL if a new transaction is returned.
++ */
++int
++xfs_trans_alloc_inode(
++	struct xfs_inode	*ip,
++	struct xfs_trans_res	*resv,
++	unsigned int		dblocks,
++	bool			force,
++	struct xfs_trans	**tpp)
++{
++	struct xfs_trans	*tp;
++	struct xfs_mount	*mp = ip->i_mount;
++	int			error;
++
++	error = xfs_trans_alloc(mp, resv, dblocks, 0,
++			force ? XFS_TRANS_RESERVE : 0, &tp);
++	if (error)
++		return error;
++
++	xfs_ilock(ip, XFS_ILOCK_EXCL);
++	xfs_trans_ijoin(tp, ip, 0);
++
++	error = xfs_qm_dqattach_locked(ip, false);
++	if (error) {
++		/* Caller should have allocated the dquots! */
++		ASSERT(error != -ENOENT);
++		goto out_cancel;
++	}
++
++	error = xfs_trans_reserve_quota_nblks(tp, ip, dblocks, 0, force);
++	if (error)
++		goto out_cancel;
++
++	*tpp = tp;
++	return 0;
++
++out_cancel:
++	xfs_trans_cancel(tp);
++	xfs_iunlock(ip, XFS_ILOCK_EXCL);
++	return error;
++}
+--- a/fs/xfs/xfs_trans.h
++++ b/fs/xfs/xfs_trans.h
+@@ -268,4 +268,7 @@ xfs_trans_item_relog(
+ 	return lip->li_ops->iop_relog(lip, tp);
+ }
+ 
++int xfs_trans_alloc_inode(struct xfs_inode *ip, struct xfs_trans_res *resv,
++		unsigned int dblocks, bool force, struct xfs_trans **tpp);
++
+ #endif	/* __XFS_TRANS_H__ */

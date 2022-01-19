@@ -1,0 +1,112 @@
+From e8d04c2abcebd66bdbacd53bb273d824d4e27080 Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Fri, 6 Aug 2021 11:05:42 -0700
+Subject: [PATCH] xfs: use background worker pool when transactions can't get
+ free space
+Git-commit: e8d04c2abcebd66bdbacd53bb273d824d4e27080
+Patch-mainline: v5.15-rc1
+References: bsn#12
+
+
+In xfs_trans_alloc, if the block reservation call returns ENOSPC, we
+call xfs_blockgc_free_space with a NULL icwalk structure to try to free
+space.  Each frontend thread that encounters this situation starts its
+own walk of the inode cache to see if it can find anything, which is
+wasteful since we don't have any additional selection criteria.  For
+this one common case, create a function that reschedules all pending
+background work immediately and flushes the workqueue so that the scan
+can run in parallel.
+
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/xfs/xfs_icache.c | 28 ++++++++++++++++++++++++++++
+ fs/xfs/xfs_icache.h |  1 +
+ fs/xfs/xfs_trace.h  |  1 +
+ fs/xfs/xfs_trans.c  |  5 +----
+ 4 files changed, 31 insertions(+), 4 deletions(-)
+
+diff --git a/fs/xfs/xfs_icache.c b/fs/xfs/xfs_icache.c
+index 41bd84fd9e87..93ab83dfa36e 100644
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@ -1500,6 +1500,34 @@ xfs_blockgc_free_space(
+ 	return 0;
+ }
+ 
++/*
++ * Reclaim all the free space that we can by scheduling the background blockgc
++ * and inodegc workers immediately and waiting for them all to clear.
++ */
++void
++xfs_blockgc_flush_all(
++	struct xfs_mount	*mp)
++{
++	struct xfs_perag	*pag;
++	xfs_agnumber_t		agno;
++
++	trace_xfs_blockgc_flush_all(mp, __return_address);
++
++	/*
++	 * For each blockgc worker, move its queue time up to now.  If it
++	 * wasn't queued, it will not be requeued.  Then flush whatever's
++	 * left.
++	 */
++	for_each_perag_tag(mp, agno, pag, XFS_ICI_BLOCKGC_TAG)
++		mod_delayed_work(pag->pag_mount->m_blockgc_wq,
++				&pag->pag_blockgc_work, 0);
++
++	for_each_perag_tag(mp, agno, pag, XFS_ICI_BLOCKGC_TAG)
++		flush_delayed_work(&pag->pag_blockgc_work);
++
++	xfs_inodegc_flush(mp);
++}
++
+ /*
+  * Run cow/eofblocks scans on the supplied dquots.  We don't know exactly which
+  * quota caused an allocation failure, so we make a best effort by including
+diff --git a/fs/xfs/xfs_icache.h b/fs/xfs/xfs_icache.h
+index 8175148afd50..18c2d224aa78 100644
+--- a/fs/xfs/xfs_icache.h
++++ b/fs/xfs/xfs_icache.h
+@@ -59,6 +59,7 @@ int xfs_blockgc_free_dquots(struct xfs_mount *mp, struct xfs_dquot *udqp,
+ 		unsigned int iwalk_flags);
+ int xfs_blockgc_free_quota(struct xfs_inode *ip, unsigned int iwalk_flags);
+ int xfs_blockgc_free_space(struct xfs_mount *mp, struct xfs_icwalk *icm);
++void xfs_blockgc_flush_all(struct xfs_mount *mp);
+ 
+ void xfs_inode_set_eofblocks_tag(struct xfs_inode *ip);
+ void xfs_inode_clear_eofblocks_tag(struct xfs_inode *ip);
+diff --git a/fs/xfs/xfs_trace.h b/fs/xfs/xfs_trace.h
+index 3440046facc7..4a6616490315 100644
+--- a/fs/xfs/xfs_trace.h
++++ b/fs/xfs/xfs_trace.h
+@@ -198,6 +198,7 @@ DEFINE_FS_EVENT(xfs_fs_sync_fs);
+ DEFINE_FS_EVENT(xfs_blockgc_start);
+ DEFINE_FS_EVENT(xfs_blockgc_stop);
+ DEFINE_FS_EVENT(xfs_blockgc_worker);
++DEFINE_FS_EVENT(xfs_blockgc_flush_all);
+ 
+ DECLARE_EVENT_CLASS(xfs_ag_class,
+ 	TP_PROTO(struct xfs_mount *mp, xfs_agnumber_t agno),
+diff --git a/fs/xfs/xfs_trans.c b/fs/xfs/xfs_trans.c
+index 87bffd12c20c..83abaa219616 100644
+--- a/fs/xfs/xfs_trans.c
++++ b/fs/xfs/xfs_trans.c
+@@ -295,10 +295,7 @@ xfs_trans_alloc(
+ 		 * Do not perform a synchronous scan because callers can hold
+ 		 * other locks.
+ 		 */
+-		error = xfs_blockgc_free_space(mp, NULL);
+-		if (error)
+-			return error;
+-
++		xfs_blockgc_flush_all(mp);
+ 		want_retry = false;
+ 		goto retry;
+ 	}
+-- 
+2.26.2
+

@@ -1,0 +1,111 @@
+From 65f03d8652b240aa66b99a07e3c423a51e967568 Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Fri, 6 Aug 2021 11:05:41 -0700
+Subject: [PATCH] xfs: queue inactivation immediately when free realtime
+ extents are tight
+Git-commit: 65f03d8652b240aa66b99a07e3c423a51e967568
+Patch-mainline: v5.15-rc1
+References: bsn#12
+
+
+Now that we have made the inactivation of unlinked inodes a background
+task to increase the throughput of file deletions, we need to be a
+little more careful about how long of a delay we can tolerate.
+
+Similar to the patch doing this for free space on the data device, if
+the file being inactivated is a realtime file and the realtime volume is
+running low on free extents, we want to run the worker ASAP so that the
+realtime allocator can make better decisions.
+
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/xfs/xfs_icache.c | 21 +++++++++++++++++++++
+ fs/xfs/xfs_mount.c  | 13 ++++++++-----
+ fs/xfs/xfs_mount.h  |  3 ++-
+ 3 files changed, 31 insertions(+), 6 deletions(-)
+
+diff --git a/fs/xfs/xfs_icache.c b/fs/xfs/xfs_icache.c
+index 0bea604f320a..0ca0b1981de9 100644
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@ -1916,6 +1916,24 @@ xfs_inodegc_start(
+ 	xfs_inodegc_queue_all(mp);
+ }
+ 
++#ifdef CONFIG_XFS_RT
++static inline bool
++xfs_inodegc_want_queue_rt_file(
++	struct xfs_inode	*ip)
++{
++	struct xfs_mount	*mp = ip->i_mount;
++	uint64_t		freertx;
++
++	if (!XFS_IS_REALTIME_INODE(ip))
++		return false;
++
++	freertx = READ_ONCE(mp->m_sb.sb_frextents);
++	return freertx < mp->m_low_rtexts[XFS_LOWSP_5_PCNT];
++}
++#else
++# define xfs_inodegc_want_queue_rt_file(ip)	(false)
++#endif /* CONFIG_XFS_RT */
++
+ /*
+  * Schedule the inactivation worker when:
+  *
+@@ -1938,6 +1956,9 @@ xfs_inodegc_want_queue_work(
+ 				XFS_FDBLOCKS_BATCH) < 0)
+ 		return true;
+ 
++	if (xfs_inodegc_want_queue_rt_file(ip))
++		return true;
++
+ 	if (xfs_inode_near_dquot_enforcement(ip, XFS_DQTYPE_USER))
+ 		return true;
+ 
+diff --git a/fs/xfs/xfs_mount.c b/fs/xfs/xfs_mount.c
+index 5fe6f1db4fe9..ed1e7e3dce7e 100644
+--- a/fs/xfs/xfs_mount.c
++++ b/fs/xfs/xfs_mount.c
+@@ -365,13 +365,16 @@ void
+ xfs_set_low_space_thresholds(
+ 	struct xfs_mount	*mp)
+ {
+-	int i;
++	uint64_t		dblocks = mp->m_sb.sb_dblocks;
++	uint64_t		rtexts = mp->m_sb.sb_rextents;
++	int			i;
+ 
+-	for (i = 0; i < XFS_LOWSP_MAX; i++) {
+-		uint64_t space = mp->m_sb.sb_dblocks;
++	do_div(dblocks, 100);
++	do_div(rtexts, 100);
+ 
+-		do_div(space, 100);
+-		mp->m_low_space[i] = space * (i + 1);
++	for (i = 0; i < XFS_LOWSP_MAX; i++) {
++		mp->m_low_space[i] = dblocks * (i + 1);
++		mp->m_low_rtexts[i] = rtexts * (i + 1);
+ 	}
+ }
+ 
+diff --git a/fs/xfs/xfs_mount.h b/fs/xfs/xfs_mount.h
+index 60468a2a5e67..fbb18c2f00bd 100644
+--- a/fs/xfs/xfs_mount.h
++++ b/fs/xfs/xfs_mount.h
+@@ -147,7 +147,8 @@ typedef struct xfs_mount {
+ 	int			m_fixedfsid[2];	/* unchanged for life of FS */
+ 	uint			m_qflags;	/* quota status flags */
+ 	uint64_t		m_flags;	/* global mount flags */
+-	int64_t			m_low_space[XFS_LOWSP_MAX];
++	uint64_t		m_low_space[XFS_LOWSP_MAX];
++	uint64_t		m_low_rtexts[XFS_LOWSP_MAX];
+ 	struct xfs_ino_geometry	m_ino_geo;	/* inode geometry */
+ 	struct xfs_trans_resv	m_resv;		/* precomputed res values */
+ 						/* low free space thresholds */
+-- 
+2.26.2
+

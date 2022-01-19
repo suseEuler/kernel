@@ -1,0 +1,100 @@
+From b9b7e1dc56c5ca8d6fc37c410b054e9f26737d2e Mon Sep 17 00:00:00 2001
+Message-Id: <b9b7e1dc56c5ca8d6fc37c410b054e9f26737d2e.1642557667.git.geliang.tang@suse.com>
+From: Chandan Babu R <chandanrlinux@gmail.com>
+Date: Fri, 22 Jan 2021 16:48:10 -0800
+Subject: [PATCH] xfs: Add helper for checking per-inode extent count overflow
+Git-commit: b9b7e1dc56c5ca8d6fc37c410b054e9f26737d2e
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+XFS does not check for possible overflow of per-inode extent counter
+fields when adding extents to either data or attr fork.
+
+For e.g.
+1. Insert 5 million xattrs (each having a value size of 255 bytes) and
+   then delete 50% of them in an alternating manner.
+
+2. On a 4k block sized XFS filesystem instance, the above causes 98511
+   extents to be created in the attr fork of the inode.
+
+   xfsaild/loop0  2008 [003]  1475.127209: probe:xfs_inode_to_disk: (ffffffffa43fb6b0) if_nextents=98511 i_ino=131
+
+3. The incore inode fork extent counter is a signed 32-bit
+   quantity. However the on-disk extent counter is an unsigned 16-bit
+   quantity and hence cannot hold 98511 extents.
+
+4. The following incorrect value is stored in the attr extent counter,
+   # xfs_db -f -c 'inode 131' -c 'print core.naextents' /dev/loop0
+   core.naextents = -32561
+
+This commit adds a new helper function (i.e.
+xfs_iext_count_may_overflow()) to check for overflow of the per-inode
+data and xattr extent counters. Future patches will use this function to
+make sure that an FS operation won't cause the extent counter to
+overflow.
+
+Suggested-by: Darrick J. Wong <darrick.wong@oracle.com>
+Reviewed-by: Allison Henderson <allison.henderson@oracle.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Chandan Babu R <chandanrlinux@gmail.com>
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/xfs/libxfs/xfs_inode_fork.c | 23 +++++++++++++++++++++++
+ fs/xfs/libxfs/xfs_inode_fork.h |  2 ++
+ 2 files changed, 25 insertions(+)
+
+diff --git a/fs/xfs/libxfs/xfs_inode_fork.c b/fs/xfs/libxfs/xfs_inode_fork.c
+index 7575de5cecb1..8d48716547e5 100644
+--- a/fs/xfs/libxfs/xfs_inode_fork.c
++++ b/fs/xfs/libxfs/xfs_inode_fork.c
+@@ -23,6 +23,7 @@
+ #include "xfs_da_btree.h"
+ #include "xfs_dir2_priv.h"
+ #include "xfs_attr_leaf.h"
++#include "xfs_types.h"
+ 
+ kmem_zone_t *xfs_ifork_zone;
+ 
+@@ -728,3 +729,25 @@ xfs_ifork_verify_local_attr(
+ 
+ 	return 0;
+ }
++
++int
++xfs_iext_count_may_overflow(
++	struct xfs_inode	*ip,
++	int			whichfork,
++	int			nr_to_add)
++{
++	struct xfs_ifork	*ifp = XFS_IFORK_PTR(ip, whichfork);
++	uint64_t		max_exts;
++	uint64_t		nr_exts;
++
++	if (whichfork == XFS_COW_FORK)
++		return 0;
++
++	max_exts = (whichfork == XFS_ATTR_FORK) ? MAXAEXTNUM : MAXEXTNUM;
++
++	nr_exts = ifp->if_nextents + nr_to_add;
++	if (nr_exts < ifp->if_nextents || nr_exts > max_exts)
++		return -EFBIG;
++
++	return 0;
++}
+diff --git a/fs/xfs/libxfs/xfs_inode_fork.h b/fs/xfs/libxfs/xfs_inode_fork.h
+index a4953e95c4f3..0beb8e2a00be 100644
+--- a/fs/xfs/libxfs/xfs_inode_fork.h
++++ b/fs/xfs/libxfs/xfs_inode_fork.h
+@@ -172,5 +172,7 @@ extern void xfs_ifork_init_cow(struct xfs_inode *ip);
+ 
+ int xfs_ifork_verify_local_data(struct xfs_inode *ip);
+ int xfs_ifork_verify_local_attr(struct xfs_inode *ip);
++int xfs_iext_count_may_overflow(struct xfs_inode *ip, int whichfork,
++		int nr_to_add);
+ 
+ #endif	/* __XFS_INODE_FORK_H__ */
+-- 
+2.31.1
+

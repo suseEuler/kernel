@@ -1,0 +1,101 @@
+From 383e32b0d0db464dc53052a97bf7f9ee3a1937cc Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Mon, 22 Mar 2021 09:51:54 -0700
+Subject: [PATCH] xfs: prevent metadata files from being inactivated
+Git-commit: 383e32b0d0db464dc53052a97bf7f9ee3a1937cc
+Patch-mainline: v5.13-rc1
+References: bsn#12
+
+
+Files containing metadata (quota records, rt bitmap and summary info)
+are fully managed by the filesystem, which means that all resource
+cleanup must be explicit, not automatic.  This means that they should
+never be subjected automatic to post-eof truncation, nor should they be
+freed automatically even if the link count drops to zero.
+
+In other words, xfs_inactive() should leave these files alone.  Add the
+necessary predicate functions to make this happen.  This adds a second
+layer of prevention for the kinds of fs corruption that was fixed by
+commit f4c32e87de7d.  If we ever decide to support removing metadata
+files, we should make all those metadata updates explicit.
+
+Rearrange the order of #includes to fix compiler errors, since
+xfs_mount.h is supposed to be included before xfs_inode.h
+
+Followup-to: f4c32e87de7d ("xfs: fix realtime bitmap/summary file truncation when growing rt volume")
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/xfs/libxfs/xfs_iext_tree.c | 2 +-
+ fs/xfs/xfs_inode.c            | 4 ++++
+ fs/xfs/xfs_inode.h            | 8 ++++++++
+ fs/xfs/xfs_xattr.c            | 2 ++
+ 4 files changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/fs/xfs/libxfs/xfs_iext_tree.c b/fs/xfs/libxfs/xfs_iext_tree.c
+index b4164256993d..773cf4349428 100644
+--- a/fs/xfs/libxfs/xfs_iext_tree.c
++++ b/fs/xfs/libxfs/xfs_iext_tree.c
+@@ -8,9 +8,9 @@
+ #include "xfs_format.h"
+ #include "xfs_bit.h"
+ #include "xfs_log_format.h"
+-#include "xfs_inode.h"
+ #include "xfs_trans_resv.h"
+ #include "xfs_mount.h"
++#include "xfs_inode.h"
+ #include "xfs_trace.h"
+ 
+ /*
+diff --git a/fs/xfs/xfs_inode.c b/fs/xfs/xfs_inode.c
+index f93370bd7b1e..12c79962f8c3 100644
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@ -1697,6 +1697,10 @@ xfs_inactive(
+ 	if (mp->m_flags & XFS_MOUNT_RDONLY)
+ 		return;
+ 
++	/* Metadata inodes require explicit resource cleanup. */
++	if (xfs_is_metadata_inode(ip))
++		return;
++
+ 	/* Try to clean out the cow blocks if there are any. */
+ 	if (xfs_inode_has_cow_data(ip))
+ 		xfs_reflink_cancel_cow_range(ip, 0, NULLFILEOFF, true);
+diff --git a/fs/xfs/xfs_inode.h b/fs/xfs/xfs_inode.h
+index 88ee4c3930ae..c2c26f8f4a81 100644
+--- a/fs/xfs/xfs_inode.h
++++ b/fs/xfs/xfs_inode.h
+@@ -185,6 +185,14 @@ static inline bool xfs_is_reflink_inode(struct xfs_inode *ip)
+ 	return ip->i_d.di_flags2 & XFS_DIFLAG2_REFLINK;
+ }
+ 
++static inline bool xfs_is_metadata_inode(struct xfs_inode *ip)
++{
++	struct xfs_mount	*mp = ip->i_mount;
++
++	return ip == mp->m_rbmip || ip == mp->m_rsumip ||
++		xfs_is_quota_inode(&mp->m_sb, ip->i_ino);
++}
++
+ /*
+  * Check if an inode has any data in the COW fork.  This might be often false
+  * even for inodes with the reflink flag when there is no pending COW operation.
+diff --git a/fs/xfs/xfs_xattr.c b/fs/xfs/xfs_xattr.c
+index 12be32f66dc1..0d050f8829ef 100644
+--- a/fs/xfs/xfs_xattr.c
++++ b/fs/xfs/xfs_xattr.c
+@@ -9,6 +9,8 @@
+ #include "xfs_format.h"
+ #include "xfs_log_format.h"
+ #include "xfs_da_format.h"
++#include "xfs_trans_resv.h"
++#include "xfs_mount.h"
+ #include "xfs_inode.h"
+ #include "xfs_attr.h"
+ #include "xfs_acl.h"
+-- 
+2.26.2
+

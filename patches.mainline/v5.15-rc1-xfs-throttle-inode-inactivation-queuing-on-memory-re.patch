@@ -1,0 +1,324 @@
+From 40b1de007aca4f9ec4ee4322c29f026ebb60ac96 Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Fri, 6 Aug 2021 11:05:43 -0700
+Subject: [PATCH] xfs: throttle inode inactivation queuing on memory reclaim
+Git-commit: 40b1de007aca4f9ec4ee4322c29f026ebb60ac96
+Patch-mainline: v5.15-rc1
+References: bsn#12
+
+
+Now that we defer inode inactivation, we've decoupled the process of
+unlinking or closing an inode from the process of inactivating it.  In
+theory this should lead to better throughput since we now inactivate the
+queued inodes in batches instead of one at a time.
+
+Unfortunately, one of the primary risks with this decoupling is the loss
+of rate control feedback between the frontend and background threads.
+In other words, a rm -rf /* thread can run the system out of memory if
+it can queue inodes for inactivation and jump to a new CPU faster than
+the background threads can actually clear the deferred work.  The
+workers can get scheduled off the CPU if they have to do IO, etc.
+
+To solve this problem, we configure a shrinker so that it will activate
+the /second/ time the shrinkers are called.  The custom shrinker will
+queue all percpu deferred inactivation workers immediately and set a
+flag to force frontend callers who are releasing a vfs inode to wait for
+the inactivation workers.
+
+On my test VM with 560M of RAM and a 2TB filesystem, this seems to solve
+most of the OOMing problem when deleting 10 million inodes.
+
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/xfs/xfs_icache.c | 102 ++++++++++++++++++++++++++++++++++++++++++--
+ fs/xfs/xfs_icache.h |   1 +
+ fs/xfs/xfs_mount.c  |   9 +++-
+ fs/xfs/xfs_mount.h  |   3 ++
+ fs/xfs/xfs_trace.h  |  37 +++++++++++++++-
+ 5 files changed, 147 insertions(+), 5 deletions(-)
+
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@ -1900,8 +1900,9 @@ xfs_inodegc_worker(
+ 		return;
+ 
+ 	ip = llist_entry(node, struct xfs_inode, i_gclist);
+-	trace_xfs_inodegc_worker(ip->i_mount, __return_address);
++	trace_xfs_inodegc_worker(ip->i_mount, READ_ONCE(gc->shrinker_hits));
+ 
++	WRITE_ONCE(gc->shrinker_hits, 0);
+ 	llist_for_each_entry_safe(ip, n, node, i_gclist) {
+ 		xfs_iflags_set(ip, XFS_INACTIVATING);
+ 		xfs_inodegc_inactivate(ip);
+@@ -2035,6 +2036,7 @@ xfs_inodegc_want_queue_work(
+ /*
+  * Make the frontend wait for inactivations when:
+  *
++ *  - Memory shrinkers queued the inactivation worker and it hasn't finished.
+  *  - The queue depth exceeds the maximum allowable percpu backlog.
+  *
+  * Note: If the current thread is running a transaction, we don't ever want to
+@@ -2043,11 +2045,15 @@ xfs_inodegc_want_queue_work(
+ static inline bool
+ xfs_inodegc_want_flush_work(
+ 	struct xfs_inode	*ip,
+-	unsigned int		items)
++	unsigned int		items,
++	unsigned int		shrinker_hits)
+ {
+ 	if (current->journal_info)
+ 		return false;
+ 
++	if (shrinker_hits > 0)
++		return true;
++
+ 	if (items > XFS_INODEGC_MAX_BACKLOG)
+ 		return true;
+ 
+@@ -2066,6 +2072,7 @@ xfs_inodegc_queue(
+ 	struct xfs_mount	*mp = ip->i_mount;
+ 	struct xfs_inodegc	*gc;
+ 	int			items;
++	unsigned int		shrinker_hits;
+ 
+ 	trace_xfs_inode_set_need_inactive(ip);
+ 	spin_lock(&ip->i_flags_lock);
+@@ -2076,6 +2083,7 @@ xfs_inodegc_queue(
+ 	llist_add(&ip->i_gclist, &gc->list);
+ 	items = READ_ONCE(gc->items);
+ 	WRITE_ONCE(gc->items, items + 1);
++	shrinker_hits = READ_ONCE(gc->shrinker_hits);
+ 	put_cpu_ptr(gc);
+ 
+ 	if (!xfs_is_inodegc_enabled(mp))
+@@ -2086,7 +2094,7 @@ xfs_inodegc_queue(
+ 		queue_work(mp->m_inodegc_wq, &gc->work);
+ 	}
+ 
+-	if (xfs_inodegc_want_flush_work(ip, items)) {
++	if (xfs_inodegc_want_flush_work(ip, items, shrinker_hits)) {
+ 		trace_xfs_inodegc_throttle(mp, __return_address);
+ 		flush_work(&gc->work);
+ 	}
+@@ -2166,3 +2174,91 @@ xfs_inode_mark_reclaimable(
+ 	xfs_qm_dqdetach(ip);
+ 	xfs_inodegc_set_reclaimable(ip);
+ }
++
++/*
++ * Register a phony shrinker so that we can run background inodegc sooner when
++ * there's memory pressure.  Inactivation does not itself free any memory but
++ * it does make inodes reclaimable, which eventually frees memory.
++ *
++ * The count function, seek value, and batch value are crafted to trigger the
++ * scan function during the second round of scanning.  Hopefully this means
++ * that we reclaimed enough memory that initiating metadata transactions won't
++ * make things worse.
++ */
++#define XFS_INODEGC_SHRINKER_COUNT	(1UL << DEF_PRIORITY)
++#define XFS_INODEGC_SHRINKER_BATCH	((XFS_INODEGC_SHRINKER_COUNT / 2) + 1)
++
++static unsigned long
++xfs_inodegc_shrinker_count(
++	struct shrinker		*shrink,
++	struct shrink_control	*sc)
++{
++	struct xfs_mount	*mp = container_of(shrink, struct xfs_mount,
++						   m_inodegc_shrinker);
++	struct xfs_inodegc	*gc;
++	int			cpu;
++
++	if (!xfs_is_inodegc_enabled(mp))
++		return 0;
++
++	for_each_online_cpu(cpu) {
++		gc = per_cpu_ptr(mp->m_inodegc, cpu);
++		if (!llist_empty(&gc->list))
++			return XFS_INODEGC_SHRINKER_COUNT;
++	}
++
++	return 0;
++}
++
++static unsigned long
++xfs_inodegc_shrinker_scan(
++	struct shrinker		*shrink,
++	struct shrink_control	*sc)
++{
++	struct xfs_mount	*mp = container_of(shrink, struct xfs_mount,
++						   m_inodegc_shrinker);
++	struct xfs_inodegc	*gc;
++	int			cpu;
++	bool			no_items = true;
++
++	if (!xfs_is_inodegc_enabled(mp))
++		return SHRINK_STOP;
++
++	trace_xfs_inodegc_shrinker_scan(mp, sc, __return_address);
++
++	for_each_online_cpu(cpu) {
++		gc = per_cpu_ptr(mp->m_inodegc, cpu);
++		if (!llist_empty(&gc->list)) {
++			unsigned int	h = READ_ONCE(gc->shrinker_hits);
++
++			WRITE_ONCE(gc->shrinker_hits, h + 1);
++			queue_work_on(cpu, mp->m_inodegc_wq, &gc->work);
++			no_items = false;
++		}
++	}
++
++	/*
++	 * If there are no inodes to inactivate, we don't want the shrinker
++	 * to think there's deferred work to call us back about.
++	 */
++	if (no_items)
++		return LONG_MAX;
++
++	return SHRINK_STOP;
++}
++
++/* Register a shrinker so we can accelerate inodegc and throttle queuing. */
++int
++xfs_inodegc_register_shrinker(
++	struct xfs_mount	*mp)
++{
++	struct shrinker		*shrink = &mp->m_inodegc_shrinker;
++
++	shrink->count_objects = xfs_inodegc_shrinker_count;
++	shrink->scan_objects = xfs_inodegc_shrinker_scan;
++	shrink->seeks = 0;
++	shrink->flags = SHRINKER_NONSLAB;
++	shrink->batch = XFS_INODEGC_SHRINKER_BATCH;
++
++	return register_shrinker(shrink);
++}
+--- a/fs/xfs/xfs_icache.h
++++ b/fs/xfs/xfs_icache.h
+@@ -80,5 +80,6 @@ void xfs_inodegc_flush(struct xfs_mount
+ void xfs_inodegc_stop(struct xfs_mount *mp);
+ void xfs_inodegc_start(struct xfs_mount *mp);
+ void xfs_inodegc_cpu_dead(struct xfs_mount *mp, unsigned int cpu);
++int xfs_inodegc_register_shrinker(struct xfs_mount *mp);
+ 
+ #endif
+--- a/fs/xfs/xfs_mount.c
++++ b/fs/xfs/xfs_mount.c
+@@ -881,6 +881,10 @@ xfs_mountfs(
+ 		goto out_free_perag;
+ 	}
+ 
++	error = xfs_inodegc_register_shrinker(mp);
++	if (error)
++		goto out_fail_wait;
++
+ 	/*
+ 	 * Log's mount-time initialization. The first part of recovery can place
+ 	 * some items on the AIL, to be handled when recovery is finished or
+@@ -891,7 +895,7 @@ xfs_mountfs(
+ 			      XFS_FSB_TO_BB(mp, sbp->sb_logblocks));
+ 	if (error) {
+ 		xfs_warn(mp, "log mount failed");
+-		goto out_fail_wait;
++		goto out_inodegc_shrinker;
+ 	}
+ 
+ 	/* Make sure the summary counts are ok. */
+@@ -1086,6 +1090,8 @@ xfs_mountfs(
+ 	xfs_unmount_flush_inodes(mp);
+  out_log_dealloc:
+ 	xfs_log_mount_cancel(mp);
++ out_inodegc_shrinker:
++	unregister_shrinker(&mp->m_inodegc_shrinker);
+  out_fail_wait:
+ 	if (mp->m_logdev_targp && mp->m_logdev_targp != mp->m_ddev_targp)
+ 		xfs_wait_buftarg(mp->m_logdev_targp);
+@@ -1172,6 +1178,7 @@ xfs_unmountfs(
+ #if defined(DEBUG)
+ 	xfs_errortag_clearall(mp);
+ #endif
++	unregister_shrinker(&mp->m_inodegc_shrinker);
+ 	xfs_free_perag(mp);
+ 
+ 	xfs_errortag_del(mp);
+--- a/fs/xfs/xfs_mount.h
++++ b/fs/xfs/xfs_mount.h
+@@ -64,6 +64,7 @@ struct xfs_inodegc {
+ 
+ 	/* approximate count of inodes in the list */
+ 	unsigned int		items;
++	unsigned int		shrinker_hits;
+ };
+ 
+ /*
+@@ -203,6 +204,8 @@ typedef struct xfs_mount {
+ 	xfs_agnumber_t		m_agirotor;	/* last ag dir inode alloced */
+ 	spinlock_t		m_agirotor_lock;/* .. and lock protecting it */
+ 
++	/* Memory shrinker to throttle and reprioritize inodegc */
++	struct shrinker		m_inodegc_shrinker;
+ 	/*
+ 	 * Workqueue item so that we can coalesce multiple inode flush attempts
+ 	 * into a single flush.
+--- a/fs/xfs/xfs_trace.h
++++ b/fs/xfs/xfs_trace.h
+@@ -139,6 +139,22 @@ DEFINE_PERAG_REF_EVENT(xfs_perag_put);
+ DEFINE_PERAG_REF_EVENT(xfs_perag_set_inode_tag);
+ DEFINE_PERAG_REF_EVENT(xfs_perag_clear_inode_tag);
+ 
++TRACE_EVENT(xfs_inodegc_worker,
++	TP_PROTO(struct xfs_mount *mp, unsigned int shrinker_hits),
++	TP_ARGS(mp, shrinker_hits),
++	TP_STRUCT__entry(
++		__field(dev_t, dev)
++		__field(unsigned int, shrinker_hits)
++	),
++	TP_fast_assign(
++		__entry->dev = mp->m_super->s_dev;
++		__entry->shrinker_hits = shrinker_hits;
++	),
++	TP_printk("dev %d:%d shrinker_hits %u",
++		  MAJOR(__entry->dev), MINOR(__entry->dev),
++		  __entry->shrinker_hits)
++);
++
+ DECLARE_EVENT_CLASS(xfs_fs_class,
+ 	TP_PROTO(struct xfs_mount *mp, void *caller_ip),
+ 	TP_ARGS(mp, caller_ip),
+@@ -173,7 +189,6 @@ DEFINE_EVENT(xfs_fs_class, name,					\
+ DEFINE_FS_EVENT(xfs_inodegc_flush);
+ DEFINE_FS_EVENT(xfs_inodegc_start);
+ DEFINE_FS_EVENT(xfs_inodegc_stop);
+-DEFINE_FS_EVENT(xfs_inodegc_worker);
+ DEFINE_FS_EVENT(xfs_inodegc_queue);
+ DEFINE_FS_EVENT(xfs_inodegc_throttle);
+ DEFINE_FS_EVENT(xfs_fs_sync_fs);
+@@ -182,6 +197,26 @@ DEFINE_FS_EVENT(xfs_blockgc_stop);
+ DEFINE_FS_EVENT(xfs_blockgc_worker);
+ DEFINE_FS_EVENT(xfs_blockgc_flush_all);
+ 
++TRACE_EVENT(xfs_inodegc_shrinker_scan,
++	TP_PROTO(struct xfs_mount *mp, struct shrink_control *sc,
++		 void *caller_ip),
++	TP_ARGS(mp, sc, caller_ip),
++	TP_STRUCT__entry(
++		__field(dev_t, dev)
++		__field(unsigned long, nr_to_scan)
++		__field(void *, caller_ip)
++	),
++	TP_fast_assign(
++		__entry->dev = mp->m_super->s_dev;
++		__entry->nr_to_scan = sc->nr_to_scan;
++		__entry->caller_ip = caller_ip;
++	),
++	TP_printk("dev %d:%d nr_to_scan %lu caller %pS",
++		  MAJOR(__entry->dev), MINOR(__entry->dev),
++		  __entry->nr_to_scan,
++		  __entry->caller_ip)
++);
++
+ DECLARE_EVENT_CLASS(xfs_ag_class,
+ 	TP_PROTO(struct xfs_mount *mp, xfs_agnumber_t agno),
+ 	TP_ARGS(mp, agno),

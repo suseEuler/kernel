@@ -1,0 +1,233 @@
+From 6f6490914d9b712004ddad648e47b1bf22647978 Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Fri, 6 Aug 2021 11:05:42 -0700
+Subject: [PATCH] xfs: don't run speculative preallocation gc when fs is frozen
+Git-commit: 6f6490914d9b712004ddad648e47b1bf22647978
+Patch-mainline: v5.15-rc1
+References: bsn#12
+openEuler-commit: 6d67e0b467e6185c8e947b5b84d911378db68e89
+
+
+Now that we have the infrastructure to switch background workers on and
+off at will, fix the block gc worker code so that we don't actually run
+the worker when the filesystem is frozen, same as we do for deferred
+inactivation.
+
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+Signed-off-by: Lihong Kou <koulihong@huawei.com>
+Reviewed-by: Zhang Yi <yi.zhang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/xfs/scrub/common.c |  9 +++++----
+ fs/xfs/xfs_icache.c   | 18 +++++++++++++++---
+ fs/xfs/xfs_mount.c    |  1 +
+ fs/xfs/xfs_mount.h    | 10 +++++++++-
+ fs/xfs/xfs_super.c    | 21 ++++++++++++++-------
+ fs/xfs/xfs_trace.h    |  3 +++
+ 6 files changed, 47 insertions(+), 15 deletions(-)
+
+diff --git a/fs/xfs/scrub/common.c b/fs/xfs/scrub/common.c
+index 5743cf6f8b18..63ea31f9ade3 100644
+--- a/fs/xfs/scrub/common.c
++++ b/fs/xfs/scrub/common.c
+@@ -914,11 +914,12 @@ xchk_start_reaping(
+ 	struct xfs_scrub	*sc)
+ {
+ 	/*
+-	 * Readonly filesystems do not perform inactivation, so there's no
+-	 * need to restart the worker.
++	 * Readonly filesystems do not perform inactivation or speculative
++	 * preallocation, so there's no need to restart the workers.
+ 	 */
+-	if (!(sc->mp->m_flags & XFS_MOUNT_RDONLY))
++	if (!(sc->mp->m_flags & XFS_MOUNT_RDONLY)) {
+ 		xfs_inodegc_start(sc->mp);
+-	xfs_blockgc_start(sc->mp);
++		xfs_blockgc_start(sc->mp);
++	}
+ 	sc->flags &= ~XCHK_REAPING_DISABLED;
+ }
+diff --git a/fs/xfs/xfs_icache.c b/fs/xfs/xfs_icache.c
+index 893118e73de0..438a7a2d4bc9 100644
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@ -210,6 +210,11 @@ static inline void
+ xfs_blockgc_queue(
+ 	struct xfs_perag	*pag)
+ {
++	struct xfs_mount	*mp = pag->pag_mount;
++
++	if (!xfs_is_blockgc_enabled(mp))
++		return;
++
+ 	rcu_read_lock();
+ 	if (radix_tree_tagged(&pag->pag_ici_root, XFS_ICI_BLOCKGC_TAG))
+ 		queue_delayed_work(pag->pag_mount->m_blockgc_wq,
+@@ -1374,8 +1379,12 @@ xfs_blockgc_stop(
+ 	struct xfs_perag	*pag;
+ 	xfs_agnumber_t		agno;
+ 
++	if (!xfs_clear_blockgc_enabled(mp))
++		return;
++
+ 	for_each_perag_tag(mp, agno, pag, XFS_ICI_BLOCKGC_TAG)
+ 		cancel_delayed_work_sync(&pag->pag_blockgc_work);
++	trace_xfs_blockgc_stop(mp, __return_address);
+ }
+ 
+ /* Enable post-EOF and CoW block auto-reclamation. */
+@@ -1386,6 +1395,10 @@ xfs_blockgc_start(
+ 	struct xfs_perag	*pag;
+ 	xfs_agnumber_t		agno;
+ 
++	if (xfs_set_blockgc_enabled(mp))
++		return;
++
++	trace_xfs_blockgc_start(mp, __return_address);
+ 	for_each_perag_tag(mp, agno, pag, XFS_ICI_BLOCKGC_TAG)
+ 		xfs_blockgc_queue(pag);
+ }
+@@ -1465,13 +1478,12 @@ xfs_blockgc_worker(
+ 	struct xfs_mount	*mp = pag->pag_mount;
+ 	int			error;
+ 
+-	if (!sb_start_write_trylock(mp->m_super))
+-		return;
++	trace_xfs_blockgc_worker(mp, __return_address);
++
+ 	error = xfs_icwalk_ag(pag, XFS_ICWALK_BLOCKGC, NULL);
+ 	if (error)
+ 		xfs_info(mp, "AG %u preallocation gc worker failed, err=%d",
+ 				pag->pag_agno, error);
+-	sb_end_write(mp->m_super);
+ 	xfs_blockgc_queue(pag);
+ }
+ 
+diff --git a/fs/xfs/xfs_mount.c b/fs/xfs/xfs_mount.c
+index b9be1554aeb1..1539d8d49c09 100644
+--- a/fs/xfs/xfs_mount.c
++++ b/fs/xfs/xfs_mount.c
+@@ -901,6 +901,7 @@ xfs_mountfs(
+ 
+ 	/* Enable background inode inactivation workers. */
+ 	xfs_inodegc_start(mp);
++	xfs_blockgc_start(mp);
+ 
+ 	/*
+ 	 * Get and sanity-check the root inode.
+diff --git a/fs/xfs/xfs_mount.h b/fs/xfs/xfs_mount.h
+index 5d3762982725..805c04a4b278 100644
+--- a/fs/xfs/xfs_mount.h
++++ b/fs/xfs/xfs_mount.h
+@@ -274,6 +274,12 @@ typedef struct xfs_mount {
+  * processed.
+  */
+ #define XFS_OPSTATE_INODEGC_ENABLED	0
++/*
++ * If set, background speculative prealloc gc worker threads will be scheduled
++ * to process queued blockgc work.  If not, inodes retain their preallocations
++ * until explicitly deleted.
++ */
++#define XFS_OPSTATE_BLOCKGC_ENABLED	1
+ 
+ #define __XFS_IS_OPSTATE(name, NAME) \
+ static inline bool xfs_is_ ## name (struct xfs_mount *mp) \
+@@ -290,9 +296,11 @@ static inline bool xfs_set_ ## name (struct xfs_mount *mp) \
+ }
+ 
+ __XFS_IS_OPSTATE(inodegc_enabled, INODEGC_ENABLED)
++__XFS_IS_OPSTATE(blockgc_enabled, BLOCKGC_ENABLED)
+ 
+ #define XFS_OPSTATE_STRINGS \
+-	{ (1UL << XFS_OPSTATE_INODEGC_ENABLED),		"inodegc" }
++	{ (1UL << XFS_OPSTATE_INODEGC_ENABLED),		"inodegc" }, \
++	{ (1UL << XFS_OPSTATE_BLOCKGC_ENABLED),		"blockgc" }
+ 
+ /*
+  * Max and min values for mount-option defined I/O
+diff --git a/fs/xfs/xfs_super.c b/fs/xfs/xfs_super.c
+index 23ff5bd0191a..0c59b538bab5 100644
+--- a/fs/xfs/xfs_super.c
++++ b/fs/xfs/xfs_super.c
+@@ -763,15 +763,18 @@ xfs_fs_sync_fs(
+ 	 * down inodegc because once SB_FREEZE_FS is set it's too late to
+ 	 * prevent inactivation races with freeze. The fs doesn't get called
+ 	 * again by the freezing process until after SB_FREEZE_FS has been set,
+-	 * so it's now or never.
++	 * so it's now or never.  Same logic applies to speculative allocation
++	 * garbage collection.
+ 	 *
+ 	 * We don't care if this is a normal syncfs call that does this or
+ 	 * freeze that does this - we can run this multiple times without issue
+ 	 * and we won't race with a restart because a restart can only occur
+ 	 * when the state is either SB_FREEZE_FS or SB_FREEZE_COMPLETE.
+ 	 */
+-	if (sb->s_writers.frozen == SB_FREEZE_PAGEFAULT)
++	if (sb->s_writers.frozen == SB_FREEZE_PAGEFAULT) {
+ 		xfs_inodegc_stop(mp);
++		xfs_blockgc_stop(mp);
++	}
+ 
+ 	return 0;
+ }
+@@ -922,7 +925,6 @@ xfs_fs_freeze(
+ 	 * set a GFP_NOFS context here to avoid recursion deadlocks.
+ 	 */
+ 	flags = memalloc_nofs_save();
+-	xfs_blockgc_stop(mp);
+ 	xfs_save_resvblks(mp);
+ 	xfs_quiesce_attr(mp);
+ 	ret = xfs_sync_sb(mp, true);
+@@ -935,8 +937,10 @@ xfs_fs_freeze(
+ 	 * here, so we can restart safely without racing with a stop in
+ 	 * xfs_fs_sync_fs().
+ 	 */
+-	if (ret && !(mp->m_flags & XFS_MOUNT_RDONLY))
++	if (ret && !(mp->m_flags & XFS_MOUNT_RDONLY)) {
++		xfs_blockgc_start(mp);
+ 		xfs_inodegc_start(mp);
++	}
+ 
+ 	return ret;
+ }
+@@ -949,14 +953,17 @@ xfs_fs_unfreeze(
+ 
+ 	xfs_restore_resvblks(mp);
+ 	xfs_log_work_queue(mp);
+-	xfs_blockgc_start(mp);
+ 
+ 	/*
+ 	 * Don't reactivate the inodegc worker on a readonly filesystem because
+-	 * inodes are sent directly to reclaim.
++	 * inodes are sent directly to reclaim.  Don't reactivate the blockgc
++	 * worker because there are no speculative preallocations on a readonly
++	 * filesystem.
+ 	 */
+-	if (!(mp->m_flags & XFS_MOUNT_RDONLY))
++	if (!(mp->m_flags & XFS_MOUNT_RDONLY)) {
++		xfs_blockgc_start(mp);
+ 		xfs_inodegc_start(mp);
++	}
+ 
+ 	return 0;
+ }
+diff --git a/fs/xfs/xfs_trace.h b/fs/xfs/xfs_trace.h
+index bc6bed5f0eae..4a3b122d62b5 100644
+--- a/fs/xfs/xfs_trace.h
++++ b/fs/xfs/xfs_trace.h
+@@ -177,6 +177,9 @@ DEFINE_FS_EVENT(xfs_inodegc_worker);
+ DEFINE_FS_EVENT(xfs_inodegc_queue);
+ DEFINE_FS_EVENT(xfs_inodegc_throttle);
+ DEFINE_FS_EVENT(xfs_fs_sync_fs);
++DEFINE_FS_EVENT(xfs_blockgc_start);
++DEFINE_FS_EVENT(xfs_blockgc_stop);
++DEFINE_FS_EVENT(xfs_blockgc_worker);
+ 
+ DECLARE_EVENT_CLASS(xfs_ag_class,
+ 	TP_PROTO(struct xfs_mount *mp, xfs_agnumber_t agno),
+-- 
+2.31.1
+

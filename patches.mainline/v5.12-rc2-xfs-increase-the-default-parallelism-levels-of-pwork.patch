@@ -1,0 +1,168 @@
+From f83d436aef5def77b318effc14809fdc57092588 Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Fri, 22 Jan 2021 16:48:41 -0800
+Subject: [PATCH] xfs: increase the default parallelism levels of pwork clients
+Git-commit: f83d436aef5def77b318effc14809fdc57092588
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+Increase the parallelism level for pwork clients to the workqueue
+defaults so that we can take advantage of computers with a lot of CPUs
+and a lot of hardware.  On fast systems this will speed up quotacheck by
+a large factor, and the following posteof/cowblocks cleanup series will
+use the functionality presented in this patch to run garbage collection
+as quickly as possible.
+
+We do this by switching the pwork workqueue to unbounded, since the
+current user (quotacheck) runs lengthy scans for each work item and we
+don't care about dispatching the work on a warm cpu cache or anything
+like that.  Also set WQ_SYSFS so that we can monitor where the wq is
+running.
+
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ Documentation/admin-guide/xfs.rst | 38 +++++++++++++++++++++++++++++++
+ fs/xfs/xfs_iwalk.c                |  5 +---
+ fs/xfs/xfs_pwork.c                | 25 ++++----------------
+ fs/xfs/xfs_pwork.h                |  4 +---
+ 4 files changed, 45 insertions(+), 27 deletions(-)
+
+diff --git a/Documentation/admin-guide/xfs.rst b/Documentation/admin-guide/xfs.rst
+index 86de8a1ad91c..b00b1eece9de 100644
+--- a/Documentation/admin-guide/xfs.rst
++++ b/Documentation/admin-guide/xfs.rst
+@@ -495,3 +495,41 @@ the class and error context. For example, the default values for
+ "metadata/ENODEV" are "0" rather than "-1" so that this error handler defaults
+ to "fail immediately" behaviour. This is done because ENODEV is a fatal,
+ unrecoverable error no matter how many times the metadata IO is retried.
++
++Workqueue Concurrency
++=====================
++
++XFS uses kernel workqueues to parallelize metadata update processes.  This
++enables it to take advantage of storage hardware that can service many IO
++operations simultaneously.  This interface exposes internal implementation
++details of XFS, and as such is explicitly not part of any userspace API/ABI
++guarantee the kernel may give userspace.  These are undocumented features of
++the generic workqueue implementation XFS uses for concurrency, and they are
++provided here purely for diagnostic and tuning purposes and may change at any
++time in the future.
++
++The control knobs for a filesystem's workqueues are organized by task at hand
++and the short name of the data device.  They all can be found in:
++
++  /sys/bus/workqueue/devices/${task}!${device}
++
++================  ===========
++  Task            Description
++================  ===========
++  xfs_iwalk-$pid  Inode scans of the entire filesystem. Currently limited to
++                  mount time quotacheck.
++================  ===========
++
++For example, the knobs for the quotacheck workqueue for /dev/nvme0n1 would be
++found in /sys/bus/workqueue/devices/xfs_iwalk-1111!nvme0n1/.
++
++The interesting knobs for XFS workqueues are as follows:
++
++============     ===========
++  Knob           Description
++============     ===========
++  max_active     Maximum number of background threads that can be started to
++                 run the work.
++  cpumask        CPUs upon which the threads are allowed to run.
++  nice           Relative priority of scheduling the threads.  These are the
++                 same nice levels that can be applied to userspace processes.
+diff --git a/fs/xfs/xfs_iwalk.c b/fs/xfs/xfs_iwalk.c
+index eae3aff9bc97..c4a340f1f1e1 100644
+--- a/fs/xfs/xfs_iwalk.c
++++ b/fs/xfs/xfs_iwalk.c
+@@ -618,15 +618,12 @@ xfs_iwalk_threaded(
+ {
+ 	struct xfs_pwork_ctl	pctl;
+ 	xfs_agnumber_t		agno = XFS_INO_TO_AGNO(mp, startino);
+-	unsigned int		nr_threads;
+ 	int			error;
+ 
+ 	ASSERT(agno < mp->m_sb.sb_agcount);
+ 	ASSERT(!(flags & ~XFS_IWALK_FLAGS_ALL));
+ 
+-	nr_threads = xfs_pwork_guess_datadev_parallelism(mp);
+-	error = xfs_pwork_init(mp, &pctl, xfs_iwalk_ag_work, "xfs_iwalk",
+-			nr_threads);
++	error = xfs_pwork_init(mp, &pctl, xfs_iwalk_ag_work, "xfs_iwalk");
+ 	if (error)
+ 		return error;
+ 
+diff --git a/fs/xfs/xfs_pwork.c b/fs/xfs/xfs_pwork.c
+index b03333f1c84a..c283b801cc5d 100644
+--- a/fs/xfs/xfs_pwork.c
++++ b/fs/xfs/xfs_pwork.c
+@@ -61,16 +61,18 @@ xfs_pwork_init(
+ 	struct xfs_mount	*mp,
+ 	struct xfs_pwork_ctl	*pctl,
+ 	xfs_pwork_work_fn	work_fn,
+-	const char		*tag,
+-	unsigned int		nr_threads)
++	const char		*tag)
+ {
++	unsigned int		nr_threads = 0;
++
+ #ifdef DEBUG
+ 	if (xfs_globals.pwork_threads >= 0)
+ 		nr_threads = xfs_globals.pwork_threads;
+ #endif
+ 	trace_xfs_pwork_init(mp, nr_threads, current->pid);
+ 
+-	pctl->wq = alloc_workqueue("%s-%d", WQ_FREEZABLE, nr_threads, tag,
++	pctl->wq = alloc_workqueue("%s-%d",
++			WQ_UNBOUND | WQ_SYSFS | WQ_FREEZABLE, nr_threads, tag,
+ 			current->pid);
+ 	if (!pctl->wq)
+ 		return -ENOMEM;
+@@ -117,20 +119,3 @@ xfs_pwork_poll(
+ 				atomic_read(&pctl->nr_work) == 0, HZ) == 0)
+ 		touch_softlockup_watchdog();
+ }
+-
+-/*
+- * Return the amount of parallelism that the data device can handle, or 0 for
+- * no limit.
+- */
+-unsigned int
+-xfs_pwork_guess_datadev_parallelism(
+-	struct xfs_mount	*mp)
+-{
+-	struct xfs_buftarg	*btp = mp->m_ddev_targp;
+-
+-	/*
+-	 * For now we'll go with the most conservative setting possible,
+-	 * which is two threads for an SSD and 1 thread everywhere else.
+-	 */
+-	return blk_queue_nonrot(btp->bt_bdev->bd_disk->queue) ? 2 : 1;
+-}
+diff --git a/fs/xfs/xfs_pwork.h b/fs/xfs/xfs_pwork.h
+index 8133124cf3bb..c0ef81fc85dd 100644
+--- a/fs/xfs/xfs_pwork.h
++++ b/fs/xfs/xfs_pwork.h
+@@ -51,11 +51,9 @@ xfs_pwork_want_abort(
+ }
+ 
+ int xfs_pwork_init(struct xfs_mount *mp, struct xfs_pwork_ctl *pctl,
+-		xfs_pwork_work_fn work_fn, const char *tag,
+-		unsigned int nr_threads);
++		xfs_pwork_work_fn work_fn, const char *tag);
+ void xfs_pwork_queue(struct xfs_pwork_ctl *pctl, struct xfs_pwork *pwork);
+ int xfs_pwork_destroy(struct xfs_pwork_ctl *pctl);
+ void xfs_pwork_poll(struct xfs_pwork_ctl *pctl);
+-unsigned int xfs_pwork_guess_datadev_parallelism(struct xfs_mount *mp);
+ 
+ #endif /* __XFS_PWORK_H__ */
+-- 
+2.26.2
+

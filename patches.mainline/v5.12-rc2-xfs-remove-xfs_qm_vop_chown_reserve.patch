@@ -1,0 +1,136 @@
+From 5c615f0feb9a559abd08da0842d6fcfee105b7e3 Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Mon, 1 Feb 2021 10:38:51 -0800
+Subject: [PATCH] xfs: remove xfs_qm_vop_chown_reserve
+Git-commit: 5c615f0feb9a559abd08da0842d6fcfee105b7e3
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+Now that the only caller of this function is xfs_trans_alloc_ichange,
+just open-code the meat of _chown_reserve in that caller.  Drop the
+(redundant) [ugp]id checks because xfs has a 1:1 relationship between
+quota ids and incore dquots.
+
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/xfs/xfs_qm.c    | 48 ----------------------------------------------
+ fs/xfs/xfs_quota.h |  4 ----
+ fs/xfs/xfs_trans.c | 16 ++++++++++++++--
+ 3 files changed, 14 insertions(+), 54 deletions(-)
+
+diff --git a/fs/xfs/xfs_qm.c b/fs/xfs/xfs_qm.c
+index c2e4d3a27469..742d1413e2d0 100644
+--- a/fs/xfs/xfs_qm.c
++++ b/fs/xfs/xfs_qm.c
+@@ -1817,54 +1817,6 @@ xfs_qm_vop_chown(
+ 	return prevdq;
+ }
+ 
+-/*
+- * Quota reservations for setattr(AT_UID|AT_GID|AT_PROJID).
+- */
+-int
+-xfs_qm_vop_chown_reserve(
+-	struct xfs_trans	*tp,
+-	struct xfs_inode	*ip,
+-	struct xfs_dquot	*udqp,
+-	struct xfs_dquot	*gdqp,
+-	struct xfs_dquot	*pdqp,
+-	uint			flags)
+-{
+-	struct xfs_mount	*mp = ip->i_mount;
+-	unsigned int		blkflags;
+-	struct xfs_dquot	*udq_delblks = NULL;
+-	struct xfs_dquot	*gdq_delblks = NULL;
+-	struct xfs_dquot	*pdq_delblks = NULL;
+-
+-	ASSERT(xfs_isilocked(ip, XFS_ILOCK_EXCL|XFS_ILOCK_SHARED));
+-	ASSERT(XFS_IS_QUOTA_RUNNING(mp));
+-
+-	blkflags = XFS_IS_REALTIME_INODE(ip) ?
+-			XFS_QMOPT_RES_RTBLKS : XFS_QMOPT_RES_REGBLKS;
+-
+-	if (XFS_IS_UQUOTA_ON(mp) && udqp &&
+-	    i_uid_read(VFS_I(ip)) != udqp->q_id)
+-		udq_delblks = udqp;
+-
+-	if (XFS_IS_GQUOTA_ON(ip->i_mount) && gdqp &&
+-	    i_gid_read(VFS_I(ip)) != gdqp->q_id)
+-		gdq_delblks = gdqp;
+-
+-	if (XFS_IS_PQUOTA_ON(ip->i_mount) && pdqp &&
+-	    ip->i_d.di_projid != pdqp->q_id)
+-		pdq_delblks = pdqp;
+-
+-	/*
+-	 * Reserve enough quota to handle blocks on disk and reserved for a
+-	 * delayed allocation.  We'll actually transfer the delalloc
+-	 * reservation between dquots at chown time, even though that part is
+-	 * only semi-transactional.
+-	 */
+-	return xfs_trans_reserve_quota_bydquots(tp, ip->i_mount, udq_delblks,
+-			gdq_delblks, pdq_delblks,
+-			ip->i_d.di_nblocks + ip->i_delayed_blks,
+-			1, blkflags | flags);
+-}
+-
+ int
+ xfs_qm_vop_rename_dqattach(
+ 	struct xfs_inode	**i_tab)
+diff --git a/fs/xfs/xfs_quota.h b/fs/xfs/xfs_quota.h
+index 6ddc4b358ede..d00d01302545 100644
+--- a/fs/xfs/xfs_quota.h
++++ b/fs/xfs/xfs_quota.h
+@@ -98,9 +98,6 @@ extern void xfs_qm_vop_create_dqattach(struct xfs_trans *, struct xfs_inode *,
+ extern int xfs_qm_vop_rename_dqattach(struct xfs_inode **);
+ extern struct xfs_dquot *xfs_qm_vop_chown(struct xfs_trans *,
+ 		struct xfs_inode *, struct xfs_dquot **, struct xfs_dquot *);
+-extern int xfs_qm_vop_chown_reserve(struct xfs_trans *, struct xfs_inode *,
+-		struct xfs_dquot *, struct xfs_dquot *,
+-		struct xfs_dquot *, uint);
+ extern int xfs_qm_dqattach(struct xfs_inode *);
+ extern int xfs_qm_dqattach_locked(struct xfs_inode *ip, bool doalloc);
+ extern void xfs_qm_dqdetach(struct xfs_inode *);
+@@ -162,7 +159,6 @@ xfs_trans_reserve_quota_icreate(struct xfs_trans *tp, struct xfs_dquot *udqp,
+ #define xfs_qm_vop_create_dqattach(tp, ip, u, g, p)
+ #define xfs_qm_vop_rename_dqattach(it)					(0)
+ #define xfs_qm_vop_chown(tp, ip, old, new)				(NULL)
+-#define xfs_qm_vop_chown_reserve(tp, ip, u, g, p, fl)			(0)
+ #define xfs_qm_dqattach(ip)						(0)
+ #define xfs_qm_dqattach_locked(ip, fl)					(0)
+ #define xfs_qm_dqdetach(ip)
+diff --git a/fs/xfs/xfs_trans.c b/fs/xfs/xfs_trans.c
+index 60672b5545c9..29dca1bc4c1a 100644
+--- a/fs/xfs/xfs_trans.c
++++ b/fs/xfs/xfs_trans.c
+@@ -1156,8 +1156,20 @@ xfs_trans_alloc_ichange(
+ 	if (pdqp == ip->i_pdquot)
+ 		pdqp = NULL;
+ 	if (udqp || gdqp || pdqp) {
+-		error = xfs_qm_vop_chown_reserve(tp, ip, udqp, gdqp, pdqp,
+-				force ? XFS_QMOPT_FORCE_RES : 0);
++		unsigned int	qflags = XFS_QMOPT_RES_REGBLKS;
++
++		if (force)
++			qflags |= XFS_QMOPT_FORCE_RES;
++
++		/*
++		 * Reserve enough quota to handle blocks on disk and reserved
++		 * for a delayed allocation.  We'll actually transfer the
++		 * delalloc reservation between dquots at chown time, even
++		 * though that part is only semi-transactional.
++		 */
++		error = xfs_trans_reserve_quota_bydquots(tp, mp, udqp, gdqp,
++				pdqp, ip->i_d.di_nblocks + ip->i_delayed_blks,
++				1, qflags);
+ 		if (error)
+ 			goto out_cancel;
+ 	}
+-- 
+2.26.2
+

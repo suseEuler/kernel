@@ -1,0 +1,71 @@
+From f41a0716f4b08678a73173d71ff3f409b996df2d Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Fri, 22 Jan 2021 16:48:35 -0800
+Subject: [PATCH] xfs: don't stall cowblocks scan if we can't take locks
+Git-commit: f41a0716f4b08678a73173d71ff3f409b996df2d
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+Don't stall the cowblocks scan on a locked inode if we possibly can.
+We'd much rather the background scanner keep moving.
+
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/xfs/xfs_icache.c | 21 ++++++++++++++++++---
+ 1 file changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/fs/xfs/xfs_icache.c b/fs/xfs/xfs_icache.c
+index c71eb15e3835..89f9e692fde7 100644
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@ -1605,17 +1605,31 @@ xfs_inode_free_cowblocks(
+ 	void			*args)
+ {
+ 	struct xfs_eofblocks	*eofb = args;
++	bool			wait;
+ 	int			ret = 0;
+ 
++	wait = eofb && (eofb->eof_flags & XFS_EOF_FLAGS_SYNC);
++
+ 	if (!xfs_prep_free_cowblocks(ip))
+ 		return 0;
+ 
+ 	if (!xfs_inode_matches_eofb(ip, eofb))
+ 		return 0;
+ 
+-	/* Free the CoW blocks */
+-	xfs_ilock(ip, XFS_IOLOCK_EXCL);
+-	xfs_ilock(ip, XFS_MMAPLOCK_EXCL);
++	/*
++	 * If the caller is waiting, return -EAGAIN to keep the background
++	 * scanner moving and revisit the inode in a subsequent pass.
++	 */
++	if (!xfs_ilock_nowait(ip, XFS_IOLOCK_EXCL)) {
++		if (wait)
++			return -EAGAIN;
++		return 0;
++	}
++	if (!xfs_ilock_nowait(ip, XFS_MMAPLOCK_EXCL)) {
++		if (wait)
++			ret = -EAGAIN;
++		goto out_iolock;
++	}
+ 
+ 	/*
+ 	 * Check again, nobody else should be able to dirty blocks or change
+@@ -1625,6 +1639,7 @@ xfs_inode_free_cowblocks(
+ 		ret = xfs_reflink_cancel_cow_range(ip, 0, NULLFILEOFF, false);
+ 
+ 	xfs_iunlock(ip, XFS_MMAPLOCK_EXCL);
++out_iolock:
+ 	xfs_iunlock(ip, XFS_IOLOCK_EXCL);
+ 
+ 	return ret;
+-- 
+2.26.2
+

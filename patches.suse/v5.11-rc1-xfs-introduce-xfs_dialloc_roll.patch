@@ -1,0 +1,145 @@
+From aececc9f8dec92a25c84a3378021636ce58d72dc Mon Sep 17 00:00:00 2001
+Message-Id: <aececc9f8dec92a25c84a3378021636ce58d72dc.1642486467.git.geliang.tang@suse.com>
+From: Dave Chinner <dchinner@redhat.com>
+Date: Wed, 9 Dec 2020 10:02:17 -0800
+Subject: [PATCH] xfs: introduce xfs_dialloc_roll()
+
+Git-commit: aececc9f8dec92a25c84a3378021636ce58d72dc
+Patch-mainline: v5.11-rc1
+References: bsn#12
+
+Introduce a helper to make the on-disk inode allocation rolling
+logic clearer in preparation of the following cleanup.
+
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Signed-off-by: Gao Xiang <hsiangkao@redhat.com>
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/xfs/libxfs/xfs_ialloc.c | 35 +++++++++++++++++++++++++++++++++++
+ fs/xfs/libxfs/xfs_ialloc.h |  5 +++++
+ fs/xfs/xfs_inode.c         | 31 +------------------------------
+ 3 files changed, 41 insertions(+), 30 deletions(-)
+
+diff --git a/fs/xfs/libxfs/xfs_ialloc.c b/fs/xfs/libxfs/xfs_ialloc.c
+index 45cf7e55f5ee..3ae83f6998dc 100644
+--- a/fs/xfs/libxfs/xfs_ialloc.c
++++ b/fs/xfs/libxfs/xfs_ialloc.c
+@@ -1682,6 +1682,41 @@ xfs_dialloc_ag(
+ 	return error;
+ }
+ 
++int
++xfs_dialloc_roll(
++	struct xfs_trans	**tpp,
++	struct xfs_buf		*agibp)
++{
++	struct xfs_trans	*tp = *tpp;
++	struct xfs_dquot_acct	*dqinfo;
++	int			error;
++
++	/*
++	 * Hold to on to the agibp across the commit so no other allocation can
++	 * come in and take the free inodes we just allocated for our caller.
++	 */
++	xfs_trans_bhold(tp, agibp);
++
++	/*
++	 * We want the quota changes to be associated with the next transaction,
++	 * NOT this one. So, detach the dqinfo from this and attach it to the
++	 * next transaction.
++	 */
++	dqinfo = tp->t_dqinfo;
++	tp->t_dqinfo = NULL;
++
++	error = xfs_trans_roll(&tp);
++
++	/* Re-attach the quota info that we detached from prev trx. */
++	tp->t_dqinfo = dqinfo;
++
++	*tpp = tp;
++	if (error)
++		return error;
++	xfs_trans_bjoin(tp, agibp);
++	return 0;
++}
++
+ /*
+  * Allocate an inode on disk.
+  *
+diff --git a/fs/xfs/libxfs/xfs_ialloc.h b/fs/xfs/libxfs/xfs_ialloc.h
+index 72b3468b97b1..bd6e0db9e23c 100644
+--- a/fs/xfs/libxfs/xfs_ialloc.h
++++ b/fs/xfs/libxfs/xfs_ialloc.h
+@@ -32,6 +32,11 @@ xfs_make_iptr(struct xfs_mount *mp, struct xfs_buf *b, int o)
+ 	return xfs_buf_offset(b, o << (mp)->m_sb.sb_inodelog);
+ }
+ 
++int
++xfs_dialloc_roll(
++	struct xfs_trans	**tpp,
++	struct xfs_buf		*agibp);
++
+ /*
+  * Allocate an inode on disk.
+  * Mode is used to tell whether the new inode will need space, and whether
+diff --git a/fs/xfs/xfs_inode.c b/fs/xfs/xfs_inode.c
+index 034fe0adae05..6329b049570b 100644
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@ -958,7 +958,6 @@ xfs_dir_ialloc(
+ 	xfs_inode_t	*ip;
+ 	xfs_buf_t	*ialloc_context = NULL;
+ 	int		code;
+-	void		*dqinfo;
+ 
+ 	tp = *tpp;
+ 	ASSERT(tp->t_flags & XFS_TRANS_PERM_LOG_RES);
+@@ -1002,41 +1001,13 @@ xfs_dir_ialloc(
+ 	 * to succeed the second time.
+ 	 */
+ 	if (ialloc_context) {
+-		/*
+-		 * Normally, xfs_trans_commit releases all the locks.
+-		 * We call bhold to hang on to the ialloc_context across
+-		 * the commit.  Holding this buffer prevents any other
+-		 * processes from doing any allocations in this
+-		 * allocation group.
+-		 */
+-		xfs_trans_bhold(tp, ialloc_context);
+-
+-		/*
+-		 * We want the quota changes to be associated with the next
+-		 * transaction, NOT this one. So, detach the dqinfo from this
+-		 * and attach it to the next transaction.
+-		 */
+-		dqinfo = NULL;
+-		if (tp->t_dqinfo) {
+-			dqinfo = (void *)tp->t_dqinfo;
+-			tp->t_dqinfo = NULL;
+-		}
+-
+-		code = xfs_trans_roll(&tp);
+-
+-		/*
+-		 * Re-attach the quota info that we detached from prev trx.
+-		 */
+-		if (dqinfo)
+-			tp->t_dqinfo = dqinfo;
+-
++		code = xfs_dialloc_roll(&tp, ialloc_context);
+ 		if (code) {
+ 			xfs_buf_relse(ialloc_context);
+ 			*tpp = tp;
+ 			*ipp = NULL;
+ 			return code;
+ 		}
+-		xfs_trans_bjoin(tp, ialloc_context);
+ 
+ 		/*
+ 		 * Call ialloc again. Since we've locked out all
+-- 
+2.31.1
+

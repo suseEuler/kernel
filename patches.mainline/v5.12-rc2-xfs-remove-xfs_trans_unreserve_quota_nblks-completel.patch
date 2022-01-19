@@ -1,0 +1,134 @@
+From 35b1101099e85af74a46b8e36f4d1fdac0367ffd Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Tue, 26 Jan 2021 17:23:30 -0800
+Subject: [PATCH] xfs: remove xfs_trans_unreserve_quota_nblks completely
+Git-commit: 35b1101099e85af74a46b8e36f4d1fdac0367ffd
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+xfs_trans_cancel will release all the quota resources that were reserved
+on behalf of the transaction, so get rid of the explicit unreserve step.
+
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/xfs/xfs_bmap_util.c | 11 ++++-------
+ fs/xfs/xfs_iomap.c     |  6 ++----
+ fs/xfs/xfs_quota.h     |  2 --
+ fs/xfs/xfs_reflink.c   |  5 +----
+ 4 files changed, 7 insertions(+), 17 deletions(-)
+
+diff --git a/fs/xfs/xfs_bmap_util.c b/fs/xfs/xfs_bmap_util.c
+index 792809debaaa..ae2d98af693c 100644
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@ -820,12 +820,12 @@ xfs_alloc_file_space(
+ 		error = xfs_trans_reserve_quota_nblks(tp, ip, qblocks,
+ 						      0, quota_flag);
+ 		if (error)
+-			goto error1;
++			goto error;
+ 
+ 		error = xfs_iext_count_may_overflow(ip, XFS_DATA_FORK,
+ 				XFS_IEXT_ADD_NOSPLIT_CNT);
+ 		if (error)
+-			goto error0;
++			goto error;
+ 
+ 		xfs_trans_ijoin(tp, ip, 0);
+ 
+@@ -833,7 +833,7 @@ xfs_alloc_file_space(
+ 					allocatesize_fsb, alloc_type, 0, imapp,
+ 					&nimaps);
+ 		if (error)
+-			goto error0;
++			goto error;
+ 
+ 		/*
+ 		 * Complete the transaction
+@@ -856,10 +856,7 @@ xfs_alloc_file_space(
+ 
+ 	return error;
+ 
+-error0:	/* unlock inode, unreserve quota blocks, cancel trans */
+-	xfs_trans_unreserve_quota_nblks(tp, ip, (long)qblocks, 0, quota_flag);
+-
+-error1:	/* Just cancel transaction */
++error:
+ 	xfs_trans_cancel(tp);
+ 	xfs_iunlock(ip, XFS_ILOCK_EXCL);
+ 	return error;
+diff --git a/fs/xfs/xfs_iomap.c b/fs/xfs/xfs_iomap.c
+index b05cfeb09301..b046eadd3b21 100644
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@ -253,7 +253,7 @@ xfs_iomap_write_direct(
+ 	error = xfs_iext_count_may_overflow(ip, XFS_DATA_FORK,
+ 			XFS_IEXT_ADD_NOSPLIT_CNT);
+ 	if (error)
+-		goto out_res_cancel;
++		goto out_trans_cancel;
+ 
+ 	xfs_trans_ijoin(tp, ip, 0);
+ 
+@@ -265,7 +265,7 @@ xfs_iomap_write_direct(
+ 	error = xfs_bmapi_write(tp, ip, offset_fsb, count_fsb, bmapi_flags, 0,
+ 				imap, &nimaps);
+ 	if (error)
+-		goto out_res_cancel;
++		goto out_trans_cancel;
+ 
+ 	/*
+ 	 * Complete the transaction
+@@ -289,8 +289,6 @@ xfs_iomap_write_direct(
+ 	xfs_iunlock(ip, XFS_ILOCK_EXCL);
+ 	return error;
+ 
+-out_res_cancel:
+-	xfs_trans_unreserve_quota_nblks(tp, ip, (long)qblocks, 0, quota_flag);
+ out_trans_cancel:
+ 	xfs_trans_cancel(tp);
+ 	goto out_unlock;
+diff --git a/fs/xfs/xfs_quota.h b/fs/xfs/xfs_quota.h
+index 1d1a1634ea29..31d0de899cc4 100644
+--- a/fs/xfs/xfs_quota.h
++++ b/fs/xfs/xfs_quota.h
+@@ -164,8 +164,6 @@ xfs_quota_reserve_blkres(struct xfs_inode *ip, int64_t blocks)
+ #define xfs_qm_unmount_quotas(mp)
+ #endif /* CONFIG_XFS_QUOTA */
+ 
+-#define xfs_trans_unreserve_quota_nblks(tp, ip, nblks, ninos, flags) \
+-	xfs_trans_reserve_quota_nblks(tp, ip, -(nblks), -(ninos), flags)
+ #define xfs_trans_reserve_quota(tp, mp, ud, gd, pd, nb, ni, f) \
+ 	xfs_trans_reserve_quota_bydquots(tp, mp, ud, gd, pd, nb, ni, \
+ 				f | XFS_QMOPT_RES_REGBLKS)
+diff --git a/fs/xfs/xfs_reflink.c b/fs/xfs/xfs_reflink.c
+index bea64ed5a57f..15435229bc1f 100644
+--- a/fs/xfs/xfs_reflink.c
++++ b/fs/xfs/xfs_reflink.c
+@@ -411,7 +411,7 @@ xfs_reflink_allocate_cow(
+ 			XFS_BMAPI_COWFORK | XFS_BMAPI_PREALLOC, 0, cmap,
+ 			&nimaps);
+ 	if (error)
+-		goto out_unreserve;
++		goto out_trans_cancel;
+ 
+ 	xfs_inode_set_cowblocks_tag(ip);
+ 	error = xfs_trans_commit(tp);
+@@ -436,9 +436,6 @@ xfs_reflink_allocate_cow(
+ 	trace_xfs_reflink_convert_cow(ip, cmap);
+ 	return xfs_reflink_convert_cow_locked(ip, offset_fsb, count_fsb);
+ 
+-out_unreserve:
+-	xfs_trans_unreserve_quota_nblks(tp, ip, (long)resblks, 0,
+-			XFS_QMOPT_RES_REGBLKS);
+ out_trans_cancel:
+ 	xfs_trans_cancel(tp);
+ 	return error;
+-- 
+2.26.2
+

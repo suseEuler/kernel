@@ -5,7 +5,6 @@ Subject: [PATCH] xfs: xfs_log_force_lsn isn't passed a LSN
 Git-commit: 5f9b4b0de8dc2fb8eb655463b438001c111570fe
 Patch-mainline: v5.14-rc1
 References: bsn#12
-openEuler-commit: e100c699b2562a353d1fb862c23d03e995e33a57
 
 In doing an investigation into AIL push stalls, I was looking at the
 log force code to see if an async CIL push could be done instead.
@@ -50,7 +49,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  fs/xfs/libxfs/xfs_types.h |  1 +
  fs/xfs/xfs_buf_item.c     |  2 +-
  fs/xfs/xfs_dquot_item.c   |  2 +-
- fs/xfs/xfs_file.c         | 10 +++++-----
+ fs/xfs/xfs_file.c         | 14 +++++++-------
  fs/xfs/xfs_inode.c        | 10 +++++-----
  fs/xfs/xfs_inode_item.c   |  4 ++--
  fs/xfs/xfs_inode_item.h   |  2 +-
@@ -60,7 +59,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  fs/xfs/xfs_log_priv.h     | 15 +++++++--------
  fs/xfs/xfs_trans.c        |  6 +++---
  fs/xfs/xfs_trans.h        |  4 ++--
- 13 files changed, 54 insertions(+), 63 deletions(-)
+ 13 files changed, 56 insertions(+), 65 deletions(-)
 
 diff --git a/fs/xfs/libxfs/xfs_types.h b/fs/xfs/libxfs/xfs_types.h
 index 397d94775440..1ce06173c2f5 100644
@@ -104,44 +103,48 @@ diff --git a/fs/xfs/xfs_file.c b/fs/xfs/xfs_file.c
 index 5fedb04b0cc3..a66afc7ddfdd 100644
 --- a/fs/xfs/xfs_file.c
 +++ b/fs/xfs/xfs_file.c
-@@ -131,7 +131,7 @@ xfs_file_fsync(
- 	struct xfs_mount	*mp = ip->i_mount;
+@@ -118,8 +118,8 @@ xfs_dir_fsync(
+ 	return xfs_log_force_inode(ip);
+ }
+ 
+-static xfs_lsn_t
+-xfs_fsync_lsn(
++static xfs_csn_t
++xfs_fsync_seq(
+ 	struct xfs_inode	*ip,
+ 	bool			datasync)
+ {
+@@ -127,7 +127,7 @@ xfs_fsync_lsn(
+ 		return 0;
+ 	if (datasync && !(ip->i_itemp->ili_fsync_fields & ~XFS_ILOG_TIMESTAMP))
+ 		return 0;
+-	return ip->i_itemp->ili_last_lsn;
++	return ip->i_itemp->ili_commit_seq;
+ }
+ 
+ /*
+@@ -150,12 +150,12 @@ xfs_fsync_flush_log(
+ 	int			*log_flushed)
+ {
  	int			error = 0;
- 	int			log_flushed = 0;
--	xfs_lsn_t		lsn = 0;
-+	xfs_csn_t		seq = 0;
+-	xfs_lsn_t		lsn;
++	xfs_csn_t		seq;
  
- 	trace_xfs_file_fsync(ip);
- 
-@@ -163,7 +163,7 @@ xfs_file_fsync(
- 	 * that we don't get a racing sync operation that does not wait for the
- 	 * metadata to hit the journal before returning. If we race with
- 	 * clearing the ili_fsync_fields, then all that will happen is the log
--	 * force will do nothing as the lsn will already be on disk. We can't
-+	 * force will do nothing as the seq will already be on disk. We can't
- 	 * race with setting ili_fsync_fields because that is done under
- 	 * XFS_ILOCK_EXCL, and that can't happen because we hold the lock shared
- 	 * until after the ili_fsync_fields is cleared.
-@@ -172,11 +172,11 @@ xfs_file_fsync(
- 	if (xfs_ipincount(ip)) {
- 		if (!datasync ||
- 		    (iip->ili_fsync_fields & ~XFS_ILOG_TIMESTAMP))
--			lsn = iip->ili_last_lsn;
-+			seq = iip->ili_commit_seq;
- 	}
- 
+ 	xfs_ilock(ip, XFS_ILOCK_SHARED);
+-	lsn = xfs_fsync_lsn(ip, datasync);
 -	if (lsn) {
--		error = xfs_log_force_lsn(mp, lsn, XFS_LOG_SYNC, &log_flushed);
+-		error = xfs_log_force_lsn(ip->i_mount, lsn, XFS_LOG_SYNC,
++	seq = xfs_fsync_seq(ip, datasync);
 +	if (seq) {
-+		error = xfs_log_force_seq(mp, seq, XFS_LOG_SYNC, &log_flushed);
- 		spin_lock(&iip->ili_lock);
- 		iip->ili_fsync_fields = 0;
- 		spin_unlock(&iip->ili_lock);
++		error = xfs_log_force_seq(ip->i_mount, seq, XFS_LOG_SYNC,
+ 					  log_flushed);
+ 
+ 		spin_lock(&ip->i_itemp->ili_lock);
 diff --git a/fs/xfs/xfs_inode.c b/fs/xfs/xfs_inode.c
 index b4557a827666..4db3c0b7d71b 100644
 --- a/fs/xfs/xfs_inode.c
 +++ b/fs/xfs/xfs_inode.c
-@@ -2754,7 +2754,7 @@ xfs_iunpin(
+@@ -2648,7 +2648,7 @@ xfs_iunpin(
  	trace_xfs_inode_unpin_nowait(ip, _RET_IP_);
  
  	/* Give the log a push to start the unpinning I/O */
@@ -150,7 +153,7 @@ index b4557a827666..4db3c0b7d71b 100644
  
  }
  
-@@ -3709,16 +3709,16 @@ int
+@@ -3603,16 +3603,16 @@ int
  xfs_log_force_inode(
  	struct xfs_inode	*ip)
  {
@@ -204,7 +207,7 @@ diff --git a/fs/xfs/xfs_log.c b/fs/xfs/xfs_log.c
 index 001307f40f99..befd46346786 100644
 --- a/fs/xfs/xfs_log.c
 +++ b/fs/xfs/xfs_log.c
-@@ -3175,14 +3175,13 @@ xfs_log_force(
+@@ -3176,14 +3176,13 @@ out_error:
  }
  
  static int
@@ -221,7 +224,7 @@ index 001307f40f99..befd46346786 100644
  	struct xlog_in_core	*iclog;
  
  	spin_lock(&log->l_icloglock);
-@@ -3215,8 +3214,6 @@ __xfs_log_force_lsn(
+@@ -3216,8 +3215,6 @@ __xfs_log_force_lsn(
  		if (!already_slept &&
  		    (iclog->ic_prev->ic_state == XLOG_STATE_WANT_SYNC ||
  		     iclog->ic_prev->ic_state == XLOG_STATE_SYNCING)) {
@@ -230,7 +233,7 @@ index 001307f40f99..befd46346786 100644
  			xlog_wait(&iclog->ic_prev->ic_write_wait,
  					&log->l_icloglock);
  			return -EAGAIN;
-@@ -3254,25 +3251,29 @@ __xfs_log_force_lsn(
+@@ -3255,25 +3252,29 @@ out_error:
   * to disk, that thread will wake up all threads waiting on the queue.
   */
  int
@@ -281,7 +284,7 @@ index 7c8a775781d3..93fbb8fbbc8c 100644
  		int *log_forced);
  int	  xfs_log_mount(struct xfs_mount	*mp,
  			struct xfs_buftarg	*log_target,
-@@ -130,8 +130,6 @@ int	  xfs_log_force_umount(struct xfs_mount *mp, int logerror);
+@@ -130,8 +130,6 @@ int	  xfs_log_force_umount(struct xfs_mo
  struct xlog_ticket *xfs_log_ticket_get(struct xlog_ticket *ticket);
  void	  xfs_log_ticket_put(struct xlog_ticket *ticket);
  
@@ -436,7 +439,7 @@ diff --git a/fs/xfs/xfs_trans.c b/fs/xfs/xfs_trans.c
 index f41b16ad5b24..c19807abbefa 100644
 --- a/fs/xfs/xfs_trans.c
 +++ b/fs/xfs/xfs_trans.c
-@@ -830,7 +830,7 @@ __xfs_trans_commit(
+@@ -848,7 +848,7 @@ __xfs_trans_commit(
  	bool			regrant)
  {
  	struct xfs_mount	*mp = tp->t_mountp;
@@ -445,7 +448,7 @@ index f41b16ad5b24..c19807abbefa 100644
  	int			error = 0;
  	int			sync = tp->t_flags & XFS_TRANS_SYNC;
  
-@@ -872,7 +872,7 @@ __xfs_trans_commit(
+@@ -890,7 +890,7 @@ __xfs_trans_commit(
  		xfs_trans_apply_sb_deltas(tp);
  	xfs_trans_apply_dquot_deltas(tp);
  
@@ -454,7 +457,7 @@ index f41b16ad5b24..c19807abbefa 100644
  
  	current_restore_flags_nested(&tp->t_pflags, PF_MEMALLOC_NOFS);
  	xfs_trans_free(tp);
-@@ -882,7 +882,7 @@ __xfs_trans_commit(
+@@ -900,7 +900,7 @@ __xfs_trans_commit(
  	 * log out now and wait for it.
  	 */
  	if (sync) {
@@ -485,6 +488,3 @@ index 2f802d6c9fcf..f4159326411a 100644
  	void (*iop_release)(struct xfs_log_item *);
  	xfs_lsn_t (*iop_committed)(struct xfs_log_item *, xfs_lsn_t);
  	int (*iop_recover)(struct xfs_log_item *lip,
--- 
-2.26.2
-

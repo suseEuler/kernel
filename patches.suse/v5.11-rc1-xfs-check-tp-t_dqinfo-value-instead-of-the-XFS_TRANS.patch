@@ -1,0 +1,131 @@
+From 04a58620a17cb14fa20c6e536e03eb27f9af6bc9 Mon Sep 17 00:00:00 2001
+Message-Id: <04a58620a17cb14fa20c6e536e03eb27f9af6bc9.1642486559.git.geliang.tang@suse.com>
+From: Kaixu Xia <kaixuxia@tencent.com>
+Date: Thu, 3 Dec 2020 16:41:21 -0800
+Subject: [PATCH] xfs: check tp->t_dqinfo value instead of the
+ XFS_TRANS_DQ_DIRTY flag
+
+Git-commit: 04a58620a17cb14fa20c6e536e03eb27f9af6bc9
+Patch-mainline: v5.11-rc1
+References: bsn#12
+
+Nowadays the only things that the XFS_TRANS_DQ_DIRTY flag seems to do
+are indicates the tp->t_dqinfo->dqs[XFS_QM_TRANS_{USR,GRP,PRJ}] values
+changed and check in xfs_trans_apply_dquot_deltas() and the unreserve
+variant xfs_trans_unreserve_and_mod_dquots(). Actually, we also can
+use the tp->t_dqinfo value instead of the XFS_TRANS_DQ_DIRTY flag, that
+is to say, we allocate the new tp->t_dqinfo only when the qtrx values
+changed, so the tp->t_dqinfo value isn't NULL equals the XFS_TRANS_DQ_DIRTY
+flag is set, we only need to check if tp->t_dqinfo == NULL in
+xfs_trans_apply_dquot_deltas() and its unreserve variant to determine
+whether lock all of the dquots and join them to the transaction.
+
+Signed-off-by: Kaixu Xia <kaixuxia@tencent.com>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/xfs/libxfs/xfs_shared.h |  1 -
+ fs/xfs/xfs_inode.c         |  8 +-------
+ fs/xfs/xfs_trans_dquot.c   | 13 ++-----------
+ 3 files changed, 3 insertions(+), 19 deletions(-)
+
+diff --git a/fs/xfs/libxfs/xfs_shared.h b/fs/xfs/libxfs/xfs_shared.h
+index c795ae47b3c9..8c61a461bf7b 100644
+--- a/fs/xfs/libxfs/xfs_shared.h
++++ b/fs/xfs/libxfs/xfs_shared.h
+@@ -62,7 +62,6 @@ void	xfs_log_get_max_trans_res(struct xfs_mount *mp,
+ #define	XFS_TRANS_SB_DIRTY	0x02	/* superblock is modified */
+ #define	XFS_TRANS_PERM_LOG_RES	0x04	/* xact took a permanent log res */
+ #define	XFS_TRANS_SYNC		0x08	/* make commit synchronous */
+-#define XFS_TRANS_DQ_DIRTY	0x10	/* at least one dquot in trx dirty */
+ #define XFS_TRANS_RESERVE	0x20    /* OK to use reserved data blocks */
+ #define XFS_TRANS_NO_WRITECOUNT 0x40	/* do not elevate SB writecount */
+ #define XFS_TRANS_RES_FDBLKS	0x80	/* reserve newly freed blocks */
+diff --git a/fs/xfs/xfs_inode.c b/fs/xfs/xfs_inode.c
+index 004fce3646ae..034fe0adae05 100644
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@ -959,7 +959,6 @@ xfs_dir_ialloc(
+ 	xfs_buf_t	*ialloc_context = NULL;
+ 	int		code;
+ 	void		*dqinfo;
+-	uint		tflags;
+ 
+ 	tp = *tpp;
+ 	ASSERT(tp->t_flags & XFS_TRANS_PERM_LOG_RES);
+@@ -1018,12 +1017,9 @@ xfs_dir_ialloc(
+ 		 * and attach it to the next transaction.
+ 		 */
+ 		dqinfo = NULL;
+-		tflags = 0;
+ 		if (tp->t_dqinfo) {
+ 			dqinfo = (void *)tp->t_dqinfo;
+ 			tp->t_dqinfo = NULL;
+-			tflags = tp->t_flags & XFS_TRANS_DQ_DIRTY;
+-			tp->t_flags &= ~(XFS_TRANS_DQ_DIRTY);
+ 		}
+ 
+ 		code = xfs_trans_roll(&tp);
+@@ -1031,10 +1027,8 @@ xfs_dir_ialloc(
+ 		/*
+ 		 * Re-attach the quota info that we detached from prev trx.
+ 		 */
+-		if (dqinfo) {
++		if (dqinfo)
+ 			tp->t_dqinfo = dqinfo;
+-			tp->t_flags |= tflags;
+-		}
+ 
+ 		if (code) {
+ 			xfs_buf_relse(ialloc_context);
+diff --git a/fs/xfs/xfs_trans_dquot.c b/fs/xfs/xfs_trans_dquot.c
+index 67f1e275b34d..0ebfd7930382 100644
+--- a/fs/xfs/xfs_trans_dquot.c
++++ b/fs/xfs/xfs_trans_dquot.c
+@@ -84,13 +84,6 @@ xfs_trans_dup_dqinfo(
+ 
+ 	xfs_trans_alloc_dqinfo(ntp);
+ 
+-	/*
+-	 * Because the quota blk reservation is carried forward,
+-	 * it is also necessary to carry forward the DQ_DIRTY flag.
+-	 */
+-	if (otp->t_flags & XFS_TRANS_DQ_DIRTY)
+-		ntp->t_flags |= XFS_TRANS_DQ_DIRTY;
+-
+ 	for (j = 0; j < XFS_QM_TRANS_DQTYPES; j++) {
+ 		oqa = otp->t_dqinfo->dqs[j];
+ 		nqa = ntp->t_dqinfo->dqs[j];
+@@ -270,8 +263,6 @@ xfs_trans_mod_dquot(
+ 
+ 	if (delta)
+ 		trace_xfs_trans_mod_dquot_after(qtrx);
+-
+-	tp->t_flags |= XFS_TRANS_DQ_DIRTY;
+ }
+ 
+ 
+@@ -348,7 +339,7 @@ xfs_trans_apply_dquot_deltas(
+ 	int64_t			totalbdelta;
+ 	int64_t			totalrtbdelta;
+ 
+-	if (!(tp->t_flags & XFS_TRANS_DQ_DIRTY))
++	if (!tp->t_dqinfo)
+ 		return;
+ 
+ 	ASSERT(tp->t_dqinfo);
+@@ -490,7 +481,7 @@ xfs_trans_unreserve_and_mod_dquots(
+ 	struct xfs_dqtrx	*qtrx, *qa;
+ 	bool			locked;
+ 
+-	if (!tp->t_dqinfo || !(tp->t_flags & XFS_TRANS_DQ_DIRTY))
++	if (!tp->t_dqinfo)
+ 		return;
+ 
+ 	for (j = 0; j < XFS_QM_TRANS_DQTYPES; j++) {
+-- 
+2.31.1
+

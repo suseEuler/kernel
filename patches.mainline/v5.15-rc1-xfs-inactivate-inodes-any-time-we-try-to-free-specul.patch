@@ -1,0 +1,63 @@
+From 2eb665027b6528c1a8e9158c2f722a6ec0af359d Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Fri, 6 Aug 2021 11:05:41 -0700
+Subject: [PATCH] xfs: inactivate inodes any time we try to free speculative
+ preallocations
+Git-commit: 2eb665027b6528c1a8e9158c2f722a6ec0af359d
+Patch-mainline: v5.15-rc1
+References: bsn#12
+
+
+Other parts of XFS have learned to call xfs_blockgc_free_{space,quota}
+to try to free speculative preallocations when space is tight.  This
+means that file writes, transaction reservation failures, quota limit
+enforcement, and the EOFBLOCKS ioctl all call this function to free
+space when things are tight.
+
+Since inode inactivation is now a background task, this means that the
+filesystem can be hanging on to unlinked but not yet freed space.  Add
+this to the list of things that xfs_blockgc_free_* makes writer threads
+scan for when they cannot reserve space.
+
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/xfs/xfs_icache.c | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/fs/xfs/xfs_icache.c b/fs/xfs/xfs_icache.c
+index 0ca0b1981de9..9ba537c82d07 100644
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@ -1468,16 +1468,24 @@ xfs_blockgc_worker(
+ }
+ 
+ /*
+- * Try to free space in the filesystem by purging eofblocks and cowblocks.
++ * Try to free space in the filesystem by purging inactive inodes, eofblocks
++ * and cowblocks.
+  */
+ int
+ xfs_blockgc_free_space(
+ 	struct xfs_mount	*mp,
+ 	struct xfs_icwalk	*icw)
+ {
++	int			error;
++
+ 	trace_xfs_blockgc_free_space(mp, icw, _RET_IP_);
+ 
+-	return xfs_icwalk(mp, XFS_ICWALK_BLOCKGC, icw);
++	error = xfs_icwalk(mp, XFS_ICWALK_BLOCKGC, icw);
++	if (error)
++		return error;
++
++	xfs_inodegc_flush(mp);
++	return 0;
+ }
+ 
+ /*
+-- 
+2.26.2
+

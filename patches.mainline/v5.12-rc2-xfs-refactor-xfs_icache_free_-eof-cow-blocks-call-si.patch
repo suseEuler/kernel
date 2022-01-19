@@ -1,0 +1,131 @@
+From 85c5b27075ba0389855d9f46ff1b1d5c34a44c94 Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Fri, 22 Jan 2021 16:48:39 -0800
+Subject: [PATCH] xfs: refactor xfs_icache_free_{eof,cow}blocks call sites
+Git-commit: 85c5b27075ba0389855d9f46ff1b1d5c34a44c94
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+In anticipation of more restructuring of the eof/cowblocks gc code,
+refactor calling of those two functions into a single internal helper
+function, then present a new standard interface to purge speculative
+block preallocations and start shifting higher level code to use that.
+
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/xfs/xfs_file.c   |  3 +--
+ fs/xfs/xfs_icache.c | 39 +++++++++++++++++++++++++++++++++------
+ fs/xfs/xfs_icache.h |  1 +
+ fs/xfs/xfs_trace.h  |  1 +
+ 4 files changed, 36 insertions(+), 8 deletions(-)
+
+diff --git a/fs/xfs/xfs_file.c b/fs/xfs/xfs_file.c
+index 8546dbf6c5ac..38528e59030e 100644
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@ -718,8 +718,7 @@ xfs_file_buffered_aio_write(
+ 
+ 		xfs_iunlock(ip, iolock);
+ 		eofb.eof_flags = XFS_EOF_FLAGS_SYNC;
+-		xfs_icache_free_eofblocks(ip->i_mount, &eofb);
+-		xfs_icache_free_cowblocks(ip->i_mount, &eofb);
++		xfs_blockgc_free_space(ip->i_mount, &eofb);
+ 		goto write_retry;
+ 	}
+ 
+diff --git a/fs/xfs/xfs_icache.c b/fs/xfs/xfs_icache.c
+index df9533d6bc16..0d81330a0fd3 100644
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@ -1645,6 +1645,38 @@ xfs_start_block_reaping(
+ 	xfs_queue_cowblocks(mp);
+ }
+ 
++/* Scan all incore inodes for block preallocations that we can remove. */
++static inline int
++xfs_blockgc_scan(
++	struct xfs_mount	*mp,
++	struct xfs_eofblocks	*eofb)
++{
++	int			error;
++
++	error = xfs_icache_free_eofblocks(mp, eofb);
++	if (error)
++		return error;
++
++	error = xfs_icache_free_cowblocks(mp, eofb);
++	if (error)
++		return error;
++
++	return 0;
++}
++
++/*
++ * Try to free space in the filesystem by purging eofblocks and cowblocks.
++ */
++int
++xfs_blockgc_free_space(
++	struct xfs_mount	*mp,
++	struct xfs_eofblocks	*eofb)
++{
++	trace_xfs_blockgc_free_space(mp, eofb, _RET_IP_);
++
++	return xfs_blockgc_scan(mp, eofb);
++}
++
+ /*
+  * Run cow/eofblocks scans on the supplied dquots.  We don't know exactly which
+  * quota caused an allocation failure, so we make a best effort by including
+@@ -1665,7 +1697,6 @@ xfs_blockgc_free_dquots(
+ {
+ 	struct xfs_eofblocks	eofb = {0};
+ 	bool			do_work = false;
+-	int			error;
+ 
+ 	if (!udqp && !gdqp && !pdqp)
+ 		return 0;
+@@ -1697,11 +1728,7 @@ xfs_blockgc_free_dquots(
+ 	if (!do_work)
+ 		return 0;
+ 
+-	error = xfs_icache_free_eofblocks(mp, &eofb);
+-	if (error)
+-		return error;
+-
+-	return xfs_icache_free_cowblocks(mp, &eofb);
++	return xfs_blockgc_free_space(mp, &eofb);
+ }
+ 
+ /* Run cow/eofblocks scans on the quotas attached to the inode. */
+diff --git a/fs/xfs/xfs_icache.h b/fs/xfs/xfs_icache.h
+index 5f7d7c192d1e..f7dc8d1c91e5 100644
+--- a/fs/xfs/xfs_icache.h
++++ b/fs/xfs/xfs_icache.h
+@@ -58,6 +58,7 @@ int xfs_blockgc_free_dquots(struct xfs_mount *mp, struct xfs_dquot *udqp,
+ 		struct xfs_dquot *gdqp, struct xfs_dquot *pdqp,
+ 		unsigned int eof_flags);
+ int xfs_blockgc_free_quota(struct xfs_inode *ip, unsigned int eof_flags);
++int xfs_blockgc_free_space(struct xfs_mount *mp, struct xfs_eofblocks *eofb);
+ 
+ void xfs_inode_set_eofblocks_tag(struct xfs_inode *ip);
+ void xfs_inode_clear_eofblocks_tag(struct xfs_inode *ip);
+diff --git a/fs/xfs/xfs_trace.h b/fs/xfs/xfs_trace.h
+index 965873026116..404a00ea9d9e 100644
+--- a/fs/xfs/xfs_trace.h
++++ b/fs/xfs/xfs_trace.h
+@@ -3928,6 +3928,7 @@ DEFINE_EVENT(xfs_eofblocks_class, name,	\
+ 		 unsigned long caller_ip), \
+ 	TP_ARGS(mp, eofb, caller_ip))
+ DEFINE_EOFBLOCKS_EVENT(xfs_ioc_free_eofblocks);
++DEFINE_EOFBLOCKS_EVENT(xfs_blockgc_free_space);
+ 
+ #endif /* _TRACE_XFS_H */
+ 
+-- 
+2.26.2
+

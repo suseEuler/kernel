@@ -1,0 +1,85 @@
+From 3a19bb147c72d2e9b77137bf5130b9cfb50a5eef Mon Sep 17 00:00:00 2001
+Message-Id: <3a19bb147c72d2e9b77137bf5130b9cfb50a5eef.1642491313.git.geliang.tang@suse.com>
+From: Chandan Babu R <chandanrlinux@gmail.com>
+Date: Fri, 22 Jan 2021 16:48:13 -0800
+Subject: [PATCH] xfs: Check for extent overflow when adding/removing xattrs
+Git-commit: 3a19bb147c72d2e9b77137bf5130b9cfb50a5eef
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+Adding/removing an xattr can cause XFS_DA_NODE_MAXDEPTH extents to be
+added. One extra extent for dabtree in case a local attr is large enough
+to cause a double split.  It can also cause extent count to increase
+proportional to the size of a remote xattr's value.
+
+Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Allison Henderson <allison.henderson@oracle.com>
+Signed-off-by: Chandan Babu R <chandanrlinux@gmail.com>
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/xfs/libxfs/xfs_attr.c       | 13 +++++++++++++
+ fs/xfs/libxfs/xfs_inode_fork.h | 10 ++++++++++
+ 2 files changed, 23 insertions(+)
+
+--- a/fs/xfs/libxfs/xfs_attr.c
++++ b/fs/xfs/libxfs/xfs_attr.c
+@@ -396,6 +396,7 @@ xfs_attr_set(
+ 	struct xfs_trans_res	tres;
+ 	bool			rsvd = (args->attr_filter & XFS_ATTR_ROOT);
+ 	int			error, local;
++	int			rmt_blks = 0;
+ 	unsigned int		total;
+ 
+ 	if (XFS_FORCED_SHUTDOWN(dp->i_mount))
+@@ -442,11 +443,15 @@ xfs_attr_set(
+ 		tres.tr_logcount = XFS_ATTRSET_LOG_COUNT;
+ 		tres.tr_logflags = XFS_TRANS_PERM_LOG_RES;
+ 		total = args->total;
++
++		if (!local)
++			rmt_blks = xfs_attr3_rmt_blocks(mp, args->valuelen);
+ 	} else {
+ 		XFS_STATS_INC(mp, xs_attr_remove);
+ 
+ 		tres = M_RES(mp)->tr_attrrm;
+ 		total = XFS_ATTRRM_SPACE_RES(mp);
++		rmt_blks = xfs_attr3_rmt_blocks(mp, XFS_XATTR_SIZE_MAX);
+ 	}
+ 
+ 	/*
+@@ -460,6 +465,14 @@ xfs_attr_set(
+ 
+ 	xfs_ilock(dp, XFS_ILOCK_EXCL);
+ 	xfs_trans_ijoin(args->trans, dp, 0);
++
++	if (args->value || xfs_inode_hasattr(dp)) {
++		error = xfs_iext_count_may_overflow(dp, XFS_ATTR_FORK,
++				XFS_IEXT_ATTR_MANIP_CNT(rmt_blks));
++		if (error)
++			goto out_trans_cancel;
++	}
++
+ 	if (args->value) {
+ 		unsigned int	quota_flags = XFS_QMOPT_RES_REGBLKS;
+ 
+--- a/fs/xfs/libxfs/xfs_inode_fork.h
++++ b/fs/xfs/libxfs/xfs_inode_fork.h
+@@ -54,6 +54,16 @@ struct xfs_ifork {
+ 	((XFS_DA_NODE_MAXDEPTH + 1 + 1) * (mp)->m_dir_geo->fsbcount)
+ 
+ /*
++ * Adding/removing an xattr can cause XFS_DA_NODE_MAXDEPTH extents to
++ * be added. One extra extent for dabtree in case a local attr is
++ * large enough to cause a double split.  It can also cause extent
++ * count to increase proportional to the size of a remote xattr's
++ * value.
++ */
++#define XFS_IEXT_ATTR_MANIP_CNT(rmt_blks) \
++	(XFS_DA_NODE_MAXDEPTH + max(1, rmt_blks))
++
++/*
+  * Fork handling.
+  */
+ 

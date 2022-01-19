@@ -1,0 +1,90 @@
+From 758303d1449965819661048e9e31f32d61888f70 Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Fri, 22 Jan 2021 16:48:38 -0800
+Subject: [PATCH] xfs: flush eof/cowblocks if we can't reserve quota for chown
+Git-commit: 758303d1449965819661048e9e31f32d61888f70
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+If a file user, group, or project change is unable to reserve enough
+quota to handle the modification, try clearing whatever space the
+filesystem might have been hanging onto in the hopes of speeding up the
+filesystem.  The flushing behavior will become particularly important
+when we add deferred inode inactivation because that will increase the
+amount of space that isn't actively tied to user data.
+
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/xfs/xfs_trans.c | 29 +++++++++++++++++++----------
+ 1 file changed, 19 insertions(+), 10 deletions(-)
+
+diff --git a/fs/xfs/xfs_trans.c b/fs/xfs/xfs_trans.c
+index b29434199079..a23400f59e7d 100644
+--- a/fs/xfs/xfs_trans.c
++++ b/fs/xfs/xfs_trans.c
+@@ -1138,16 +1138,21 @@ xfs_trans_alloc_icreate(
+ int
+ xfs_trans_alloc_ichange(
+ 	struct xfs_inode	*ip,
+-	struct xfs_dquot	*udqp,
+-	struct xfs_dquot	*gdqp,
+-	struct xfs_dquot	*pdqp,
++	struct xfs_dquot	*new_udqp,
++	struct xfs_dquot	*new_gdqp,
++	struct xfs_dquot	*new_pdqp,
+ 	bool			force,
+ 	struct xfs_trans	**tpp)
+ {
+ 	struct xfs_trans	*tp;
+ 	struct xfs_mount	*mp = ip->i_mount;
++	struct xfs_dquot	*udqp;
++	struct xfs_dquot	*gdqp;
++	struct xfs_dquot	*pdqp;
++	bool			retried = false;
+ 	int			error;
+ 
++retry:
+ 	error = xfs_trans_alloc(mp, &M_RES(mp)->tr_ichange, 0, 0, 0, &tp);
+ 	if (error)
+ 		return error;
+@@ -1165,14 +1170,12 @@ xfs_trans_alloc_ichange(
+ 	/*
+ 	 * For each quota type, skip quota reservations if the inode's dquots
+ 	 * now match the ones that came from the caller, or the caller didn't
+-	 * pass one in.
++	 * pass one in.  The inode's dquots can change if we drop the ILOCK to
++	 * perform a blockgc scan, so we must preserve the caller's arguments.
+ 	 */
+-	if (udqp == ip->i_udquot)
+-		udqp = NULL;
+-	if (gdqp == ip->i_gdquot)
+-		gdqp = NULL;
+-	if (pdqp == ip->i_pdquot)
+-		pdqp = NULL;
++	udqp = (new_udqp != ip->i_udquot) ? new_udqp : NULL;
++	gdqp = (new_gdqp != ip->i_gdquot) ? new_gdqp : NULL;
++	pdqp = (new_pdqp != ip->i_pdquot) ? new_pdqp : NULL;
+ 	if (udqp || gdqp || pdqp) {
+ 		unsigned int	qflags = XFS_QMOPT_RES_REGBLKS;
+ 
+@@ -1188,6 +1191,12 @@ xfs_trans_alloc_ichange(
+ 		error = xfs_trans_reserve_quota_bydquots(tp, mp, udqp, gdqp,
+ 				pdqp, ip->i_d.di_nblocks + ip->i_delayed_blks,
+ 				1, qflags);
++		if ((error == -EDQUOT || error == -ENOSPC) && !retried) {
++			xfs_trans_cancel(tp);
++			xfs_blockgc_free_dquots(mp, udqp, gdqp, pdqp, 0);
++			retried = true;
++			goto retry;
++		}
+ 		if (error)
+ 			goto out_cancel;
+ 	}
+-- 
+2.26.2
+

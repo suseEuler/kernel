@@ -1,0 +1,183 @@
+From a636b1d1cf73804e385990c975e33cf06c032b64 Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Fri, 22 Jan 2021 16:48:34 -0800
+Subject: [PATCH] xfs: trigger all block gc scans when low on quota space
+Git-commit: a636b1d1cf73804e385990c975e33cf06c032b64
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+The functions to run an eof/cowblocks scan to try to reduce quota usage
+are kind of a mess -- the logic repeatedly initializes an eofb structure
+and there are logic bugs in the code that result in the cowblocks scan
+never actually happening.
+
+Replace all three functions with a single function that fills out an
+eofb and runs both eof and cowblocks scans.
+
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/xfs/xfs_file.c   | 15 ++++++---------
+ fs/xfs/xfs_icache.c | 46 ++++++++++++++++-----------------------------
+ fs/xfs/xfs_icache.h |  4 ++--
+ 3 files changed, 24 insertions(+), 41 deletions(-)
+
+diff --git a/fs/xfs/xfs_file.c b/fs/xfs/xfs_file.c
+index 48f6f89a38a9..b55f1eb8f1c8 100644
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@ -672,7 +672,7 @@ xfs_file_buffered_aio_write(
+ 	struct inode		*inode = mapping->host;
+ 	struct xfs_inode	*ip = XFS_I(inode);
+ 	ssize_t			ret;
+-	int			enospc = 0;
++	bool			cleared_space = false;
+ 	int			iolock;
+ 
+ 	if (iocb->ki_flags & IOCB_NOWAIT)
+@@ -704,19 +704,16 @@ xfs_file_buffered_aio_write(
+ 	 * also behaves as a filter to prevent too many eofblocks scans from
+ 	 * running at the same time.
+ 	 */
+-	if (ret == -EDQUOT && !enospc) {
++	if (ret == -EDQUOT && !cleared_space) {
+ 		xfs_iunlock(ip, iolock);
+-		enospc = xfs_inode_free_quota_eofblocks(ip);
+-		if (enospc)
+-			goto write_retry;
+-		enospc = xfs_inode_free_quota_cowblocks(ip);
+-		if (enospc)
++		cleared_space = xfs_inode_free_quota_blocks(ip);
++		if (cleared_space)
+ 			goto write_retry;
+ 		iolock = 0;
+-	} else if (ret == -ENOSPC && !enospc) {
++	} else if (ret == -ENOSPC && !cleared_space) {
+ 		struct xfs_eofblocks eofb = {0};
+ 
+-		enospc = 1;
++		cleared_space = true;
+ 		xfs_flush_inodes(ip->i_mount);
+ 
+ 		xfs_iunlock(ip, iolock);
+diff --git a/fs/xfs/xfs_icache.c b/fs/xfs/xfs_icache.c
+index deb99300d171..c71eb15e3835 100644
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@ -1397,33 +1397,31 @@ xfs_icache_free_eofblocks(
+ }
+ 
+ /*
+- * Run eofblocks scans on the quotas applicable to the inode. For inodes with
+- * multiple quotas, we don't know exactly which quota caused an allocation
++ * Run cow/eofblocks scans on the quotas applicable to the inode. For inodes
++ * with multiple quotas, we don't know exactly which quota caused an allocation
+  * failure. We make a best effort by including each quota under low free space
+  * conditions (less than 1% free space) in the scan.
+  */
+-static int
+-__xfs_inode_free_quota_eofblocks(
+-	struct xfs_inode	*ip,
+-	int			(*execute)(struct xfs_mount *mp,
+-					   struct xfs_eofblocks	*eofb))
++bool
++xfs_inode_free_quota_blocks(
++	struct xfs_inode	*ip)
+ {
+-	int scan = 0;
+-	struct xfs_eofblocks eofb = {0};
+-	struct xfs_dquot *dq;
++	struct xfs_eofblocks	eofb = {0};
++	struct xfs_dquot	*dq;
++	bool			do_work = false;
+ 
+ 	/*
+ 	 * Run a sync scan to increase effectiveness and use the union filter to
+ 	 * cover all applicable quotas in a single scan.
+ 	 */
+-	eofb.eof_flags = XFS_EOF_FLAGS_UNION|XFS_EOF_FLAGS_SYNC;
++	eofb.eof_flags = XFS_EOF_FLAGS_UNION | XFS_EOF_FLAGS_SYNC;
+ 
+ 	if (XFS_IS_UQUOTA_ENFORCED(ip->i_mount)) {
+ 		dq = xfs_inode_dquot(ip, XFS_DQTYPE_USER);
+ 		if (dq && xfs_dquot_lowsp(dq)) {
+ 			eofb.eof_uid = VFS_I(ip)->i_uid;
+ 			eofb.eof_flags |= XFS_EOF_FLAGS_UID;
+-			scan = 1;
++			do_work = true;
+ 		}
+ 	}
+ 
+@@ -1432,21 +1430,16 @@ __xfs_inode_free_quota_eofblocks(
+ 		if (dq && xfs_dquot_lowsp(dq)) {
+ 			eofb.eof_gid = VFS_I(ip)->i_gid;
+ 			eofb.eof_flags |= XFS_EOF_FLAGS_GID;
+-			scan = 1;
++			do_work = true;
+ 		}
+ 	}
+ 
+-	if (scan)
+-		execute(ip->i_mount, &eofb);
+-
+-	return scan;
+-}
++	if (!do_work)
++		return false;
+ 
+-int
+-xfs_inode_free_quota_eofblocks(
+-	struct xfs_inode *ip)
+-{
+-	return __xfs_inode_free_quota_eofblocks(ip, xfs_icache_free_eofblocks);
++	xfs_icache_free_eofblocks(ip->i_mount, &eofb);
++	xfs_icache_free_cowblocks(ip->i_mount, &eofb);
++	return true;
+ }
+ 
+ static inline unsigned long
+@@ -1646,13 +1639,6 @@ xfs_icache_free_cowblocks(
+ 			XFS_ICI_COWBLOCKS_TAG);
+ }
+ 
+-int
+-xfs_inode_free_quota_cowblocks(
+-	struct xfs_inode *ip)
+-{
+-	return __xfs_inode_free_quota_eofblocks(ip, xfs_icache_free_cowblocks);
+-}
+-
+ void
+ xfs_inode_set_cowblocks_tag(
+ 	xfs_inode_t	*ip)
+diff --git a/fs/xfs/xfs_icache.h b/fs/xfs/xfs_icache.h
+index 3a4c8b382cd0..3f7ddbca8638 100644
+--- a/fs/xfs/xfs_icache.h
++++ b/fs/xfs/xfs_icache.h
+@@ -54,17 +54,17 @@ long xfs_reclaim_inodes_nr(struct xfs_mount *mp, int nr_to_scan);
+ 
+ void xfs_inode_set_reclaim_tag(struct xfs_inode *ip);
+ 
++bool xfs_inode_free_quota_blocks(struct xfs_inode *ip);
++
+ void xfs_inode_set_eofblocks_tag(struct xfs_inode *ip);
+ void xfs_inode_clear_eofblocks_tag(struct xfs_inode *ip);
+ int xfs_icache_free_eofblocks(struct xfs_mount *, struct xfs_eofblocks *);
+-int xfs_inode_free_quota_eofblocks(struct xfs_inode *ip);
+ void xfs_eofblocks_worker(struct work_struct *);
+ void xfs_queue_eofblocks(struct xfs_mount *);
+ 
+ void xfs_inode_set_cowblocks_tag(struct xfs_inode *ip);
+ void xfs_inode_clear_cowblocks_tag(struct xfs_inode *ip);
+ int xfs_icache_free_cowblocks(struct xfs_mount *, struct xfs_eofblocks *);
+-int xfs_inode_free_quota_cowblocks(struct xfs_inode *ip);
+ void xfs_cowblocks_worker(struct work_struct *);
+ void xfs_queue_cowblocks(struct xfs_mount *);
+ 
+-- 
+2.26.2
+

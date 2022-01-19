@@ -1,0 +1,83 @@
+From 766aabd59929cd05fc1a249f376e4395bed93d30 Mon Sep 17 00:00:00 2001
+Message-Id: <766aabd59929cd05fc1a249f376e4395bed93d30.1642574766.git.geliang.tang@suse.com>
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Fri, 22 Jan 2021 16:48:37 -0800
+Subject: [PATCH] xfs: flush eof/cowblocks if we can't reserve quota for file
+ blocks
+Git-commit: 766aabd59929cd05fc1a249f376e4395bed93d30
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+If a fs modification (data write, reflink, xattr set, fallocate, etc.)
+is unable to reserve enough quota to handle the modification, try
+clearing whatever space the filesystem might have been hanging onto in
+the hopes of speeding up the filesystem.  The flushing behavior will
+become particularly important when we add deferred inode inactivation
+because that will increase the amount of space that isn't actively tied
+to user data.
+
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/xfs/xfs_reflink.c |  5 +++++
+ fs/xfs/xfs_trans.c   | 10 ++++++++++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/fs/xfs/xfs_reflink.c b/fs/xfs/xfs_reflink.c
+index 086866f6e71f..725c7d8e4438 100644
+--- a/fs/xfs/xfs_reflink.c
++++ b/fs/xfs/xfs_reflink.c
+@@ -1092,6 +1092,11 @@ xfs_reflink_remap_extent(
+ 	 * count.  This is suboptimal, but the VFS flushed the dest range
+ 	 * before we started.  That should have removed all the delalloc
+ 	 * reservations, but we code defensively.
++	 *
++	 * xfs_trans_alloc_inode above already tried to grab an even larger
++	 * quota reservation, and kicked off a blockgc scan if it couldn't.
++	 * If we can't get a potentially smaller quota reservation now, we're
++	 * done.
+ 	 */
+ 	if (!quota_reserved && !smap_real && dmap_written) {
+ 		error = xfs_trans_reserve_quota_nblks(tp, ip,
+diff --git a/fs/xfs/xfs_trans.c b/fs/xfs/xfs_trans.c
+index 29dca1bc4c1a..4071bbed2d48 100644
+--- a/fs/xfs/xfs_trans.c
++++ b/fs/xfs/xfs_trans.c
+@@ -23,6 +23,7 @@
+ #include "xfs_inode.h"
+ #include "xfs_dquot_item.h"
+ #include "xfs_dquot.h"
++#include "xfs_icache.h"
+ 
+ kmem_zone_t	*xfs_trans_zone;
+ 
+@@ -1046,8 +1047,10 @@ xfs_trans_alloc_inode(
+ {
+ 	struct xfs_trans	*tp;
+ 	struct xfs_mount	*mp = ip->i_mount;
++	bool			retried = false;
+ 	int			error;
+ 
++retry:
+ 	error = xfs_trans_alloc(mp, resv, dblocks,
+ 			rblocks / mp->m_sb.sb_rextsize,
+ 			force ? XFS_TRANS_RESERVE : 0, &tp);
+@@ -1065,6 +1068,13 @@ xfs_trans_alloc_inode(
+ 	}
+ 
+ 	error = xfs_trans_reserve_quota_nblks(tp, ip, dblocks, rblocks, force);
++	if ((error == -EDQUOT || error == -ENOSPC) && !retried) {
++		xfs_trans_cancel(tp);
++		xfs_iunlock(ip, XFS_ILOCK_EXCL);
++		xfs_blockgc_free_quota(ip, 0);
++		retried = true;
++		goto retry;
++	}
+ 	if (error)
+ 		goto out_cancel;
+ 
+-- 
+2.31.1
+

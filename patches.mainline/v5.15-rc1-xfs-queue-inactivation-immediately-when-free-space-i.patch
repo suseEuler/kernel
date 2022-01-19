@@ -1,0 +1,92 @@
+From 7d6f07d2c5ad9fce298889eeed317d512a2df8cd Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Fri, 6 Aug 2021 11:05:40 -0700
+Subject: [PATCH] xfs: queue inactivation immediately when free space is tight
+Git-commit: 7d6f07d2c5ad9fce298889eeed317d512a2df8cd
+Patch-mainline: v5.15-rc1
+References: bsn#12
+
+
+Now that we have made the inactivation of unlinked inodes a background
+task to increase the throughput of file deletions, we need to be a
+little more careful about how long of a delay we can tolerate.
+
+On a mostly empty filesystem, the risk of the allocator making poor
+decisions due to fragmentation of the free space on account a lengthy
+delay in background updates is minimal because there's plenty of space.
+However, if free space is tight, we want to deallocate unlinked inodes
+as quickly as possible to avoid fallocate ENOSPC and to give the
+allocator the best shot at optimal allocations for new writes.
+
+Therefore, queue the percpu worker immediately if the filesystem is more
+than 95% full.  This follows the same principle that XFS becomes less
+aggressive about speculative allocations and lazy cleanup (and more
+precise about accounting) when nearing full.
+
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/xfs/xfs_icache.c | 6 ++++++
+ fs/xfs/xfs_mount.c  | 8 --------
+ fs/xfs/xfs_mount.h  | 9 +++++++++
+ 3 files changed, 15 insertions(+), 8 deletions(-)
+
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@ -1927,6 +1927,7 @@ xfs_inodegc_start(
+  * Schedule the inactivation worker when:
+  *
+  *  - We've accumulated more than one inode cluster buffer's worth of inodes.
++ *  - There is less than 5% free space left.
+  */
+ static inline bool
+ xfs_inodegc_want_queue_work(
+@@ -1938,6 +1939,11 @@ xfs_inodegc_want_queue_work(
+ 	if (items > mp->m_ino_geo.inodes_per_cluster)
+ 		return true;
+ 
++	if (__percpu_counter_compare(&mp->m_fdblocks,
++				mp->m_low_space[XFS_LOWSP_5_PCNT],
++				XFS_FDBLOCKS_BATCH) < 0)
++		return true;
++
+ 	return false;
+ }
+ 
+--- a/fs/xfs/xfs_mount.c
++++ b/fs/xfs/xfs_mount.c
+@@ -1221,14 +1221,6 @@ xfs_log_sbcount(xfs_mount_t *mp)
+ 	return xfs_sync_sb(mp, true);
+ }
+ 
+-/*
+- * Deltas for the block count can vary from 1 to very large, but lock contention
+- * only occurs on frequent small block count updates such as in the delayed
+- * allocation path for buffered writes (page a time updates). Hence we set
+- * a large batch count (1024) to minimise global counter updates except when
+- * we get near to ENOSPC and we have to be very accurate with our updates.
+- */
+-#define XFS_FDBLOCKS_BATCH	1024
+ int
+ xfs_mod_fdblocks(
+ 	struct xfs_mount	*mp,
+--- a/fs/xfs/xfs_mount.h
++++ b/fs/xfs/xfs_mount.h
+@@ -447,6 +447,15 @@ extern int	xfs_initialize_perag(xfs_moun
+ 				     xfs_agnumber_t *maxagi);
+ extern void	xfs_unmountfs(xfs_mount_t *);
+ 
++/*
++ * Deltas for the block count can vary from 1 to very large, but lock contention
++ * only occurs on frequent small block count updates such as in the delayed
++ * allocation path for buffered writes (page a time updates). Hence we set
++ * a large batch count (1024) to minimise global counter updates except when
++ * we get near to ENOSPC and we have to be very accurate with our updates.
++ */
++#define XFS_FDBLOCKS_BATCH	1024
++
+ extern int	xfs_mod_fdblocks(struct xfs_mount *mp, int64_t delta,
+ 				 bool reserved);
+ extern int	xfs_mod_frextents(struct xfs_mount *mp, int64_t delta);

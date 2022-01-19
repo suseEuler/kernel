@@ -1,0 +1,52 @@
+From a1a7d05a05765eec042942a5c360e909c0dd0131 Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Fri, 22 Jan 2021 16:48:39 -0800
+Subject: [PATCH] xfs: flush speculative space allocations when we run out of
+ space
+Git-commit: a1a7d05a05765eec042942a5c360e909c0dd0131
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+If a fs modification (creation, file write, reflink, etc.) is unable to
+reserve enough space to handle the modification, try clearing whatever
+space the filesystem might have been hanging onto in the hopes of
+speeding up the filesystem.  The flushing behavior will become
+particularly important when we add deferred inode inactivation because
+that will increase the amount of space that isn't actively tied to user
+data.
+
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/xfs/xfs_trans.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/fs/xfs/xfs_trans.c b/fs/xfs/xfs_trans.c
+index a23400f59e7d..44f72c09c203 100644
+--- a/fs/xfs/xfs_trans.c
++++ b/fs/xfs/xfs_trans.c
+@@ -289,6 +289,17 @@ xfs_trans_alloc(
+ 	tp->t_firstblock = NULLFSBLOCK;
+ 
+ 	error = xfs_trans_reserve(tp, resp, blocks, rtextents);
++	if (error == -ENOSPC) {
++		/*
++		 * We weren't able to reserve enough space for the transaction.
++		 * Flush the other speculative space allocations to free space.
++		 * Do not perform a synchronous scan because callers can hold
++		 * other locks.
++		 */
++		error = xfs_blockgc_free_space(mp, NULL);
++		if (!error)
++			error = xfs_trans_reserve(tp, resp, blocks, rtextents);
++	}
+ 	if (error) {
+ 		xfs_trans_cancel(tp);
+ 		return error;
+-- 
+2.26.2
+

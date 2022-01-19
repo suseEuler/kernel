@@ -1,0 +1,105 @@
+From 77b4d2861e8381d00e4b9bd1be2a355dda99ff60 Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Fri, 18 Jun 2021 11:57:06 -0700
+Subject: [PATCH] xfs: separate primary inode selection criteria in
+ xfs_iget_cache_hit
+Git-commit: 77b4d2861e8381d00e4b9bd1be2a355dda99ff60
+Patch-mainline: v5.14-rc1
+References: bsn#12
+
+
+During review of the v6 deferred inode inactivation patchset[1], Dave
+commented that _cache_hit should have a clear separation between inode
+selection criteria and actions performed on a selected inode.  Move a
+hunk to make this true, and compact the shrink cases in the function.
+
+[1] https://lore.kernel.org/linux-xfs/162310469340.3465262.504398465311182657.stgit@locust/T/#mca6d958521cb88bbc1bfe1a30767203328d410b5
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/xfs/xfs_icache.c | 39 ++++++++++++++++-----------------------
+ 1 file changed, 16 insertions(+), 23 deletions(-)
+
+diff --git a/fs/xfs/xfs_icache.c b/fs/xfs/xfs_icache.c
+index 37229517c8f7..6b44fc734cb5 100644
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@ -507,13 +507,8 @@ xfs_iget_cache_hit(
+ 	 * will not match, so check for that, too.
+ 	 */
+ 	spin_lock(&ip->i_flags_lock);
+-	if (ip->i_ino != ino) {
+-		trace_xfs_iget_skip(ip);
+-		XFS_STATS_INC(mp, xs_ig_frecycle);
+-		error = -EAGAIN;
+-		goto out_error;
+-	}
+-
++	if (ip->i_ino != ino)
++		goto out_skip;
+ 
+ 	/*
+ 	 * If we are racing with another cache hit that is currently
+@@ -525,12 +520,8 @@ xfs_iget_cache_hit(
+ 	 *	     wait_on_inode to wait for these flags to be cleared
+ 	 *	     instead of polling for it.
+ 	 */
+-	if (ip->i_flags & (XFS_INEW|XFS_IRECLAIM)) {
+-		trace_xfs_iget_skip(ip);
+-		XFS_STATS_INC(mp, xs_ig_frecycle);
+-		error = -EAGAIN;
+-		goto out_error;
+-	}
++	if (ip->i_flags & (XFS_INEW | XFS_IRECLAIM))
++		goto out_skip;
+ 
+ 	/*
+ 	 * Check the inode free state is valid. This also detects lookup
+@@ -540,23 +531,21 @@ xfs_iget_cache_hit(
+ 	if (error)
+ 		goto out_error;
+ 
+-	if (ip->i_flags & XFS_IRECLAIMABLE) {
+-		if (flags & XFS_IGET_INCORE) {
+-			error = -EAGAIN;
+-			goto out_error;
+-		}
++	/* Skip inodes that have no vfs state. */
++	if ((flags & XFS_IGET_INCORE) &&
++	    (ip->i_flags & XFS_IRECLAIMABLE))
++		goto out_skip;
+ 
++	/* The inode fits the selection criteria; process it. */
++	if (ip->i_flags & XFS_IRECLAIMABLE) {
+ 		/* Drops i_flags_lock and RCU read lock. */
+ 		error = xfs_iget_recycle(pag, ip);
+ 		if (error)
+ 			return error;
+ 	} else {
+ 		/* If the VFS inode is being torn down, pause and try again. */
+-		if (!igrab(inode)) {
+-			trace_xfs_iget_skip(ip);
+-			error = -EAGAIN;
+-			goto out_error;
+-		}
++		if (!igrab(inode))
++			goto out_skip;
+ 
+ 		/* We've got a live one. */
+ 		spin_unlock(&ip->i_flags_lock);
+@@ -573,6 +562,10 @@ xfs_iget_cache_hit(
+ 
+ 	return 0;
+ 
++out_skip:
++	trace_xfs_iget_skip(ip);
++	XFS_STATS_INC(mp, xs_ig_frecycle);
++	error = -EAGAIN;
+ out_error:
+ 	spin_unlock(&ip->i_flags_lock);
+ 	rcu_read_unlock();
+-- 
+2.26.2
+

@@ -1,0 +1,144 @@
+From 108523b8de676a45cef1f6c8566c444222b85de0 Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Fri, 6 Aug 2021 11:05:40 -0700
+Subject: [PATCH] xfs: queue inactivation immediately when quota is nearing
+ enforcement
+Git-commit: 108523b8de676a45cef1f6c8566c444222b85de0
+Patch-mainline: v5.15-rc1
+References: bsn#12
+
+
+Now that we have made the inactivation of unlinked inodes a background
+task to increase the throughput of file deletions, we need to be a
+little more careful about how long of a delay we can tolerate.
+
+Specifically, if the dquots attached to the inode being inactivated are
+nearing any kind of enforcement boundary, we want to queue that
+inactivation work immediately so that users don't get EDQUOT/ENOSPC
+errors even after they deleted a bunch of files to stay within quota.
+
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/xfs/xfs_dquot.h  | 10 ++++++++++
+ fs/xfs/xfs_icache.c | 10 ++++++++++
+ fs/xfs/xfs_qm.c     | 34 ++++++++++++++++++++++++++++++++++
+ fs/xfs/xfs_quota.h  |  2 ++
+ 4 files changed, 56 insertions(+)
+
+diff --git a/fs/xfs/xfs_dquot.h b/fs/xfs/xfs_dquot.h
+index f642884a6834..6b5e3cf40c8b 100644
+--- a/fs/xfs/xfs_dquot.h
++++ b/fs/xfs/xfs_dquot.h
+@@ -54,6 +54,16 @@ struct xfs_dquot_res {
+ 	xfs_qwarncnt_t		warnings;
+ };
+ 
++static inline bool
++xfs_dquot_res_over_limits(
++	const struct xfs_dquot_res	*qres)
++{
++	if ((qres->softlimit && qres->softlimit < qres->reserved) ||
++	    (qres->hardlimit && qres->hardlimit < qres->reserved))
++		return true;
++	return false;
++}
++
+ /*
+  * The incore dquot structure
+  */
+diff --git a/fs/xfs/xfs_icache.c b/fs/xfs/xfs_icache.c
+index 8b2ac969c60c..0bea604f320a 100644
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@ -1921,6 +1921,7 @@ xfs_inodegc_start(
+  *
+  *  - We've accumulated more than one inode cluster buffer's worth of inodes.
+  *  - There is less than 5% free space left.
++ *  - Any of the quotas for this inode are near an enforcement limit.
+  */
+ static inline bool
+ xfs_inodegc_want_queue_work(
+@@ -1937,6 +1938,15 @@ xfs_inodegc_want_queue_work(
+ 				XFS_FDBLOCKS_BATCH) < 0)
+ 		return true;
+ 
++	if (xfs_inode_near_dquot_enforcement(ip, XFS_DQTYPE_USER))
++		return true;
++
++	if (xfs_inode_near_dquot_enforcement(ip, XFS_DQTYPE_GROUP))
++		return true;
++
++	if (xfs_inode_near_dquot_enforcement(ip, XFS_DQTYPE_PROJ))
++		return true;
++
+ 	return false;
+ }
+ 
+diff --git a/fs/xfs/xfs_qm.c b/fs/xfs/xfs_qm.c
+index 351d99bc52e5..2bef4735d030 100644
+--- a/fs/xfs/xfs_qm.c
++++ b/fs/xfs/xfs_qm.c
+@@ -1882,3 +1882,37 @@ xfs_qm_vop_create_dqattach(
+ 	}
+ }
+ 
++/* Decide if this inode's dquot is near an enforcement boundary. */
++bool
++xfs_inode_near_dquot_enforcement(
++	struct xfs_inode	*ip,
++	xfs_dqtype_t		type)
++{
++	struct xfs_dquot	*dqp;
++	int64_t			freesp;
++
++	/* We only care for quotas that are enabled and enforced. */
++	dqp = xfs_inode_dquot(ip, type);
++	if (!dqp || !xfs_dquot_is_enforced(dqp))
++		return false;
++
++	if (xfs_dquot_res_over_limits(&dqp->q_ino) ||
++	    xfs_dquot_res_over_limits(&dqp->q_rtb))
++		return true;
++
++	/* For space on the data device, check the various thresholds. */
++	if (!dqp->q_prealloc_hi_wmark)
++		return false;
++
++	if (dqp->q_blk.reserved < dqp->q_prealloc_lo_wmark)
++		return false;
++
++	if (dqp->q_blk.reserved >= dqp->q_prealloc_hi_wmark)
++		return true;
++
++	freesp = dqp->q_prealloc_hi_wmark - dqp->q_blk.reserved;
++	if (freesp < dqp->q_low_space[XFS_QLOWSP_5_PCNT])
++		return true;
++
++	return false;
++}
+diff --git a/fs/xfs/xfs_quota.h b/fs/xfs/xfs_quota.h
+index d00d01302545..dcc785fdd345 100644
+--- a/fs/xfs/xfs_quota.h
++++ b/fs/xfs/xfs_quota.h
+@@ -113,6 +113,7 @@ xfs_quota_reserve_blkres(struct xfs_inode *ip, int64_t blocks)
+ {
+ 	return xfs_trans_reserve_quota_nblks(NULL, ip, blocks, 0, false);
+ }
++bool xfs_inode_near_dquot_enforcement(struct xfs_inode *ip, xfs_dqtype_t type);
+ #else
+ static inline int
+ xfs_qm_vop_dqalloc(struct xfs_inode *ip, kuid_t kuid, kgid_t kgid,
+@@ -168,6 +169,7 @@ xfs_trans_reserve_quota_icreate(struct xfs_trans *tp, struct xfs_dquot *udqp,
+ #define xfs_qm_mount_quotas(mp)
+ #define xfs_qm_unmount(mp)
+ #define xfs_qm_unmount_quotas(mp)
++#define xfs_inode_near_dquot_enforcement(ip, type)			(false)
+ #endif /* CONFIG_XFS_QUOTA */
+ 
+ static inline int
+-- 
+2.26.2
+

@@ -1,0 +1,246 @@
+From 7317a03df703f7cdae3ae9e9635a0ef45849fe09 Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Fri, 29 Jan 2021 11:32:09 -0800
+Subject: [PATCH] xfs: refactor inode ownership change transaction/inode/quota
+ allocation idiom
+Git-commit: 7317a03df703f7cdae3ae9e9635a0ef45849fe09
+Patch-mainline: v5.12-rc2
+References: bsn#12
+
+
+For file ownership (uid, gid, prid) changes, create a new helper
+xfs_trans_alloc_ichange that allocates a transaction and reserves the
+appropriate amount of quota against that transction in preparation for a
+change of user, group, or project id.  Replace all the open-coded idioms
+with a single call to this helper so that we can contain the retry loops
+in the next patchset.
+
+This changes the locking behavior for ichange transactions slightly.
+Since tr_ichange does not have a permanent reservation and cannot roll,
+we pass XFS_ILOCK_EXCL to ijoin so that the inode will be unlocked
+automatically at commit time.
+
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/xfs/xfs_ioctl.c |   29 ++++++++----------------
+ fs/xfs/xfs_iops.c  |   26 +---------------------
+ fs/xfs/xfs_trans.c |   62 +++++++++++++++++++++++++++++++++++++++++++++++++++++
+ fs/xfs/xfs_trans.h |    3 ++
+ 4 files changed, 77 insertions(+), 43 deletions(-)
+
+--- a/fs/xfs/xfs_ioctl.c
++++ b/fs/xfs/xfs_ioctl.c
+@@ -1276,24 +1276,23 @@ xfs_ioctl_setattr_prepare_dax(
+  */
+ static struct xfs_trans *
+ xfs_ioctl_setattr_get_trans(
+-	struct xfs_inode	*ip)
++	struct xfs_inode	*ip,
++	struct xfs_dquot	*pdqp)
+ {
+ 	struct xfs_mount	*mp = ip->i_mount;
+ 	struct xfs_trans	*tp;
+ 	int			error = -EROFS;
+ 
+ 	if (mp->m_flags & XFS_MOUNT_RDONLY)
+-		goto out_unlock;
++		goto out_error;
+ 	error = -EIO;
+ 	if (XFS_FORCED_SHUTDOWN(mp))
+-		goto out_unlock;
++		goto out_error;
+ 
+-	error = xfs_trans_alloc(mp, &M_RES(mp)->tr_ichange, 0, 0, 0, &tp);
++	error = xfs_trans_alloc_ichange(ip, NULL, NULL, pdqp,
++			capable(CAP_FOWNER), &tp);
+ 	if (error)
+-		goto out_unlock;
+-
+-	xfs_ilock(ip, XFS_ILOCK_EXCL);
+-	xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
++		goto out_error;
+ 
+ 	/*
+ 	 * CAP_FOWNER overrides the following restrictions:
+@@ -1313,7 +1312,7 @@ xfs_ioctl_setattr_get_trans(
+ 
+ out_cancel:
+ 	xfs_trans_cancel(tp);
+-out_unlock:
++out_error:
+ 	return ERR_PTR(error);
+ }
+ 
+@@ -1463,20 +1462,12 @@ xfs_ioctl_setattr(
+ 
+ 	xfs_ioctl_setattr_prepare_dax(ip, fa);
+ 
+-	tp = xfs_ioctl_setattr_get_trans(ip);
++	tp = xfs_ioctl_setattr_get_trans(ip, pdqp);
+ 	if (IS_ERR(tp)) {
+ 		code = PTR_ERR(tp);
+ 		goto error_free_dquots;
+ 	}
+ 
+-	if (XFS_IS_QUOTA_RUNNING(mp) && XFS_IS_PQUOTA_ON(mp) &&
+-	    ip->i_d.di_projid != fa->fsx_projid) {
+-		code = xfs_qm_vop_chown_reserve(tp, ip, NULL, NULL, pdqp,
+-				capable(CAP_FOWNER) ?  XFS_QMOPT_FORCE_RES : 0);
+-		if (code)	/* out of quota */
+-			goto error_trans_cancel;
+-	}
+-
+ 	xfs_fill_fsxattr(ip, false, &old_fa);
+ 	code = vfs_ioc_fssetxattr_check(VFS_I(ip), &old_fa, fa);
+ 	if (code)
+@@ -1609,7 +1600,7 @@ xfs_ioc_setxflags(
+ 
+ 	xfs_ioctl_setattr_prepare_dax(ip, &fa);
+ 
+-	tp = xfs_ioctl_setattr_get_trans(ip);
++	tp = xfs_ioctl_setattr_get_trans(ip, NULL);
+ 	if (IS_ERR(tp)) {
+ 		error = PTR_ERR(tp);
+ 		goto out_drop_write;
+--- a/fs/xfs/xfs_iops.c
++++ b/fs/xfs/xfs_iops.c
+@@ -703,13 +703,11 @@ xfs_setattr_nonsize(
+ 			return error;
+ 	}
+ 
+-	error = xfs_trans_alloc(mp, &M_RES(mp)->tr_ichange, 0, 0, 0, &tp);
++	error = xfs_trans_alloc_ichange(ip, udqp, gdqp, NULL,
++			capable(CAP_FOWNER), &tp);
+ 	if (error)
+ 		goto out_dqrele;
+ 
+-	xfs_ilock(ip, XFS_ILOCK_EXCL);
+-	xfs_trans_ijoin(tp, ip, 0);
+-
+ 	/*
+ 	 * Change file ownership.  Must be the owner or privileged.
+ 	 */
+@@ -726,21 +724,6 @@ xfs_setattr_nonsize(
+ 		uid = (mask & ATTR_UID) ? iattr->ia_uid : iuid;
+ 
+ 		/*
+-		 * Do a quota reservation only if uid/gid is actually
+-		 * going to change.
+-		 */
+-		if (XFS_IS_QUOTA_RUNNING(mp) &&
+-		    ((XFS_IS_UQUOTA_ON(mp) && !uid_eq(iuid, uid)) ||
+-		     (XFS_IS_GQUOTA_ON(mp) && !gid_eq(igid, gid)))) {
+-			ASSERT(tp);
+-			error = xfs_qm_vop_chown_reserve(tp, ip, udqp, gdqp,
+-						NULL, capable(CAP_FOWNER) ?
+-						XFS_QMOPT_FORCE_RES : 0);
+-			if (error)	/* out of quota */
+-				goto out_cancel;
+-		}
+-
+-		/*
+ 		 * CAP_FSETID overrides the following restrictions:
+ 		 *
+ 		 * The set-user-ID and set-group-ID bits of a file will be
+@@ -789,8 +772,6 @@ xfs_setattr_nonsize(
+ 		xfs_trans_set_sync(tp);
+ 	error = xfs_trans_commit(tp);
+ 
+-	xfs_iunlock(ip, XFS_ILOCK_EXCL);
+-
+ 	/*
+ 	 * Release any dquot(s) the inode had kept before chown.
+ 	 */
+@@ -817,9 +798,6 @@ xfs_setattr_nonsize(
+ 
+ 	return 0;
+ 
+-out_cancel:
+-	xfs_trans_cancel(tp);
+-	xfs_iunlock(ip, XFS_ILOCK_EXCL);
+ out_dqrele:
+ 	xfs_qm_dqrele(udqp);
+ 	xfs_qm_dqrele(gdqp);
+--- a/fs/xfs/xfs_trans.c
++++ b/fs/xfs/xfs_trans.c
+@@ -1107,3 +1107,65 @@ xfs_trans_alloc_icreate(
+ 	*tpp = tp;
+ 	return 0;
+ }
++
++/*
++ * Allocate an transaction, lock and join the inode to it, and reserve quota
++ * in preparation for inode attribute changes that include uid, gid, or prid
++ * changes.
++ *
++ * The caller must ensure that the on-disk dquots attached to this inode have
++ * already been allocated and initialized.  The ILOCK will be dropped when the
++ * transaction is committed or cancelled.
++ */
++int
++xfs_trans_alloc_ichange(
++	struct xfs_inode	*ip,
++	struct xfs_dquot	*udqp,
++	struct xfs_dquot	*gdqp,
++	struct xfs_dquot	*pdqp,
++	bool			force,
++	struct xfs_trans	**tpp)
++{
++	struct xfs_trans	*tp;
++	struct xfs_mount	*mp = ip->i_mount;
++	int			error;
++
++	error = xfs_trans_alloc(mp, &M_RES(mp)->tr_ichange, 0, 0, 0, &tp);
++	if (error)
++		return error;
++
++	xfs_ilock(ip, XFS_ILOCK_EXCL);
++	xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
++
++	error = xfs_qm_dqattach_locked(ip, false);
++	if (error) {
++		/* Caller should have allocated the dquots! */
++		ASSERT(error != -ENOENT);
++		goto out_cancel;
++	}
++
++	/*
++	 * For each quota type, skip quota reservations if the inode's dquots
++	 * now match the ones that came from the caller, or the caller didn't
++	 * pass one in.
++	 */
++	if (udqp == ip->i_udquot)
++		udqp = NULL;
++	if (gdqp == ip->i_gdquot)
++		gdqp = NULL;
++	if (pdqp == ip->i_pdquot)
++		pdqp = NULL;
++	if (udqp || gdqp || pdqp) {
++		error = xfs_qm_vop_chown_reserve(tp, ip, udqp, gdqp, pdqp,
++				force ? XFS_QMOPT_FORCE_RES : 0);
++		if (error)
++			goto out_cancel;
++	}
++
++	*tpp = tp;
++	return 0;
++
++out_cancel:
++	xfs_trans_cancel(tp);
++	return error;
++}
+--- a/fs/xfs/xfs_trans.h
++++ b/fs/xfs/xfs_trans.h
+@@ -277,5 +277,8 @@ int xfs_trans_alloc_icreate(struct xfs_m
+ 		struct xfs_dquot *udqp, struct xfs_dquot *gdqp,
+ 		struct xfs_dquot *pdqp, unsigned int dblocks,
+ 		struct xfs_trans **tpp);
++int xfs_trans_alloc_ichange(struct xfs_inode *ip, struct xfs_dquot *udqp,
++		struct xfs_dquot *gdqp, struct xfs_dquot *pdqp, bool force,
++		struct xfs_trans **tpp);
+ 
+ #endif	/* __XFS_TRANS_H__ */

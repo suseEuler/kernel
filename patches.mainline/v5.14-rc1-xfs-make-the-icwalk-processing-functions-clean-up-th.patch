@@ -1,0 +1,110 @@
+From 594ab00b760f1722b800c45d37adc21eecf42dc1 Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Mon, 31 May 2021 11:32:00 -0700
+Subject: [PATCH] xfs: make the icwalk processing functions clean up the grab
+ state
+Git-commit: 594ab00b760f1722b800c45d37adc21eecf42dc1
+Patch-mainline: v5.14-rc1
+References: bsn#12
+
+
+Soon we're going to be adding two new callers to the incore inode walk
+code: reclaim of incore inodes, and (later) inactivation of inodes.
+Both states operate on inodes that no longer have any VFS state, so we
+need to move the xfs_irele calls into the processing functions.
+
+In other words, icwalk processing functions are responsible for cleaning
+up whatever state changes are made by the corresponding icwalk igrab
+function that picked the inode for processing.
+
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/xfs/xfs_icache.c | 20 +++++++++++---------
+ 1 file changed, 11 insertions(+), 9 deletions(-)
+
+diff --git a/fs/xfs/xfs_icache.c b/fs/xfs/xfs_icache.c
+index 94dba5c1b98d..806faa8df7e9 100644
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@ -811,7 +811,7 @@ xfs_dqrele_igrab(
+ }
+ 
+ /* Drop this inode's dquots. */
+-static int
++static void
+ xfs_dqrele_inode(
+ 	struct xfs_inode	*ip,
+ 	void			*priv)
+@@ -835,7 +835,7 @@ xfs_dqrele_inode(
+ 		ip->i_pdquot = NULL;
+ 	}
+ 	xfs_iunlock(ip, XFS_ILOCK_EXCL);
+-	return 0;
++	xfs_irele(ip);
+ }
+ 
+ /*
+@@ -861,7 +861,7 @@ xfs_dqrele_all_inodes(
+ }
+ #else
+ # define xfs_dqrele_igrab(ip)		(false)
+-# define xfs_dqrele_inode(ip, priv)	(0)
++# define xfs_dqrele_inode(ip, priv)	((void)0)
+ #endif /* CONFIG_XFS_QUOTA */
+ 
+ /*
+@@ -1592,6 +1592,7 @@ xfs_blockgc_scan_inode(
+ unlock:
+ 	if (lockflags)
+ 		xfs_iunlock(ip, lockflags);
++	xfs_irele(ip);
+ 	return error;
+ }
+ 
+@@ -1698,8 +1699,7 @@ xfs_blockgc_free_quota(
+ 
+ /*
+  * Decide if we want to grab this inode in anticipation of doing work towards
+- * the goal.  If selected, the VFS must hold a reference to this inode, which
+- * will be released after processing.
++ * the goal.
+  */
+ static inline bool
+ xfs_icwalk_igrab(
+@@ -1716,24 +1716,26 @@ xfs_icwalk_igrab(
+ 	}
+ }
+ 
+-/* Process an inode and release it.  Return -EAGAIN to skip an inode. */
++/*
++ * Process an inode.  Each processing function must handle any state changes
++ * made by the icwalk igrab function.  Return -EAGAIN to skip an inode.
++ */
+ static inline int
+ xfs_icwalk_process_inode(
+ 	enum xfs_icwalk_goal	goal,
+ 	struct xfs_inode	*ip,
+ 	void			*args)
+ {
+-	int			error;
++	int			error = 0;
+ 
+ 	switch (goal) {
+ 	case XFS_ICWALK_DQRELE:
+-		error = xfs_dqrele_inode(ip, args);
++		xfs_dqrele_inode(ip, args);
+ 		break;
+ 	case XFS_ICWALK_BLOCKGC:
+ 		error = xfs_blockgc_scan_inode(ip, args);
+ 		break;
+ 	}
+-	xfs_irele(ip);
+ 	return error;
+ }
+ 
+-- 
+2.26.2
+
