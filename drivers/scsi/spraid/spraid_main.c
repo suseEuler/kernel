@@ -800,7 +800,7 @@ static void spraid_map_status(struct spraid_iod *iod, struct scsi_cmnd *scmd,
 		if (scmd->result & SAM_STAT_CHECK_CONDITION) {
 			memset(scmd->sense_buffer, 0, SCSI_SENSE_BUFFERSIZE);
 			memcpy(scmd->sense_buffer, iod->sense, SCSI_SENSE_BUFFERSIZE);
-			scmd->result = (scmd->result & 0x00ffffff) | (DRIVER_SENSE << 24);
+			scmd->result = SAM_STAT_CHECK_CONDITION;
 		}
 		break;
 	case FW_STAT_ABORTED:
