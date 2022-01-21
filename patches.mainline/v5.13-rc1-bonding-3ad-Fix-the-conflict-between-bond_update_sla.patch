@@ -1,0 +1,88 @@
+From 83d686a6822322c4981b745dc1d7185f1f40811b Mon Sep 17 00:00:00 2001
+From: jinyiting <jinyiting@huawei.com>
+Date: Wed, 21 Apr 2021 16:38:21 +0800
+Subject: [PATCH] bonding: 3ad: Fix the conflict between bond_update_slave_arr
+ and the state machine
+Git-commit: 83d686a6822322c4981b745dc1d7185f1f40811b
+Patch-mainline: v5.13-rc1
+References: bsn#12
+
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The bond works in mode 4, and performs down/up operations on the bond
+that is normally negotiated. The probability of bond-> slave_arr is NULL
+
+Test commands:
+   ifconfig bond1 down
+   ifconfig bond1 up
+
+The conflict occurs in the following process：
+
+__dev_open (CPU A)
+--bond_open
+  --queue_delayed_work(bond->wq,&bond->ad_work,0);
+  --bond_update_slave_arr
+    --bond_3ad_get_active_agg_info
+
+ad_work(CPU B)
+--bond_3ad_state_machine_handler
+  --ad_agg_selection_logic
+
+ad_work runs on cpu B. In the function ad_agg_selection_logic, all
+agg->is_active will be cleared. Before the new active aggregator is
+selected on CPU B, bond_3ad_get_active_agg_info failed on CPU A,
+bond->slave_arr will be set to NULL. The best aggregator in
+ad_agg_selection_logic has not changed, no need to update slave arr.
+
+The conflict occurred in that ad_agg_selection_logic clears
+agg->is_active under mode_lock, but bond_open -> bond_update_slave_arr
+is inspecting agg->is_active outside the lock.
+
+Also, bond_update_slave_arr is normal for potential sleep when
+allocating memory, so replace the WARN_ON with a call to might_sleep.
+
+Signed-off-by: jinyiting <jinyiting@huawei.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/net/bonding/bond_main.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
+index 74cbbb22470b..83ef62db6285 100644
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@ -4391,9 +4391,7 @@ int bond_update_slave_arr(struct bonding *bond, struct slave *skipslave)
+ 	int agg_id = 0;
+ 	int ret = 0;
+ 
+-#ifdef CONFIG_LOCKDEP
+-	WARN_ON(lockdep_is_held(&bond->mode_lock));
+-#endif
++	might_sleep();
+ 
+ 	usable_slaves = kzalloc(struct_size(usable_slaves, arr,
+ 					    bond->slave_cnt), GFP_KERNEL);
+@@ -4406,7 +4404,9 @@ int bond_update_slave_arr(struct bonding *bond, struct slave *skipslave)
+ 	if (BOND_MODE(bond) == BOND_MODE_8023AD) {
+ 		struct ad_info ad_info;
+ 
++		spin_lock_bh(&bond->mode_lock);
+ 		if (bond_3ad_get_active_agg_info(bond, &ad_info)) {
++			spin_unlock_bh(&bond->mode_lock);
+ 			pr_debug("bond_3ad_get_active_agg_info failed\n");
+ 			/* No active aggragator means it's not safe to use
+ 			 * the previous array.
+@@ -4414,6 +4414,7 @@ int bond_update_slave_arr(struct bonding *bond, struct slave *skipslave)
+ 			bond_reset_slave_arr(bond);
+ 			goto out;
+ 		}
++		spin_unlock_bh(&bond->mode_lock);
+ 		agg_id = ad_info.aggregator_id;
+ 	}
+ 	bond_for_each_slave(bond, slave, iter) {
+-- 
+2.26.2
+

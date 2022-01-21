@@ -1,0 +1,119 @@
+From 6ede0f004ac6fcb49ce9bd7fc0b88e9d7db8df15 Mon Sep 17 00:00:00 2001
+From: Liu Shixin <liushixin2@huawei.com>
+Date: Tue, 18 Jan 2022 21:23:33 +0800
+Subject: [PATCH] mm/dynamic_hugetlb: free huge pages to dhugetlb_pool
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 6ede0f004ac6fcb49ce9bd7fc0b88e9d7db8df15
+
+
+hulk inclusion
+category: feature
+bugzilla: 46904, https://gitee.com/openeuler/kernel/issues/I4QSHG
+CVE: NA
+
+--------------------------------
+
+Add function to free huge page to dhugetlb_pool.
+
+Signed-off-by: Liu Shixin <liushixin2@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/dynamic_hugetlb.h |  5 +++++
+ mm/dynamic_hugetlb.c            | 30 ++++++++++++++++++++++++++++++
+ mm/hugetlb.c                    | 13 +++++++++++++
+ 3 files changed, 48 insertions(+)
+
+diff --git a/include/linux/dynamic_hugetlb.h b/include/linux/dynamic_hugetlb.h
+index 65d4b5dbf3f6..05bc55ef831b 100644
+--- a/include/linux/dynamic_hugetlb.h
++++ b/include/linux/dynamic_hugetlb.h
+@@ -102,6 +102,7 @@ bool file_has_mem_in_hpool(struct hugetlbfs_inode_info *p);
+ int dhugetlb_acct_memory(struct hstate *h, long delta, struct hugetlbfs_inode_info *p);
+ struct page *alloc_huge_page_from_dhugetlb_pool(struct hstate *h, struct dhugetlb_pool *hpool,
+ 						bool need_unreserved);
++void free_huge_page_to_dhugetlb_pool(struct page *page, bool restore_reserve);
+ 
+ #else
+ 
+@@ -162,6 +163,10 @@ struct page *alloc_huge_page_from_dhugetlb_pool(struct hstate *h, struct dhugetl
+ {
+ 	return NULL;
+ }
++static inline
++void free_huge_page_to_dhugetlb_pool(struct page *page, bool restore_reserve)
++{
++}
+ #endif
+ 
+ #endif /* CONFIG_DYNAMIC_HUGETLB */
+diff --git a/mm/dynamic_hugetlb.c b/mm/dynamic_hugetlb.c
+index 126b3d9d3754..73795d533f7e 100644
+--- a/mm/dynamic_hugetlb.c
++++ b/mm/dynamic_hugetlb.c
+@@ -649,6 +649,36 @@ struct page *alloc_huge_page_from_dhugetlb_pool(struct hstate *h, struct dhugetl
+ 	return page;
+ }
+ 
++void free_huge_page_to_dhugetlb_pool(struct page *page, bool restore_reserve)
++{
++	struct hstate *h = page_hstate(page);
++	struct huge_pages_pool *hpages_pool;
++	struct dhugetlb_pool *hpool;
++
++	hpool = find_hpool_by_dhugetlb_pagelist(page);
++
++	if (!get_hpool_unless_zero(hpool)) {
++		pr_err("dhugetlb: free error: get hpool failed\n");
++		return;
++	}
++
++	spin_lock(&hpool->lock);
++	ClearPagePool(page);
++	set_compound_page_dtor(page, NULL_COMPOUND_DTOR);
++	if (hstate_is_gigantic(h))
++		hpages_pool = &hpool->hpages_pool[HUGE_PAGES_POOL_1G];
++	else
++		hpages_pool = &hpool->hpages_pool[HUGE_PAGES_POOL_2M];
++
++	list_add(&page->lru, &hpages_pool->hugepage_freelists);
++	hpages_pool->free_huge_pages++;
++	hpages_pool->used_huge_pages--;
++	if (restore_reserve)
++		hpages_pool->resv_huge_pages++;
++	spin_unlock(&hpool->lock);
++	put_hpool(hpool);
++}
++
+ static int alloc_hugepage_from_hugetlb(struct dhugetlb_pool *hpool,
+ 				       unsigned long nid, unsigned long nr_pages)
+ {
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 031ad320f10c..3b787cb56699 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -1583,6 +1583,19 @@ void free_huge_page(struct page *page)
+ 	restore_reserve = HPageRestoreReserve(page);
+ 	ClearHPageRestoreReserve(page);
+ 
++	if (dhugetlb_enabled && PagePool(page)) {
++		spin_lock(&hugetlb_lock);
++		ClearHPageMigratable(page);
++		list_del(&page->lru);
++		hugetlb_cgroup_uncharge_page(hstate_index(h),
++					     pages_per_huge_page(h), page);
++		hugetlb_cgroup_uncharge_page_rsvd(hstate_index(h),
++						  pages_per_huge_page(h), page);
++		spin_unlock(&hugetlb_lock);
++		free_huge_page_to_dhugetlb_pool(page, restore_reserve);
++		return;
++	}
++
+ 	/*
+ 	 * If HPageRestoreReserve was set on page, page allocation consumed a
+ 	 * reservation.  If the page was associated with a subpool, there
+-- 
+2.26.2
+

@@ -1,0 +1,221 @@
+From 5993c1d64dd71be12990db7c5f20857318f13347 Mon Sep 17 00:00:00 2001
+From: Liu Shixin <liushixin2@huawei.com>
+Date: Tue, 18 Jan 2022 21:23:31 +0800
+Subject: [PATCH] mm/dynamic_hugetlb: collects resv allocated for dhugetlb_pool
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 5993c1d64dd71be12990db7c5f20857318f13347
+
+
+hulk inclusion
+category: feature
+bugzilla: 46904, https://gitee.com/openeuler/kernel/issues/I4QSHG
+CVE: NA
+
+--------------------------------
+
+The dynamic hugetlb feature is based on hugetlb. There is a reserve count in
+hugetlb to determine if there were enough free huge pages to satisfy the
+requirement while mmap() to avoid SIGBUS at the next page fault time. Add similar
+count for dhugetlb_pool to avoid same problem.
+
+References: Documentation/vm/hugetlbfs_reserv.rst
+
+Signed-off-by: Liu Shixin <liushixin2@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/hugetlbfs/inode.c            |  4 +++
+ include/linux/dynamic_hugetlb.h | 22 +++++++++++++
+ include/linux/hugetlb.h         |  1 +
+ mm/dynamic_hugetlb.c            | 56 +++++++++++++++++++++++++++++++++
+ mm/hugetlb.c                    | 11 +++++++
+ 5 files changed, 94 insertions(+)
+
+diff --git a/fs/hugetlbfs/inode.c b/fs/hugetlbfs/inode.c
+index 246858ea0a52..6f2943465bff 100644
+--- a/fs/hugetlbfs/inode.c
++++ b/fs/hugetlbfs/inode.c
+@@ -36,6 +36,7 @@
+ #include <linux/magic.h>
+ #include <linux/migrate.h>
+ #include <linux/uio.h>
++#include <linux/dynamic_hugetlb.h>
+ 
+ #include <linux/uaccess.h>
+ #include <linux/sched/mm.h>
+@@ -1191,6 +1192,8 @@ static struct inode *hugetlbfs_alloc_inode(struct super_block *sb)
+ 	 * private inode.  This simplifies hugetlbfs_destroy_inode.
+ 	 */
+ 	mpol_shared_policy_init(&p->policy, NULL);
++	/* Initialize hpool here in case of a quick call to destroy */
++	link_hpool(p);
+ 
+ 	return &p->vfs_inode;
+ }
+@@ -1204,6 +1207,7 @@ static void hugetlbfs_destroy_inode(struct inode *inode)
+ {
+ 	hugetlbfs_inc_free_inodes(HUGETLBFS_SB(inode->i_sb));
+ 	mpol_free_shared_policy(&HUGETLBFS_I(inode)->policy);
++	unlink_hpool(HUGETLBFS_I(inode));
+ }
+ 
+ static const struct address_space_operations hugetlbfs_aops = {
+diff --git a/include/linux/dynamic_hugetlb.h b/include/linux/dynamic_hugetlb.h
+index 2b2c90562bcf..8512f509899b 100644
+--- a/include/linux/dynamic_hugetlb.h
++++ b/include/linux/dynamic_hugetlb.h
+@@ -96,6 +96,11 @@ bool free_page_to_dhugetlb_pool(struct page *page);
+ void free_page_list_to_dhugetlb_pool(struct list_head *list);
+ int task_has_mem_in_hpool(struct task_struct *tsk);
+ 
++void link_hpool(struct hugetlbfs_inode_info *p);
++void unlink_hpool(struct hugetlbfs_inode_info *p);
++bool file_has_mem_in_hpool(struct hugetlbfs_inode_info *p);
++int dhugetlb_acct_memory(struct hstate *h, long delta, struct hugetlbfs_inode_info *p);
++
+ #else
+ 
+ #define dhugetlb_enabled	0
+@@ -134,5 +139,22 @@ static inline int task_has_mem_in_hpool(struct task_struct *tsk)
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_HUGETLBFS
++static inline void link_hpool(struct hugetlbfs_inode_info *p)
++{
++}
++static inline void unlink_hpool(struct hugetlbfs_inode_info *p)
++{
++}
++static inline bool file_has_mem_in_hpool(struct hugetlbfs_inode_info *p)
++{
++	return false;
++}
++static inline int dhugetlb_acct_memory(struct hstate *h, long delta, struct hugetlbfs_inode_info *p)
++{
++	return 0;
++}
++#endif
++
+ #endif /* CONFIG_DYNAMIC_HUGETLB */
+ #endif /* __LINUX_DYNAMIC_HUGETLB_H */
+diff --git a/include/linux/hugetlb.h b/include/linux/hugetlb.h
+index a1135c43719e..634630ebc8a7 100644
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -446,6 +446,7 @@ struct hugetlbfs_inode_info {
+ 	struct shared_policy policy;
+ 	struct inode vfs_inode;
+ 	unsigned int seals;
++	struct dhugetlb_pool *hpool;
+ };
+ 
+ static inline struct hugetlbfs_inode_info *HUGETLBFS_I(struct inode *inode)
+diff --git a/mm/dynamic_hugetlb.c b/mm/dynamic_hugetlb.c
+index 423d9624d4f0..f8ae9ba90bcb 100644
+--- a/mm/dynamic_hugetlb.c
++++ b/mm/dynamic_hugetlb.c
+@@ -556,6 +556,62 @@ void free_page_list_to_dhugetlb_pool(struct list_head *list)
+ 	}
+ }
+ 
++void link_hpool(struct hugetlbfs_inode_info *p)
++{
++	if (!dhugetlb_enabled || !p)
++		return;
++
++	p->hpool = find_hpool_by_task(current);
++	if (!get_hpool_unless_zero(p->hpool))
++		p->hpool = NULL;
++}
++
++void unlink_hpool(struct hugetlbfs_inode_info *p)
++{
++	if (!dhugetlb_enabled || !p)
++		return;
++
++	put_hpool(p->hpool);
++	p->hpool = NULL;
++}
++
++bool file_has_mem_in_hpool(struct hugetlbfs_inode_info *p)
++{
++	if (!dhugetlb_enabled || !p || !p->hpool)
++		return false;
++	return true;
++}
++
++int dhugetlb_acct_memory(struct hstate *h, long delta, struct hugetlbfs_inode_info *p)
++{
++	struct dhugetlb_pool *hpool = p ? p->hpool : NULL;
++	struct huge_pages_pool *hpages_pool;
++	int ret = -ENOMEM;
++
++	if (!dhugetlb_enabled || !hpool)
++		return 0;
++
++	if (delta == 0)
++		return 0;
++
++	spin_lock(&hpool->lock);
++	if (hstate_is_gigantic(h))
++		hpages_pool = &hpool->hpages_pool[HUGE_PAGES_POOL_1G];
++	else
++		hpages_pool = &hpool->hpages_pool[HUGE_PAGES_POOL_2M];
++	if (delta > 0 && delta <= hpages_pool->free_huge_pages - hpages_pool->resv_huge_pages) {
++		hpages_pool->resv_huge_pages += delta;
++		ret = 0;
++	} else if (delta < 0) {
++		hpages_pool->resv_huge_pages -= (unsigned long)(-delta);
++		WARN_ON(hpages_pool->resv_huge_pages < 0);
++		ret = 0;
++	}
++	spin_unlock(&hpool->lock);
++
++	return ret;
++}
++
+ static int alloc_hugepage_from_hugetlb(struct dhugetlb_pool *hpool,
+ 				       unsigned long nid, unsigned long nr_pages)
+ {
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 6049fd4a9050..d26f0a7ca780 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -157,6 +157,10 @@ static long hugepage_subpool_get_pages(struct hugepage_subpool *spool,
+ 	if (!spool)
+ 		return ret;
+ 
++	/* Skip subpool when hugetlb file belongs to a hugetlb_pool */
++	if (file_has_mem_in_hpool(info))
++		return ret;
++
+ 	spin_lock_irq(&spool->lock);
+ 
+ 	if (spool->max_hpages != -1) {		/* maximum size accounting */
+@@ -203,6 +207,10 @@ static long hugepage_subpool_put_pages(struct hugepage_subpool *spool,
+ 	if (!spool)
+ 		return delta;
+ 
++	/* Skip subpool when hugetlb file belongs to a hugetlb_pool */
++	if (file_has_mem_in_hpool(info))
++		return ret;
++
+ 	spin_lock_irqsave(&spool->lock, flags);
+ 
+ 	if (spool->max_hpages != -1)		/* maximum size accounting */
+@@ -3899,6 +3907,9 @@ static int hugetlb_acct_memory(struct hstate *h, long delta, struct hugetlbfs_in
+ {
+ 	int ret = -ENOMEM;
+ 
++	if (file_has_mem_in_hpool(info))
++		return dhugetlb_acct_memory(h, delta, info);
++
+ 	spin_lock_irq(&hugetlb_lock);
+ 	/*
+ 	 * When cpuset is configured, it breaks the strict hugetlb page
+-- 
+2.26.2
+

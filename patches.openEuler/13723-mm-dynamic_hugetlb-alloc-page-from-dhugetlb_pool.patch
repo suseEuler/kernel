@@ -1,0 +1,262 @@
+From 32d6d14f29c169a49685a853e3506116f89750d5 Mon Sep 17 00:00:00 2001
+From: Liu Shixin <liushixin2@huawei.com>
+Date: Tue, 18 Jan 2022 21:23:28 +0800
+Subject: [PATCH] mm/dynamic_hugetlb: alloc page from dhugetlb_pool
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 32d6d14f29c169a49685a853e3506116f89750d5
+
+
+hulk inclusion
+category: feature
+bugzilla: 46904, https://gitee.com/openeuler/kernel/issues/I4QSHG
+CVE: NA
+
+--------------------------------
+
+Add function to alloc page from dhugetlb_pool.
+When process is bound to a mem_cgroup configured with dhugtlb_pool, alloc
+page from dhugetlb_pool firstly. If there is no page in dhugetlb_pool,
+fallback to alloc page from buddy system.
+
+As the process will alloc pages from dhugetlb_pool in the mem_cgroup,
+process is not allowed to migrate to other mem_cgroup.
+
+Signed-off-by: Liu Shixin <liushixin2@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/dynamic_hugetlb.h |  15 ++++
+ mm/dynamic_hugetlb.c            | 135 ++++++++++++++++++++++++++++++++
+ mm/memcontrol.c                 |   4 +
+ mm/page_alloc.c                 |   6 ++
+ 4 files changed, 160 insertions(+)
+
+diff --git a/include/linux/dynamic_hugetlb.h b/include/linux/dynamic_hugetlb.h
+index 2004f174f7d3..9af8ed6ec96b 100644
+--- a/include/linux/dynamic_hugetlb.h
++++ b/include/linux/dynamic_hugetlb.h
+@@ -88,6 +88,10 @@ void hugetlb_pool_inherit(struct mem_cgroup *memcg, struct mem_cgroup *parent);
+ int hugetlb_pool_destroy(struct cgroup *cgrp);
+ void __init dynamic_hugetlb_init(void);
+ 
++struct page *alloc_page_from_dhugetlb_pool(gfp_t gfp, unsigned int order,
++					   unsigned int flags);
++int task_has_mem_in_hpool(struct task_struct *tsk);
++
+ #else
+ 
+ #define dhugetlb_enabled	0
+@@ -108,5 +112,16 @@ static inline int hugetlb_pool_destroy(struct cgroup *cgrp)
+ static inline void __init dynamic_hugetlb_init(void)
+ {
+ }
++
++static inline struct page *alloc_page_from_dhugetlb_pool(gfp_t gfp, unsigned int order,
++							 unsigned int flags)
++{
++	return NULL;
++}
++static inline int task_has_mem_in_hpool(struct task_struct *tsk)
++{
++	return 0;
++}
++
+ #endif /* CONFIG_DYNAMIC_HUGETLB */
+ #endif /* __LINUX_DYNAMIC_HUGETLB_H */
+diff --git a/mm/dynamic_hugetlb.c b/mm/dynamic_hugetlb.c
+index 2dd58cbee610..c54c99627994 100644
+--- a/mm/dynamic_hugetlb.c
++++ b/mm/dynamic_hugetlb.c
+@@ -122,6 +122,34 @@ static int hpool_split_page(struct dhugetlb_pool *hpool, int hpages_pool_idx)
+ 	return 0;
+ }
+ 
++static int add_pages_to_percpu_pool(struct dhugetlb_pool *hpool,
++				    struct percpu_pages_pool *percpu_pool,
++				    unsigned long nr_pages)
++{
++	struct huge_pages_pool *hpages_pool = &hpool->hpages_pool[HUGE_PAGES_POOL_4K];
++	struct page *page, *next;
++	int ret, i = 0;
++
++	while (hpages_pool->free_normal_pages < nr_pages) {
++		ret = hpool_split_page(hpool, HUGE_PAGES_POOL_2M);
++		if (ret)
++			break;
++	}
++
++	list_for_each_entry_safe(page, next, &hpages_pool->hugepage_freelists, lru) {
++		list_del(&page->lru);
++		hpages_pool->free_normal_pages--;
++		list_add_tail(&page->lru, &percpu_pool->head_page);
++		percpu_pool->free_pages++;
++		if (++i == nr_pages)
++			break;
++	}
++
++	if (percpu_pool->free_pages == 0)
++		return -ENOMEM;
++	return 0;
++}
++
+ static void reclaim_pages_from_percpu_pool(struct dhugetlb_pool *hpool,
+ 					struct percpu_pages_pool *percpu_pool,
+ 					unsigned long nr_pages)
+@@ -350,6 +378,113 @@ static int set_hpool_in_dhugetlb_pagelist(unsigned long idx, struct dhugetlb_poo
+ 	return 0;
+ }
+ 
++static struct dhugetlb_pool *find_hpool_by_task(struct task_struct *tsk)
++{
++	struct mem_cgroup *memcg;
++
++	if (!dhugetlb_enabled)
++		return NULL;
++
++	rcu_read_lock();
++	memcg = mem_cgroup_from_task(tsk);
++	rcu_read_unlock();
++
++	if (!memcg)
++		return NULL;
++
++	return memcg->hpool;
++}
++
++int task_has_mem_in_hpool(struct task_struct *tsk)
++{
++	struct dhugetlb_pool *hpool;
++
++	if (!dhugetlb_enabled)
++		return 0;
++
++	hpool = find_hpool_by_task(tsk);
++
++	return hpool ? -EPERM : 0;
++}
++
++static bool should_allocate_from_dhugetlb_pool(gfp_t gfp_mask)
++{
++	gfp_t gfp = gfp_mask & GFP_HIGHUSER_MOVABLE;
++
++	if (current->flags & PF_KTHREAD)
++		return false;
++
++	/*
++	 * The cgroup only charges anonymous and file pages from usespage.
++	 * some filesystem maybe has masked out the __GFP_IO | __GFP_FS
++	 * to avoid recursive memory request. eg: loop device, xfs.
++	 */
++	if ((gfp | __GFP_IO | __GFP_FS) != GFP_HIGHUSER_MOVABLE)
++		return false;
++
++	return true;
++}
++
++static struct page *__alloc_page_from_dhugetlb_pool(void)
++{
++	struct percpu_pages_pool *percpu_pool;
++	struct dhugetlb_pool *hpool;
++	struct page *page = NULL;
++	unsigned long flags;
++
++	hpool = find_hpool_by_task(current);
++
++	if (!get_hpool_unless_zero(hpool))
++		return NULL;
++
++	percpu_pool = &hpool->percpu_pool[smp_processor_id()];
++	/*
++	 * Before we lock percpu_pool, must be sure hpool is unlocked.
++	 */
++	spin_lock_irqsave(&percpu_pool->lock, flags);
++
++	if (percpu_pool->free_pages == 0) {
++		int ret;
++
++		spin_lock(&hpool->lock);
++		ret = add_pages_to_percpu_pool(hpool, percpu_pool,
++						PERCPU_POOL_PAGE_BATCH);
++		spin_unlock(&hpool->lock);
++		if (ret)
++			goto unlock;
++	}
++
++	page = list_entry(percpu_pool->head_page.next, struct page, lru);
++	list_del(&page->lru);
++	percpu_pool->free_pages--;
++	percpu_pool->used_pages++;
++	SetPagePool(page);
++
++unlock:
++	spin_unlock_irqrestore(&percpu_pool->lock, flags);
++	put_hpool(hpool);
++	return page;
++}
++
++struct page *alloc_page_from_dhugetlb_pool(gfp_t gfp, unsigned int order,
++					   unsigned int flags)
++{
++	struct page *page = NULL;
++
++	if (!dhugetlb_enabled)
++		return NULL;
++
++	if (order != 0)
++		return NULL;
++
++	if (should_allocate_from_dhugetlb_pool(gfp))
++		page = __alloc_page_from_dhugetlb_pool();
++
++	if (page)
++		prep_new_page(page, order, gfp, flags);
++	return page;
++}
++
+ static int alloc_hugepage_from_hugetlb(struct dhugetlb_pool *hpool,
+ 				       unsigned long nid, unsigned long nr_pages)
+ {
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 6381de898f31..f06c7349d9a4 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -6254,6 +6254,10 @@ static int mem_cgroup_can_attach(struct cgroup_taskset *tset)
+ 	if (!p)
+ 		return 0;
+ 
++	ret = task_has_mem_in_hpool(p);
++	if (ret)
++		return ret;
++
+ 	/*
+ 	 * We are now commited to this value whatever it is. Changes in this
+ 	 * tunable will only affect upcoming migrations, not the current one.
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 0ff4f4e3a538..403898a3ab1e 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -72,6 +72,7 @@
+ #include <linux/khugepaged.h>
+ #include <linux/buffer_head.h>
+ #include <linux/vmalloc.h>
++#include <linux/dynamic_hugetlb.h>
+ 
+ #include <asm/sections.h>
+ #include <asm/tlbflush.h>
+@@ -5160,6 +5161,11 @@ struct page *__alloc_pages(gfp_t gfp, unsigned int order, int preferred_nid,
+ 	 */
+ 	alloc_flags |= alloc_flags_nofragment(ac.preferred_zoneref->zone, gfp);
+ 
++	/* Before alloc from buddy system, alloc from hpool firstly */
++	page = alloc_page_from_dhugetlb_pool(alloc_gfp, order, alloc_flags);
++	if (page)
++		goto out;
++
+ 	/* First allocation attempt */
+ 	page = get_page_from_freelist(alloc_gfp, order, alloc_flags, &ac);
+ 	if (likely(page))
+-- 
+2.26.2
+

@@ -1,0 +1,75 @@
+From 21c7e972475e6a975fbe97f8974c96fe4713077c Mon Sep 17 00:00:00 2001
+From: Luo Jiaxing <luojiaxing@huawei.com>
+Date: Tue, 12 Oct 2021 20:26:28 +0800
+Subject: [PATCH] scsi: hisi_sas: Disable SATA disk phy for severe I_T nexus
+ reset failure
+Git-commit: 21c7e972475e6a975fbe97f8974c96fe4713077c
+Patch-mainline: v5.16-rc1
+References: bsn#12
+
+
+If the softreset fails in the I_T reset, libsas will then continue to issue
+a controller reset to try to recover.
+
+However a faulty disk may cause the softreset to fail, and resetting the
+controller will not help this scenario. Indeed, we will just continue the
+cycle of error handle handling to try to recover.
+
+So if the softreset fails upon certain conditions, just disable the phy
+associated with the disk. The user needs to handle this problem.
+
+Link: https://lore.kernel.org/r/1634041588-74824-5-git-send-email-john.garry@huawei.com
+Signed-off-by: Luo Jiaxing <luojiaxing@huawei.com>
+Signed-off-by: John Garry <john.garry@huawei.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/scsi/hisi_sas/hisi_sas_main.c | 29 ++++++++++++++++++++++-----
+ 1 file changed, 24 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/scsi/hisi_sas/hisi_sas_main.c b/drivers/scsi/hisi_sas/hisi_sas_main.c
+index 5b091388c095..f206c433de32 100644
+--- a/drivers/scsi/hisi_sas/hisi_sas_main.c
++++ b/drivers/scsi/hisi_sas/hisi_sas_main.c
+@@ -1870,14 +1870,33 @@ static int hisi_sas_I_T_nexus_reset(struct domain_device *device)
+ 	}
+ 	hisi_sas_dereg_device(hisi_hba, device);
+ 
+-	if (dev_is_sata(device)) {
++	rc = hisi_sas_debug_I_T_nexus_reset(device);
++	if (rc == TMF_RESP_FUNC_COMPLETE && dev_is_sata(device)) {
++		struct sas_phy *local_phy;
++
+ 		rc = hisi_sas_softreset_ata_disk(device);
+-		if (rc == TMF_RESP_FUNC_FAILED)
+-			return TMF_RESP_FUNC_FAILED;
++		switch (rc) {
++		case -ECOMM:
++			rc = -ENODEV;
++			break;
++		case TMF_RESP_FUNC_FAILED:
++		case -EMSGSIZE:
++		case -EIO:
++			local_phy = sas_get_local_phy(device);
++			rc = sas_phy_enable(local_phy, 0);
++			if (!rc) {
++				local_phy->enabled = 0;
++				dev_err(dev, "Disabled local phy of ATA disk %016llx due to softreset fail (%d)\n",
++					SAS_ADDR(device->sas_addr), rc);
++				rc = -ENODEV;
++			}
++			sas_put_local_phy(local_phy);
++			break;
++		default:
++			break;
++		}
+ 	}
+ 
+-	rc = hisi_sas_debug_I_T_nexus_reset(device);
+-
+ 	if ((rc == TMF_RESP_FUNC_COMPLETE) || (rc == -ENODEV))
+ 		hisi_sas_release_task(hisi_hba, device);
+ 
+-- 
+2.26.2
+

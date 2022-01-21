@@ -1,0 +1,150 @@
+From 39eec7589dee394f9d8de863cdd5773a63edf32a Mon Sep 17 00:00:00 2001
+From: Liu Shixin <liushixin2@huawei.com>
+Date: Tue, 18 Jan 2022 21:23:32 +0800
+Subject: [PATCH] mm/dynamic_hugetlb: alloc huge pages from dhugetlb_pool
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 39eec7589dee394f9d8de863cdd5773a63edf32a
+
+
+hulk inclusion
+category: feature
+bugzilla: 46904, https://gitee.com/openeuler/kernel/issues/I4QSHG
+CVE: NA
+
+--------------------------------
+
+Add function to alloc huge page from dhugetlb_pool.
+When process is bound to a mem_cgroup configured with dhugetlb_pool,
+only allowed to alloc huge page from dhugetlb_pool. If there is no huge
+pages in dhugetlb_pool, the mmap() will failed due to the reserve count
+introduced in previous patch.
+
+Signed-off-by: Liu Shixin <liushixin2@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/dynamic_hugetlb.h |  8 +++++++
+ mm/dynamic_hugetlb.c            | 39 ++++++++++++++++++++++++++++++++-
+ mm/hugetlb.c                    | 14 ++++++++++++
+ 3 files changed, 60 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/dynamic_hugetlb.h b/include/linux/dynamic_hugetlb.h
+index 8512f509899b..65d4b5dbf3f6 100644
+--- a/include/linux/dynamic_hugetlb.h
++++ b/include/linux/dynamic_hugetlb.h
+@@ -100,6 +100,8 @@ void link_hpool(struct hugetlbfs_inode_info *p);
+ void unlink_hpool(struct hugetlbfs_inode_info *p);
+ bool file_has_mem_in_hpool(struct hugetlbfs_inode_info *p);
+ int dhugetlb_acct_memory(struct hstate *h, long delta, struct hugetlbfs_inode_info *p);
++struct page *alloc_huge_page_from_dhugetlb_pool(struct hstate *h, struct dhugetlb_pool *hpool,
++						bool need_unreserved);
+ 
+ #else
+ 
+@@ -154,6 +156,12 @@ static inline int dhugetlb_acct_memory(struct hstate *h, long delta, struct huge
+ {
+ 	return 0;
+ }
++static inline
++struct page *alloc_huge_page_from_dhugetlb_pool(struct hstate *h, struct dhugetlb_pool *hpool,
++						bool need_unreserved)
++{
++	return NULL;
++}
+ #endif
+ 
+ #endif /* CONFIG_DYNAMIC_HUGETLB */
+diff --git a/mm/dynamic_hugetlb.c b/mm/dynamic_hugetlb.c
+index f8ae9ba90bcb..126b3d9d3754 100644
+--- a/mm/dynamic_hugetlb.c
++++ b/mm/dynamic_hugetlb.c
+@@ -103,7 +103,7 @@ static int hpool_split_page(struct dhugetlb_pool *hpool, int hpages_pool_idx)
+ 	if (!split_page)
+ 		return -ENOMEM;
+ 
+-	page = list_entry(hpages_pool->hugepage_freelists.next, struct page, lru);
++	page = list_entry(hpages_pool->hugepage_freelists.prev, struct page, lru);
+ 	list_del(&page->lru);
+ 	hpages_pool->free_normal_pages--;
+ 
+@@ -612,6 +612,43 @@ int dhugetlb_acct_memory(struct hstate *h, long delta, struct hugetlbfs_inode_in
+ 	return ret;
+ }
+ 
++struct page *alloc_huge_page_from_dhugetlb_pool(struct hstate *h, struct dhugetlb_pool *hpool,
++						bool need_unreserved)
++{
++	struct huge_pages_pool *hpages_pool;
++	struct page *page = NULL;
++	unsigned long flags;
++
++	if (!dhugetlb_enabled)
++		return NULL;
++
++	spin_lock_irqsave(&hpool->lock, flags);
++	if (hstate_is_gigantic(h))
++		hpages_pool = &hpool->hpages_pool[HUGE_PAGES_POOL_1G];
++	else
++		hpages_pool = &hpool->hpages_pool[HUGE_PAGES_POOL_2M];
++
++	if (hpages_pool->free_huge_pages) {
++		page = list_entry(hpages_pool->hugepage_freelists.next, struct page, lru);
++		list_del(&page->lru);
++		hpages_pool->free_huge_pages--;
++		hpages_pool->used_huge_pages++;
++		if (need_unreserved) {
++			SetHPageRestoreReserve(page);
++			hpages_pool->resv_huge_pages--;
++		}
++	}
++	if (page) {
++		INIT_LIST_HEAD(&page->lru);
++		set_compound_page_dtor(page, HUGETLB_PAGE_DTOR);
++		set_page_refcounted(page);
++		SetPagePool(page);
++	}
++	spin_unlock_irqrestore(&hpool->lock, flags);
++
++	return page;
++}
++
+ static int alloc_hugepage_from_hugetlb(struct dhugetlb_pool *hpool,
+ 				       unsigned long nid, unsigned long nr_pages)
+ {
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index d26f0a7ca780..031ad320f10c 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -2534,6 +2534,19 @@ struct page *alloc_huge_page(struct vm_area_struct *vma,
+ 	if (ret)
+ 		goto out_uncharge_cgroup_reservation;
+ 
++	if (file_has_mem_in_hpool(info)) {
++		bool need_unreserved = false;
++
++		if (!avoid_reserve && vma_has_reserves(vma, gbl_chg))
++			need_unreserved = true;
++		page = alloc_huge_page_from_dhugetlb_pool(h, info->hpool, need_unreserved);
++		if (!page)
++			goto out_uncharge_cgroup;
++		spin_lock_irq(&hugetlb_lock);
++		list_add(&page->lru, &h->hugepage_activelist);
++		goto out;
++	}
++
+ 	spin_lock_irq(&hugetlb_lock);
+ 	/*
+ 	 * glb_chg is passed to indicate whether or not a page must be taken
+@@ -2554,6 +2567,7 @@ struct page *alloc_huge_page(struct vm_area_struct *vma,
+ 		list_add(&page->lru, &h->hugepage_activelist);
+ 		/* Fall through */
+ 	}
++out:
+ 	hugetlb_cgroup_commit_charge(idx, pages_per_huge_page(h), h_cg, page);
+ 	/* If allocation is not consuming a reservation, also store the
+ 	 * hugetlb_cgroup pointer on the page.
+-- 
+2.26.2
+

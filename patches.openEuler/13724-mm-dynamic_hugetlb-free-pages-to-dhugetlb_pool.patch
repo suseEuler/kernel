@@ -1,0 +1,169 @@
+From 71197c63bfe9f1b66da00b17ac948e27d531d529 Mon Sep 17 00:00:00 2001
+From: Liu Shixin <liushixin2@huawei.com>
+Date: Tue, 18 Jan 2022 21:23:29 +0800
+Subject: [PATCH] mm/dynamic_hugetlb: free pages to dhugetlb_pool
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 71197c63bfe9f1b66da00b17ac948e27d531d529
+
+
+hulk inclusion
+category: feature
+bugzilla: 46904, https://gitee.com/openeuler/kernel/issues/I4QSHG
+CVE: NA
+
+--------------------------------
+
+Add function to free page to dhugetlb_pool.
+
+Signed-off-by: Liu Shixin <liushixin2@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/dynamic_hugetlb.h |  9 +++++
+ mm/dynamic_hugetlb.c            | 68 +++++++++++++++++++++++++++++++++
+ mm/page_alloc.c                 |  7 ++++
+ 3 files changed, 84 insertions(+)
+
+diff --git a/include/linux/dynamic_hugetlb.h b/include/linux/dynamic_hugetlb.h
+index 9af8ed6ec96b..ebb5a36a4a26 100644
+--- a/include/linux/dynamic_hugetlb.h
++++ b/include/linux/dynamic_hugetlb.h
+@@ -90,6 +90,8 @@ void __init dynamic_hugetlb_init(void);
+ 
+ struct page *alloc_page_from_dhugetlb_pool(gfp_t gfp, unsigned int order,
+ 					   unsigned int flags);
++bool free_page_to_dhugetlb_pool(struct page *page);
++void free_page_list_to_dhugetlb_pool(struct list_head *list);
+ int task_has_mem_in_hpool(struct task_struct *tsk);
+ 
+ #else
+@@ -118,6 +120,13 @@ static inline struct page *alloc_page_from_dhugetlb_pool(gfp_t gfp, unsigned int
+ {
+ 	return NULL;
+ }
++static inline bool free_page_to_dhugetlb_pool(struct page *page)
++{
++	return false;
++}
++static inline void free_page_list_to_dhugetlb_pool(struct list_head *list)
++{
++}
+ static inline int task_has_mem_in_hpool(struct task_struct *tsk)
+ {
+ 	return 0;
+diff --git a/mm/dynamic_hugetlb.c b/mm/dynamic_hugetlb.c
+index c54c99627994..40f79f3e6aeb 100644
+--- a/mm/dynamic_hugetlb.c
++++ b/mm/dynamic_hugetlb.c
+@@ -378,6 +378,18 @@ static int set_hpool_in_dhugetlb_pagelist(unsigned long idx, struct dhugetlb_poo
+ 	return 0;
+ }
+ 
++static struct dhugetlb_pool *find_hpool_by_dhugetlb_pagelist(struct page *page)
++{
++	unsigned long idx = hugepage_index(page_to_pfn(page));
++	struct dhugetlb_pool *hpool = NULL;
++
++	read_lock(&dhugetlb_pagelist_rwlock);
++	if (idx < dhugetlb_pagelist_t->count)
++		hpool = dhugetlb_pagelist_t->hpool[idx];
++	read_unlock(&dhugetlb_pagelist_rwlock);
++	return hpool;
++}
++
+ static struct dhugetlb_pool *find_hpool_by_task(struct task_struct *tsk)
+ {
+ 	struct mem_cgroup *memcg;
+@@ -485,6 +497,62 @@ struct page *alloc_page_from_dhugetlb_pool(gfp_t gfp, unsigned int order,
+ 	return page;
+ }
+ 
++static void __free_page_to_dhugetlb_pool(struct page *page)
++{
++	struct percpu_pages_pool *percpu_pool;
++	struct dhugetlb_pool *hpool;
++	unsigned long flags;
++
++	hpool = find_hpool_by_dhugetlb_pagelist(page);
++
++	if (!get_hpool_unless_zero(hpool)) {
++		pr_err("dhugetlb: free error: get hpool failed\n");
++		return;
++	}
++
++	percpu_pool = &hpool->percpu_pool[smp_processor_id()];
++	spin_lock_irqsave(&percpu_pool->lock, flags);
++
++	ClearPagePool(page);
++	list_add(&page->lru, &percpu_pool->head_page);
++	percpu_pool->free_pages++;
++	percpu_pool->used_pages--;
++	if (percpu_pool->free_pages > PERCPU_POOL_PAGE_MAX) {
++		spin_lock(&hpool->lock);
++		reclaim_pages_from_percpu_pool(hpool, percpu_pool, PERCPU_POOL_PAGE_BATCH);
++		spin_unlock(&hpool->lock);
++	}
++
++	spin_unlock_irqrestore(&percpu_pool->lock, flags);
++	put_hpool(hpool);
++}
++
++bool free_page_to_dhugetlb_pool(struct page *page)
++{
++	if (!dhugetlb_enabled || !PagePool(page))
++		return false;
++
++	if (free_pages_prepare(page, 0, true))
++		__free_page_to_dhugetlb_pool(page);
++	return true;
++}
++
++void free_page_list_to_dhugetlb_pool(struct list_head *list)
++{
++	struct page *page, *next;
++
++	if (!dhugetlb_enabled)
++		return;
++
++	list_for_each_entry_safe(page, next, list, lru) {
++		if (PagePool(page)) {
++			list_del(&page->lru);
++			if (free_pages_prepare(page, 0, true))
++				__free_page_to_dhugetlb_pool(page);
++		}
++	}
++}
++
+ static int alloc_hugepage_from_hugetlb(struct dhugetlb_pool *hpool,
+ 				       unsigned long nid, unsigned long nr_pages)
+ {
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 403898a3ab1e..e078e3acb3de 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -3230,6 +3230,10 @@ void free_unref_page(struct page *page)
+ 	unsigned long flags;
+ 	unsigned long pfn = page_to_pfn(page);
+ 
++	/* Free dynamic hugetlb page */
++	if (free_page_to_dhugetlb_pool(page))
++		return;
++
+ 	if (!free_unref_page_prepare(page, pfn))
+ 		return;
+ 
+@@ -3247,6 +3251,9 @@ void free_unref_page_list(struct list_head *list)
+ 	unsigned long flags, pfn;
+ 	int batch_count = 0;
+ 
++	/* Free dynamic hugetlb page list */
++	free_page_list_to_dhugetlb_pool(list);
++
+ 	/* Prepare pages for freeing */
+ 	list_for_each_entry_safe(page, next, list, lru) {
+ 		pfn = page_to_pfn(page);
+-- 
+2.26.2
+

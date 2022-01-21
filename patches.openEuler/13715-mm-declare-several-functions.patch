@@ -1,0 +1,196 @@
+From 98ecb3cdddc49e2d2ef82e743058f8ab26326182 Mon Sep 17 00:00:00 2001
+From: Liu Shixin <liushixin2@huawei.com>
+Date: Tue, 18 Jan 2022 21:23:20 +0800
+Subject: [PATCH] mm: declare several functions
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 98ecb3cdddc49e2d2ef82e743058f8ab26326182
+
+
+hulk inclusion
+category: feature
+bugzilla: 46904, https://gitee.com/openeuler/kernel/issues/I4QSHG
+CVE: NA
+
+--------------------------------
+
+There are several functions that will be used in next patches for
+dynamic hugetlb feature. Declare them.
+
+No functional changes.
+
+Signed-off-by: Liu Shixin <liushixin2@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/hugetlb.h        |  3 +++
+ include/linux/memcontrol.h     | 16 ++++++++++++++++
+ include/linux/memory_hotplug.h |  6 ++++++
+ mm/hugetlb.c                   |  2 +-
+ mm/internal.h                  |  3 +++
+ mm/memcontrol.c                | 16 ----------------
+ mm/memory_hotplug.c            |  3 +--
+ mm/page_alloc.c                |  6 +++---
+ 8 files changed, 33 insertions(+), 22 deletions(-)
+
+diff --git a/include/linux/hugetlb.h b/include/linux/hugetlb.h
+index 61c38e6c6c43..a1135c43719e 100644
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -471,6 +471,9 @@ static inline struct hstate *hstate_inode(struct inode *i)
+ {
+ 	return HUGETLBFS_SB(i->i_sb)->hstate;
+ }
++
++bool prep_compound_gigantic_page(struct page *page, unsigned int order);
++
+ #else /* !CONFIG_HUGETLBFS */
+ 
+ #define is_file_hugepages(file)			false
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index e5826f1ff337..2e0a480a8665 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -1239,6 +1239,22 @@ unsigned long mem_cgroup_soft_limit_reclaim(pg_data_t *pgdat, int order,
+ 						gfp_t gfp_mask,
+ 						unsigned long *total_scanned);
+ 
++/*
++ * Test whether @memcg has children, dead or alive.  Note that this
++ * function doesn't care whether @memcg has use_hierarchy enabled and
++ * returns %true if there are child csses according to the cgroup
++ * hierarchy.  Testing use_hierarchy is the caller's responsibility.
++ */
++static inline bool memcg_has_children(struct mem_cgroup *memcg)
++{
++	bool ret;
++
++	rcu_read_lock();
++	ret = css_next_child(NULL, &memcg->css);
++	rcu_read_unlock();
++	return ret;
++}
++
+ #else /* CONFIG_MEMCG */
+ 
+ #define MEM_CGROUP_ID_SHIFT	0
+diff --git a/include/linux/memory_hotplug.h b/include/linux/memory_hotplug.h
+index c60bda5cbb17..b9aeabcce49a 100644
+--- a/include/linux/memory_hotplug.h
++++ b/include/linux/memory_hotplug.h
+@@ -284,6 +284,7 @@ static inline void pgdat_resize_init(struct pglist_data *pgdat) {}
+ 
+ #ifdef CONFIG_MEMORY_HOTREMOVE
+ 
++extern int do_migrate_range(unsigned long start_pfn, unsigned long end_pfn);
+ extern void try_offline_node(int nid);
+ extern int offline_pages(unsigned long start_pfn, unsigned long nr_pages);
+ extern int remove_memory(int nid, u64 start, u64 size);
+@@ -291,6 +292,11 @@ extern void __remove_memory(int nid, u64 start, u64 size);
+ extern int offline_and_remove_memory(int nid, u64 start, u64 size);
+ 
+ #else
++static inline int do_migrate_range(unsigned long start_pfn, unsigned long end_pfn)
++{
++	return -ENOSYS;
++}
++
+ static inline void try_offline_node(int nid) {}
+ 
+ static inline int offline_pages(unsigned long start_pfn, unsigned long nr_pages)
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 219bf083dc8a..fa3cba3571cc 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -1633,7 +1633,7 @@ static void prep_new_huge_page(struct hstate *h, struct page *page, int nid)
+ 	spin_unlock_irq(&hugetlb_lock);
+ }
+ 
+-static bool prep_compound_gigantic_page(struct page *page, unsigned int order)
++bool prep_compound_gigantic_page(struct page *page, unsigned int order)
+ {
+ 	int i, j;
+ 	int nr_pages = 1 << order;
+diff --git a/mm/internal.h b/mm/internal.h
+index db9546707695..31517354f3c7 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -197,6 +197,9 @@ extern void __free_pages_core(struct page *page, unsigned int order);
+ extern void prep_compound_page(struct page *page, unsigned int order);
+ extern void post_alloc_hook(struct page *page, unsigned int order,
+ 					gfp_t gfp_flags);
++extern void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags,
++							unsigned int alloc_flags);
++extern bool free_pages_prepare(struct page *page, unsigned int order, bool check_free);
+ extern int user_min_free_kbytes;
+ 
+ extern void zone_pcp_update(struct zone *zone);
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 8acf7ff56294..011aff396af2 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -3402,22 +3402,6 @@ unsigned long mem_cgroup_soft_limit_reclaim(pg_data_t *pgdat, int order,
+ 	return nr_reclaimed;
+ }
+ 
+-/*
+- * Test whether @memcg has children, dead or alive.  Note that this
+- * function doesn't care whether @memcg has use_hierarchy enabled and
+- * returns %true if there are child csses according to the cgroup
+- * hierarchy.  Testing use_hierarchy is the caller's responsibility.
+- */
+-static inline bool memcg_has_children(struct mem_cgroup *memcg)
+-{
+-	bool ret;
+-
+-	rcu_read_lock();
+-	ret = css_next_child(NULL, &memcg->css);
+-	rcu_read_unlock();
+-	return ret;
+-}
+-
+ /*
+  * Reclaims as many pages from the given memcg as possible.
+  *
+diff --git a/mm/memory_hotplug.c b/mm/memory_hotplug.c
+index 1549b19b36f6..73ea92dae74a 100644
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@ -1165,8 +1165,7 @@ static int scan_movable_pages(unsigned long start, unsigned long end,
+ 	return 0;
+ }
+ 
+-static int
+-do_migrate_range(unsigned long start_pfn, unsigned long end_pfn)
++int do_migrate_range(unsigned long start_pfn, unsigned long end_pfn)
+ {
+ 	unsigned long pfn;
+ 	struct page *page, *head;
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 988051bf6795..0ff4f4e3a538 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -1203,7 +1203,7 @@ static void kernel_init_free_pages(struct page *page, int numpages)
+ 	kasan_enable_current();
+ }
+ 
+-static __always_inline bool free_pages_prepare(struct page *page,
++__always_inline bool free_pages_prepare(struct page *page,
+ 					unsigned int order, bool check_free)
+ {
+ 	int bad = 0;
+@@ -2283,8 +2283,8 @@ inline void post_alloc_hook(struct page *page, unsigned int order,
+ 	set_page_owner(page, order, gfp_flags);
+ }
+ 
+-static void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags,
+-							unsigned int alloc_flags)
++void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags,
++						unsigned int alloc_flags)
+ {
+ 	post_alloc_hook(page, order, gfp_flags);
+ 
+-- 
+2.26.2
+

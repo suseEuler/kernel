@@ -1,0 +1,136 @@
+From 0c06a1c068ab68fac72602d8147df8d0943f2882 Mon Sep 17 00:00:00 2001
+From: Liu Shixin <liushixin2@huawei.com>
+Date: Tue, 18 Jan 2022 21:23:24 +0800
+Subject: [PATCH] mm/dynamic_hugetlb: add interface to configure the count of
+ hugepages
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 0c06a1c068ab68fac72602d8147df8d0943f2882
+
+
+hulk inclusion
+category: feature
+bugzilla: 46904, https://gitee.com/openeuler/kernel/issues/I4QSHG
+CVE: NA
+
+--------------------------------
+
+Add two interfaces in mem_cgroup to configure the count of 1G/2M hugepages
+in dhugetlb_pool.
+
+Signed-off-by: Liu Shixin <liushixin2@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/dynamic_hugetlb.h |  4 +++
+ mm/dynamic_hugetlb.c            | 56 +++++++++++++++++++++++++++++++++
+ mm/memcontrol.c                 | 10 ++++++
+ 3 files changed, 70 insertions(+)
+
+diff --git a/include/linux/dynamic_hugetlb.h b/include/linux/dynamic_hugetlb.h
+index 30ccbd9f1853..d0f6c1dd2361 100644
+--- a/include/linux/dynamic_hugetlb.h
++++ b/include/linux/dynamic_hugetlb.h
+@@ -75,6 +75,10 @@ struct dhugetlb_pool {
+ };
+ 
+ bool dhugetlb_hide_files(struct cftype *cft);
++ssize_t write_2M_reserved_pages(struct kernfs_open_file *of,
++				char *buf, size_t nbytes, loff_t off);
++ssize_t write_1G_reserved_pages(struct kernfs_open_file *of,
++				char *buf, size_t nbytes, loff_t off);
+ ssize_t write_hugepage_to_hpool(struct kernfs_open_file *of,
+ 				char *buf, size_t nbytes, loff_t off);
+ int hugetlb_pool_info_show(struct seq_file *m, void *v);
+diff --git a/mm/dynamic_hugetlb.c b/mm/dynamic_hugetlb.c
+index 8881e9e1a032..d12e07ca90c2 100644
+--- a/mm/dynamic_hugetlb.c
++++ b/mm/dynamic_hugetlb.c
+@@ -255,6 +255,62 @@ bool dhugetlb_hide_files(struct cftype *cft)
+ 	return false;
+ }
+ 
++static ssize_t update_reserved_pages(struct mem_cgroup *memcg, char *buf, int hpages_pool_idx)
++{
++	struct dhugetlb_pool *hpool = memcg->hpool;
++	struct huge_pages_pool *hpages_pool;
++	unsigned long nr_pages;
++	unsigned long delta;
++	char *endp;
++
++	if (!dhugetlb_enabled)
++		return -EINVAL;
++
++	buf = strstrip(buf);
++	nr_pages = memparse(buf, &endp);
++	if (*endp != '\0')
++		return -EINVAL;
++
++	if (!get_hpool_unless_zero(hpool))
++		return -EINVAL;
++
++	spin_lock(&hpool->reserved_lock);
++	spin_lock(&hpool->lock);
++	hpages_pool = &hpool->hpages_pool[hpages_pool_idx];
++	if (nr_pages > hpages_pool->nr_huge_pages) {
++		delta = min(nr_pages - hpages_pool->nr_huge_pages, hpages_pool->free_normal_pages);
++		hpages_pool->nr_huge_pages += delta;
++		hpages_pool->free_huge_pages += delta;
++		hpages_pool->free_normal_pages -= delta;
++	} else {
++		delta = min(hpages_pool->nr_huge_pages - nr_pages,
++			    hpages_pool->free_huge_pages - hpages_pool->resv_huge_pages);
++		hpages_pool->nr_huge_pages -= delta;
++		hpages_pool->free_huge_pages -= delta;
++		hpages_pool->free_normal_pages += delta;
++	}
++	spin_unlock(&hpool->lock);
++	spin_unlock(&hpool->reserved_lock);
++	put_hpool(hpool);
++	return 0;
++}
++
++ssize_t write_2M_reserved_pages(struct kernfs_open_file *of,
++				char *buf, size_t nbytes, loff_t off)
++{
++	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
++
++	return update_reserved_pages(memcg, buf, HUGE_PAGES_POOL_2M) ?: nbytes;
++}
++
++ssize_t write_1G_reserved_pages(struct kernfs_open_file *of,
++				char *buf, size_t nbytes, loff_t off)
++{
++	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
++
++	return update_reserved_pages(memcg, buf, HUGE_PAGES_POOL_1G) ?: nbytes;
++}
++
+ ssize_t write_hugepage_to_hpool(struct kernfs_open_file *of,
+ 				char *buf, size_t nbytes, loff_t off)
+ {
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 1a292d54e7ad..6381de898f31 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -5202,6 +5202,16 @@ static struct cftype mem_cgroup_legacy_files[] = {
+ 		.seq_show = hugetlb_pool_info_show,
+ 		.flags = CFTYPE_NO_PREFIX | CFTYPE_WORLD_WRITABLE | CFTYPE_NOT_ON_ROOT,
+ 	},
++	{
++		.name = "dhugetlb.1G.reserved_pages",
++		.write = write_1G_reserved_pages,
++		.flags = CFTYPE_NO_PREFIX | CFTYPE_WORLD_WRITABLE | CFTYPE_NOT_ON_ROOT,
++	},
++	{
++		.name = "dhugetlb.2M.reserved_pages",
++		.write = write_2M_reserved_pages,
++		.flags = CFTYPE_NO_PREFIX | CFTYPE_WORLD_WRITABLE | CFTYPE_NOT_ON_ROOT,
++	},
+ #endif
+ #ifdef CONFIG_NUMA
+ 	{
+-- 
+2.26.2
+

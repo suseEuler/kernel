@@ -1,0 +1,703 @@
+From a8a836a36072aacbc4aaf08b8b3c8a654dbc0157 Mon Sep 17 00:00:00 2001
+From: Liu Shixin <liushixin2@huawei.com>
+Date: Tue, 18 Jan 2022 21:23:22 +0800
+Subject: [PATCH] mm/dynamic_hugetlb: establish the dynamic hugetlb feature
+ framework
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: a8a836a36072aacbc4aaf08b8b3c8a654dbc0157
+
+
+hulk inclusion
+category: feature
+bugzilla: 46904, https://gitee.com/openeuler/kernel/issues/I4QSHG
+CVE: NA
+
+--------------------------------
+
+Dynamic hugetlb is a self-developed feature based on the hugetlb and memcontrol.
+It supports to split huge page dynamically in a memory cgroup. There is a new structure
+dhugetlb_pool in every mem_cgroup to manage the pages configured to the mem_cgroup.
+For the mem_cgroup configured with dhugetlb_pool, processes in the mem_cgroup will
+preferentially use the pages in dhugetlb_pool.
+
+Dynamic hugetlb supports three types of pages, including 1G/2M huge pages and 4K pages.
+For the mem_cgroup configured with dhugetlb_pool, processes will be limited to alloc
+1G/2M huge pages only from dhugetlb_pool. But there is no such constraint for 4K pages.
+If there are insufficient 4K pages in the dhugetlb_pool, pages can also be allocated from
+buddy system. So before using dynamic hugetlb, user must know how many huge pages they
+need.
+
+Usage:
+1. Add 'dynamic_hugetlb=on' in cmdline to enable dynamic hugetlb feature.
+2. Prealloc some 1G hugepages through hugetlb.
+3. Create a mem_cgroup and configure dhugetlb_pool to mem_cgroup.
+4. Configure the count of 1G/2M hugepages, and the remaining pages in dhugetlb_pool will
+   be used as basic pages.
+5. Bound a process to mem_cgroup. then the memory for it will be allocated from dhugetlb_pool.
+
+This patch add the corresponding structure dhugetlb_pool for dynamic hugetlb feature,
+the interface 'dhugetlb.nr_pages' in mem_cgroup to configure dhugetlb_pool and the cmdline
+'dynamic_hugetlb=on' to enable dynamic hugetlb feature.
+
+Signed-off-by: Liu Shixin <liushixin2@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/Kconfig                      |  10 +
+ include/linux/dynamic_hugetlb.h | 106 +++++++++
+ include/linux/memcontrol.h      |   5 +-
+ kernel/cgroup/cgroup.c          |  11 +
+ mm/Makefile                     |   1 +
+ mm/dynamic_hugetlb.c            | 375 ++++++++++++++++++++++++++++++++
+ mm/hugetlb.c                    |   3 +
+ mm/memcontrol.c                 |  10 +
+ 8 files changed, 520 insertions(+), 1 deletion(-)
+ create mode 100644 include/linux/dynamic_hugetlb.h
+ create mode 100644 mm/dynamic_hugetlb.c
+
+diff --git a/fs/Kconfig b/fs/Kconfig
+index 3cc647e00f3c..20bd86b65dcc 100644
+--- a/fs/Kconfig
++++ b/fs/Kconfig
+@@ -251,6 +251,16 @@ config HUGETLB_PAGE_FREE_VMEMMAP_DEFAULT_ON
+ 	  to enable freeing vmemmap pages of HugeTLB by default. It can then
+ 	  be disabled on the command line via hugetlb_free_vmemmap=off.
+ 
++config DYNAMIC_HUGETLB
++	bool "Dynamic HugeTLB"
++	depends on X86_64
++	depends on HUGETLBFS
++	depends on MEMCG && CGROUP_HUGETLB
++	help
++	  Dynamic hugepage are used in memcg and can be splited into small
++	  pages automatically. The tasks in the memcg prefer to alloc dynamic
++	  hugepage.
++
+ config MEMFD_CREATE
+ 	def_bool TMPFS || HUGETLBFS
+ 
+diff --git a/include/linux/dynamic_hugetlb.h b/include/linux/dynamic_hugetlb.h
+new file mode 100644
+index 000000000000..30ccbd9f1853
+--- /dev/null
++++ b/include/linux/dynamic_hugetlb.h
+@@ -0,0 +1,106 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef __LINUX_DYNAMIC_HUGETLB_H
++#define __LINUX_DYNAMIC_HUGETLB_H
++
++#include <linux/hugetlb.h>
++#include <linux/memcontrol.h>
++
++#ifdef CONFIG_DYNAMIC_HUGETLB
++
++extern struct static_key_false dhugetlb_enabled_key;
++#define dhugetlb_enabled (static_branch_unlikely(&dhugetlb_enabled_key))
++
++#define NR_PERCPU_POOL		num_possible_cpus()
++#define PERCPU_POOL_PAGE_MAX	1024
++#define PERCPU_POOL_PAGE_BATCH	(PERCPU_POOL_PAGE_MAX >> 2)
++
++struct split_hugepage {
++	struct list_head head_pages;
++	unsigned long start_pfn;
++};
++
++struct percpu_pages_pool {
++	spinlock_t lock;
++	unsigned long free_pages;
++	long used_pages;
++	struct list_head head_page;
++};
++
++struct huge_pages_pool {
++	/*
++	 * This four counts is used for huge page allocation.
++	 */
++	unsigned long nr_huge_pages;
++	unsigned long free_huge_pages;
++	unsigned long resv_huge_pages;
++	unsigned long used_huge_pages;
++	/*
++	 * free_normal_pages means how many huge pages can be split to
++	 * smaller pages or reserved for huge page allocation.
++	 */
++	unsigned long free_normal_pages;
++	/*
++	 * split_normal_pages means how many huge pages have already been
++	 * split.
++	 */
++	unsigned long split_normal_pages;
++	struct list_head hugepage_freelists;
++	/* Used to record which hugepages have been split */
++	struct list_head hugepage_splitlists;
++};
++
++enum huge_pages_pool_type {
++	HUGE_PAGES_POOL_1G,
++	HUGE_PAGES_POOL_2M,
++	HUGE_PAGES_POOL_4K,
++	HUGE_PAGES_POOL_MAX,
++};
++/*
++ * Dynamic hugetlb pool data structure. Each Dynamic hugetlb pool is
++ * associated with one memory cgroup and controls the allocation of memory
++ * resources for both processes and files which belongs to the memory cgroup.
++ */
++struct dhugetlb_pool {
++	int nid;
++	spinlock_t lock;
++	spinlock_t reserved_lock;
++	atomic_t refcnt;
++	unsigned long normal_pages_disabled;
++
++	struct mem_cgroup *attach_memcg;
++
++	unsigned long total_huge_pages;
++	struct huge_pages_pool hpages_pool[HUGE_PAGES_POOL_MAX];
++	struct percpu_pages_pool percpu_pool[0];
++};
++
++bool dhugetlb_hide_files(struct cftype *cft);
++ssize_t write_hugepage_to_hpool(struct kernfs_open_file *of,
++				char *buf, size_t nbytes, loff_t off);
++int hugetlb_pool_info_show(struct seq_file *m, void *v);
++void hugetlb_pool_inherit(struct mem_cgroup *memcg, struct mem_cgroup *parent);
++int hugetlb_pool_destroy(struct cgroup *cgrp);
++void __init dynamic_hugetlb_init(void);
++
++#else
++
++#define dhugetlb_enabled	0
++
++struct dhugetlb_pool {};
++
++static inline bool dhugetlb_hide_files(struct cftype *cft)
++{
++	return false;
++}
++static inline void hugetlb_pool_inherit(struct mem_cgroup *memcg, struct mem_cgroup *parent)
++{
++}
++static inline int hugetlb_pool_destroy(struct cgroup *cgrp)
++{
++	return 0;
++}
++static inline void __init dynamic_hugetlb_init(void)
++{
++}
++#endif /* CONFIG_DYNAMIC_HUGETLB */
++#endif /* __LINUX_DYNAMIC_HUGETLB_H */
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index 2e0a480a8665..7cc7cfe55d9a 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -22,6 +22,7 @@
+ #include <linux/writeback.h>
+ #include <linux/page-flags.h>
+ #include <linux/kabi.h>
++#include <linux/dynamic_hugetlb.h>
+ 
+ struct mem_cgroup;
+ struct obj_cgroup;
+@@ -370,6 +371,9 @@ struct mem_cgroup {
+ 	struct deferred_split deferred_split_queue;
+ #endif
+ 
++#ifdef CONFIG_DYNAMIC_HUGETLB
++	struct dhugetlb_pool *hpool;
++#endif
+ 	KABI_RESERVE(1)
+ 	KABI_RESERVE(2)
+ 	KABI_RESERVE(3)
+@@ -1238,7 +1242,6 @@ void split_page_memcg(struct page *head, unsigned int nr);
+ unsigned long mem_cgroup_soft_limit_reclaim(pg_data_t *pgdat, int order,
+ 						gfp_t gfp_mask,
+ 						unsigned long *total_scanned);
+-
+ /*
+  * Test whether @memcg has children, dead or alive.  Note that this
+  * function doesn't care whether @memcg has use_hierarchy enabled and
+diff --git a/kernel/cgroup/cgroup.c b/kernel/cgroup/cgroup.c
+index 8ef51ddfb301..59cc82ef52a6 100644
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@ -57,6 +57,7 @@
+ #include <linux/fs_parser.h>
+ #include <linux/sched/cputime.h>
+ #include <linux/psi.h>
++#include <linux/dynamic_hugetlb.h>
+ #include <net/sock.h>
+ 
+ #define CREATE_TRACE_POINTS
+@@ -4009,6 +4010,9 @@ static int cgroup_addrm_files(struct cgroup_subsys_state *css,
+ 			continue;
+ 		if ((cft->flags & CFTYPE_DEBUG) && !cgroup_debug)
+ 			continue;
++		/* if dynamic hugetlb is not enabled, hide the interfaces */
++		if (dhugetlb_hide_files(cft))
++			continue;
+ 		if (is_add) {
+ 			ret = cgroup_add_file(css, cgrp, cft);
+ 			if (ret) {
+@@ -5609,6 +5613,13 @@ static int cgroup_destroy_locked(struct cgroup *cgrp)
+ 	if (css_has_online_children(&cgrp->self))
+ 		return -EBUSY;
+ 
++	/*
++	 * If dynamic hugetlb is enabled, make sure dhugtlb_pool is free
++	 * before removing the corresponding memory cgroup.
++	 */
++	if (hugetlb_pool_destroy(cgrp))
++		return -EBUSY;
++
+ 	/*
+ 	 * Mark @cgrp and the associated csets dead.  The former prevents
+ 	 * further task migration and child creation by disabling
+diff --git a/mm/Makefile b/mm/Makefile
+index ec3d0ab14a6a..f3dce99ee62f 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -72,6 +72,7 @@ obj-$(CONFIG_ZSWAP)	+= zswap.o
+ obj-$(CONFIG_HAS_DMA)	+= dmapool.o
+ obj-$(CONFIG_HUGETLBFS)	+= hugetlb.o
+ obj-$(CONFIG_HUGETLB_PAGE_FREE_VMEMMAP)	+= hugetlb_vmemmap.o
++obj-$(CONFIG_DYNAMIC_HUGETLB) += dynamic_hugetlb.o
+ obj-$(CONFIG_NUMA) 	+= mempolicy.o
+ obj-$(CONFIG_SPARSEMEM)	+= sparse.o
+ obj-$(CONFIG_SPARSEMEM_VMEMMAP) += sparse-vmemmap.o
+diff --git a/mm/dynamic_hugetlb.c b/mm/dynamic_hugetlb.c
+new file mode 100644
+index 000000000000..8881e9e1a032
+--- /dev/null
++++ b/mm/dynamic_hugetlb.c
+@@ -0,0 +1,375 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * dynamic hugetlb core file
++ */
++
++#include <linux/dynamic_hugetlb.h>
++
++static bool enable_dhugetlb = false;
++DEFINE_STATIC_KEY_FALSE(dhugetlb_enabled_key);
++
++#define hugepage_index(pfn)	((pfn) >> (PUD_SHIFT - PAGE_SHIFT))
++
++static bool get_hpool_unless_zero(struct dhugetlb_pool *hpool)
++{
++	if (!dhugetlb_enabled || !hpool)
++		return false;
++	return atomic_inc_not_zero(&hpool->refcnt);
++}
++
++static void put_hpool(struct dhugetlb_pool *hpool)
++{
++	if (!dhugetlb_enabled || !hpool)
++		return;
++	if (atomic_dec_and_test(&hpool->refcnt)) {
++		css_put(&hpool->attach_memcg->css);
++		kfree(hpool);
++	}
++}
++
++struct dhugetlb_pagelist {
++	unsigned long count;
++	struct dhugetlb_pool *hpool[0];
++};
++
++static struct dhugetlb_pagelist *dhugetlb_pagelist_t;
++static DEFINE_RWLOCK(dhugetlb_pagelist_rwlock);
++
++static int set_hpool_in_dhugetlb_pagelist(unsigned long idx, struct dhugetlb_pool *hpool)
++{
++	/*
++	 * There is not conflit when write to dhugetlb_pagelist_t->hpool, so just
++	 * need read_lock here.
++	 */
++	read_lock(&dhugetlb_pagelist_rwlock);
++
++	/*
++	 * If page's pfn is greater than dhugetlb_pagelist_t->count (which may
++	 * occurs due to memory hotplug) then dhugetlb_pagelist_t need to be
++	 * reallocated, so need write_lock here.
++	 */
++	if (idx >= dhugetlb_pagelist_t->count) {
++		unsigned long size;
++		struct dhugetlb_pagelist *tmp;
++
++		read_unlock(&dhugetlb_pagelist_rwlock);
++		write_lock(&dhugetlb_pagelist_rwlock);
++
++		size = sizeof(struct dhugetlb_pagelist) +
++			(idx + 1) * sizeof(struct dhugetlb_pool *);
++		tmp = krealloc(dhugetlb_pagelist_t, size, GFP_ATOMIC);
++		if (!tmp) {
++			write_unlock(&dhugetlb_pagelist_rwlock);
++			return -ENOMEM;
++		}
++		tmp->count = idx + 1;
++		dhugetlb_pagelist_t = tmp;
++
++		write_unlock(&dhugetlb_pagelist_rwlock);
++		read_lock(&dhugetlb_pagelist_rwlock);
++	}
++	dhugetlb_pagelist_t->hpool[idx] = hpool;
++	read_unlock(&dhugetlb_pagelist_rwlock);
++
++	return 0;
++}
++
++static int alloc_hugepage_from_hugetlb(struct dhugetlb_pool *hpool,
++				       unsigned long nid, unsigned long nr_pages)
++{
++	struct hstate *h = size_to_hstate(PUD_SIZE);
++	struct huge_pages_pool *hpages_pool = &hpool->hpages_pool[HUGE_PAGES_POOL_1G];
++	struct page *page, *next;
++	unsigned long count = 0, idx;
++	int ret = 0;
++
++	if (!h)
++		return -ENOMEM;
++
++	spin_lock(&hpool->lock);
++	spin_lock(&hugetlb_lock);
++	if (h->free_huge_pages_node[nid] - h->resv_huge_pages_node[nid] < nr_pages) {
++		ret = -ENOMEM;
++		goto out_unlock;
++	}
++
++	list_for_each_entry_safe(page, next, &h->hugepage_freelists[nid], lru) {
++		idx = hugepage_index(page_to_pfn(page));
++		ret = set_hpool_in_dhugetlb_pagelist(idx, hpool);
++		if (ret)
++			continue;
++
++		list_move_tail(&page->lru, &hpages_pool->hugepage_freelists);
++		h->free_huge_pages--;
++		h->free_huge_pages_node[nid]--;
++		hpool->total_huge_pages++;
++		hpages_pool->free_normal_pages++;
++
++		if (++count == nr_pages)
++			break;
++	}
++
++out_unlock:
++	spin_unlock(&hugetlb_lock);
++	spin_unlock(&hpool->lock);
++	return ret;
++}
++
++static int free_hugepage_to_hugetlb(struct dhugetlb_pool *hpool)
++{
++	struct hstate *h = size_to_hstate(PUD_SIZE);
++	struct huge_pages_pool *hpages_pool = &hpool->hpages_pool[HUGE_PAGES_POOL_1G];
++	struct page *page, *next, *p;
++	unsigned long pfn, idx;
++	unsigned int nr_pages;
++	int nid, ret = 0;
++
++	spin_lock(&hpool->lock);
++	spin_lock(&hugetlb_lock);
++	list_for_each_entry_safe(page, next, &hpages_pool->hugepage_freelists, lru) {
++		nr_pages = 1 << huge_page_order(h);
++		pfn = page_to_pfn(page);
++		for (; nr_pages--; pfn++) {
++			p = pfn_to_page(pfn);
++			p->mapping = NULL;
++		}
++		set_compound_page_dtor(page, HUGETLB_PAGE_DTOR);
++
++		nid = page_to_nid(page);
++		list_move(&page->lru, &h->hugepage_freelists[nid]);
++		hpool->total_huge_pages--;
++		hpages_pool->free_normal_pages--;
++		h->free_huge_pages++;
++		h->free_huge_pages_node[nid]++;
++
++		idx = hugepage_index(page_to_pfn(page));
++		ret = set_hpool_in_dhugetlb_pagelist(idx, NULL);
++		if (ret)
++			break;
++	}
++	spin_unlock(&hugetlb_lock);
++	spin_unlock(&hpool->lock);
++	return ret;
++}
++
++void hugetlb_pool_inherit(struct mem_cgroup *memcg, struct mem_cgroup *parent)
++{
++	if (!dhugetlb_enabled || !memcg || !parent)
++		return;
++	memcg->hpool = parent->hpool;
++}
++
++static int hugetlb_pool_create(struct mem_cgroup *memcg, unsigned long nid)
++{
++	struct dhugetlb_pool *hpool;
++	int i;
++
++	if (memcg_has_children(memcg))
++		return -EINVAL;
++
++	hpool = kzalloc(sizeof(struct dhugetlb_pool) +
++			NR_PERCPU_POOL * sizeof(struct percpu_pages_pool), GFP_KERNEL);
++	if (!hpool)
++		return -ENOMEM;
++
++	spin_lock_init(&hpool->lock);
++	spin_lock_init(&hpool->reserved_lock);
++	hpool->nid = nid;
++	atomic_set(&hpool->refcnt, 1);
++
++	for (i = 0; i < HUGE_PAGES_POOL_MAX; i++) {
++		INIT_LIST_HEAD(&hpool->hpages_pool[i].hugepage_freelists);
++		INIT_LIST_HEAD(&hpool->hpages_pool[i].hugepage_splitlists);
++	}
++	for (i = 0; i < NR_PERCPU_POOL; i++) {
++		spin_lock_init(&hpool->percpu_pool[i].lock);
++		INIT_LIST_HEAD(&hpool->percpu_pool[i].head_page);
++	}
++
++	hpool->attach_memcg = memcg;
++	css_get(&memcg->css);
++	memcg->hpool = hpool;
++
++	return 0;
++}
++
++int hugetlb_pool_destroy(struct cgroup *cgrp)
++{
++	struct cgroup_subsys_state *css = cgrp->subsys[memory_cgrp_id];
++	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
++	struct dhugetlb_pool *hpool = memcg ? memcg->hpool : NULL;
++	int ret = 0;
++
++	if (!dhugetlb_enabled)
++		return 0;
++
++	if (!hpool || hpool->attach_memcg != memcg)
++		return 0;
++
++	ret = free_hugepage_to_hugetlb(hpool);
++	memcg->hpool = NULL;
++
++	put_hpool(hpool);
++	return ret;
++}
++
++static int hugetlb_pool_update(struct mem_cgroup *memcg,
++			       unsigned long nid, unsigned long size)
++{
++	struct dhugetlb_pool *hpool;
++	bool new_create = false;
++	int ret = -EINVAL;
++
++again:
++	hpool = memcg->hpool;
++	if (!hpool) {
++		ret = hugetlb_pool_create(memcg, nid);
++		if (ret)
++			return ret;
++		new_create = true;
++		goto again;
++	}
++	if (!get_hpool_unless_zero(hpool))
++		return -EINVAL;
++
++	if (hpool->attach_memcg != memcg || hpool->nid != nid)
++		goto out;
++	ret = alloc_hugepage_from_hugetlb(hpool, nid, size);
++	/*
++	 * if create a new hpool here but alloc hugepages failed,
++	 * destroy it directly here.
++	 */
++	if (ret && new_create) {
++		memcg->hpool = NULL;
++		put_hpool(hpool);
++	}
++out:
++	put_hpool(hpool);
++	return ret;
++}
++
++bool dhugetlb_hide_files(struct cftype *cft)
++{
++	if (!dhugetlb_enabled && strstr(cft->name, "dhugetlb"))
++		return true;
++	return false;
++}
++
++ssize_t write_hugepage_to_hpool(struct kernfs_open_file *of,
++				char *buf, size_t nbytes, loff_t off)
++{
++	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
++	unsigned long nid, size;
++	char *endp;
++	int ret;
++
++	if (!dhugetlb_enabled || !memcg)
++		return -EINVAL;
++
++	buf = strstrip(buf);
++	nid = memparse(buf, &endp);
++	if (*endp != ' ' || nid < 0 || nid >= MAX_NUMNODES)
++		return -EINVAL;
++
++	buf = endp + 1;
++	size = memparse(buf, &endp);
++	if (*endp != '\0' || size == 0)
++		return -EINVAL;
++
++	ret = hugetlb_pool_update(memcg, nid, size);
++
++	return ret ? : nbytes;
++}
++
++int hugetlb_pool_info_show(struct seq_file *m, void *v)
++{
++	struct mem_cgroup *memcg = mem_cgroup_from_css(seq_css(m));
++	struct dhugetlb_pool *hpool = memcg ? memcg->hpool : NULL;
++	unsigned long free_pages;
++	long used_pages = 0;
++	int i;
++
++	if (!dhugetlb_enabled)
++		return 0;
++
++	if (!hpool) {
++		seq_printf(m, "Curent hierarchial have not memory pool.\n");
++		return 0;
++	}
++
++	if (!get_hpool_unless_zero(hpool))
++		return 0;
++
++	for (i = 0; i < NR_PERCPU_POOL; i++)
++		spin_lock(&hpool->percpu_pool[i].lock);
++	spin_lock(&hpool->lock);
++
++	free_pages = hpool->hpages_pool[HUGE_PAGES_POOL_4K].free_normal_pages;
++	for (i = 0; i < NR_PERCPU_POOL; i++) {
++		free_pages += hpool->percpu_pool[i].free_pages;
++		used_pages += hpool->percpu_pool[i].used_pages;
++	}
++
++	seq_printf(m,
++		   "dhugetlb_total_pages %ld\n"
++		   "1G_total_reserved_pages %ld\n"
++		   "1G_free_reserved_pages %ld\n"
++		   "1G_mmap_reserved_pages %ld\n"
++		   "1G_used_pages %ld\n"
++		   "2M_total_reserved_pages %ld\n"
++		   "2M_free_reserved_pages %ld\n"
++		   "2M_mmap_reserved_pages %ld\n"
++		   "2M_used_pages %ld\n"
++		   "1G_free_unreserved_pages %ld\n"
++		   "2M_free_unreserved_pages %ld\n"
++		   "4K_free_pages %ld\n"
++		   "4K_used_pages %ld\n",
++		   hpool->total_huge_pages,
++		   hpool->hpages_pool[HUGE_PAGES_POOL_1G].nr_huge_pages,
++		   hpool->hpages_pool[HUGE_PAGES_POOL_1G].free_huge_pages,
++		   hpool->hpages_pool[HUGE_PAGES_POOL_1G].resv_huge_pages,
++		   hpool->hpages_pool[HUGE_PAGES_POOL_1G].used_huge_pages,
++		   hpool->hpages_pool[HUGE_PAGES_POOL_2M].nr_huge_pages,
++		   hpool->hpages_pool[HUGE_PAGES_POOL_2M].free_huge_pages,
++		   hpool->hpages_pool[HUGE_PAGES_POOL_2M].resv_huge_pages,
++		   hpool->hpages_pool[HUGE_PAGES_POOL_2M].used_huge_pages,
++		   hpool->hpages_pool[HUGE_PAGES_POOL_1G].free_normal_pages,
++		   hpool->hpages_pool[HUGE_PAGES_POOL_2M].free_normal_pages,
++		   free_pages,
++		   used_pages);
++
++	spin_unlock(&hpool->lock);
++	for (i = NR_PERCPU_POOL - 1; i >= 0; i--)
++		spin_unlock(&hpool->percpu_pool[i].lock);
++	put_hpool(hpool);
++	return 0;
++}
++
++#define	DEFAULT_PAGELIST_COUNT	4096
++void __init dynamic_hugetlb_init(void)
++{
++	unsigned long count, size;
++
++	if (!enable_dhugetlb)
++		return;
++
++	count = max(hugepage_index(max_pfn), (unsigned long)DEFAULT_PAGELIST_COUNT);
++	size = sizeof(struct dhugetlb_pagelist) + count * sizeof(struct dhugetlb_pool *);
++	dhugetlb_pagelist_t = kzalloc(size, GFP_KERNEL);
++	if (!dhugetlb_pagelist_t) {
++		pr_info("Dynamic hugetlb init failed, need %lu memory\n", size);
++		return;
++	}
++
++	dhugetlb_pagelist_t->count = count;
++	static_branch_enable(&dhugetlb_enabled_key);
++	pr_info("Dynamic hugetlb is enabled\n");
++}
++
++static int __init dynamic_hugetlb_setup(char *s)
++{
++	if (!strcmp(s, "on"))
++		enable_dhugetlb = true;
++	return 1;
++}
++__setup("dynamic_hugetlb=", dynamic_hugetlb_setup);
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 1528a12ab3a9..6049fd4a9050 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -43,6 +43,7 @@
+ #include <linux/node.h>
+ #include <linux/userfaultfd_k.h>
+ #include <linux/page_owner.h>
++#include <linux/dynamic_hugetlb.h>
+ #include "internal.h"
+ #include "hugetlb_vmemmap.h"
+ 
+@@ -3460,6 +3461,8 @@ static int __init hugetlb_init(void)
+ 	hugetlb_register_all_nodes();
+ 	hugetlb_cgroup_file_init();
+ 
++	dynamic_hugetlb_init();
++
+ #ifdef CONFIG_SMP
+ 	num_fault_mutexes = roundup_pow_of_two(8 * num_possible_cpus());
+ #else
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 011aff396af2..1a292d54e7ad 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -5195,6 +5195,14 @@ static struct cftype mem_cgroup_legacy_files[] = {
+ 		.write_s64 = memcg_qos_write,
+ 	},
+ #endif
++#ifdef CONFIG_DYNAMIC_HUGETLB
++	{
++		.name = "dhugetlb.nr_pages",
++		.write = write_hugepage_to_hpool,
++		.seq_show = hugetlb_pool_info_show,
++		.flags = CFTYPE_NO_PREFIX | CFTYPE_WORLD_WRITABLE | CFTYPE_NOT_ON_ROOT,
++	},
++#endif
+ #ifdef CONFIG_NUMA
+ 	{
+ 		.name = "numa_stat",
+@@ -5523,6 +5531,8 @@ mem_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
+ 		return &memcg->css;
+ 	}
+ 
++	hugetlb_pool_inherit(memcg, parent);
++
+ 	error = memcg_online_kmem(memcg);
+ 	if (error)
+ 		goto fail;
+-- 
+2.26.2
+
