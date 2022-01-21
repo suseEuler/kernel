@@ -7639,7 +7639,6 @@ static inline int alloc_qos_sched_group(struct task_group *tg,
 static void sched_change_qos_group(struct task_struct *tsk, struct task_group *tg)
 {
 	struct sched_attr attr;
-	struct rq *rq = task_rq(tsk);
 
 	/*
 	 * No need to re-setcheduler when a task is exiting or the task
@@ -7650,8 +7649,8 @@ static void sched_change_qos_group(struct task_struct *tsk, struct task_group *t
 	    (tg->qos_level == -1)) {
 		attr.sched_priority = 0;
 		attr.sched_policy = SCHED_IDLE;
-		attr.sched_nice = PRIO_TO_NICE(tsk->static_prio);
-		__setscheduler(rq, tsk, &attr, 0);
+		__setscheduler_params(tsk, &attr);
+		__setscheduler_prio(tsk, tsk->static_prio);
 	}
 }
 
