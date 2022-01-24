@@ -1,0 +1,118 @@
+From af1830956dc3dca0c87b2d679f7c91a8fe0331e1 Mon Sep 17 00:00:00 2001
+From: Kashyap Desai <kashyap.desai@broadcom.com>
+Date: Mon, 15 Feb 2021 13:10:44 +0530
+Subject: [PATCH] scsi: core: Add mq_poll support to SCSI layer
+Git-commit: af1830956dc3dca0c87b2d679f7c91a8fe0331e1
+Patch-mainline: v5.13-rc1
+References: bsn#71
+
+Currently IOPOLL support is only available in block layer. This patch
+adds mq_poll support to the SCSI layer.
+
+Link: https://lore.kernel.org/r/20210215074048.19424-2-kashyap.desai@broadcom.com
+Cc: sumit.saxena@broadcom.com
+Cc: chandrakanth.patil@broadcom.com
+Cc: linux-block@vger.kernel.org
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Reviewed-by: John Garry <john.garry@huawei.com>
+Signed-off-by: Kashyap Desai <kashyap.desai@broadcom.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ drivers/scsi/scsi_lib.c  | 16 ++++++++++++++++
+ include/scsi/scsi_cmnd.h |  1 +
+ include/scsi/scsi_host.h | 11 +++++++++++
+ 3 files changed, 28 insertions(+)
+
+diff --git a/drivers/scsi/scsi_lib.c b/drivers/scsi/scsi_lib.c
+index ffe824782647..09d09ef9d193 100644
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@ -1810,6 +1810,19 @@ static void scsi_mq_exit_request(struct blk_mq_tag_set *set, struct request *rq,
+ 			       cmd->sense_buffer);
+ }
+ 
++
++static int scsi_mq_poll(struct blk_mq_hw_ctx *hctx)
++{
++	struct request_queue *q = hctx->queue;
++	struct scsi_device *sdev = q->queuedata;
++	struct Scsi_Host *shost = sdev->host;
++
++	if (shost->hostt->mq_poll)
++		return shost->hostt->mq_poll(shost, hctx->queue_num);
++
++	return 0;
++}
++
+ static int scsi_map_queues(struct blk_mq_tag_set *set)
+ {
+ 	struct Scsi_Host *shost = container_of(set, struct Scsi_Host, tag_set);
+@@ -1877,6 +1890,7 @@ static const struct blk_mq_ops scsi_mq_ops_no_commit = {
+ 	.cleanup_rq	= scsi_cleanup_rq,
+ 	.busy		= scsi_mq_lld_busy,
+ 	.map_queues	= scsi_map_queues,
++	.poll		= scsi_mq_poll,
+ 	.set_rq_budget_token = scsi_mq_set_rq_budget_token,
+ 	.get_rq_budget_token = scsi_mq_get_rq_budget_token,
+ };
+@@ -1907,6 +1921,7 @@ static const struct blk_mq_ops scsi_mq_ops = {
+ 	.cleanup_rq	= scsi_cleanup_rq,
+ 	.busy		= scsi_mq_lld_busy,
+ 	.map_queues	= scsi_map_queues,
++	.poll		= scsi_mq_poll,
+ 	.set_rq_budget_token = scsi_mq_set_rq_budget_token,
+ 	.get_rq_budget_token = scsi_mq_get_rq_budget_token,
+ };
+@@ -1941,6 +1956,7 @@ int scsi_mq_setup_tags(struct Scsi_Host *shost)
+ 	else
+ 		tag_set->ops = &scsi_mq_ops_no_commit;
+ 	tag_set->nr_hw_queues = shost->nr_hw_queues ? : 1;
++	tag_set->nr_maps = shost->nr_maps ? : 1;
+ 	tag_set->queue_depth = shost->can_queue;
+ 	tag_set->cmd_size = cmd_size;
+ 	tag_set->numa_node = NUMA_NO_NODE;
+diff --git a/include/scsi/scsi_cmnd.h b/include/scsi/scsi_cmnd.h
+index 0cf2b5ccc1f7..83f7e520be48 100644
+--- a/include/scsi/scsi_cmnd.h
++++ b/include/scsi/scsi_cmnd.h
+@@ -10,6 +10,7 @@
+ #include <linux/timer.h>
+ #include <linux/scatterlist.h>
+ #include <scsi/scsi_device.h>
++#include <scsi/scsi_host.h>
+ #include <scsi/scsi_request.h>
+ 
+ struct Scsi_Host;
+diff --git a/include/scsi/scsi_host.h b/include/scsi/scsi_host.h
+index f0e8a9e73002..d95c1502e17d 100644
+--- a/include/scsi/scsi_host.h
++++ b/include/scsi/scsi_host.h
+@@ -280,6 +280,16 @@ struct scsi_host_template {
+ 	 */
+ 	int (* map_queues)(struct Scsi_Host *shost);
+ 
++	/*
++	 * SCSI interface of blk_poll - poll for IO completions.
++	 * Only applicable if SCSI LLD exposes multiple h/w queues.
++	 *
++	 * Return value: Number of completed entries found.
++	 *
++	 * Status: OPTIONAL
++	 */
++	int (* mq_poll)(struct Scsi_Host *shost, unsigned int queue_num);
++
+ 	/*
+ 	 * Check if scatterlists need to be padded for DMA draining.
+ 	 *
+@@ -622,6 +632,7 @@ struct Scsi_Host {
+ 	 * the total queue depth is can_queue.
+ 	 */
+ 	unsigned nr_hw_queues;
++	unsigned nr_maps;
+ 	unsigned active_mode:2;
+ 	unsigned unchecked_isa_dma:1;
+ 
+-- 
+2.31.1
+
