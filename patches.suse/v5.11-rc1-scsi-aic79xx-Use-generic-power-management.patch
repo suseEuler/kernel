@@ -1,0 +1,210 @@
+From ec199a8df6989915bd2f099e868f09d6ea6b7f06 Mon Sep 17 00:00:00 2001
+From: Vaibhav Gupta <vaibhavgupta40@gmail.com>
+Date: Mon, 2 Nov 2020 22:17:08 +0530
+Subject: [PATCH] scsi: aic79xx: Use generic power management
+Git-commit: ec199a8df6989915bd2f099e868f09d6ea6b7f06
+Patch-mainline: v5.11-rc1
+References: bsn#71
+
+Drivers should do only device-specific jobs. But in general, drivers using
+legacy PCI PM framework for .suspend()/.resume() have to manage many PCI
+PM-related tasks themselves which can be done by PCI Core itself. This
+brings extra load on the driver and it directly calls PCI helper functions
+to handle them.
+
+Switch to the new generic framework by updating function signatures and
+define a "struct dev_pm_ops" variable to bind PM callbacks. Also, remove
+unnecessary calls to the PCI Helper functions along with the legacy
+.suspend & .resume bindings.
+
+Link: https://lore.kernel.org/r/20201102164730.324035-8-vaibhavgupta40@gmail.com
+Signed-off-by: Vaibhav Gupta <vaibhavgupta40@gmail.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ drivers/scsi/aic7xxx/aic79xx.h         | 12 +++----
+ drivers/scsi/aic7xxx/aic79xx_core.c    |  8 ++---
+ drivers/scsi/aic7xxx/aic79xx_osm_pci.c | 43 +++++++-------------------
+ drivers/scsi/aic7xxx/aic79xx_pci.c     |  6 ++--
+ 4 files changed, 20 insertions(+), 49 deletions(-)
+
+diff --git a/drivers/scsi/aic7xxx/aic79xx.h b/drivers/scsi/aic7xxx/aic79xx.h
+index 9a515551641c..dd5dfd4f30a5 100644
+--- a/drivers/scsi/aic7xxx/aic79xx.h
++++ b/drivers/scsi/aic7xxx/aic79xx.h
+@@ -1330,10 +1330,8 @@ const struct	ahd_pci_identity *ahd_find_pci_device(ahd_dev_softc_t);
+ int			  ahd_pci_config(struct ahd_softc *,
+ 					 const struct ahd_pci_identity *);
+ int	ahd_pci_test_register_access(struct ahd_softc *);
+-#ifdef CONFIG_PM
+-void	ahd_pci_suspend(struct ahd_softc *);
+-void	ahd_pci_resume(struct ahd_softc *);
+-#endif
++void __maybe_unused	ahd_pci_suspend(struct ahd_softc *);
++void __maybe_unused	ahd_pci_resume(struct ahd_softc *);
+ 
+ /************************** SCB and SCB queue management **********************/
+ void		ahd_qinfifo_requeue_tail(struct ahd_softc *ahd,
+@@ -1344,10 +1342,8 @@ struct ahd_softc	*ahd_alloc(void *platform_arg, char *name);
+ int			 ahd_softc_init(struct ahd_softc *);
+ void			 ahd_controller_info(struct ahd_softc *ahd, char *buf);
+ int			 ahd_init(struct ahd_softc *ahd);
+-#ifdef CONFIG_PM
+-int			 ahd_suspend(struct ahd_softc *ahd);
+-void			 ahd_resume(struct ahd_softc *ahd);
+-#endif
++int __maybe_unused	 ahd_suspend(struct ahd_softc *ahd);
++void __maybe_unused	 ahd_resume(struct ahd_softc *ahd);
+ int			 ahd_default_config(struct ahd_softc *ahd);
+ int			 ahd_parse_vpddata(struct ahd_softc *ahd,
+ 					   struct vpd_config *vpd);
+diff --git a/drivers/scsi/aic7xxx/aic79xx_core.c b/drivers/scsi/aic7xxx/aic79xx_core.c
+index 98b02e7d38bb..78560a85b1e3 100644
+--- a/drivers/scsi/aic7xxx/aic79xx_core.c
++++ b/drivers/scsi/aic7xxx/aic79xx_core.c
+@@ -7866,11 +7866,9 @@ ahd_pause_and_flushwork(struct ahd_softc *ahd)
+ 	ahd->flags &= ~AHD_ALL_INTERRUPTS;
+ }
+ 
+-#ifdef CONFIG_PM
+-int
++int __maybe_unused
+ ahd_suspend(struct ahd_softc *ahd)
+ {
+-
+ 	ahd_pause_and_flushwork(ahd);
+ 
+ 	if (LIST_FIRST(&ahd->pending_scbs) != NULL) {
+@@ -7881,15 +7879,13 @@ ahd_suspend(struct ahd_softc *ahd)
+ 	return (0);
+ }
+ 
+-void
++void __maybe_unused
+ ahd_resume(struct ahd_softc *ahd)
+ {
+-
+ 	ahd_reset(ahd, /*reinit*/TRUE);
+ 	ahd_intr_enable(ahd, TRUE); 
+ 	ahd_restart(ahd);
+ }
+-#endif
+ 
+ /************************** Busy Target Table *********************************/
+ /*
+diff --git a/drivers/scsi/aic7xxx/aic79xx_osm_pci.c b/drivers/scsi/aic7xxx/aic79xx_osm_pci.c
+index 8b891a05d9e7..07b670b80f1b 100644
+--- a/drivers/scsi/aic7xxx/aic79xx_osm_pci.c
++++ b/drivers/scsi/aic7xxx/aic79xx_osm_pci.c
+@@ -74,11 +74,10 @@ static const struct pci_device_id ahd_linux_pci_id_table[] = {
+ 
+ MODULE_DEVICE_TABLE(pci, ahd_linux_pci_id_table);
+ 
+-#ifdef CONFIG_PM
+-static int
+-ahd_linux_pci_dev_suspend(struct pci_dev *pdev, pm_message_t mesg)
++static int __maybe_unused
++ahd_linux_pci_dev_suspend(struct device *dev)
+ {
+-	struct ahd_softc *ahd = pci_get_drvdata(pdev);
++	struct ahd_softc *ahd = dev_get_drvdata(dev);
+ 	int rc;
+ 
+ 	if ((rc = ahd_suspend(ahd)))
+@@ -86,39 +85,20 @@ ahd_linux_pci_dev_suspend(struct pci_dev *pdev, pm_message_t mesg)
+ 
+ 	ahd_pci_suspend(ahd);
+ 
+-	pci_save_state(pdev);
+-	pci_disable_device(pdev);
+-
+-	if (mesg.event & PM_EVENT_SLEEP)
+-		pci_set_power_state(pdev, PCI_D3hot);
+-
+ 	return rc;
+ }
+ 
+-static int
+-ahd_linux_pci_dev_resume(struct pci_dev *pdev)
++static int __maybe_unused
++ahd_linux_pci_dev_resume(struct device *dev)
+ {
+-	struct ahd_softc *ahd = pci_get_drvdata(pdev);
+-	int rc;
+-
+-	pci_set_power_state(pdev, PCI_D0);
+-	pci_restore_state(pdev);
+-
+-	if ((rc = pci_enable_device(pdev))) {
+-		dev_printk(KERN_ERR, &pdev->dev,
+-			   "failed to enable device after resume (%d)\n", rc);
+-		return rc;
+-	}
+-
+-	pci_set_master(pdev);
++	struct ahd_softc *ahd = dev_get_drvdata(dev);
+ 
+ 	ahd_pci_resume(ahd);
+ 
+ 	ahd_resume(ahd);
+ 
+-	return rc;
++	return 0;
+ }
+-#endif
+ 
+ static void
+ ahd_linux_pci_dev_remove(struct pci_dev *pdev)
+@@ -224,13 +204,14 @@ ahd_linux_pci_dev_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	return (0);
+ }
+ 
++static SIMPLE_DEV_PM_OPS(ahd_linux_pci_dev_pm_ops,
++			 ahd_linux_pci_dev_suspend,
++			 ahd_linux_pci_dev_resume);
++
+ static struct pci_driver aic79xx_pci_driver = {
+ 	.name		= "aic79xx",
+ 	.probe		= ahd_linux_pci_dev_probe,
+-#ifdef CONFIG_PM
+-	.suspend	= ahd_linux_pci_dev_suspend,
+-	.resume		= ahd_linux_pci_dev_resume,
+-#endif
++	.driver.pm	= &ahd_linux_pci_dev_pm_ops,
+ 	.remove		= ahd_linux_pci_dev_remove,
+ 	.id_table	= ahd_linux_pci_id_table
+ };
+diff --git a/drivers/scsi/aic7xxx/aic79xx_pci.c b/drivers/scsi/aic7xxx/aic79xx_pci.c
+index 8397ae93f7dd..2f0bdb9225a4 100644
+--- a/drivers/scsi/aic7xxx/aic79xx_pci.c
++++ b/drivers/scsi/aic7xxx/aic79xx_pci.c
+@@ -377,8 +377,7 @@ ahd_pci_config(struct ahd_softc *ahd, const struct ahd_pci_identity *entry)
+ 	return ahd_pci_map_int(ahd);
+ }
+ 
+-#ifdef CONFIG_PM
+-void
++void __maybe_unused
+ ahd_pci_suspend(struct ahd_softc *ahd)
+ {
+ 	/*
+@@ -394,7 +393,7 @@ ahd_pci_suspend(struct ahd_softc *ahd)
+ 
+ }
+ 
+-void
++void __maybe_unused
+ ahd_pci_resume(struct ahd_softc *ahd)
+ {
+ 	ahd_pci_write_config(ahd->dev_softc, DEVCONFIG,
+@@ -404,7 +403,6 @@ ahd_pci_resume(struct ahd_softc *ahd)
+ 	ahd_pci_write_config(ahd->dev_softc, CSIZE_LATTIME,
+ 			     ahd->suspend_state.pci_state.csize_lattime, /*bytes*/1);
+ }
+-#endif
+ 
+ /*
+  * Perform some simple tests that should catch situations where
+-- 
+2.31.1
+

@@ -1,0 +1,342 @@
+From 2a5a24aa83382a88c43d18a901fab66e6ffe1199 Mon Sep 17 00:00:00 2001
+From: Ming Lei <ming.lei@redhat.com>
+Date: Fri, 22 Jan 2021 10:33:12 +0800
+Subject: [PATCH] scsi: blk-mq: Return budget token from .get_budget callback
+Git-commit: 2a5a24aa83382a88c43d18a901fab66e6ffe1199
+Patch-mainline: v5.13-rc1
+References: bsn#71
+
+
+SCSI uses a global atomic variable to track queue depth for each
+LUN/request queue.
+
+This doesn't scale well when there are lots of CPU cores and the disk is
+very fast. It has been observed that IOPS is affected a lot by tracking
+queue depth via sdev->device_busy in the I/O path.
+
+Return budget token from .get_budget callback. The budget token can be
+passed to driver so that we can replace the atomic variable with
+sbitmap_queue and alleviate the scaling problems that way.
+
+Link: https://lore.kernel.org/r/20210122023317.687987-9-ming.lei@redhat.com
+Cc: Omar Sandoval <osandov@fb.com>
+Cc: Kashyap Desai <kashyap.desai@broadcom.com>
+Cc: Sumanesh Samanta <sumanesh.samanta@broadcom.com>
+Cc: Ewan D. Milne <emilne@redhat.com>
+Tested-by: Sumanesh Samanta <sumanesh.samanta@broadcom.com>
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Signed-off-by: Ming Lei <ming.lei@redhat.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+[jyang: fix fuzz in blk-mq.c and blk-mq.h]
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ block/blk-mq-sched.c    | 17 +++++++++++++----
+ block/blk-mq.c          | 36 +++++++++++++++++++++++++-----------
+ block/blk-mq.h          | 25 +++++++++++++++++++++----
+ drivers/scsi/scsi_lib.c | 16 +++++++++++-----
+ include/linux/blk-mq.h  |  4 ++--
+ 5 files changed, 72 insertions(+), 26 deletions(-)
+
+diff --git a/block/blk-mq-sched.c b/block/blk-mq-sched.c
+index ddb65e9e6fd9..712b7f0afd63 100644
+--- a/block/blk-mq-sched.c
++++ b/block/blk-mq-sched.c
+@@ -131,6 +131,7 @@ static int __blk_mq_do_dispatch_sched(struct blk_mq_hw_ctx *hctx)
+ 
+ 	do {
+ 		struct request *rq;
++		int budget_token;
+ 
+ 		if (e->type->ops.has_work && !e->type->ops.has_work(hctx))
+ 			break;
+@@ -140,12 +141,13 @@ static int __blk_mq_do_dispatch_sched(struct blk_mq_hw_ctx *hctx)
+ 			break;
+ 		}
+ 
+-		if (!blk_mq_get_dispatch_budget(q))
++		budget_token = blk_mq_get_dispatch_budget(q);
++		if (budget_token < 0)
+ 			break;
+ 
+ 		rq = e->type->ops.dispatch_request(hctx);
+ 		if (!rq) {
+-			blk_mq_put_dispatch_budget(q);
++			blk_mq_put_dispatch_budget(q, budget_token);
+ 			/*
+ 			 * We're releasing without dispatching. Holding the
+ 			 * budget could have blocked any "hctx"s with the
+@@ -157,6 +159,8 @@ static int __blk_mq_do_dispatch_sched(struct blk_mq_hw_ctx *hctx)
+ 			break;
+ 		}
+ 
++		blk_mq_set_rq_budget_token(rq, budget_token);
++
+ 		/*
+ 		 * Now this rq owns the budget which has to be released
+ 		 * if this rq won't be queued to driver via .queue_rq()
+@@ -230,6 +234,8 @@ static int blk_mq_do_dispatch_ctx(struct blk_mq_hw_ctx *hctx)
+ 	struct request *rq;
+ 
+ 	do {
++		int budget_token;
++
+ 		if (!list_empty_careful(&hctx->dispatch)) {
+ 			ret = -EAGAIN;
+ 			break;
+@@ -238,12 +244,13 @@ static int blk_mq_do_dispatch_ctx(struct blk_mq_hw_ctx *hctx)
+ 		if (!sbitmap_any_bit_set(&hctx->ctx_map))
+ 			break;
+ 
+-		if (!blk_mq_get_dispatch_budget(q))
++		budget_token = blk_mq_get_dispatch_budget(q);
++		if (budget_token < 0)
+ 			break;
+ 
+ 		rq = blk_mq_dequeue_from_ctx(hctx, ctx);
+ 		if (!rq) {
+-			blk_mq_put_dispatch_budget(q);
++			blk_mq_put_dispatch_budget(q, budget_token);
+ 			/*
+ 			 * We're releasing without dispatching. Holding the
+ 			 * budget could have blocked any "hctx"s with the
+@@ -255,6 +262,8 @@ static int blk_mq_do_dispatch_ctx(struct blk_mq_hw_ctx *hctx)
+ 			break;
+ 		}
+ 
++		blk_mq_set_rq_budget_token(rq, budget_token);
++
+ 		/*
+ 		 * Now this rq owns the budget which has to be released
+ 		 * if this rq won't be queued to driver via .queue_rq()
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 2e8c94e00f58..2e825a7a3606 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -1277,10 +1277,15 @@ static enum prep_dispatch blk_mq_prep_dispatch_rq(struct request *rq,
+ 						  bool need_budget)
+ {
+ 	struct blk_mq_hw_ctx *hctx = rq->mq_hctx;
++	int budget_token = -1;
+ 
+-	if (need_budget && !blk_mq_get_dispatch_budget(rq->q)) {
+-		blk_mq_put_driver_tag(rq);
+-		return PREP_DISPATCH_NO_BUDGET;
++	if (need_budget) {
++		budget_token = blk_mq_get_dispatch_budget(rq->q);
++		if (budget_token < 0) {
++			blk_mq_put_driver_tag(rq);
++			return PREP_DISPATCH_NO_BUDGET;
++		}
++		blk_mq_set_rq_budget_token(rq, budget_token);
+ 	}
+ 
+ 	if (!blk_mq_get_driver_tag(rq)) {
+@@ -1297,7 +1302,7 @@ static enum prep_dispatch blk_mq_prep_dispatch_rq(struct request *rq,
+ 			 * together during handling partial dispatch
+ 			 */
+ 			if (need_budget)
+-				blk_mq_put_dispatch_budget(rq->q);
++				blk_mq_put_dispatch_budget(rq->q, budget_token);
+ 			return PREP_DISPATCH_NO_TAG;
+ 		}
+ 	}
+@@ -1307,12 +1312,16 @@ static enum prep_dispatch blk_mq_prep_dispatch_rq(struct request *rq,
+ 
+ /* release all allocated budgets before calling to blk_mq_dispatch_rq_list */
+ static void blk_mq_release_budgets(struct request_queue *q,
+-		unsigned int nr_budgets)
++		struct list_head *list)
+ {
+-	int i;
++	struct request *rq;
+ 
+-	for (i = 0; i < nr_budgets; i++)
+-		blk_mq_put_dispatch_budget(q);
++	list_for_each_entry(rq, list, queuelist) {
++		int budget_token = blk_mq_get_rq_budget_token(rq);
++
++		if (budget_token >= 0)
++			blk_mq_put_dispatch_budget(q, budget_token);
++	}
+ }
+ 
+ /*
+@@ -1410,7 +1419,8 @@ bool blk_mq_dispatch_rq_list(struct blk_mq_hw_ctx *hctx, struct list_head *list,
+ 		bool no_tag = prep == PREP_DISPATCH_NO_TAG &&
+ 			(hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED);
+ 
+-		blk_mq_release_budgets(q, nr_budgets);
++		if (nr_budgets)
++			blk_mq_release_budgets(q, list);
+ 
+ 		spin_lock(&hctx->lock);
+ 		list_splice_tail_init(list, &hctx->dispatch);
+@@ -2009,6 +2019,7 @@ static blk_status_t __blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
+ {
+ 	struct request_queue *q = rq->q;
+ 	bool run_queue = true;
++	int budget_token;
+ 
+ 	/*
+ 	 * RCU or SRCU read lock is needed before checking quiesced flag.
+@@ -2026,11 +2037,14 @@ static blk_status_t __blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
+ 	if (q->elevator && !bypass_insert)
+ 		goto insert;
+ 
+-	if (!blk_mq_get_dispatch_budget(q))
++	budget_token = blk_mq_get_dispatch_budget(q);
++	if (budget_token < 0)
+ 		goto insert;
+ 
++	blk_mq_set_rq_budget_token(rq, budget_token);
++
+ 	if (!blk_mq_get_driver_tag(rq)) {
+-		blk_mq_put_dispatch_budget(q);
++		blk_mq_put_dispatch_budget(q, budget_token);
+ 		goto insert;
+ 	}
+ 
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index 3616453ca28c..9ce64bc4a6c8 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -187,17 +187,34 @@ unsigned int blk_mq_in_flight(struct request_queue *q,
+ void blk_mq_in_flight_rw(struct request_queue *q, struct hd_struct *part,
+ 			 unsigned int inflight[2]);
+ 
+-static inline void blk_mq_put_dispatch_budget(struct request_queue *q)
++static inline void blk_mq_put_dispatch_budget(struct request_queue *q,
++					      int budget_token)
+ {
+ 	if (q->mq_ops->put_budget)
+-		q->mq_ops->put_budget(q);
++		q->mq_ops->put_budget(q, budget_token);
+ }
+ 
+-static inline bool blk_mq_get_dispatch_budget(struct request_queue *q)
++static inline int blk_mq_get_dispatch_budget(struct request_queue *q)
+ {
+ 	if (q->mq_ops->get_budget)
+ 		return q->mq_ops->get_budget(q);
+-	return true;
++	return 0;
++}
++
++static inline void blk_mq_set_rq_budget_token(struct request *rq, int token)
++{
++	if (token < 0)
++		return;
++
++	if (rq->q->mq_ops->set_rq_budget_token)
++		rq->q->mq_ops->set_rq_budget_token(rq, token);
++}
++
++static inline int blk_mq_get_rq_budget_token(struct request *rq)
++{
++	if (rq->q->mq_ops->get_rq_budget_token)
++		return rq->q->mq_ops->get_rq_budget_token(rq);
++	return -1;
+ }
+ 
+ static inline void __blk_mq_inc_active_requests(struct blk_mq_hw_ctx *hctx)
+diff --git a/drivers/scsi/scsi_lib.c b/drivers/scsi/scsi_lib.c
+index 02da34ab335d..dae9f66caffd 100644
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@ -329,6 +329,7 @@ void scsi_device_unbusy(struct scsi_device *sdev, struct scsi_cmnd *cmd)
+ 		atomic_dec(&starget->target_busy);
+ 
+ 	atomic_dec(&sdev->device_busy);
++	cmd->budget_token = -1;
+ }
+ 
+ static void scsi_kick_queue(struct request_queue *q)
+@@ -1143,6 +1144,7 @@ void scsi_init_command(struct scsi_device *dev, struct scsi_cmnd *cmd)
+ 	unsigned long jiffies_at_alloc;
+ 	int retries, to_clear;
+ 	bool in_flight;
++	int budget_token = cmd->budget_token;
+ 
+ 	if (!blk_rq_is_scsi(rq) && !(flags & SCMD_INITIALIZED)) {
+ 		flags |= SCMD_INITIALIZED;
+@@ -1171,6 +1173,7 @@ void scsi_init_command(struct scsi_device *dev, struct scsi_cmnd *cmd)
+ 	cmd->retries = retries;
+ 	if (in_flight)
+ 		__set_bit(SCMD_STATE_INFLIGHT, &cmd->state);
++	cmd->budget_token = budget_token;
+ 
+ }
+ 
+@@ -1605,19 +1608,19 @@ static void scsi_mq_done(struct scsi_cmnd *cmd)
+ 	blk_mq_complete_request(cmd->request);
+ }
+ 
+-static void scsi_mq_put_budget(struct request_queue *q)
++static void scsi_mq_put_budget(struct request_queue *q, int budget_token)
+ {
+ 	struct scsi_device *sdev = q->queuedata;
+ 
+ 	atomic_dec(&sdev->device_busy);
+ }
+ 
+-static bool scsi_mq_get_budget(struct request_queue *q)
++static int scsi_mq_get_budget(struct request_queue *q)
+ {
+ 	struct scsi_device *sdev = q->queuedata;
+ 
+ 	if (scsi_dev_queue_ready(q, sdev))
+-		return true;
++		return 0;
+ 
+ 	atomic_inc(&sdev->restarts);
+ 
+@@ -1639,7 +1642,7 @@ static bool scsi_mq_get_budget(struct request_queue *q)
+ 	if (unlikely(atomic_read(&sdev->device_busy) == 0 &&
+ 				!scsi_device_blocked(sdev)))
+ 		blk_mq_delay_run_hw_queues(sdev->request_queue, SCSI_QUEUE_DELAY);
+-	return false;
++	return -1;
+ }
+ 
+ static void scsi_mq_set_rq_budget_token(struct request *req, int token)
+@@ -1667,6 +1670,8 @@ static blk_status_t scsi_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 	blk_status_t ret;
+ 	int reason;
+ 
++	WARN_ON_ONCE(cmd->budget_token < 0);
++
+ 	/*
+ 	 * If the device is not in running state we will reject some or all
+ 	 * commands.
+@@ -1718,7 +1723,8 @@ static blk_status_t scsi_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 	if (scsi_target(sdev)->can_queue > 0)
+ 		atomic_dec(&scsi_target(sdev)->target_busy);
+ out_put_budget:
+-	scsi_mq_put_budget(q);
++	scsi_mq_put_budget(q, cmd->budget_token);
++	cmd->budget_token = -1;
+ 	switch (ret) {
+ 	case BLK_STS_OK:
+ 		break;
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index 5fae401f083d..3bd3ee651143 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -306,12 +306,12 @@ struct blk_mq_ops {
+ 	 * reserved budget. Also we have to handle failure case
+ 	 * of .get_budget for avoiding I/O deadlock.
+ 	 */
+-	bool (*get_budget)(struct request_queue *);
++	int (*get_budget)(struct request_queue *);
+ 
+ 	/**
+ 	 * @put_budget: Release the reserved budget.
+ 	 */
+-	void (*put_budget)(struct request_queue *);
++	void (*put_budget)(struct request_queue *, int);
+ 
+ 	/*
+ 	 * @set_rq_budget_toekn: store rq's budget token
+-- 
+2.31.1
+
