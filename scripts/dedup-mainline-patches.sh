@@ -8,24 +8,23 @@
 #
 # TODO: improve the checking of duplicated patch
 
+. ./scripts/common_lib.sh
+
 i=0
 CURR_PWD=$PWD
 START_STABLE_VERSION=v5.10
 END_STABLE_VERSION=v5.10.83
+count=$(wc -l mainline-patch-files | awk '{print $1}')
 while read -r line; do
 	i=$[$i+1]
 
 	echo $line
-	SUBJECT=$(head -10 $line | grep Subject |  cut -d " " -f 3-)
+	SUBJECT=$(ext_subject $line)
 	echo $SUBJECT
-	cd $LINUX_STABLE_GIT; #stable tree, 5.10.y branch for OE OLK-5.10
-	EXISTED=$(git log --oneline $START_STABLE_VERSION..$END_STABLE_VERSION | grep -F -i "$SUBJECT")
-    	echo $EXISTED
-	cd $CURR_PWD
+	EXISTED=$(subject_existed "$SUBJECT")
 	if [ -n "$EXISTED" ]; then
+		echo "rm $line"
 		rm $line
-		echo rm $line
 	fi
-
-	echo $i
+	echo $i/$count
 done < mainline-patch-files

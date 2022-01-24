@@ -2,6 +2,8 @@
 #
 # This is used to backport specific subsystem from latest mainline.
 #
+. ./scripts/common_lib.sh
+
 # TODO: improve the checking of duplicated patch
 
 # XXX setup them based on your own requirement.
@@ -35,11 +37,11 @@ generate_patch_from_file() {
 		echo 000 $KERNELVERSION
 		MPF=$(git format-patch -1 --no-numbered --no-renames --signoff $COMMIT)
 		echo 111 $MPF
-		SUBJECT=$(head -10 $MPF|grep Subject|cut -d " " -f 3-)
+		SUBJECT=$(ext_subject "$MPF")
 
 		# check it the SUBJECT is existed in stable kernel
 		cd $LINUX_STABLE_GIT
-		EXISTED=$(git log --oneline $START_VERSION..$END_STABLE_VERSION | grep -F -i "$SUBJECT")
+		EXISTED=$(subject_existed "$SUBJECT")
 		cd $LINUX_GIT
 		if [ -n "$EXISTED" ]; then
 			rm $MPF
