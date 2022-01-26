@@ -1,0 +1,111 @@
+From 39107e8577ad177db4585d99f1fcc5a29a754ee2 Mon Sep 17 00:00:00 2001
+From: "Gustavo A. R. Silva" <gustavoars@kernel.org>
+Date: Wed, 21 Apr 2021 13:56:11 -0500
+Subject: [PATCH] scsi: aacraid: Replace one-element array with flexible-array
+ member
+Git-commit: 39107e8577ad177db4585d99f1fcc5a29a754ee2
+Patch-mainline: v5.14-rc1
+References: bsn#74
+
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+There is a regular need in the kernel to provide a way to declare having a
+dynamically sized set of trailing elements in a structure. Kernel code
+should always use “flexible array members”[1] for these cases. The older
+style of one-element or zero-length arrays should no longer be used[2].
+
+Refactor the code according to the use of a flexible-array member in struct
+aac_raw_io2 instead of one-element array, and use the struct_size() helper.
+
+Also, this helps with the ongoing efforts to enable -Warray-bounds by
+fixing the following warnings:
+
+drivers/scsi/aacraid/aachba.c: In function ‘aac_build_sgraw2’:
+drivers/scsi/aacraid/aachba.c:3970:18: warning: array subscript 1 is above array bounds of ‘struct sge_ieee1212[1]’ [-Warray-bounds]
+ 3970 |     if (rio2->sge[j].length % (i*PAGE_SIZE)) {
+      |         ~~~~~~~~~^~~
+drivers/scsi/aacraid/aachba.c:3974:27: warning: array subscript 1 is above array bounds of ‘struct sge_ieee1212[1]’ [-Warray-bounds]
+ 3974 |     nseg_new += (rio2->sge[j].length / (i*PAGE_SIZE));
+      |                  ~~~~~~~~~^~~
+drivers/scsi/aacraid/aachba.c:4011:28: warning: array subscript 1 is above array bounds of ‘struct sge_ieee1212[1]’ [-Warray-bounds]
+ 4011 |   for (j = 0; j < rio2->sge[i].length / (pages * PAGE_SIZE); ++j) {
+      |                   ~~~~~~~~~^~~
+drivers/scsi/aacraid/aachba.c:4012:24: warning: array subscript 1 is above array bounds of ‘struct sge_ieee1212[1]’ [-Warray-bounds]
+ 4012 |    addr_low = rio2->sge[i].addrLow + j * pages * PAGE_SIZE;
+      |               ~~~~~~~~~^~~
+drivers/scsi/aacraid/aachba.c:4014:33: warning: array subscript 1 is above array bounds of ‘struct sge_ieee1212[1]’ [-Warray-bounds]
+ 4014 |    sge[pos].addrHigh = rio2->sge[i].addrHigh;
+      |                        ~~~~~~~~~^~~
+drivers/scsi/aacraid/aachba.c:4015:28: warning: array subscript 1 is above array bounds of ‘struct sge_ieee1212[1]’ [-Warray-bounds]
+ 4015 |    if (addr_low < rio2->sge[i].addrLow)
+      |                   ~~~~~~~~~^~~
+
+[1] https://en.wikipedia.org/wiki/Flexible_array_member
+[2] https://www.kernel.org/doc/html/v5.9/process/deprecated.html#zero-length-and-one-element-arrays
+
+Link: https://github.com/KSPP/linux/issues/79
+Link: https://github.com/KSPP/linux/issues/109
+Link: https://lore.kernel.org/lkml/60414244.ur4%2FkI+fBF1ohKZs%25lkp@intel.com/
+Link: https://lore.kernel.org/r/20210421185611.GA105224@embeddedor
+Signed-off-by: Gustavo A. R. Silva <gustavoars@kernel.org>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Build-tested-by: kernel test robot <lkp@intel.com>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ drivers/scsi/aacraid/aachba.c  | 10 +++++-----
+ drivers/scsi/aacraid/aacraid.h |  2 +-
+ 2 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/scsi/aacraid/aachba.c b/drivers/scsi/aacraid/aachba.c
+index f1f62b5da8b7..46b8dffce2dd 100644
+--- a/drivers/scsi/aacraid/aachba.c
++++ b/drivers/scsi/aacraid/aachba.c
+@@ -1235,8 +1235,8 @@ static int aac_read_raw_io(struct fib * fib, struct scsi_cmnd * cmd, u64 lba, u3
+ 		if (ret < 0)
+ 			return ret;
+ 		command = ContainerRawIo2;
+-		fibsize = sizeof(struct aac_raw_io2) +
+-			((le32_to_cpu(readcmd2->sgeCnt)-1) * sizeof(struct sge_ieee1212));
++		fibsize = struct_size(readcmd2, sge,
++				     le32_to_cpu(readcmd2->sgeCnt));
+ 	} else {
+ 		struct aac_raw_io *readcmd;
+ 		readcmd = (struct aac_raw_io *) fib_data(fib);
+@@ -1366,8 +1366,8 @@ static int aac_write_raw_io(struct fib * fib, struct scsi_cmnd * cmd, u64 lba, u
+ 		if (ret < 0)
+ 			return ret;
+ 		command = ContainerRawIo2;
+-		fibsize = sizeof(struct aac_raw_io2) +
+-			((le32_to_cpu(writecmd2->sgeCnt)-1) * sizeof(struct sge_ieee1212));
++		fibsize = struct_size(writecmd2, sge,
++				      le32_to_cpu(writecmd2->sgeCnt));
+ 	} else {
+ 		struct aac_raw_io *writecmd;
+ 		writecmd = (struct aac_raw_io *) fib_data(fib);
+@@ -3998,7 +3998,7 @@ static int aac_convert_sgraw2(struct aac_raw_io2 *rio2, int pages, int nseg, int
+ 	if (aac_convert_sgl == 0)
+ 		return 0;
+ 
+-	sge = kmalloc_array(nseg_new, sizeof(struct sge_ieee1212), GFP_ATOMIC);
++	sge = kmalloc_array(nseg_new, sizeof(*sge), GFP_ATOMIC);
+ 	if (sge == NULL)
+ 		return -ENOMEM;
+ 
+diff --git a/drivers/scsi/aacraid/aacraid.h b/drivers/scsi/aacraid/aacraid.h
+index e3e4ecbea726..3733df77bc65 100644
+--- a/drivers/scsi/aacraid/aacraid.h
++++ b/drivers/scsi/aacraid/aacraid.h
+@@ -1929,7 +1929,7 @@ struct aac_raw_io2 {
+ 	u8		bpComplete;	/* reserved for F/W use */
+ 	u8		sgeFirstIndex;	/* reserved for F/W use */
+ 	u8		unused[4];
+-	struct sge_ieee1212	sge[1];
++	struct sge_ieee1212	sge[];
+ };
+ 
+ #define CT_FLUSH_CACHE 129
+-- 
+2.31.1
+
