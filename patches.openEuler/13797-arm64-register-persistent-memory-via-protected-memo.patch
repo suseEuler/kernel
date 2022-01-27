@@ -1,0 +1,261 @@
+From db4cd75bc674e6f473c0a7303b1744155352882c Mon Sep 17 00:00:00 2001
+From: Zhuling <zhuling8@huawei.com>
+Date: Sat, 22 Jan 2022 17:58:47 +0800
+Subject: [PATCH] arm64: register persistent memory via protected memory
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: db4cd75bc674e6f473c0a7303b1744155352882c
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4O31I
+
+----------------------------
+
+This patch is to support persistent memory(legacy) register on arm64.
+
+Firstly, support memory region marked as protected memory, which
+removed from memblock, the ranges for persistent memory are described
+by the 'memmap=nn[KMG]!ss[KMG]' kernel parameter", then they will
+be passed to the 'pmem' driver so they can be used for persistent
+storage. For now, the maximum memory regions supported is 8.
+
+Secondly, add ARM64_PMEM_LEGACY Kconfig to select PMEM_LEGACY and
+PMEM_LEGACY_DEVICE to reuse the nvdimm resource discovery and pmem
+device registering mechanism provided by pmem_legacy.c and e820.c.
+
+Note, the functions in those file should not only used by x86, but
+the file and function naming is x86 specific, will update after this
+feature upstreamed.
+
+Here are steps to show how to use this feature on arm64,
+1. setup the memmap kernel parameter, memmap=nn[KMG]!ss[KMG],
+   eg, memmap=100K!0x1a0000000.
+2. load nd_e820.ko driver, modprobe nd_e820.
+3. check pmem device in /dev, eg, /dev/pmem0
+
+Signed-off-by: Zhuling <zhuling8@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ .../admin-guide/kernel-parameters.txt         |  7 +-
+ arch/arm64/Kconfig                            | 18 +++++
+ arch/arm64/kernel/setup.c                     |  4 ++
+ arch/arm64/mm/Makefile                        |  2 +
+ arch/arm64/mm/init.c                          |  7 ++
+ arch/arm64/mm/pmem_reserve.c                  | 66 +++++++++++++++++++
+ arch/arm64/mm/pmem_reserve.h                  | 13 ++++
+ 7 files changed, 115 insertions(+), 2 deletions(-)
+ create mode 100644 arch/arm64/mm/pmem_reserve.c
+ create mode 100644 arch/arm64/mm/pmem_reserve.h
+
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index 5a0a68b35bb1..4b38e33741e4 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -2831,10 +2831,13 @@
+ 			will be eaten.
+ 
+ 	memmap=nn[KMG]!ss[KMG]
+-			[KNL,X86] Mark specific memory as protected.
++			[KNL,X86,ARM64] Mark specific memory as protected.
+ 			Region of memory to be used, from ss to ss+nn.
+-			The memory region may be marked as e820 type 12 (0xc)
++			[X86] The memory region may be marked as e820 type 12 (0xc)
+ 			and is NVDIMM or ADR memory.
++			[ARM64] The maximum memory regions supported is 8.
++			Example:
++				memmap=100K!0x1a0000000
+ 
+ 	memmap=<size>%<offset>-<oldtype>+<newtype>
+ 			[KNL,ACPI] Convert memory within the specified region
+diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
+index 2cab963563d9..e0c2f9a1a256 100644
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -1325,6 +1325,24 @@ config RODATA_FULL_DEFAULT_ENABLED
+ 	  This requires the linear region to be mapped down to pages,
+ 	  which may adversely affect performance in some cases.
+ 
++config ARM64_PMEM_RESERVE
++	bool
++
++config ARM64_PMEM_LEGACY
++	tristate "Support Persistent Memory (legacy) register via protected memory"
++	depends on BLK_DEV
++	select ARM64_PMEM_RESERVE
++	select PMEM_LEGACY
++	select PMEM_LEGACY_DEVICE
++	select LIBNVDIMM
++	help
++	  Protected memory ranges for persistent memory are described by the
++	  'memmap=nn[KMG]!ss[KMG]' kernel parameter".
++	  The kernel will offer those memory regions to the 'pmem' driver so
++	  they can be used for persistent storage.
++
++	  Say Y if unsure.
++
+ config ARM64_SW_TTBR0_PAN
+ 	bool "Emulate Privileged Access Never using TTBR0_EL1 switching"
+ 	help
+diff --git a/arch/arm64/kernel/setup.c b/arch/arm64/kernel/setup.c
+index 58d69e2e7538..5e0713f5120e 100644
+--- a/arch/arm64/kernel/setup.c
++++ b/arch/arm64/kernel/setup.c
+@@ -52,6 +52,8 @@
+ #include <asm/xen/hypervisor.h>
+ #include <asm/mmu_context.h>
+ 
++#include "../mm/pmem_reserve.h"
++
+ static int num_standard_resources;
+ static struct resource *standard_resources;
+ 
+@@ -297,6 +299,8 @@ static void __init request_standard_resources(void)
+ 
+ 		request_pin_mem_res(res);
+ 	}
++
++	request_pmem_res_resource();
+ }
+ 
+ static int __init reserve_memblock_reserved_regions(void)
+diff --git a/arch/arm64/mm/Makefile b/arch/arm64/mm/Makefile
+index 5ead3c3de3b6..42e107d6da4f 100644
+--- a/arch/arm64/mm/Makefile
++++ b/arch/arm64/mm/Makefile
+@@ -13,3 +13,5 @@ KASAN_SANITIZE_physaddr.o	+= n
+ 
+ obj-$(CONFIG_KASAN)		+= kasan_init.o
+ KASAN_SANITIZE_kasan_init.o	:= n
++
++obj-$(CONFIG_ARM64_PMEM_RESERVE)	+= pmem_reserve.o
+diff --git a/arch/arm64/mm/init.c b/arch/arm64/mm/init.c
+index 1364d52cbaa8..5ab9dd7d55d9 100644
+--- a/arch/arm64/mm/init.c
++++ b/arch/arm64/mm/init.c
+@@ -45,6 +45,8 @@
+ #include <asm/tlb.h>
+ #include <asm/alternative.h>
+ 
++#include "pmem_reserve.h"
++
+ /*
+  * We need to be able to catch inadvertent references to memstart_addr
+  * that occur (potentially in generic code) before arm64_memblock_init()
+@@ -394,6 +396,9 @@ static int __init parse_memmap_one(char *p)
+ 		start_at = memparse(p + 1, &p);
+ 		memblock_reserve(start_at, mem_size);
+ 		memblock_mark_memmap(start_at, mem_size);
++	} else if (*p == '!') {
++		start_at = memparse(p + 1, &p);
++		setup_reserve_pmem(start_at, mem_size);
+ 	} else
+ 		pr_info("Unrecognized memmap option, please check the parameter.\n");
+ 
+@@ -590,6 +595,8 @@ void __init bootmem_init(void)
+ 	reserve_quick_kexec();
+ #endif
+ 
++	reserve_pmem();
++
+ 	reserve_pin_memory_res();
+ 
+ 	memblock_dump_all();
+diff --git a/arch/arm64/mm/pmem_reserve.c b/arch/arm64/mm/pmem_reserve.c
+new file mode 100644
+index 000000000000..70fec28409ad
+--- /dev/null
++++ b/arch/arm64/mm/pmem_reserve.c
+@@ -0,0 +1,66 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#define pr_fmt(fmt) "pmem_reserve: " fmt
++
++#include <linux/memblock.h>
++#include <linux/ioport.h>
++#include <linux/types.h>
++
++#define MAX_REGIONS 8
++static int pmem_res_cnt;
++struct resource pmem_res[MAX_REGIONS];
++
++void __init setup_reserve_pmem(u64 start, u64 size)
++{
++	if (pmem_res_cnt >= MAX_REGIONS) {
++		pr_err("protected memory regions above upper limit %d\n", MAX_REGIONS);
++		return;
++	}
++
++	pmem_res[pmem_res_cnt].start = start;
++	pmem_res[pmem_res_cnt].end = start + size - 1;
++	pmem_res_cnt++;
++}
++
++void __init request_pmem_res_resource(void)
++{
++	struct resource *res;
++	int i;
++
++	for (i = 0; i < pmem_res_cnt; i++) {
++		res = &pmem_res[i];
++		res->name = "Persistent Memory (legacy)";
++		res->flags = IORESOURCE_MEM;
++		res->desc = IORES_DESC_PERSISTENT_MEMORY_LEGACY;
++		if (res->start && res->end)
++			request_resource(&iomem_resource, res);
++	}
++}
++
++void __init reserve_pmem(void)
++{
++	struct resource *res;
++	phys_addr_t size;
++	int i;
++
++	for (i = 0; i < pmem_res_cnt; i++) {
++		res = &pmem_res[i];
++		size = res->end - res->start;
++		if (!memblock_is_region_memory(res->start, size)) {
++			pr_warn("region[%pa-%pa] is not in memory\n",
++				&res->start, &res->end);
++			res->start = res->end = 0;
++			continue;
++		}
++
++		if (memblock_is_region_reserved(res->start, size)) {
++			pr_warn("region[%pa-%pa] overlaps reserved memory\n",
++				&res->start, &res->end);
++			res->start = res->end = 0;
++			continue;
++		}
++
++		memblock_remove(res->start, size);
++		pr_info("region %d: [%pa-%pa] (%lluMB)\n", i, &res->start, &res->end, size >> 20);
++	}
++}
+diff --git a/arch/arm64/mm/pmem_reserve.h b/arch/arm64/mm/pmem_reserve.h
+new file mode 100644
+index 000000000000..d143198c9696
+--- /dev/null
++++ b/arch/arm64/mm/pmem_reserve.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++#include <linux/types.h>
++
++#ifdef CONFIG_ARM64_PMEM_RESERVE
++void __init setup_reserve_pmem(u64 start, u64 size);
++void __init reserve_pmem(void);
++void __init request_pmem_res_resource(void);
++#else
++static inline void __init setup_reserve_pmem(u64 start, u64 size) {}
++static inline void __init reserve_pmem(void) {}
++static inline void __init request_pmem_res_resource(void) {}
++#endif
+-- 
+2.26.2
+

@@ -1,0 +1,197 @@
+From 88ecee4ba0fd8d3d93c2f27edb319699795b72d8 Mon Sep 17 00:00:00 2001
+From: Zhuling <zhuling8@huawei.com>
+Date: Sat, 22 Jan 2022 17:58:46 +0800
+Subject: [PATCH] x86: pmem: move persistent memory(legacy) code into nvdimm
+MIME-Version: 1.0
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 88ecee4ba0fd8d3d93c2f27edb319699795b72d8
+Modified-by-SEL: No
+
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4O31I
+
+-------------------------
+
+Move x86's pmem.c into nvdimm, and rename X86_PMEM_LEGACY_DEVICE to
+PMEM_LEGACY_DEVICE, also add PMEM_LEGACY to control the built of
+nd_e820.o, then the code could be reused by other architectures.
+
+Note，this patch fixs the nd_e820.c build introduced by commit 2499317e408e
+("arm64: Revert feature: Add memmap parameter and register pmem").
+
+Signed-off-by: Zhuling <zhuling8@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/Kconfig                    |  6 ++----
+ arch/x86/kernel/Makefile            |  1 -
+ arch/x86/kernel/pmem.c              | 32 -----------------------------
+ drivers/nvdimm/Kconfig              |  6 ++++++
+ drivers/nvdimm/Makefile             |  2 ++
+ drivers/nvdimm/pmem_legacy_device.c | 32 +++++++++++++++++++++++++++++
+ tools/testing/nvdimm/Kbuild         |  2 +-
+ 7 files changed, 43 insertions(+), 38 deletions(-)
+ delete mode 100644 arch/x86/kernel/pmem.c
+ create mode 100644 drivers/nvdimm/pmem_legacy_device.c
+
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index c77ef59d7bf2..1d3176a41a29 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -1667,14 +1667,12 @@ config ILLEGAL_POINTER_VALUE
+ 	default 0 if X86_32
+ 	default 0xdead000000000000 if X86_64
+ 
+-config X86_PMEM_LEGACY_DEVICE
+-	bool
+-
+ config X86_PMEM_LEGACY
+ 	tristate "Support non-standard NVDIMMs and ADR protected memory"
+ 	depends on PHYS_ADDR_T_64BIT
+ 	depends on BLK_DEV
+-	select X86_PMEM_LEGACY_DEVICE
++	select PMEM_LEGACY
++	select PMEM_LEGACY_DEVICE
+ 	select NUMA_KEEP_MEMINFO if NUMA
+ 	select LIBNVDIMM
+ 	help
+diff --git a/arch/x86/kernel/Makefile b/arch/x86/kernel/Makefile
+index f0606f816aa8..1e127514c824 100644
+--- a/arch/x86/kernel/Makefile
++++ b/arch/x86/kernel/Makefile
+@@ -130,7 +130,6 @@ obj-$(CONFIG_KVM_GUEST)		+= kvm.o kvmclock.o
+ obj-$(CONFIG_PARAVIRT)		+= paravirt.o paravirt_patch.o
+ obj-$(CONFIG_PARAVIRT_SPINLOCKS)+= paravirt-spinlocks.o
+ obj-$(CONFIG_PARAVIRT_CLOCK)	+= pvclock.o
+-obj-$(CONFIG_X86_PMEM_LEGACY_DEVICE) += pmem.o
+ 
+ obj-$(CONFIG_JAILHOUSE_GUEST)	+= jailhouse.o
+ 
+diff --git a/arch/x86/kernel/pmem.c b/arch/x86/kernel/pmem.c
+deleted file mode 100644
+index 6b07faaa1579..000000000000
+--- a/arch/x86/kernel/pmem.c
++++ /dev/null
+@@ -1,32 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0
+-/*
+- * Copyright (c) 2015, Christoph Hellwig.
+- * Copyright (c) 2015, Intel Corporation.
+- */
+-#include <linux/platform_device.h>
+-#include <linux/init.h>
+-#include <linux/ioport.h>
+-
+-static int found(struct resource *res, void *data)
+-{
+-	return 1;
+-}
+-
+-static __init int register_e820_pmem(void)
+-{
+-	struct platform_device *pdev;
+-	int rc;
+-
+-	rc = walk_iomem_res_desc(IORES_DESC_PERSISTENT_MEMORY_LEGACY,
+-				 IORESOURCE_MEM, 0, -1, NULL, found);
+-	if (rc <= 0)
+-		return 0;
+-
+-	/*
+-	 * See drivers/nvdimm/e820.c for the implementation, this is
+-	 * simply here to trigger the module to load on demand.
+-	 */
+-	pdev = platform_device_alloc("e820_pmem", -1);
+-	return platform_device_add(pdev);
+-}
+-device_initcall(register_e820_pmem);
+diff --git a/drivers/nvdimm/Kconfig b/drivers/nvdimm/Kconfig
+index b7d1eb38b27d..632b6eda5252 100644
+--- a/drivers/nvdimm/Kconfig
++++ b/drivers/nvdimm/Kconfig
+@@ -19,6 +19,12 @@ menuconfig LIBNVDIMM
+ 
+ if LIBNVDIMM
+ 
++config PMEM_LEGACY
++	tristate
++
++config PMEM_LEGACY_DEVICE
++	bool
++
+ config BLK_DEV_PMEM
+ 	tristate "PMEM: Persistent memory block device support"
+ 	default LIBNVDIMM
+diff --git a/drivers/nvdimm/Makefile b/drivers/nvdimm/Makefile
+index 04077532f7ed..2098221f1c90 100644
+--- a/drivers/nvdimm/Makefile
++++ b/drivers/nvdimm/Makefile
+@@ -3,6 +3,8 @@ obj-$(CONFIG_LIBNVDIMM) += libnvdimm.o
+ obj-$(CONFIG_BLK_DEV_PMEM) += nd_pmem.o
+ obj-$(CONFIG_ND_BTT) += nd_btt.o
+ obj-$(CONFIG_ND_BLK) += nd_blk.o
++obj-$(CONFIG_PMEM_LEGACY_DEVICE) += pmem_legacy_device.o
++obj-$(CONFIG_PMEM_LEGACY) += nd_e820.o
+ obj-$(CONFIG_OF_PMEM) += of_pmem.o
+ obj-$(CONFIG_VIRTIO_PMEM) += virtio_pmem.o nd_virtio.o
+ 
+diff --git a/drivers/nvdimm/pmem_legacy_device.c b/drivers/nvdimm/pmem_legacy_device.c
+new file mode 100644
+index 000000000000..6b07faaa1579
+--- /dev/null
++++ b/drivers/nvdimm/pmem_legacy_device.c
+@@ -0,0 +1,32 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (c) 2015, Christoph Hellwig.
++ * Copyright (c) 2015, Intel Corporation.
++ */
++#include <linux/platform_device.h>
++#include <linux/init.h>
++#include <linux/ioport.h>
++
++static int found(struct resource *res, void *data)
++{
++	return 1;
++}
++
++static __init int register_e820_pmem(void)
++{
++	struct platform_device *pdev;
++	int rc;
++
++	rc = walk_iomem_res_desc(IORES_DESC_PERSISTENT_MEMORY_LEGACY,
++				 IORESOURCE_MEM, 0, -1, NULL, found);
++	if (rc <= 0)
++		return 0;
++
++	/*
++	 * See drivers/nvdimm/e820.c for the implementation, this is
++	 * simply here to trigger the module to load on demand.
++	 */
++	pdev = platform_device_alloc("e820_pmem", -1);
++	return platform_device_add(pdev);
++}
++device_initcall(register_e820_pmem);
+diff --git a/tools/testing/nvdimm/Kbuild b/tools/testing/nvdimm/Kbuild
+index 47f9cc9dcd94..77aa117fbd11 100644
+--- a/tools/testing/nvdimm/Kbuild
++++ b/tools/testing/nvdimm/Kbuild
+@@ -28,7 +28,7 @@ obj-$(CONFIG_LIBNVDIMM) += libnvdimm.o
+ obj-$(CONFIG_BLK_DEV_PMEM) += nd_pmem.o
+ obj-$(CONFIG_ND_BTT) += nd_btt.o
+ obj-$(CONFIG_ND_BLK) += nd_blk.o
+-obj-$(CONFIG_X86_PMEM_LEGACY) += nd_e820.o
++obj-$(CONFIG_PMEM_LEGACY) += nd_e820.o
+ obj-$(CONFIG_ACPI_NFIT) += nfit.o
+ ifeq ($(CONFIG_DAX),m)
+ obj-$(CONFIG_DAX) += dax.o
+-- 
+2.26.2
+

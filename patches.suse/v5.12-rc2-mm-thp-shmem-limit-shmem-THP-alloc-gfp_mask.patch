@@ -1,0 +1,156 @@
+From 164cc4fef4456727466f8e35bb654c3994748070 Mon Sep 17 00:00:00 2001
+From: Rik van Riel <riel@surriel.com>
+Date: Thu, 25 Feb 2021 17:16:18 -0800
+Subject: [PATCH] mm,thp,shmem: limit shmem THP alloc gfp_mask
+Git-commit: 164cc4fef4456727466f8e35bb654c3994748070
+Patch-mainline: v5.12-rc2
+References: bsn#12
+Modified-by-SEL: No
+
+
+Patch series "mm,thp,shm: limit shmem THP alloc gfp_mask", v6.
+
+The allocation flags of anonymous transparent huge pages can be controlled
+through the files in /sys/kernel/mm/transparent_hugepage/defrag, which can
+help the system from getting bogged down in the page reclaim and
+compaction code when many THPs are getting allocated simultaneously.
+
+However, the gfp_mask for shmem THP allocations were not limited by those
+configuration settings, and some workloads ended up with all CPUs stuck on
+the LRU lock in the page reclaim code, trying to allocate dozens of THPs
+simultaneously.
+
+This patch applies the same configurated limitation of THPs to shmem
+hugepage allocations, to prevent that from happening.
+
+This way a THP defrag setting of "never" or "defer+madvise" will result in
+quick allocation failures without direct reclaim when no 2MB free pages
+are available.
+
+With this patch applied, THP allocations for tmpfs will be a little more
+aggressive than today for files mmapped with MADV_HUGEPAGE, and a little
+less aggressive for files that are not mmapped or mapped without that
+flag.
+
+This patch (of 4):
+
+The allocation flags of anonymous transparent huge pages can be controlled
+through the files in /sys/kernel/mm/transparent_hugepage/defrag, which can
+help the system from getting bogged down in the page reclaim and
+compaction code when many THPs are getting allocated simultaneously.
+
+However, the gfp_mask for shmem THP allocations were not limited by those
+configuration settings, and some workloads ended up with all CPUs stuck on
+the LRU lock in the page reclaim code, trying to allocate dozens of THPs
+simultaneously.
+
+This patch applies the same configurated limitation of THPs to shmem
+hugepage allocations, to prevent that from happening.
+
+Controlling the gfp_mask of THP allocations through the knobs in sysfs
+allows users to determine the balance between how aggressively the system
+tries to allocate THPs at fault time, and how much the application may end
+up stalling attempting those allocations.
+
+This way a THP defrag setting of "never" or "defer+madvise" will result in
+quick allocation failures without direct reclaim when no 2MB free pages
+are available.
+
+With this patch applied, THP allocations for tmpfs will be a little more
+aggressive than today for files mmapped with MADV_HUGEPAGE, and a little
+less aggressive for files that are not mmapped or mapped without that
+flag.
+
+Link: https://lkml.kernel.org/r/20201124194925.623931-1-riel@surriel.com
+Link: https://lkml.kernel.org/r/20201124194925.623931-2-riel@surriel.com
+Signed-off-by: Rik van Riel <riel@surriel.com>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: Xu Yu <xuyu@linux.alibaba.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Hugh Dickins <hughd@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/gfp.h | 2 ++
+ mm/huge_memory.c    | 6 +++---
+ mm/shmem.c          | 8 +++++---
+ 3 files changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/include/linux/gfp.h b/include/linux/gfp.h
+index 220cd553a9e7..8572a1474e16 100644
+--- a/include/linux/gfp.h
++++ b/include/linux/gfp.h
+@@ -634,6 +634,8 @@ bool gfp_pfmemalloc_allowed(gfp_t gfp_mask);
+ extern void pm_restrict_gfp_mask(void);
+ extern void pm_restore_gfp_mask(void);
+ 
++extern gfp_t vma_thp_gfp_mask(struct vm_area_struct *vma);
++
+ #ifdef CONFIG_PM_SLEEP
+ extern bool pm_suspended_storage(void);
+ #else
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index d77605c30f2e..395c75111d33 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -668,9 +668,9 @@ static vm_fault_t __do_huge_pmd_anonymous_page(struct vm_fault *vmf,
+  *	    available
+  * never: never stall for any thp allocation
+  */
+-static inline gfp_t alloc_hugepage_direct_gfpmask(struct vm_area_struct *vma)
++gfp_t vma_thp_gfp_mask(struct vm_area_struct *vma)
+ {
+-	const bool vma_madvised = !!(vma->vm_flags & VM_HUGEPAGE);
++	const bool vma_madvised = vma && (vma->vm_flags & VM_HUGEPAGE);
+ 
+ 	/* Always do synchronous compaction */
+ 	if (test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_DIRECT_FLAG, &transparent_hugepage_flags))
+@@ -762,7 +762,7 @@ vm_fault_t do_huge_pmd_anonymous_page(struct vm_fault *vmf)
+ 		}
+ 		return ret;
+ 	}
+-	gfp = alloc_hugepage_direct_gfpmask(vma);
++	gfp = vma_thp_gfp_mask(vma);
+ 	page = alloc_hugepage_vma(gfp, vma, haddr, HPAGE_PMD_ORDER);
+ 	if (unlikely(!page)) {
+ 		count_vm_event(THP_FAULT_FALLBACK);
+diff --git a/mm/shmem.c b/mm/shmem.c
+index ee8f21832f98..596009a44431 100644
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -1519,8 +1519,8 @@ static struct page *shmem_alloc_hugepage(gfp_t gfp,
+ 		return NULL;
+ 
+ 	shmem_pseudo_vma_init(&pvma, info, hindex);
+-	page = alloc_pages_vma(gfp | __GFP_COMP | __GFP_NORETRY | __GFP_NOWARN,
+-			HPAGE_PMD_ORDER, &pvma, 0, numa_node_id(), true);
++	page = alloc_pages_vma(gfp, HPAGE_PMD_ORDER, &pvma, 0, numa_node_id(),
++			       true);
+ 	shmem_pseudo_vma_destroy(&pvma);
+ 	if (page)
+ 		prep_transhuge_page(page);
+@@ -1776,6 +1776,7 @@ static int shmem_getpage_gfp(struct inode *inode, pgoff_t index,
+ 	struct page *page;
+ 	enum sgp_type sgp_huge = sgp;
+ 	pgoff_t hindex = index;
++	gfp_t huge_gfp;
+ 	int error;
+ 	int once = 0;
+ 	int alloced = 0;
+@@ -1862,7 +1863,8 @@ static int shmem_getpage_gfp(struct inode *inode, pgoff_t index,
+ 	}
+ 
+ alloc_huge:
+-	page = shmem_alloc_and_acct_page(gfp, inode, index, true);
++	huge_gfp = vma_thp_gfp_mask(vma);
++	page = shmem_alloc_and_acct_page(huge_gfp, inode, index, true);
+ 	if (IS_ERR(page)) {
+ alloc_nohuge:
+ 		page = shmem_alloc_and_acct_page(gfp, inode,
+-- 
+2.26.2
+

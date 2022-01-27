@@ -1,0 +1,89 @@
+From d9a1be1be331fc857d3fe29f86c3a305950b35a9 Mon Sep 17 00:00:00 2001
+From: "Steven Rostedt (VMware)" <rostedt@goodmis.org>
+Date: Mon, 8 Feb 2021 15:09:24 -0500
+Subject: [PATCH] tracepoints: Do not punish non static call users
+Git-commit: d9a1be1be331fc857d3fe29f86c3a305950b35a9
+Patch-mainline: v5.12-rc2
+References: bsn#12
+Modified-by-SEL: No
+
+
+With static calls, a tracepoint can call the callback directly if there is
+only one callback registered to that tracepoint. When there is more than
+one, the static call will call the tracepoint's "iterator" function, which
+needs to reload the tracepoint's "funcs" array again, as it could have
+changed since the first time it was loaded.
+
+But an arch without static calls is punished by having to load the
+tracepoint's "funcs" array twice. Once in the DO_TRACE macro, and once
+again in the iterator macro.
+
+For archs without static calls, there's no reason to load the array macro
+in the first place, since the iterator function will do it anyway.
+
+Change the __DO_TRACE_CALL() macro to do the load and call of the
+tracepoints funcs array only for architectures with static calls, and just
+call the iterator function directly for architectures without static calls.
+
+Link: https://lkml.kernel.org/r/20210208201050.909329787@goodmis.org
+
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/tracepoint.h | 23 +++++++++++++----------
+ 1 file changed, 13 insertions(+), 10 deletions(-)
+
+diff --git a/include/linux/tracepoint.h b/include/linux/tracepoint.h
+index 42bb5b753b33..2aad1c10821a 100644
+--- a/include/linux/tracepoint.h
++++ b/include/linux/tracepoint.h
+@@ -152,9 +152,19 @@ static inline struct tracepoint *tracepoint_ptr_deref(tracepoint_ptr_t *p)
+ #ifdef TRACEPOINTS_ENABLED
+ 
+ #ifdef CONFIG_HAVE_STATIC_CALL
+-#define __DO_TRACE_CALL(name)	static_call(tp_func_##name)
++#define __DO_TRACE_CALL(name, args)					\
++	do {								\
++		struct tracepoint_func *it_func_ptr;			\
++		void *__data;						\
++		it_func_ptr =						\
++			rcu_dereference_raw((&__tracepoint_##name)->funcs); \
++		if (it_func_ptr) {					\
++			__data = (it_func_ptr)->data;			\
++			static_call(tp_func_##name)(__data, args);	\
++		}							\
++	} while (0)
+ #else
+-#define __DO_TRACE_CALL(name)	__traceiter_##name
++#define __DO_TRACE_CALL(name, args)	__traceiter_##name(NULL, args)
+ #endif /* CONFIG_HAVE_STATIC_CALL */
+ 
+ /*
+@@ -163,9 +173,7 @@ static inline struct tracepoint *tracepoint_ptr_deref(tracepoint_ptr_t *p)
+  */
+ #define __DO_TRACE(name, args, cond, rcuidle)				\
+ 	do {								\
+-		struct tracepoint_func *it_func_ptr;			\
+ 		int __maybe_unused __idx = 0;				\
+-		void *__data;						\
+ 									\
+ 		if (!(cond))						\
+ 			return;						\
+@@ -185,12 +193,7 @@ static inline struct tracepoint *tracepoint_ptr_deref(tracepoint_ptr_t *p)
+ 			rcu_irq_enter_irqson();				\
+ 		}							\
+ 									\
+-		it_func_ptr =						\
+-			rcu_dereference_raw((&__tracepoint_##name)->funcs); \
+-		if (it_func_ptr) {					\
+-			__data = (it_func_ptr)->data;			\
+-			__DO_TRACE_CALL(name)(__data, args);		\
+-		}							\
++		__DO_TRACE_CALL(name, TP_ARGS(args));			\
+ 									\
+ 		if (rcuidle) {						\
+ 			rcu_irq_exit_irqson();				\
+-- 
+2.26.2
+

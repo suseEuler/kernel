@@ -1,0 +1,75 @@
+From 78cc8cdc54008f54b79711fc027afc3564588a04 Mon Sep 17 00:00:00 2001
+From: Rik van Riel <riel@surriel.com>
+Date: Thu, 25 Feb 2021 17:16:22 -0800
+Subject: [PATCH] mm,thp,shm: limit gfp mask to no more than specified
+Git-commit: 78cc8cdc54008f54b79711fc027afc3564588a04
+Patch-mainline: v5.12-rc2
+References: bsn#12
+Modified-by-SEL: No
+
+
+Matthew Wilcox pointed out that the i915 driver opportunistically
+allocates tmpfs memory, but will happily reclaim some of its pool if no
+memory is available.
+
+Make sure the gfp mask used to opportunistically allocate a THP is always
+at least as restrictive as the original gfp mask.
+
+Link: https://lkml.kernel.org/r/20201124194925.623931-3-riel@surriel.com
+Signed-off-by: Rik van Riel <riel@surriel.com>
+Suggested-by: Matthew Wilcox <willy@infradead.org>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Xu Yu <xuyu@linux.alibaba.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/shmem.c | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/mm/shmem.c b/mm/shmem.c
+index 596009a44431..06c771d23127 100644
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -1505,6 +1505,26 @@ static struct page *shmem_swapin(swp_entry_t swap, gfp_t gfp,
+ 	return page;
+ }
+ 
++/*
++ * Make sure huge_gfp is always more limited than limit_gfp.
++ * Some of the flags set permissions, while others set limitations.
++ */
++static gfp_t limit_gfp_mask(gfp_t huge_gfp, gfp_t limit_gfp)
++{
++	gfp_t allowflags = __GFP_IO | __GFP_FS | __GFP_RECLAIM;
++	gfp_t denyflags = __GFP_NOWARN | __GFP_NORETRY;
++	gfp_t result = huge_gfp & ~allowflags;
++
++	/*
++	 * Minimize the result gfp by taking the union with the deny flags,
++	 * and the intersection of the allow flags.
++	 */
++	result |= (limit_gfp & denyflags);
++	result |= (huge_gfp & limit_gfp) & allowflags;
++
++	return result;
++}
++
+ static struct page *shmem_alloc_hugepage(gfp_t gfp,
+ 		struct shmem_inode_info *info, pgoff_t index)
+ {
+@@ -1864,6 +1884,7 @@ static int shmem_getpage_gfp(struct inode *inode, pgoff_t index,
+ 
+ alloc_huge:
+ 	huge_gfp = vma_thp_gfp_mask(vma);
++	huge_gfp = limit_gfp_mask(huge_gfp, gfp);
+ 	page = shmem_alloc_and_acct_page(huge_gfp, inode, index, true);
+ 	if (IS_ERR(page)) {
+ alloc_nohuge:
+-- 
+2.26.2
+

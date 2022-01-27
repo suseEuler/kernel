@@ -1,0 +1,127 @@
+From d01079f3d0c0a9e306ffbdb2694c5281bd9e065e Mon Sep 17 00:00:00 2001
+From: Mel Gorman <mgorman@techsingularity.net>
+Date: Wed, 30 Jun 2021 18:53:50 -0700
+Subject: [PATCH] mm/mmap_lock: remove dead code for !CONFIG_TRACING
+ configurations
+Git-commit: d01079f3d0c0a9e306ffbdb2694c5281bd9e065e
+Patch-mainline: v5.14-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+make W=1 generates the following warning in mmap_lock.c for allnoconfig
+
+  mm/mmap_lock.c:213:6: warning: no previous prototype for `__mmap_lock_do_trace_start_locking' [-Wmissing-prototypes]
+   void __mmap_lock_do_trace_start_locking(struct mm_struct *mm, bool write)
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  mm/mmap_lock.c:219:6: warning: no previous prototype for `__mmap_lock_do_trace_acquire_returned' [-Wmissing-prototypes]
+   void __mmap_lock_do_trace_acquire_returned(struct mm_struct *mm, bool write,
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  mm/mmap_lock.c:226:6: warning: no previous prototype for `__mmap_lock_do_trace_released' [-Wmissing-prototypes]
+   void __mmap_lock_do_trace_released(struct mm_struct *mm, bool write)
+
+On !CONFIG_TRACING configurations, the code is dead so put it behind an
+#ifdef.
+
+[cuibixuan@huawei.com: fix warning when CONFIG_TRACING is not defined]
+  Link: https://lkml.kernel.org/r/20210531033426.74031-1-cuibixuan@huawei.com
+
+Link: https://lkml.kernel.org/r/20210520084809.8576-13-mgorman@techsingularity.net
+Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+Signed-off-by: Bixuan Cui <cuibixuan@huawei.com>
+Reviewed-by: Yang Shi <shy828301@gmail.com>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: Dan Streetman <ddstreet@ieee.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Michal Hocko <mhocko@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/mmap_lock.c | 59 +++++++++++++++++++++++++++-----------------------
+ 1 file changed, 32 insertions(+), 27 deletions(-)
+
+diff --git a/mm/mmap_lock.c b/mm/mmap_lock.c
+index 2ae3f33b85b1..f5852a058ce0 100644
+--- a/mm/mmap_lock.c
++++ b/mm/mmap_lock.c
+@@ -153,6 +153,37 @@ static inline void put_memcg_path_buf(void)
+ 	rcu_read_unlock();
+ }
+ 
++#define TRACE_MMAP_LOCK_EVENT(type, mm, ...)                                   \
++	do {                                                                   \
++		const char *memcg_path;                                        \
++		preempt_disable();                                             \
++		memcg_path = get_mm_memcg_path(mm);                            \
++		trace_mmap_lock_##type(mm,                                     \
++				       memcg_path != NULL ? memcg_path : "",   \
++				       ##__VA_ARGS__);                         \
++		if (likely(memcg_path != NULL))                                \
++			put_memcg_path_buf();                                  \
++		preempt_enable();                                              \
++	} while (0)
++
++#else /* !CONFIG_MEMCG */
++
++int trace_mmap_lock_reg(void)
++{
++	return 0;
++}
++
++void trace_mmap_lock_unreg(void)
++{
++}
++
++#define TRACE_MMAP_LOCK_EVENT(type, mm, ...)                                   \
++	trace_mmap_lock_##type(mm, "", ##__VA_ARGS__)
++
++#endif /* CONFIG_MEMCG */
++
++#ifdef CONFIG_TRACING
++#ifdef CONFIG_MEMCG
+ /*
+  * Write the given mm_struct's memcg path to a percpu buffer, and return a
+  * pointer to it. If the path cannot be determined, or no buffer was available
+@@ -187,33 +218,6 @@ static const char *get_mm_memcg_path(struct mm_struct *mm)
+ 	return buf;
+ }
+ 
+-#define TRACE_MMAP_LOCK_EVENT(type, mm, ...)                                   \
+-	do {                                                                   \
+-		const char *memcg_path;                                        \
+-		local_lock(&memcg_paths.lock);				       \
+-		memcg_path = get_mm_memcg_path(mm);                            \
+-		trace_mmap_lock_##type(mm,                                     \
+-				       memcg_path != NULL ? memcg_path : "",   \
+-				       ##__VA_ARGS__);                         \
+-		if (likely(memcg_path != NULL))                                \
+-			put_memcg_path_buf();                                  \
+-		local_unlock(&memcg_paths.lock);			       \
+-	} while (0)
+-
+-#else /* !CONFIG_MEMCG */
+-
+-int trace_mmap_lock_reg(void)
+-{
+-	return 0;
+-}
+-
+-void trace_mmap_lock_unreg(void)
+-{
+-}
+-
+-#define TRACE_MMAP_LOCK_EVENT(type, mm, ...)                                   \
+-	trace_mmap_lock_##type(mm, "", ##__VA_ARGS__)
+-
+ #endif /* CONFIG_MEMCG */
+ 
+ /*
+@@ -239,3 +243,4 @@ void __mmap_lock_do_trace_released(struct mm_struct *mm, bool write)
+ 	TRACE_MMAP_LOCK_EVENT(released, mm, write);
+ }
+ EXPORT_SYMBOL(__mmap_lock_do_trace_released);
++#endif /* CONFIG_TRACING */
+-- 
+2.26.2
+
