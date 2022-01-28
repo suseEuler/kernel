@@ -6,6 +6,8 @@ fi
 
 patch=$1
 
+grep -q "Modified-by-SEL:" $patch && exit
+
 openeuler_commit=$(grep -r "openEuler-commit:" $patch | awk '{ print $2 }')
 if [ "$openeuler_commit" = "" ]; then
 	tag="No"
