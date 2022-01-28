@@ -1,0 +1,171 @@
+From fca6116564181a76c32bf89a0452585f5cb10004 Mon Sep 17 00:00:00 2001
+From: Len Baker <len.baker@gmx.com>
+Date: Fri, 3 Sep 2021 17:05:39 +0200
+Subject: [PATCH] EDAC/mc: Replace strcpy(), sprintf() and snprintf() with
+ strscpy() or scnprintf()
+Git-commit: fca6116564181a76c32bf89a0452585f5cb10004
+Patch-mainline: v5.16-rc1
+References: bsn#84
+Modified-by-SEL: No
+
+
+strcpy() performs no bounds checking on the destination buffer. This
+could result in linear overflows beyond the end of the buffer, leading
+to all kinds of misbehavior. The safe replacement is strscpy().
+[1][2]
+
+However, to simplify and clarify the code, to concatenate labels use the
+scnprintf() function. This way it is not necessary to check the return
+value of strscpy() (-E2BIG if the parameter count is 0 or the src was
+truncated) since scnprintf() always returns the number of chars written
+into the buffer. This function always returns a nul-terminated string
+even if it needs to be truncated.
+
+While at it, fix all other broken string generation code that wrongly
+interprets snprintf()'s return code or just uses sprintf(), implement
+that using scnprintf() here too. Drop breaks in loops around
+scnprintf() as it is safe now to loop.
+
+Moreover, the check is not needed: for the case when the buffer is
+exhausted, len never gets zero because scnprintf() takes the full buffer
+length as input parameter, but excludes the trailing '\0' in its return
+code and thus, 1 is the minimum len.
+
+[1] https://www.kernel.org/doc/html/latest/process/deprecated.html#strcpy
+[2] https://github.com/KSPP/linux/issues/88
+
+ [ rric: Replace snprintf() with scnprintf(), rework sprintf() user,
+   drop breaks in loops around scnprintf(), introduce 'end' pointer to
+   reduce pointer arithmetic, use prefix pattern for e->location,
+   adjust subject and description ]
+
+Co-developed-by: Joe Perches <joe@perches.com>
+Signed-off-by: Joe Perches <joe@perches.com>
+Signed-off-by: Len Baker <len.baker@gmx.com>
+Signed-off-by: Robert Richter <rrichter@amd.com>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20210903150539.7282-1-len.baker@gmx.com
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/edac/edac_mc.c | 42 ++++++++++++++++++------------------------
+ 1 file changed, 18 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/edac/edac_mc.c b/drivers/edac/edac_mc.c
+index 2c5975674723..9f82ca295353 100644
+--- a/drivers/edac/edac_mc.c
++++ b/drivers/edac/edac_mc.c
+@@ -66,14 +66,12 @@ unsigned int edac_dimm_info_location(struct dimm_info *dimm, char *buf,
+ 	char *p = buf;
+ 
+ 	for (i = 0; i < mci->n_layers; i++) {
+-		n = snprintf(p, len, "%s %d ",
++		n = scnprintf(p, len, "%s %d ",
+ 			      edac_layer_name[mci->layers[i].type],
+ 			      dimm->location[i]);
+ 		p += n;
+ 		len -= n;
+ 		count += n;
+-		if (!len)
+-			break;
+ 	}
+ 
+ 	return count;
+@@ -341,19 +339,16 @@ static int edac_mc_alloc_dimms(struct mem_ctl_info *mci)
+ 		 */
+ 		len = sizeof(dimm->label);
+ 		p = dimm->label;
+-		n = snprintf(p, len, "mc#%u", mci->mc_idx);
++		n = scnprintf(p, len, "mc#%u", mci->mc_idx);
+ 		p += n;
+ 		len -= n;
+ 		for (layer = 0; layer < mci->n_layers; layer++) {
+-			n = snprintf(p, len, "%s#%u",
+-				     edac_layer_name[mci->layers[layer].type],
+-				     pos[layer]);
++			n = scnprintf(p, len, "%s#%u",
++				      edac_layer_name[mci->layers[layer].type],
++				      pos[layer]);
+ 			p += n;
+ 			len -= n;
+ 			dimm->location[layer] = pos[layer];
+-
+-			if (len <= 0)
+-				break;
+ 		}
+ 
+ 		/* Link it to the csrows old API data */
+@@ -1027,12 +1022,13 @@ void edac_mc_handle_error(const enum hw_event_mc_err_type type,
+ 			  const char *other_detail)
+ {
+ 	struct dimm_info *dimm;
+-	char *p;
++	char *p, *end;
+ 	int row = -1, chan = -1;
+ 	int pos[EDAC_MAX_LAYERS] = { top_layer, mid_layer, low_layer };
+ 	int i, n_labels = 0;
+ 	struct edac_raw_error_desc *e = &mci->error_desc;
+ 	bool any_memory = true;
++	const char *prefix;
+ 
+ 	edac_dbg(3, "MC%d\n", mci->mc_idx);
+ 
+@@ -1087,6 +1083,8 @@ void edac_mc_handle_error(const enum hw_event_mc_err_type type,
+ 	 */
+ 	p = e->label;
+ 	*p = '\0';
++	end = p + sizeof(e->label);
++	prefix = "";
+ 
+ 	mci_for_each_dimm(mci, dimm) {
+ 		if (top_layer >= 0 && top_layer != dimm->location[0])
+@@ -1114,12 +1112,8 @@ void edac_mc_handle_error(const enum hw_event_mc_err_type type,
+ 			p = e->label;
+ 			*p = '\0';
+ 		} else {
+-			if (p != e->label) {
+-				strcpy(p, OTHER_LABEL);
+-				p += strlen(OTHER_LABEL);
+-			}
+-			strcpy(p, dimm->label);
+-			p += strlen(p);
++			p += scnprintf(p, end - p, "%s%s", prefix, dimm->label);
++			prefix = OTHER_LABEL;
+ 		}
+ 
+ 		/*
+@@ -1141,25 +1135,25 @@ void edac_mc_handle_error(const enum hw_event_mc_err_type type,
+ 	}
+ 
+ 	if (any_memory)
+-		strcpy(e->label, "any memory");
++		strscpy(e->label, "any memory", sizeof(e->label));
+ 	else if (!*e->label)
+-		strcpy(e->label, "unknown memory");
++		strscpy(e->label, "unknown memory", sizeof(e->label));
+ 
+ 	edac_inc_csrow(e, row, chan);
+ 
+ 	/* Fill the RAM location data */
+ 	p = e->location;
++	end = p + sizeof(e->location);
++	prefix = "";
+ 
+ 	for (i = 0; i < mci->n_layers; i++) {
+ 		if (pos[i] < 0)
+ 			continue;
+ 
+-		p += sprintf(p, "%s:%d ",
+-			     edac_layer_name[mci->layers[i].type],
+-			     pos[i]);
++		p += scnprintf(p, end - p, "%s%s:%d", prefix,
++			       edac_layer_name[mci->layers[i].type], pos[i]);
++		prefix = " ";
+ 	}
+-	if (p > e->location)
+-		*(p - 1) = '\0';
+ 
+ 	edac_raw_mc_handle_error(e);
+ }
+-- 
+2.26.2
+
