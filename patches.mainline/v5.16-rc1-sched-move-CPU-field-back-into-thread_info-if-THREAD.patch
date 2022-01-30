@@ -1,0 +1,123 @@
+From e75571a4b264cd3887d059566113607f6b582e97 Mon Sep 17 00:00:00 2001
+From: Ard Biesheuvel <ardb@kernel.org>
+Date: Sat, 29 Jan 2022 00:22:50 +0800
+Subject: [PATCH] sched: move CPU field back into thread_info if
+ THREAD_INFO_IN_TASK=y
+Git-commit: bcf9033e5449bdcaa9bed46467a7141a8049dadb
+Patch-mainline: v5.16-rc1
+References: bsn#12
+Modified-by-SEL: Yes, referred to openEuler commit e75571a4b264cd3887d059566113607f6b582e97
+
+
+THREAD_INFO_IN_TASK moved the CPU field out of thread_info, but this
+causes some issues on architectures that define raw_smp_processor_id()
+in terms of this field, due to the fact that #include'ing linux/sched.h
+to get at struct task_struct is problematic in terms of circular
+dependencies.
+
+Given that thread_info and task_struct are the same data structure
+anyway when THREAD_INFO_IN_TASK=y, let's move it back so that having
+access to the type definition of struct thread_info is sufficient to
+reference the CPU number of the current task.
+
+Note that this requires THREAD_INFO_IN_TASK's definition of the
+task_thread_info() helper to be updated, as task_cpu() takes a
+pointer-to-const, whereas task_thread_info() (which is used to generate
+lvalues as well), needs a non-const pointer. So make it a macro instead.
+
+Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+Acked-by: Catalin Marinas <catalin.marinas@arm.com>
+Acked-by: Mark Rutland <mark.rutland@arm.com>
+Acked-by: Michael Ellerman <mpe@ellerman.id.au>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/powerpc/kernel/asm-offsets.c |  2 +-
+ arch/powerpc/kernel/smp.c         |  2 +-
+ include/linux/sched.h             | 13 +------------
+ kernel/sched/sched.h              |  4 ----
+ 4 files changed, 3 insertions(+), 18 deletions(-)
+
+diff --git a/arch/powerpc/kernel/asm-offsets.c b/arch/powerpc/kernel/asm-offsets.c
+index c5fe4be1c68a..760f656efcf6 100644
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@ -96,7 +96,7 @@ int main(void)
+ #endif /* CONFIG_PPC64 */
+ 	OFFSET(TASK_STACK, task_struct, stack);
+ #ifdef CONFIG_SMP
+-	OFFSET(TASK_CPU, task_struct, cpu);
++	OFFSET(TASK_CPU, task_struct, thread_info.cpu);
+ #endif
+ 
+ #ifdef CONFIG_LIVEPATCH
+diff --git a/arch/powerpc/kernel/smp.c b/arch/powerpc/kernel/smp.c
+index b7bed52a5a73..ab2d3446e628 100644
+--- a/arch/powerpc/kernel/smp.c
++++ b/arch/powerpc/kernel/smp.c
+@@ -1103,7 +1103,7 @@ static void cpu_idle_thread_init(unsigned int cpu, struct task_struct *idle)
+ 	paca_ptrs[cpu]->kstack = (unsigned long)task_stack_page(idle) +
+ 				 THREAD_SIZE - STACK_FRAME_OVERHEAD;
+ #endif
+-	idle->cpu = cpu;
++	task_thread_info(idle)->cpu = cpu;
+ 	secondary_current = current_set[cpu] = idle;
+ }
+ 
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 3bc2f15df252..5cd59c883522 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -694,10 +694,6 @@ struct task_struct {
+ #ifdef CONFIG_SMP
+ 	int				on_cpu;
+ 	struct __call_single_node	wake_entry;
+-#ifdef CONFIG_THREAD_INFO_IN_TASK
+-	/* Current CPU: */
+-	unsigned int			cpu;
+-#endif
+ 	unsigned int			wakee_flips;
+ 	unsigned long			wakee_flip_decay_ts;
+ 	struct task_struct		*last_wakee;
+@@ -1771,10 +1767,7 @@ extern struct thread_info init_thread_info;
+ extern unsigned long init_stack[THREAD_SIZE / sizeof(unsigned long)];
+ 
+ #ifdef CONFIG_THREAD_INFO_IN_TASK
+-static inline struct thread_info *task_thread_info(struct task_struct *task)
+-{
+-	return &task->thread_info;
+-}
++# define task_thread_info(task)	(&(task)->thread_info)
+ #elif !defined(__HAVE_THREAD_FUNCTIONS)
+ # define task_thread_info(task)	((struct thread_info *)(task)->stack)
+ #endif
+@@ -1970,11 +1963,7 @@ static __always_inline bool need_resched(void)
+ 
+ static inline unsigned int task_cpu(const struct task_struct *p)
+ {
+-#ifdef CONFIG_THREAD_INFO_IN_TASK
+-	return READ_ONCE(p->cpu);
+-#else
+ 	return READ_ONCE(task_thread_info(p)->cpu);
+-#endif
+ }
+ 
+ extern void set_task_cpu(struct task_struct *p, unsigned int cpu);
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 451440e36318..66be40862d99 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1652,11 +1652,7 @@ static inline void __set_task_cpu(struct task_struct *p, unsigned int cpu)
+ 	 * per-task data have been completed by this moment.
+ 	 */
+ 	smp_wmb();
+-#ifdef CONFIG_THREAD_INFO_IN_TASK
+-	WRITE_ONCE(p->cpu, cpu);
+-#else
+ 	WRITE_ONCE(task_thread_info(p)->cpu, cpu);
+-#endif
+ 	p->wake_cpu = cpu;
+ #endif
+ }
+-- 
+2.26.2
+
