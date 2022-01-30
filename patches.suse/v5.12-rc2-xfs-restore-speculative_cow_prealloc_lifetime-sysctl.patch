@@ -1,0 +1,143 @@
+From 89e0eb8c13bb842e224b27d7e071262cd84717cb Mon Sep 17 00:00:00 2001
+Message-Id: <89e0eb8c13bb842e224b27d7e071262cd84717cb.1643510669.git.geliang.tang@suse.com>
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Fri, 12 Feb 2021 09:14:47 -0800
+Subject: [PATCH] xfs: restore speculative_cow_prealloc_lifetime sysctl
+Git-commit: 89e0eb8c13bb842e224b27d7e071262cd84717cb
+Patch-mainline: v5.12-rc2
+References: bsn#12
+Modified-by-SEL: No
+
+In commit 9669f51de5c0 I tried to get rid of the undocumented cow gc
+lifetime knob.  The knob's function was never documented and it now
+doesn't really have a function since eof and cow gc have been
+consolidated.
+
+Regrettably, xfs/231 relies on it and regresses on for-next.  I did not
+succeed at getting far enough through fstests patch review for the fixup
+to land in time.
+
+Restore the sysctl knob, document what it did (does?), put it on the
+deprecation schedule, and rip out a redundant function.
+
+Fixes: 9669f51de5c0 ("xfs: consolidate the eofblocks and cowblocks workers")
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ Documentation/admin-guide/xfs.rst | 16 ++++++++------
+ fs/xfs/xfs_sysctl.c               | 35 +++++++++++++------------------
+ 2 files changed, 24 insertions(+), 27 deletions(-)
+
+diff --git a/Documentation/admin-guide/xfs.rst b/Documentation/admin-guide/xfs.rst
+index 6178153d3320..5422407a96d7 100644
+--- a/Documentation/admin-guide/xfs.rst
++++ b/Documentation/admin-guide/xfs.rst
+@@ -284,6 +284,9 @@ The following sysctls are available for the XFS filesystem:
+ 	removes unused preallocation from clean inodes and releases
+ 	the unused space back to the free pool.
+ 
++  fs.xfs.speculative_cow_prealloc_lifetime
++	This is an alias for speculative_prealloc_lifetime.
++
+   fs.xfs.error_level		(Min: 0  Default: 3  Max: 11)
+ 	A volume knob for error reporting when internal errors occur.
+ 	This will generate detailed messages & backtraces for filesystem
+@@ -356,12 +359,13 @@ The following sysctls are available for the XFS filesystem:
+ Deprecated Sysctls
+ ==================
+ 
+-===========================     ================
+-  Name				Removal Schedule
+-===========================     ================
+-fs.xfs.irix_sgid_inherit        September 2025
+-fs.xfs.irix_symlink_mode        September 2025
+-===========================     ================
++===========================================     ================
++  Name                                          Removal Schedule
++===========================================     ================
++fs.xfs.irix_sgid_inherit                        September 2025
++fs.xfs.irix_symlink_mode                        September 2025
++fs.xfs.speculative_cow_prealloc_lifetime        September 2025
++===========================================     ================
+ 
+ 
+ Removed Sysctls
+diff --git a/fs/xfs/xfs_sysctl.c b/fs/xfs/xfs_sysctl.c
+index 145e06c47744..546a6cd96729 100644
+--- a/fs/xfs/xfs_sysctl.c
++++ b/fs/xfs/xfs_sysctl.c
+@@ -51,7 +51,7 @@ xfs_panic_mask_proc_handler(
+ #endif /* CONFIG_PROC_FS */
+ 
+ STATIC int
+-xfs_deprecate_irix_sgid_inherit_proc_handler(
++xfs_deprecated_dointvec_minmax(
+ 	struct ctl_table	*ctl,
+ 	int			write,
+ 	void			*buffer,
+@@ -59,24 +59,8 @@ xfs_deprecate_irix_sgid_inherit_proc_handler(
+ 	loff_t			*ppos)
+ {
+ 	if (write) {
+-		printk_once(KERN_WARNING
+-				"XFS: " "%s sysctl option is deprecated.\n",
+-				ctl->procname);
+-	}
+-	return proc_dointvec_minmax(ctl, write, buffer, lenp, ppos);
+-}
+-
+-STATIC int
+-xfs_deprecate_irix_symlink_mode_proc_handler(
+-	struct ctl_table	*ctl,
+-	int			write,
+-	void			*buffer,
+-	size_t			*lenp,
+-	loff_t			*ppos)
+-{
+-	if (write) {
+-		printk_once(KERN_WARNING
+-				"XFS: " "%s sysctl option is deprecated.\n",
++		printk_ratelimited(KERN_WARNING
++				"XFS: %s sysctl option is deprecated.\n",
+ 				ctl->procname);
+ 	}
+ 	return proc_dointvec_minmax(ctl, write, buffer, lenp, ppos);
+@@ -88,7 +72,7 @@ static struct ctl_table xfs_table[] = {
+ 		.data		= &xfs_params.sgid_inherit.val,
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+-		.proc_handler	= xfs_deprecate_irix_sgid_inherit_proc_handler,
++		.proc_handler	= xfs_deprecated_dointvec_minmax,
+ 		.extra1		= &xfs_params.sgid_inherit.min,
+ 		.extra2		= &xfs_params.sgid_inherit.max
+ 	},
+@@ -97,7 +81,7 @@ static struct ctl_table xfs_table[] = {
+ 		.data		= &xfs_params.symlink_mode.val,
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+-		.proc_handler	= xfs_deprecate_irix_symlink_mode_proc_handler,
++		.proc_handler	= xfs_deprecated_dointvec_minmax,
+ 		.extra1		= &xfs_params.symlink_mode.min,
+ 		.extra2		= &xfs_params.symlink_mode.max
+ 	},
+@@ -201,6 +185,15 @@ static struct ctl_table xfs_table[] = {
+ 		.extra1		= &xfs_params.blockgc_timer.min,
+ 		.extra2		= &xfs_params.blockgc_timer.max,
+ 	},
++	{
++		.procname	= "speculative_cow_prealloc_lifetime",
++		.data		= &xfs_params.blockgc_timer.val,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= xfs_deprecated_dointvec_minmax,
++		.extra1		= &xfs_params.blockgc_timer.min,
++		.extra2		= &xfs_params.blockgc_timer.max,
++	},
+ 	/* please keep this the last entry */
+ #ifdef CONFIG_PROC_FS
+ 	{
+-- 
+2.31.1
+
