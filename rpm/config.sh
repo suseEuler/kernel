@@ -7,10 +7,10 @@ COMPRESS_MODULES="xz"
 # Use new style livepatch package names
 #LIVEPATCH=livepatch
 # Compile binary devicetrees for Leap
-BUILD_DTBS="Yes"
+BUILD_DTBS="No"
 # buildservice projects to build the kernel against
-OBS_PROJECT=openEuler.org:20.03:LTS:SP2
-OBS_PROJECT_ARM=openEuler.org:20.03:LTS:SP2
+OBS_PROJECT=SEL:2.0:Everything
+OBS_PROJECT_ARM=SEL:2.0:Everything
 # Bugzilla info
 #BUGZILLA_SERVER="apibugzilla.suse.com"
 #BUGZILLA_PRODUCT="SUSE Linux Enterprise Server 15 SP3"
