@@ -1,0 +1,233 @@
+From: Kai Liu <kai.liu@suse.com>
+Date: Tue, 8 Feb 2022 14:53:11 +0800
+Subject: [PATCH] Revert "psi: Fix uaf issue when psi trigger is destroyed
+ while being polled"
+Patch-mainline: Never, revert stable patch which is added again in sorted section
+References: bsn#83
+Modified-by-SEL: No
+
+This reverts commit d4e4e61d4a5b87bfc9953c306a11d35d869417fd.
+
+Signed-off-by: Kai Liu <kai.liu@suse.com>
+---
+ Documentation/accounting/psi.rst |  3 +-
+ include/linux/psi.h              |  2 +-
+ include/linux/psi_types.h        |  3 ++
+ kernel/cgroup/cgroup.c           | 11 ++----
+ kernel/sched/psi.c               | 66 ++++++++++++++++++--------------
+ 5 files changed, 45 insertions(+), 40 deletions(-)
+
+diff --git a/Documentation/accounting/psi.rst b/Documentation/accounting/psi.rst
+index 860fe651d645..f2b3439edcc2 100644
+--- a/Documentation/accounting/psi.rst
++++ b/Documentation/accounting/psi.rst
+@@ -92,8 +92,7 @@ Triggers can be set on more than one psi metric and more than one trigger
+ for the same psi metric can be specified. However for each trigger a separate
+ file descriptor is required to be able to poll it separately from others,
+ therefore for each trigger a separate open() syscall should be made even
+-when opening the same psi interface file. Write operations to a file descriptor
+-with an already existing psi trigger will fail with EBUSY.
++when opening the same psi interface file.
+ 
+ Monitors activate only when system enters stall state for the monitored
+ psi metric and deactivates upon exit from the stall state. While system is
+diff --git a/include/linux/psi.h b/include/linux/psi.h
+index db4ecfaab879..7361023f3fdd 100644
+--- a/include/linux/psi.h
++++ b/include/linux/psi.h
+@@ -33,7 +33,7 @@ void cgroup_move_task(struct task_struct *p, struct css_set *to);
+ 
+ struct psi_trigger *psi_trigger_create(struct psi_group *group,
+ 			char *buf, size_t nbytes, enum psi_res res);
+-void psi_trigger_destroy(struct psi_trigger *t);
++void psi_trigger_replace(void **trigger_ptr, struct psi_trigger *t);
+ 
+ __poll_t psi_trigger_poll(void **trigger_ptr, struct file *file,
+ 			poll_table *wait);
+diff --git a/include/linux/psi_types.h b/include/linux/psi_types.h
+index 17d74f62c181..b95f3211566a 100644
+--- a/include/linux/psi_types.h
++++ b/include/linux/psi_types.h
+@@ -128,6 +128,9 @@ struct psi_trigger {
+ 	 * events to one per window
+ 	 */
+ 	u64 last_event_time;
++
++	/* Refcounting to prevent premature destruction */
++	struct kref refcount;
+ };
+ 
+ struct psi_group {
+diff --git a/kernel/cgroup/cgroup.c b/kernel/cgroup/cgroup.c
+index 4927289a91a9..a86857edaa57 100644
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@ -3601,12 +3601,6 @@ static ssize_t cgroup_pressure_write(struct kernfs_open_file *of, char *buf,
+ 	cgroup_get(cgrp);
+ 	cgroup_kn_unlock(of->kn);
+ 
+-	/* Allow only one trigger per file descriptor */
+-	if (of->priv) {
+-		cgroup_put(cgrp);
+-		return -EBUSY;
+-	}
+-
+ 	psi = cgroup_ino(cgrp) == 1 ? &psi_system : &cgrp->psi;
+ 	new = psi_trigger_create(psi, buf, nbytes, res);
+ 	if (IS_ERR(new)) {
+@@ -3614,7 +3608,8 @@ static ssize_t cgroup_pressure_write(struct kernfs_open_file *of, char *buf,
+ 		return PTR_ERR(new);
+ 	}
+ 
+-	smp_store_release(&of->priv, new);
++	psi_trigger_replace(&of->priv, new);
++
+ 	cgroup_put(cgrp);
+ 
+ 	return nbytes;
+@@ -3649,7 +3644,7 @@ static __poll_t cgroup_pressure_poll(struct kernfs_open_file *of,
+ 
+ static void cgroup_pressure_release(struct kernfs_open_file *of)
+ {
+-	psi_trigger_destroy(of->priv);
++	psi_trigger_replace(&of->priv, NULL);
+ }
+ #endif /* CONFIG_PSI */
+ 
+diff --git a/kernel/sched/psi.c b/kernel/sched/psi.c
+index b7f38f3ad42a..d50a31ecedee 100644
+--- a/kernel/sched/psi.c
++++ b/kernel/sched/psi.c
+@@ -1116,6 +1116,7 @@ struct psi_trigger *psi_trigger_create(struct psi_group *group,
+ 	t->event = 0;
+ 	t->last_event_time = 0;
+ 	init_waitqueue_head(&t->event_wait);
++	kref_init(&t->refcount);
+ 
+ 	mutex_lock(&group->trigger_lock);
+ 
+@@ -1144,19 +1145,15 @@ struct psi_trigger *psi_trigger_create(struct psi_group *group,
+ 	return t;
+ }
+ 
+-void psi_trigger_destroy(struct psi_trigger *t)
++static void psi_trigger_destroy(struct kref *ref)
+ {
+-	struct psi_group *group;
++	struct psi_trigger *t = container_of(ref, struct psi_trigger, refcount);
++	struct psi_group *group = t->group;
+ 	struct task_struct *task_to_destroy = NULL;
+ 
+-	/*
+-	 * We do not check psi_disabled since it might have been disabled after
+-	 * the trigger got created.
+-	 */
+-	if (!t)
++	if (static_branch_likely(&psi_disabled))
+ 		return;
+ 
+-	group = t->group;
+ 	/*
+ 	 * Wakeup waiters to stop polling. Can happen if cgroup is deleted
+ 	 * from under a polling process.
+@@ -1192,9 +1189,9 @@ void psi_trigger_destroy(struct psi_trigger *t)
+ 	mutex_unlock(&group->trigger_lock);
+ 
+ 	/*
+-	 * Wait for psi_schedule_poll_work RCU to complete its read-side
+-	 * critical section before destroying the trigger and optionally the
+-	 * poll_task.
++	 * Wait for both *trigger_ptr from psi_trigger_replace and
++	 * poll_task RCUs to complete their read-side critical sections
++	 * before destroying the trigger and optionally the poll_task
+ 	 */
+ 	synchronize_rcu();
+ 	/*
+@@ -1211,6 +1208,18 @@ void psi_trigger_destroy(struct psi_trigger *t)
+ 	kfree(t);
+ }
+ 
++void psi_trigger_replace(void **trigger_ptr, struct psi_trigger *new)
++{
++	struct psi_trigger *old = *trigger_ptr;
++
++	if (static_branch_likely(&psi_disabled))
++		return;
++
++	rcu_assign_pointer(*trigger_ptr, new);
++	if (old)
++		kref_put(&old->refcount, psi_trigger_destroy);
++}
++
+ __poll_t psi_trigger_poll(void **trigger_ptr,
+ 				struct file *file, poll_table *wait)
+ {
+@@ -1220,15 +1229,24 @@ __poll_t psi_trigger_poll(void **trigger_ptr,
+ 	if (static_branch_likely(&psi_disabled))
+ 		return DEFAULT_POLLMASK | EPOLLERR | EPOLLPRI;
+ 
+-	t = smp_load_acquire(trigger_ptr);
+-	if (!t)
++	rcu_read_lock();
++
++	t = rcu_dereference(*(void __rcu __force **)trigger_ptr);
++	if (!t) {
++		rcu_read_unlock();
+ 		return DEFAULT_POLLMASK | EPOLLERR | EPOLLPRI;
++	}
++	kref_get(&t->refcount);
++
++	rcu_read_unlock();
+ 
+ 	poll_wait(file, &t->event_wait, wait);
+ 
+ 	if (cmpxchg(&t->event, 1, 0) == 1)
+ 		ret |= EPOLLPRI;
+ 
++	kref_put(&t->refcount, psi_trigger_destroy);
++
+ 	return ret;
+ }
+ 
+@@ -1252,24 +1270,14 @@ static ssize_t psi_write(struct file *file, const char __user *user_buf,
+ 
+ 	buf[buf_size - 1] = '\0';
+ 
+-	seq = file->private_data;
+-
+-	/* Take seq->lock to protect seq->private from concurrent writes */
+-	mutex_lock(&seq->lock);
+-
+-	/* Allow only one trigger per file descriptor */
+-	if (seq->private) {
+-		mutex_unlock(&seq->lock);
+-		return -EBUSY;
+-	}
+-
+ 	new = psi_trigger_create(&psi_system, buf, nbytes, res);
+-	if (IS_ERR(new)) {
+-		mutex_unlock(&seq->lock);
++	if (IS_ERR(new))
+ 		return PTR_ERR(new);
+-	}
+ 
+-	smp_store_release(&seq->private, new);
++	seq = file->private_data;
++	/* Take seq->lock to protect seq->private from concurrent writes */
++	mutex_lock(&seq->lock);
++	psi_trigger_replace(&seq->private, new);
+ 	mutex_unlock(&seq->lock);
+ 
+ 	return nbytes;
+@@ -1304,7 +1312,7 @@ static int psi_fop_release(struct inode *inode, struct file *file)
+ {
+ 	struct seq_file *seq = file->private_data;
+ 
+-	psi_trigger_destroy(seq->private);
++	psi_trigger_replace(&seq->private, NULL);
+ 	return single_release(inode, file);
+ }
+ 
+-- 
+2.35.1
+
