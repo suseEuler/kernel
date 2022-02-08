@@ -1,0 +1,67 @@
+From 919ba0ad7d5a52cb83ae9aebe4500d8bed0a0830 Mon Sep 17 00:00:00 2001
+From: Mike Christie <michael.christie@oracle.com>
+Date: Sat, 27 Feb 2021 10:59:48 -0600
+Subject: [PATCH] scsi: target: qla2xxx: Convert to new submission API
+Git-commit: 919ba0ad7d5a52cb83ae9aebe4500d8bed0a0830
+Patch-mainline: v5.13-rc1
+References: bsn#81
+Modified-by-SEL: No
+
+
+target_submit_cmd() is now only for simple drivers that do their
+own sync during shutdown and do not use target_stop_session().
+
+tcm_qla2xxx uses target_stop_session() to sync session shutdown with LIO
+core, so we use target_init_cmd()/target_submit_prep()/target_submit(),
+because target_init_cmd() will detect the target_stop_session() call and
+return an error.
+
+Link: https://lore.kernel.org/r/20210227170006.5077-8-michael.christie@oracle.com
+Cc: Nilesh Javali <njavali@marvell.com>
+Tested-by: Laurence Oberman <loberman@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Himanshu Madhani <himanshu.madhani@oracle.com>
+Signed-off-by: Mike Christie <michael.christie@oracle.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ drivers/scsi/qla2xxx/tcm_qla2xxx.c | 16 ++++++++++++----
+ 1 file changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/scsi/qla2xxx/tcm_qla2xxx.c b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+index b55fc768a2a7..56394d901791 100644
+--- a/drivers/scsi/qla2xxx/tcm_qla2xxx.c
++++ b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+@@ -451,7 +451,7 @@ static int tcm_qla2xxx_handle_cmd(scsi_qla_host_t *vha, struct qla_tgt_cmd *cmd,
+ 	struct se_portal_group *se_tpg;
+ 	struct tcm_qla2xxx_tpg *tpg;
+ #endif
+-	int target_flags = TARGET_SCF_ACK_KREF;
++	int rc, target_flags = TARGET_SCF_ACK_KREF;
+ 	unsigned long flags;
+ 
+ 	if (bidi)
+@@ -486,9 +486,17 @@ static int tcm_qla2xxx_handle_cmd(scsi_qla_host_t *vha, struct qla_tgt_cmd *cmd,
+ 	list_add_tail(&cmd->sess_cmd_list, &sess->sess_cmd_list);
+ 	spin_unlock_irqrestore(&sess->sess_cmd_lock, flags);
+ 
+-	return target_submit_cmd(se_cmd, se_sess, cdb, &cmd->sense_buffer[0],
+-				 cmd->unpacked_lun, data_length, fcp_task_attr,
+-				 data_dir, target_flags);
++	rc = target_init_cmd(se_cmd, se_sess, &cmd->sense_buffer[0],
++			     cmd->unpacked_lun, data_length, fcp_task_attr,
++			     data_dir, target_flags);
++	if (rc)
++		return rc;
++
++	if (target_submit_prep(se_cmd, cdb, NULL, 0, NULL, 0, NULL, 0))
++		return 0;
++
++	target_submit(se_cmd);
++	return 0;
+ }
+ 
+ static void tcm_qla2xxx_handle_data_work(struct work_struct *work)
+-- 
+2.31.1
+
