@@ -1,0 +1,199 @@
+From eb44ce8c8c7d3b45f9204c7f34577960c00d5919 Mon Sep 17 00:00:00 2001
+From: Mike Christie <michael.christie@oracle.com>
+Date: Sat, 27 Feb 2021 10:59:57 -0600
+Subject: [PATCH] scsi: target: core: Add workqueue based cmd submission
+Git-commit: eb44ce8c8c7d3b45f9204c7f34577960c00d5919
+Patch-mainline: v5.13-rc1
+References: bsn#81
+Modified-by-SEL: No
+
+
+loop and vhost/scsi do their target cmd submission from driver
+workqueues. This allows them to avoid an issue where the backend may block
+waiting for resources like tags/requests, mem/locks, etc and that ends up
+blocking their entire submission path and for the case of vhost-scsi both
+the submission and completion path.
+
+This patch adds a helper drivers can use to submit from a LIO workqueue.
+This code will then be extended in the next patches to fix the plugging of
+backend devices.
+
+We are only converting vhost/loop initially, but the workqueue based
+submission will work for other drivers and have similar benefits where the
+main target loops will not end up blocking one some backend resource.
+
+Link: https://lore.kernel.org/r/20210227170006.5077-17-michael.christie@oracle.com
+Tested-by: Laurence Oberman <loberman@redhat.com>
+Reviewed-by: Bodo Stroesser <bostroesser@gmail.com>
+Signed-off-by: Mike Christie <michael.christie@oracle.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ drivers/target/target_core_device.c    | 10 ++++--
+ drivers/target/target_core_internal.h  |  1 +
+ drivers/target/target_core_transport.c | 42 +++++++++++++++++++++++++-
+ include/target/target_core_base.h      |  8 ++++-
+ include/target/target_core_fabric.h    |  2 ++
+ 5 files changed, 59 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/target/target_core_device.c b/drivers/target/target_core_device.c
+index 7787c527aad3..74d3a4896588 100644
+--- a/drivers/target/target_core_device.c
++++ b/drivers/target/target_core_device.c
+@@ -735,8 +735,14 @@ struct se_device *target_alloc_device(struct se_hba *hba, const char *name)
+ 
+ 	dev->queue_cnt = nr_cpu_ids;
+ 	for (i = 0; i < dev->queue_cnt; i++) {
+-		INIT_LIST_HEAD(&dev->queues[i].state_list);
+-		spin_lock_init(&dev->queues[i].lock);
++		struct se_device_queue *q;
++
++		q = &dev->queues[i];
++		INIT_LIST_HEAD(&q->state_list);
++		spin_lock_init(&q->lock);
++
++		init_llist_head(&q->sq.cmd_list);
++		INIT_WORK(&q->sq.work, target_queued_submit_work);
+ 	}
+ 
+ 	dev->se_hba = hba;
+diff --git a/drivers/target/target_core_internal.h b/drivers/target/target_core_internal.h
+index e7b3c6e5d574..56f841fd7f04 100644
+--- a/drivers/target/target_core_internal.h
++++ b/drivers/target/target_core_internal.h
+@@ -153,6 +153,7 @@ void	target_qf_do_work(struct work_struct *work);
+ bool	target_check_wce(struct se_device *dev);
+ bool	target_check_fua(struct se_device *dev);
+ void	__target_execute_cmd(struct se_cmd *, bool);
++void	target_queued_submit_work(struct work_struct *work);
+ 
+ /* target_core_stat.c */
+ void	target_stat_setup_dev_default_groups(struct se_device *);
+diff --git a/drivers/target/target_core_transport.c b/drivers/target/target_core_transport.c
+index bd3d125a3978..eea7c27dc4cd 100644
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@ -41,6 +41,7 @@
+ #include <trace/events/target.h>
+ 
+ static struct workqueue_struct *target_completion_wq;
++static struct workqueue_struct *target_submission_wq;
+ static struct kmem_cache *se_sess_cache;
+ struct kmem_cache *se_ua_cache;
+ struct kmem_cache *t10_pr_reg_cache;
+@@ -129,8 +130,15 @@ int init_se_kmem_caches(void)
+ 	if (!target_completion_wq)
+ 		goto out_free_lba_map_mem_cache;
+ 
++	target_submission_wq = alloc_workqueue("target_submission",
++					       WQ_MEM_RECLAIM, 0);
++	if (!target_submission_wq)
++		goto out_free_completion_wq;
++
+ 	return 0;
+ 
++out_free_completion_wq:
++	destroy_workqueue(target_completion_wq);
+ out_free_lba_map_mem_cache:
+ 	kmem_cache_destroy(t10_alua_lba_map_mem_cache);
+ out_free_lba_map_cache:
+@@ -153,6 +161,7 @@ int init_se_kmem_caches(void)
+ 
+ void release_se_kmem_caches(void)
+ {
++	destroy_workqueue(target_submission_wq);
+ 	destroy_workqueue(target_completion_wq);
+ 	kmem_cache_destroy(se_sess_cache);
+ 	kmem_cache_destroy(se_ua_cache);
+@@ -1382,7 +1391,6 @@ void __target_init_cmd(
+ {
+ 	INIT_LIST_HEAD(&cmd->se_delayed_node);
+ 	INIT_LIST_HEAD(&cmd->se_qf_node);
+-	INIT_LIST_HEAD(&cmd->se_cmd_list);
+ 	INIT_LIST_HEAD(&cmd->state_list);
+ 	init_completion(&cmd->t_transport_stop_comp);
+ 	cmd->free_compl = NULL;
+@@ -1799,6 +1807,38 @@ void target_submit_cmd(struct se_cmd *se_cmd, struct se_session *se_sess,
+ }
+ EXPORT_SYMBOL(target_submit_cmd);
+ 
++void target_queued_submit_work(struct work_struct *work)
++{
++	struct se_cmd_queue *sq = container_of(work, struct se_cmd_queue, work);
++	struct se_cmd *se_cmd, *next_cmd;
++	struct llist_node *cmd_list;
++
++	cmd_list = llist_del_all(&sq->cmd_list);
++	if (!cmd_list)
++		/* Previous call took what we were queued to submit */
++		return;
++
++	cmd_list = llist_reverse_order(cmd_list);
++	llist_for_each_entry_safe(se_cmd, next_cmd, cmd_list, se_cmd_list)
++		target_submit(se_cmd);
++}
++
++/**
++ * target_queue_submission - queue the cmd to run on the LIO workqueue
++ * @se_cmd: command descriptor to submit
++ */
++void target_queue_submission(struct se_cmd *se_cmd)
++{
++	struct se_device *se_dev = se_cmd->se_dev;
++	int cpu = se_cmd->cpuid;
++	struct se_cmd_queue *sq;
++
++	sq = &se_dev->queues[cpu].sq;
++	llist_add(&se_cmd->se_cmd_list, &sq->cmd_list);
++	queue_work_on(cpu, target_submission_wq, &sq->work);
++}
++EXPORT_SYMBOL_GPL(target_queue_submission);
++
+ static void target_complete_tmr_failure(struct work_struct *work)
+ {
+ 	struct se_cmd *se_cmd = container_of(work, struct se_cmd, work);
+diff --git a/include/target/target_core_base.h b/include/target/target_core_base.h
+index 54dcc0eb25fa..ec5a10d2d843 100644
+--- a/include/target/target_core_base.h
++++ b/include/target/target_core_base.h
+@@ -488,7 +488,7 @@ struct se_cmd {
+ 	/* Only used for internal passthrough and legacy TCM fabric modules */
+ 	struct se_session	*se_sess;
+ 	struct se_tmr_req	*se_tmr_req;
+-	struct list_head	se_cmd_list;
++	struct llist_node	se_cmd_list;
+ 	struct completion	*free_compl;
+ 	struct completion	*abrt_compl;
+ 	const struct target_core_fabric_ops *se_tfo;
+@@ -765,9 +765,15 @@ struct se_dev_stat_grps {
+ 	struct config_group scsi_lu_group;
+ };
+ 
++struct se_cmd_queue {
++	struct llist_head	cmd_list;
++	struct work_struct	work;
++};
++
+ struct se_device_queue {
+ 	struct list_head	state_list;
+ 	spinlock_t		lock;
++	struct se_cmd_queue	sq;
+ };
+ 
+ struct se_device {
+diff --git a/include/target/target_core_fabric.h b/include/target/target_core_fabric.h
+index 0543ab107723..3c5ade7a04a6 100644
+--- a/include/target/target_core_fabric.h
++++ b/include/target/target_core_fabric.h
+@@ -165,6 +165,8 @@ sense_reason_t target_cmd_init_cdb(struct se_cmd *se_cmd, unsigned char *cdb,
+ sense_reason_t target_cmd_parse_cdb(struct se_cmd *);
+ void	target_submit_cmd(struct se_cmd *, struct se_session *, unsigned char *,
+ 		unsigned char *, u64, u32, int, int, int);
++void	target_queue_submission(struct se_cmd *se_cmd);
++
+ int	target_submit_tmr(struct se_cmd *se_cmd, struct se_session *se_sess,
+ 		unsigned char *sense, u64 unpacked_lun,
+ 		void *fabric_tmr_ptr, unsigned char tm_type,
+-- 
+2.31.1
+

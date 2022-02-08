@@ -1,0 +1,168 @@
+From 2469f1e0412cb053e37b7499ce5e48b6be4d7653 Mon Sep 17 00:00:00 2001
+From: Sergey Samoylenko <s.samoylenko@yadro.com>
+Date: Tue, 20 Apr 2021 21:59:20 +0300
+Subject: [PATCH] scsi: target: core: Add configurable IEEE Company ID
+ attribute
+Git-commit: 2469f1e0412cb053e37b7499ce5e48b6be4d7653
+Patch-mainline: v5.14-rc1
+References: bsn#81
+Modified-by-SEL: Yes, refreshed due to context change
+
+
+Implement an attribute which provides a way to set a company specific WWN
+in configfs via:
+
+  target/core/$backstore/$name/wwn/company_id
+
+The Open Fabrics Alliance ID 001405h remains the default.
+
+Link: https://lore.kernel.org/r/20210420185920.42431-3-s.samoylenko@yadro.com
+Signed-off-by: Sergey Samoylenko <s.samoylenko@yadro.com>
+Signed-off-by: Roman Bolshakov <r.bolshakov@yadro.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ drivers/target/target_core_configfs.c | 50 +++++++++++++++++++++++++++
+ drivers/target/target_core_device.c   |  5 +++
+ drivers/target/target_core_spc.c      | 14 ++++----
+ include/target/target_core_base.h     |  1 +
+ 4 files changed, 63 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/target/target_core_configfs.c b/drivers/target/target_core_configfs.c
+index 4b2e49341ad6..102ec644bc8a 100644
+--- a/drivers/target/target_core_configfs.c
++++ b/drivers/target/target_core_configfs.c
+@@ -1479,6 +1479,54 @@ static ssize_t target_wwn_revision_store(struct config_item *item,
+ 	return count;
+ }
+ 
++static ssize_t
++target_wwn_company_id_show(struct config_item *item,
++				char *page)
++{
++	return snprintf(page, PAGE_SIZE, "%#08x\n",
++			to_t10_wwn(item)->company_id);
++}
++
++static ssize_t
++target_wwn_company_id_store(struct config_item *item,
++				 const char *page, size_t count)
++{
++	struct t10_wwn *t10_wwn = to_t10_wwn(item);
++	struct se_device *dev = t10_wwn->t10_dev;
++	u32 val;
++	int ret;
++
++	/*
++	 * The IEEE COMPANY_ID field should contain a 24-bit canonical
++	 * form OUI assigned by the IEEE.
++	 */
++	ret = kstrtou32(page, 0, &val);
++	if (ret < 0)
++		return ret;
++
++	if (val >= 0x1000000)
++		return -EOVERFLOW;
++
++	/*
++	 * Check to see if any active exports exist. If they do exist, fail
++	 * here as changing this information on the fly (underneath the
++	 * initiator side OS dependent multipath code) could cause negative
++	 * effects.
++	 */
++	if (dev->export_count) {
++		pr_err("Unable to set Company ID while %u exports exist\n",
++		       dev->export_count);
++		return -EINVAL;
++	}
++
++	t10_wwn->company_id = val;
++
++	pr_debug("Target_Core_ConfigFS: Set IEEE Company ID: %#08x\n",
++		 t10_wwn->company_id);
++
++	return count;
++}
++
+ /*
+  * VPD page 0x80 Unit serial
+  */
+@@ -1625,6 +1673,7 @@ DEF_DEV_WWN_ASSOC_SHOW(vpd_assoc_scsi_target_device, 0x20);
+ CONFIGFS_ATTR(target_wwn_, vendor_id);
+ CONFIGFS_ATTR(target_wwn_, product_id);
+ CONFIGFS_ATTR(target_wwn_, revision);
++CONFIGFS_ATTR(target_wwn_, company_id);
+ CONFIGFS_ATTR(target_wwn_, vpd_unit_serial);
+ CONFIGFS_ATTR_RO(target_wwn_, vpd_protocol_identifier);
+ CONFIGFS_ATTR_RO(target_wwn_, vpd_assoc_logical_unit);
+@@ -1635,6 +1684,7 @@ static struct configfs_attribute *target_core_dev_wwn_attrs[] = {
+ 	&target_wwn_attr_vendor_id,
+ 	&target_wwn_attr_product_id,
+ 	&target_wwn_attr_revision,
++	&target_wwn_attr_company_id,
+ 	&target_wwn_attr_vpd_unit_serial,
+ 	&target_wwn_attr_vpd_protocol_identifier,
+ 	&target_wwn_attr_vpd_assoc_logical_unit,
+diff --git a/drivers/target/target_core_device.c b/drivers/target/target_core_device.c
+index a8df9f0a82fa..8cb1fa0c0585 100644
+--- a/drivers/target/target_core_device.c
++++ b/drivers/target/target_core_device.c
+@@ -773,6 +773,11 @@ struct se_device *target_alloc_device(struct se_hba *hba, const char *name)
+ 	INIT_WORK(&dev->delayed_cmd_work, target_do_delayed_work);
+ 
+ 	dev->t10_wwn.t10_dev = dev;
++	/*
++	 * Use OpenFabrics IEEE Company ID: 00 14 05
++	 */
++	dev->t10_wwn.company_id = 0x001405;
++
+ 	dev->t10_alua.t10_dev = dev;
+ 
+ 	dev->dev_attrib.da_dev = dev;
+diff --git a/drivers/target/target_core_spc.c b/drivers/target/target_core_spc.c
+index b2d19493a994..fe5d5ce4099c 100644
+--- a/drivers/target/target_core_spc.c
++++ b/drivers/target/target_core_spc.c
+@@ -136,20 +136,20 @@ void spc_gen_naa_6h_vendor_specific(struct se_device *dev,
+ 				    unsigned char *buf)
+ {
+ 	unsigned char *p = &dev->t10_wwn.unit_serial[0];
++	u32 company_id = dev->t10_wwn.company_id;
+ 	int cnt, off = 0;
+ 	bool next = true;
+ 
+ 	/*
+ 	 * Start NAA IEEE Registered Extended Identifier/Designator
+ 	 */
+-	buf[off++] = 0x6 << 4;
++	buf[off] = 0x6 << 4;
+ 
+-	/*
+-	 * Use OpenFabrics IEEE Company ID: 00 14 05
+-	 */
+-	buf[off++] = 0x01;
+-	buf[off++] = 0x40;
+-	buf[off] = (0x5 << 4);
++	/* IEEE COMPANY_ID */
++	buf[off++] |= (company_id >> 20) & 0xf;
++	buf[off++] = (company_id >> 12) & 0xff;
++	buf[off++] = (company_id >> 4) & 0xff;
++	buf[off] = (company_id & 0xf) << 4;
+ 
+ 	/*
+ 	 * Generate up to 36 bits of VENDOR SPECIFIC IDENTIFIER starting on
+diff --git a/include/target/target_core_base.h b/include/target/target_core_base.h
+index d1f7d2a45354..85c16c266eac 100644
+--- a/include/target/target_core_base.h
++++ b/include/target/target_core_base.h
+@@ -326,6 +326,7 @@ struct t10_wwn {
+ 	char model[INQUIRY_MODEL_LEN + 1];
+ 	char revision[INQUIRY_REVISION_LEN + 1];
+ 	char unit_serial[INQUIRY_VPD_SERIAL_LEN];
++	u32 company_id;
+ 	spinlock_t t10_vpd_lock;
+ 	struct se_device *t10_dev;
+ 	struct config_group t10_wwn_group;
+-- 
+2.31.1
+

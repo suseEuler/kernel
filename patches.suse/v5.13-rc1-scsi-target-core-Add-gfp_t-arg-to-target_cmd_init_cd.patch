@@ -1,0 +1,223 @@
+From 08694199477da412baf1852c6d1bf5fedbd40c7e Mon Sep 17 00:00:00 2001
+From: Mike Christie <michael.christie@oracle.com>
+Date: Sat, 27 Feb 2021 10:59:56 -0600
+Subject: [PATCH] scsi: target: core: Add gfp_t arg to target_cmd_init_cdb()
+Git-commit: 08694199477da412baf1852c6d1bf5fedbd40c7e
+Patch-mainline: v5.13-rc1
+References: bsn#81
+Modified-by-SEL: Yes, refreshed due to context change
+
+
+tcm_loop could be used like a normal block device, so we can't use
+GFP_KERNEL and should use GFP_NOIO. This adds a gfp_t arg to
+target_cmd_init_cdb() and converts the users. For every driver but loop
+GFP_KERNEL is kept.
+
+This will also be useful in subsequent patches where loop needs to do
+target_submit_prep() from interrupt context to get a ref to the se_device,
+and so it will need to use GFP_ATOMIC.
+
+Link: https://lore.kernel.org/r/20210227170006.5077-16-michael.christie@oracle.com
+Tested-by: Laurence Oberman <loberman@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Mike Christie <michael.christie@oracle.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ drivers/infiniband/ulp/srpt/ib_srpt.c  |  3 ++-
+ drivers/scsi/qla2xxx/tcm_qla2xxx.c     |  3 ++-
+ drivers/target/iscsi/iscsi_target.c    |  3 ++-
+ drivers/target/loopback/tcm_loop.c     |  3 ++-
+ drivers/target/target_core_transport.c | 14 ++++++++------
+ drivers/target/target_core_xcopy.c     |  2 +-
+ drivers/target/tcm_fc/tfc_cmd.c        |  2 +-
+ drivers/vhost/scsi.c                   |  2 +-
+ drivers/xen/xen-scsiback.c             |  2 +-
+ include/target/target_core_fabric.h    |  5 +++--
+ 10 files changed, 23 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/infiniband/ulp/srpt/ib_srpt.c b/drivers/infiniband/ulp/srpt/ib_srpt.c
+index 87741e0b4bca..51c386a215f5 100644
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.c
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.c
+@@ -1537,7 +1537,8 @@ static void srpt_handle_cmd(struct srpt_rdma_ch *ch,
+ 		goto busy;
+ 	}
+ 
+-	if (target_submit_prep(cmd, srp_cmd->cdb, sg, sg_cnt, NULL, 0, NULL, 0))
++	if (target_submit_prep(cmd, srp_cmd->cdb, sg, sg_cnt, NULL, 0, NULL, 0,
++			       GFP_KERNEL))
+ 		return;
+ 
+ 	target_submit(cmd);
+diff --git a/drivers/scsi/qla2xxx/tcm_qla2xxx.c b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+index 56394d901791..12a2265eb2de 100644
+--- a/drivers/scsi/qla2xxx/tcm_qla2xxx.c
++++ b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+@@ -492,7 +492,8 @@ static int tcm_qla2xxx_handle_cmd(scsi_qla_host_t *vha, struct qla_tgt_cmd *cmd,
+ 	if (rc)
+ 		return rc;
+ 
+-	if (target_submit_prep(se_cmd, cdb, NULL, 0, NULL, 0, NULL, 0))
++	if (target_submit_prep(se_cmd, cdb, NULL, 0, NULL, 0, NULL, 0,
++			       GFP_KERNEL))
+ 		return 0;
+ 
+ 	target_submit(se_cmd);
+diff --git a/drivers/target/iscsi/iscsi_target.c b/drivers/target/iscsi/iscsi_target.c
+index ef9133a674f6..cf7f0465dd63 100644
+--- a/drivers/target/iscsi/iscsi_target.c
++++ b/drivers/target/iscsi/iscsi_target.c
+@@ -1166,7 +1166,8 @@ int iscsit_setup_scsi_cmd(struct iscsi_conn *conn, struct iscsi_cmd *cmd,
+ 	target_get_sess_cmd(&cmd->se_cmd, true);
+ 
+ 	cmd->se_cmd.tag = (__force u32)cmd->init_task_tag;
+-	cmd->sense_reason = target_cmd_init_cdb(&cmd->se_cmd, hdr->cdb);
++	cmd->sense_reason = target_cmd_init_cdb(&cmd->se_cmd, hdr->cdb,
++						GFP_KERNEL);
+ 	if (cmd->sense_reason) {
+ 		if (cmd->sense_reason == TCM_OUT_OF_RESOURCES) {
+ 			return iscsit_add_reject_cmd(cmd,
+diff --git a/drivers/target/loopback/tcm_loop.c b/drivers/target/loopback/tcm_loop.c
+index 461f4125fcab..677e4b8f0642 100644
+--- a/drivers/target/loopback/tcm_loop.c
++++ b/drivers/target/loopback/tcm_loop.c
+@@ -156,7 +156,8 @@ static void tcm_loop_submission_work(struct work_struct *work)
+ 
+ 	if (target_submit_prep(se_cmd, sc->cmnd, scsi_sglist(sc),
+ 			       scsi_sg_count(sc), sgl_bidi, sgl_bidi_count,
+-			       scsi_prot_sglist(sc), scsi_prot_sg_count(sc)))
++			       scsi_prot_sglist(sc), scsi_prot_sg_count(sc),
++			       GFP_NOIO))
+ 		return;
+ 
+ 	target_submit(se_cmd);
+diff --git a/drivers/target/target_core_transport.c b/drivers/target/target_core_transport.c
+index 560daf9bb039..bd3d125a3978 100644
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@ -1429,7 +1429,7 @@ transport_check_alloc_task_attr(struct se_cmd *cmd)
+ }
+ 
+ sense_reason_t
+-target_cmd_init_cdb(struct se_cmd *cmd, unsigned char *cdb)
++target_cmd_init_cdb(struct se_cmd *cmd, unsigned char *cdb, gfp_t gfp)
+ {
+ 	sense_reason_t ret;
+ 
+@@ -1450,8 +1450,7 @@ target_cmd_init_cdb(struct se_cmd *cmd, unsigned char *cdb)
+ 	 * setup the pointer from __t_task_cdb to t_task_cdb.
+ 	 */
+ 	if (scsi_command_size(cdb) > sizeof(cmd->__t_task_cdb)) {
+-		cmd->t_task_cdb = kzalloc(scsi_command_size(cdb),
+-						GFP_KERNEL);
++		cmd->t_task_cdb = kzalloc(scsi_command_size(cdb), gfp);
+ 		if (!cmd->t_task_cdb) {
+ 			pr_err("Unable to allocate cmd->t_task_cdb"
+ 				" %u > sizeof(cmd->__t_task_cdb): %lu ops\n",
+@@ -1640,6 +1639,7 @@ EXPORT_SYMBOL_GPL(target_init_cmd);
+  * @sgl_bidi_count: scatterlist count for bidirectional READ mapping
+  * @sgl_prot: struct scatterlist memory protection information
+  * @sgl_prot_count: scatterlist count for protection information
++ * @gfp: gfp allocation type
+  *
+  * Returns:
+  *	- less than zero to signal failure.
+@@ -1650,11 +1650,12 @@ EXPORT_SYMBOL_GPL(target_init_cmd);
+ int target_submit_prep(struct se_cmd *se_cmd, unsigned char *cdb,
+ 		       struct scatterlist *sgl, u32 sgl_count,
+ 		       struct scatterlist *sgl_bidi, u32 sgl_bidi_count,
+-		       struct scatterlist *sgl_prot, u32 sgl_prot_count)
++		       struct scatterlist *sgl_prot, u32 sgl_prot_count,
++		       gfp_t gfp)
+ {
+ 	sense_reason_t rc;
+ 
+-	rc = target_cmd_init_cdb(se_cmd, cdb);
++	rc = target_cmd_init_cdb(se_cmd, cdb, gfp);
+ 	if (rc)
+ 		goto send_cc_direct;
+ 
+@@ -1790,7 +1791,8 @@ void target_submit_cmd(struct se_cmd *se_cmd, struct se_session *se_sess,
+ 	if (rc)
+ 		return;
+ 
+-	if (target_submit_prep(se_cmd, cdb, NULL, 0, NULL, 0, NULL, 0))
++	if (target_submit_prep(se_cmd, cdb, NULL, 0, NULL, 0, NULL, 0,
++			       GFP_KERNEL))
+ 		return;
+ 
+ 	target_submit(se_cmd);
+diff --git a/drivers/target/target_core_xcopy.c b/drivers/target/target_core_xcopy.c
+index e86cc6135587..d31ed071cb08 100644
+--- a/drivers/target/target_core_xcopy.c
++++ b/drivers/target/target_core_xcopy.c
+@@ -554,7 +554,7 @@ static int target_xcopy_setup_pt_cmd(
+ 	}
+ 	cmd->se_cmd_flags |= SCF_SE_LUN_CMD;
+ 
+-	if (target_cmd_init_cdb(cmd, cdb))
++	if (target_cmd_init_cdb(cmd, cdb, GFP_KERNEL))
+ 		return -EINVAL;
+ 
+ 	cmd->tag = 0;
+diff --git a/drivers/target/tcm_fc/tfc_cmd.c b/drivers/target/tcm_fc/tfc_cmd.c
+index 1376501ee3d0..410b723f9d79 100644
+--- a/drivers/target/tcm_fc/tfc_cmd.c
++++ b/drivers/target/tcm_fc/tfc_cmd.c
+@@ -555,7 +555,7 @@ static void ft_send_work(struct work_struct *work)
+ 		goto err;
+ 
+ 	if (target_submit_prep(&cmd->se_cmd, fcp->fc_cdb, NULL, 0, NULL, 0,
+-			       NULL, 0))
++			       NULL, 0, GFP_KERNEL))
+ 		return;
+ 
+ 	target_submit(&cmd->se_cmd);
+diff --git a/drivers/vhost/scsi.c b/drivers/vhost/scsi.c
+index ec7ffd51fe5b..9b448a197cb5 100644
+--- a/drivers/vhost/scsi.c
++++ b/drivers/vhost/scsi.c
+@@ -811,7 +811,7 @@ static void vhost_scsi_submission_work(struct work_struct *work)
+ 
+ 	if (target_submit_prep(se_cmd, cmd->tvc_cdb, sg_ptr,
+ 			       cmd->tvc_sgl_count, NULL, 0, sg_prot_ptr,
+-			       cmd->tvc_prot_sgl_count))
++			       cmd->tvc_prot_sgl_count, GFP_KERNEL))
+ 		return;
+ 
+ 	target_submit(se_cmd);
+diff --git a/drivers/xen/xen-scsiback.c b/drivers/xen/xen-scsiback.c
+index 18b9549f6fa3..55a4763da05e 100644
+--- a/drivers/xen/xen-scsiback.c
++++ b/drivers/xen/xen-scsiback.c
+@@ -368,7 +368,7 @@ static void scsiback_cmd_exec(struct vscsibk_pend *pending_req)
+ 			pending_req->sc_data_direction, TARGET_SCF_ACK_KREF);
+ 
+ 	if (target_submit_prep(se_cmd, pending_req->cmnd, pending_req->sgl,
+-			       pending_req->n_sg, NULL, 0, NULL, 0))
++			       pending_req->n_sg, NULL, 0, NULL, 0, GFP_KERNEL))
+ 		return;
+ 
+ 	target_submit(se_cmd);
+diff --git a/include/target/target_core_fabric.h b/include/target/target_core_fabric.h
+index 86b0d4a7df92..0543ab107723 100644
+--- a/include/target/target_core_fabric.h
++++ b/include/target/target_core_fabric.h
+@@ -157,10 +157,11 @@ int	target_init_cmd(struct se_cmd *se_cmd, struct se_session *se_sess,
+ int	target_submit_prep(struct se_cmd *se_cmd, unsigned char *cdb,
+ 		struct scatterlist *sgl, u32 sgl_count,
+ 		struct scatterlist *sgl_bidi, u32 sgl_bidi_count,
+-		struct scatterlist *sgl_prot, u32 sgl_prot_count);
++		struct scatterlist *sgl_prot, u32 sgl_prot_count, gfp_t gfp);
+ void	target_submit(struct se_cmd *se_cmd);
+ sense_reason_t transport_lookup_cmd_lun(struct se_cmd *);
+-sense_reason_t target_cmd_init_cdb(struct se_cmd *, unsigned char *);
++sense_reason_t target_cmd_init_cdb(struct se_cmd *se_cmd, unsigned char *cdb,
++				   gfp_t gfp);
+ sense_reason_t target_cmd_parse_cdb(struct se_cmd *);
+ void	target_submit_cmd(struct se_cmd *, struct se_session *, unsigned char *,
+ 		unsigned char *, u64, u32, int, int, int);
+-- 
+2.31.1
+

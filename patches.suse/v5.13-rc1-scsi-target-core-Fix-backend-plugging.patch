@@ -1,0 +1,126 @@
+From 302990ac3b1b1a2b7b66f59a5c88038a51fbe18e Mon Sep 17 00:00:00 2001
+From: Mike Christie <michael.christie@oracle.com>
+Date: Sat, 27 Feb 2021 11:00:02 -0600
+Subject: [PATCH] scsi: target: core: Fix backend plugging
+Git-commit: 302990ac3b1b1a2b7b66f59a5c88038a51fbe18e
+Patch-mainline: v5.13-rc1
+References: bsn#81
+Modified-by-SEL: No
+
+
+target_core_iblock is plugging and unplugging on every command and this is
+causing perf issues for drivers that prefer batched cmds. With recent
+patches we can now take multiple cmds from a fabric driver queue and then
+pass them down the backend drivers in a batch. This patch adds this support
+by adding 2 callouts to the backend for plugging and unplugging the
+device. Subsequent commits will add support for iblock and tcmu device
+plugging.
+
+Link: https://lore.kernel.org/r/20210227170006.5077-22-michael.christie@oracle.com
+Reviewed-by: Bodo Stroesser <bostroesser@gmail.com>
+Signed-off-by: Mike Christie <michael.christie@oracle.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ drivers/target/target_core_transport.c | 43 +++++++++++++++++++++++++-
+ include/target/target_core_backend.h   |  2 ++
+ include/target/target_core_base.h      |  4 +++
+ 3 files changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/target/target_core_transport.c b/drivers/target/target_core_transport.c
+index eea7c27dc4cd..1245c288d3bf 100644
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@ -1807,10 +1807,42 @@ void target_submit_cmd(struct se_cmd *se_cmd, struct se_session *se_sess,
+ }
+ EXPORT_SYMBOL(target_submit_cmd);
+ 
++
++static struct se_dev_plug *target_plug_device(struct se_device *se_dev)
++{
++	struct se_dev_plug *se_plug;
++
++	if (!se_dev->transport->plug_device)
++		return NULL;
++
++	se_plug = se_dev->transport->plug_device(se_dev);
++	if (!se_plug)
++		return NULL;
++
++	se_plug->se_dev = se_dev;
++	/*
++	 * We have a ref to the lun at this point, but the cmds could
++	 * complete before we unplug, so grab a ref to the se_device so we
++	 * can call back into the backend.
++	 */
++	config_group_get(&se_dev->dev_group);
++	return se_plug;
++}
++
++static void target_unplug_device(struct se_dev_plug *se_plug)
++{
++	struct se_device *se_dev = se_plug->se_dev;
++
++	se_dev->transport->unplug_device(se_plug);
++	config_group_put(&se_dev->dev_group);
++}
++
+ void target_queued_submit_work(struct work_struct *work)
+ {
+ 	struct se_cmd_queue *sq = container_of(work, struct se_cmd_queue, work);
+ 	struct se_cmd *se_cmd, *next_cmd;
++	struct se_dev_plug *se_plug = NULL;
++	struct se_device *se_dev = NULL;
+ 	struct llist_node *cmd_list;
+ 
+ 	cmd_list = llist_del_all(&sq->cmd_list);
+@@ -1819,8 +1851,17 @@ void target_queued_submit_work(struct work_struct *work)
+ 		return;
+ 
+ 	cmd_list = llist_reverse_order(cmd_list);
+-	llist_for_each_entry_safe(se_cmd, next_cmd, cmd_list, se_cmd_list)
++	llist_for_each_entry_safe(se_cmd, next_cmd, cmd_list, se_cmd_list) {
++		if (!se_dev) {
++			se_dev = se_cmd->se_dev;
++			se_plug = target_plug_device(se_dev);
++		}
++
+ 		target_submit(se_cmd);
++	}
++
++	if (se_plug)
++		target_unplug_device(se_plug);
+ }
+ 
+ /**
+diff --git a/include/target/target_core_backend.h b/include/target/target_core_backend.h
+index ce2fba49c95d..1f78b09bba55 100644
+--- a/include/target/target_core_backend.h
++++ b/include/target/target_core_backend.h
+@@ -34,6 +34,8 @@ struct target_backend_ops {
+ 	int (*configure_device)(struct se_device *);
+ 	void (*destroy_device)(struct se_device *);
+ 	void (*free_device)(struct se_device *device);
++	struct se_dev_plug *(*plug_device)(struct se_device *se_dev);
++	void (*unplug_device)(struct se_dev_plug *se_plug);
+ 
+ 	ssize_t (*set_configfs_dev_params)(struct se_device *,
+ 					   const char *, ssize_t);
+diff --git a/include/target/target_core_base.h b/include/target/target_core_base.h
+index fbe5b5b93afa..cf445c3a551a 100644
+--- a/include/target/target_core_base.h
++++ b/include/target/target_core_base.h
+@@ -770,6 +770,10 @@ struct se_cmd_queue {
+ 	struct work_struct	work;
+ };
+ 
++struct se_dev_plug {
++	struct se_device	*se_dev;
++};
++
+ struct se_device_queue {
+ 	struct list_head	state_list;
+ 	spinlock_t		lock;
+-- 
+2.31.1
+
