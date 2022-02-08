@@ -1,0 +1,61 @@
+From 47edc84f3376980cc2f573d25844c0260e756166 Mon Sep 17 00:00:00 2001
+From: Mike Christie <michael.christie@oracle.com>
+Date: Sat, 27 Feb 2021 10:59:54 -0600
+Subject: [PATCH] scsi: target: tcm_fc: Convert to new submission API
+Git-commit: 47edc84f3376980cc2f573d25844c0260e756166
+Patch-mainline: v5.13-rc1
+References: bsn#81
+Modified-by-SEL: No
+
+
+target_submit_cmd() is now only for simple drivers that do their own sync
+during shutdown and do not use target_stop_session().
+
+tcm_fc uses target_stop_session() to sync session shutdown with LIO core,
+so we use target_init_cmd(), target_submit_prep(), target_submit(), because
+target_init_cmd() will now detect the target_stop_session() call and return
+an error.
+
+Link: https://lore.kernel.org/r/20210227170006.5077-14-michael.christie@oracle.com
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Mike Christie <michael.christie@oracle.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ drivers/target/tcm_fc/tfc_cmd.c | 14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/target/tcm_fc/tfc_cmd.c b/drivers/target/tcm_fc/tfc_cmd.c
+index 768f250680d9..1376501ee3d0 100644
+--- a/drivers/target/tcm_fc/tfc_cmd.c
++++ b/drivers/target/tcm_fc/tfc_cmd.c
+@@ -543,16 +543,22 @@ static void ft_send_work(struct work_struct *work)
+ 
+ 	fc_seq_set_resp(cmd->seq, ft_recv_seq, cmd);
+ 	cmd->se_cmd.tag = fc_seq_exch(cmd->seq)->rxid;
++
+ 	/*
+ 	 * Use a single se_cmd->cmd_kref as we expect to release se_cmd
+ 	 * directly from ft_check_stop_free callback in response path.
+ 	 */
+-	if (target_submit_cmd(&cmd->se_cmd, cmd->sess->se_sess, fcp->fc_cdb,
+-			      &cmd->ft_sense_buffer[0], scsilun_to_int(&fcp->fc_lun),
+-			      ntohl(fcp->fc_dl), task_attr, data_dir,
+-			      TARGET_SCF_ACK_KREF))
++	if (target_init_cmd(&cmd->se_cmd, cmd->sess->se_sess,
++			    &cmd->ft_sense_buffer[0],
++			    scsilun_to_int(&fcp->fc_lun), ntohl(fcp->fc_dl),
++			    task_attr, data_dir, TARGET_SCF_ACK_KREF))
+ 		goto err;
+ 
++	if (target_submit_prep(&cmd->se_cmd, fcp->fc_cdb, NULL, 0, NULL, 0,
++			       NULL, 0))
++		return;
++
++	target_submit(&cmd->se_cmd);
+ 	pr_debug("r_ctl %x target_submit_cmd %p\n", fh->fh_r_ctl, cmd);
+ 	return;
+ 
+-- 
+2.34.1
+

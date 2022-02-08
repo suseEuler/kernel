@@ -1,0 +1,80 @@
+From 1f48b065dad168eebc4f184e97d4aab7a732bd6a Mon Sep 17 00:00:00 2001
+From: Mike Christie <michael.christie@oracle.com>
+Date: Sat, 27 Feb 2021 10:59:53 -0600
+Subject: [PATCH] scsi: target: xen-scsiback: Convert to new submission API
+Git-commit: 1f48b065dad168eebc4f184e97d4aab7a732bd6a
+Patch-mainline: v5.13-rc1
+References: bsn#81
+Modified-by-SEL: No
+
+
+target_submit_cmd_map_sgls() is being removed, so convert xen to the new
+submission API. This has it use target_init_cmd(), target_submit_prep(), or
+target_submit() because we need to have LIO core map sgls which is now done
+in target_submit_prep(). target_init_cmd() will never fail for xen because
+it does its own sync during session shutdown, so we can remove that code.
+
+Note: xen never calls target_stop_session() so target_submit_cmd_map_sgls()
+never failed (in the new API target_init_cmd() handles
+target_stop_session() being called when cmds are being submitted). If it
+were to have used target_stop_session() and got an error, we would have hit
+a refcount bug like xen and usb, because it does:
+
+    if (rc < 0) {
+            transport_send_check_condition_and_sense(se_cmd,
+                            TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE, 0);
+            transport_generic_free_cmd(se_cmd, 0);
+    }
+
+transport_send_check_condition_and_sense() calls queue_status which calls
+scsiback_cmd_done->target_put_sess_cmd. We do an extra
+transport_generic_free_cmd() call above which would have dropped the
+refcount to -1 and the refcount code would spit out errors.
+
+Link: https://lore.kernel.org/r/20210227170006.5077-13-michael.christie@oracle.com
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Mike Christie <michael.christie@oracle.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ drivers/xen/xen-scsiback.c | 21 +++++++++------------
+ 1 file changed, 9 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/xen/xen-scsiback.c b/drivers/xen/xen-scsiback.c
+index f3024942fbdf..18b9549f6fa3 100644
+--- a/drivers/xen/xen-scsiback.c
++++ b/drivers/xen/xen-scsiback.c
+@@ -360,21 +360,18 @@ static void scsiback_cmd_exec(struct vscsibk_pend *pending_req)
+ {
+ 	struct se_cmd *se_cmd = &pending_req->se_cmd;
+ 	struct se_session *sess = pending_req->v2p->tpg->tpg_nexus->tvn_se_sess;
+-	int rc;
+ 
+ 	scsiback_get(pending_req->info);
+ 	se_cmd->tag = pending_req->rqid;
+-	rc = target_submit_cmd_map_sgls(se_cmd, sess, pending_req->cmnd,
+-			pending_req->sense_buffer, pending_req->v2p->lun,
+-			pending_req->data_len, 0,
+-			pending_req->sc_data_direction, TARGET_SCF_ACK_KREF,
+-			pending_req->sgl, pending_req->n_sg,
+-			NULL, 0, NULL, 0);
+-	if (rc < 0) {
+-		transport_send_check_condition_and_sense(se_cmd,
+-				TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE, 0);
+-		transport_generic_free_cmd(se_cmd, 0);
+-	}
++	target_init_cmd(se_cmd, sess, pending_req->sense_buffer,
++			pending_req->v2p->lun, pending_req->data_len, 0,
++			pending_req->sc_data_direction, TARGET_SCF_ACK_KREF);
++
++	if (target_submit_prep(se_cmd, pending_req->cmnd, pending_req->sgl,
++			       pending_req->n_sg, NULL, 0, NULL, 0))
++		return;
++
++	target_submit(se_cmd);
+ }
+ 
+ static int scsiback_gnttab_data_map_batch(struct gnttab_map_grant_ref *map,
+-- 
+2.34.1
+
