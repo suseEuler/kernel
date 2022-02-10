@@ -1,0 +1,109 @@
+From 71ba088ce0aa87370b18a1d35cd742f352d51c24 Mon Sep 17 00:00:00 2001
+Message-Id: <71ba088ce0aa87370b18a1d35cd742f352d51c24.1644478892.git.geliang.tang@suse.com>
+From: Paolo Abeni <pabeni@redhat.com>
+Date: Thu, 6 Jan 2022 16:20:17 -0800
+Subject: [PATCH] mptcp: cleanup accept and poll
+Git-commit: 71ba088ce0aa87370b18a1d35cd742f352d51c24
+Patch-mainline: v5.17-rc1
+References: bsn#2
+Modified-by-SEL: No
+
+
+After the previous patch,  msk->subflow will never be deleted during
+the whole msk lifetime. We don't need anymore to acquire references to
+it in mptcp_stream_accept() and we can use the listener subflow accept
+queue to simplify mptcp_poll() for listener socket.
+
+Overall this removes a lock pair and 4 more atomic operations per
+accept().
+
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ net/mptcp/protocol.c | 25 +++++++------------------
+ net/mptcp/protocol.h |  1 -
+ net/mptcp/subflow.c  |  1 -
+ 3 files changed, 7 insertions(+), 20 deletions(-)
+
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index 83f6d6c3e3eb..628cd60c9d0f 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -3493,17 +3493,9 @@ static int mptcp_stream_accept(struct socket *sock, struct socket *newsock,
+ 
+ 	pr_debug("msk=%p", msk);
+ 
+-	lock_sock(sock->sk);
+-	if (sock->sk->sk_state != TCP_LISTEN)
+-		goto unlock_fail;
+-
+ 	ssock = __mptcp_nmpc_socket(msk);
+ 	if (!ssock)
+-		goto unlock_fail;
+-
+-	clear_bit(MPTCP_DATA_READY, &msk->flags);
+-	sock_hold(ssock->sk);
+-	release_sock(sock->sk);
++		return -EINVAL;
+ 
+ 	err = ssock->ops->accept(sock, newsock, flags, kern);
+ 	if (err == 0 && !mptcp_is_tcpsk(newsock->sk)) {
+@@ -3543,14 +3535,7 @@ static int mptcp_stream_accept(struct socket *sock, struct socket *newsock,
+ 		release_sock(newsk);
+ 	}
+ 
+-	if (inet_csk_listen_poll(ssock->sk))
+-		set_bit(MPTCP_DATA_READY, &msk->flags);
+-	sock_put(ssock->sk);
+ 	return err;
+-
+-unlock_fail:
+-	release_sock(sock->sk);
+-	return -EINVAL;
+ }
+ 
+ static __poll_t mptcp_check_readable(struct mptcp_sock *msk)
+@@ -3596,8 +3581,12 @@ static __poll_t mptcp_poll(struct file *file, struct socket *sock,
+ 
+ 	state = inet_sk_state_load(sk);
+ 	pr_debug("msk=%p state=%d flags=%lx", msk, state, msk->flags);
+-	if (state == TCP_LISTEN)
+-		return test_bit(MPTCP_DATA_READY, &msk->flags) ? EPOLLIN | EPOLLRDNORM : 0;
++	if (state == TCP_LISTEN) {
++		if (WARN_ON_ONCE(!msk->subflow || !msk->subflow->sk))
++			return 0;
++
++		return inet_csk_listen_poll(msk->subflow->sk);
++	}
+ 
+ 	if (state != TCP_SYN_SENT && state != TCP_SYN_RECV) {
+ 		mask |= mptcp_check_readable(msk);
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index 1a4ca5a202c8..386d1a98ff1d 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -111,7 +111,6 @@
+ #define MPTCP_RST_TRANSIENT	BIT(0)
+ 
+ /* MPTCP socket flags */
+-#define MPTCP_DATA_READY	0
+ #define MPTCP_NOSPACE		1
+ #define MPTCP_WORK_RTX		2
+ #define MPTCP_WORK_EOF		3
+diff --git a/net/mptcp/subflow.c b/net/mptcp/subflow.c
+index 24bc9d5e87be..d861307f7efe 100644
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@ -1293,7 +1293,6 @@ static void subflow_data_ready(struct sock *sk)
+ 		if (reqsk_queue_empty(&inet_csk(sk)->icsk_accept_queue))
+ 			return;
+ 
+-		set_bit(MPTCP_DATA_READY, &msk->flags);
+ 		parent->sk_data_ready(parent);
+ 		return;
+ 	}
+-- 
+2.34.1
+

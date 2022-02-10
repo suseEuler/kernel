@@ -1,0 +1,93 @@
+From 3b1e21eb60e8d4aa42474fed606a8ea8767b0120 Mon Sep 17 00:00:00 2001
+Message-Id: <3b1e21eb60e8d4aa42474fed606a8ea8767b0120.1644479061.git.geliang.tang@suse.com>
+From: Florian Westphal <fw@strlen.de>
+Date: Fri, 3 Dec 2021 14:35:37 -0800
+Subject: [PATCH] mptcp: getsockopt: add support for IP_TOS
+Git-commit: 3b1e21eb60e8d4aa42474fed606a8ea8767b0120
+Patch-mainline: v5.17-rc1
+References: bsn#2
+Modified-by-SEL: No
+
+
+earlier patch added IP_TOS setsockopt support, this allows to get
+the value set by earlier setsockopt.
+
+Extends mptcp_put_int_option to handle u8 input/output by
+adding required cast.
+
+Reviewed-by: Matthieu Baerts <matthieu.baerts@tessares.net>
+Signed-off-by: Florian Westphal <fw@strlen.de>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ net/mptcp/sockopt.c | 36 ++++++++++++++++++++++++++++++------
+ 1 file changed, 30 insertions(+), 6 deletions(-)
+
+diff --git a/net/mptcp/sockopt.c b/net/mptcp/sockopt.c
+index 11cda8629993..44e0a37c567c 100644
+--- a/net/mptcp/sockopt.c
++++ b/net/mptcp/sockopt.c
+@@ -1053,15 +1053,24 @@ static int mptcp_put_int_option(struct mptcp_sock *msk, char __user *optval,
+ 
+ 	if (get_user(len, optlen))
+ 		return -EFAULT;
+-
+-	len = min_t(unsigned int, len, sizeof(int));
+ 	if (len < 0)
+ 		return -EINVAL;
+ 
+-	if (put_user(len, optlen))
+-		return -EFAULT;
+-	if (copy_to_user(optval, &val, len))
+-		return -EFAULT;
++	if (len < sizeof(int) && len > 0 && val >= 0 && val <= 255) {
++		unsigned char ucval = (unsigned char)val;
++
++		len = 1;
++		if (put_user(len, optlen))
++			return -EFAULT;
++		if (copy_to_user(optval, &ucval, 1))
++			return -EFAULT;
++	} else {
++		len = min_t(unsigned int, len, sizeof(int));
++		if (put_user(len, optlen))
++			return -EFAULT;
++		if (copy_to_user(optval, &val, len))
++			return -EFAULT;
++	}
+ 
+ 	return 0;
+ }
+@@ -1082,6 +1091,19 @@ static int mptcp_getsockopt_sol_tcp(struct mptcp_sock *msk, int optname,
+ 	return -EOPNOTSUPP;
+ }
+ 
++static int mptcp_getsockopt_v4(struct mptcp_sock *msk, int optname,
++			       char __user *optval, int __user *optlen)
++{
++	struct sock *sk = (void *)msk;
++
++	switch (optname) {
++	case IP_TOS:
++		return mptcp_put_int_option(msk, optval, optlen, inet_sk(sk)->tos);
++	}
++
++	return -EOPNOTSUPP;
++}
++
+ static int mptcp_getsockopt_sol_mptcp(struct mptcp_sock *msk, int optname,
+ 				      char __user *optval, int __user *optlen)
+ {
+@@ -1117,6 +1139,8 @@ int mptcp_getsockopt(struct sock *sk, int level, int optname,
+ 	if (ssk)
+ 		return tcp_getsockopt(ssk, level, optname, optval, option);
+ 
++	if (level == SOL_IP)
++		return mptcp_getsockopt_v4(msk, optname, optval, option);
+ 	if (level == SOL_TCP)
+ 		return mptcp_getsockopt_sol_tcp(msk, optname, optval, option);
+ 	if (level == SOL_MPTCP)
+-- 
+2.34.1
+
