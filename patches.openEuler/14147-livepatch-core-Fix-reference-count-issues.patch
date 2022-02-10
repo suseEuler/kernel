@@ -1,0 +1,106 @@
+From a891dbbeae0d5698f1a342392fd66b97ca32fe15 Mon Sep 17 00:00:00 2001
+From: Zheng Yejian <zhengyejian1@huawei.com>
+Date: Sat, 29 Jan 2022 15:10:47 +0800
+Subject: [PATCH] livepatch/core: Fix reference count issues
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: a891dbbeae0d5698f1a342392fd66b97ca32fe15
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4SFHQ
+
+--------------------------------
+
+Fix following reference count issues where get 'obj->mod' once but put
+twice:
+  1) klp_register_patch
+      klp_init_patch
+          klp_init_object
+              klp_find_object_module
+                  try_module_get    <-- 1. Get refcount once
+              klp_init_object_loaded    <-- 2. If fail here!!!
+              module_put    <-- 3. Put refcount first time
+      klp_free_patch_start
+          klp_free_objects
+              __klp_free_objects
+                  module_put    <-- 4. 'obj->mod' not null, put twice!!!
+
+  2) klp_register_patch
+    klp_init_patch
+        klp_init_object
+            klp_find_object_module
+                try_module_get    <-- 1. Get refcount once
+        kobject_add    <-- 2. If other objs fail here!!!
+        klp_free_objects_mod_limited
+            module_put    <-- 3. Put refcount first time
+    klp_free_patch_start
+        klp_free_objects
+            __klp_free_objects
+                module_put    <-- 4. 'obj->mod' not null, put twice!!!
+
+Fixes: c33e42836a74 ("livepatch/core: Allow implementation without ftrace")
+Signed-off-by: Zheng Yejian <zhengyejian1@huawei.com>
+Reviewed-by: Xu Kuohai <xukuohai@huawei.com>
+Reviewed-by: Cheng Jian <cj.chengjian@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/livepatch/core.c | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/livepatch/core.c b/kernel/livepatch/core.c
+index 1fde6ba196a4..e964d834203a 100644
+--- a/kernel/livepatch/core.c
++++ b/kernel/livepatch/core.c
+@@ -811,8 +811,10 @@ static void __klp_free_objects(struct klp_patch *patch, bool nops_only)
+ 
+ 	klp_for_each_object_safe(patch, obj, tmp_obj) {
+ #ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
+-		if (klp_is_module(obj))
++		if (klp_is_module(obj) && obj->mod) {
+ 			module_put(obj->mod);
++			obj->mod = NULL;
++		}
+ #endif
+ 		__klp_free_funcs(obj, nops_only);
+ 
+@@ -1118,8 +1120,10 @@ static int klp_init_object(struct klp_patch *patch, struct klp_object *obj)
+ 
+ out:
+ #ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
+-	if (klp_is_module(obj))
++	if (klp_is_module(obj)) {
+ 		module_put(obj->mod);
++		obj->mod = NULL;
++	}
+ #endif
+ 	return ret;
+ }
+@@ -1137,6 +1141,9 @@ static void klp_init_object_early(struct klp_patch *patch,
+ 	INIT_LIST_HEAD(&obj->func_list);
+ 	kobject_init(&obj->kobj, &klp_ktype_object);
+ 	list_add_tail(&obj->node, &patch->obj_list);
++#ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
++	obj->mod = NULL;
++#endif
+ }
+ 
+ static int klp_init_patch_early(struct klp_patch *patch)
+@@ -1187,8 +1194,10 @@ static void klp_free_objects_mod_limited(struct klp_patch *patch,
+ 	klp_for_each_object_safe(patch, obj, tmp_obj) {
+ 		if (limit == obj)
+ 			break;
+-		if (klp_is_module(obj))
++		if (klp_is_module(obj) && obj->mod) {
+ 			module_put(obj->mod);
++			obj->mod = NULL;
++		}
+ 	}
+ }
+ #endif
+-- 
+2.26.2
+
