@@ -3,6 +3,7 @@
 
 import sys
 import re
+from os import environ
 from optparse import OptionParser
 from . import patch
 from io import StringIO
@@ -176,8 +177,25 @@ tag_map = {
         'error' : "must contain list of references",
      # Enable to require real References tags
      #   'requires' : ['References:SUSE'],
-    }
+    },
+    'Modified-by-sel' : {
+        'required' : True,
+        'accepted' : [
+            {
+                'name' : 'SEL',
+                'match' : 'No\s*$',
+            },
+            {
+                'name' : 'SEL',
+                'match' : 'Yes, \S+.*'
+            },
+        ],
+        'error' : "Must contain Modified-by-SEL: [No|Yes, blabla...]",
+    },
 }
+
+if 'SKIP_MBS_TAG' in environ:
+    del(tag_map['Modified-by-sel'])
 
 class ValidationError(patch.ValidationError):
     def __init__(self, name, msg):
