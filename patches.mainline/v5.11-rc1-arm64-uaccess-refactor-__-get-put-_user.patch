@@ -1,0 +1,149 @@
+From f253d827f33cb5a5990b5cfd271941d1a21ecd85 Mon Sep 17 00:00:00 2001
+From: Mark Rutland <mark.rutland@arm.com>
+Date: Wed, 2 Dec 2020 13:15:52 +0000
+Subject: [PATCH] arm64: uaccess: refactor __{get,put}_user
+Git-commit: f253d827f33cb5a5990b5cfd271941d1a21ecd85
+Patch-mainline: v5.11-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+As a step towards implementing __{get,put}_kernel_nofault(), this patch
+splits most user-memory specific logic out of __{get,put}_user(), with
+the memory access and fault handling in new __{raw_get,put}_mem()
+helpers.
+
+For now the LDR/LDTR patching is left within the *get_mem() helpers, and
+will be removed in a subsequent patch.
+
+There should be no functional change as a result of this patch.
+
+Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: James Morse <james.morse@arm.com>
+Cc: Will Deacon <will@kernel.org>
+Link: https://lore.kernel.org/r/20201202131558.39270-7-mark.rutland@arm.com
+Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/uaccess.h | 44 ++++++++++++++++++++------------
+ 1 file changed, 27 insertions(+), 17 deletions(-)
+
+diff --git a/arch/arm64/include/asm/uaccess.h b/arch/arm64/include/asm/uaccess.h
+index d6a4e496ebc6..743f209d3fab 100644
+--- a/arch/arm64/include/asm/uaccess.h
++++ b/arch/arm64/include/asm/uaccess.h
+@@ -253,7 +253,7 @@ static inline void __user *__uaccess_mask_ptr(const void __user *ptr)
+  * The "__xxx_error" versions set the third argument to -EFAULT if an error
+  * occurs, and leave it unchanged on success.
+  */
+-#define __get_user_asm(instr, alt_instr, reg, x, addr, err, feature)	\
++#define __get_mem_asm(instr, alt_instr, reg, x, addr, err, feature)	\
+ 	asm volatile(							\
+ 	"1:"ALTERNATIVE(instr "     " reg "1, [%2]\n",			\
+ 			alt_instr " " reg "1, [%2]\n", feature)		\
+@@ -268,35 +268,40 @@ static inline void __user *__uaccess_mask_ptr(const void __user *ptr)
+ 	: "+r" (err), "=&r" (x)						\
+ 	: "r" (addr), "i" (-EFAULT))
+ 
+-#define __raw_get_user(x, ptr, err)					\
++#define __raw_get_mem(x, ptr, err)					\
+ do {									\
+ 	unsigned long __gu_val;						\
+-	__chk_user_ptr(ptr);						\
+-	uaccess_enable_not_uao();					\
+ 	switch (sizeof(*(ptr))) {					\
+ 	case 1:								\
+-		__get_user_asm("ldrb", "ldtrb", "%w", __gu_val, (ptr),  \
++		__get_mem_asm("ldrb", "ldtrb", "%w", __gu_val, (ptr),	\
+ 			       (err), ARM64_HAS_UAO);			\
+ 		break;							\
+ 	case 2:								\
+-		__get_user_asm("ldrh", "ldtrh", "%w", __gu_val, (ptr),  \
++		__get_mem_asm("ldrh", "ldtrh", "%w", __gu_val, (ptr),	\
+ 			       (err), ARM64_HAS_UAO);			\
+ 		break;							\
+ 	case 4:								\
+-		__get_user_asm("ldr", "ldtr", "%w", __gu_val, (ptr),	\
++		__get_mem_asm("ldr", "ldtr", "%w", __gu_val, (ptr),	\
+ 			       (err), ARM64_HAS_UAO);			\
+ 		break;							\
+ 	case 8:								\
+-		__get_user_asm("ldr", "ldtr", "%x",  __gu_val, (ptr),	\
++		__get_mem_asm("ldr", "ldtr", "%x",  __gu_val, (ptr),	\
+ 			       (err), ARM64_HAS_UAO);			\
+ 		break;							\
+ 	default:							\
+ 		BUILD_BUG();						\
+ 	}								\
+-	uaccess_disable_not_uao();					\
+ 	(x) = (__force __typeof__(*(ptr)))__gu_val;			\
+ } while (0)
+ 
++#define __raw_get_user(x, ptr, err)					\
++do {									\
++	__chk_user_ptr(ptr);						\
++	uaccess_enable_not_uao();					\
++	__raw_get_mem(x, ptr, err);					\
++	uaccess_disable_not_uao();					\
++} while (0)
++
+ #define __get_user_error(x, ptr, err)					\
+ do {									\
+ 	__typeof__(*(ptr)) __user *__p = (ptr);				\
+@@ -318,7 +323,7 @@ do {									\
+ 
+ #define get_user	__get_user
+ 
+-#define __put_user_asm(instr, alt_instr, reg, x, addr, err, feature)	\
++#define __put_mem_asm(instr, alt_instr, reg, x, addr, err, feature)	\
+ 	asm volatile(							\
+ 	"1:"ALTERNATIVE(instr "     " reg "1, [%2]\n",			\
+ 			alt_instr " " reg "1, [%2]\n", feature)		\
+@@ -332,31 +337,36 @@ do {									\
+ 	: "+r" (err)							\
+ 	: "r" (x), "r" (addr), "i" (-EFAULT))
+ 
+-#define __raw_put_user(x, ptr, err)					\
++#define __raw_put_mem(x, ptr, err)					\
+ do {									\
+ 	__typeof__(*(ptr)) __pu_val = (x);				\
+-	__chk_user_ptr(ptr);						\
+-	uaccess_enable_not_uao();					\
+ 	switch (sizeof(*(ptr))) {					\
+ 	case 1:								\
+-		__put_user_asm("strb", "sttrb", "%w", __pu_val, (ptr),	\
++		__put_mem_asm("strb", "sttrb", "%w", __pu_val, (ptr),	\
+ 			       (err), ARM64_HAS_UAO);			\
+ 		break;							\
+ 	case 2:								\
+-		__put_user_asm("strh", "sttrh", "%w", __pu_val, (ptr),	\
++		__put_mem_asm("strh", "sttrh", "%w", __pu_val, (ptr),	\
+ 			       (err), ARM64_HAS_UAO);			\
+ 		break;							\
+ 	case 4:								\
+-		__put_user_asm("str", "sttr", "%w", __pu_val, (ptr),	\
++		__put_mem_asm("str", "sttr", "%w", __pu_val, (ptr),	\
+ 			       (err), ARM64_HAS_UAO);			\
+ 		break;							\
+ 	case 8:								\
+-		__put_user_asm("str", "sttr", "%x", __pu_val, (ptr),	\
++		__put_mem_asm("str", "sttr", "%x", __pu_val, (ptr),	\
+ 			       (err), ARM64_HAS_UAO);			\
+ 		break;							\
+ 	default:							\
+ 		BUILD_BUG();						\
+ 	}								\
++} while (0)
++
++#define __raw_put_user(x, ptr, err)					\
++do {									\
++	__chk_user_ptr(ptr);						\
++	uaccess_enable_not_uao();					\
++	__raw_put_mem(x, ptr, err);					\
+ 	uaccess_disable_not_uao();					\
+ } while (0)
+ 
+-- 
+2.26.2
+

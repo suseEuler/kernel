@@ -1,0 +1,139 @@
+From 4f451644e8003573b78acd4d4f50e04ccd92c4cd Mon Sep 17 00:00:00 2001
+From: Guoqing Jiang <guoqing.jiang@suse.com>
+Date: Fri, 18 Feb 2022 13:58:39 +0800
+Subject: [PATCH] Revert "arm64: entry: always set GIC_PRIO_PSR_I_SET during
+ entry"
+Patch-mainline: Never, revert stable patch which is added again in sorted section
+References: bsn#12
+Modified-by-SEL: No
+
+This reverts commit 51524fa8b5f7b879ba569227738375d283b79382.
+
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/daifflags.h |  3 ---
+ arch/arm64/kernel/entry-common.c   | 17 +++++++++++++++++
+ arch/arm64/kernel/entry.S          | 15 +++++++++++++--
+ 3 files changed, 30 insertions(+), 5 deletions(-)
+
+diff --git a/arch/arm64/include/asm/daifflags.h b/arch/arm64/include/asm/daifflags.h
+index cfdde3a56805..1c26d7baa67f 100644
+--- a/arch/arm64/include/asm/daifflags.h
++++ b/arch/arm64/include/asm/daifflags.h
+@@ -131,9 +131,6 @@ static inline void local_daif_inherit(struct pt_regs *regs)
+ 	if (interrupts_enabled(regs))
+ 		trace_hardirqs_on();
+ 
+-	if (system_uses_irq_prio_masking())
+-		gic_write_pmr(regs->pmr_save);
+-
+ 	/*
+ 	 * We can't use local_daif_restore(regs->pstate) here as
+ 	 * system_has_prio_mask_debugging() won't restore the I bit if it can
+diff --git a/arch/arm64/kernel/entry-common.c b/arch/arm64/kernel/entry-common.c
+index ec120ed18faf..70e0a7591245 100644
+--- a/arch/arm64/kernel/entry-common.c
++++ b/arch/arm64/kernel/entry-common.c
+@@ -178,6 +178,14 @@ static void noinstr el1_dbg(struct pt_regs *regs, unsigned long esr)
+ {
+ 	unsigned long far = read_sysreg(far_el1);
+ 
++	/*
++	 * The CPU masked interrupts, and we are leaving them masked during
++	 * do_debug_exception(). Update PMR as if we had called
++	 * local_daif_mask().
++	 */
++	if (system_uses_irq_prio_masking())
++		gic_write_pmr(GIC_PRIO_IRQON | GIC_PRIO_PSR_I_SET);
++
+ 	arm64_enter_el1_dbg(regs);
+ 	do_debug_exception(far, esr, regs);
+ 	arm64_exit_el1_dbg(regs);
+@@ -342,6 +350,9 @@ static void noinstr el0_dbg(struct pt_regs *regs, unsigned long esr)
+ 	/* Only watchpoints write FAR_EL1, otherwise its UNKNOWN */
+ 	unsigned long far = read_sysreg(far_el1);
+ 
++	if (system_uses_irq_prio_masking())
++		gic_write_pmr(GIC_PRIO_IRQON | GIC_PRIO_PSR_I_SET);
++
+ 	enter_from_user_mode();
+ 	do_debug_exception(far, esr, regs);
+ 	local_daif_restore(DAIF_PROCCTX_NOIRQ);
+@@ -349,6 +360,9 @@ static void noinstr el0_dbg(struct pt_regs *regs, unsigned long esr)
+ 
+ static void noinstr el0_svc(struct pt_regs *regs)
+ {
++	if (system_uses_irq_prio_masking())
++		gic_write_pmr(GIC_PRIO_IRQON | GIC_PRIO_PSR_I_SET);
++
+ 	enter_from_user_mode();
+ 	do_el0_svc(regs);
+ }
+@@ -423,6 +437,9 @@ static void noinstr el0_cp15(struct pt_regs *regs, unsigned long esr)
+ 
+ static void noinstr el0_svc_compat(struct pt_regs *regs)
+ {
++	if (system_uses_irq_prio_masking())
++		gic_write_pmr(GIC_PRIO_IRQON | GIC_PRIO_PSR_I_SET);
++
+ 	enter_from_user_mode();
+ 	do_el0_svc_compat(regs);
+ }
+diff --git a/arch/arm64/kernel/entry.S b/arch/arm64/kernel/entry.S
+index 60d399123360..a9644da545c7 100644
+--- a/arch/arm64/kernel/entry.S
++++ b/arch/arm64/kernel/entry.S
+@@ -259,8 +259,6 @@ alternative_else_nop_endif
+ alternative_if ARM64_HAS_IRQ_PRIO_MASKING
+ 	mrs_s	x20, SYS_ICC_PMR_EL1
+ 	str	x20, [sp, #S_PMR_SAVE]
+-	mov	x20, #GIC_PRIO_IRQON | GIC_PRIO_PSR_I_SET
+-	msr_s	SYS_ICC_PMR_EL1, x20
+ alternative_else_nop_endif
+ 
+ 	/* Re-enable tag checking (TCO set on exception entry) */
+@@ -497,7 +495,17 @@ alternative_endif
+ #endif
+ 	.endm
+ 
++	.macro	gic_prio_irq_setup, pmr:req, tmp:req
++#ifdef CONFIG_ARM64_PSEUDO_NMI
++	alternative_if ARM64_HAS_IRQ_PRIO_MASKING
++	orr	\tmp, \pmr, #GIC_PRIO_PSR_I_SET
++	msr_s	SYS_ICC_PMR_EL1, \tmp
++	alternative_else_nop_endif
++#endif
++	.endm
++
+ 	.macro el1_interrupt_handler, handler:req
++	gic_prio_irq_setup pmr=x20, tmp=x1
+ 	enable_da_f
+ 
+ 	mov	x0, sp
+@@ -525,6 +533,7 @@ alternative_else_nop_endif
+ 	.endm
+ 
+ 	.macro el0_interrupt_handler, handler:req
++	gic_prio_irq_setup pmr=x20, tmp=x0
+ 	user_exit_irqoff
+ 	enable_da_f
+ 
+@@ -710,6 +719,7 @@ SYM_CODE_END(el0_irq)
+ SYM_CODE_START_LOCAL(el1_error)
+ 	kernel_entry 1
+ 	mrs	x1, esr_el1
++	gic_prio_kentry_setup tmp=x2
+ 	enable_dbg
+ 	mov	x0, sp
+ 	bl	do_serror
+@@ -720,6 +730,7 @@ SYM_CODE_START_LOCAL(el0_error)
+ 	kernel_entry 0
+ el0_error_naked:
+ 	mrs	x25, esr_el1
++	gic_prio_kentry_setup tmp=x2
+ 	user_exit_irqoff
+ 	enable_dbg
+ 	mov	x0, sp
+-- 
+2.26.2
+

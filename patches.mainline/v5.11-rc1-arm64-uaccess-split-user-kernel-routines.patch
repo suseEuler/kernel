@@ -1,0 +1,269 @@
+From fc703d80130b1c9d6783f4cbb9516fd5fe4a750d Mon Sep 17 00:00:00 2001
+From: Mark Rutland <mark.rutland@arm.com>
+Date: Wed, 2 Dec 2020 13:15:53 +0000
+Subject: [PATCH] arm64: uaccess: split user/kernel routines
+Git-commit: fc703d80130b1c9d6783f4cbb9516fd5fe4a750d
+Patch-mainline: v5.11-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+This patch separates arm64's user and kernel memory access primitives
+into distinct routines, adding new __{get,put}_kernel_nofault() helpers
+to access kernel memory, upon which core code builds larger copy
+routines.
+
+The kernel access routines (using LDR/STR) are not affected by PAN (when
+legitimately accessing kernel memory), nor are they affected by UAO.
+Switching to KERNEL_DS may set UAO, but this does not adversely affect
+the kernel access routines.
+
+The user access routines (using LDTR/STTR) are not affected by PAN (when
+legitimately accessing user memory), but are affected by UAO. As these
+are only legitimate to use under USER_DS with UAO clear, this should not
+be problematic.
+
+Routines performing atomics to user memory (futex and deprecated
+instruction emulation) still need to transiently clear PAN, and these
+are left as-is. These are never used on kernel memory.
+
+Subsequent patches will refactor the uaccess helpers to remove redundant
+code, and will also remove the redundant PAN/UAO manipulation.
+
+Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: James Morse <james.morse@arm.com>
+Cc: Will Deacon <will@kernel.org>
+Link: https://lore.kernel.org/r/20201202131558.39270-8-mark.rutland@arm.com
+Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/asm-uaccess.h | 48 ++++-----------------
+ arch/arm64/include/asm/uaccess.h     | 64 +++++++++++++++++-----------
+ 2 files changed, 47 insertions(+), 65 deletions(-)
+
+diff --git a/arch/arm64/include/asm/asm-uaccess.h b/arch/arm64/include/asm/asm-uaccess.h
+index 2c26ca5b7bb0..2b5454fa0f24 100644
+--- a/arch/arm64/include/asm/asm-uaccess.h
++++ b/arch/arm64/include/asm/asm-uaccess.h
+@@ -59,62 +59,32 @@ alternative_else_nop_endif
+ #endif
+ 
+ /*
+- * Generate the assembly for UAO alternatives with exception table entries.
++ * Generate the assembly for LDTR/STTR with exception table entries.
+  * This is complicated as there is no post-increment or pair versions of the
+  * unprivileged instructions, and USER() only works for single instructions.
+  */
+-#ifdef CONFIG_ARM64_UAO
+ 	.macro uao_ldp l, reg1, reg2, addr, post_inc
+-		alternative_if_not ARM64_HAS_UAO
+-8888:			ldp	\reg1, \reg2, [\addr], \post_inc;
+-8889:			nop;
+-			nop;
+-		alternative_else
+-			ldtr	\reg1, [\addr];
+-			ldtr	\reg2, [\addr, #8];
+-			add	\addr, \addr, \post_inc;
+-		alternative_endif
++8888:		ldtr	\reg1, [\addr];
++8889:		ldtr	\reg2, [\addr, #8];
++		add	\addr, \addr, \post_inc;
+ 
+ 		_asm_extable	8888b,\l;
+ 		_asm_extable	8889b,\l;
+ 	.endm
+ 
+ 	.macro uao_stp l, reg1, reg2, addr, post_inc
+-		alternative_if_not ARM64_HAS_UAO
+-8888:			stp	\reg1, \reg2, [\addr], \post_inc;
+-8889:			nop;
+-			nop;
+-		alternative_else
+-			sttr	\reg1, [\addr];
+-			sttr	\reg2, [\addr, #8];
+-			add	\addr, \addr, \post_inc;
+-		alternative_endif
++8888:		sttr	\reg1, [\addr];
++8889:		sttr	\reg2, [\addr, #8];
++		add	\addr, \addr, \post_inc;
+ 
+ 		_asm_extable	8888b,\l;
+ 		_asm_extable	8889b,\l;
+ 	.endm
+ 
+ 	.macro uao_user_alternative l, inst, alt_inst, reg, addr, post_inc
+-		alternative_if_not ARM64_HAS_UAO
+-8888:			\inst	\reg, [\addr], \post_inc;
+-			nop;
+-		alternative_else
+-			\alt_inst	\reg, [\addr];
+-			add		\addr, \addr, \post_inc;
+-		alternative_endif
++8888:		\alt_inst	\reg, [\addr];
++		add		\addr, \addr, \post_inc;
+ 
+ 		_asm_extable	8888b,\l;
+ 	.endm
+-#else
+-	.macro uao_ldp l, reg1, reg2, addr, post_inc
+-		USER(\l, ldp \reg1, \reg2, [\addr], \post_inc)
+-	.endm
+-	.macro uao_stp l, reg1, reg2, addr, post_inc
+-		USER(\l, stp \reg1, \reg2, [\addr], \post_inc)
+-	.endm
+-	.macro uao_user_alternative l, inst, alt_inst, reg, addr, post_inc
+-		USER(\l, \inst \reg, [\addr], \post_inc)
+-	.endm
+-#endif
+-
+ #endif
+diff --git a/arch/arm64/include/asm/uaccess.h b/arch/arm64/include/asm/uaccess.h
+index 743f209d3fab..eb04f02299fe 100644
+--- a/arch/arm64/include/asm/uaccess.h
++++ b/arch/arm64/include/asm/uaccess.h
+@@ -24,6 +24,8 @@
+ #include <asm/memory.h>
+ #include <asm/extable.h>
+ 
++#define HAVE_GET_KERNEL_NOFAULT
++
+ #define get_fs()	(current_thread_info()->addr_limit)
+ 
+ static inline void set_fs(mm_segment_t fs)
+@@ -253,10 +255,9 @@ static inline void __user *__uaccess_mask_ptr(const void __user *ptr)
+  * The "__xxx_error" versions set the third argument to -EFAULT if an error
+  * occurs, and leave it unchanged on success.
+  */
+-#define __get_mem_asm(instr, alt_instr, reg, x, addr, err, feature)	\
++#define __get_mem_asm(load, reg, x, addr, err)				\
+ 	asm volatile(							\
+-	"1:"ALTERNATIVE(instr "     " reg "1, [%2]\n",			\
+-			alt_instr " " reg "1, [%2]\n", feature)		\
++	"1:	" load "	" reg "1, [%2]\n"			\
+ 	"2:\n"								\
+ 	"	.section .fixup, \"ax\"\n"				\
+ 	"	.align	2\n"						\
+@@ -268,25 +269,21 @@ static inline void __user *__uaccess_mask_ptr(const void __user *ptr)
+ 	: "+r" (err), "=&r" (x)						\
+ 	: "r" (addr), "i" (-EFAULT))
+ 
+-#define __raw_get_mem(x, ptr, err)					\
++#define __raw_get_mem(ldr, x, ptr, err)					\
+ do {									\
+ 	unsigned long __gu_val;						\
+ 	switch (sizeof(*(ptr))) {					\
+ 	case 1:								\
+-		__get_mem_asm("ldrb", "ldtrb", "%w", __gu_val, (ptr),	\
+-			       (err), ARM64_HAS_UAO);			\
++		__get_mem_asm(ldr "b", "%w", __gu_val, (ptr), (err));	\
+ 		break;							\
+ 	case 2:								\
+-		__get_mem_asm("ldrh", "ldtrh", "%w", __gu_val, (ptr),	\
+-			       (err), ARM64_HAS_UAO);			\
++		__get_mem_asm(ldr "h", "%w", __gu_val, (ptr), (err));	\
+ 		break;							\
+ 	case 4:								\
+-		__get_mem_asm("ldr", "ldtr", "%w", __gu_val, (ptr),	\
+-			       (err), ARM64_HAS_UAO);			\
++		__get_mem_asm(ldr, "%w", __gu_val, (ptr), (err));	\
+ 		break;							\
+ 	case 8:								\
+-		__get_mem_asm("ldr", "ldtr", "%x",  __gu_val, (ptr),	\
+-			       (err), ARM64_HAS_UAO);			\
++		__get_mem_asm(ldr, "%x",  __gu_val, (ptr), (err));	\
+ 		break;							\
+ 	default:							\
+ 		BUILD_BUG();						\
+@@ -298,7 +295,7 @@ do {									\
+ do {									\
+ 	__chk_user_ptr(ptr);						\
+ 	uaccess_enable_not_uao();					\
+-	__raw_get_mem(x, ptr, err);					\
++	__raw_get_mem("ldtr", x, ptr, err);				\
+ 	uaccess_disable_not_uao();					\
+ } while (0)
+ 
+@@ -323,10 +320,19 @@ do {									\
+ 
+ #define get_user	__get_user
+ 
+-#define __put_mem_asm(instr, alt_instr, reg, x, addr, err, feature)	\
++#define __get_kernel_nofault(dst, src, type, err_label)			\
++do {									\
++	int __gkn_err = 0;						\
++									\
++	__raw_get_mem("ldr", *((type *)(dst)),				\
++		      (__force type *)(src), __gkn_err);		\
++	if (unlikely(__gkn_err))					\
++		goto err_label;						\
++} while (0)
++
++#define __put_mem_asm(store, reg, x, addr, err)				\
+ 	asm volatile(							\
+-	"1:"ALTERNATIVE(instr "     " reg "1, [%2]\n",			\
+-			alt_instr " " reg "1, [%2]\n", feature)		\
++	"1:	" store "	" reg "1, [%2]\n"			\
+ 	"2:\n"								\
+ 	"	.section .fixup,\"ax\"\n"				\
+ 	"	.align	2\n"						\
+@@ -337,25 +343,21 @@ do {									\
+ 	: "+r" (err)							\
+ 	: "r" (x), "r" (addr), "i" (-EFAULT))
+ 
+-#define __raw_put_mem(x, ptr, err)					\
++#define __raw_put_mem(str, x, ptr, err)					\
+ do {									\
+ 	__typeof__(*(ptr)) __pu_val = (x);				\
+ 	switch (sizeof(*(ptr))) {					\
+ 	case 1:								\
+-		__put_mem_asm("strb", "sttrb", "%w", __pu_val, (ptr),	\
+-			       (err), ARM64_HAS_UAO);			\
++		__put_mem_asm(str "b", "%w", __pu_val, (ptr), (err));	\
+ 		break;							\
+ 	case 2:								\
+-		__put_mem_asm("strh", "sttrh", "%w", __pu_val, (ptr),	\
+-			       (err), ARM64_HAS_UAO);			\
++		__put_mem_asm(str "h", "%w", __pu_val, (ptr), (err));	\
+ 		break;							\
+ 	case 4:								\
+-		__put_mem_asm("str", "sttr", "%w", __pu_val, (ptr),	\
+-			       (err), ARM64_HAS_UAO);			\
++		__put_mem_asm(str, "%w", __pu_val, (ptr), (err));	\
+ 		break;							\
+ 	case 8:								\
+-		__put_mem_asm("str", "sttr", "%x", __pu_val, (ptr),	\
+-			       (err), ARM64_HAS_UAO);			\
++		__put_mem_asm(str, "%x", __pu_val, (ptr), (err));	\
+ 		break;							\
+ 	default:							\
+ 		BUILD_BUG();						\
+@@ -366,7 +368,7 @@ do {									\
+ do {									\
+ 	__chk_user_ptr(ptr);						\
+ 	uaccess_enable_not_uao();					\
+-	__raw_put_mem(x, ptr, err);					\
++	__raw_put_mem("sttr", x, ptr, err);				\
+ 	uaccess_disable_not_uao();					\
+ } while (0)
+ 
+@@ -391,6 +393,16 @@ do {									\
+ 
+ #define put_user	__put_user
+ 
++#define __put_kernel_nofault(dst, src, type, err_label)			\
++do {									\
++	int __pkn_err = 0;						\
++									\
++	__raw_put_mem("str", *((type *)(src)),				\
++		      (__force type *)(dst), __pkn_err);		\
++	if (unlikely(__pkn_err))					\
++		goto err_label;						\
++} while(0)
++
+ extern unsigned long __must_check __arch_copy_from_user(void *to, const void __user *from, unsigned long n);
+ #define raw_copy_from_user(to, from, n)					\
+ ({									\
+-- 
+2.26.2
+

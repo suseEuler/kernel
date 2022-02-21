@@ -1,0 +1,114 @@
+From d1a303e8616c5ba1260722bb9068bbc0d1704847 Mon Sep 17 00:00:00 2001
+From: Stefan Berger <stefanb@linux.ibm.com>
+Date: Tue, 16 Mar 2021 17:07:36 -0400
+Subject: [PATCH] x509: Detect sm2 keys by their parameters OID
+Git-commit: d1a303e8616c5ba1260722bb9068bbc0d1704847
+Patch-mainline: v5.13-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+Detect whether a key is an sm2 type of key by its OID in the parameters
+array rather than assuming that everything under OID_id_ecPublicKey
+is sm2, which is not the case.
+
+Cc: David Howells <dhowells@redhat.com>
+Cc: keyrings@vger.kernel.org
+Signed-off-by: Stefan Berger <stefanb@linux.ibm.com>
+Reviewed-by: Tianjia Zhang <tianjia.zhang@linux.alibaba.com>
+Tested-by: Tianjia Zhang <tianjia.zhang@linux.alibaba.com>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ crypto/asymmetric_keys/x509_cert_parser.c | 12 +++++++++++-
+ include/linux/oid_registry.h              |  1 +
+ lib/oid_registry.c                        | 24 +++++++++++++++++++++++
+ 3 files changed, 36 insertions(+), 1 deletion(-)
+
+diff --git a/crypto/asymmetric_keys/x509_cert_parser.c b/crypto/asymmetric_keys/x509_cert_parser.c
+index 52c9b455fc7d..1621ceaf5c95 100644
+--- a/crypto/asymmetric_keys/x509_cert_parser.c
++++ b/crypto/asymmetric_keys/x509_cert_parser.c
+@@ -459,6 +459,7 @@ int x509_extract_key_data(void *context, size_t hdrlen,
+ 			  const void *value, size_t vlen)
+ {
+ 	struct x509_parse_context *ctx = context;
++	enum OID oid;
+ 
+ 	ctx->key_algo = ctx->last_oid;
+ 	switch (ctx->last_oid) {
+@@ -470,7 +471,16 @@ int x509_extract_key_data(void *context, size_t hdrlen,
+ 		ctx->cert->pub->pkey_algo = "ecrdsa";
+ 		break;
+ 	case OID_id_ecPublicKey:
+-		ctx->cert->pub->pkey_algo = "sm2";
++		if (parse_OID(ctx->params, ctx->params_size, &oid) != 0)
++			return -EBADMSG;
++
++		switch (oid) {
++		case OID_sm2:
++			ctx->cert->pub->pkey_algo = "sm2";
++			break;
++		default:
++			return -ENOPKG;
++		}
+ 		break;
+ 	default:
+ 		return -ENOPKG;
+diff --git a/include/linux/oid_registry.h b/include/linux/oid_registry.h
+index b504e2f36b25..f32d91895e4d 100644
+--- a/include/linux/oid_registry.h
++++ b/include/linux/oid_registry.h
+@@ -121,6 +121,7 @@ enum OID {
+ };
+ 
+ extern enum OID look_up_OID(const void *data, size_t datasize);
++extern int parse_OID(const void *data, size_t datasize, enum OID *oid);
+ extern int sprint_oid(const void *, size_t, char *, size_t);
+ extern int sprint_OID(enum OID, char *, size_t);
+ 
+diff --git a/lib/oid_registry.c b/lib/oid_registry.c
+index f7ad43f28579..3dfaa836e7c5 100644
+--- a/lib/oid_registry.c
++++ b/lib/oid_registry.c
+@@ -11,6 +11,7 @@
+ #include <linux/kernel.h>
+ #include <linux/errno.h>
+ #include <linux/bug.h>
++#include <linux/asn1.h>
+ #include "oid_registry_data.c"
+ 
+ MODULE_DESCRIPTION("OID Registry");
+@@ -92,6 +93,29 @@ enum OID look_up_OID(const void *data, size_t datasize)
+ }
+ EXPORT_SYMBOL_GPL(look_up_OID);
+ 
++/**
++ * parse_OID - Parse an OID from a bytestream
++ * @data: Binary representation of the header + OID
++ * @datasize: Size of the binary representation
++ * @oid: Pointer to oid to return result
++ *
++ * Parse an OID from a bytestream that holds the OID in the format
++ * ASN1_OID | length | oid. The length indicator must equal to datasize - 2.
++ * -EBADMSG is returned if the bytestream is too short.
++ */
++int parse_OID(const void *data, size_t datasize, enum OID *oid)
++{
++	const unsigned char *v = data;
++
++	/* we need 2 bytes of header and at least 1 byte for oid */
++	if (datasize < 3 || v[0] != ASN1_OID || v[1] != datasize - 2)
++		return -EBADMSG;
++
++	*oid = look_up_OID(data + 2, datasize - 2);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(parse_OID);
++
+ /*
+  * sprint_OID - Print an Object Identifier into a buffer
+  * @data: The encoded OID to print
+-- 
+2.26.2
+

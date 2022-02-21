@@ -1,0 +1,111 @@
+From 7ec2ec6825684ff5b3811c1e79770dc1249d2269 Mon Sep 17 00:00:00 2001
+From: Zhang Wensheng <zhangwensheng5@huawei.com>
+Date: Thu, 17 Feb 2022 14:58:59 +0800
+Subject: [PATCH] block: update io_ticks when io hang
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 7ec2ec6825684ff5b3811c1e79770dc1249d2269
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4STNX?from=project-issue
+CVE: NA
+
+--------------------------------
+
+When the inflight IOs are slow and no new IOs are issued, we expect
+iostat could manifest the IO hang problem. However after
+commit 5b18b5a73760 ("block: delete part_round_stats and switch to less
+precise counting"), io_tick and time_in_queue will not be updated until
+the end of IO, and the avgqu-sz and %util columns of iostat will be zero.
+
+Because it has using stat.nsecs accumulation to express time_in_queue
+which is not suitable to change, and may %util will express the status
+better when io hang occur. To fix io_ticks, we use update_io_ticks and
+inflight to update io_ticks when diskstats_show and part_stat_show
+been called.
+
+Fixes: 5b18b5a73760 ("block: delete part_round_stats and switch to less precise counting")
+Signed-off-by: Zhang Wensheng <zhangwensheng5@huawei.com>
+Reviewed-by: Hou Tao <houtao1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ block/blk-core.c |  2 +-
+ block/blk.h      |  2 ++
+ block/genhd.c    | 14 ++++++++++++--
+ 3 files changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 89f1e74785dc..019d583b355c 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -1249,7 +1249,7 @@ unsigned int blk_rq_err_bytes(const struct request *rq)
+ }
+ EXPORT_SYMBOL_GPL(blk_rq_err_bytes);
+ 
+-static void update_io_ticks(struct hd_struct *part, unsigned long now, bool end)
++void update_io_ticks(struct hd_struct *part, unsigned long now, bool end)
+ {
+ 	unsigned long stamp;
+ again:
+diff --git a/block/blk.h b/block/blk.h
+index cd39fd0c93f1..3165c16725d5 100644
+--- a/block/blk.h
++++ b/block/blk.h
+@@ -255,6 +255,8 @@ static inline bool blk_do_io_stat(struct request *rq)
+ 	return rq->rq_disk && (rq->rq_flags & RQF_IO_STAT);
+ }
+ 
++void update_io_ticks(struct hd_struct *part, unsigned long now, bool end);
++
+ static inline void req_set_nomerge(struct request_queue *q, struct request *req)
+ {
+ 	req->cmd_flags |= REQ_NOMERGE;
+diff --git a/block/genhd.c b/block/genhd.c
+index 6566eacc807d..f94152e99876 100644
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -1301,12 +1301,17 @@ ssize_t part_stat_show(struct device *dev,
+ 	struct disk_stats stat;
+ 	unsigned int inflight;
+ 
+-	part_stat_read_all(p, &stat);
+ 	if (queue_is_mq(q))
+ 		inflight = blk_mq_in_flight(q, p);
+ 	else
+ 		inflight = part_in_flight(p);
+ 
++	if (inflight) {
++		part_stat_lock();
++		update_io_ticks(p, jiffies, true);
++		part_stat_unlock();
++	}
++	part_stat_read_all(p, &stat);
+ 	return sprintf(buf,
+ 		"%8lu %8lu %8llu %8u "
+ 		"%8lu %8lu %8llu %8u "
+@@ -1623,12 +1628,17 @@ static int diskstats_show(struct seq_file *seqf, void *v)
+ 
+ 	disk_part_iter_init(&piter, gp, DISK_PITER_INCL_EMPTY_PART0);
+ 	while ((hd = disk_part_iter_next(&piter))) {
+-		part_stat_read_all(hd, &stat);
+ 		if (queue_is_mq(gp->queue))
+ 			inflight = blk_mq_in_flight(gp->queue, hd);
+ 		else
+ 			inflight = part_in_flight(hd);
+ 
++		if (inflight) {
++			part_stat_lock();
++			update_io_ticks(hd, jiffies, true);
++			part_stat_unlock();
++		}
++		part_stat_read_all(hd, &stat);
+ 		seq_printf(seqf, "%4d %7d %s "
+ 			   "%lu %lu %lu %u "
+ 			   "%lu %lu %lu %u "
+-- 
+2.26.2
+

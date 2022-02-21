@@ -1,0 +1,126 @@
+From 923e1e7d8223cfa6e67d00ad238ee415c3c59320 Mon Sep 17 00:00:00 2001
+From: Mark Rutland <mark.rutland@arm.com>
+Date: Wed, 2 Dec 2020 13:15:50 +0000
+Subject: [PATCH] arm64: uaccess: rename privileged uaccess routines
+Git-commit: 923e1e7d8223cfa6e67d00ad238ee415c3c59320
+Patch-mainline: v5.11-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+We currently have many uaccess_*{enable,disable}*() variants, which
+subsequent patches will cut down as part of removing set_fs() and
+friends. Once this simplification is made, most uaccess routines will
+only need to ensure that the user page tables are mapped in TTBR0, as is
+currently dealt with by uaccess_ttbr0_{enable,disable}().
+
+The existing uaccess_{enable,disable}() routines ensure that user page
+tables are mapped in TTBR0, and also disable PAN protections, which is
+necessary to be able to use atomics on user memory, but also permit
+unrelated privileged accesses to access user memory.
+
+As preparatory step, let's rename uaccess_{enable,disable}() to
+uaccess_{enable,disable}_privileged(), highlighting this caveat and
+discouraging wider misuse. Subsequent patches can reuse the
+uaccess_{enable,disable}() naming for the common case of ensuring the
+user page tables are mapped in TTBR0.
+
+There should be no functional change as a result of this patch.
+
+Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: James Morse <james.morse@arm.com>
+Cc: Will Deacon <will@kernel.org>
+Link: https://lore.kernel.org/r/20201202131558.39270-5-mark.rutland@arm.com
+Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/futex.h       | 8 ++++----
+ arch/arm64/include/asm/uaccess.h     | 4 ++--
+ arch/arm64/kernel/armv8_deprecated.c | 4 ++--
+ 3 files changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/arch/arm64/include/asm/futex.h b/arch/arm64/include/asm/futex.h
+index 97f6a63810ec..8e41faa37c69 100644
+--- a/arch/arm64/include/asm/futex.h
++++ b/arch/arm64/include/asm/futex.h
+@@ -16,7 +16,7 @@
+ do {									\
+ 	unsigned int loops = FUTEX_MAX_LOOPS;				\
+ 									\
+-	uaccess_enable();						\
++	uaccess_enable_privileged();					\
+ 	asm volatile(							\
+ "	prfm	pstl1strm, %2\n"					\
+ "1:	ldxr	%w1, %2\n"						\
+@@ -39,7 +39,7 @@ do {									\
+ 	  "+r" (loops)							\
+ 	: "r" (oparg), "Ir" (-EFAULT), "Ir" (-EAGAIN)			\
+ 	: "memory");							\
+-	uaccess_disable();						\
++	uaccess_disable_privileged();					\
+ } while (0)
+ 
+ static inline int
+@@ -95,7 +95,7 @@ futex_atomic_cmpxchg_inatomic(u32 *uval, u32 __user *_uaddr,
+ 		return -EFAULT;
+ 
+ 	uaddr = __uaccess_mask_ptr(_uaddr);
+-	uaccess_enable();
++	uaccess_enable_privileged();
+ 	asm volatile("// futex_atomic_cmpxchg_inatomic\n"
+ "	prfm	pstl1strm, %2\n"
+ "1:	ldxr	%w1, %2\n"
+@@ -118,7 +118,7 @@ futex_atomic_cmpxchg_inatomic(u32 *uval, u32 __user *_uaddr,
+ 	: "+r" (ret), "=&r" (val), "+Q" (*uaddr), "=&r" (tmp), "+r" (loops)
+ 	: "r" (oldval), "r" (newval), "Ir" (-EFAULT), "Ir" (-EAGAIN)
+ 	: "memory");
+-	uaccess_disable();
++	uaccess_disable_privileged();
+ 
+ 	if (!ret)
+ 		*uval = val;
+diff --git a/arch/arm64/include/asm/uaccess.h b/arch/arm64/include/asm/uaccess.h
+index 991dd5f031e4..d6a4e496ebc6 100644
+--- a/arch/arm64/include/asm/uaccess.h
++++ b/arch/arm64/include/asm/uaccess.h
+@@ -200,12 +200,12 @@ do {									\
+ 				CONFIG_ARM64_PAN));			\
+ } while (0)
+ 
+-static inline void uaccess_disable(void)
++static inline void uaccess_disable_privileged(void)
+ {
+ 	__uaccess_disable(ARM64_HAS_PAN);
+ }
+ 
+-static inline void uaccess_enable(void)
++static inline void uaccess_enable_privileged(void)
+ {
+ 	__uaccess_enable(ARM64_HAS_PAN);
+ }
+diff --git a/arch/arm64/kernel/armv8_deprecated.c b/arch/arm64/kernel/armv8_deprecated.c
+index 7364de008bab..0e86e8b9cedd 100644
+--- a/arch/arm64/kernel/armv8_deprecated.c
++++ b/arch/arm64/kernel/armv8_deprecated.c
+@@ -277,7 +277,7 @@ static void __init register_insn_emulation_sysctl(void)
+ 
+ #define __user_swpX_asm(data, addr, res, temp, temp2, B)	\
+ do {								\
+-	uaccess_enable();					\
++	uaccess_enable_privileged();				\
+ 	__asm__ __volatile__(					\
+ 	"	mov		%w3, %w7\n"			\
+ 	"0:	ldxr"B"		%w2, [%4]\n"			\
+@@ -302,7 +302,7 @@ do {								\
+ 	  "i" (-EFAULT),					\
+ 	  "i" (__SWP_LL_SC_LOOPS)				\
+ 	: "memory");						\
+-	uaccess_disable();					\
++	uaccess_disable_privileged();				\
+ } while (0)
+ 
+ #define __user_swp_asm(data, addr, res, temp, temp2) \
+-- 
+2.26.2
+
