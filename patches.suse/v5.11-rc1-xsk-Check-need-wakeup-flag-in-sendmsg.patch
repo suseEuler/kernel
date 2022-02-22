@@ -1,0 +1,90 @@
+From e392081837283fbe5df1837fd85012ae5bfae098 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Bj=C3=B6rn=20T=C3=B6pel?= <bjorn.topel@intel.com>
+Date: Mon, 30 Nov 2020 19:51:59 +0100
+Subject: [PATCH] xsk: Check need wakeup flag in sendmsg()
+MIME-Version: 1.0
+Git-commit: e392081837283fbe5df1837fd85012ae5bfae098
+Patch-mainline: v5.11-rc1
+References: bsn#92
+Modified-by-SEL: No
+
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add a check for need wake up in sendmsg(), so that if a user calls
+sendmsg() when no wakeup is needed, do not trigger a wakeup.
+
+To simplify the need wakeup check in the syscall, unconditionally
+enable the need wakeup flag for Tx. This has a side-effect for poll();
+If poll() is called for a socket without enabled need wakeup, a Tx
+wakeup is unconditionally performed.
+
+The wakeup matrix for AF_XDP now looks like:
+
+need wakeup | poll()       | sendmsg()   | recvmsg()
+------------+--------------+-------------+------------
+disabled    | wake Tx      | wake Tx     | nop
+enabled     | check flag;  | check flag; | check flag;
+            |   wake Tx/Rx |   wake Tx   |   wake Rx
+
+Signed-off-by: Björn Töpel <bjorn.topel@intel.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Magnus Karlsson <magnus.karlsson@intel.com>
+Link: https://lore.kernel.org/bpf/20201130185205.196029-5-bjorn.topel@gmail.com
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ net/xdp/xsk.c           |  6 +++++-
+ net/xdp/xsk_buff_pool.c | 13 ++++++-------
+ 2 files changed, 11 insertions(+), 8 deletions(-)
+
+diff --git a/net/xdp/xsk.c b/net/xdp/xsk.c
+index 1d1e0cd51a95..c72b4dba2878 100644
+--- a/net/xdp/xsk.c
++++ b/net/xdp/xsk.c
+@@ -522,13 +522,17 @@ static int xsk_sendmsg(struct socket *sock, struct msghdr *m, size_t total_len)
+ 	bool need_wait = !(m->msg_flags & MSG_DONTWAIT);
+ 	struct sock *sk = sock->sk;
+ 	struct xdp_sock *xs = xdp_sk(sk);
++	struct xsk_buff_pool *pool;
+ 
+ 	if (unlikely(!xsk_is_bound(xs)))
+ 		return -ENXIO;
+ 	if (unlikely(need_wait))
+ 		return -EOPNOTSUPP;
+ 
+-	return __xsk_sendmsg(sk);
++	pool = xs->pool;
++	if (pool->cached_need_wakeup & XDP_WAKEUP_TX)
++		return __xsk_sendmsg(sk);
++	return 0;
+ }
+ 
+ static int xsk_recvmsg(struct socket *sock, struct msghdr *m, size_t len, int flags)
+diff --git a/net/xdp/xsk_buff_pool.c b/net/xdp/xsk_buff_pool.c
+index 8a3bf4e1318e..96bb607853ad 100644
+--- a/net/xdp/xsk_buff_pool.c
++++ b/net/xdp/xsk_buff_pool.c
+@@ -144,14 +144,13 @@ static int __xp_assign_dev(struct xsk_buff_pool *pool,
+ 	if (err)
+ 		return err;
+ 
+-	if (flags & XDP_USE_NEED_WAKEUP) {
++	if (flags & XDP_USE_NEED_WAKEUP)
+ 		pool->uses_need_wakeup = true;
+-		/* Tx needs to be explicitly woken up the first time.
+-		 * Also for supporting drivers that do not implement this
+-		 * feature. They will always have to call sendto().
+-		 */
+-		pool->cached_need_wakeup = XDP_WAKEUP_TX;
+-	}
++	/* Tx needs to be explicitly woken up the first time.  Also
++	 * for supporting drivers that do not implement this
++	 * feature. They will always have to call sendto() or poll().
++	 */
++	pool->cached_need_wakeup = XDP_WAKEUP_TX;
+ 
+ 	dev_hold(netdev);
+ 
+-- 
+2.34.1
+
