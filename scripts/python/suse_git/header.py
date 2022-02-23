@@ -189,8 +189,14 @@ tag_map = {
                 'name' : 'SEL',
                 'match' : 'Yes, \S+.*'
             },
+            {
+                'name' : 'NA',
+                'match' : 'N\/A\s*$',
+                'requires_any': ['Patch-mainline:Never', 'Patch-mainline:Not yet', 'Patch-mainline:No'],
+            },
+
         ],
-        'error' : "Must contain Modified-by-SEL: [No|Yes, blabla...]",
+        'error' : "Must contain Modified-by-SEL: [N/A|No|Yes, blabla...]",
     },
 }
 
