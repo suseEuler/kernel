@@ -178,7 +178,7 @@ tag_map = {
      # Enable to require real References tags
      #   'requires' : ['References:SUSE'],
     },
-    'Modified-by-sel' : {
+    'Modified-by-SEL' : {
         'required' : True,
         'accepted' : [
             {
@@ -195,7 +195,7 @@ tag_map = {
 }
 
 if 'SKIP_MBS_TAG' in environ:
-    del(tag_map['Modified-by-sel'])
+    del(tag_map['Modified-by-SEL'])
 
 class ValidationError(patch.ValidationError):
     def __init__(self, name, msg):
@@ -204,7 +204,6 @@ class ValidationError(patch.ValidationError):
 
 class FormatError(ValidationError):
     def __init__(self, name, value, error=None):
-        name = name.capitalize()
         if error is None:
             error = "invalid value"
         msg = "%s: `%s': %s." % (name, value, error)
@@ -269,6 +268,8 @@ class HeaderException(patch.PatchException):
 class Tag:
     def __init__(self, name, value):
         self.name = name.lower().capitalize()
+        if self.name == 'Modified-by-sel':
+            self.name = 'Modified-by-SEL'
         self.value = value
         self.tagtype = None
         self.valid = False
