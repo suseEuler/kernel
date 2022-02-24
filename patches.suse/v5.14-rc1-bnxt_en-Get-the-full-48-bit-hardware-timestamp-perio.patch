@@ -1,0 +1,119 @@
+From 390862f45c85b8ebbf9c5c09192bf413a8fb72f8 Mon Sep 17 00:00:00 2001
+From: Pavan Chebbi <pavan.chebbi@broadcom.com>
+Date: Sun, 27 Jun 2021 13:19:47 -0400
+Subject: [PATCH] bnxt_en: Get the full 48-bit hardware timestamp periodically
+Git-commit: 390862f45c85b8ebbf9c5c09192bf413a8fb72f8
+Patch-mainline: v5.14-rc1
+References: bsn#92
+Modified-by-SEL: No
+
+
+From the bnxt_timer(), read the 48-bit hardware running clock
+periodically and store it in ptp->current_time.  The previous snapshot
+of the clock will be stored in ptp->old_time.  The old_time snapshot
+will be used in the next patches to compute the RX packet timestamps.
+
+v2: Use .do_aux_work() to read the timer periodically.
+
+Reviewed-by: Edwin Peer <edwin.peer@broadcom.com>
+Signed-off-by: Pavan Chebbi <pavan.chebbi@broadcom.com>
+Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ drivers/net/ethernet/broadcom/bnxt/bnxt.c     |  1 +
+ drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.c | 39 +++++++++++++++++++
+ drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.h |  1 +
+ 3 files changed, 41 insertions(+)
+
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 1250a5b50b50..23eddde7bf12 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -10075,6 +10075,7 @@ static int __bnxt_open_nic(struct bnxt *bp, bool irq_re_init, bool link_re_init)
+ 		}
+ 	}
+ 
++	bnxt_ptp_start(bp);
+ 	rc = bnxt_init_nic(bp, irq_re_init);
+ 	if (rc) {
+ 		netdev_err(bp->dev, "bnxt_init_nic err: %x\n", rc);
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.c
+index 47f1f9c3380c..b0563c7761ff 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.c
+@@ -45,6 +45,18 @@ static u64 bnxt_refclk_read(struct bnxt *bp, struct ptp_system_timestamp *sts)
+ 	return ns;
+ }
+ 
++static void bnxt_ptp_get_current_time(struct bnxt *bp)
++{
++	struct bnxt_ptp_cfg *ptp = bp->ptp_cfg;
++
++	if (!ptp)
++		return;
++	spin_lock_bh(&ptp->ptp_lock);
++	WRITE_ONCE(ptp->old_time, ptp->current_time);
++	ptp->current_time = bnxt_refclk_read(bp, NULL);
++	spin_unlock_bh(&ptp->ptp_lock);
++}
++
+ static int bnxt_ptp_gettimex(struct ptp_clock_info *ptp_info,
+ 			     struct timespec64 *ts,
+ 			     struct ptp_system_timestamp *sts)
+@@ -257,6 +269,32 @@ static u64 bnxt_cc_read(const struct cyclecounter *cc)
+ 	return bnxt_refclk_read(ptp->bp, NULL);
+ }
+ 
++static long bnxt_ptp_ts_aux_work(struct ptp_clock_info *ptp_info)
++{
++	struct bnxt_ptp_cfg *ptp = container_of(ptp_info, struct bnxt_ptp_cfg,
++						ptp_info);
++	struct bnxt *bp = ptp->bp;
++
++	bnxt_ptp_get_current_time(bp);
++	return HZ;
++}
++
++void bnxt_ptp_start(struct bnxt *bp)
++{
++	struct bnxt_ptp_cfg *ptp = bp->ptp_cfg;
++
++	if (!ptp)
++		return;
++
++	if (bp->flags & BNXT_FLAG_CHIP_P5) {
++		spin_lock_bh(&ptp->ptp_lock);
++		ptp->current_time = bnxt_refclk_read(bp, NULL);
++		WRITE_ONCE(ptp->old_time, ptp->current_time);
++		spin_unlock_bh(&ptp->ptp_lock);
++		ptp_schedule_worker(ptp->ptp_clock, 0);
++	}
++}
++
+ static const struct ptp_clock_info bnxt_ptp_caps = {
+ 	.owner		= THIS_MODULE,
+ 	.name		= "bnxt clock",
+@@ -268,6 +306,7 @@ static const struct ptp_clock_info bnxt_ptp_caps = {
+ 	.pps		= 0,
+ 	.adjfreq	= bnxt_ptp_adjfreq,
+ 	.adjtime	= bnxt_ptp_adjtime,
++	.do_aux_work	= bnxt_ptp_ts_aux_work,
+ 	.gettimex64	= bnxt_ptp_gettimex,
+ 	.settime64	= bnxt_ptp_settime,
+ 	.enable		= bnxt_ptp_enable,
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.h b/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.h
+index 93a9921a8b46..61a67055c812 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.h
+@@ -60,6 +60,7 @@ struct bnxt_ptp_cfg {
+ 
+ int bnxt_hwtstamp_set(struct net_device *dev, struct ifreq *ifr);
+ int bnxt_hwtstamp_get(struct net_device *dev, struct ifreq *ifr);
++void bnxt_ptp_start(struct bnxt *bp);
+ int bnxt_ptp_init(struct bnxt *bp);
+ void bnxt_ptp_clear(struct bnxt *bp);
+ #endif
+-- 
+2.34.1
+

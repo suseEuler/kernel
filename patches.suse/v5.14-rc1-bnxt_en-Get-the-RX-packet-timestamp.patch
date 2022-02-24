@@ -1,0 +1,158 @@
+From 7f5515d19cd7aa02a866fd86622a022f12e06f0f Mon Sep 17 00:00:00 2001
+From: Pavan Chebbi <pavan.chebbi@broadcom.com>
+Date: Sun, 27 Jun 2021 13:19:48 -0400
+Subject: [PATCH] bnxt_en: Get the RX packet timestamp
+Git-commit: 7f5515d19cd7aa02a866fd86622a022f12e06f0f
+Patch-mainline: v5.14-rc1
+References: bsn#92
+Modified-by-SEL: No
+
+
+If the RX packet is timestamped by the hardware, the RX completion
+record will contain the lower 32-bit of the timestamp.  This needs
+to be combined with the upper 16-bit of the periodic timestamp that
+we get from the timer.  The previous snapshot in ptp->old_timer is
+used to make sure that the snapshot is not ahead of the RX timestamp
+and we adjust for wrap-around if needed.
+
+v2: Make ptp->old_time read access safe on 32-bit CPUs.
+
+Reviewed-by: Edwin Peer <edwin.peer@broadcom.com>
+Signed-off-by: Pavan Chebbi <pavan.chebbi@broadcom.com>
+Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ drivers/net/ethernet/broadcom/bnxt/bnxt.c     | 23 +++++++++++++++++--
+ drivers/net/ethernet/broadcom/bnxt/bnxt.h     |  3 ++-
+ drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.c | 16 +++++++++++++
+ drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.h | 13 +++++++++++
+ 4 files changed, 52 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 23eddde7bf12..5132f07a5f43 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -1709,9 +1709,9 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_cp_ring_info *cpr,
+ 	u8 *data_ptr, agg_bufs, cmp_type;
+ 	dma_addr_t dma_addr;
+ 	struct sk_buff *skb;
++	u32 flags, misc;
+ 	void *data;
+ 	int rc = 0;
+-	u32 misc;
+ 
+ 	rxcmp = (struct rx_cmp *)
+ 			&cpr->cp_desc_ring[CP_RING(cp_cons)][CP_IDX(cp_cons)];
+@@ -1809,7 +1809,8 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_cp_ring_info *cpr,
+ 		goto next_rx_no_len;
+ 	}
+ 
+-	len = le32_to_cpu(rxcmp->rx_cmp_len_flags_type) >> RX_CMP_LEN_SHIFT;
++	flags = le32_to_cpu(rxcmp->rx_cmp_len_flags_type);
++	len = flags >> RX_CMP_LEN_SHIFT;
+ 	dma_addr = rx_buf->mapping;
+ 
+ 	if (bnxt_rx_xdp(bp, rxr, cons, data, &data_ptr, &len, event)) {
+@@ -1886,6 +1887,24 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_cp_ring_info *cpr,
+ 		}
+ 	}
+ 
++	if (unlikely((flags & RX_CMP_FLAGS_ITYPES_MASK) ==
++		     RX_CMP_FLAGS_ITYPE_PTP_W_TS)) {
++		if (bp->flags & BNXT_FLAG_CHIP_P5) {
++			u32 cmpl_ts = le32_to_cpu(rxcmp1->rx_cmp_timestamp);
++			u64 ns, ts;
++
++			if (!bnxt_get_rx_ts_p5(bp, &ts, cmpl_ts)) {
++				struct bnxt_ptp_cfg *ptp = bp->ptp_cfg;
++
++				spin_lock_bh(&ptp->ptp_lock);
++				ns = timecounter_cyc2time(&ptp->tc, ts);
++				spin_unlock_bh(&ptp->ptp_lock);
++				memset(skb_hwtstamps(skb), 0,
++				       sizeof(*skb_hwtstamps(skb)));
++				skb_hwtstamps(skb)->hwtstamp = ns_to_ktime(ns);
++			}
++		}
++	}
+ 	bnxt_deliver_skb(bp, bnapi, skb);
+ 	rc = 1;
+ 
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.h b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index 696163559b64..94a612e8cd42 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@ -159,6 +159,7 @@ struct rx_cmp {
+ 	#define RX_CMP_FLAGS_RSS_VALID				(1 << 10)
+ 	#define RX_CMP_FLAGS_UNUSED				(1 << 11)
+ 	 #define RX_CMP_FLAGS_ITYPES_SHIFT			 12
++	 #define RX_CMP_FLAGS_ITYPES_MASK			 0xf000
+ 	 #define RX_CMP_FLAGS_ITYPE_UNKNOWN			 (0 << 12)
+ 	 #define RX_CMP_FLAGS_ITYPE_IP				 (1 << 12)
+ 	 #define RX_CMP_FLAGS_ITYPE_TCP				 (2 << 12)
+@@ -240,7 +241,7 @@ struct rx_cmp_ext {
+ 	#define RX_CMPL_CFA_CODE_MASK				(0xffff << 16)
+ 	 #define RX_CMPL_CFA_CODE_SFT				 16
+ 
+-	__le32 rx_cmp_unused3;
++	__le32 rx_cmp_timestamp;
+ };
+ 
+ #define RX_CMP_L2_ERRORS						\
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.c
+index b0563c7761ff..cea7220f3d1b 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.c
+@@ -279,6 +279,22 @@ static long bnxt_ptp_ts_aux_work(struct ptp_clock_info *ptp_info)
+ 	return HZ;
+ }
+ 
++int bnxt_get_rx_ts_p5(struct bnxt *bp, u64 *ts, u32 pkt_ts)
++{
++	struct bnxt_ptp_cfg *ptp = bp->ptp_cfg;
++	u64 time;
++
++	if (!ptp)
++		return -ENODEV;
++
++	BNXT_READ_TIME64(ptp, time, ptp->old_time);
++	*ts = (time & BNXT_HI_TIMER_MASK) | pkt_ts;
++	if (pkt_ts < (time & BNXT_LO_TIMER_MASK))
++		*ts += BNXT_LO_TIMER_MASK + 1;
++
++	return 0;
++}
++
+ void bnxt_ptp_start(struct bnxt *bp)
+ {
+ 	struct bnxt_ptp_cfg *ptp = bp->ptp_cfg;
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.h b/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.h
+index 61a67055c812..4f2c62f5a78e 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.h
+@@ -58,8 +58,21 @@ struct bnxt_ptp_cfg {
+ 	u32			refclk_mapped_regs[2];
+ };
+ 
++#if BITS_PER_LONG == 32
++#define BNXT_READ_TIME64(ptp, dst, src)		\
++do {						\
++	spin_lock_bh(&(ptp)->ptp_lock);		\
++	(dst) = (src);				\
++	spin_unlock_bh(&(ptp)->ptp_lock);	\
++} while (0)
++#else
++#define BNXT_READ_TIME64(ptp, dst, src)		\
++	((dst) = READ_ONCE(src))
++#endif
++
+ int bnxt_hwtstamp_set(struct net_device *dev, struct ifreq *ifr);
+ int bnxt_hwtstamp_get(struct net_device *dev, struct ifreq *ifr);
++int bnxt_get_rx_ts_p5(struct bnxt *bp, u64 *ts, u32 pkt_ts);
+ void bnxt_ptp_start(struct bnxt *bp);
+ int bnxt_ptp_init(struct bnxt *bp);
+ void bnxt_ptp_clear(struct bnxt *bp);
+-- 
+2.34.1
+

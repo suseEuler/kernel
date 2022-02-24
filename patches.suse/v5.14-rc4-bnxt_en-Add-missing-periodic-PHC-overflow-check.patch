@@ -1,0 +1,69 @@
+From 89bc7f456cd40e0be7b94f4fdae9186f22b76a05 Mon Sep 17 00:00:00 2001
+From: Michael Chan <michael.chan@broadcom.com>
+Date: Fri, 23 Jul 2021 17:53:48 -0400
+Subject: [PATCH] bnxt_en: Add missing periodic PHC overflow check
+Git-commit: 89bc7f456cd40e0be7b94f4fdae9186f22b76a05
+Patch-mainline: v5.14-rc4
+References: bsn#92
+Modified-by-SEL: No
+
+
+We use the timecounter APIs for the 48-bit PHC and packet timestamps.
+We must periodically update the timecounter at roughly half the
+overflow interval.  The overflow interval is about 78 hours, so
+update it every 19 hours (1/4 interval) for some extra margins.
+
+Fixes: 390862f45c85 ("bnxt_en: Get the full 48-bit hardware timestamp periodically")
+Reviewed-by: Pavan Chebbi <pavan.chebbi@broadcom.com>
+Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+Acked-by: Richard Cochran <richardcochran@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.c | 7 +++++++
+ drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.h | 4 ++++
+ 2 files changed, 11 insertions(+)
+
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.c
+index 9089e7f3fbd4..ec381c2423b8 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.c
+@@ -353,6 +353,12 @@ static long bnxt_ptp_ts_aux_work(struct ptp_clock_info *ptp_info)
+ 
+ 	bnxt_ptp_get_current_time(bp);
+ 	ptp->next_period = now + HZ;
++	if (time_after_eq(now, ptp->next_overflow_check)) {
++		spin_lock_bh(&ptp->ptp_lock);
++		timecounter_read(&ptp->tc);
++		spin_unlock_bh(&ptp->ptp_lock);
++		ptp->next_overflow_check = now + BNXT_PHC_OVERFLOW_PERIOD;
++	}
+ 	return HZ;
+ }
+ 
+@@ -423,6 +429,7 @@ int bnxt_ptp_init(struct bnxt *bp)
+ 	ptp->cc.shift = 0;
+ 	ptp->cc.mult = 1;
+ 
++	ptp->next_overflow_check = jiffies + BNXT_PHC_OVERFLOW_PERIOD;
+ 	timecounter_init(&ptp->tc, &ptp->cc, ktime_to_ns(ktime_get_real()));
+ 
+ 	ptp->ptp_info = bnxt_ptp_caps;
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.h b/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.h
+index 4135ea3ec788..254ba7bc0f99 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.h
+@@ -32,6 +32,10 @@ struct bnxt_ptp_cfg {
+ 	u64			current_time;
+ 	u64			old_time;
+ 	unsigned long		next_period;
++	unsigned long		next_overflow_check;
++	/* 48-bit PHC overflows in 78 hours.  Check overflow every 19 hours. */
++	#define BNXT_PHC_OVERFLOW_PERIOD	(19 * 3600 * HZ)
++
+ 	u16			tx_seqid;
+ 	struct bnxt		*bp;
+ 	atomic_t		tx_avail;
+-- 
+2.34.1
+

@@ -1,0 +1,104 @@
+From 3958b1da725a477b4a222183d16a14d85445d4b6 Mon Sep 17 00:00:00 2001
+From: Somnath Kotur <somnath.kotur@broadcom.com>
+Date: Sun, 18 Jul 2021 15:36:29 -0400
+Subject: [PATCH] bnxt_en: fix error path of FW reset
+Git-commit: 3958b1da725a477b4a222183d16a14d85445d4b6
+Patch-mainline: v5.14-rc3
+References: bsn#92
+Modified-by-SEL: No
+
+
+When bnxt_open() fails in the firmware reset path, the driver needs to
+gracefully abort, but it is executing code that should be invoked only
+in the success path.  Define a function to abort FW reset and
+consolidate all error paths to call this new function.
+
+Fixes: dab62e7c2de7 ("bnxt_en: Implement faster recovery for firmware fatal error.")
+Signed-off-by: Somnath Kotur <somnath.kotur@broadcom.com>
+Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ drivers/net/ethernet/broadcom/bnxt/bnxt.c |   31 ++++++++++++++++++++----------
+ 1 file changed, 21 insertions(+), 10 deletions(-)
+
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -12038,10 +12038,21 @@ static bool bnxt_fw_reset_timeout(struct
+ 			  (bp->fw_reset_max_dsecs * HZ / 10));
+ }
+ 
++static void bnxt_fw_reset_abort(struct bnxt *bp, int rc)
++{
++	clear_bit(BNXT_STATE_IN_FW_RESET, &bp->state);
++	if (bp->fw_reset_state != BNXT_FW_RESET_STATE_POLL_VF) {
++		bnxt_ulp_start(bp, rc);
++		bnxt_dl_health_status_update(bp, false);
++	}
++	bp->fw_reset_state = 0;
++	dev_close(bp->dev);
++}
++
+ static void bnxt_fw_reset_task(struct work_struct *work)
+ {
+ 	struct bnxt *bp = container_of(work, struct bnxt, fw_reset_task.work);
+-	int rc;
++	int rc = 0;
+ 
+ 	if (!test_bit(BNXT_STATE_IN_FW_RESET, &bp->state)) {
+ 		netdev_err(bp->dev, "bnxt_fw_reset_task() called when not in fw reset mode!\n");
+@@ -12072,8 +12083,9 @@ static void bnxt_fw_reset_task(struct wo
+ 		bp->fw_reset_timestamp = jiffies;
+ 		rtnl_lock();
+ 		if (test_bit(BNXT_STATE_ABORT_ERR, &bp->state)) {
++			bnxt_fw_reset_abort(bp, rc);
+ 			rtnl_unlock();
+-			goto fw_reset_abort;
++			return;
+ 		}
+ 		bnxt_fw_reset_close(bp);
+ 		if (bp->fw_cap & BNXT_FW_CAP_ERR_RECOVER_RELOAD) {
+@@ -12122,6 +12134,7 @@ static void bnxt_fw_reset_task(struct wo
+ 			if (val == 0xffff) {
+ 				if (bnxt_fw_reset_timeout(bp)) {
+ 					netdev_err(bp->dev, "Firmware reset aborted, PCI config space invalid\n");
++					rc = -ETIMEDOUT;
+ 					goto fw_reset_abort;
+ 				}
+ 				bnxt_queue_fw_reset_work(bp, HZ / 1000);
+@@ -12131,6 +12144,7 @@ static void bnxt_fw_reset_task(struct wo
+ 		clear_bit(BNXT_STATE_FW_FATAL_COND, &bp->state);
+ 		if (pci_enable_device(bp->pdev)) {
+ 			netdev_err(bp->dev, "Cannot re-enable PCI device\n");
++			rc = -ENODEV;
+ 			goto fw_reset_abort;
+ 		}
+ 		pci_set_master(bp->pdev);
+@@ -12157,9 +12171,10 @@ static void bnxt_fw_reset_task(struct wo
+ 		}
+ 		rc = bnxt_open(bp->dev);
+ 		if (rc) {
+-			netdev_err(bp->dev, "bnxt_open_nic() failed\n");
+-			clear_bit(BNXT_STATE_IN_FW_RESET, &bp->state);
+-			dev_close(bp->dev);
++			netdev_err(bp->dev, "bnxt_open() failed during FW reset\n");
++			bnxt_fw_reset_abort(bp, rc);
++			rtnl_unlock();
++			return;
+ 		}
+ 
+ 		if ((bp->fw_cap & BNXT_FW_CAP_ERROR_RECOVERY) &&
+@@ -12191,12 +12206,8 @@ fw_reset_abort_status:
+ 		netdev_err(bp->dev, "fw_health_status 0x%x\n", sts);
+ 	}
+ fw_reset_abort:
+-	clear_bit(BNXT_STATE_IN_FW_RESET, &bp->state);
+-	if (bp->fw_reset_state != BNXT_FW_RESET_STATE_POLL_VF)
+-		bnxt_dl_health_status_update(bp, false);
+-	bp->fw_reset_state = 0;
+ 	rtnl_lock();
+-	dev_close(bp->dev);
++	bnxt_fw_reset_abort(bp, rc);
+ 	rtnl_unlock();
+ }
+ 
