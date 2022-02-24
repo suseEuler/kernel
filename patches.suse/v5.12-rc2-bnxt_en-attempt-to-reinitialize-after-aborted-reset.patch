@@ -1,0 +1,81 @@
+From 6882c36cf82ebb210f3977be7a3a0be0c64a44cb Mon Sep 17 00:00:00 2001
+From: Edwin Peer <edwin.peer@broadcom.com>
+Date: Mon, 25 Jan 2021 02:08:14 -0500
+Subject: [PATCH] bnxt_en: attempt to reinitialize after aborted reset
+Git-commit: 6882c36cf82ebb210f3977be7a3a0be0c64a44cb
+Patch-mainline: v5.12-rc2
+References: bsn#92
+Modified-by-SEL: No
+
+
+Drawing a hard line on aborted resets prevents a NIC open in
+some scenarios that may otherwise be recoverable. For example,
+if a firmware recovery happened while a PF was down and an
+attempt was made to bring up an associated VF in this state,
+then it was impossible to ever bring up this VF without a
+rebind or reload of its driver.
+
+Attempt to reinitialize the firmware when an aborted reset (or
+failed init after a reset) is discovered during open - it may
+succeed. Also take care to allow the user to retry opening the
+NIC even after an aborted reset.
+
+Signed-off-by: Edwin Peer <edwin.peer@broadcom.com>
+Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+Acked-by: Willem de Bruijn <willemb@google.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ drivers/net/ethernet/broadcom/bnxt/bnxt.c | 29 +++++++++++++++++++++--
+ 1 file changed, 27 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index c8c25f7644ae..7f30a9fee0c8 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -9768,6 +9768,25 @@ static void bnxt_preset_reg_win(struct bnxt *bp)
+ 
+ static int bnxt_init_dflt_ring_mode(struct bnxt *bp);
+ 
++static int bnxt_reinit_after_abort(struct bnxt *bp)
++{
++	int rc;
++
++	if (test_bit(BNXT_STATE_IN_FW_RESET, &bp->state))
++		return -EBUSY;
++
++	rc = bnxt_fw_init_one(bp);
++	if (!rc) {
++		bnxt_clear_int_mode(bp);
++		rc = bnxt_init_int_mode(bp);
++		if (!rc) {
++			clear_bit(BNXT_STATE_ABORT_ERR, &bp->state);
++			set_bit(BNXT_STATE_FW_RESET_DET, &bp->state);
++		}
++	}
++	return rc;
++}
++
+ static int __bnxt_open_nic(struct bnxt *bp, bool irq_re_init, bool link_re_init)
+ {
+ 	int rc = 0;
+@@ -9926,8 +9945,14 @@ static int bnxt_open(struct net_device *dev)
+ 	int rc;
+ 
+ 	if (test_bit(BNXT_STATE_ABORT_ERR, &bp->state)) {
+-		netdev_err(bp->dev, "A previous firmware reset did not complete, aborting\n");
+-		return -ENODEV;
++		rc = bnxt_reinit_after_abort(bp);
++		if (rc) {
++			if (rc == -EBUSY)
++				netdev_err(bp->dev, "A previous firmware reset has not completed, aborting\n");
++			else
++				netdev_err(bp->dev, "Failed to reinitialize after aborted firmware reset\n");
++			return -ENODEV;
++		}
+ 	}
+ 
+ 	rc = bnxt_hwrm_if_change(bp, true);
+-- 
+2.34.1
+

@@ -1,0 +1,69 @@
+From 5d06eb5cb1f9da393eb47b8948d4367e69e48a62 Mon Sep 17 00:00:00 2001
+From: Vasundhara Volam <vasundhara-v.volam@broadcom.com>
+Date: Mon, 25 Jan 2021 02:08:15 -0500
+Subject: [PATCH] bnxt_en: Retry open if firmware is in reset.
+Git-commit: 5d06eb5cb1f9da393eb47b8948d4367e69e48a62
+Patch-mainline: v5.12-rc2
+References: bsn#92
+Modified-by-SEL: Yes, refreshed due to context change
+
+
+Firmware may be in the middle of reset when the driver tries to do ifup.
+In that case, firmware will return a special error code and the driver
+will retry 10 times with 50 msecs delay after each retry.
+
+Signed-off-by: Vasundhara Volam <vasundhara-v.volam@broadcom.com>
+Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+Acked-by: Willem de Bruijn <willemb@google.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ drivers/net/ethernet/broadcom/bnxt/bnxt.c |   15 +++++++++++++--
+ drivers/net/ethernet/broadcom/bnxt/bnxt.h |    1 +
+ 2 files changed, 14 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -9500,8 +9500,8 @@ static int bnxt_hwrm_if_change(struct bn
+ 	struct hwrm_func_drv_if_change_input req = {0};
+ 	bool fw_reset = !bp->irq_tbl;
+ 	bool resc_reinit = false;
++	int rc, retry = 0;
+ 	u32 flags = 0;
+-	int rc;
+ 
+ 	if (!(bp->fw_cap & BNXT_FW_CAP_IF_CHANGE))
+ 		return 0;
+@@ -9510,10 +9510,21 @@ static int bnxt_hwrm_if_change(struct bn
+ 	if (up)
+ 		req.flags = cpu_to_le32(FUNC_DRV_IF_CHANGE_REQ_FLAGS_UP);
+ 	mutex_lock(&bp->hwrm_cmd_lock);
+-	rc = _hwrm_send_message(bp, &req, sizeof(req), HWRM_CMD_TIMEOUT);
++	while (retry < BNXT_FW_IF_RETRY) {
++		rc = _hwrm_send_message(bp, &req, sizeof(req),
++					HWRM_CMD_TIMEOUT);
++		if (rc != -EAGAIN)
++			break;
++
++		msleep(50);
++		retry++;
++	}
+ 	if (!rc)
+ 		flags = le32_to_cpu(resp->flags);
+ 	mutex_unlock(&bp->hwrm_cmd_lock);
++
++	if (rc == -EAGAIN)
++		return rc;
+ 	if (rc && up) {
+ 		rc = bnxt_try_recover_fw(bp);
+ 		fw_reset = true;
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@ -1570,6 +1570,7 @@ struct bnxt_fw_reporter_ctx {
+ 					 BNXT_FW_STATUS_HEALTHY)
+ 
+ #define BNXT_FW_RETRY			5
++#define BNXT_FW_IF_RETRY		10
+ 
+ struct bnxt {
+ 	void __iomem		*bar0;
