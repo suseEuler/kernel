@@ -1,0 +1,84 @@
+From ea2d37b2b3079a896bc3f44a1962d3f01aa81b7f Mon Sep 17 00:00:00 2001
+From: Sriharsha Basavapatna <sriharsha.basavapatna@broadcom.com>
+Date: Sun, 11 Apr 2021 20:18:13 -0400
+Subject: [PATCH] bnxt_en: Refactor bnxt_vf_reps_create().
+Git-commit: ea2d37b2b3079a896bc3f44a1962d3f01aa81b7f
+Patch-mainline: v5.13-rc1
+References: bsn#92
+Modified-by-SEL: No
+
+
+Add a new function bnxt_alloc_vf_rep() to allocate a VF representor.
+This function will be needed in subsequent patches to recreate the
+VF reps after error recovery.
+
+Signed-off-by: Sriharsha Basavapatna <sriharsha.basavapatna@broadcom.com>
+Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ drivers/net/ethernet/broadcom/bnxt/bnxt_vfr.c | 40 ++++++++++---------
+ 1 file changed, 22 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_vfr.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_vfr.c
+index 4b5c8fd76a51..b5d6cd63bea7 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_vfr.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_vfr.c
+@@ -350,6 +350,26 @@ void bnxt_vf_reps_destroy(struct bnxt *bp)
+ 	__bnxt_vf_reps_destroy(bp);
+ }
+ 
++static int bnxt_alloc_vf_rep(struct bnxt *bp, struct bnxt_vf_rep *vf_rep,
++			     u16 *cfa_code_map)
++{
++	/* get cfa handles from FW */
++	if (hwrm_cfa_vfr_alloc(bp, vf_rep->vf_idx, &vf_rep->tx_cfa_action,
++			       &vf_rep->rx_cfa_code))
++		return -ENOLINK;
++
++	cfa_code_map[vf_rep->rx_cfa_code] = vf_rep->vf_idx;
++	vf_rep->dst = metadata_dst_alloc(0, METADATA_HW_PORT_MUX, GFP_KERNEL);
++	if (!vf_rep->dst)
++		return -ENOMEM;
++
++	/* only cfa_action is needed to mux a packet while TXing */
++	vf_rep->dst->u.port_info.port_id = vf_rep->tx_cfa_action;
++	vf_rep->dst->u.port_info.lower_dev = bp->dev;
++
++	return 0;
++}
++
+ /* Use the OUI of the PF's perm addr and report the same mac addr
+  * for the same VF-rep each time
+  */
+@@ -428,25 +448,9 @@ static int bnxt_vf_reps_create(struct bnxt *bp)
+ 		vf_rep->vf_idx = i;
+ 		vf_rep->tx_cfa_action = CFA_HANDLE_INVALID;
+ 
+-		/* get cfa handles from FW */
+-		rc = hwrm_cfa_vfr_alloc(bp, vf_rep->vf_idx,
+-					&vf_rep->tx_cfa_action,
+-					&vf_rep->rx_cfa_code);
+-		if (rc) {
+-			rc = -ENOLINK;
+-			goto err;
+-		}
+-		cfa_code_map[vf_rep->rx_cfa_code] = vf_rep->vf_idx;
+-
+-		vf_rep->dst = metadata_dst_alloc(0, METADATA_HW_PORT_MUX,
+-						 GFP_KERNEL);
+-		if (!vf_rep->dst) {
+-			rc = -ENOMEM;
++		rc = bnxt_alloc_vf_rep(bp, vf_rep, cfa_code_map);
++		if (rc)
+ 			goto err;
+-		}
+-		/* only cfa_action is needed to mux a packet while TXing */
+-		vf_rep->dst->u.port_info.port_id = vf_rep->tx_cfa_action;
+-		vf_rep->dst->u.port_info.lower_dev = bp->dev;
+ 
+ 		bnxt_vf_rep_netdev_init(bp, vf_rep, dev);
+ 		rc = register_netdev(dev);
+-- 
+2.34.1
+

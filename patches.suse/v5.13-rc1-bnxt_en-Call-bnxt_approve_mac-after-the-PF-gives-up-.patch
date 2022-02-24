@@ -1,0 +1,64 @@
+From 92923cc71012535cc5d760b1319675ad4c404c08 Mon Sep 17 00:00:00 2001
+From: Michael Chan <michael.chan@broadcom.com>
+Date: Sun, 25 Apr 2021 13:45:24 -0400
+Subject: [PATCH] bnxt_en: Call bnxt_approve_mac() after the PF gives up
+ control of the VF MAC.
+Git-commit: 92923cc71012535cc5d760b1319675ad4c404c08
+Patch-mainline: v5.13-rc1
+References: bsn#92
+Modified-by-SEL: No
+
+
+When the PF is no longer enforcing an assigned MAC address on a VF, the
+VF needs to call bnxt_approve_mac() to tell the PF what MAC address it is
+now using.  Otherwise it gets out of sync and the PF won't know what
+MAC address the VF wants to use.  Ultimately the VF will fail when it
+tries to setup the L2 MAC filter for the vnic.
+
+Reviewed-by: Edwin Peer <edwin.peer@broadcom.com>
+Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ drivers/net/ethernet/broadcom/bnxt/bnxt_sriov.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_sriov.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_sriov.c
+index e65093f4aa7a..eb00a219aa51 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_sriov.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_sriov.c
+@@ -1147,6 +1147,7 @@ void bnxt_update_vf_mac(struct bnxt *bp)
+ {
+ 	struct hwrm_func_qcaps_input req = {0};
+ 	struct hwrm_func_qcaps_output *resp = bp->hwrm_cmd_resp_addr;
++	bool inform_pf = false;
+ 
+ 	bnxt_hwrm_cmd_hdr_init(bp, &req, HWRM_FUNC_QCAPS, -1, -1);
+ 	req.fid = cpu_to_le16(0xffff);
+@@ -1162,14 +1163,22 @@ void bnxt_update_vf_mac(struct bnxt *bp)
+ 	 *    default but the stored zero MAC will allow the VF user to change
+ 	 *    the random MAC address using ndo_set_mac_address() if he wants.
+ 	 */
+-	if (!ether_addr_equal(resp->mac_address, bp->vf.mac_addr))
++	if (!ether_addr_equal(resp->mac_address, bp->vf.mac_addr)) {
+ 		memcpy(bp->vf.mac_addr, resp->mac_address, ETH_ALEN);
++		/* This means we are now using our own MAC address, let
++		 * the PF know about this MAC address.
++		 */
++		if (!is_valid_ether_addr(bp->vf.mac_addr))
++			inform_pf = true;
++	}
+ 
+ 	/* overwrite netdev dev_addr with admin VF MAC */
+ 	if (is_valid_ether_addr(bp->vf.mac_addr))
+ 		memcpy(bp->dev->dev_addr, bp->vf.mac_addr, ETH_ALEN);
+ update_vf_mac_exit:
+ 	mutex_unlock(&bp->hwrm_cmd_lock);
++	if (inform_pf)
++		bnxt_approve_mac(bp, bp->dev->dev_addr, false);
+ }
+ 
+ #else
+-- 
+2.34.1
+

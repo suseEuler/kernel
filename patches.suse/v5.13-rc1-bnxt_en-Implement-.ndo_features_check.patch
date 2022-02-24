@@ -1,0 +1,111 @@
+From 1698d600b361915fbe5eda63a613da55c435bd34 Mon Sep 17 00:00:00 2001
+From: Michael Chan <michael.chan@broadcom.com>
+Date: Sun, 25 Apr 2021 13:45:27 -0400
+Subject: [PATCH] bnxt_en: Implement .ndo_features_check().
+Git-commit: 1698d600b361915fbe5eda63a613da55c435bd34
+Patch-mainline: v5.13-rc1
+References: bsn#92
+Modified-by-SEL: No
+
+
+For UDP encapsultions, we only support the offloaded Vxlan port and
+Geneve port.  All other ports included FOU and GUE are not supported so
+we need to turn off TSO and checksum features.
+
+v2: Reverse the check for supported UDP ports to be more straight forward.
+
+Reviewed-by: Sriharsha Basavapatna <sriharsha.basavapatna@broadcom.com>
+Reviewed-by: Edwin Peer <edwin.peer@broadcom.com>
+Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ drivers/net/ethernet/broadcom/bnxt/bnxt.c | 42 +++++++++++++++++++++--
+ drivers/net/ethernet/broadcom/bnxt/bnxt.h |  2 ++
+ 2 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 53db073b457c..5d0ab5629aa4 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -10781,6 +10781,40 @@ static int bnxt_set_features(struct net_device *dev, netdev_features_t features)
+ 	return rc;
+ }
+ 
++static netdev_features_t bnxt_features_check(struct sk_buff *skb,
++					     struct net_device *dev,
++					     netdev_features_t features)
++{
++	struct bnxt *bp;
++	__be16 udp_port;
++	u8 l4_proto = 0;
++
++	features = vlan_features_check(skb, features);
++	if (!skb->encapsulation)
++		return features;
++
++	switch (vlan_get_protocol(skb)) {
++	case htons(ETH_P_IP):
++		l4_proto = ip_hdr(skb)->protocol;
++		break;
++	case htons(ETH_P_IPV6):
++		l4_proto = ipv6_hdr(skb)->nexthdr;
++		break;
++	default:
++		return features;
++	}
++
++	if (l4_proto != IPPROTO_UDP)
++		return features;
++
++	bp = netdev_priv(dev);
++	/* For UDP, we can only handle 1 Vxlan port and 1 Geneve port. */
++	udp_port = udp_hdr(skb)->dest;
++	if (udp_port == bp->vxlan_port || udp_port == bp->nge_port)
++		return features;
++	return features & ~(NETIF_F_CSUM_MASK | NETIF_F_GSO_MASK);
++}
++
+ int bnxt_dbg_hwrm_rd_reg(struct bnxt *bp, u32 reg_off, u16 num_words,
+ 			 u32 *reg_buf)
+ {
+@@ -12288,10 +12322,13 @@ static int bnxt_udp_tunnel_sync(struct net_device *netdev, unsigned int table)
+ 	unsigned int cmd;
+ 
+ 	udp_tunnel_nic_get_port(netdev, table, 0, &ti);
+-	if (ti.type == UDP_TUNNEL_TYPE_VXLAN)
++	if (ti.type == UDP_TUNNEL_TYPE_VXLAN) {
++		bp->vxlan_port = ti.port;
+ 		cmd = TUNNEL_DST_PORT_FREE_REQ_TUNNEL_TYPE_VXLAN;
+-	else
++	} else {
++		bp->nge_port = ti.port;
+ 		cmd = TUNNEL_DST_PORT_FREE_REQ_TUNNEL_TYPE_GENEVE;
++	}
+ 
+ 	if (ti.port)
+ 		return bnxt_hwrm_tunnel_dst_port_alloc(bp, ti.port, cmd);
+@@ -12391,6 +12428,7 @@ static const struct net_device_ops bnxt_netdev_ops = {
+ 	.ndo_change_mtu		= bnxt_change_mtu,
+ 	.ndo_fix_features	= bnxt_fix_features,
+ 	.ndo_set_features	= bnxt_set_features,
++	.ndo_features_check	= bnxt_features_check,
+ 	.ndo_tx_timeout		= bnxt_tx_timeout,
+ #ifdef CONFIG_BNXT_SRIOV
+ 	.ndo_get_vf_config	= bnxt_get_vf_config,
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.h b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index a3744247740b..24d2ad6a8740 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@ -1914,6 +1914,8 @@ struct bnxt {
+ 
+ 	u16			vxlan_fw_dst_port_id;
+ 	u16			nge_fw_dst_port_id;
++	__be16			vxlan_port;
++	__be16			nge_port;
+ 	u8			port_partition_type;
+ 	u8			port_count;
+ 	u16			br_mode;
+-- 
+2.34.1
+

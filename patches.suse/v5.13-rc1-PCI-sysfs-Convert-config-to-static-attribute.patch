@@ -1,0 +1,175 @@
+From e1d3f3268b0e512ceb811dd4765e476626bde71c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Krzysztof=20Wilczy=C5=84ski?= <kw@linux.com>
+Date: Fri, 16 Apr 2021 20:58:37 +0000
+Subject: [PATCH] PCI/sysfs: Convert "config" to static attribute
+MIME-Version: 1.0
+Git-commit: e1d3f3268b0e512ceb811dd4765e476626bde71c
+Patch-mainline: v5.13-rc1
+References: bsn#92
+Modified-by-SEL: No
+
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The "config" sysfs attribute allows access to either the legacy (PCI and
+PCI-X Mode 1) or the extended (PCI-X Mode 2 and PCIe) device configuration
+space.  Previously it was dynamically created either when a device was
+added (for hot-added devices) or via a late_initcall (for devices present
+at boot):
+
+  pci_bus_add_devices
+    pci_bus_add_device
+      pci_create_sysfs_dev_files
+        if (!sysfs_initialized)
+	  return
+	sysfs_create_bin_file           # for hot-added devices
+
+  pci_sysfs_init                        # late_initcall
+    sysfs_initialized = 1
+    for_each_pci_dev(pdev)
+      pci_create_sysfs_dev_files(pdev)  # for devices present at boot
+
+And dynamically removed when the PCI device is stopped and removed:
+
+  pci_stop_bus_device
+    pci_stop_dev
+      pci_remove_sysfs_dev_files
+        sysfs_remove_bin_file
+
+This attribute does not need to be created or removed dynamically, so we
+can use a static attribute so the device model takes care of addition and
+removal automatically.
+
+Convert "config" to a static attribute and use the .is_bin_visible()
+callback to set the correct object size (either 256 bytes or 4 KiB) at
+runtime.
+
+The pci_sysfs_init() scheme was added in the pre-git era by
+https://git.kernel.org/pub/scm/linux/kernel/git/tglx/history.git/commit/drivers/pci/pci-sysfs.c?id=f6d553444da2
+
+[bhelgaas: commit log]
+Suggested-by: Oliver O'Halloran <oohall@gmail.com>
+Link: https://lore.kernel.org/r/CAOSf1CHss03DBSDO4PmTtMp0tCEu5kScn704ZEwLKGXQzBfqaA@mail.gmail.com
+Link: https://lore.kernel.org/r/20210416205856.3234481-2-kw@linux.com
+Signed-off-by: Krzysztof Wilczyński <kw@linux.com>
+Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ drivers/pci/pci-sysfs.c | 64 ++++++++++++++++-------------------------
+ 1 file changed, 25 insertions(+), 39 deletions(-)
+
+diff --git a/drivers/pci/pci-sysfs.c b/drivers/pci/pci-sysfs.c
+index f8afd54ca3e1..dc14daf404f5 100644
+--- a/drivers/pci/pci-sysfs.c
++++ b/drivers/pci/pci-sysfs.c
+@@ -808,6 +808,29 @@ static ssize_t pci_write_config(struct file *filp, struct kobject *kobj,
+ 
+ 	return count;
+ }
++static BIN_ATTR(config, 0644, pci_read_config, pci_write_config, 0);
++
++static struct bin_attribute *pci_dev_config_attrs[] = {
++	&bin_attr_config,
++	NULL,
++};
++
++static umode_t pci_dev_config_attr_is_visible(struct kobject *kobj,
++					      struct bin_attribute *a, int n)
++{
++	struct pci_dev *pdev = to_pci_dev(kobj_to_dev(kobj));
++
++	a->size = PCI_CFG_SPACE_SIZE;
++	if (pdev->cfg_size > PCI_CFG_SPACE_SIZE)
++		a->size = PCI_CFG_SPACE_EXP_SIZE;
++
++	return a->attr.mode;
++}
++
++static const struct attribute_group pci_dev_config_attr_group = {
++	.bin_attrs = pci_dev_config_attrs,
++	.is_bin_visible = pci_dev_config_attr_is_visible,
++};
+ 
+ #ifdef HAVE_PCI_LEGACY
+ /**
+@@ -1284,26 +1307,6 @@ static ssize_t pci_read_rom(struct file *filp, struct kobject *kobj,
+ 	return count;
+ }
+ 
+-static const struct bin_attribute pci_config_attr = {
+-	.attr =	{
+-		.name = "config",
+-		.mode = 0644,
+-	},
+-	.size = PCI_CFG_SPACE_SIZE,
+-	.read = pci_read_config,
+-	.write = pci_write_config,
+-};
+-
+-static const struct bin_attribute pcie_config_attr = {
+-	.attr =	{
+-		.name = "config",
+-		.mode = 0644,
+-	},
+-	.size = PCI_CFG_SPACE_EXP_SIZE,
+-	.read = pci_read_config,
+-	.write = pci_write_config,
+-};
+-
+ static ssize_t reset_store(struct device *dev, struct device_attribute *attr,
+ 			   const char *buf, size_t count)
+ {
+@@ -1355,16 +1358,9 @@ int __must_check pci_create_sysfs_dev_files(struct pci_dev *pdev)
+ 	if (!sysfs_initialized)
+ 		return -EACCES;
+ 
+-	if (pdev->cfg_size > PCI_CFG_SPACE_SIZE)
+-		retval = sysfs_create_bin_file(&pdev->dev.kobj, &pcie_config_attr);
+-	else
+-		retval = sysfs_create_bin_file(&pdev->dev.kobj, &pci_config_attr);
+-	if (retval)
+-		goto err;
+-
+ 	retval = pci_create_resource_files(pdev);
+ 	if (retval)
+-		goto err_config_file;
++		goto err;
+ 
+ 	/* If the device has a ROM, try to expose it in sysfs. */
+ 	rom_size = pci_resource_len(pdev, PCI_ROM_RESOURCE);
+@@ -1405,11 +1401,6 @@ int __must_check pci_create_sysfs_dev_files(struct pci_dev *pdev)
+ 	}
+ err_resource_files:
+ 	pci_remove_resource_files(pdev);
+-err_config_file:
+-	if (pdev->cfg_size > PCI_CFG_SPACE_SIZE)
+-		sysfs_remove_bin_file(&pdev->dev.kobj, &pcie_config_attr);
+-	else
+-		sysfs_remove_bin_file(&pdev->dev.kobj, &pci_config_attr);
+ err:
+ 	return retval;
+ }
+@@ -1435,12 +1426,6 @@ void pci_remove_sysfs_dev_files(struct pci_dev *pdev)
+ 		return;
+ 
+ 	pci_remove_capabilities_sysfs(pdev);
+-
+-	if (pdev->cfg_size > PCI_CFG_SPACE_SIZE)
+-		sysfs_remove_bin_file(&pdev->dev.kobj, &pcie_config_attr);
+-	else
+-		sysfs_remove_bin_file(&pdev->dev.kobj, &pci_config_attr);
+-
+ 	pci_remove_resource_files(pdev);
+ 
+ 	if (pdev->rom_attr) {
+@@ -1540,6 +1525,7 @@ static const struct attribute_group pci_dev_group = {
+ 
+ const struct attribute_group *pci_dev_groups[] = {
+ 	&pci_dev_group,
++	&pci_dev_config_attr_group,
+ 	NULL,
+ };
+ 
+-- 
+2.34.1
+

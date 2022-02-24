@@ -1,0 +1,144 @@
+From f42c35ea3b137c01b3e073232131674be8efb924 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Krzysztof=20Wilczy=C5=84ski?= <kw@linux.com>
+Date: Fri, 16 Apr 2021 20:58:39 +0000
+Subject: [PATCH] PCI/sysfs: Convert "reset" to static attribute
+MIME-Version: 1.0
+Git-commit: f42c35ea3b137c01b3e073232131674be8efb924
+Patch-mainline: v5.13-rc1
+References: bsn#92
+Modified-by-SEL: No
+
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The "reset" sysfs attribute allows for resetting a PCI function.
+Previously it was dynamically created either by pci_bus_add_device() or
+the pci_sysfs_init() initcall, but since it doesn't need to be created or
+removed dynamically, we can use a static attribute so the device model
+takes care of addition and removal automatically.
+
+Convert "reset" to a static attribute and use the .is_visible() callback to
+check whether the device supports reset.
+
+Clear reset_fn in pci_stop_dev() instead of pci_remove_capabilities_sysfs()
+since we no longer explicitly remove the "reset" sysfs file.
+
+[bhelgaas: commit log]
+Suggested-by: Oliver O'Halloran <oohall@gmail.com>
+Link: https://lore.kernel.org/r/20210416205856.3234481-4-kw@linux.com
+Signed-off-by: Krzysztof Wilczyński <kw@linux.com>
+Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ drivers/pci/pci-sysfs.c | 51 +++++++++++++++++++----------------------
+ drivers/pci/remove.c    |  2 ++
+ 2 files changed, 26 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/pci/pci-sysfs.c b/drivers/pci/pci-sysfs.c
+index fa8373685140..c469d9cad0a8 100644
+--- a/drivers/pci/pci-sysfs.c
++++ b/drivers/pci/pci-sysfs.c
+@@ -1355,25 +1355,33 @@ static ssize_t reset_store(struct device *dev, struct device_attribute *attr,
+ 
+ 	return count;
+ }
++static DEVICE_ATTR_WO(reset);
+ 
+-static DEVICE_ATTR(reset, 0200, NULL, reset_store);
++static struct attribute *pci_dev_reset_attrs[] = {
++	&dev_attr_reset.attr,
++	NULL,
++};
+ 
+-static int pci_create_capabilities_sysfs(struct pci_dev *dev)
++static umode_t pci_dev_reset_attr_is_visible(struct kobject *kobj,
++					     struct attribute *a, int n)
+ {
+-	int retval;
++	struct pci_dev *pdev = to_pci_dev(kobj_to_dev(kobj));
+ 
+-	pcie_vpd_create_sysfs_dev_files(dev);
++	if (!pdev->reset_fn)
++		return 0;
+ 
+-	if (dev->reset_fn) {
+-		retval = device_create_file(&dev->dev, &dev_attr_reset);
+-		if (retval)
+-			goto error;
+-	}
+-	return 0;
++	return a->mode;
++}
+ 
+-error:
+-	pcie_vpd_remove_sysfs_dev_files(dev);
+-	return retval;
++static const struct attribute_group pci_dev_reset_attr_group = {
++	.attrs = pci_dev_reset_attrs,
++	.is_visible = pci_dev_reset_attr_is_visible,
++};
++
++
++static void pci_create_capabilities_sysfs(struct pci_dev *dev)
++{
++	pcie_vpd_create_sysfs_dev_files(dev);
+ }
+ 
+ int __must_check pci_create_sysfs_dev_files(struct pci_dev *pdev)
+@@ -1385,30 +1393,18 @@ int __must_check pci_create_sysfs_dev_files(struct pci_dev *pdev)
+ 
+ 	retval = pci_create_resource_files(pdev);
+ 	if (retval)
+-		goto err;
++		return retval;
+ 
+ 	/* add sysfs entries for various capabilities */
+-	retval = pci_create_capabilities_sysfs(pdev);
+-	if (retval)
+-		goto err_resource_files;
+-
++	pci_create_capabilities_sysfs(pdev);
+ 	pci_create_firmware_label_files(pdev);
+ 
+ 	return 0;
+-
+-err_resource_files:
+-	pci_remove_resource_files(pdev);
+-err:
+-	return retval;
+ }
+ 
+ static void pci_remove_capabilities_sysfs(struct pci_dev *dev)
+ {
+ 	pcie_vpd_remove_sysfs_dev_files(dev);
+-	if (dev->reset_fn) {
+-		device_remove_file(&dev->dev, &dev_attr_reset);
+-		dev->reset_fn = 0;
+-	}
+ }
+ 
+ /**
+@@ -1517,6 +1513,7 @@ const struct attribute_group *pci_dev_groups[] = {
+ 	&pci_dev_group,
+ 	&pci_dev_config_attr_group,
+ 	&pci_dev_rom_attr_group,
++	&pci_dev_reset_attr_group,
+ 	NULL,
+ };
+ 
+diff --git a/drivers/pci/remove.c b/drivers/pci/remove.c
+index 95dec03d9f2a..dd12c2fcc7dc 100644
+--- a/drivers/pci/remove.c
++++ b/drivers/pci/remove.c
+@@ -19,6 +19,8 @@ static void pci_stop_dev(struct pci_dev *dev)
+ 	pci_pme_active(dev, false);
+ 
+ 	if (pci_dev_is_added(dev)) {
++		dev->reset_fn = 0;
++
+ 		device_release_driver(&dev->dev);
+ 		pci_proc_detach_device(dev);
+ 		pci_remove_sysfs_dev_files(dev);
+-- 
+2.34.1
+
