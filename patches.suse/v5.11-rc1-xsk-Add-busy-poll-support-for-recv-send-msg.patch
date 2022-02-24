@@ -1,0 +1,85 @@
+From a0731952d9cddc9c11a8352922f449e6ab2f7537 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Bj=C3=B6rn=20T=C3=B6pel?= <bjorn.topel@intel.com>
+Date: Mon, 30 Nov 2020 19:52:00 +0100
+Subject: [PATCH] xsk: Add busy-poll support for {recv,send}msg()
+MIME-Version: 1.0
+Git-commit: a0731952d9cddc9c11a8352922f449e6ab2f7537
+Patch-mainline: v5.11-rc1
+References: bsn#92
+Modified-by-SEL: No
+
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Wire-up XDP socket busy-poll support for recvmsg() and sendmsg(). If
+the XDP socket prefers busy-polling, make sure that no wakeup/IPI is
+performed.
+
+Signed-off-by: Björn Töpel <bjorn.topel@intel.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Magnus Karlsson <magnus.karlsson@intel.com>
+Link: https://lore.kernel.org/bpf/20201130185205.196029-6-bjorn.topel@gmail.com
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ net/xdp/xsk.c | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/net/xdp/xsk.c b/net/xdp/xsk.c
+index c72b4dba2878..a8501a5477cf 100644
+--- a/net/xdp/xsk.c
++++ b/net/xdp/xsk.c
+@@ -23,6 +23,7 @@
+ #include <linux/netdevice.h>
+ #include <linux/rculist.h>
+ #include <net/xdp_sock_drv.h>
++#include <net/busy_poll.h>
+ #include <net/xdp.h>
+ 
+ #include "xsk_queue.h"
+@@ -517,6 +518,17 @@ static int __xsk_sendmsg(struct sock *sk)
+ 	return xs->zc ? xsk_zc_xmit(xs) : xsk_generic_xmit(sk);
+ }
+ 
++static bool xsk_no_wakeup(struct sock *sk)
++{
++#ifdef CONFIG_NET_RX_BUSY_POLL
++	/* Prefer busy-polling, skip the wakeup. */
++	return READ_ONCE(sk->sk_prefer_busy_poll) && READ_ONCE(sk->sk_ll_usec) &&
++		READ_ONCE(sk->sk_napi_id) >= MIN_NAPI_ID;
++#else
++	return false;
++#endif
++}
++
+ static int xsk_sendmsg(struct socket *sock, struct msghdr *m, size_t total_len)
+ {
+ 	bool need_wait = !(m->msg_flags & MSG_DONTWAIT);
+@@ -529,6 +541,12 @@ static int xsk_sendmsg(struct socket *sock, struct msghdr *m, size_t total_len)
+ 	if (unlikely(need_wait))
+ 		return -EOPNOTSUPP;
+ 
++	if (sk_can_busy_loop(sk))
++		sk_busy_loop(sk, 1); /* only support non-blocking sockets */
++
++	if (xsk_no_wakeup(sk))
++		return 0;
++
+ 	pool = xs->pool;
+ 	if (pool->cached_need_wakeup & XDP_WAKEUP_TX)
+ 		return __xsk_sendmsg(sk);
+@@ -550,6 +568,12 @@ static int xsk_recvmsg(struct socket *sock, struct msghdr *m, size_t len, int fl
+ 	if (unlikely(need_wait))
+ 		return -EOPNOTSUPP;
+ 
++	if (sk_can_busy_loop(sk))
++		sk_busy_loop(sk, 1); /* only support non-blocking sockets */
++
++	if (xsk_no_wakeup(sk))
++		return 0;
++
+ 	if (xs->pool->cached_need_wakeup & XDP_WAKEUP_RX && xs->zc)
+ 		return xsk_wakeup(xs, XDP_WAKEUP_RX);
+ 	return 0;
+-- 
+2.34.1
+

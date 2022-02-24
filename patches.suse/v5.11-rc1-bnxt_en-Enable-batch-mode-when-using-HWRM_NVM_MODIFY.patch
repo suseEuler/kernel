@@ -1,0 +1,131 @@
+From a86b313e18178b39fcca4850d4dfeb5af1e3dc7e Mon Sep 17 00:00:00 2001
+From: Michael Chan <michael.chan@broadcom.com>
+Date: Sun, 13 Dec 2020 06:51:46 -0500
+Subject: [PATCH] bnxt_en: Enable batch mode when using HWRM_NVM_MODIFY to
+ flash packages.
+Git-commit: a86b313e18178b39fcca4850d4dfeb5af1e3dc7e
+Patch-mainline: v5.11-rc1
+References: bsn#92
+Modified-by-SEL: No
+
+
+The current scheme allocates a DMA buffer as big as the requested
+firmware package file and DMAs the contents to firmware in one
+operation.  The buffer size can be several hundred kilo bytes and
+the driver may not be able to allocate the memory.  This will cause
+firmware upgrade to fail.
+
+Improve the scheme by using smaller DMA blocks and calling firmware to
+DMA each block in a batch mode.  Older firmware can cause excessive
+NVRAM erases if the block size is too small so we try to allocate a
+256K buffer to begin with and size it down successively if we cannot
+allocate the memory.
+
+Reviewed-by: Edwin Peer <edwin.peer@broadcom.com>
+Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ .../net/ethernet/broadcom/bnxt/bnxt_ethtool.c | 49 +++++++++++++++----
+ 1 file changed, 40 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
+index 38ab882715c4..9ff79d5d14c4 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
+@@ -2432,6 +2432,10 @@ static int bnxt_flash_firmware_from_file(struct net_device *dev,
+ 	return rc;
+ }
+ 
++#define BNXT_PKG_DMA_SIZE	0x40000
++#define BNXT_NVM_MORE_FLAG	(cpu_to_le16(NVM_MODIFY_REQ_FLAGS_BATCH_MODE))
++#define BNXT_NVM_LAST_FLAG	(cpu_to_le16(NVM_MODIFY_REQ_FLAGS_BATCH_LAST))
++
+ int bnxt_flash_package_from_fw_obj(struct net_device *dev, const struct firmware *fw,
+ 				   u32 install_type)
+ {
+@@ -2442,6 +2446,7 @@ int bnxt_flash_package_from_fw_obj(struct net_device *dev, const struct firmware
+ 	bool defrag_attempted = false;
+ 	dma_addr_t dma_handle;
+ 	u8 *kmem = NULL;
++	u32 modify_len;
+ 	u32 item_len;
+ 	int rc = 0;
+ 	u16 index;
+@@ -2450,8 +2455,19 @@ int bnxt_flash_package_from_fw_obj(struct net_device *dev, const struct firmware
+ 
+ 	bnxt_hwrm_cmd_hdr_init(bp, &modify, HWRM_NVM_MODIFY, -1, -1);
+ 
+-	kmem = dma_alloc_coherent(&bp->pdev->dev, fw->size, &dma_handle,
+-				  GFP_KERNEL);
++	/* Try allocating a large DMA buffer first.  Older fw will
++	 * cause excessive NVRAM erases when using small blocks.
++	 */
++	modify_len = roundup_pow_of_two(fw->size);
++	modify_len = min_t(u32, modify_len, BNXT_PKG_DMA_SIZE);
++	while (1) {
++		kmem = dma_alloc_coherent(&bp->pdev->dev, modify_len,
++					  &dma_handle, GFP_KERNEL);
++		if (!kmem && modify_len > PAGE_SIZE)
++			modify_len /= 2;
++		else
++			break;
++	}
+ 	if (!kmem)
+ 		return -ENOMEM;
+ 
+@@ -2463,6 +2479,8 @@ int bnxt_flash_package_from_fw_obj(struct net_device *dev, const struct firmware
+ 	install.install_type = cpu_to_le32(install_type);
+ 
+ 	do {
++		u32 copied = 0, len = modify_len;
++
+ 		rc = bnxt_find_nvram_item(dev, BNX_DIR_TYPE_UPDATE,
+ 					  BNX_DIR_ORDINAL_FIRST,
+ 					  BNX_DIR_EXT_NONE,
+@@ -2479,14 +2497,26 @@ int bnxt_flash_package_from_fw_obj(struct net_device *dev, const struct firmware
+ 		}
+ 
+ 		modify.dir_idx = cpu_to_le16(index);
+-		modify.len = cpu_to_le32(fw->size);
+ 
+-		memcpy(kmem, fw->data, fw->size);
+-		rc = hwrm_send_message(bp, &modify, sizeof(modify),
+-				       FLASH_PACKAGE_TIMEOUT);
+-		if (rc)
+-			break;
++		if (fw->size > modify_len)
++			modify.flags = BNXT_NVM_MORE_FLAG;
++		while (copied < fw->size) {
++			u32 balance = fw->size - copied;
+ 
++			if (balance <= modify_len) {
++				len = balance;
++				if (copied)
++					modify.flags |= BNXT_NVM_LAST_FLAG;
++			}
++			memcpy(kmem, fw->data + copied, len);
++			modify.len = cpu_to_le32(len);
++			modify.offset = cpu_to_le32(copied);
++			rc = hwrm_send_message(bp, &modify, sizeof(modify),
++					       FLASH_PACKAGE_TIMEOUT);
++			if (rc)
++				goto pkg_abort;
++			copied += len;
++		}
+ 		mutex_lock(&bp->hwrm_cmd_lock);
+ 		rc = _hwrm_send_message_silent(bp, &install, sizeof(install),
+ 					       INSTALL_PACKAGE_TIMEOUT);
+@@ -2530,7 +2560,8 @@ int bnxt_flash_package_from_fw_obj(struct net_device *dev, const struct firmware
+ 		mutex_unlock(&bp->hwrm_cmd_lock);
+ 	} while (defrag_attempted && !rc);
+ 
+-	dma_free_coherent(&bp->pdev->dev, fw->size, kmem, dma_handle);
++pkg_abort:
++	dma_free_coherent(&bp->pdev->dev, modify_len, kmem, dma_handle);
+ 	if (resp.result) {
+ 		netdev_err(dev, "PKG install error = %d, problem_item = %d\n",
+ 			   (s8)resp.result, (int)resp.problem_item);
+-- 
+2.34.1
+
