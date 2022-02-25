@@ -1,0 +1,107 @@
+From 356efe60eb78cd77659581d48c245c96dcf0857a Mon Sep 17 00:00:00 2001
+From: Zhang Yi <yi.zhang@huawei.com>
+Date: Wed, 23 Feb 2022 18:45:27 +0800
+Subject: [PATCH] ext4: fix underflow in ext4_max_bitmap_size()
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 356efe60eb78cd77659581d48c245c96dcf0857a
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 186216, https://gitee.com/openeuler/kernel/issues/I4PW7R
+CVE: NA
+
+--------------------------------
+
+The same to commit 1c2d14212b15 ("ext2: Fix underflow in ext2_max_size()")
+in ext2 filesystem, ext4 driver has the same issue with 64K block size
+and ^huge_file, fix this issue the same as ext2. This patch also revert
+commit 75ca6ad408f4 ("ext4: fix loff_t overflow in ext4_max_bitmap_size()")
+because it's no longer needed.
+
+Signed-off-by: Zhang Yi <yi.zhang@huawei.com>
+Signed-off-by: Baokun Li <libaokun1@huawei.com>
+Reviewed-by: Yang Erkun <yangerkun@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/ext4/super.c | 46 +++++++++++++++++++++++++++++++---------------
+ 1 file changed, 31 insertions(+), 15 deletions(-)
+
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 856733f756cf..19539be45aec 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -3220,8 +3220,9 @@ static loff_t ext4_max_size(int blkbits, int has_huge_files)
+  */
+ static loff_t ext4_max_bitmap_size(int bits, int has_huge_files)
+ {
+-	unsigned long long upper_limit, res = EXT4_NDIR_BLOCKS;
++	loff_t upper_limit, res = EXT4_NDIR_BLOCKS;
+ 	int meta_blocks;
++	unsigned int ppb = 1 << (bits - 2);
+ 
+ 	/*
+ 	 * This is calculated to be the largest file size for a dense, block
+@@ -3253,27 +3254,42 @@ static loff_t ext4_max_bitmap_size(int bits, int has_huge_files)
+ 
+ 	}
+ 
+-	/* indirect blocks */
+-	meta_blocks = 1;
+-	/* double indirect blocks */
+-	meta_blocks += 1 + (1LL << (bits-2));
+-	/* tripple indirect blocks */
+-	meta_blocks += 1 + (1LL << (bits-2)) + (1LL << (2*(bits-2)));
+-
+-	upper_limit -= meta_blocks;
+-	upper_limit <<= bits;
+-
++	/* Compute how many blocks we can address by block tree */
+ 	res += 1LL << (bits-2);
+ 	res += 1LL << (2*(bits-2));
+ 	res += 1LL << (3*(bits-2));
++	/* Compute how many metadata blocks are needed */
++	meta_blocks = 1;
++	meta_blocks += 1 + ppb;
++	meta_blocks += 1 + ppb + ppb * ppb;
++	/* Does block tree limit file size? */
++	if (res + meta_blocks <= upper_limit)
++		goto check_lfs;
++
++	res = upper_limit;
++	/* How many metadata blocks are needed for addressing upper_limit? */
++	upper_limit -= EXT4_NDIR_BLOCKS;
++	/* indirect blocks */
++	meta_blocks = 1;
++	upper_limit -= ppb;
++	/* double indirect blocks */
++	if (upper_limit < ppb * ppb) {
++		meta_blocks += 1 + DIV_ROUND_UP(upper_limit, ppb);
++		res -= meta_blocks;
++		goto check_lfs;
++	}
++	meta_blocks += 1 + ppb;
++	upper_limit -= ppb * ppb;
++	/* tripple indirect blocks for the rest */
++	meta_blocks += 1 + DIV_ROUND_UP(upper_limit, ppb) +
++		DIV_ROUND_UP(upper_limit, ppb*ppb);
++	res -= meta_blocks;
++check_lfs:
+ 	res <<= bits;
+-	if (res > upper_limit)
+-		res = upper_limit;
+-
+ 	if (res > MAX_LFS_FILESIZE)
+ 		res = MAX_LFS_FILESIZE;
+ 
+-	return (loff_t)res;
++	return res;
+ }
+ 
+ static ext4_fsblk_t descriptor_loc(struct super_block *sb,
+-- 
+2.26.2
+

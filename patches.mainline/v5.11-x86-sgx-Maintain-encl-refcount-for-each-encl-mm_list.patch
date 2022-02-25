@@ -1,0 +1,94 @@
+From 2ade0d60939bcd54197c133b03b460fe62a4ec47 Mon Sep 17 00:00:00 2001
+From: Jarkko Sakkinen <jarkko@kernel.org>
+Date: Mon, 8 Feb 2021 00:14:01 +0200
+Subject: [PATCH] x86/sgx: Maintain encl->refcount for each encl->mm_list entry
+Git-commit: 2ade0d60939bcd54197c133b03b460fe62a4ec47
+Patch-mainline: v5.11
+References: bsn#12
+Modified-by-SEL: No
+
+
+This has been shown in tests:
+
+[  +0.000008] WARNING: CPU: 3 PID: 7620 at kernel/rcu/srcutree.c:374 cleanup_srcu_struct+0xed/0x100
+
+This is essentially a use-after free, although SRCU notices it as
+an SRCU cleanup in an invalid context.
+
+== Background ==
+
+SGX has a data structure (struct sgx_encl_mm) which keeps per-mm SGX
+metadata.  This is separate from struct sgx_encl because, in theory,
+an enclave can be mapped from more than one mm.  sgx_encl_mm includes
+a pointer back to the sgx_encl.
+
+This means that sgx_encl must have a longer lifetime than all of the
+sgx_encl_mm's that point to it.  That's usually the case: sgx_encl_mm
+is freed only after the mmu_notifier is unregistered in sgx_release().
+
+However, there's a race.  If the process is exiting,
+sgx_mmu_notifier_release() can be called in parallel with sgx_release()
+instead of being called *by* it.  The mmu_notifier path keeps encl_mm
+alive past when sgx_encl can be freed.  This inverts the lifetime rules
+and means that sgx_mmu_notifier_release() can access a freed sgx_encl.
+
+== Fix ==
+
+Increase encl->refcount when encl_mm->encl is established. Release
+this reference when encl_mm is freed. This ensures that encl outlives
+encl_mm.
+
+ [ bp: Massage commit message. ]
+
+Fixes: 1728ab54b4be ("x86/sgx: Add a page reclaimer")
+Reported-by: Haitao Huang <haitao.huang@linux.intel.com>
+Signed-off-by: Jarkko Sakkinen <jarkko@kernel.org>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Acked-by: Dave Hansen <dave.hansen@linux.intel.com>
+Link: https://lkml.kernel.org/r/20210207221401.29933-1-jarkko@kernel.org
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/kernel/cpu/sgx/driver.c | 3 +++
+ arch/x86/kernel/cpu/sgx/encl.c   | 5 +++++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/arch/x86/kernel/cpu/sgx/driver.c b/arch/x86/kernel/cpu/sgx/driver.c
+index f2eac41bb4ff..8ce6d8371cfb 100644
+--- a/arch/x86/kernel/cpu/sgx/driver.c
++++ b/arch/x86/kernel/cpu/sgx/driver.c
+@@ -72,6 +72,9 @@ static int sgx_release(struct inode *inode, struct file *file)
+ 		synchronize_srcu(&encl->srcu);
+ 		mmu_notifier_unregister(&encl_mm->mmu_notifier, encl_mm->mm);
+ 		kfree(encl_mm);
++
++		/* 'encl_mm' is gone, put encl_mm->encl reference: */
++		kref_put(&encl->refcount, sgx_encl_release);
+ 	}
+ 
+ 	kref_put(&encl->refcount, sgx_encl_release);
+diff --git a/arch/x86/kernel/cpu/sgx/encl.c b/arch/x86/kernel/cpu/sgx/encl.c
+index ee50a5010277..f65564a94b9b 100644
+--- a/arch/x86/kernel/cpu/sgx/encl.c
++++ b/arch/x86/kernel/cpu/sgx/encl.c
+@@ -481,6 +481,9 @@ static void sgx_mmu_notifier_free(struct mmu_notifier *mn)
+ {
+ 	struct sgx_encl_mm *encl_mm = container_of(mn, struct sgx_encl_mm, mmu_notifier);
+ 
++	/* 'encl_mm' is going away, put encl_mm->encl reference: */
++	kref_put(&encl_mm->encl->refcount, sgx_encl_release);
++
+ 	kfree(encl_mm);
+ }
+ 
+@@ -534,6 +537,8 @@ int sgx_encl_mm_add(struct sgx_encl *encl, struct mm_struct *mm)
+ 	if (!encl_mm)
+ 		return -ENOMEM;
+ 
++	/* Grab a refcount for the encl_mm->encl reference: */
++	kref_get(&encl->refcount);
+ 	encl_mm->encl = encl;
+ 	encl_mm->mm = mm;
+ 	encl_mm->mmu_notifier.ops = &sgx_mmu_notifier_ops;
+-- 
+2.26.2
+

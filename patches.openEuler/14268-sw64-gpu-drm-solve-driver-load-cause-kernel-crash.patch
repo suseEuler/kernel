@@ -1,0 +1,116 @@
+From ec4ae62c07d56281aacec51770e0453414a76ded Mon Sep 17 00:00:00 2001
+From: Gu Zitao <guzitao@wxiat.com>
+Date: Tue, 22 Feb 2022 22:12:55 +0800
+Subject: [PATCH] sw64: gpu/drm: solve driver load cause kernel crash
+Patch-mainline: NO, OTHERS
+References: OLK-5.10
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4SPZD
+CVE: NA
+
+-------------------------------
+
+It causes kernel to crash when loading AMD video card driver on sw64
+arch showing as follows:
+
+Unable to handle kernel paging request at virtual address 0000000000000060
+CPU 0 kworker/0:1(56): Oops 0
+pc = [<ffffffff809a4b14>]  ra = [<ffffffff80923440>]  ps = 0000    Not tainted
+pc is at up_read+0x14/0x80
+ra is at do_page_fault+0x380/0x610
+v0 = 0000000000000000  t0 = 0000000000000001  t1 = 0000000000000001
+t2 = fff0000fd8bbf000  t3 = 0000000000000060  t4 = 00038c3001804009
+t5 = 0000002000038d30  t6 = fff0888000040080  t7 = fff0000fd8e48000
+s0 = fff0000fd1df8000  s1 = fff0888000040000  s2 = 0000000000000001
+s3 = 0000000000000000  s4 = 0000000000000007  s5 = 0000000000000060
+s6 = fff0000fd8e4ba60
+a0 = 0000000000000060  a1 = 0000000000000000  a2 = 0000000000000001
+a3 = fff0000fd8e4ba60  a4 = 0000000000000000  a5 = 0000000000000177
+t8 = 0000000000000029  t9 = ffffffff82974bc0  t10= 0000000000000000
+t11= 0000000000000178  pv = ffffffff809a4b00  at = 0000000000000007
+gp = ffffffff82944bc0  sp = (____ptAMD video card driver on sw_64 arch show as follows:
+
+Disabling lock debugging due to kernel taint
+Trace:
+[<ffffffff80923440>] do_page_fault+0x380/0x610
+[<ffffffff80910f70>] entMM+0x90/0xc0
+[<ffffffff813da9bc>] dev_printk_emit+0x4c/0x60
+[<ffffffff81189180>] radeon_uvd_resume+0x40/0xa0
+[<ffffffff81a56eb0>] memcpy+0x0/0x2f0
+[<ffffffff81a56fb0>] memcpy+0x100/0x2f0
+[<ffffffff81121e04>] cik_startup+0x3a64/0x3c70
+
+It's the reason that we use SIMD intruction to implement memset/memcpy
+hooks, which will cause some problems on I/O memory. Sigh, let's correct
+it.
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com> #openEuler_contributor
+Signed-off-by: Laibin Qiu <qiulaibin@huawei.com>
+Reviewed-by: Hanjun Guo <guohanjun@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c | 16 ++++++++++++----
+ drivers/gpu/drm/radeon/radeon_vce.c   |  8 ++++++--
+ 2 files changed, 18 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+index b19f7bd37781..8dd7587fea26 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+@@ -3721,8 +3721,12 @@ static int gfx_v9_0_kiq_init_queue(struct amdgpu_ring *ring)
+ 
+ 	if (amdgpu_in_reset(adev)) { /* for GPU_RESET case */
+ 		/* reset MQD to a clean status */
+-		if (adev->gfx.mec.mqd_backup[mqd_idx])
+-			memcpy(mqd, adev->gfx.mec.mqd_backup[mqd_idx], sizeof(struct v9_mqd_allocation));
++		if (adev->gfx.mec.mqd_backup[mqd_idx]) {
++			if (IS_ENABLED(CONFIG_SW64))
++				memcpy_toio(mqd, adev->gfx.mec.mqd_backup[mqd_idx], sizeof(struct v9_mqd_allocation));
++			else
++				memcpy(mqd, adev->gfx.mec.mqd_backup[mqd_idx], sizeof(struct v9_mqd_allocation));
++		}
+ 
+ 		/* reset ring buffer */
+ 		ring->wptr = 0;
+@@ -3744,8 +3748,12 @@ static int gfx_v9_0_kiq_init_queue(struct amdgpu_ring *ring)
+ 		soc15_grbm_select(adev, 0, 0, 0, 0);
+ 		mutex_unlock(&adev->srbm_mutex);
+ 
+-		if (adev->gfx.mec.mqd_backup[mqd_idx])
+-			memcpy(adev->gfx.mec.mqd_backup[mqd_idx], mqd, sizeof(struct v9_mqd_allocation));
++		if (adev->gfx.mec.mqd_backup[mqd_idx]) {
++			if (IS_ENABLED(CONFIG_SW64))
++				memcpy_fromio(adev->gfx.mec.mqd_backup[mqd_idx], mqd, sizeof(struct v9_mqd_allocation));
++			else
++				memcpy(adev->gfx.mec.mqd_backup[mqd_idx], mqd, sizeof(struct v9_mqd_allocation));
++		}
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/radeon/radeon_vce.c b/drivers/gpu/drm/radeon/radeon_vce.c
+index 5e8006444704..9f59e2b8935b 100644
+--- a/drivers/gpu/drm/radeon/radeon_vce.c
++++ b/drivers/gpu/drm/radeon/radeon_vce.c
+@@ -242,8 +242,12 @@ int radeon_vce_resume(struct radeon_device *rdev)
+ 	memset(cpu_addr, 0, radeon_bo_size(rdev->vce.vcpu_bo));
+ 	if (rdev->family < CHIP_BONAIRE)
+ 		r = vce_v1_0_load_fw(rdev, cpu_addr);
+-	else
+-		memcpy(cpu_addr, rdev->vce_fw->data, rdev->vce_fw->size);
++	else {
++		if (IS_ENABLED(CONFIG_SW64))
++			memcpy_toio(cpu_addr, rdev->vce_fw->data, rdev->vce_fw->size);
++		else
++			memcpy(cpu_addr, rdev->vce_fw->data, rdev->vce_fw->size);
++	}
+ 
+ 	radeon_bo_kunmap(rdev->vce.vcpu_bo);
+ 
+-- 
+2.26.2
+

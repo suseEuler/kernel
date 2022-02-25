@@ -1,0 +1,460 @@
+From 6c59ddf2139dd251343d4966849714bceab4ee66 Mon Sep 17 00:00:00 2001
+From: Ma Wupeng <mawupeng1@huawei.com>
+Date: Wed, 23 Feb 2022 18:45:18 +0800
+Subject: [PATCH] mm: Introduce memory reliable
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 6c59ddf2139dd251343d4966849714bceab4ee66
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4PM01
+CVE: NA
+
+--------------------------------
+
+Introduction
+
+============
+
+Memory reliable feature is a memory tiering mechanism. It is based on
+kernel mirror feature, which splits memory into two sperate regions,
+mirrored(reliable) region and non-mirrored (non-reliable) region.
+
+for kernel mirror feature:
+
+- allocate kernel memory from mirrored region by default
+- allocate user memory from non-mirrored region by default
+
+non-mirrored region will be arranged into ZONE_MOVABLE.
+
+for kernel reliable feature, it has additional features below:
+
+- normal user tasks never alloc memory from mirrored region with userspace
+  apis(malloc, mmap, etc.)
+- special user tasks will allocate memory from mirrored region by default
+- tmpfs/pagecache allocate memory from mirrored region by default
+- upper limit of mirrored region allcated for user tasks, tmpfs and
+  pagecache
+
+Support Reliable fallback mechanism which allows special user tasks, tmpfs
+and pagecache can fallback to alloc non-mirrored region, it's the default
+setting.
+
+In order to fulfil the goal
+
+- ___GFP_RELIABLE flag added for alloc memory from mirrored region.
+
+- the high_zoneidx for special user tasks/tmpfs/pagecache is set to
+  ZONE_NORMAL.
+
+- normal user tasks could only alloc from ZONE_MOVABLE.
+
+This patch is just the main framework, memory reliable support for special
+user tasks, pagecache and tmpfs has own patches.
+
+To enable this function, mirrored(reliable) memory is needed and
+"kernelcore=reliable" should be added to kernel parameters.
+
+Signed-off-by: Ma Wupeng <mawupeng1@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ .../admin-guide/kernel-parameters.txt         |  5 +-
+ include/linux/gfp.h                           | 15 +++-
+ include/linux/mem_reliable.h                  | 62 +++++++++++++++
+ include/linux/mm.h                            |  3 +
+ include/trace/events/mmflags.h                |  2 +-
+ mm/Kconfig                                    | 18 +++++
+ mm/Makefile                                   |  1 +
+ mm/mem_reliable.c                             | 79 +++++++++++++++++++
+ mm/page_alloc.c                               | 31 +++++++-
+ tools/perf/builtin-kmem.c                     |  2 +-
+ 10 files changed, 211 insertions(+), 7 deletions(-)
+ create mode 100644 include/linux/mem_reliable.h
+ create mode 100644 mm/mem_reliable.c
+
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index 50abc29d8366..b5524464f1cb 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -2227,7 +2227,7 @@
+ 	keepinitrd	[HW,ARM]
+ 
+ 	kernelcore=	[KNL,X86,IA-64,PPC,ARM64]
+-			Format: nn[KMGTPE] | nn% | "mirror"
++			Format: nn[KMGTPE] | nn% | "mirror" | "reliable"
+ 			This parameter specifies the amount of memory usable by
+ 			the kernel for non-movable allocations.  The requested
+ 			amount is spread evenly throughout all nodes in the
+@@ -2251,6 +2251,9 @@
+ 			for Movable pages.  "nn[KMGTPE]", "nn%", and "mirror"
+ 			are exclusive, so you cannot specify multiple forms.
+ 
++			Option "reliable" is base on option "mirror", but make
++			some extension. These two features are alternatives.
++
+ 	kgdbdbgp=	[KGDB,HW] kgdb over EHCI usb debug port.
+ 			Format: <Controller#>[,poll interval]
+ 			The controller # is the number of the ehci usb debug
+diff --git a/include/linux/gfp.h b/include/linux/gfp.h
+index 80efbea0c9d7..5c3df92a4745 100644
+--- a/include/linux/gfp.h
++++ b/include/linux/gfp.h
+@@ -39,7 +39,7 @@ struct vm_area_struct;
+ #define ___GFP_HARDWALL		0x100000u
+ #define ___GFP_THISNODE		0x200000u
+ #define ___GFP_ACCOUNT		0x400000u
+-#define ___GFP_RESERVE_0	0x800000u
++#define ___GFP_RELIABLE		0x800000u
+ #define ___GFP_RESERVE_1	0x1000000u
+ #ifdef CONFIG_LOCKDEP
+ #define ___GFP_NOLOCKDEP	0x2000000u
+@@ -225,8 +225,10 @@ struct vm_area_struct;
+ /* Disable lockdep for GFP context tracking */
+ #define __GFP_NOLOCKDEP ((__force gfp_t)___GFP_NOLOCKDEP)
+ 
+-/* Reserve 2 flags for future usage */
+-#define __GFP_RESERVE_0 ((__force gfp_t)___GFP_RESERVE_0)
++/* Alloc memory from mirrored region */
++#define __GFP_RELIABLE ((__force gfp_t)___GFP_RELIABLE)
++
++/* Reserve 1 flags for future usage */
+ #define __GFP_RESERVE_1 ((__force gfp_t)___GFP_RESERVE_1)
+ 
+ /* Room for N __GFP_FOO bits */
+@@ -315,6 +317,7 @@ struct vm_area_struct;
+ #define GFP_TRANSHUGE_LIGHT	((GFP_HIGHUSER_MOVABLE | __GFP_COMP | \
+ 			 __GFP_NOMEMALLOC | __GFP_NOWARN) & ~__GFP_RECLAIM)
+ #define GFP_TRANSHUGE	(GFP_TRANSHUGE_LIGHT | __GFP_DIRECT_RECLAIM)
++#define GFP_RELIABLE __GFP_RELIABLE
+ 
+ /* Convert GFP flags to their corresponding migrate type */
+ #define GFP_MOVABLE_MASK (__GFP_RECLAIMABLE|__GFP_MOVABLE)
+@@ -461,6 +464,12 @@ static inline enum zone_type gfp_zone(gfp_t flags)
+ 	z = (GFP_ZONE_TABLE >> (bit * GFP_ZONES_SHIFT)) &
+ 					 ((1 << GFP_ZONES_SHIFT) - 1);
+ 	VM_BUG_ON((GFP_ZONE_BAD >> bit) & 1);
++
++#ifdef CONFIG_MEMORY_RELIABLE
++	if (z == ZONE_MOVABLE && (flags & GFP_RELIABLE))
++		return ZONE_NORMAL;
++#endif
++
+ 	return z;
+ }
+ 
+diff --git a/include/linux/mem_reliable.h b/include/linux/mem_reliable.h
+new file mode 100644
+index 000000000000..02f73a91058b
+--- /dev/null
++++ b/include/linux/mem_reliable.h
+@@ -0,0 +1,62 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __MM_MEM_RELIABLE__
++#define __MM_MEM_RELIABLE__
++
++#include <linux/stddef.h>
++#include <linux/gfp.h>
++#include <linux/mmzone.h>
++#include <linux/mm_types.h>
++#include <linux/sched.h>
++
++#ifdef CONFIG_MEMORY_RELIABLE
++
++extern struct static_key_false mem_reliable;
++
++extern bool reliable_enabled;
++
++extern void add_reliable_mem_size(long sz);
++extern void mem_reliable_init(bool has_unmirrored_mem,
++			      unsigned long *zone_movable_pfn);
++
++static inline bool mem_reliable_is_enabled(void)
++{
++	return static_branch_likely(&mem_reliable);
++}
++
++static inline bool zone_reliable(struct zone *zone)
++{
++	return mem_reliable_is_enabled() && zone_idx(zone) < ZONE_MOVABLE;
++}
++
++static inline bool skip_none_movable_zone(gfp_t gfp, struct zoneref *z)
++{
++	if (!mem_reliable_is_enabled())
++		return false;
++
++	if (!current->mm || (current->flags & PF_KTHREAD))
++		return false;
++
++	/* user tasks can only alloc memory from non-mirrored region */
++	if (!(gfp & GFP_RELIABLE) && (gfp & __GFP_HIGHMEM) &&
++	    (gfp & __GFP_MOVABLE)) {
++		if (zonelist_zone_idx(z) < ZONE_MOVABLE)
++			return true;
++	}
++
++	return false;
++}
++#else
++#define reliable_enabled 0
++
++static inline bool mem_reliable_is_enabled(void) { return false; }
++static inline void add_reliable_mem_size(long sz) {}
++static inline void mem_reliable_init(bool has_unmirrored_mem,
++				     unsigned long *zone_movable_pfn) {}
++static inline bool zone_reliable(struct zone *zone) { return false; }
++static inline bool skip_none_movable_zone(gfp_t gfp, struct zoneref *z)
++{
++	return false;
++}
++#endif
++
++#endif
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 52c4ac088b88..859d5200c57b 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -34,6 +34,9 @@
+ #include <linux/pgtable.h>
+ #include <linux/kabi.h>
+ 
++/* added to mm.h to avoid every caller adding new header file */
++#include <linux/mem_reliable.h>
++
+ struct mempolicy;
+ struct anon_vma;
+ struct anon_vma_chain;
+diff --git a/include/trace/events/mmflags.h b/include/trace/events/mmflags.h
+index fba14499b87e..dc1805fbf893 100644
+--- a/include/trace/events/mmflags.h
++++ b/include/trace/events/mmflags.h
+@@ -49,7 +49,7 @@
+ 	{(unsigned long)__GFP_RECLAIM,		"__GFP_RECLAIM"},	\
+ 	{(unsigned long)__GFP_DIRECT_RECLAIM,	"__GFP_DIRECT_RECLAIM"},\
+ 	{(unsigned long)__GFP_KSWAPD_RECLAIM,	"__GFP_KSWAPD_RECLAIM"},\
+-	{(unsigned long)__GFP_RESERVE_0,	"__GFP_RESERVE_0"},	\
++	{(unsigned long)__GFP_RELIABLE,		"__GFP_RELIABLE"},	\
+ 	{(unsigned long)__GFP_RESERVE_1,	"__GFP_RESERVE_1"}	\
+ 
+ #define show_gfp_flags(flags)						\
+diff --git a/mm/Kconfig b/mm/Kconfig
+index 1ba477dee3ae..4475bd9f8762 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -951,6 +951,24 @@ config PID_RESERVE
+ 	  and reserve the pids before init task start. In restore process,
+ 	  free the reserved pids and realloc them for use.
+ 
++config MEMORY_RELIABLE
++	bool "Support for memory reliable"
++	depends on NEED_MULTIPLE_NODES
++	depends on ARM64
++	default n
++	help
++	  Memory reliable is based on mirror memory. It has the following
++	  additional features:
++	  a) normal user tasks never alloc memory from mirrored region;
++	  b) special user tasks will allocate memory from mirrored region
++	  by default; c) upper limit of mirrored region allcated for user
++	  tasks, tmpfs and pagecache.
++	  Special user tasks and tmpfs/pagecache can fallback to
++	  non-mirrored region if you enable reliable fallback mechanism.
++
++	  To enable this function, mirrored memory is needed and
++	  "kernelcore=reliable" need to be added in kernel parameters.
++
+ source "mm/damon/Kconfig"
+ 
+ endmenu
+diff --git a/mm/Makefile b/mm/Makefile
+index 4b0b5e7af40f..4b3a827429f3 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -128,3 +128,4 @@ obj-$(CONFIG_HAVE_BOOTMEM_INFO_NODE) += bootmem_info.o
+ obj-$(CONFIG_PIN_MEMORY) += pin_mem.o
+ obj-$(CONFIG_SHRINK_PAGECACHE) += page_cache_limit.o
+ obj-$(CONFIG_ASCEND_SHARE_POOL) += share_pool.o
++obj-$(CONFIG_MEMORY_RELIABLE) += mem_reliable.o
+diff --git a/mm/mem_reliable.c b/mm/mem_reliable.c
+new file mode 100644
+index 000000000000..7914c76c1fcd
+--- /dev/null
++++ b/mm/mem_reliable.c
+@@ -0,0 +1,79 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#define pr_fmt(fmt)	"mem reliable: " fmt
++
++#include <linux/mm.h>
++#include <linux/memory.h>
++#include <linux/memory_hotplug.h>
++
++DEFINE_STATIC_KEY_FALSE(mem_reliable);
++
++bool reliable_enabled;
++
++static atomic_long_t total_reliable_mem;
++
++void add_reliable_mem_size(long sz)
++{
++	atomic_long_add(sz, &total_reliable_mem);
++}
++
++static unsigned long total_reliable_mem_sz(void)
++{
++	return atomic_long_read(&total_reliable_mem);
++}
++
++static int reliable_mem_notifier(struct notifier_block *nb,
++				 unsigned long action, void *arg)
++{
++	struct memory_notify *m_arg = arg;
++	struct zone *zone;
++
++	switch (action) {
++	case MEM_ONLINE:
++		zone = page_zone(pfn_to_page(m_arg->start_pfn));
++		if (zone_reliable(zone))
++			add_reliable_mem_size(m_arg->nr_pages * PAGE_SIZE);
++		break;
++	case MEM_OFFLINE:
++		zone = page_zone(pfn_to_page(m_arg->start_pfn));
++		if (zone_reliable(zone))
++			add_reliable_mem_size(-m_arg->nr_pages * PAGE_SIZE);
++		break;
++	default:
++		break;
++	}
++
++	return NOTIFY_OK;
++}
++
++static struct notifier_block reliable_notifier_block = {
++	.notifier_call = reliable_mem_notifier,
++};
++
++void mem_reliable_init(bool has_unmirrored_mem, unsigned long *zone_movable_pfn)
++{
++	if (!reliable_enabled)
++		return;
++
++	if (atomic_long_read(&total_reliable_mem) == 0) {
++		memset(zone_movable_pfn, 0,
++		       sizeof(unsigned long) * MAX_NUMNODES);
++		pr_err("init failed, mirrored memory size is zero.\n");
++		return;
++	}
++
++	if (!has_unmirrored_mem) {
++		pr_err("init failed, unmirrored memory size is zero.\n");
++		return;
++	}
++
++	if (register_hotmemory_notifier(&reliable_notifier_block)) {
++		pr_err("init failed, register memory notifier failed.\n");
++		return;
++	}
++
++	static_branch_enable(&mem_reliable);
++
++	pr_info("init succeed, mirrored memory size(%lu)\n",
++		total_reliable_mem_sz());
++}
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 7ea4531cc557..bfe215fc0da1 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -3840,6 +3840,10 @@ get_page_from_freelist(gfp_t gfp_mask, unsigned int order, int alloc_flags,
+ 		struct page *page;
+ 		unsigned long mark;
+ 
++		/* skip non-movable zone for normal user tasks */
++		if (skip_none_movable_zone(gfp_mask, z))
++			continue;
++
+ 		/*
+ 		 * CDM nodes get skipped if the requested gfp flag
+ 		 * does not have __GFP_THISNODE set or the nodemask
+@@ -7494,10 +7498,13 @@ static void __init find_zone_movable_pfns_for_nodes(void)
+ 	 */
+ 	if (mirrored_kernelcore) {
+ 		bool mem_below_4gb_not_mirrored = false;
++		bool has_unmirrored_mem = false;
+ 
+ 		for_each_mem_region(r) {
+-			if (memblock_is_mirror(r))
++			if (memblock_is_mirror(r)) {
++				add_reliable_mem_size(r->size);
+ 				continue;
++			}
+ 
+ 			nid = memblock_get_region_node(r);
+ 
+@@ -7508,6 +7515,7 @@ static void __init find_zone_movable_pfns_for_nodes(void)
+ 				continue;
+ 			}
+ 
++			has_unmirrored_mem = true;
+ 			zone_movable_pfn[nid] = zone_movable_pfn[nid] ?
+ 				min(usable_startpfn, zone_movable_pfn[nid]) :
+ 				usable_startpfn;
+@@ -7516,6 +7524,8 @@ static void __init find_zone_movable_pfns_for_nodes(void)
+ 		if (mem_below_4gb_not_mirrored)
+ 			pr_warn("This configuration results in unmirrored kernel memory.\n");
+ 
++		mem_reliable_init(has_unmirrored_mem, zone_movable_pfn);
++
+ 		goto out2;
+ 	}
+ 
+@@ -7827,10 +7837,29 @@ static int __init cmdline_parse_kernelcore(char *p)
+ {
+ 	/* parse kernelcore=mirror */
+ 	if (parse_option_str(p, "mirror")) {
++		if (reliable_enabled) {
++			pr_info("kernelcore=reliable and kernelcore=mirror are alternative.\n");
++			return -EINVAL;
++		}
++
+ 		mirrored_kernelcore = true;
+ 		return 0;
+ 	}
+ 
++#ifdef CONFIG_MEMORY_RELIABLE
++	/* parse kernelcore=reliable */
++	if (parse_option_str(p, "reliable")) {
++		if (!reliable_enabled && mirrored_kernelcore) {
++			pr_info("kernelcore=mirror and kernelcore=reliable are alternative.\n");
++			return -EINVAL;
++		}
++
++		reliable_enabled = true;
++		mirrored_kernelcore = true;
++		return 0;
++	}
++#endif
++
+ 	return cmdline_parse_core(p, &required_kernelcore,
+ 				  &required_kernelcore_percent);
+ }
+diff --git a/tools/perf/builtin-kmem.c b/tools/perf/builtin-kmem.c
+index ffe9cf4160cf..5f4cc7126688 100644
+--- a/tools/perf/builtin-kmem.c
++++ b/tools/perf/builtin-kmem.c
+@@ -660,7 +660,7 @@ static const struct {
+ 	{ "__GFP_RECLAIM",		"R" },
+ 	{ "__GFP_DIRECT_RECLAIM",	"DR" },
+ 	{ "__GFP_KSWAPD_RECLAIM",	"KR" },
+-	{ "__GFP_RESERVE_0",		"RE0" },
++	{ "__GFP_RELIABLE",		"REL" },
+ 	{ "__GFP_RESERVE_1",		"RE1" },
+ };
+ 
+-- 
+2.26.2
+

@@ -1,0 +1,153 @@
+From 67655b57f8f59467506463055d9a8398d2836377 Mon Sep 17 00:00:00 2001
+From: Dave Hansen <dave.hansen@linux.intel.com>
+Date: Mon, 16 Nov 2020 14:25:31 -0800
+Subject: [PATCH] x86/sgx: Clarify 'laundry_list' locking
+Git-commit: 67655b57f8f59467506463055d9a8398d2836377
+Patch-mainline: v5.11-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+Short Version:
+
+The SGX section->laundry_list structure is effectively thread-local, but
+declared next to some shared structures. Its semantics are clear as mud.
+Fix that. No functional changes. Compile tested only.
+
+Long Version:
+
+The SGX hardware keeps per-page metadata. This can provide things like
+permissions, integrity and replay protection. It also prevents things
+like having an enclave page mapped multiple times or shared between
+enclaves.
+
+But, that presents a problem for kexec()'d kernels (or any other kernel
+that does not run immediately after a hardware reset). This is because
+the last kernel may have been rude and forgotten to reset pages, which
+would trigger the "shared page" sanity check.
+
+To fix this, the SGX code "launders" the pages by running the EREMOVE
+instruction on all pages at boot. This is slow and can take a long
+time, so it is performed off in the SGX-specific ksgxd instead of being
+synchronous at boot. The init code hands the list of pages to launder in
+a per-SGX-section list: ->laundry_list. The only code to touch this list
+is the init code and ksgxd. This means that no locking is necessary for
+->laundry_list.
+
+However, a lock is required for section->page_list, which is accessed
+while creating enclaves and by ksgxd. This lock (section->lock) is
+acquired by ksgxd while also processing ->laundry_list. It is easy to
+confuse the purpose of the locking as being for ->laundry_list and
+->page_list.
+
+Rename ->laundry_list to ->init_laundry_list to make it clear that this
+is not normally used at runtime. Also add some comments clarifying the
+locking, and reorganize 'sgx_epc_section' to put 'lock' near the things
+it protects.
+
+Note: init_laundry_list is 128 bytes of wasted space at runtime. It
+could theoretically be dynamically allocated and then freed after
+the laundering process. But it would take nearly 128 bytes of extra
+instructions to do that.
+
+Signed-off-by: Jarkko Sakkinen <jarkko@kernel.org>
+Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20201116222531.4834-1-dave.hansen@intel.com
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/kernel/cpu/sgx/main.c | 14 ++++++++------
+ arch/x86/kernel/cpu/sgx/sgx.h  | 15 ++++++++++++---
+ 2 files changed, 20 insertions(+), 9 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/sgx/main.c b/arch/x86/kernel/cpu/sgx/main.c
+index 3426785df457..c519fc5f6948 100644
+--- a/arch/x86/kernel/cpu/sgx/main.c
++++ b/arch/x86/kernel/cpu/sgx/main.c
+@@ -36,13 +36,15 @@ static void sgx_sanitize_section(struct sgx_epc_section *section)
+ 	LIST_HEAD(dirty);
+ 	int ret;
+ 
+-	while (!list_empty(&section->laundry_list)) {
++	/* init_laundry_list is thread-local, no need for a lock: */
++	while (!list_empty(&section->init_laundry_list)) {
+ 		if (kthread_should_stop())
+ 			return;
+ 
++		/* needed for access to ->page_list: */
+ 		spin_lock(&section->lock);
+ 
+-		page = list_first_entry(&section->laundry_list,
++		page = list_first_entry(&section->init_laundry_list,
+ 					struct sgx_epc_page, list);
+ 
+ 		ret = __eremove(sgx_get_epc_virt_addr(page));
+@@ -56,7 +58,7 @@ static void sgx_sanitize_section(struct sgx_epc_section *section)
+ 		cond_resched();
+ 	}
+ 
+-	list_splice(&dirty, &section->laundry_list);
++	list_splice(&dirty, &section->init_laundry_list);
+ }
+ 
+ static bool sgx_reclaimer_age(struct sgx_epc_page *epc_page)
+@@ -418,7 +420,7 @@ static int ksgxd(void *p)
+ 		sgx_sanitize_section(&sgx_epc_sections[i]);
+ 
+ 		/* Should never happen. */
+-		if (!list_empty(&sgx_epc_sections[i].laundry_list))
++		if (!list_empty(&sgx_epc_sections[i].init_laundry_list))
+ 			WARN(1, "EPC section %d has unsanitized pages.\n", i);
+ 	}
+ 
+@@ -635,13 +637,13 @@ static bool __init sgx_setup_epc_section(u64 phys_addr, u64 size,
+ 	section->phys_addr = phys_addr;
+ 	spin_lock_init(&section->lock);
+ 	INIT_LIST_HEAD(&section->page_list);
+-	INIT_LIST_HEAD(&section->laundry_list);
++	INIT_LIST_HEAD(&section->init_laundry_list);
+ 
+ 	for (i = 0; i < nr_pages; i++) {
+ 		section->pages[i].section = index;
+ 		section->pages[i].flags = 0;
+ 		section->pages[i].owner = NULL;
+-		list_add_tail(&section->pages[i].list, &section->laundry_list);
++		list_add_tail(&section->pages[i].list, &section->init_laundry_list);
+ 	}
+ 
+ 	section->free_cnt = nr_pages;
+diff --git a/arch/x86/kernel/cpu/sgx/sgx.h b/arch/x86/kernel/cpu/sgx/sgx.h
+index a188a683ffb6..5fa42d143feb 100644
+--- a/arch/x86/kernel/cpu/sgx/sgx.h
++++ b/arch/x86/kernel/cpu/sgx/sgx.h
+@@ -34,15 +34,24 @@ struct sgx_epc_page {
+  * physical memory e.g. for memory areas of the each node. This structure is
+  * used to store EPC pages for one EPC section and virtual memory area where
+  * the pages have been mapped.
++ *
++ * 'lock' must be held before accessing 'page_list' or 'free_cnt'.
+  */
+ struct sgx_epc_section {
+ 	unsigned long phys_addr;
+ 	void *virt_addr;
+-	struct list_head page_list;
+-	struct list_head laundry_list;
+ 	struct sgx_epc_page *pages;
+-	unsigned long free_cnt;
++
+ 	spinlock_t lock;
++	struct list_head page_list;
++	unsigned long free_cnt;
++
++	/*
++	 * Pages which need EREMOVE run on them before they can be
++	 * used.  Only safe to be accessed in ksgxd and init code.
++	 * Not protected by locks.
++	 */
++	struct list_head init_laundry_list;
+ };
+ 
+ extern struct sgx_epc_section sgx_epc_sections[SGX_MAX_EPC_SECTIONS];
+-- 
+2.26.2
+

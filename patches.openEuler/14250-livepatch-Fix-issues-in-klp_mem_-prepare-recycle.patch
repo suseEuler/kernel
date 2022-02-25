@@ -1,0 +1,493 @@
+From e3857414ea6b0750d5f8be68f25e44d4656b23a6 Mon Sep 17 00:00:00 2001
+From: Zheng Yejian <zhengyejian1@huawei.com>
+Date: Tue, 22 Feb 2022 22:12:37 +0800
+Subject: [PATCH] livepatch: Fix issues in klp_mem_{prepare,recycle}
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: e3857414ea6b0750d5f8be68f25e44d4656b23a6
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4UAQ1
+
+--------------------------------
+
+There are several issues in klp_mem_{prepare,recycle}:
+  1. Memory leak when save old codes fail:
+    __klp_enable_patch
+        klp_mem_prepare
+            klp_for_each_func(patch)
+                func->func_node = kzalloc(...)    <-- 1. Alloc memory
+        stop_machine(klp_try_enable_patch, ...)
+            enable_patch
+                arch_klp_patch_func
+                    INIT_LIST_HEAD(&func_node->func_stack); <-- 2. func_stack list inited as empty
+                    copy_from_kernel_nofault    <-- 3. When save codes fail
+        klp_mem_recycle
+            klp_for_each_func(patch)
+                <-- 4. Here func_stack list is empty but not singular, 'func_node' not be freed!!!
+                if (func_node && list_is_singular(&func_node->func_stack))
+                    kfree(func_node);
+
+  2. Memory leak in following scene:
+     Suppose P1/P2 want to patch same old func, then enable P1 --> enable P2 --> disable P2 --> disable P1
+  3. UAF(use-after-free) happened in following scene:
+     Suppose P1/P2 want to patch same old func, then enable P1 --> enable P2 --> disable P1 --> disable P2
+
+Above problems are introduced in commit ec7ce700674f ("[Huawei] livepatch:
+put memory alloc and free out stop machine"):
+  before it: 'func_node' is only keep in 'klp_func_list';
+  after it: 'func_node' is keep both in 'klp_func_list' and 'struct klp_func', and
+            conditions to free memory of 'func_node' somewhat wrong.
+
+To resolve it, we add check and do func_node init when klp_mem_prepare.
+
+Fixes: ("000c0197ed37 livepatch: put memory alloc and free out stop machine")
+Signed-off-by: Zheng Yejian <zhengyejian1@huawei.com>
+Reviewed-by: Kuohai Xu <xukuohai@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm/kernel/livepatch.c        | 22 +---------
+ arch/arm64/kernel/livepatch.c      | 30 +------------
+ arch/powerpc/kernel/livepatch_32.c | 25 +----------
+ arch/powerpc/kernel/livepatch_64.c | 24 +---------
+ arch/x86/kernel/livepatch.c        | 21 +--------
+ kernel/livepatch/core.c            | 70 +++++++++++++++++++++++++-----
+ kernel/livepatch/patch.c           |  5 ++-
+ 7 files changed, 74 insertions(+), 123 deletions(-)
+
+diff --git a/arch/arm/kernel/livepatch.c b/arch/arm/kernel/livepatch.c
+index ffecb1f0c968..4b07e73ad37b 100644
+--- a/arch/arm/kernel/livepatch.c
++++ b/arch/arm/kernel/livepatch.c
+@@ -375,32 +375,15 @@ int arch_klp_patch_func(struct klp_func *func)
+ 	struct klp_func_node *func_node;
+ 	unsigned long pc, new_addr;
+ 	u32 insn;
+-	long ret;
+ #ifdef CONFIG_ARM_MODULE_PLTS
+ 	int i;
+ 	u32 insns[LJMP_INSN_SIZE];
+ #endif
+ 
+-	func_node = klp_find_func_node(func->old_func);
+-	if (!func_node) {
+-		func_node = func->func_node;
+-		if (!func_node)
+-			return -ENOMEM;
+-
+-		INIT_LIST_HEAD(&func_node->func_stack);
+-		func_node->old_func = func->old_func;
+-		ret = arch_klp_save_old_code(&func_node->arch_data, func->old_func);
+-		if (ret) {
+-			return -EPERM;
+-		}
+-		klp_add_func_node(func_node);
+-	}
+-
++	func_node = func->func_node;
+ 	list_add_rcu(&func->stack_node, &func_node->func_stack);
+-
+ 	pc = (unsigned long)func->old_func;
+ 	new_addr = (unsigned long)func->new_func;
+-
+ #ifdef CONFIG_ARM_MODULE_PLTS
+ 	if (!offset_in_range(pc, new_addr, SZ_32M)) {
+ 		/*
+@@ -438,7 +421,7 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 	u32 insns[LJMP_INSN_SIZE];
+ #endif
+ 
+-	func_node = klp_find_func_node(func->old_func);
++	func_node = func->func_node;
+ 	pc = (unsigned long)func_node->old_func;
+ 	if (list_is_singular(&func_node->func_stack)) {
+ #ifdef CONFIG_ARM_MODULE_PLTS
+@@ -451,7 +434,6 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 		__patch_text((void *)pc, insn);
+ #endif
+ 		list_del_rcu(&func->stack_node);
+-		klp_del_func_node(func_node);
+ 	} else {
+ 		list_del_rcu(&func->stack_node);
+ 		next_func = list_first_or_null_rcu(&func_node->func_stack,
+diff --git a/arch/arm64/kernel/livepatch.c b/arch/arm64/kernel/livepatch.c
+index 6683cb0a28fa..2c292008440c 100644
+--- a/arch/arm64/kernel/livepatch.c
++++ b/arch/arm64/kernel/livepatch.c
+@@ -354,35 +354,15 @@ int arch_klp_patch_func(struct klp_func *func)
+ 	struct klp_func_node *func_node;
+ 	unsigned long pc, new_addr;
+ 	u32 insn;
+-	u32 memory_flag = 0;
+ #ifdef CONFIG_ARM64_MODULE_PLTS
+ 	int i;
+ 	u32 insns[LJMP_INSN_SIZE];
+ #endif
+-	int ret = 0;
+-
+-	func_node = klp_find_func_node(func->old_func);
+-	if (!func_node) {
+-		func_node = func->func_node;
+-		if (!func_node)
+-			return -ENOMEM;
+-		memory_flag = 1;
+-
+-		INIT_LIST_HEAD(&func_node->func_stack);
+-		func_node->old_func = func->old_func;
+-
+-		ret = arch_klp_save_old_code(&func_node->arch_data, func->old_func);
+-		if (ret) {
+-			return -EPERM;
+-		}
+-		klp_add_func_node(func_node);
+-	}
+ 
++	func_node = func->func_node;
+ 	list_add_rcu(&func->stack_node, &func_node->func_stack);
+-
+ 	pc = (unsigned long)func->old_func;
+ 	new_addr = (unsigned long)func->new_func;
+-
+ #ifdef CONFIG_ARM64_MODULE_PLTS
+ 	if (offset_in_range(pc, new_addr, SZ_128M)) {
+ 		insn = aarch64_insn_gen_branch_imm(pc, new_addr,
+@@ -410,9 +390,6 @@ int arch_klp_patch_func(struct klp_func *func)
+ 
+ ERR_OUT:
+ 	list_del_rcu(&func->stack_node);
+-	if (memory_flag) {
+-		klp_del_func_node(func_node);
+-	}
+ 
+ 	return -EPERM;
+ }
+@@ -427,10 +404,8 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 	int i;
+ 	u32 insns[LJMP_INSN_SIZE];
+ #endif
+-	func_node = klp_find_func_node(func->old_func);
+-	if (WARN_ON(!func_node))
+-		return;
+ 
++	func_node = func->func_node;
+ 	pc = (unsigned long)func_node->old_func;
+ 	if (list_is_singular(&func_node->func_stack)) {
+ #ifdef CONFIG_ARM64_MODULE_PLTS
+@@ -440,7 +415,6 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 		insn = func_node->arch_data.old_insn;
+ #endif
+ 		list_del_rcu(&func->stack_node);
+-		klp_del_func_node(func_node);
+ 
+ #ifdef CONFIG_ARM64_MODULE_PLTS
+ 		for (i = 0; i < LJMP_INSN_SIZE; i++) {
+diff --git a/arch/powerpc/kernel/livepatch_32.c b/arch/powerpc/kernel/livepatch_32.c
+index ddc858294afb..99acabd730e0 100644
+--- a/arch/powerpc/kernel/livepatch_32.c
++++ b/arch/powerpc/kernel/livepatch_32.c
+@@ -397,28 +397,11 @@ int arch_klp_patch_func(struct klp_func *func)
+ 	struct klp_func_node *func_node;
+ 	unsigned long pc, new_addr;
+ 	long ret;
+-	int memory_flag = 0;
+ 	int i;
+ 	u32 insns[LJMP_INSN_SIZE];
+ 
+-	func_node = klp_find_func_node(func->old_func);
+-	if (!func_node) {
+-		func_node = func->func_node;
+-		if (!func_node)
+-			return -ENOMEM;
+-
+-		memory_flag = 1;
+-		INIT_LIST_HEAD(&func_node->func_stack);
+-		func_node->old_func = func->old_func;
+-		ret = arch_klp_save_old_code(&func_node->arch_data, func->old_func);
+-		if (ret)
+-			return -EPERM;
+-
+-		klp_add_func_node(func_node);
+-	}
+-
++	func_node = func->func_node;
+ 	list_add_rcu(&func->stack_node, &func_node->func_stack);
+-
+ 	pc = (unsigned long)func->old_func;
+ 	new_addr = (unsigned long)func->new_func;
+ 	if (offset_in_range(pc, new_addr, SZ_32M)) {
+@@ -451,9 +434,6 @@ int arch_klp_patch_func(struct klp_func *func)
+ 
+ ERR_OUT:
+ 	list_del_rcu(&func->stack_node);
+-	if (memory_flag) {
+-		klp_del_func_node(func_node);
+-	}
+ 
+ 	return -EPERM;
+ }
+@@ -466,14 +446,13 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 	u32 insns[LJMP_INSN_SIZE];
+ 	int i;
+ 
+-	func_node = klp_find_func_node(func->old_func);
++	func_node = func->func_node;
+ 	pc = (unsigned long)func_node->old_func;
+ 	if (list_is_singular(&func_node->func_stack)) {
+ 		for (i = 0; i < LJMP_INSN_SIZE; i++)
+ 			insns[i] = func_node->arch_data.old_insns[i];
+ 
+ 		list_del_rcu(&func->stack_node);
+-		klp_del_func_node(func_node);
+ 
+ 		for (i = 0; i < LJMP_INSN_SIZE; i++)
+ 			patch_instruction((struct ppc_inst *)(((u32 *)pc) + i),
+diff --git a/arch/powerpc/kernel/livepatch_64.c b/arch/powerpc/kernel/livepatch_64.c
+index 6fa7c3c20528..b319675afd4c 100644
+--- a/arch/powerpc/kernel/livepatch_64.c
++++ b/arch/powerpc/kernel/livepatch_64.c
+@@ -443,29 +443,13 @@ int arch_klp_patch_func(struct klp_func *func)
+ {
+ 	struct klp_func_node *func_node;
+ 	unsigned long pc, new_addr;
+-	int memory_flag = 0;
+ 	long ret;
+ 
+-	func_node = klp_find_func_node(func->old_func);
+-	if (!func_node) {
+-		func_node = func->func_node;
+-		if (!func_node)
+-			return -ENOMEM;
+-
+-		memory_flag = 1;
+-		INIT_LIST_HEAD(&func_node->func_stack);
+-		func_node->old_func = func->old_func;
+-		ret = arch_klp_save_old_code(&func_node->arch_data, func->old_func);
+-		if (ret)
+-			return -EPERM;
+-		klp_add_func_node(func_node);
+-	}
+-
++	func_node = func->func_node;
+ 	list_add_rcu(&func->stack_node, &func_node->func_stack);
+ 
+ 	pc = (unsigned long)func->old_func;
+ 	new_addr = (unsigned long)func->new_func;
+-
+ 	ret = livepatch_create_branch(pc, (unsigned long)&func_node->arch_data.trampoline,
+ 				      new_addr, func->old_mod);
+ 	if (ret)
+@@ -483,9 +467,6 @@ int arch_klp_patch_func(struct klp_func *func)
+ 
+ ERR_OUT:
+ 	list_del_rcu(&func->stack_node);
+-	if (memory_flag) {
+-		klp_del_func_node(func_node);
+-	}
+ 
+ 	return -EPERM;
+ }
+@@ -498,14 +479,13 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 	u32 insns[LJMP_INSN_SIZE];
+ 	int i;
+ 
+-	func_node = klp_find_func_node(func->old_func);
++	func_node = func->func_node;
+ 	pc = (unsigned long)func_node->old_func;
+ 	if (list_is_singular(&func_node->func_stack)) {
+ 		for (i = 0; i < LJMP_INSN_SIZE; i++)
+ 			insns[i] = func_node->arch_data.old_insns[i];
+ 
+ 		list_del_rcu(&func->stack_node);
+-		klp_del_func_node(func_node);
+ 
+ 		for (i = 0; i < LJMP_INSN_SIZE; i++)
+ 			patch_instruction((struct ppc_inst *)((u32 *)pc + i),
+diff --git a/arch/x86/kernel/livepatch.c b/arch/x86/kernel/livepatch.c
+index d5c03869df00..b3e891efa113 100644
+--- a/arch/x86/kernel/livepatch.c
++++ b/arch/x86/kernel/livepatch.c
+@@ -399,26 +399,10 @@ int arch_klp_patch_func(struct klp_func *func)
+ 	struct klp_func_node *func_node;
+ 	unsigned long ip, new_addr;
+ 	void *new;
+-	long ret;
+ 
+-	func_node = klp_find_func_node(func->old_func);
++	func_node = func->func_node;
+ 	ip = (unsigned long)func->old_func;
+-	if (!func_node) {
+-		func_node = func->func_node;
+-		if (!func_node)
+-			return -ENOMEM;
+-
+-		INIT_LIST_HEAD(&func_node->func_stack);
+-		func_node->old_func = func->old_func;
+-		ret = arch_klp_save_old_code(&func_node->arch_data, (void *)ip);
+-		if (ret) {
+-			return -EPERM;
+-		}
+-		klp_add_func_node(func_node);
+-	}
+-
+ 	list_add_rcu(&func->stack_node, &func_node->func_stack);
+-
+ 	new_addr = (unsigned long)func->new_func;
+ 	/* replace the text with the new text */
+ 	new = klp_jmp_code(ip, new_addr);
+@@ -434,11 +418,10 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 	unsigned long ip, new_addr;
+ 	void *new;
+ 
+-	func_node = klp_find_func_node(func->old_func);
++	func_node = func->func_node;
+ 	ip = (unsigned long)func_node->old_func;
+ 	if (list_is_singular(&func_node->func_stack)) {
+ 		list_del_rcu(&func->stack_node);
+-		klp_del_func_node(func_node);
+ 		new = klp_old_code(func_node->arch_data.old_code);
+ 	} else {
+ 		list_del_rcu(&func->stack_node);
+diff --git a/kernel/livepatch/core.c b/kernel/livepatch/core.c
+index 38c2b603b6a8..2da8b922278a 100644
+--- a/kernel/livepatch/core.c
++++ b/kernel/livepatch/core.c
+@@ -1133,6 +1133,7 @@ static void klp_init_func_early(struct klp_object *obj,
+ {
+ 	kobject_init(&func->kobj, &klp_ktype_func);
+ 	list_add_tail(&func->node, &obj->func_list);
++	func->func_node = NULL;
+ }
+ 
+ static void klp_init_object_early(struct klp_patch *patch,
+@@ -1337,31 +1338,79 @@ void __weak arch_klp_mem_free(void *mem)
+ 	kfree(mem);
+ }
+ 
+-static void klp_mem_prepare(struct klp_patch *patch)
++long __weak arch_klp_save_old_code(struct arch_klp_data *arch_data, void *old_func)
++{
++	return -ENOSYS;
++}
++
++static struct klp_func_node *func_node_alloc(struct klp_func *func)
++{
++	long ret;
++	struct klp_func_node *func_node = NULL;
++
++	func_node = klp_find_func_node(func->old_func);
++	if (func_node) /* The old_func has ever been patched */
++		return func_node;
++	func_node = arch_klp_mem_alloc(sizeof(struct klp_func_node));
++	if (func_node) {
++		INIT_LIST_HEAD(&func_node->func_stack);
++		func_node->old_func = func->old_func;
++		/*
++		 * Module which contains 'old_func' would not be removed because
++		 * it's reference count has been held during registration.
++		 * But it's not in stop_machine context here, 'old_func' should
++		 * not be modified as saving old code.
++		 */
++		ret = arch_klp_save_old_code(&func_node->arch_data, func->old_func);
++		if (ret) {
++			arch_klp_mem_free(func_node);
++			pr_err("save old code failed, ret=%ld\n", ret);
++			return NULL;
++		}
++		klp_add_func_node(func_node);
++	}
++	return func_node;
++}
++
++static void func_node_free(struct klp_func *func)
++{
++	struct klp_func_node *func_node;
++
++	func_node = func->func_node;
++	if (func_node) {
++		func->func_node = NULL;
++		if (list_empty(&func_node->func_stack)) {
++			klp_del_func_node(func_node);
++			arch_klp_mem_free(func_node);
++		}
++	}
++}
++
++static int klp_mem_prepare(struct klp_patch *patch)
+ {
+ 	struct klp_object *obj;
+ 	struct klp_func *func;
+ 
+ 	klp_for_each_object(patch, obj) {
+ 		klp_for_each_func(obj, func) {
+-			func->func_node = arch_klp_mem_alloc(sizeof(struct klp_func_node));
++			func->func_node = func_node_alloc(func);
++			if (func->func_node == NULL) {
++				pr_err("alloc func_node failed\n");
++				return -ENOMEM;
++			}
+ 		}
+ 	}
++	return 0;
+ }
+ 
+ static void klp_mem_recycle(struct klp_patch *patch)
+ {
+ 	struct klp_object *obj;
+ 	struct klp_func *func;
+-	struct klp_func_node *func_node;
+ 
+ 	klp_for_each_object(patch, obj) {
+ 		klp_for_each_func(obj, func) {
+-			func_node = func->func_node;
+-			if (func_node && list_is_singular(&func_node->func_stack)) {
+-				arch_klp_mem_free(func_node);
+-				func->func_node = NULL;
+-			}
++			func_node_free(func);
+ 		}
+ 	}
+ }
+@@ -1625,8 +1674,9 @@ static int __klp_enable_patch(struct klp_patch *patch)
+ #endif
+ 
+ 	arch_klp_code_modify_prepare();
+-	klp_mem_prepare(patch);
+-	ret = stop_machine(klp_try_enable_patch, &patch_data, cpu_online_mask);
++	ret = klp_mem_prepare(patch);
++	if (ret == 0)
++		ret = stop_machine(klp_try_enable_patch, &patch_data, cpu_online_mask);
+ 	arch_klp_code_modify_post_process();
+ 	if (ret) {
+ 		klp_mem_recycle(patch);
+diff --git a/kernel/livepatch/patch.c b/kernel/livepatch/patch.c
+index 28e0de4edd72..6515b8e99829 100644
+--- a/kernel/livepatch/patch.c
++++ b/kernel/livepatch/patch.c
+@@ -257,6 +257,8 @@ static void klp_unpatch_func(struct klp_func *func)
+ 		return;
+ 	if (WARN_ON(!func->old_func))
+ 		return;
++	if (WARN_ON(!func->func_node))
++		return;
+ 
+ 	arch_klp_unpatch_func(func);
+ 
+@@ -269,9 +271,10 @@ static inline int klp_patch_func(struct klp_func *func)
+ 
+ 	if (WARN_ON(!func->old_func))
+ 		return -EINVAL;
+-
+ 	if (WARN_ON(func->patched))
+ 		return -EINVAL;
++	if (WARN_ON(!func->func_node))
++		return -EINVAL;
+ 
+ 	ret = arch_klp_patch_func(func);
+ 	if (!ret)
+-- 
+2.26.2
+

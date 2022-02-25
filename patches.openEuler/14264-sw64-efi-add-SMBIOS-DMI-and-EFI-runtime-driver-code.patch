@@ -1,0 +1,420 @@
+From 5840a30e3a35aa6615aadc19108b3ad49cafe9c3 Mon Sep 17 00:00:00 2001
+From: Gu Zitao <guzitao@wxiat.com>
+Date: Tue, 22 Feb 2022 22:12:51 +0800
+Subject: [PATCH] sw64: efi: add SMBIOS/DMI and EFI runtime driver codes
+Patch-mainline: NO, OTHERS
+References: OLK-5.10
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4SPZD
+CVE: NA
+
+-------------------------------
+
+This patch adds sw64 arch-specific SMBIOS/DMI driver codes, and adds
+EFI runtime driver codes to allow kernel to access various EFI runtime
+services provided by EFI firmware. Things like reboot, real time clock,
+EFI boot variables, and others, however, due to lack of BIOS's efi mmap
+support, these services have not been implemented, we will fix them in
+the near future.
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com> #openEuler_contributor
+Signed-off-by: Laibin Qiu <qiulaibin@huawei.com>
+Reviewed-by: Hanjun Guo <guohanjun@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/firmware/efi/Kconfig          |   2 +-
+ drivers/firmware/efi/Makefile         |   2 +
+ drivers/firmware/efi/efi.c            |   2 +-
+ drivers/firmware/efi/sunway-init.c    | 244 ++++++++++++++++++++++++++
+ drivers/firmware/efi/sunway-runtime.c |  84 +++++++++
+ 5 files changed, 332 insertions(+), 2 deletions(-)
+ create mode 100644 drivers/firmware/efi/sunway-init.c
+ create mode 100644 drivers/firmware/efi/sunway-runtime.c
+
+diff --git a/drivers/firmware/efi/Kconfig b/drivers/firmware/efi/Kconfig
+index d9895491ff34..c196b7ef6a2a 100644
+--- a/drivers/firmware/efi/Kconfig
++++ b/drivers/firmware/efi/Kconfig
+@@ -270,7 +270,7 @@ config EFI_DEV_PATH_PARSER
+ 
+ config EFI_EARLYCON
+ 	def_bool y
+-	depends on EFI && SERIAL_EARLYCON && !ARM && !IA64
++	depends on EFI && SERIAL_EARLYCON && !ARM && !IA64 && !SW64
+ 	select FONT_SUPPORT
+ 	select ARCH_USE_MEMREMAP_PROT
+ 
+diff --git a/drivers/firmware/efi/Makefile b/drivers/firmware/efi/Makefile
+index d6ca2da19339..3a0770d7dd36 100644
+--- a/drivers/firmware/efi/Makefile
++++ b/drivers/firmware/efi/Makefile
+@@ -36,6 +36,8 @@ fake_map-$(CONFIG_X86)			+= x86_fake_mem.o
+ arm-obj-$(CONFIG_EFI)			:= efi-init.o arm-runtime.o
+ obj-$(CONFIG_ARM)			+= $(arm-obj-y)
+ obj-$(CONFIG_ARM64)			+= $(arm-obj-y)
++sw64-obj-$(CONFIG_EFI)			:= sunway-init.o sunway-runtime.o
++obj-$(CONFIG_SW64)			+= $(sw64-obj-y)
+ riscv-obj-$(CONFIG_EFI)			:= efi-init.o riscv-runtime.o
+ obj-$(CONFIG_RISCV)			+= $(riscv-obj-y)
+ obj-$(CONFIG_EFI_CAPSULE_LOADER)	+= capsule-loader.o
+diff --git a/drivers/firmware/efi/efi.c b/drivers/firmware/efi/efi.c
+index 847f33ffc4ae..4cd03ab9a5a6 100644
+--- a/drivers/firmware/efi/efi.c
++++ b/drivers/firmware/efi/efi.c
+@@ -678,7 +678,7 @@ int __init efi_systab_check_header(const efi_table_hdr_t *systab_hdr,
+ 	return 0;
+ }
+ 
+-#ifndef CONFIG_IA64
++#if !defined(CONFIG_IA64) && !defined(CONFIG_SW64)
+ static const efi_char16_t *__init map_fw_vendor(unsigned long fw_vendor,
+ 						size_t size)
+ {
+diff --git a/drivers/firmware/efi/sunway-init.c b/drivers/firmware/efi/sunway-init.c
+new file mode 100644
+index 000000000000..9871508df58c
+--- /dev/null
++++ b/drivers/firmware/efi/sunway-init.c
+@@ -0,0 +1,244 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Extensible Firmware Interface
++ *
++ * Based on Extensible Firmware Interface Specification version 2.4
++ *
++ * Copyright (C) 2013 - 2015 Linaro Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#define pr_fmt(fmt)	"efi: " fmt
++
++#include <linux/efi.h>
++#include <linux/init.h>
++#include <linux/memblock.h>
++#include <linux/mm_types.h>
++#include <linux/of.h>
++#include <linux/of_fdt.h>
++#include <linux/platform_device.h>
++#include <linux/screen_info.h>
++
++#include <asm/efi.h>
++
++extern bool __virt_addr_valid(unsigned long x);
++
++static int __init is_memory(efi_memory_desc_t *md)
++{
++	if (md->attribute & (EFI_MEMORY_WB|EFI_MEMORY_WT|EFI_MEMORY_WC))
++		return 1;
++	return 0;
++}
++static efi_config_table_type_t arch_tables[] __initdata = {
++	{SMBIOS3_TABLE_GUID, NULL, NULL}
++};
++
++static int __init uefi_init(u64 efi_system_table)
++{
++	efi_char16_t *c16;
++	efi_config_table_t *config_tables;
++	efi_system_table_t *systab;
++	size_t table_size;
++	char vendor[100] = "unknown";
++	int i, retval;
++
++	systab = early_memremap(efi_system_table,
++			sizeof(efi_system_table_t));
++	if (systab == NULL) {
++		pr_warn("Unable to map EFI system table.\n");
++		return -ENOMEM;
++	}
++
++	set_bit(EFI_BOOT, &efi.flags);
++	if (IS_ENABLED(CONFIG_64BIT))
++		set_bit(EFI_64BIT, &efi.flags);
++
++	/*
++	 * Verify the EFI Table
++	 */
++	if (systab->hdr.signature != EFI_SYSTEM_TABLE_SIGNATURE) {
++		pr_err("System table signature incorrect\n");
++		retval = -EINVAL;
++		goto out;
++	}
++	if ((systab->hdr.revision >> 16) < 2)
++		pr_warn("Warning: EFI system table version %d.%02d, expected 2.00 or greater\n",
++				systab->hdr.revision >> 16,
++				systab->hdr.revision & 0xffff);
++
++	efi.runtime = systab->runtime;
++	efi.runtime_version = systab->hdr.revision;
++
++	/* Show what we know for posterity */
++	c16 = early_memremap(systab->fw_vendor,
++			sizeof(vendor) * sizeof(efi_char16_t));
++	if (c16) {
++		for (i = 0; i < (int) sizeof(vendor) - 1 && *c16; ++i)
++			vendor[i] = c16[i];
++		vendor[i] = '\0';
++		early_memunmap(c16, sizeof(vendor) * sizeof(efi_char16_t));
++	}
++
++	pr_info("EFI v%u.%.02u by %s\n",
++			systab->hdr.revision >> 16,
++			systab->hdr.revision & 0xffff, vendor);
++
++	table_size = sizeof(efi_config_table_64_t) * systab->nr_tables;
++	config_tables = early_memremap(systab->tables, table_size);
++	if (config_tables == NULL) {
++		pr_warn("Unable to map EFI config table array.\n");
++		retval = -ENOMEM;
++		goto out;
++	}
++
++	retval = efi_config_parse_tables(config_tables, systab->nr_tables,
++			arch_tables);
++
++	early_memunmap(config_tables, table_size);
++out:
++	early_memunmap(systab,  sizeof(efi_system_table_t));
++	return retval;
++}
++
++/*
++ * Return true for regions that can be used as System RAM.
++ */
++static __init int is_usable_memory(efi_memory_desc_t *md)
++{
++	switch (md->type) {
++	case EFI_LOADER_CODE:
++	case EFI_LOADER_DATA:
++	case EFI_ACPI_RECLAIM_MEMORY:
++	case EFI_BOOT_SERVICES_CODE:
++	case EFI_BOOT_SERVICES_DATA:
++	case EFI_CONVENTIONAL_MEMORY:
++	case EFI_PERSISTENT_MEMORY:
++		/*
++		 * According to the spec, these regions are no longer reserved
++		 * after calling ExitBootServices(). However, we can only use
++		 * them as System RAM if they can be mapped writeback cacheable.
++		 */
++		return (md->attribute & EFI_MEMORY_WB);
++	default:
++		break;
++	}
++	return false;
++}
++static __initdata char memory_type_name1[][20] = {
++	"Reserved",
++	"Loader Code",
++	"Loader Data",
++	"Boot Code",
++	"Boot Data",
++	"Runtime Code",
++	"Runtime Data",
++	"Conventional Memory",
++	"Unusable Memory",
++	"ACPI Reclaim Memory",
++	"ACPI Memory NVS",
++	"Memory Mapped I/O",
++	"MMIO Port Space",
++	"PAL Code",
++	"Persistent Memory",
++};
++static __init void reserve_regions(void)
++{
++	efi_memory_desc_t *md;
++	u64 paddr, npages, size;
++
++	if (efi_enabled(EFI_DBG))
++		pr_info("Processing EFI memory map:\n");
++
++	for_each_efi_memory_desc(md) {
++		paddr = md->phys_addr;
++		npages = md->num_pages;
++
++		if (!__virt_addr_valid(paddr))
++			continue;
++
++		if (md->type >= ARRAY_SIZE(memory_type_name1))
++			continue;
++
++		if (md->attribute & ~(EFI_MEMORY_UC | EFI_MEMORY_WC | EFI_MEMORY_WT |
++					EFI_MEMORY_WB | EFI_MEMORY_UCE | EFI_MEMORY_RO |
++					EFI_MEMORY_WP | EFI_MEMORY_RP | EFI_MEMORY_XP |
++					EFI_MEMORY_NV |
++					EFI_MEMORY_RUNTIME | EFI_MEMORY_MORE_RELIABLE))
++			continue;
++
++		if (strncmp(memory_type_name1[md->type], "Reserved", 8) == 0)
++			continue;
++
++		if (efi_enabled(EFI_DBG)) {
++			char buf[64];
++
++			pr_info("  0x%012llx-0x%012llx %s\n",
++				paddr, paddr + (npages << EFI_PAGE_SHIFT) - 1,
++				efi_md_typeattr_format(buf, sizeof(buf), md));
++		}
++
++		memrange_efi_to_native(&paddr, &npages);
++		size = npages << PAGE_SHIFT;
++
++		if (is_memory(md)) {
++			early_init_dt_add_memory_arch(paddr, size);
++
++			if (!is_usable_memory(md))
++				memblock_mark_nomap(paddr, size);
++
++			/* keep ACPI reclaim memory intact for kexec etc. */
++			if (md->type == EFI_ACPI_RECLAIM_MEMORY)
++				memblock_reserve(paddr, size);
++		}
++	}
++}
++
++void __init efi_init(void)
++{
++	struct efi_memory_map_data data;
++	u64 efi_system_table;
++
++	if (sunway_boot_params->efi_systab == 0) {
++		pr_info("System Table is not exist, disabling EFI.\n");
++		return;
++	}
++
++	/* Grab UEFI information placed in struct boot_params by stub */
++	efi_system_table = sunway_boot_params->efi_systab;
++	if (!efi_system_table)
++		return;
++
++	data.desc_version = sunway_boot_params->efi_memdesc_version;
++	data.desc_size = sunway_boot_params->efi_memdesc_size;
++	data.size = sunway_boot_params->efi_memmap_size;
++	data.phys_map = sunway_boot_params->efi_memmap;
++
++	if (efi_memmap_init_early(&data) < 0) {
++		/*
++		 * If we are booting via UEFI, the UEFI memory map is the only
++		 * description of memory we have, so there is little point in
++		 * proceeding if we cannot access it.
++		 */
++		panic("Unable to map EFI memory map.\n");
++	}
++
++	WARN(efi.memmap.desc_version != 1,
++	     "Unexpected EFI_MEMORY_DESCRIPTOR version %ld",
++	      efi.memmap.desc_version);
++
++	if (uefi_init(efi_system_table) < 0) {
++		efi_memmap_unmap();
++		return;
++	}
++
++	reserve_regions();
++
++	memblock_reserve(sunway_boot_params->efi_memmap & PAGE_MASK,
++			 PAGE_ALIGN(sunway_boot_params->efi_memmap_size +
++				    (sunway_boot_params->efi_memmap & ~PAGE_MASK)));
++
++}
+diff --git a/drivers/firmware/efi/sunway-runtime.c b/drivers/firmware/efi/sunway-runtime.c
+new file mode 100644
+index 000000000000..46fcb46b06ff
+--- /dev/null
++++ b/drivers/firmware/efi/sunway-runtime.c
+@@ -0,0 +1,84 @@
++/*
++ * Extensible Firmware Interface
++ *
++ * Based on Extensible Firmware Interface Specification version 2.4
++ *
++ * Copyright (C) 2013, 2014 Linaro Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#include <linux/dmi.h>
++#include <linux/efi.h>
++#include <linux/io.h>
++#include <linux/memblock.h>
++#include <linux/mm_types.h>
++#include <linux/preempt.h>
++#include <linux/rbtree.h>
++#include <linux/rwsem.h>
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++
++#include <asm/cacheflush.h>
++#include <asm/efi.h>
++#include <asm/mmu.h>
++#include <asm/pgalloc.h>
++#include <asm/pgtable.h>
++
++/*
++ * Enable the UEFI Runtime Services if all prerequisites are in place, i.e.,
++ * non-early mapping of the UEFI system table and virtual mappings for all
++ * EFI_MEMORY_RUNTIME regions.
++ */
++static int __init sunway_enable_runtime_services(void)
++{
++	u64 mapsize;
++
++	if (!efi_enabled(EFI_BOOT)) {
++		pr_info("EFI services will not be available.\n");
++		return 0;
++	}
++
++	efi_memmap_unmap();
++
++	mapsize = efi.memmap.desc_size * efi.memmap.nr_map;
++
++	if (efi_memmap_init_late(efi.memmap.phys_map, mapsize)) {
++		pr_err("Failed to remap EFI memory map\n");
++		return 0;
++	}
++
++	if (efi_runtime_disabled()) {
++		pr_info("EFI runtime services will be disabled.\n");
++		return 0;
++	}
++
++	if (efi_enabled(EFI_RUNTIME_SERVICES)) {
++		pr_info("EFI runtime services access via paravirt.\n");
++		return 0;
++	}
++
++	/* Set up runtime services function pointers */
++	efi_native_runtime_setup();
++	set_bit(EFI_RUNTIME_SERVICES, &efi.flags);
++
++	return 0;
++}
++early_initcall(sunway_enable_runtime_services);
++
++
++static int __init sunway_dmi_init(void)
++{
++	/*
++	 * On SW64, DMI depends on UEFI, and dmi_scan_machine() needs to
++	 * be called early because dmi_id_init(), which is an arch_initcall
++	 * itself, depends on dmi_scan_machine() having been called already.
++	 */
++	dmi_setup();
++	return 0;
++}
++core_initcall(sunway_dmi_init);
+-- 
+2.26.2
+

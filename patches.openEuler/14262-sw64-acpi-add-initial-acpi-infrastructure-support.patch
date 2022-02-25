@@ -1,0 +1,265 @@
+From 9d21798e01d7d7c5df0d72b35d482ac0addffb2e Mon Sep 17 00:00:00 2001
+From: Gu Zitao <guzitao@wxiat.com>
+Date: Tue, 22 Feb 2022 22:12:49 +0800
+Subject: [PATCH] sw64: acpi: add initial acpi infrastructure support
+Patch-mainline: NO, OTHERS
+References: OLK-5.10
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4SPZD
+CVE: NA
+
+-------------------------------
+
+As we want to get ACPI tables to parse and then use the information
+for system initialization, we should get the RSDP (Root System
+Description Pointer) first, it then locates Extended Root Description
+Table (XSDT) which contains all the 64-bit physical address that
+pointer to other boot-time tables.
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com> #openEuler_contributor
+Signed-off-by: Laibin Qiu <qiulaibin@huawei.com>
+Reviewed-by: Hanjun Guo <guohanjun@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/acpi/acpi_apd.c       |  19 ++++++-
+ drivers/irqchip/Kconfig       |   8 +++
+ drivers/irqchip/Makefile      |   1 +
+ drivers/irqchip/irq-intc-v1.c | 104 ++++++++++++++++++++++++++++++++++
+ include/acpi/pdc_sw64.h       |  34 +++++++++++
+ 5 files changed, 165 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/irqchip/irq-intc-v1.c
+ create mode 100644 include/acpi/pdc_sw64.h
+
+diff --git a/drivers/acpi/acpi_apd.c b/drivers/acpi/acpi_apd.c
+index 645e82a66bb0..f1841d1714be 100644
+--- a/drivers/acpi/acpi_apd.c
++++ b/drivers/acpi/acpi_apd.c
+@@ -40,7 +40,8 @@ struct apd_private_data {
+ 	const struct apd_device_desc *dev_desc;
+ };
+ 
+-#if defined(CONFIG_X86_AMD_PLATFORM_DEVICE) || defined(CONFIG_ARM64)
++#if defined(CONFIG_X86_AMD_PLATFORM_DEVICE) || \
++defined(CONFIG_ARM64) || defined(CONFIG_SW64)
+ #define APD_ADDR(desc)	((unsigned long)&desc)
+ 
+ static int acpi_apd_setup(struct apd_private_data *pdata)
+@@ -174,6 +175,18 @@ static const struct apd_device_desc hip08_spi_desc = {
+ };
+ #endif /* CONFIG_ARM64 */
+ 
++#ifdef CONFIG_SW64
++static const struct apd_device_desc sunway_i2c_desc = {
++	.setup = acpi_apd_setup,
++	.fixed_clk_rate = 25000000,
++};
++
++static const struct apd_device_desc sunway_spi_desc = {
++	.setup = acpi_apd_setup,
++	.fixed_clk_rate = 25000000,
++};
++#endif
++
+ #endif
+ 
+ /**
+@@ -241,6 +254,10 @@ static const struct acpi_device_id acpi_apd_device_ids[] = {
+ 	{ "HISI02A3", APD_ADDR(hip08_lite_i2c_desc) },
+ 	{ "HISI0173", APD_ADDR(hip08_spi_desc) },
+ 	{ "NXP0001", APD_ADDR(nxp_i2c_desc) },
++#endif
++#ifdef CONFIG_SW64
++	{ "HISI02A1", APD_ADDR(sunway_i2c_desc) },
++	{ "HISI0173", APD_ADDR(sunway_spi_desc) },
+ #endif
+ 	{ }
+ };
+diff --git a/drivers/irqchip/Kconfig b/drivers/irqchip/Kconfig
+index f52568d46a19..214d7fd1fdd1 100644
+--- a/drivers/irqchip/Kconfig
++++ b/drivers/irqchip/Kconfig
+@@ -1,6 +1,14 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ menu "IRQ chip support"
+ 
++config SW64_INTC
++	bool "SW64 Platform-Level Interrupt Controller"
++	depends on ACPI && SW64
++	help
++           This enables support for the INTC chip found in SW systems.
++           The INTC controls devices interrupts and connects them to each
++           core's local interrupt controller.
++
+ config IRQCHIP
+ 	def_bool y
+ 	depends on OF_IRQ
+diff --git a/drivers/irqchip/Makefile b/drivers/irqchip/Makefile
+index ed171c68cc6d..4c78b0f64e6c 100644
+--- a/drivers/irqchip/Makefile
++++ b/drivers/irqchip/Makefile
+@@ -27,6 +27,7 @@ obj-$(CONFIG_ARCH_SUNXI)		+= irq-sun4i.o
+ obj-$(CONFIG_ARCH_SUNXI)		+= irq-sunxi-nmi.o
+ obj-$(CONFIG_ARCH_SPEAR3XX)		+= spear-shirq.o
+ obj-$(CONFIG_ARM_GIC)			+= irq-gic.o irq-gic-common.o
++obj-$(CONFIG_SW64_INTC)			+= irq-intc-v1.o
+ obj-$(CONFIG_ARM_GIC_PM)		+= irq-gic-pm.o
+ obj-$(CONFIG_ARCH_REALVIEW)		+= irq-gic-realview.o
+ obj-$(CONFIG_ARM_GIC_V2M)		+= irq-gic-v2m.o
+diff --git a/drivers/irqchip/irq-intc-v1.c b/drivers/irqchip/irq-intc-v1.c
+new file mode 100644
+index 000000000000..4519e96526fb
+--- /dev/null
++++ b/drivers/irqchip/irq-intc-v1.c
+@@ -0,0 +1,104 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include <linux/acpi_iort.h>
++#include <linux/msi.h>
++#include <linux/acpi.h>
++#include <linux/irqdomain.h>
++#include <linux/interrupt.h>
++#include <linux/cpumask.h>
++#include <linux/io.h>
++#include <linux/percpu.h>
++#include <linux/slab.h>
++#include <linux/irqchip.h>
++#include <asm/sw64io.h>
++static void fake_irq_mask(struct irq_data *data)
++{
++}
++
++static void fake_irq_unmask(struct irq_data *data)
++{
++}
++
++static struct irq_chip onchip_intc = {
++	.name           = "SW fake Intc",
++	.irq_mask       = fake_irq_mask,
++	.irq_unmask     = fake_irq_unmask,
++};
++
++static int sw_intc_domain_map(struct irq_domain *d, unsigned int irq,
++				irq_hw_number_t hw)
++{
++	irq_set_chip_and_handler(irq, &onchip_intc, handle_level_irq);
++	irq_set_status_flags(irq, IRQ_LEVEL);
++	return 0;
++}
++
++static const struct irq_domain_ops intc_irq_domain_ops = {
++	.xlate = irq_domain_xlate_onecell,
++	.map = sw_intc_domain_map,
++};
++
++#ifdef CONFIG_ACPI
++
++static int __init
++intc_parse_madt(union acpi_subtable_headers *header,
++		       const unsigned long end)
++{
++	struct acpi_madt_io_sapic *its_entry;
++	static struct irq_domain *root_domain;
++	int intc_irqs = 8, irq_base = NR_IRQS_LEGACY;
++	irq_hw_number_t hwirq_base = 0;
++	int irq_start = -1;
++
++	its_entry = (struct acpi_madt_io_sapic *)header;
++
++	intc_irqs -= hwirq_base; /* calculate # of irqs to allocate */
++
++	irq_base = irq_alloc_descs(irq_start, 16, intc_irqs,
++			numa_node_id());
++	if (irq_base < 0) {
++		WARN(1, "Cannot allocate irq_descs @ IRQ%d, assuming pre-allocated\n",
++				irq_start);
++		irq_base = irq_start;
++	}
++
++	root_domain = irq_domain_add_legacy(NULL, intc_irqs, irq_base,
++			hwirq_base, &intc_irq_domain_ops, NULL);
++
++	if (!root_domain)
++		pr_err("Failed to create irqdomain");
++
++	irq_set_default_host(root_domain);
++
++	sw64_io_write(0, MCU_DVC_INT_EN, 0xff);
++
++	return 0;
++}
++
++static int __init acpi_intc_init(void)
++{
++	int count = 0;
++
++	count = acpi_table_parse_madt(ACPI_MADT_TYPE_IO_SAPIC,
++			      intc_parse_madt, 0);
++
++	if (count <= 0) {
++		pr_err("No valid intc entries exist\n");
++		return -EINVAL;
++	}
++	return 0;
++}
++#else
++static int __init acpi_intc_init(void)
++{
++	return 0;
++}
++#endif
++
++static int __init intc_init(void)
++{
++	acpi_intc_init();
++
++	return 0;
++}
++subsys_initcall(intc_init);
+diff --git a/include/acpi/pdc_sw64.h b/include/acpi/pdc_sw64.h
+new file mode 100644
+index 000000000000..4724f10e8c6a
+--- /dev/null
++++ b/include/acpi/pdc_sw64.h
+@@ -0,0 +1,34 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++#ifndef _ASM_PDC_SW64_H
++#define _ASM_PDC_SW64_H
++
++#define ACPI_PDC_P_FFH			(0x0001)
++#define ACPI_PDC_C_C1_HALT		(0x0002)
++#define ACPI_PDC_T_FFH			(0x0004)
++#define ACPI_PDC_SMP_C1PT		(0x0008)
++#define ACPI_PDC_SMP_C2C3		(0x0010)
++#define ACPI_PDC_SMP_P_SWCOORD		(0x0020)
++#define ACPI_PDC_SMP_C_SWCOORD		(0x0040)
++#define ACPI_PDC_SMP_T_SWCOORD		(0x0080)
++#define ACPI_PDC_C_C1_FFH		(0x0100)
++#define ACPI_PDC_C_C2C3_FFH		(0x0200)
++#define ACPI_PDC_SMP_P_HWCOORD		(0x0800)
++
++#define ACPI_PDC_EST_CAPABILITY_SMP	(ACPI_PDC_SMP_C1PT | \
++					ACPI_PDC_C_C1_HALT | \
++					ACPI_PDC_P_FFH)
++
++#define ACPI_PDC_EST_CAPABILITY_SWSMP	(ACPI_PDC_SMP_C1PT | \
++					ACPI_PDC_C_C1_HALT | \
++					ACPI_PDC_SMP_P_SWCOORD | \
++					ACPI_PDC_SMP_P_HWCOORD | \
++					ACPI_PDC_P_FFH)
++
++#define ACPI_PDC_C_CAPABILITY_SMP	(ACPI_PDC_SMP_C2C3  | \
++					ACPI_PDC_SMP_C1PT  | \
++					ACPI_PDC_C_C1_HALT | \
++					ACPI_PDC_C_C1_FFH  | \
++					ACPI_PDC_C_C2C3_FFH)
++
++#endif				/* _ASM_PDC_SW64_H */
+-- 
+2.26.2
+

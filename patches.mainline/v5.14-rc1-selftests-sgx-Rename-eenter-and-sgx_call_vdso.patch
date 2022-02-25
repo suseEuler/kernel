@@ -1,0 +1,130 @@
+From 6a7171b8a0f8e961744d0c46fb7547662a3fca36 Mon Sep 17 00:00:00 2001
+From: Jarkko Sakkinen <jarkko@kernel.org>
+Date: Thu, 10 Jun 2021 11:30:17 +0300
+Subject: [PATCH] selftests/sgx: Rename 'eenter' and 'sgx_call_vdso'
+Git-commit: 6a7171b8a0f8e961744d0c46fb7547662a3fca36
+Patch-mainline: v5.14-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+Rename symbols for better clarity:
+
+* 'eenter' might be confused for directly calling ENCLU[EENTER].  It does
+  not.  It calls into the VDSO, which actually has the EENTER instruction.
+* 'sgx_call_vdso' is *only* used for entering the enclave.  It's not some
+  generic SGX call into the VDSO.
+
+Signed-off-by: Jarkko Sakkinen <jarkko@kernel.org>
+Signed-off-by: Shuah Khan <skhan@linuxfoundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ tools/testing/selftests/sgx/call.S |  6 +++---
+ tools/testing/selftests/sgx/main.c | 25 +++++++++++++------------
+ tools/testing/selftests/sgx/main.h |  4 ++--
+ 3 files changed, 18 insertions(+), 17 deletions(-)
+
+diff --git a/tools/testing/selftests/sgx/call.S b/tools/testing/selftests/sgx/call.S
+index 4ecadc7490f4..b09a25890f3b 100644
+--- a/tools/testing/selftests/sgx/call.S
++++ b/tools/testing/selftests/sgx/call.S
+@@ -5,8 +5,8 @@
+ 
+ 	.text
+ 
+-	.global sgx_call_vdso
+-sgx_call_vdso:
++	.global sgx_enter_enclave
++sgx_enter_enclave:
+ 	.cfi_startproc
+ 	push	%r15
+ 	.cfi_adjust_cfa_offset	8
+@@ -27,7 +27,7 @@ sgx_call_vdso:
+ 	.cfi_adjust_cfa_offset	8
+ 	push	0x38(%rsp)
+ 	.cfi_adjust_cfa_offset	8
+-	call	*eenter(%rip)
++	call	*vdso_sgx_enter_enclave(%rip)
+ 	add	$0x10, %rsp
+ 	.cfi_adjust_cfa_offset	-0x10
+ 	pop	%rbx
+diff --git a/tools/testing/selftests/sgx/main.c b/tools/testing/selftests/sgx/main.c
+index d304a4044eb9..43da68388e25 100644
+--- a/tools/testing/selftests/sgx/main.c
++++ b/tools/testing/selftests/sgx/main.c
+@@ -21,7 +21,7 @@
+ #include "../kselftest.h"
+ 
+ static const uint64_t MAGIC = 0x1122334455667788ULL;
+-vdso_sgx_enter_enclave_t eenter;
++vdso_sgx_enter_enclave_t vdso_sgx_enter_enclave;
+ 
+ struct vdso_symtab {
+ 	Elf64_Sym *elf_symtab;
+@@ -149,7 +149,7 @@ int main(int argc, char *argv[])
+ {
+ 	struct sgx_enclave_run run;
+ 	struct vdso_symtab symtab;
+-	Elf64_Sym *eenter_sym;
++	Elf64_Sym *sgx_enter_enclave_sym;
+ 	uint64_t result = 0;
+ 	struct encl encl;
+ 	unsigned int i;
+@@ -194,29 +194,30 @@ int main(int argc, char *argv[])
+ 	if (!vdso_get_symtab(addr, &symtab))
+ 		goto err;
+ 
+-	eenter_sym = vdso_symtab_get(&symtab, "__vdso_sgx_enter_enclave");
+-	if (!eenter_sym)
++	sgx_enter_enclave_sym = vdso_symtab_get(&symtab, "__vdso_sgx_enter_enclave");
++	if (!sgx_enter_enclave_sym)
+ 		goto err;
+ 
+-	eenter = addr + eenter_sym->st_value;
++	vdso_sgx_enter_enclave = addr + sgx_enter_enclave_sym->st_value;
+ 
+-	ret = sgx_call_vdso((void *)&MAGIC, &result, 0, EENTER, NULL, NULL, &run);
+-	if (!report_results(&run, ret, result, "sgx_call_vdso"))
++	ret = sgx_enter_enclave((void *)&MAGIC, &result, 0, EENTER,
++					    NULL, NULL, &run);
++	if (!report_results(&run, ret, result, "sgx_enter_enclave_unclobbered"))
+ 		goto err;
+ 
+ 
+ 	/* Invoke the vDSO directly. */
+ 	result = 0;
+-	ret = eenter((unsigned long)&MAGIC, (unsigned long)&result, 0, EENTER,
+-		     0, 0, &run);
+-	if (!report_results(&run, ret, result, "eenter"))
++	ret = vdso_sgx_enter_enclave((unsigned long)&MAGIC, (unsigned long)&result,
++				     0, EENTER, 0, 0, &run);
++	if (!report_results(&run, ret, result, "sgx_enter_enclave"))
+ 		goto err;
+ 
+ 	/* And with an exit handler. */
+ 	run.user_handler = (__u64)user_handler;
+ 	run.user_data = 0xdeadbeef;
+-	ret = eenter((unsigned long)&MAGIC, (unsigned long)&result, 0, EENTER,
+-		     0, 0, &run);
++	ret = vdso_sgx_enter_enclave((unsigned long)&MAGIC, (unsigned long)&result,
++				     0, EENTER, 0, 0, &run);
+ 	if (!report_results(&run, ret, result, "user_handler"))
+ 		goto err;
+ 
+diff --git a/tools/testing/selftests/sgx/main.h b/tools/testing/selftests/sgx/main.h
+index 67211a708f04..68672fd86cf9 100644
+--- a/tools/testing/selftests/sgx/main.h
++++ b/tools/testing/selftests/sgx/main.h
+@@ -35,7 +35,7 @@ bool encl_load(const char *path, struct encl *encl);
+ bool encl_measure(struct encl *encl);
+ bool encl_build(struct encl *encl);
+ 
+-int sgx_call_vdso(void *rdi, void *rsi, long rdx, u32 function, void *r8, void *r9,
+-		  struct sgx_enclave_run *run);
++int sgx_enter_enclave(void *rdi, void *rsi, long rdx, u32 function, void *r8, void *r9,
++		      struct sgx_enclave_run *run);
+ 
+ #endif /* MAIN_H */
+-- 
+2.26.2
+

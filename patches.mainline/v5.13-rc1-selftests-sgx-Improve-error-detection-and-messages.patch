@@ -1,0 +1,239 @@
+From 4284f7acb78bfb0e0c26a2b78e2b2c3d68fccd6f Mon Sep 17 00:00:00 2001
+From: Dave Hansen <dave.hansen@linux.intel.com>
+Date: Thu, 18 Mar 2021 12:43:01 -0700
+Subject: [PATCH] selftests/sgx: Improve error detection and messages
+Git-commit: 4284f7acb78bfb0e0c26a2b78e2b2c3d68fccd6f
+Patch-mainline: v5.13-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+The SGX device file (/dev/sgx_enclave) is unusual in that it requires
+execute permissions.  It has to be both "chmod +x" *and* be on a
+filesystem without 'noexec'.
+
+In the future, udev and systemd should get updates to set up systems
+automatically.  But, for now, nobody's systems do this automatically,
+and everybody gets error messages like this when running ./test_sgx:
+
+	0x0000000000000000 0x0000000000002000 0x03
+	0x0000000000002000 0x0000000000001000 0x05
+	0x0000000000003000 0x0000000000003000 0x03
+	mmap() failed, errno=1.
+
+That isn't very user friendly, even for forgetful kernel developers.
+
+Further, the test case is rather haphazard about its use of fprintf()
+versus perror().
+
+Improve the error messages.  Use perror() where possible.  Lastly,
+do some sanity checks on opening and mmap()ing the device file so
+that we can get a decent error message out to the user.
+
+Now, if your user doesn't have permission, you'll get the following:
+
+	$ ls -l /dev/sgx_enclave
+	crw------- 1 root root 10, 126 Mar 18 11:29 /dev/sgx_enclave
+	$ ./test_sgx
+	Unable to open /dev/sgx_enclave: Permission denied
+
+If you then 'chown dave:dave /dev/sgx_enclave' (or whatever), but
+you leave execute permissions off, you'll get:
+
+	$ ls -l /dev/sgx_enclave
+	crw------- 1 dave dave 10, 126 Mar 18 11:29 /dev/sgx_enclave
+	$ ./test_sgx
+	no execute permissions on device file
+
+If you fix that with "chmod ug+x /dev/sgx" but you leave /dev as
+noexec, you'll get this:
+
+	$ mount | grep "/dev .*noexec"
+	udev on /dev type devtmpfs (rw,nosuid,noexec,...)
+	$ ./test_sgx
+	ERROR: mmap for exec: Operation not permitted
+	mmap() succeeded for PROT_READ, but failed for PROT_EXEC
+	check that user has execute permissions on /dev/sgx_enclave and
+	that /dev does not have noexec set: 'mount | grep "/dev .*noexec"'
+
+That can be fixed with:
+
+	mount -o remount,noexec /devESC
+
+Hopefully, the combination of better error messages and the search
+engines indexing this message will help people fix their systems
+until we do this properly.
+
+ [ bp: Improve error messages more. ]
+
+Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Reviewed-by: Jarkko Sakkinen <jarkko@kernel.org>
+Link: https://lore.kernel.org/r/20210318194301.11D9A984@viggo.jf.intel.com
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ tools/testing/selftests/sgx/load.c | 69 ++++++++++++++++++++++++------
+ tools/testing/selftests/sgx/main.c |  2 +-
+ 2 files changed, 56 insertions(+), 15 deletions(-)
+
+diff --git a/tools/testing/selftests/sgx/load.c b/tools/testing/selftests/sgx/load.c
+index 9d43b75aaa55..f441ac34b4d4 100644
+--- a/tools/testing/selftests/sgx/load.c
++++ b/tools/testing/selftests/sgx/load.c
+@@ -45,19 +45,19 @@ static bool encl_map_bin(const char *path, struct encl *encl)
+ 
+ 	fd = open(path, O_RDONLY);
+ 	if (fd == -1)  {
+-		perror("open()");
++		perror("enclave executable open()");
+ 		return false;
+ 	}
+ 
+ 	ret = stat(path, &sb);
+ 	if (ret) {
+-		perror("stat()");
++		perror("enclave executable stat()");
+ 		goto err;
+ 	}
+ 
+ 	bin = mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+ 	if (bin == MAP_FAILED) {
+-		perror("mmap()");
++		perror("enclave executable mmap()");
+ 		goto err;
+ 	}
+ 
+@@ -90,8 +90,7 @@ static bool encl_ioc_create(struct encl *encl)
+ 	ioc.src = (unsigned long)secs;
+ 	rc = ioctl(encl->fd, SGX_IOC_ENCLAVE_CREATE, &ioc);
+ 	if (rc) {
+-		fprintf(stderr, "SGX_IOC_ENCLAVE_CREATE failed: errno=%d\n",
+-			errno);
++		perror("SGX_IOC_ENCLAVE_CREATE failed");
+ 		munmap((void *)secs->base, encl->encl_size);
+ 		return false;
+ 	}
+@@ -116,31 +115,72 @@ static bool encl_ioc_add_pages(struct encl *encl, struct encl_segment *seg)
+ 
+ 	rc = ioctl(encl->fd, SGX_IOC_ENCLAVE_ADD_PAGES, &ioc);
+ 	if (rc < 0) {
+-		fprintf(stderr, "SGX_IOC_ENCLAVE_ADD_PAGES failed: errno=%d.\n",
+-			errno);
++		perror("SGX_IOC_ENCLAVE_ADD_PAGES failed");
+ 		return false;
+ 	}
+ 
+ 	return true;
+ }
+ 
++
++
+ bool encl_load(const char *path, struct encl *encl)
+ {
++	const char device_path[] = "/dev/sgx_enclave";
+ 	Elf64_Phdr *phdr_tbl;
+ 	off_t src_offset;
+ 	Elf64_Ehdr *ehdr;
++	struct stat sb;
++	void *ptr;
+ 	int i, j;
+ 	int ret;
++	int fd = -1;
+ 
+ 	memset(encl, 0, sizeof(*encl));
+ 
+-	ret = open("/dev/sgx_enclave", O_RDWR);
+-	if (ret < 0) {
+-		fprintf(stderr, "Unable to open /dev/sgx_enclave\n");
++	fd = open(device_path, O_RDWR);
++	if (fd < 0) {
++		perror("Unable to open /dev/sgx_enclave");
++		goto err;
++	}
++
++	ret = stat(device_path, &sb);
++	if (ret) {
++		perror("device file stat()");
++		goto err;
++	}
++
++	/*
++	 * This just checks if the /dev file has these permission
++	 * bits set.  It does not check that the current user is
++	 * the owner or in the owning group.
++	 */
++	if (!(sb.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH))) {
++		fprintf(stderr, "no execute permissions on device file %s\n", device_path);
++		goto err;
++	}
++
++	ptr = mmap(NULL, PAGE_SIZE, PROT_READ, MAP_SHARED, fd, 0);
++	if (ptr == (void *)-1) {
++		perror("mmap for read");
++		goto err;
++	}
++	munmap(ptr, PAGE_SIZE);
++
++#define ERR_MSG \
++"mmap() succeeded for PROT_READ, but failed for PROT_EXEC.\n" \
++" Check that current user has execute permissions on %s and \n" \
++" that /dev does not have noexec set: mount | grep \"/dev .*noexec\"\n" \
++" If so, remount it executable: mount -o remount,exec /dev\n\n"
++
++	ptr = mmap(NULL, PAGE_SIZE, PROT_EXEC, MAP_SHARED, fd, 0);
++	if (ptr == (void *)-1) {
++		fprintf(stderr, ERR_MSG, device_path);
+ 		goto err;
+ 	}
++	munmap(ptr, PAGE_SIZE);
+ 
+-	encl->fd = ret;
++	encl->fd = fd;
+ 
+ 	if (!encl_map_bin(path, encl))
+ 		goto err;
+@@ -217,6 +257,8 @@ bool encl_load(const char *path, struct encl *encl)
+ 	return true;
+ 
+ err:
++	if (fd != -1)
++		close(fd);
+ 	encl_delete(encl);
+ 	return false;
+ }
+@@ -229,7 +271,7 @@ static bool encl_map_area(struct encl *encl)
+ 	area = mmap(NULL, encl_size * 2, PROT_NONE,
+ 		    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+ 	if (area == MAP_FAILED) {
+-		perror("mmap");
++		perror("reservation mmap()");
+ 		return false;
+ 	}
+ 
+@@ -268,8 +310,7 @@ bool encl_build(struct encl *encl)
+ 	ioc.sigstruct = (uint64_t)&encl->sigstruct;
+ 	ret = ioctl(encl->fd, SGX_IOC_ENCLAVE_INIT, &ioc);
+ 	if (ret) {
+-		fprintf(stderr, "SGX_IOC_ENCLAVE_INIT failed: errno=%d\n",
+-			errno);
++		perror("SGX_IOC_ENCLAVE_INIT failed");
+ 		return false;
+ 	}
+ 
+diff --git a/tools/testing/selftests/sgx/main.c b/tools/testing/selftests/sgx/main.c
+index 724cec700926..b117bb86a73f 100644
+--- a/tools/testing/selftests/sgx/main.c
++++ b/tools/testing/selftests/sgx/main.c
+@@ -195,7 +195,7 @@ int main(int argc, char *argv[], char *envp[])
+ 		addr = mmap((void *)encl.encl_base + seg->offset, seg->size,
+ 			    seg->prot, MAP_SHARED | MAP_FIXED, encl.fd, 0);
+ 		if (addr == MAP_FAILED) {
+-			fprintf(stderr, "mmap() failed, errno=%d.\n", errno);
++			perror("mmap() segment failed");
+ 			exit(KSFT_FAIL);
+ 		}
+ 	}
+-- 
+2.26.2
+

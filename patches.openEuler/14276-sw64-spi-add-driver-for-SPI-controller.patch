@@ -1,0 +1,881 @@
+From f904d5efc500459d30854d634f4335352a7c5246 Mon Sep 17 00:00:00 2001
+From: Gu Zitao <guzitao@wxiat.com>
+Date: Tue, 22 Feb 2022 22:13:03 +0800
+Subject: [PATCH] sw64: spi: add driver for SPI controller
+Patch-mainline: NO, OTHERS
+References: OLK-5.10
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4SPZD
+CVE: NA
+
+-------------------------------
+
+Implement controller memory operation hook function. Support transmit
+and receive mode.
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com> #openEuler_contributor
+Signed-off-by: Laibin Qiu <qiulaibin@huawei.com>
+Reviewed-by: Hanjun Guo <guohanjun@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/spi/Kconfig          |   6 +
+ drivers/spi/Makefile         |   1 +
+ drivers/spi/spi-chip3-mmio.c | 147 +++++++++++++
+ drivers/spi/spi-chip3.c      | 404 +++++++++++++++++++++++++++++++++++
+ drivers/spi/spi-chip3.h      | 245 +++++++++++++++++++++
+ 5 files changed, 803 insertions(+)
+ create mode 100644 drivers/spi/spi-chip3-mmio.c
+ create mode 100644 drivers/spi/spi-chip3.c
+ create mode 100644 drivers/spi/spi-chip3.h
+
+diff --git a/drivers/spi/Kconfig b/drivers/spi/Kconfig
+index 2e284cae97e3..1bc68c0547c1 100644
+--- a/drivers/spi/Kconfig
++++ b/drivers/spi/Kconfig
+@@ -980,6 +980,12 @@ config SPI_AMD
+ #
+ # Add new SPI master controllers in alphabetical order above this line
+ #
++config SPI_CHIP3
++	tristate "Memory-mapped io interface driver for SUNWAY CHIP3 SPI core"
++	depends on SW64
++	help
++          general driver for SPI controller core from DesignWare
++
+ 
+ comment "SPI Multiplexer support"
+ 
+diff --git a/drivers/spi/Makefile b/drivers/spi/Makefile
+index 04291ff89e16..e1f88bd47ded 100644
+--- a/drivers/spi/Makefile
++++ b/drivers/spi/Makefile
+@@ -41,6 +41,7 @@ spi-dw-y				:= spi-dw-core.o
+ spi-dw-$(CONFIG_SPI_DW_DMA)		+= spi-dw-dma.o
+ obj-$(CONFIG_SPI_DW_BT1)		+= spi-dw-bt1.o
+ obj-$(CONFIG_SPI_DW_MMIO)		+= spi-dw-mmio.o
++obj-$(CONFIG_SPI_CHIP3)			+= spi-chip3.o spi-chip3-mmio.o
+ obj-$(CONFIG_SPI_DW_PCI)		+= spi-dw-pci.o
+ obj-$(CONFIG_SPI_EFM32)			+= spi-efm32.o
+ obj-$(CONFIG_SPI_EP93XX)		+= spi-ep93xx.o
+diff --git a/drivers/spi/spi-chip3-mmio.c b/drivers/spi/spi-chip3-mmio.c
+new file mode 100644
+index 000000000000..3a76382e0fd9
+--- /dev/null
++++ b/drivers/spi/spi-chip3-mmio.c
+@@ -0,0 +1,147 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Memory-mapped interface driver for SUNWAY CHIP3 SPI Core
++ */
++
++#include <linux/clk.h>
++#include <linux/err.h>
++#include <linux/interrupt.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/spi/spi.h>
++#include <linux/scatterlist.h>
++#include <linux/mfd/syscon.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_gpio.h>
++#include <linux/of_platform.h>
++#include <linux/property.h>
++#include <linux/regmap.h>
++
++#include "spi-chip3.h"
++
++#define DRIVER_NAME "sunway_chip3_spi"
++
++struct chip3_spi_mmio {
++	struct chip3_spi  dws;
++	struct clk     *clk;
++	void           *priv;
++};
++
++static int chip3_spi_mmio_probe(struct platform_device *pdev)
++{
++	int (*init_func)(struct platform_device *pdev,
++			 struct chip3_spi_mmio *dwsmmio);
++	struct chip3_spi_mmio *dwsmmio;
++	struct chip3_spi *dws;
++	struct resource *mem;
++	int ret;
++	int num_cs;
++
++	dwsmmio = devm_kzalloc(&pdev->dev, sizeof(struct chip3_spi_mmio),
++			GFP_KERNEL);
++	if (!dwsmmio)
++		return -ENOMEM;
++
++	dws = &dwsmmio->dws;
++
++	/* Get basic io resource and map it */
++	mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	dws->regs = devm_ioremap_resource(&pdev->dev, mem);
++	if (IS_ERR(dws->regs)) {
++		dev_err(&pdev->dev, "SPI region map failed\n");
++		return PTR_ERR(dws->regs);
++	}
++
++	dws->irq = platform_get_irq(pdev, 0);
++	if (dws->irq < 0) {
++		dev_err(&pdev->dev, "no irq resource?\n");
++		return dws->irq; /* -ENXIO */
++	}
++
++	dwsmmio->clk = devm_clk_get(&pdev->dev, NULL);
++	if (IS_ERR(dwsmmio->clk))
++		return PTR_ERR(dwsmmio->clk);
++	ret = clk_prepare_enable(dwsmmio->clk);
++	if (ret)
++		return ret;
++
++	dws->bus_num = pdev->id;
++	dws->max_freq = clk_get_rate(dwsmmio->clk);
++
++	device_property_read_u32(&pdev->dev, "reg-io-width",
++				&dws->reg_io_width);
++
++	num_cs = 4;
++	device_property_read_u32(&pdev->dev, "num-cs", &num_cs);
++	dws->num_cs = num_cs;
++
++	if (pdev->dev.of_node) {
++		int i;
++
++		for (i = 0; i < dws->num_cs; i++) {
++			int cs_gpio = of_get_named_gpio(pdev->dev.of_node,
++					"cs-gpios", i);
++
++			if (cs_gpio == -EPROBE_DEFER) {
++				ret = cs_gpio;
++				goto out;
++			}
++
++			if (gpio_is_valid(cs_gpio)) {
++				ret = devm_gpio_request(&pdev->dev, cs_gpio,
++						dev_name(&pdev->dev));
++				if (ret)
++					goto out;
++			}
++		}
++	}
++
++	init_func = device_get_match_data(&pdev->dev);
++	if (init_func) {
++		ret = init_func(pdev, dwsmmio);
++		if (ret)
++			goto out;
++	}
++
++	ret = chip3_spi_add_host(&pdev->dev, dws);
++	if (ret)
++		goto out;
++
++	platform_set_drvdata(pdev, dwsmmio);
++
++	return 0;
++out:
++	clk_disable_unprepare(dwsmmio->clk);
++	return ret;
++}
++
++static int chip3_spi_mmio_remove(struct platform_device *pdev)
++{
++	struct chip3_spi_mmio *dwsmmio = platform_get_drvdata(pdev);
++
++	chip3_spi_remove_host(&dwsmmio->dws);
++	clk_disable_unprepare(dwsmmio->clk);
++
++	return 0;
++}
++
++static const struct of_device_id chip3_spi_mmio_of_match[] = {
++	{ .compatible = "sunway,chip3-spi", },
++	{ /* end of table */}
++};
++MODULE_DEVICE_TABLE(of, chip3_spi_mmio_of_match);
++
++static struct platform_driver chip3_spi_mmio_driver = {
++	.probe		= chip3_spi_mmio_probe,
++	.remove		= chip3_spi_mmio_remove,
++	.driver		= {
++		.name	= DRIVER_NAME,
++		.of_match_table = chip3_spi_mmio_of_match,
++	},
++};
++module_platform_driver(chip3_spi_mmio_driver);
++
++MODULE_AUTHOR("Platform@wiat.com");
++MODULE_DESCRIPTION("Memory-mapped I/O interface driver for Sunway CHIP3");
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/spi/spi-chip3.c b/drivers/spi/spi-chip3.c
+new file mode 100644
+index 000000000000..568bcc65845d
+--- /dev/null
++++ b/drivers/spi/spi-chip3.c
+@@ -0,0 +1,404 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * SUNWAY CHIP3 SPI core controller driver
++ */
++
++#include <linux/dma-mapping.h>
++#include <linux/interrupt.h>
++#include <linux/module.h>
++#include <linux/highmem.h>
++#include <linux/delay.h>
++#include <linux/slab.h>
++#include <linux/spi/spi.h>
++#include <linux/spi/spi-mem.h>
++#include <linux/gpio.h>
++#include <linux/of.h>
++#include <linux/mtd/spi-nor.h>
++#include <linux/kernel.h>
++
++#include "spi-chip3.h"
++
++/* Slave spi_dev related */
++struct chip_data {
++	u8 tmode;		/* TR/TO/RO/EEPROM */
++	u8 type;		/* SPI/SSP/MicroWire */
++
++	u8 poll_mode;		/* 1 means use poll mode */
++
++	u16 clk_div;		/* baud rate divider */
++	u32 speed_hz;		/* baud rate */
++	void (*cs_control)(u32 command);
++};
++
++static void chip3_spi_handle_err(struct spi_controller *master,
++		struct spi_message *msg)
++{
++	struct chip3_spi *dws = spi_controller_get_devdata(master);
++
++	spi_reset_chip(dws);
++}
++
++static size_t chip3_spi_max_length(struct spi_device *spi)
++{
++	struct chip3_spi *dws = spi_controller_get_devdata(spi->master);
++
++	return dws->fifo_len;
++}
++
++static int chip3_spi_transfer_one_message(struct spi_controller *master,
++		struct spi_message *m)
++{
++	struct chip3_spi *dws = spi_controller_get_devdata(master);
++	struct spi_transfer *t = NULL;
++	u16 clk_div;
++	u32 freq;
++	u32 speed_hz;
++	u32 status;
++	u32 len = 0;
++	int ret = 0;
++	int i = 0;
++
++	spi_enable_chip(dws, 0);
++
++	/* Handle per transfer options for bpw and speed. */
++	freq = clamp(m->spi->max_speed_hz, 0U, dws->max_freq);
++	clk_div = (DIV_ROUND_UP(dws->max_freq, freq) + 1) & 0xfffe;
++	speed_hz = dws->max_freq / clk_div;
++
++	if (dws->current_freq != speed_hz) {
++		spi_set_clk(dws, clk_div);
++		dws->current_freq = speed_hz;
++	}
++
++	dws->n_bytes = 1;
++
++	/* For poll mode just disable all interrupts */
++	spi_mask_intr(dws, 0xff);
++
++	chip3_writel(dws, CHIP3_SPI_CTRL0, SPI_TRANSMIT_RECEIVE);
++
++	spi_enable_chip(dws, 1);
++
++	list_for_each_entry(t, &m->transfers, transfer_list) {
++		len += t->len;
++		/* Judge if data is overflow */
++		if (len > dws->fifo_len) {
++			pr_err("SPI transfer overflow.\n");
++			m->actual_length = 0;
++			m->status = -EIO;
++			ret = -EIO;
++			goto way_out;
++		}
++
++		if (t->tx_buf)
++			memcpy(&dws->buf[len], t->tx_buf, t->len);
++		else
++			memset(&dws->buf[len], 0, t->len);
++	}
++
++	chip3_writel(dws, CHIP3_SPI_SER, 0x0);
++	for (i = 0; i < len; i++)
++		chip3_writel(dws, CHIP3_SPI_DR, dws->buf[i]);
++	chip3_writel(dws, CHIP3_SPI_SER, BIT(m->spi->chip_select));
++
++	do {
++		status = chip3_readl(dws, CHIP3_SPI_SR);
++	} while (status & SR_BUSY);
++
++	list_for_each_entry(t, &m->transfers, transfer_list) {
++		if (t->rx_buf) {
++			for (i = 0; i < t->len; i++, t->rx_buf += 1)
++				*(u8 *)t->rx_buf = chip3_readl(dws, CHIP3_SPI_DR);
++		} else {
++			for (i = 0; i < t->len; i++)
++				chip3_readl(dws, CHIP3_SPI_DR);
++		}
++	}
++
++	m->actual_length = len;
++	m->status = 0;
++	spi_finalize_current_message(master);
++
++way_out:
++	return ret;
++}
++
++static int chip3_spi_adjust_mem_op_size(struct spi_mem *mem,
++		struct spi_mem_op *op)
++{
++	struct chip3_spi *dws = spi_controller_get_devdata(mem->spi->controller);
++	size_t len;
++
++	len = sizeof(op->cmd.opcode) + op->addr.nbytes + op->dummy.nbytes;
++
++	op->data.nbytes = min((size_t)op->data.nbytes, (dws->fifo_len - len));
++	if (!op->data.nbytes)
++		return -EINVAL;
++
++	return 0;
++}
++
++static int chip3_spi_init_mem_buf(struct chip3_spi *dws,
++		const struct spi_mem_op *op)
++{
++	int ret = 0;
++	int i, j, len;
++
++	/* Calculate the total length of the transfer. */
++	len = sizeof(op->cmd.opcode) + op->addr.nbytes + op->dummy.nbytes;
++
++	/* Judge if data is overflow */
++	if (len + op->data.nbytes > dws->fifo_len) {
++		ret = -EIO;
++		goto way_out;
++	}
++
++	/*
++	 * Collect the operation code, address and dummy bytes into the single
++	 * buffer. If it's a transfer with data to be sent, also copy it into
++	 * the single buffer.
++	 */
++	for (i = 0; i < sizeof(op->cmd.opcode); i++)
++		dws->buf[i] = op->cmd.opcode;
++	for (j = 0; j < op->addr.nbytes; i++, j++)
++		dws->buf[i] = op->addr.val >> (8 * (op->addr.nbytes - i));
++	for (j = 0; j < op->dummy.nbytes; i++, j++)
++		dws->buf[i] = 0xff;
++
++	if (op->data.dir == SPI_MEM_DATA_OUT) {
++		memcpy(&dws->buf[i], op->data.buf.out, op->data.nbytes);
++		len += op->data.nbytes;
++	}
++
++	dws->tx_len = len;
++
++	if (op->data.dir == SPI_MEM_DATA_IN) {
++		dws->rx = op->data.buf.in;
++		dws->rx_len = op->data.nbytes;
++	} else {
++		dws->rx = NULL;
++		dws->rx_len = 0;
++	}
++
++way_out:
++	return ret;
++}
++
++static int chip3_spi_exec_mem_op(struct spi_mem *mem,
++		const struct spi_mem_op *op)
++{
++	struct chip3_spi *dws = spi_controller_get_devdata(mem->spi->controller);
++	u16 clk_div;
++	int ret = 0;
++	int i;
++	unsigned short value;
++	u32 freq;
++	u32 speed_hz;
++
++	ret = chip3_spi_init_mem_buf(dws, op);
++	if (ret)
++		return ret;
++
++	spi_enable_chip(dws, 0);
++
++	/* Handle per transfer options for bpw and speed. */
++	freq = clamp(mem->spi->max_speed_hz, 0U, dws->max_freq);
++	clk_div = (DIV_ROUND_UP(dws->max_freq, freq) + 1) & 0xfffe;
++	speed_hz = dws->max_freq / clk_div;
++
++	if (dws->current_freq != speed_hz) {
++		spi_set_clk(dws, clk_div);
++		dws->current_freq = speed_hz;
++	}
++
++	dws->n_bytes = 1;
++
++	/* For poll mode just disable all interrupts */
++	spi_mask_intr(dws, 0xff);
++
++	if ((dws->tx_len != 0) && (dws->rx_len != 0)) {
++		chip3_writel(dws, CHIP3_SPI_CTRL0, SPI_EEPROM_READ);
++		chip3_writel(dws, CHIP3_SPI_CTRL1, (dws->rx_len - 1));
++	} else {
++		chip3_writel(dws, CHIP3_SPI_CTRL0, SPI_TRANSMIT_ONLY);
++	}
++
++	spi_enable_chip(dws, 1);
++
++	chip3_writel(dws, CHIP3_SPI_SER, 0x0);
++	for (i = 0; i < dws->tx_len; i++)
++		chip3_writel(dws, CHIP3_SPI_DR, dws->buf[i]);
++	chip3_writel(dws, CHIP3_SPI_SER, BIT(mem->spi->chip_select));
++
++	value = chip3_readl(dws, CHIP3_SPI_SR);
++	while (value & SR_BUSY)
++		value = chip3_readl(dws, CHIP3_SPI_SR);
++
++	for (i = 0; i < dws->rx_len; dws->rx += dws->n_bytes, i++)
++		*(u8 *)dws->rx = chip3_readl(dws, CHIP3_SPI_DR);
++
++	return ret;
++}
++
++/* This may be called twice for each spi dev */
++static int chip3_spi_setup(struct spi_device *spi)
++{
++	struct chip3_spi_chip *chip_info = NULL;
++	struct chip_data *chip;
++	u32 poll_mode = 0;
++	struct device_node *np = spi->dev.of_node;
++
++	/* Only alloc on first setup */
++	chip = spi_get_ctldata(spi);
++	if (!chip) {
++		chip = kzalloc(sizeof(struct chip_data), GFP_KERNEL);
++		if (!chip)
++			return -ENOMEM;
++		spi_set_ctldata(spi, chip);
++	}
++
++	/*
++	 * Protocol drivers may change the chip settings, so...
++	 * if chip_info exists, use it
++	 */
++	chip_info = spi->controller_data;
++
++	/* chip_info doesn't always exist */
++	if (chip_info) {
++		if (chip_info->cs_control)
++			chip->cs_control = chip_info->cs_control;
++
++		chip->poll_mode = chip_info->poll_mode;
++		chip->type = chip_info->type;
++	} else {
++		if (np) {
++			of_property_read_u32(np, "poll_mode", &poll_mode);
++			chip->poll_mode = poll_mode;
++		}
++
++	}
++
++	chip->tmode = SPI_TMOD_TR;
++	return 0;
++}
++
++static void chip3_spi_cleanup(struct spi_device *spi)
++{
++	struct chip_data *chip = spi_get_ctldata(spi);
++
++	kfree(chip);
++	spi_set_ctldata(spi, NULL);
++}
++
++/* Restart the controller, disable all interrupts, clean rx fifo */
++static void spi_hw_init(struct device *dev, struct chip3_spi *dws)
++{
++	spi_reset_chip(dws);
++
++	/*
++	 * Try to detect the FIFO depth if not set by interface driver,
++	 * the depth could be from 2 to 256 from HW spec
++	 */
++	if (!dws->fifo_len) {
++		u32 fifo;
++
++		for (fifo = 1; fifo < 256; fifo++) {
++			chip3_writel(dws, CHIP3_SPI_TXFLTR, fifo);
++			if (fifo != chip3_readl(dws, CHIP3_SPI_TXFLTR))
++				break;
++		}
++		chip3_writel(dws, CHIP3_SPI_TXFLTR, 0);
++
++		dws->fifo_len = (fifo == 1) ? 0 : fifo;
++		dev_info(dev, "Detected FIFO size: %u bytes\n", dws->fifo_len);
++	}
++}
++
++static const struct spi_controller_mem_ops chip3_mem_ops = {
++	.adjust_op_size = chip3_spi_adjust_mem_op_size,
++	.exec_op = chip3_spi_exec_mem_op,
++};
++
++
++int chip3_spi_add_host(struct device *dev, struct chip3_spi *dws)
++{
++	struct spi_controller *master;
++	int ret;
++
++	BUG_ON(dws == NULL);
++
++	master = spi_alloc_master(dev, 0);
++	if (!master)
++		return -ENOMEM;
++
++	dws->master = master;
++	dws->type = SSI_MOTO_SPI;
++
++	spi_controller_set_devdata(master, dws);
++
++	master->mode_bits = SPI_CPOL | SPI_CPHA;
++	master->bits_per_word_mask = SPI_BPW_MASK(8) | SPI_BPW_MASK(16);
++	master->bus_num = dws->bus_num;
++	master->num_chipselect = dws->num_cs;
++	master->setup = chip3_spi_setup;
++	master->cleanup = chip3_spi_cleanup;
++	master->transfer_one_message = chip3_spi_transfer_one_message;
++	master->handle_err = chip3_spi_handle_err;
++	master->max_speed_hz = dws->max_freq;
++	master->dev.of_node = dev->of_node;
++	master->flags = SPI_MASTER_GPIO_SS;
++	master->max_transfer_size = chip3_spi_max_length;
++	master->max_message_size = chip3_spi_max_length;
++
++	master->mem_ops = &chip3_mem_ops;
++
++	/* Basic HW init */
++	spi_hw_init(dev, dws);
++
++	ret = devm_spi_register_controller(dev, master);
++	if (ret) {
++		dev_err(&master->dev, "problem registering spi master\n");
++		spi_enable_chip(dws, 0);
++		free_irq(dws->irq, master);
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(chip3_spi_add_host);
++
++void chip3_spi_remove_host(struct chip3_spi *dws)
++{
++	spi_shutdown_chip(dws);
++
++	free_irq(dws->irq, dws->master);
++}
++EXPORT_SYMBOL_GPL(chip3_spi_remove_host);
++
++int chip3_spi_suspend_host(struct chip3_spi *dws)
++{
++	int ret;
++
++	ret = spi_controller_suspend(dws->master);
++	if (ret)
++		return ret;
++
++	spi_shutdown_chip(dws);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(chip3_spi_suspend_host);
++
++int chip3_spi_resume_host(struct chip3_spi *dws)
++{
++	int ret;
++
++	spi_hw_init(&dws->master->dev, dws);
++	ret = spi_controller_resume(dws->master);
++	if (ret)
++		dev_err(&dws->master->dev, "fail to start queue (%d)\n", ret);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(chip3_spi_resume_host);
++
++MODULE_AUTHOR("Platform@wiat.com");
++MODULE_DESCRIPTION("Driver for Sunway CHIP3 SPI controller core");
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/spi/spi-chip3.h b/drivers/spi/spi-chip3.h
+new file mode 100644
+index 000000000000..88e49a9091a5
+--- /dev/null
++++ b/drivers/spi/spi-chip3.h
+@@ -0,0 +1,245 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef CHIP3_SPI_HEADER_H
++#define CHIP3_SPI_HEADER_H
++
++#include <linux/io.h>
++#include <linux/scatterlist.h>
++#include <linux/gpio.h>
++#include <linux/spi/spi.h>
++
++/* Register offsets */
++#define CHIP3_SPI_CTRL0			(0x00<<7)
++#define CHIP3_SPI_CTRL1			(0x04<<7)
++#define CHIP3_SPI_SSIENR		(0x08<<7)
++#define CHIP3_SPI_MWCR			(0x0c<<7)
++#define CHIP3_SPI_SER			(0x10<<7)
++#define CHIP3_SPI_BAUDR			(0x14<<7)
++#define CHIP3_SPI_TXFLTR		(0x18<<7)
++#define CHIP3_SPI_RXFLTR		(0x1c<<7)
++#define CHIP3_SPI_TXFLR			(0x20<<7)
++#define CHIP3_SPI_RXFLR			(0x24<<7)
++#define CHIP3_SPI_SR			(0x28<<7)
++#define CHIP3_SPI_IMR			(0x2c<<7)
++#define CHIP3_SPI_ISR			(0x30<<7)
++#define CHIP3_SPI_RISR			(0x34<<7)
++#define CHIP3_SPI_TXOICR		(0x38<<7)
++#define CHIP3_SPI_RXOICR		(0x3c<<7)
++#define CHIP3_SPI_RXUICR		(0x40<<7)
++#define CHIP3_SPI_MSTICR		(0x44<<7)
++#define CHIP3_SPI_ICR			(0x48<<7)
++#define CHIP3_SPI_DMACR			(0x4c<<7)
++#define CHIP3_SPI_DMATDLR		(0x50<<7)
++#define CHIP3_SPI_DMARDLR		(0x54<<7)
++#define CHIP3_SPI_IDR			(0x58<<7)
++#define CHIP3_SPI_VERSION		(0x5c<<7)
++#define CHIP3_SPI_DR			(0x60<<7)
++
++/* Bit fields in CTRLR0 */
++#define SPI_DFS_OFFSET			0
++
++#define SPI_FRF_OFFSET			4
++#define SPI_FRF_SPI			0x0
++#define SPI_FRF_SSP			0x1
++#define SPI_FRF_MICROWIRE		0x2
++#define SPI_FRF_RESV			0x3
++
++#define SPI_MODE_OFFSET			6
++#define SPI_SCPH_OFFSET			6
++#define SPI_SCOL_OFFSET			7
++
++#define SPI_TMOD_OFFSET			8
++#define SPI_TMOD_MASK			(0x3 << SPI_TMOD_OFFSET)
++#define	SPI_TMOD_TR			0x0		/* xmit & recv */
++#define SPI_TMOD_TO			0x1		/* xmit only */
++#define SPI_TMOD_RO			0x2		/* recv only */
++#define SPI_TMOD_EPROMREAD		0x3		/* eeprom read mode */
++
++#define SPI_SLVOE_OFFSET		10
++#define SPI_SRL_OFFSET			11
++#define SPI_CFS_OFFSET			12
++
++/* Bit fields in SR, 7 bits */
++#define SR_MASK				0x7f		/* cover 7 bits */
++#define SR_BUSY				(1 << 0)
++#define SR_TF_NOT_FULL			(1 << 1)
++#define SR_TF_EMPT			(1 << 2)
++#define SR_RF_NOT_EMPT			(1 << 3)
++#define SR_RF_FULL			(1 << 4)
++#define SR_TX_ERR			(1 << 5)
++#define SR_DCOL				(1 << 6)
++
++/* Bit fields in ISR, IMR, RISR, 7 bits */
++#define SPI_INT_TXEI			(1 << 0)
++#define SPI_INT_TXOI			(1 << 1)
++#define SPI_INT_RXUI			(1 << 2)
++#define SPI_INT_RXOI			(1 << 3)
++#define SPI_INT_RXFI			(1 << 4)
++#define SPI_INT_MSTI			(1 << 5)
++
++/* Bit fields in DMACR */
++#define SPI_DMA_RDMAE			(1 << 0)
++#define SPI_DMA_TDMAE			(1 << 1)
++
++/* TX RX interrupt level threshold, max can be 256 */
++#define SPI_INT_THRESHOLD		32
++
++/* The depth of the FIFO buffer is 256, so the max transfer length is 256. */
++#define MAX_LEN				256
++
++/* The mode of spi controller. */
++#define SPI_TRANSMIT_RECEIVE		0x0c7
++#define SPI_EEPROM_READ			0x3c7
++#define SPI_TRANSMIT_ONLY		0x1c7
++
++enum chip3_ssi_type {
++	SSI_MOTO_SPI = 0,
++	SSI_TI_SSP,
++	SSI_NS_MICROWIRE,
++};
++
++struct chip3_spi;
++
++struct chip3_spi {
++	struct spi_controller	*master;
++	enum chip3_ssi_type	type;
++
++	void __iomem		*regs;
++	unsigned long		paddr;
++	int			irq;
++	u32			fifo_len;	/* depth of the FIFO buffer */
++	u32			max_freq;	/* max bus freq supported */
++
++	u32			reg_io_width;	/* DR I/O width in bytes */
++	u16			bus_num;
++	u16			num_cs;		/* supported slave numbers */
++	void (*set_cs)(struct spi_device *spi, bool enable);
++
++	/* Current message transfer state info */
++	size_t			len;
++	void			*tx;
++	unsigned int		tx_len;
++	void			*rx;
++	unsigned int		rx_len;
++	u8			n_bytes;	/* current is a 1/2 bytes op */
++	u32			current_freq;	/* frequency in hz */
++
++	u8			buf[MAX_LEN];
++
++	/* Bus interface info */
++	void			*priv;
++#ifdef CONFIG_DEBUG_FS
++	struct dentry *debugfs;
++#endif
++};
++
++static inline u32 chip3_readl(struct chip3_spi *dws, u32 offset)
++{
++	return __raw_readl(dws->regs + offset);
++}
++
++static inline u16 chip3_readw(struct chip3_spi *dws, u32 offset)
++{
++	return __raw_readw(dws->regs + offset);
++}
++
++static inline void chip3_writel(struct chip3_spi *dws, u32 offset, u32 val)
++{
++	__raw_writel(val, dws->regs + offset);
++}
++
++static inline void chip3_writew(struct chip3_spi *dws, u32 offset, u16 val)
++{
++	__raw_writew(val, dws->regs + offset);
++}
++
++static inline u32 chip3_read_io_reg(struct chip3_spi *dws, u32 offset)
++{
++	switch (dws->reg_io_width) {
++	case 2:
++		return chip3_readw(dws, offset);
++	case 4:
++	default:
++		return chip3_readl(dws, offset);
++	}
++}
++
++static inline void chip3_write_io_reg(struct chip3_spi *dws, u32 offset, u32 val)
++{
++	switch (dws->reg_io_width) {
++	case 2:
++		chip3_writew(dws, offset, val);
++		break;
++	case 4:
++	default:
++		chip3_writel(dws, offset, val);
++		break;
++	}
++}
++
++static inline void spi_enable_chip(struct chip3_spi *dws, int enable)
++{
++	chip3_writel(dws, CHIP3_SPI_SSIENR, (enable ? 1 : 0));
++}
++
++static inline void spi_set_clk(struct chip3_spi *dws, u16 div)
++{
++	chip3_writel(dws, CHIP3_SPI_BAUDR, div);
++}
++
++/* Disable IRQ bits */
++static inline void spi_mask_intr(struct chip3_spi *dws, u32 mask)
++{
++	u32 new_mask;
++
++	new_mask = chip3_readl(dws, CHIP3_SPI_IMR) & ~mask;
++	chip3_writel(dws, CHIP3_SPI_IMR, new_mask);
++}
++
++/* Enable IRQ bits */
++static inline void spi_umask_intr(struct chip3_spi *dws, u32 mask)
++{
++	u32 new_mask;
++
++	new_mask = chip3_readl(dws, CHIP3_SPI_IMR) | mask;
++	chip3_writel(dws, CHIP3_SPI_IMR, new_mask);
++}
++
++/*
++ * This does disable the SPI controller, interrupts, and re-enable the
++ * controller back. Transmit and receive FIFO buffers are cleared when the
++ * device is disabled.
++ */
++static inline void spi_reset_chip(struct chip3_spi *dws)
++{
++	spi_enable_chip(dws, 0);
++	spi_mask_intr(dws, 0xff);
++	spi_enable_chip(dws, 1);
++}
++
++static inline void spi_shutdown_chip(struct chip3_spi *dws)
++{
++	spi_enable_chip(dws, 0);
++	spi_set_clk(dws, 0);
++}
++
++/*
++ * Each SPI slave device to work with chip3_api controller should
++ * has such a structure claiming its working mode (poll or PIO/DMA),
++ * which can be save in the "controller_data" member of the
++ * struct spi_device.
++ */
++struct chip3_spi_chip {
++	u8 poll_mode;	/* 1 for controller polling mode */
++	u8 type;	/* SPI/SSP/MicroWire */
++	u8 chip_select;
++	void (*cs_control)(u32 command);
++};
++
++extern int chip3_spi_add_host(struct device *dev, struct chip3_spi *dws);
++extern void chip3_spi_remove_host(struct chip3_spi *dws);
++extern int chip3_spi_suspend_host(struct chip3_spi *dws);
++extern int chip3_spi_resume_host(struct chip3_spi *dws);
++
++/* platform related setup */
++extern int chip3_spi_mid_init(struct chip3_spi *dws); /* Intel MID platforms */
++#endif /* CHIP3_SPI_HEADER_H */
+-- 
+2.26.2
+

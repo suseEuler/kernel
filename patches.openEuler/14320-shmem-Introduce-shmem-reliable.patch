@@ -1,0 +1,138 @@
+From cb06286cdd99087d4e06cef4667f10e0f9d0edaa Mon Sep 17 00:00:00 2001
+From: Zhou Guanghui <zhouguanghui1@huawei.com>
+Date: Wed, 23 Feb 2022 18:45:22 +0800
+Subject: [PATCH] shmem: Introduce shmem reliable
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: cb06286cdd99087d4e06cef4667f10e0f9d0edaa
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4PM0Y
+CVE: NA
+
+------------------------------------------
+
+This feature depends on the overall memory reliable feature.
+When the shared memory reliable feature is enabled, the pages
+used by the shared memory are allocated from the mirrored
+region by default. If the mirrored region is insufficient,
+you can allocate resources from the non-mirrored region.
+
+Signed-off-by: Zhou Guanghui <zhouguanghui1@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/mem_reliable.h |    9 +++++++++
+ mm/mem_reliable.c            |   12 ++++++++++++
+ mm/shmem.c                   |   12 ++++++++++++
+ 3 files changed, 33 insertions(+)
+
+--- a/include/linux/mem_reliable.h
++++ b/include/linux/mem_reliable.h
+@@ -13,10 +13,12 @@
+ extern struct static_key_false mem_reliable;
+ 
+ extern bool reliable_enabled;
++extern bool shmem_reliable;
+ 
+ extern void add_reliable_mem_size(long sz);
+ extern void mem_reliable_init(bool has_unmirrored_mem,
+ 			      unsigned long *zone_movable_pfn);
++extern void shmem_reliable_init(void);
+ extern void reliable_report_meminfo(struct seq_file *m);
+ 
+ static inline bool mem_reliable_is_enabled(void)
+@@ -46,6 +48,11 @@ static inline bool skip_none_movable_zon
+ 
+ 	return false;
+ }
++
++static inline bool shmem_reliable_is_enabled(void)
++{
++	return shmem_reliable;
++}
+ #else
+ #define reliable_enabled 0
+ 
+@@ -53,12 +60,14 @@ static inline bool mem_reliable_is_enabl
+ static inline void add_reliable_mem_size(long sz) {}
+ static inline void mem_reliable_init(bool has_unmirrored_mem,
+ 				     unsigned long *zone_movable_pfn) {}
++static inline void shmem_reliable_init(void) {}
+ static inline bool zone_reliable(struct zone *zone) { return false; }
+ static inline bool skip_none_movable_zone(gfp_t gfp, struct zoneref *z)
+ {
+ 	return false;
+ }
+ static inline void reliable_report_meminfo(struct seq_file *m) {}
++static inline bool shmem_reliable_is_enabled(void) { return false; }
+ #endif
+ 
+ #endif
+--- a/mm/mem_reliable.c
++++ b/mm/mem_reliable.c
+@@ -13,6 +13,7 @@ DEFINE_STATIC_KEY_FALSE(mem_reliable);
+ bool reliable_enabled;
+ 
+ static atomic_long_t total_reliable_mem;
++bool shmem_reliable __read_mostly = true;
+ 
+ void add_reliable_mem_size(long sz)
+ {
+@@ -92,6 +93,17 @@ void mem_reliable_init(bool has_unmirror
+ 		total_reliable_mem_sz());
+ }
+ 
++void shmem_reliable_init(void)
++{
++	if (!shmem_reliable_is_enabled())
++		return;
++
++	if (!mem_reliable_is_enabled()) {
++		shmem_reliable = false;
++		pr_info("shmem reliable disabled.\n");
++	}
++}
++
+ void reliable_report_meminfo(struct seq_file *m)
+ {
+ 	if (!mem_reliable_is_enabled())
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -1622,6 +1622,14 @@ static struct page *shmem_alloc_page(gfp
+ 	return page;
+ }
+ 
++static inline void shmem_prepare_alloc(gfp_t *gfp_mask)
++{
++	if (!shmem_reliable_is_enabled())
++		return;
++
++	*gfp_mask |= GFP_RELIABLE;
++}
++
+ static struct page *shmem_alloc_and_acct_page(gfp_t gfp,
+ 		struct inode *inode,
+ 		pgoff_t index, bool huge, int node_id)
+@@ -1638,6 +1646,8 @@ static struct page *shmem_alloc_and_acct
+ 	if (!shmem_inode_acct_block(inode, nr))
+ 		goto failed;
+ 
++	shmem_prepare_alloc(&gfp);
++
+ 	if (huge)
+ 		page = shmem_alloc_hugepage(gfp, info, index, node_id);
+ 	else
+@@ -3988,6 +3998,8 @@ int __init shmem_init(void)
+ 	else
+ 		shmem_huge = SHMEM_HUGE_NEVER; /* just in case it was patched */
+ #endif
++
++	shmem_reliable_init();
+ 	return 0;
+ 
+ out1:

@@ -1,0 +1,169 @@
+From 2136092bf70b4201f97f15dc3a1cd14c10e73d4d Mon Sep 17 00:00:00 2001
+From: Gu Zitao <guzitao@wxiat.com>
+Date: Tue, 22 Feb 2022 22:13:02 +0800
+Subject: [PATCH] sw64: add hypervisor based RTC on SW64 systems
+Patch-mainline: NO, OTHERS
+References: OLK-5.10
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4SPZD
+CVE: NA
+
+-------------------------------
+
+With this support, it can enable kvm guest rtc sync.
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com> #openEuler_contributor
+Signed-off-by: Laibin Qiu <qiulaibin@huawei.com>
+Reviewed-by: Hanjun Guo <guohanjun@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/rtc/Kconfig                  |  7 ++++
+ drivers/rtc/Makefile                 |  5 +++
+ drivers/rtc/rtc-sw64-virt-platform.c | 26 +++++++++++++
+ drivers/rtc/rtc-sw64-virt.c          | 55 ++++++++++++++++++++++++++++
+ 4 files changed, 93 insertions(+)
+ create mode 100644 drivers/rtc/rtc-sw64-virt-platform.c
+ create mode 100644 drivers/rtc/rtc-sw64-virt.c
+
+diff --git a/drivers/rtc/Kconfig b/drivers/rtc/Kconfig
+index 54cf5ec8f401..d5512b18a3ae 100644
+--- a/drivers/rtc/Kconfig
++++ b/drivers/rtc/Kconfig
+@@ -973,6 +973,13 @@ config RTC_DRV_ALPHA
+ 	  Direct support for the real-time clock found on every Alpha
+ 	  system, specifically MC146818 compatibles.  If in doubt, say Y.
+ 
++config RTC_DRV_SW64_VIRT
++	bool "SW64 Hypervisor based RTC"
++	depends on SW64
++	default y
++	help
++          Get support for the Hypervisor based RTC on SW64 systems.
++
+ config RTC_DRV_VRTC
+ 	tristate "Virtual RTC for Intel MID platforms"
+ 	depends on X86_INTEL_MID
+diff --git a/drivers/rtc/Makefile b/drivers/rtc/Makefile
+index bfb57464118d..fd1d53e789b7 100644
+--- a/drivers/rtc/Makefile
++++ b/drivers/rtc/Makefile
+@@ -11,6 +11,10 @@ obj-$(CONFIG_RTC_CLASS)		+= rtc-core.o
+ obj-$(CONFIG_RTC_MC146818_LIB)	+= rtc-mc146818-lib.o
+ rtc-core-y			:= class.o interface.o
+ 
++ifdef CONFIG_RTC_DRV_SW64_VIRT
++rtc-core-y			+= rtc-sw64-virt-platform.o
++endif
++
+ rtc-core-$(CONFIG_RTC_NVMEM)		+= nvmem.o
+ rtc-core-$(CONFIG_RTC_INTF_DEV)		+= dev.o
+ rtc-core-$(CONFIG_RTC_INTF_PROC)	+= proc.o
+@@ -164,6 +168,7 @@ obj-$(CONFIG_RTC_DRV_ST_LPC)	+= rtc-st-lpc.o
+ obj-$(CONFIG_RTC_DRV_STM32) 	+= rtc-stm32.o
+ obj-$(CONFIG_RTC_DRV_STMP)	+= rtc-stmp3xxx.o
+ obj-$(CONFIG_RTC_DRV_SUN4V)	+= rtc-sun4v.o
++obj-$(CONFIG_RTC_DRV_SW64_VIRT) += rtc-sw64-virt.o
+ obj-$(CONFIG_RTC_DRV_SUN6I)	+= rtc-sun6i.o
+ obj-$(CONFIG_RTC_DRV_SUNXI)	+= rtc-sunxi.o
+ obj-$(CONFIG_RTC_DRV_TEGRA)	+= rtc-tegra.o
+diff --git a/drivers/rtc/rtc-sw64-virt-platform.c b/drivers/rtc/rtc-sw64-virt-platform.c
+new file mode 100644
+index 000000000000..d488a8f9458d
+--- /dev/null
++++ b/drivers/rtc/rtc-sw64-virt-platform.c
+@@ -0,0 +1,26 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/efi.h>
++#include <linux/platform_device.h>
++
++static struct platform_device rtc_sw64_virt_device = {
++	.name		= "rtc_sw64_virt",
++	.id		= -1,
++};
++
++static int __init rtc_sw64_virt_init(void)
++{
++	if (is_in_host())
++		return 0;
++
++	if (platform_device_register(&rtc_sw64_virt_device) < 0)
++		pr_err("unable to register rtc device...\n");
++		/* not necessarily an error */
++	return 0;
++}
++module_init(rtc_sw64_virt_init);
+diff --git a/drivers/rtc/rtc-sw64-virt.c b/drivers/rtc/rtc-sw64-virt.c
+new file mode 100644
+index 000000000000..549d2e2d8a01
+--- /dev/null
++++ b/drivers/rtc/rtc-sw64-virt.c
+@@ -0,0 +1,55 @@
++// SPDX-License-Identifier: GPL-2.0
++/* rtc-sw64-virt.c: Hypervisor based RTC for SW64 systems.
++ *
++ * Copyright (C) 2021 Lu Feifei <luff@gmail.com>
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/delay.h>
++#include <linux/init.h>
++#include <linux/rtc.h>
++#include <linux/platform_device.h>
++
++#define RTC_IO_ADDR (0x804910000000ULL)
++
++static int sw64_virt_read_time(struct device *dev, struct rtc_time *tm)
++{
++	unsigned long *ioaddr;
++
++	ioaddr = ioremap(RTC_IO_ADDR, sizeof(long));
++	rtc_time64_to_tm(*ioaddr, tm);
++	return 0;
++}
++
++static const struct rtc_class_ops rtc_sw64_virt_ops = {
++	.read_time	= sw64_virt_read_time,
++};
++
++static int __init rtc_sw64_virt_probe(struct platform_device *pdev)
++{
++	struct rtc_device *rtc;
++
++	rtc = devm_rtc_device_register(&pdev->dev, "sw64_virt",
++				&rtc_sw64_virt_ops, THIS_MODULE);
++	if (IS_ERR(rtc))
++		return PTR_ERR(rtc);
++
++	platform_set_drvdata(pdev, rtc);
++	return 0;
++}
++
++static struct platform_driver rtc_sw64_virt_driver = {
++	.driver		= {
++		.name	= "rtc_sw64_virt",
++	},
++};
++
++module_platform_driver_probe(rtc_sw64_virt_driver, rtc_sw64_virt_probe);
++
++MODULE_AUTHOR("Lu Feifei <luff@gmail.com>");
++MODULE_DESCRIPTION("Sunway virtual RTC driver");
++MODULE_LICENSE("GPL");
++MODULE_ALIAS("platform:rtc_sw64_virt");
+-- 
+2.26.2
+

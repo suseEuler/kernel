@@ -1,0 +1,398 @@
+From 3ae2c76b9ac328932a274c6eb0d71b5168ae93e7 Mon Sep 17 00:00:00 2001
+From: Zheng Yejian <zhengyejian1@huawei.com>
+Date: Tue, 22 Feb 2022 22:12:33 +0800
+Subject: [PATCH] livepatch: Introduce 'struct arch_klp_data'
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 3ae2c76b9ac328932a274c6eb0d71b5168ae93e7
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4UAQ1
+
+--------------------------------
+
+Introduce 'struct arch_klp_data' to encapsulate arch related data.
+
+Preparatory for moving 'struct klp_func_node' out of 'arch' and
+reducing duplicated codes.
+
+Signed-off-by: Zheng Yejian <zhengyejian1@huawei.com>
+Reviewed-by: Kuohai Xu <xukuohai@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm/include/asm/livepatch.h     | 17 +++++++++++++++++
+ arch/arm/kernel/livepatch.c          | 15 +++++----------
+ arch/arm64/include/asm/livepatch.h   | 15 +++++++++++++++
+ arch/arm64/kernel/livepatch.c        | 16 +++++-----------
+ arch/powerpc/include/asm/livepatch.h | 19 ++++++++++++++++++-
+ arch/powerpc/kernel/livepatch_32.c   |  7 +++----
+ arch/powerpc/kernel/livepatch_64.c   | 19 +++++++------------
+ arch/x86/include/asm/livepatch.h     | 11 +++++++++++
+ arch/x86/kernel/livepatch.c          |  7 +++----
+ 9 files changed, 84 insertions(+), 42 deletions(-)
+
+diff --git a/arch/arm/include/asm/livepatch.h b/arch/arm/include/asm/livepatch.h
+index 216078d8c2b0..abeccf19f9ca 100644
+--- a/arch/arm/include/asm/livepatch.h
++++ b/arch/arm/include/asm/livepatch.h
+@@ -36,4 +36,21 @@ void arch_klp_unpatch_func(struct klp_func *func);
+ int klp_check_calltrace(struct klp_patch *patch, int enable);
+ #endif
+ 
++
++#if defined(CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY)
++
++#ifdef CONFIG_ARM_MODULE_PLTS
++#define LJMP_INSN_SIZE	3
++#endif
++
++struct arch_klp_data {
++#ifdef CONFIG_ARM_MODULE_PLTS
++	u32 old_insns[LJMP_INSN_SIZE];
++#else
++	u32 old_insn;
++#endif
++};
++
++#endif
++
+ #endif /* _ASM_ARM_LIVEPATCH_H */
+diff --git a/arch/arm/kernel/livepatch.c b/arch/arm/kernel/livepatch.c
+index 221275714899..a72fb2c03d9d 100644
+--- a/arch/arm/kernel/livepatch.c
++++ b/arch/arm/kernel/livepatch.c
+@@ -38,7 +38,6 @@
+ #endif
+ 
+ #ifdef CONFIG_ARM_MODULE_PLTS
+-#define LJMP_INSN_SIZE	3
+ #define MAX_SIZE_TO_CHECK (LJMP_INSN_SIZE * ARM_INSN_SIZE)
+ #define CHECK_JUMP_RANGE LJMP_INSN_SIZE
+ 
+@@ -51,11 +50,7 @@ struct klp_func_node {
+ 	struct list_head node;
+ 	struct list_head func_stack;
+ 	void *old_func;
+-#ifdef CONFIG_ARM_MODULE_PLTS
+-	u32 old_insns[LJMP_INSN_SIZE];
+-#else
+-	u32 old_insn;
+-#endif
++	struct arch_klp_data arch_data;
+ };
+ 
+ static LIST_HEAD(klp_func_list);
+@@ -401,12 +396,12 @@ int arch_klp_patch_func(struct klp_func *func)
+ #ifdef CONFIG_ARM_MODULE_PLTS
+ 		for (i = 0; i < LJMP_INSN_SIZE; i++) {
+ 			ret = arm_insn_read((u32 *)func->old_func + i,
+-					    &func_node->old_insns[i]);
++					    &func_node->arch_data.old_insns[i]);
+ 			if (ret)
+ 				break;
+ 		}
+ #else
+-		ret = arm_insn_read(func->old_func, &func_node->old_insn);
++		ret = arm_insn_read(func->old_func, &func_node->arch_data.old_insn);
+ #endif
+ 		if (ret) {
+ 			return -EPERM;
+@@ -461,11 +456,11 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 	if (list_is_singular(&func_node->func_stack)) {
+ #ifdef CONFIG_ARM_MODULE_PLTS
+ 		for (i = 0; i < LJMP_INSN_SIZE; i++) {
+-			insns[i] = func_node->old_insns[i];
++			insns[i] = func_node->arch_data.old_insns[i];
+ 			__patch_text(((u32 *)pc) + i, insns[i]);
+ 		}
+ #else
+-		insn = func_node->old_insn;
++		insn = func_node->arch_data.old_insn;
+ 		__patch_text((void *)pc, insn);
+ #endif
+ 		list_del_rcu(&func->stack_node);
+diff --git a/arch/arm64/include/asm/livepatch.h b/arch/arm64/include/asm/livepatch.h
+index d85991fff647..11a972c596cf 100644
+--- a/arch/arm64/include/asm/livepatch.h
++++ b/arch/arm64/include/asm/livepatch.h
+@@ -48,4 +48,19 @@ int klp_check_calltrace(struct klp_patch *patch, int enable);
+ #error Live patching support is disabled; check CONFIG_LIVEPATCH
+ #endif
+ 
++
++#if defined(CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY)
++
++#define LJMP_INSN_SIZE 4
++
++struct arch_klp_data {
++#ifdef CONFIG_ARM64_MODULE_PLTS
++	u32 old_insns[LJMP_INSN_SIZE];
++#else
++	u32 old_insn;
++#endif
++};
++
++#endif
++
+ #endif /* _ASM_ARM64_LIVEPATCH_H */
+diff --git a/arch/arm64/kernel/livepatch.c b/arch/arm64/kernel/livepatch.c
+index a833fc14e114..5c4629c8e6e2 100644
+--- a/arch/arm64/kernel/livepatch.c
++++ b/arch/arm64/kernel/livepatch.c
+@@ -34,8 +34,6 @@
+ #include <linux/sched/debug.h>
+ #include <linux/kallsyms.h>
+ 
+-#define LJMP_INSN_SIZE 4
+-
+ #ifdef CONFIG_ARM64_MODULE_PLTS
+ #define MAX_SIZE_TO_CHECK (LJMP_INSN_SIZE * sizeof(u32))
+ #define CHECK_JUMP_RANGE LJMP_INSN_SIZE
+@@ -57,11 +55,7 @@ struct klp_func_node {
+ 	struct list_head node;
+ 	struct list_head func_stack;
+ 	void *old_func;
+-#ifdef CONFIG_ARM64_MODULE_PLTS
+-	u32 old_insns[LJMP_INSN_SIZE];
+-#else
+-	u32 old_insn;
+-#endif
++	struct arch_klp_data arch_data;
+ };
+ 
+ static LIST_HEAD(klp_func_list);
+@@ -383,13 +377,13 @@ int arch_klp_patch_func(struct klp_func *func)
+ #ifdef CONFIG_ARM64_MODULE_PLTS
+ 		for (i = 0; i < LJMP_INSN_SIZE; i++) {
+ 			ret = aarch64_insn_read(((u32 *)func->old_func) + i,
+-					&func_node->old_insns[i]);
++					&func_node->arch_data.old_insns[i]);
+ 			if (ret)
+ 				break;
+ 		}
+ #else
+ 		ret = aarch64_insn_read((void *)func->old_func,
+-					&func_node->old_insn);
++					&func_node->arch_data.old_insn);
+ #endif
+ 		if (ret) {
+ 			return -EPERM;
+@@ -455,9 +449,9 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 	if (list_is_singular(&func_node->func_stack)) {
+ #ifdef CONFIG_ARM64_MODULE_PLTS
+ 		for (i = 0; i < LJMP_INSN_SIZE; i++)
+-			insns[i] = func_node->old_insns[i];
++			insns[i] = func_node->arch_data.old_insns[i];
+ #else
+-		insn = func_node->old_insn;
++		insn = func_node->arch_data.old_insn;
+ #endif
+ 		list_del_rcu(&func->stack_node);
+ 		list_del_rcu(&func_node->node);
+diff --git a/arch/powerpc/include/asm/livepatch.h b/arch/powerpc/include/asm/livepatch.h
+index 5e5161ceac13..5901e3069c07 100644
+--- a/arch/powerpc/include/asm/livepatch.h
++++ b/arch/powerpc/include/asm/livepatch.h
+@@ -37,7 +37,7 @@ struct klp_func;
+ int arch_klp_patch_func(struct klp_func *func);
+ void arch_klp_unpatch_func(struct klp_func *func);
+ 
+-#ifdef CONFIG_PPC64
++#if defined(CONFIG_PPC64)
+ /*
+  * use the livepatch stub to jump to the trampoline.
+  * It is similar to stub, but does not need to save
+@@ -81,6 +81,23 @@ int livepatch_create_branch(unsigned long pc,
+ 			    unsigned long trampoline,
+ 			    unsigned long addr,
+ 			    struct module *me);
++
++struct arch_klp_data {
++	u32 old_insns[LJMP_INSN_SIZE];
++#ifdef PPC64_ELF_ABI_v1
++	struct ppc64_klp_btramp_entry trampoline;
++#else
++	unsigned long trampoline;
++#endif /* PPC64_ELF_ABI_v1 */
++};
++
++#elif defined(CONFIG_PPC32)
++
++#define LJMP_INSN_SIZE	4
++struct arch_klp_data {
++	u32 old_insns[LJMP_INSN_SIZE];
++};
++
+ #endif	/* CONFIG_PPC64 */
+ 
+ #endif /* CONFIG_LIVEPATCH_FTRACE */
+diff --git a/arch/powerpc/kernel/livepatch_32.c b/arch/powerpc/kernel/livepatch_32.c
+index 13f3200bf52f..e4af8faa08bb 100644
+--- a/arch/powerpc/kernel/livepatch_32.c
++++ b/arch/powerpc/kernel/livepatch_32.c
+@@ -31,7 +31,6 @@
+ 
+ #if defined (CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY) || \
+     defined (CONFIG_LIVEPATCH_WO_FTRACE)
+-#define LJMP_INSN_SIZE 4
+ #define MAX_SIZE_TO_CHECK (LJMP_INSN_SIZE * sizeof(u32))
+ #define CHECK_JUMP_RANGE LJMP_INSN_SIZE
+ 
+@@ -39,7 +38,7 @@ struct klp_func_node {
+ 	struct list_head node;
+ 	struct list_head func_stack;
+ 	void *old_func;
+-	u32 old_insns[LJMP_INSN_SIZE];
++	struct arch_klp_data arch_data;
+ };
+ 
+ static LIST_HEAD(klp_func_list);
+@@ -419,7 +418,7 @@ int arch_klp_patch_func(struct klp_func *func)
+ 		INIT_LIST_HEAD(&func_node->func_stack);
+ 		func_node->old_func = func->old_func;
+ 		for (i = 0; i < LJMP_INSN_SIZE; i++) {
+-			ret = copy_from_kernel_nofault(&func_node->old_insns[i],
++			ret = copy_from_kernel_nofault(&func_node->arch_data.old_insns[i],
+ 				((u32 *)func->old_func) + i, LJMP_INSN_SIZE);
+ 			if (ret) {
+ 				return -EPERM;
+@@ -482,7 +481,7 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 	pc = (unsigned long)func_node->old_func;
+ 	if (list_is_singular(&func_node->func_stack)) {
+ 		for (i = 0; i < LJMP_INSN_SIZE; i++)
+-			insns[i] = func_node->old_insns[i];
++			insns[i] = func_node->arch_data.old_insns[i];
+ 
+ 		list_del_rcu(&func->stack_node);
+ 		list_del_rcu(&func_node->node);
+diff --git a/arch/powerpc/kernel/livepatch_64.c b/arch/powerpc/kernel/livepatch_64.c
+index 77fbb5603137..30e4ba7db602 100644
+--- a/arch/powerpc/kernel/livepatch_64.c
++++ b/arch/powerpc/kernel/livepatch_64.c
+@@ -43,12 +43,7 @@ struct klp_func_node {
+ 	struct list_head node;
+ 	struct list_head func_stack;
+ 	void *old_func;
+-	u32 old_insns[LJMP_INSN_SIZE];
+-#ifdef PPC64_ELF_ABI_v1
+-	struct ppc64_klp_btramp_entry trampoline;
+-#else
+-	unsigned long trampoline;
+-#endif
++	struct arch_klp_data arch_data;
+ };
+ 
+ static LIST_HEAD(klp_func_list);
+@@ -265,10 +260,10 @@ static int klp_check_activeness_func(struct klp_patch *patch, int enable,
+ #endif
+ 
+ 				if (func_node == NULL ||
+-				    func_node->trampoline.magic != BRANCH_TRAMPOLINE_MAGIC)
++				    func_node->arch_data.trampoline.magic != BRANCH_TRAMPOLINE_MAGIC)
+ 					continue;
+ 
+-				func_addr = (unsigned long)&func_node->trampoline;
++				func_addr = (unsigned long)&func_node->arch_data.trampoline;
+ 				func_size = sizeof(struct ppc64_klp_btramp_entry);
+ 				ret = add_func_to_list(check_funcs, &pcheck, func_addr,
+ 						func_size, "trampoline", 0);
+@@ -468,7 +463,7 @@ int arch_klp_patch_func(struct klp_func *func)
+ 		INIT_LIST_HEAD(&func_node->func_stack);
+ 		func_node->old_func = func->old_func;
+ 		for (i = 0; i < LJMP_INSN_SIZE; i++) {
+-			ret = copy_from_kernel_nofault(&func_node->old_insns[i],
++			ret = copy_from_kernel_nofault(&func_node->arch_data.old_insns[i],
+ 				((u32 *)func->old_func) + i, 4);
+ 			if (ret) {
+ 				return -EPERM;
+@@ -482,7 +477,7 @@ int arch_klp_patch_func(struct klp_func *func)
+ 	pc = (unsigned long)func->old_func;
+ 	new_addr = (unsigned long)func->new_func;
+ 
+-	ret = livepatch_create_branch(pc, (unsigned long)&func_node->trampoline,
++	ret = livepatch_create_branch(pc, (unsigned long)&func_node->arch_data.trampoline,
+ 				      new_addr, func->old_mod);
+ 	if (ret)
+ 		goto ERR_OUT;
+@@ -518,7 +513,7 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 	pc = (unsigned long)func_node->old_func;
+ 	if (list_is_singular(&func_node->func_stack)) {
+ 		for (i = 0; i < LJMP_INSN_SIZE; i++)
+-			insns[i] = func_node->old_insns[i];
++			insns[i] = func_node->arch_data.old_insns[i];
+ 
+ 		list_del_rcu(&func->stack_node);
+ 		list_del_rcu(&func_node->node);
+@@ -534,7 +529,7 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 					struct klp_func, stack_node);
+ 		new_addr = (unsigned long)next_func->new_func;
+ 
+-		livepatch_create_branch(pc, (unsigned long)&func_node->trampoline,
++		livepatch_create_branch(pc, (unsigned long)&func_node->arch_data.trampoline,
+ 			new_addr, func->old_mod);
+ 
+ 		pr_debug("[%s %d] old = 0x%lx/0x%lx/%pS, new = 0x%lx/0x%lx/%pS\n",
+diff --git a/arch/x86/include/asm/livepatch.h b/arch/x86/include/asm/livepatch.h
+index dd51bb6c1816..c89f20576ca7 100644
+--- a/arch/x86/include/asm/livepatch.h
++++ b/arch/x86/include/asm/livepatch.h
+@@ -30,4 +30,15 @@ void arch_klp_unpatch_func(struct klp_func *func);
+ int klp_check_calltrace(struct klp_patch *patch, int enable);
+ #endif
+ 
++
++#if defined(CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY) || \
++    defined(CONFIG_LIVEPATCH_WO_FTRACE)
++
++#define JMP_E9_INSN_SIZE 5
++struct arch_klp_data {
++	unsigned char old_code[JMP_E9_INSN_SIZE];
++};
++
++#endif
++
+ #endif /* _ASM_X86_LIVEPATCH_H */
+diff --git a/arch/x86/kernel/livepatch.c b/arch/x86/kernel/livepatch.c
+index 386d224d5890..469a7e1323f5 100644
+--- a/arch/x86/kernel/livepatch.c
++++ b/arch/x86/kernel/livepatch.c
+@@ -33,13 +33,12 @@
+ 
+ #if defined (CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY) || \
+     defined (CONFIG_LIVEPATCH_WO_FTRACE)
+-#define JMP_E9_INSN_SIZE 5
+ 
+ struct klp_func_node {
+ 	struct list_head node;
+ 	struct list_head func_stack;
+ 	void *old_func;
+-	unsigned char old_code[JMP_E9_INSN_SIZE];
++	struct arch_klp_data arch_data;
+ };
+ 
+ static LIST_HEAD(klp_func_list);
+@@ -430,7 +429,7 @@ int arch_klp_patch_func(struct klp_func *func)
+ 
+ 		INIT_LIST_HEAD(&func_node->func_stack);
+ 		func_node->old_func = func->old_func;
+-		ret = copy_from_kernel_nofault(func_node->old_code,
++		ret = copy_from_kernel_nofault(func_node->arch_data.old_code,
+ 					(void *)ip, JMP_E9_INSN_SIZE);
+ 		if (ret) {
+ 			return -EPERM;
+@@ -460,7 +459,7 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 	if (list_is_singular(&func_node->func_stack)) {
+ 		list_del_rcu(&func->stack_node);
+ 		list_del_rcu(&func_node->node);
+-		new = klp_old_code(func_node->old_code);
++		new = klp_old_code(func_node->arch_data.old_code);
+ 	} else {
+ 		list_del_rcu(&func->stack_node);
+ 		next_func = list_first_or_null_rcu(&func_node->func_stack,
+-- 
+2.26.2
+
