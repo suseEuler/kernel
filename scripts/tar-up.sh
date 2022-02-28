@@ -403,6 +403,9 @@ if [ -n "$tolerate_unknown_new_config_options" ]; then
     echo > $build_dir/TOLERATE-UNKNOWN-NEW-CONFIG-OPTIONS
 fi
 
+install -m 644 revision.conf $build_dir/
+source $PWD/scripts/create-revision.sh
+
 echo "cd $build_dir; ./mkspec ${mkspec_args[@]}"
 patches=$PWD
 cd "$build_dir"
