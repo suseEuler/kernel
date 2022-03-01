@@ -1,0 +1,121 @@
+From 78b5d5c998537a34aec719af0a236119d53db752 Mon Sep 17 00:00:00 2001
+From: Heiner Kallweit <hkallweit1@gmail.com>
+Date: Fri, 10 Sep 2021 08:27:08 +0200
+Subject: [PATCH] cxgb3: Remove seeprom_write and use VPD API
+Git-commit: 78b5d5c998537a34aec719af0a236119d53db752
+Patch-mainline: v5.16-rc1
+References: bsn#58
+Modified-by-SEL: No
+
+
+Using the VPD API allows to simplify the code and completely get
+rid of t3_seeprom_write().
+
+Link: https://lore.kernel.org/r/a0291004-dda3-ea08-4d6c-a2f8826c8527@gmail.com
+Signed-off-by: Heiner Kallweit <hkallweit1@gmail.com>
+Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+Acked-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/net/ethernet/chelsio/cxgb3/common.h   |  1 -
+ .../net/ethernet/chelsio/cxgb3/cxgb3_main.c   | 11 ++----
+ drivers/net/ethernet/chelsio/cxgb3/t3_hw.c    | 35 -------------------
+ 3 files changed, 3 insertions(+), 44 deletions(-)
+
+diff --git a/drivers/net/ethernet/chelsio/cxgb3/common.h b/drivers/net/ethernet/chelsio/cxgb3/common.h
+index 56312f9ed5d8..d115ec93296d 100644
+--- a/drivers/net/ethernet/chelsio/cxgb3/common.h
++++ b/drivers/net/ethernet/chelsio/cxgb3/common.h
+@@ -676,7 +676,6 @@ void t3_link_changed(struct adapter *adapter, int port_id);
+ void t3_link_fault(struct adapter *adapter, int port_id);
+ int t3_link_start(struct cphy *phy, struct cmac *mac, struct link_config *lc);
+ const struct adapter_info *t3_get_adapter_info(unsigned int board_id);
+-int t3_seeprom_write(struct adapter *adapter, u32 addr, __le32 data);
+ int t3_seeprom_wp(struct adapter *adapter, int enable);
+ int t3_get_tp_version(struct adapter *adapter, u32 *vers);
+ int t3_check_tpsram_version(struct adapter *adapter);
+diff --git a/drivers/net/ethernet/chelsio/cxgb3/cxgb3_main.c b/drivers/net/ethernet/chelsio/cxgb3/cxgb3_main.c
+index d73339682133..e185f5f24849 100644
+--- a/drivers/net/ethernet/chelsio/cxgb3/cxgb3_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb3/cxgb3_main.c
+@@ -2054,7 +2054,6 @@ static int set_eeprom(struct net_device *dev, struct ethtool_eeprom *eeprom,
+ 	struct port_info *pi = netdev_priv(dev);
+ 	struct adapter *adapter = pi->adapter;
+ 	u32 aligned_offset, aligned_len;
+-	__le32 *p;
+ 	u8 *buf;
+ 	int err;
+ 
+@@ -2080,17 +2079,13 @@ static int set_eeprom(struct net_device *dev, struct ethtool_eeprom *eeprom,
+ 	if (err)
+ 		goto out;
+ 
+-	for (p = (__le32 *) buf; !err && aligned_len; aligned_len -= 4, p++) {
+-		err = t3_seeprom_write(adapter, aligned_offset, *p);
+-		aligned_offset += 4;
+-	}
+-
+-	if (!err)
++	err = pci_write_vpd(adapter->pdev, aligned_offset, aligned_len, buf);
++	if (err >= 0)
+ 		err = t3_seeprom_wp(adapter, 1);
+ out:
+ 	if (buf != data)
+ 		kfree(buf);
+-	return err;
++	return err < 0 ? err : 0;
+ }
+ 
+ static void get_wol(struct net_device *dev, struct ethtool_wolinfo *wol)
+diff --git a/drivers/net/ethernet/chelsio/cxgb3/t3_hw.c b/drivers/net/ethernet/chelsio/cxgb3/t3_hw.c
+index ec4b49ebe62a..cb85c2f21525 100644
+--- a/drivers/net/ethernet/chelsio/cxgb3/t3_hw.c
++++ b/drivers/net/ethernet/chelsio/cxgb3/t3_hw.c
+@@ -595,44 +595,9 @@ struct t3_vpd {
+ 	u32 pad;		/* for multiple-of-4 sizing and alignment */
+ };
+ 
+-#define EEPROM_MAX_POLL   40
+ #define EEPROM_STAT_ADDR  0x4000
+ #define VPD_BASE          0xc00
+ 
+-/**
+- *	t3_seeprom_write - write a VPD EEPROM location
+- *	@adapter: adapter to write
+- *	@addr: EEPROM address
+- *	@data: value to write
+- *
+- *	Write a 32-bit word to a location in VPD EEPROM using the card's PCI
+- *	VPD ROM capability.
+- */
+-int t3_seeprom_write(struct adapter *adapter, u32 addr, __le32 data)
+-{
+-	u16 val;
+-	int attempts = EEPROM_MAX_POLL;
+-	unsigned int base = adapter->params.pci.vpd_cap_addr;
+-
+-	if ((addr >= EEPROMSIZE && addr != EEPROM_STAT_ADDR) || (addr & 3))
+-		return -EINVAL;
+-
+-	pci_write_config_dword(adapter->pdev, base + PCI_VPD_DATA,
+-			       le32_to_cpu(data));
+-	pci_write_config_word(adapter->pdev,base + PCI_VPD_ADDR,
+-			      addr | PCI_VPD_ADDR_F);
+-	do {
+-		msleep(1);
+-		pci_read_config_word(adapter->pdev, base + PCI_VPD_ADDR, &val);
+-	} while ((val & PCI_VPD_ADDR_F) && --attempts);
+-
+-	if (val & PCI_VPD_ADDR_F) {
+-		CH_ERR(adapter, "write to EEPROM address 0x%x failed\n", addr);
+-		return -EIO;
+-	}
+-	return 0;
+-}
+-
+ /**
+  *	t3_seeprom_wp - enable/disable EEPROM write protection
+  *	@adapter: the adapter
+-- 
+2.26.2
+

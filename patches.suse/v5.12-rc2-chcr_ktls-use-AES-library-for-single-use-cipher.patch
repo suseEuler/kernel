@@ -1,0 +1,104 @@
+From a3b01ffddc210a836eda8aa751cfa911a2817a85 Mon Sep 17 00:00:00 2001
+From: Ard Biesheuvel <ardb@kernel.org>
+Date: Fri, 11 Dec 2020 13:27:14 +0100
+Subject: [PATCH] chcr_ktls: use AES library for single use cipher
+Git-commit: a3b01ffddc210a836eda8aa751cfa911a2817a85
+Patch-mainline: v5.12-rc2
+References: bsn#58
+Modified-by-SEL: No
+
+
+Allocating a cipher via the crypto API only to free it again after using
+it to encrypt a single block is unnecessary in cases where the algorithm
+is known at compile time. So replace this pattern with a call to the AES
+library.
+
+Cc: Ayush Sawal <ayush.sawal@chelsio.com>
+Cc: Vinay Kumar Yadav <vinay.yadav@chelsio.com>
+Cc: Rohit Maheshwari <rohitm@chelsio.com>
+Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+Reviewed-by: Eric Biggers <ebiggers@google.com>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ .../ethernet/chelsio/inline_crypto/Kconfig    |  1 +
+ .../chelsio/inline_crypto/ch_ktls/chcr_ktls.c | 19 +++++++------------
+ 2 files changed, 8 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/net/ethernet/chelsio/inline_crypto/Kconfig b/drivers/net/ethernet/chelsio/inline_crypto/Kconfig
+index bc06e83fd3c6..521955e1f894 100644
+--- a/drivers/net/ethernet/chelsio/inline_crypto/Kconfig
++++ b/drivers/net/ethernet/chelsio/inline_crypto/Kconfig
+@@ -42,6 +42,7 @@ config CHELSIO_TLS_DEVICE
+         depends on CHELSIO_T4
+         depends on TLS
+         depends on TLS_DEVICE
++	select CRYPTO_LIB_AES
+         help
+           This flag enables support for kernel tls offload over Chelsio T6
+           crypto accelerator. CONFIG_CHELSIO_TLS_DEVICE flag can be enabled
+diff --git a/drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c b/drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+index 1b7e8c91b541..46a809f2aeca 100644
+--- a/drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
++++ b/drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+@@ -9,6 +9,7 @@
+ #include <linux/ip.h>
+ #include <net/ipv6.h>
+ #include <linux/netdevice.h>
++#include <crypto/aes.h>
+ #include "chcr_ktls.h"
+ 
+ static LIST_HEAD(uld_ctx_list);
+@@ -74,7 +75,7 @@ static int chcr_ktls_save_keys(struct chcr_ktls_info *tx_info,
+ 	unsigned char ghash_h[TLS_CIPHER_AES_GCM_256_TAG_SIZE];
+ 	struct tls12_crypto_info_aes_gcm_128 *info_128_gcm;
+ 	struct ktls_key_ctx *kctx = &tx_info->key_ctx;
+-	struct crypto_cipher *cipher;
++	struct crypto_aes_ctx aes_ctx;
+ 	unsigned char *key, *salt;
+ 
+ 	switch (crypto_info->cipher_type) {
+@@ -135,18 +136,14 @@ static int chcr_ktls_save_keys(struct chcr_ktls_info *tx_info,
+ 	/* Calculate the H = CIPH(K, 0 repeated 16 times).
+ 	 * It will go in key context
+ 	 */
+-	cipher = crypto_alloc_cipher("aes", 0, 0);
+-	if (IS_ERR(cipher)) {
+-		ret = -ENOMEM;
+-		goto out;
+-	}
+ 
+-	ret = crypto_cipher_setkey(cipher, key, keylen);
++	ret = aes_expandkey(&aes_ctx, key, keylen);
+ 	if (ret)
+-		goto out1;
++		goto out;
+ 
+ 	memset(ghash_h, 0, ghash_size);
+-	crypto_cipher_encrypt_one(cipher, ghash_h, ghash_h);
++	aes_encrypt(&aes_ctx, ghash_h, ghash_h);
++	memzero_explicit(&aes_ctx, sizeof(aes_ctx));
+ 
+ 	/* fill the Key context */
+ 	if (direction == TLS_OFFLOAD_CTX_DIR_TX) {
+@@ -155,7 +152,7 @@ static int chcr_ktls_save_keys(struct chcr_ktls_info *tx_info,
+ 						 key_ctx_size >> 4);
+ 	} else {
+ 		ret = -EINVAL;
+-		goto out1;
++		goto out;
+ 	}
+ 
+ 	memcpy(kctx->salt, salt, tx_info->salt_size);
+@@ -163,8 +160,6 @@ static int chcr_ktls_save_keys(struct chcr_ktls_info *tx_info,
+ 	memcpy(kctx->key + keylen, ghash_h, ghash_size);
+ 	tx_info->key_ctx_len = key_ctx_size;
+ 
+-out1:
+-	crypto_free_cipher(cipher);
+ out:
+ 	return ret;
+ }
+-- 
+2.26.2
+
