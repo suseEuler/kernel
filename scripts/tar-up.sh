@@ -404,7 +404,10 @@ if [ -n "$tolerate_unknown_new_config_options" ]; then
 fi
 
 install -m 644 revision.conf $build_dir/
-source $PWD/scripts/create-revision.sh
+if ! $(dirname $0)/create-revision.sh $build_dir/$tsfile; then
+    echo "[ Create revision failed. ] "
+    exit 1
+fi
 
 echo "cd $build_dir; ./mkspec ${mkspec_args[@]}"
 patches=$PWD
