@@ -1,0 +1,70 @@
+From 0307a0b74b3af6ecb1c8b7f727376130b15bbf44 Mon Sep 17 00:00:00 2001
+Message-Id: <0307a0b74b3af6ecb1c8b7f727376130b15bbf44.1646721060.git.geliang.tang@suse.com>
+In-Reply-To: <d519f350967a60b85a574ad8aeac43f2b4384746.1646721060.git.geliang.tang@suse.com>
+References: <d519f350967a60b85a574ad8aeac43f2b4384746.1646721060.git.geliang.tang@suse.com>
+From: Eric Dumazet <edumazet@google.com>
+Date: Mon, 15 Nov 2021 11:02:42 -0800
+Subject: [PATCH 13/20] tcp: annotate data-races on tp->segs_in and
+ tp->data_segs_in
+Git-commit: 0307a0b74b3af6ecb1c8b7f727376130b15bbf44
+Patch-mainline: v5.17-rc1
+References: bsn#131
+Modified-by-SEL: No
+
+tcp_segs_in() can be called from BH, while socket spinlock
+is held but socket owned by user, eventually reading these
+fields from tcp_get_info()
+
+Found by code inspection, no need to backport this patch
+to older kernels.
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ include/net/tcp.h | 8 ++++++--
+ net/ipv4/tcp.c    | 6 ++++--
+ 2 files changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index 4da22b41bde6..05c81677aaf7 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -2172,9 +2172,13 @@ static inline void tcp_segs_in(struct tcp_sock *tp, const struct sk_buff *skb)
+ 	u16 segs_in;
+ 
+ 	segs_in = max_t(u16, 1, skb_shinfo(skb)->gso_segs);
+-	tp->segs_in += segs_in;
++
++	/* We update these fields while other threads might
++	 * read them from tcp_get_info()
++	 */
++	WRITE_ONCE(tp->segs_in, tp->segs_in + segs_in);
+ 	if (skb->len > tcp_hdrlen(skb))
+-		tp->data_segs_in += segs_in;
++		WRITE_ONCE(tp->data_segs_in, tp->data_segs_in + segs_in);
+ }
+ 
+ /*
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index 24d77a32c9cb..267b2b18f048 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -3769,10 +3769,12 @@ void tcp_get_info(struct sock *sk, struct tcp_info *info)
+ 	tcp_get_info_chrono_stats(tp, info);
+ 
+ 	info->tcpi_segs_out = tp->segs_out;
+-	info->tcpi_segs_in = tp->segs_in;
++
++	/* segs_in and data_segs_in can be updated from tcp_segs_in() from BH */
++	info->tcpi_segs_in = READ_ONCE(tp->segs_in);
++	info->tcpi_data_segs_in = READ_ONCE(tp->data_segs_in);
+ 
+ 	info->tcpi_min_rtt = tcp_min_rtt(tp);
+-	info->tcpi_data_segs_in = tp->data_segs_in;
+ 	info->tcpi_data_segs_out = tp->data_segs_out;
+ 
+ 	info->tcpi_delivery_rate_app_limited = tp->rate_app_limited ? 1 : 0;
+-- 
+2.34.1
+

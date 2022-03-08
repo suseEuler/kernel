@@ -1,0 +1,109 @@
+From 7b6a893a5991f5e8a56795155ae86333b03080b7 Mon Sep 17 00:00:00 2001
+Message-Id: <7b6a893a5991f5e8a56795155ae86333b03080b7.1646721060.git.geliang.tang@suse.com>
+In-Reply-To: <d519f350967a60b85a574ad8aeac43f2b4384746.1646721060.git.geliang.tang@suse.com>
+References: <d519f350967a60b85a574ad8aeac43f2b4384746.1646721060.git.geliang.tang@suse.com>
+From: Eric Dumazet <edumazet@google.com>
+Date: Mon, 15 Nov 2021 11:02:43 -0800
+Subject: [PATCH 14/20] tcp: annotate races around tp->urg_data
+Git-commit: 7b6a893a5991f5e8a56795155ae86333b03080b7
+Patch-mainline: v5.17-rc1
+References: bsn#131
+Modified-by-SEL: No
+
+tcp_poll() and tcp_ioctl() are reading tp->urg_data without socket lock
+owned.
+
+Also, it is faster to first check tp->urg_data in tcp_poll(),
+then tp->urg_seq == tp->copied_seq, because tp->urg_seq is
+located in a different/cold cache line.
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ net/ipv4/tcp.c       |   17 +++++++++--------
+ net/ipv4/tcp_input.c |    4 ++--
+ 2 files changed, 11 insertions(+), 10 deletions(-)
+
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -555,10 +555,11 @@ __poll_t tcp_poll(struct file *file, str
+ 	if (state != TCP_SYN_SENT &&
+ 	    (state != TCP_SYN_RECV || rcu_access_pointer(tp->fastopen_rsk))) {
+ 		int target = sock_rcvlowat(sk, 0, INT_MAX);
++		u16 urg_data = READ_ONCE(tp->urg_data);
+ 
+-		if (READ_ONCE(tp->urg_seq) == READ_ONCE(tp->copied_seq) &&
+-		    !sock_flag(sk, SOCK_URGINLINE) &&
+-		    tp->urg_data)
++		if (urg_data &&
++		    READ_ONCE(tp->urg_seq) == READ_ONCE(tp->copied_seq) &&
++		    !sock_flag(sk, SOCK_URGINLINE))
+ 			target++;
+ 
+ 		if (tcp_stream_is_readable(tp, target, sk))
+@@ -583,7 +584,7 @@ __poll_t tcp_poll(struct file *file, str
+ 		} else
+ 			mask |= EPOLLOUT | EPOLLWRNORM;
+ 
+-		if (tp->urg_data & TCP_URG_VALID)
++		if (urg_data & TCP_URG_VALID)
+ 			mask |= EPOLLPRI;
+ 	} else if (state == TCP_SYN_SENT && inet_sk(sk)->defer_connect) {
+ 		/* Active TCP fastopen socket with defer_connect
+@@ -617,7 +618,7 @@ int tcp_ioctl(struct sock *sk, int cmd,
+ 		unlock_sock_fast(sk, slow);
+ 		break;
+ 	case SIOCATMARK:
+-		answ = tp->urg_data &&
++		answ = READ_ONCE(tp->urg_data) &&
+ 		       READ_ONCE(tp->urg_seq) == READ_ONCE(tp->copied_seq);
+ 		break;
+ 	case SIOCOUTQ:
+@@ -1487,7 +1488,7 @@ static int tcp_recv_urg(struct sock *sk,
+ 		char c = tp->urg_data;
+ 
+ 		if (!(flags & MSG_PEEK))
+-			tp->urg_data = TCP_URG_READ;
++			WRITE_ONCE(tp->urg_data, TCP_URG_READ);
+ 
+ 		/* Read urgent data. */
+ 		msg->msg_flags |= MSG_OOB;
+@@ -2305,7 +2306,7 @@ found_ok_skb:
+ 
+ skip_copy:
+ 		if (tp->urg_data && after(tp->copied_seq, tp->urg_seq)) {
+-			tp->urg_data = 0;
++			WRITE_ONCE(tp->urg_data, 0);
+ 			tcp_fast_path_check(sk);
+ 		}
+ 
+@@ -2780,7 +2781,7 @@ int tcp_disconnect(struct sock *sk, int
+ 		sk->sk_rx_skb_cache = NULL;
+ 	}
+ 	WRITE_ONCE(tp->copied_seq, tp->rcv_nxt);
+-	tp->urg_data = 0;
++	WRITE_ONCE(tp->urg_data, 0);
+ 	tcp_write_queue_purge(sk);
+ 	tcp_fastopen_active_disable_ofo_check(sk);
+ 	skb_rbtree_purge(&tp->out_of_order_queue);
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -5531,7 +5531,7 @@ static void tcp_check_urg(struct sock *s
+ 		}
+ 	}
+ 
+-	tp->urg_data = TCP_URG_NOTYET;
++	WRITE_ONCE(tp->urg_data, TCP_URG_NOTYET);
+ 	WRITE_ONCE(tp->urg_seq, ptr);
+ 
+ 	/* Disable header prediction. */
+@@ -5557,7 +5557,7 @@ static void tcp_urg(struct sock *sk, str
+ 			u8 tmp;
+ 			if (skb_copy_bits(skb, ptr, &tmp, 1))
+ 				BUG();
+-			tp->urg_data = TCP_URG_VALID | tmp;
++			WRITE_ONCE(tp->urg_data, TCP_URG_VALID | tmp);
+ 			if (!sock_flag(sk, SOCK_DEAD))
+ 				sk->sk_data_ready(sk);
+ 		}
