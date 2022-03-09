@@ -1,0 +1,206 @@
+From 1f90a3477df3ff1a91e064af554cdc887c8f9e5e Mon Sep 17 00:00:00 2001
+From: Dan Williams <dan.j.williams@intel.com>
+Date: Thu, 25 Feb 2021 17:17:05 -0800
+Subject: [PATCH] mm: teach pfn_to_online_page() about ZONE_DEVICE section
+ collisions
+Git-commit: 1f90a3477df3ff1a91e064af554cdc887c8f9e5e
+Patch-mainline: v5.12-rc2
+References: bsn#118
+Modified-by-SEL: No
+
+
+While pfn_to_online_page() is able to determine pfn_valid() at subsection
+granularity it is not able to reliably determine if a given pfn is also
+online if the section is mixes ZONE_{NORMAL,MOVABLE} with ZONE_DEVICE.
+This means that pfn_to_online_page() may return invalid @page objects.
+For example with a memory map like:
+
+100000000-1fbffffff : System RAM
+  142000000-143002e16 : Kernel code
+  143200000-143713fff : Kernel rodata
+  143800000-143b15b7f : Kernel data
+  144227000-144ffffff : Kernel bss
+1fc000000-2fbffffff : Persistent Memory (legacy)
+  1fc000000-2fbffffff : namespace0.0
+
+This command:
+
+echo 0x1fc000000 > /sys/devices/system/memory/soft_offline_page
+
+...succeeds when it should fail.  When it succeeds it touches an
+uninitialized page and may crash or cause other damage (see
+dissolve_free_huge_page()).
+
+While the memory map above is contrived via the memmap=ss!nn kernel
+command line option, the collision happens in practice on shipping
+platforms.  The memory controller resources that decode spans of physical
+address space are a limited resource.  One technique platform-firmware
+uses to conserve those resources is to share a decoder across 2 devices to
+keep the address range contiguous.  Unfortunately the unit of operation of
+a decoder is 64MiB while the Linux section size is 128MiB.  This results
+in situations where, without subsection hotplug memory mappings with
+different lifetimes collide into one object that can only express one
+lifetime.
+
+Update move_pfn_range_to_zone() to flag (SECTION_TAINT_ZONE_DEVICE) a
+section that mixes ZONE_DEVICE pfns with other online pfns.  With
+SECTION_TAINT_ZONE_DEVICE to delineate, pfn_to_online_page() can fall back
+to a slow-path check for ZONE_DEVICE pfns in an online section.  In the
+fast path online_section() for a full ZONE_DEVICE section returns false.
+
+Because the collision case is rare, and for simplicity, the
+SECTION_TAINT_ZONE_DEVICE flag is never cleared once set.
+
+[dan.j.williams@intel.com: fix CONFIG_ZONE_DEVICE=n build]
+  Link: https://lkml.kernel.org/r/CAPcyv4iX+7LAgAeSqx7Zw-Zd=ZV9gBv8Bo7oTbwCOOqJoZ3+Yg@mail.gmail.com
+
+Link: https://lkml.kernel.org/r/161058500675.1840162.7887862152161279354.stgit@dwillia2-desk3.amr.corp.intel.com
+Fixes: ba72b4c8cf60 ("mm/sparsemem: support sub-section hotplug")
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Reported-by: Michal Hocko <mhocko@suse.com>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Reported-by: David Hildenbrand <david@redhat.com>
+Reviewed-by: David Hildenbrand <david@redhat.com>
+Reviewed-by: Oscar Salvador <osalvador@suse.de>
+Cc: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Cc: Qian Cai <cai@lca.pw>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ include/linux/mmzone.h | 34 +++++++++++++++++++++++++++-------
+ mm/memory_hotplug.c    | 38 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 65 insertions(+), 7 deletions(-)
+
+diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+index 5f9c4dad73ed..47946cec7584 100644
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -918,6 +918,18 @@ static inline int local_memory_node(int node_id) { return node_id; };
+  */
+ #define zone_idx(zone)		((zone) - (zone)->zone_pgdat->node_zones)
+ 
++#ifdef CONFIG_ZONE_DEVICE
++static inline bool zone_is_zone_device(struct zone *zone)
++{
++	return zone_idx(zone) == ZONE_DEVICE;
++}
++#else
++static inline bool zone_is_zone_device(struct zone *zone)
++{
++	return false;
++}
++#endif
++
+ /*
+  * Returns true if a zone has pages managed by the buddy allocator.
+  * All the reclaim decisions have to use this function rather than
+@@ -1306,13 +1318,14 @@ extern size_t mem_section_usage_size(void);
+  *      which results in PFN_SECTION_SHIFT equal 6.
+  * To sum it up, at least 6 bits are available.
+  */
+-#define	SECTION_MARKED_PRESENT	(1UL<<0)
+-#define SECTION_HAS_MEM_MAP	(1UL<<1)
+-#define SECTION_IS_ONLINE	(1UL<<2)
+-#define SECTION_IS_EARLY	(1UL<<3)
+-#define SECTION_MAP_LAST_BIT	(1UL<<4)
+-#define SECTION_MAP_MASK	(~(SECTION_MAP_LAST_BIT-1))
+-#define SECTION_NID_SHIFT	3
++#define SECTION_MARKED_PRESENT		(1UL<<0)
++#define SECTION_HAS_MEM_MAP		(1UL<<1)
++#define SECTION_IS_ONLINE		(1UL<<2)
++#define SECTION_IS_EARLY		(1UL<<3)
++#define SECTION_TAINT_ZONE_DEVICE	(1UL<<4)
++#define SECTION_MAP_LAST_BIT		(1UL<<5)
++#define SECTION_MAP_MASK		(~(SECTION_MAP_LAST_BIT-1))
++#define SECTION_NID_SHIFT		3
+ 
+ static inline struct page *__section_mem_map_addr(struct mem_section *section)
+ {
+@@ -1351,6 +1364,13 @@ static inline int online_section(struct mem_section *section)
+ 	return (section && (section->section_mem_map & SECTION_IS_ONLINE));
+ }
+ 
++static inline int online_device_section(struct mem_section *section)
++{
++	unsigned long flags = SECTION_IS_ONLINE | SECTION_TAINT_ZONE_DEVICE;
++
++	return section && ((section->section_mem_map & flags) == flags);
++}
++
+ static inline int online_section_nr(unsigned long nr)
+ {
+ 	return online_section(__nr_to_section(nr));
+diff --git a/mm/memory_hotplug.c b/mm/memory_hotplug.c
+index 02378f11e2d6..3af4d3851d1a 100644
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@ -308,6 +308,7 @@ static int check_hotplug_memory_addressable(unsigned long pfn,
+ struct page *pfn_to_online_page(unsigned long pfn)
+ {
+ 	unsigned long nr = pfn_to_section_nr(pfn);
++	struct dev_pagemap *pgmap;
+ 	struct mem_section *ms;
+ 
+ 	if (nr >= NR_MEM_SECTIONS)
+@@ -327,6 +328,22 @@ struct page *pfn_to_online_page(unsigned long pfn)
+ 	if (!pfn_section_valid(ms, pfn))
+ 		return NULL;
+ 
++	if (!online_device_section(ms))
++		return pfn_to_page(pfn);
++
++	/*
++	 * Slowpath: when ZONE_DEVICE collides with
++	 * ZONE_{NORMAL,MOVABLE} within the same section some pfns in
++	 * the section may be 'offline' but 'valid'. Only
++	 * get_dev_pagemap() can determine sub-section online status.
++	 */
++	pgmap = get_dev_pagemap(pfn, NULL);
++	put_dev_pagemap(pgmap);
++
++	/* The presence of a pgmap indicates ZONE_DEVICE offline pfn */
++	if (pgmap)
++		return NULL;
++
+ 	return pfn_to_page(pfn);
+ }
+ EXPORT_SYMBOL_GPL(pfn_to_online_page);
+@@ -709,6 +726,14 @@ static void __meminit resize_pgdat_range(struct pglist_data *pgdat, unsigned lon
+ 	pgdat->node_spanned_pages = max(start_pfn + nr_pages, old_end_pfn) - pgdat->node_start_pfn;
+ 
+ }
++
++static void section_taint_zone_device(unsigned long pfn)
++{
++	struct mem_section *ms = __pfn_to_section(pfn);
++
++	ms->section_mem_map |= SECTION_TAINT_ZONE_DEVICE;
++}
++
+ /*
+  * Associate the pfn range with the given zone, initializing the memmaps
+  * and resizing the pgdat/zone data to span the added pages. After this
+@@ -738,6 +763,19 @@ void __ref move_pfn_range_to_zone(struct zone *zone, unsigned long start_pfn,
+ 	resize_pgdat_range(pgdat, start_pfn, nr_pages);
+ 	pgdat_resize_unlock(pgdat, &flags);
+ 
++	/*
++	 * Subsection population requires care in pfn_to_online_page().
++	 * Set the taint to enable the slow path detection of
++	 * ZONE_DEVICE pages in an otherwise  ZONE_{NORMAL,MOVABLE}
++	 * section.
++	 */
++	if (zone_is_zone_device(zone)) {
++		if (!IS_ALIGNED(start_pfn, PAGES_PER_SECTION))
++			section_taint_zone_device(start_pfn);
++		if (!IS_ALIGNED(start_pfn + nr_pages, PAGES_PER_SECTION))
++			section_taint_zone_device(start_pfn + nr_pages);
++	}
++
+ 	/*
+ 	 * TODO now we have a visible range of pages which are not associated
+ 	 * with their zone properly. Not nice but set_pfnblock_flags_mask
+-- 
+2.34.1
+

@@ -1,0 +1,117 @@
+From 9f605f260594f99b950062fd62244251e85dbd2b Mon Sep 17 00:00:00 2001
+From: Dan Williams <dan.j.williams@intel.com>
+Date: Thu, 25 Feb 2021 17:16:57 -0800
+Subject: [PATCH] mm: move pfn_to_online_page() out of line
+Git-commit: 9f605f260594f99b950062fd62244251e85dbd2b
+Patch-mainline: v5.12-rc2
+References: bsn#118
+Modified-by-SEL: No
+
+
+Patch series "mm: Fix pfn_to_online_page() with respect to ZONE_DEVICE", v4.
+
+A pfn-walker that uses pfn_to_online_page() may inadvertently translate a
+pfn as online and in the page allocator, when it is offline managed by a
+ZONE_DEVICE mapping (details in Patch 3: ("mm: Teach pfn_to_online_page()
+about ZONE_DEVICE section collisions")).
+
+The 2 proposals under consideration are teach pfn_to_online_page() to be
+precise in the presence of mixed-zone sections, or teach the memory-add
+code to drop the System RAM associated with ZONE_DEVICE collisions.  In
+order to not regress memory capacity by a few 10s to 100s of MiB the
+approach taken in this set is to add precision to pfn_to_online_page().
+
+In the course of validating pfn_to_online_page() a couple other fixes
+fell out:
+
+1/ soft_offline_page() fails to drop the reference taken in the
+   madvise(..., MADV_SOFT_OFFLINE) case.
+
+2/ memory_failure() uses get_dev_pagemap() to lookup ZONE_DEVICE pages,
+   however that mapping may contain data pages and metadata raw pfns.
+   Introduce pgmap_pfn_valid() to delineate the 2 types and fail the
+   handling of raw metadata pfns.
+
+This patch (of 4);
+
+pfn_to_online_page() is already too large to be a macro or an inline
+function.  In anticipation of further logic changes / growth, move it out
+of line.
+
+No functional change, just code movement.
+
+Link: https://lkml.kernel.org/r/161058499000.1840162.702316708443239771.stgit@dwillia2-desk3.amr.corp.intel.com
+Link: https://lkml.kernel.org/r/161058499608.1840162.10165648147615238793.stgit@dwillia2-desk3.amr.corp.intel.com
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Reported-by: Michal Hocko <mhocko@kernel.org>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Reviewed-by: David Hildenbrand <david@redhat.com>
+Reviewed-by: Oscar Salvador <osalvador@suse.de>
+Cc: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Cc: Qian Cai <cai@lca.pw>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ include/linux/memory_hotplug.h | 17 +----------------
+ mm/memory_hotplug.c            | 16 ++++++++++++++++
+ 2 files changed, 17 insertions(+), 16 deletions(-)
+
+diff --git a/include/linux/memory_hotplug.h b/include/linux/memory_hotplug.h
+index 15acce5ab106..3d99de0db2dd 100644
+--- a/include/linux/memory_hotplug.h
++++ b/include/linux/memory_hotplug.h
+@@ -16,22 +16,7 @@ struct resource;
+ struct vmem_altmap;
+ 
+ #ifdef CONFIG_MEMORY_HOTPLUG
+-/*
+- * Return page for the valid pfn only if the page is online. All pfn
+- * walkers which rely on the fully initialized page->flags and others
+- * should use this rather than pfn_valid && pfn_to_page
+- */
+-#define pfn_to_online_page(pfn)					   \
+-({								   \
+-	struct page *___page = NULL;				   \
+-	unsigned long ___pfn = pfn;				   \
+-	unsigned long ___nr = pfn_to_section_nr(___pfn);	   \
+-								   \
+-	if (___nr < NR_MEM_SECTIONS && online_section_nr(___nr) && \
+-	    pfn_valid_within(___pfn))				   \
+-		___page = pfn_to_page(___pfn);			   \
+-	___page;						   \
+-})
++struct page *pfn_to_online_page(unsigned long pfn);
+ 
+ /*
+  * Types for free bootmem stored in page->lru.next. These have to be in
+diff --git a/mm/memory_hotplug.c b/mm/memory_hotplug.c
+index abe43c1ae920..fc6cdd99941b 100644
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@ -300,6 +300,22 @@ static int check_hotplug_memory_addressable(unsigned long pfn,
+ 	return 0;
+ }
+ 
++/*
++ * Return page for the valid pfn only if the page is online. All pfn
++ * walkers which rely on the fully initialized page->flags and others
++ * should use this rather than pfn_valid && pfn_to_page
++ */
++struct page *pfn_to_online_page(unsigned long pfn)
++{
++	unsigned long nr = pfn_to_section_nr(pfn);
++
++	if (nr < NR_MEM_SECTIONS && online_section_nr(nr) &&
++	    pfn_valid_within(pfn))
++		return pfn_to_page(pfn);
++	return NULL;
++}
++EXPORT_SYMBOL_GPL(pfn_to_online_page);
++
+ /*
+  * Reasonably generic function for adding memory.  It is
+  * expected that archs that support memory hotplug will
+-- 
+2.34.1
+
