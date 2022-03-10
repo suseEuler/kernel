@@ -1,0 +1,113 @@
+From 643a666a89c358ef588d2b3ef9f2dc1efc421e61 Mon Sep 17 00:00:00 2001
+From: Vivek Goyal <vgoyal@redhat.com>
+Date: Fri, 9 Oct 2020 14:15:11 -0400
+Subject: [PATCH] fuse: add a flag FUSE_OPEN_KILL_SUIDGID for open() request
+Git-commit: 643a666a89c358ef588d2b3ef9f2dc1efc421e61
+Patch-mainline: v5.11-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+With FUSE_HANDLE_KILLPRIV_V2 support, server will need to kill suid/sgid/
+security.capability on open(O_TRUNC), if server supports
+FUSE_ATOMIC_O_TRUNC.
+
+But server needs to kill suid/sgid only if caller does not have CAP_FSETID.
+Given server does not have this information, client needs to send this info
+to server.
+
+So add a flag FUSE_OPEN_KILL_SUIDGID to fuse_open_in request which tells
+server to kill suid/sgid (only if group execute is set).
+
+This flag is added to the FUSE_OPEN request, as well as the FUSE_CREATE
+request if the create was non-exclusive, since that might result in an
+existing file being opened/truncated.
+
+Signed-off-by: Vivek Goyal <vgoyal@redhat.com>
+Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/fuse/dir.c             |  6 ++++++
+ fs/fuse/file.c            |  6 ++++++
+ include/uapi/linux/fuse.h | 11 +++++++++--
+ 3 files changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/fs/fuse/dir.c b/fs/fuse/dir.c
+index 778367d125f9..5d43af1169b7 100644
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -541,6 +541,12 @@ static int fuse_create_open(struct inode *dir, struct dentry *entry,
+ 	inarg.flags = flags;
+ 	inarg.mode = mode;
+ 	inarg.umask = current_umask();
++
++	if (fm->fc->handle_killpriv_v2 && (flags & O_TRUNC) &&
++	    !(flags & O_EXCL) && !capable(CAP_FSETID)) {
++		inarg.open_flags |= FUSE_OPEN_KILL_SUIDGID;
++	}
++
+ 	args.opcode = FUSE_CREATE;
+ 	args.nodeid = get_node_id(dir);
+ 	args.in_numargs = 2;
+diff --git a/fs/fuse/file.c b/fs/fuse/file.c
+index aa0a44f7028f..349885353036 100644
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -42,6 +42,12 @@ static int fuse_send_open(struct fuse_mount *fm, u64 nodeid, struct file *file,
+ 	inarg.flags = file->f_flags & ~(O_CREAT | O_EXCL | O_NOCTTY);
+ 	if (!fm->fc->atomic_o_trunc)
+ 		inarg.flags &= ~O_TRUNC;
++
++	if (fm->fc->handle_killpriv_v2 &&
++	    (inarg.flags & O_TRUNC) && !capable(CAP_FSETID)) {
++		inarg.open_flags |= FUSE_OPEN_KILL_SUIDGID;
++	}
++
+ 	args.opcode = opcode;
+ 	args.nodeid = nodeid;
+ 	args.in_numargs = 1;
+diff --git a/include/uapi/linux/fuse.h b/include/uapi/linux/fuse.h
+index 9eb96e0564be..98ca64d1beb6 100644
+--- a/include/uapi/linux/fuse.h
++++ b/include/uapi/linux/fuse.h
+@@ -178,6 +178,7 @@
+  *
+  *  7.33
+  *  - add FUSE_HANDLE_KILLPRIV_V2, FUSE_WRITE_KILL_SUIDGID, FATTR_KILL_SUIDGID
++ *  - add FUSE_OPEN_KILL_SUIDGID
+  */
+ 
+ #ifndef _LINUX_FUSE_H
+@@ -444,6 +445,12 @@ struct fuse_file_lock {
+  */
+ #define FUSE_ATTR_SUBMOUNT      (1 << 0)
+ 
++/**
++ * Open flags
++ * FUSE_OPEN_KILL_SUIDGID: Kill suid and sgid if executable
++ */
++#define FUSE_OPEN_KILL_SUIDGID	(1 << 0)
++
+ enum fuse_opcode {
+ 	FUSE_LOOKUP		= 1,
+ 	FUSE_FORGET		= 2,  /* no reply */
+@@ -605,14 +612,14 @@ struct fuse_setattr_in {
+ 
+ struct fuse_open_in {
+ 	uint32_t	flags;
+-	uint32_t	unused;
++	uint32_t	open_flags;	/* FUSE_OPEN_... */
+ };
+ 
+ struct fuse_create_in {
+ 	uint32_t	flags;
+ 	uint32_t	mode;
+ 	uint32_t	umask;
+-	uint32_t	padding;
++	uint32_t	open_flags;	/* FUSE_OPEN_... */
+ };
+ 
+ struct fuse_open_out {
+-- 
+2.26.2
+

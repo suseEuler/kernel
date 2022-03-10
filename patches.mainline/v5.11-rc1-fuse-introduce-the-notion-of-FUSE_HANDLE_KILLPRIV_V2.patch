@@ -1,0 +1,134 @@
+From 63f9909ff602082597849f684655e93336c50b11 Mon Sep 17 00:00:00 2001
+From: Vivek Goyal <vgoyal@redhat.com>
+Date: Fri, 9 Oct 2020 14:15:07 -0400
+Subject: [PATCH] fuse: introduce the notion of FUSE_HANDLE_KILLPRIV_V2
+Git-commit: 63f9909ff602082597849f684655e93336c50b11
+Patch-mainline: v5.11-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+We already have FUSE_HANDLE_KILLPRIV flag that says that file server will
+remove suid/sgid/caps on truncate/chown/write. But that's little different
+from what Linux VFS implements.
+
+To be consistent with Linux VFS behavior what we want is.
+
+- caps are always cleared on chown/write/truncate
+- suid is always cleared on chown, while for truncate/write it is cleared
+  only if caller does not have CAP_FSETID.
+- sgid is always cleared on chown, while for truncate/write it is cleared
+  only if caller does not have CAP_FSETID as well as file has group execute
+  permission.
+
+As previous flag did not provide above semantics. Implement a V2 of the
+protocol with above said constraints.
+
+Server does not know if caller has CAP_FSETID or not. So for the case
+of write()/truncate(), client will send information in special flag to
+indicate whether to kill priviliges or not. These changes are in subsequent
+patches.
+
+FUSE_HANDLE_KILLPRIV_V2 relies on WRITE being sent to server to clear
+suid/sgid/security.capability. But with ->writeback_cache, WRITES are
+cached in guest. So it is not recommended to use FUSE_HANDLE_KILLPRIV_V2
+and writeback_cache together. Though it probably might be good enough
+for lot of use cases.
+
+Signed-off-by: Vivek Goyal <vgoyal@redhat.com>
+Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/fuse/fuse_i.h          |  8 ++++++++
+ fs/fuse/inode.c           |  5 ++++-
+ include/uapi/linux/fuse.h | 11 ++++++++++-
+ 3 files changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
+index 8301c5056022..d414c787e362 100644
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -635,6 +635,14 @@ struct fuse_conn {
+ 	/* show legacy mount options */
+ 	unsigned int legacy_opts_show:1;
+ 
++	/*
++	 * fs kills suid/sgid/cap on write/chown/trunc. suid is killed on
++	 * write/trunc only if caller did not have CAP_FSETID.  sgid is killed
++	 * on write/truncate only if caller did not have CAP_FSETID as well as
++	 * file has group execute permission.
++	 */
++	unsigned handle_killpriv_v2:1;
++
+ 	/*
+ 	 * The following bitfields are only for optimization purposes
+ 	 * and hence races in setting them will not cause malfunction
+diff --git a/fs/fuse/inode.c b/fs/fuse/inode.c
+index e7e9005b9b66..5a6102cd6473 100644
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -1038,6 +1038,8 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
+ 			    !fuse_dax_check_alignment(fc, arg->map_alignment)) {
+ 				ok = false;
+ 			}
++			if (arg->flags & FUSE_HANDLE_KILLPRIV_V2)
++				fc->handle_killpriv_v2 = 1;
+ 		} else {
+ 			ra_pages = fc->max_read / PAGE_SIZE;
+ 			fc->no_lock = 1;
+@@ -1080,7 +1082,8 @@ void fuse_send_init(struct fuse_mount *fm)
+ 		FUSE_WRITEBACK_CACHE | FUSE_NO_OPEN_SUPPORT |
+ 		FUSE_PARALLEL_DIROPS | FUSE_HANDLE_KILLPRIV | FUSE_POSIX_ACL |
+ 		FUSE_ABORT_ERROR | FUSE_MAX_PAGES | FUSE_CACHE_SYMLINKS |
+-		FUSE_NO_OPENDIR_SUPPORT | FUSE_EXPLICIT_INVAL_DATA;
++		FUSE_NO_OPENDIR_SUPPORT | FUSE_EXPLICIT_INVAL_DATA |
++		FUSE_HANDLE_KILLPRIV_V2;
+ #ifdef CONFIG_FUSE_DAX
+ 	if (fm->fc->dax)
+ 		ia->in.flags |= FUSE_MAP_ALIGNMENT;
+diff --git a/include/uapi/linux/fuse.h b/include/uapi/linux/fuse.h
+index 7233502ea991..29bd2e007947 100644
+--- a/include/uapi/linux/fuse.h
++++ b/include/uapi/linux/fuse.h
+@@ -175,6 +175,9 @@
+  *
+  *  7.32
+  *  - add flags to fuse_attr, add FUSE_ATTR_SUBMOUNT, add FUSE_SUBMOUNTS
++ *
++ *  7.33
++ *  - add FUSE_HANDLE_KILLPRIV_V2
+  */
+ 
+ #ifndef _LINUX_FUSE_H
+@@ -210,7 +213,7 @@
+ #define FUSE_KERNEL_VERSION 7
+ 
+ /** Minor version number of this interface */
+-#define FUSE_KERNEL_MINOR_VERSION 32
++#define FUSE_KERNEL_MINOR_VERSION 33
+ 
+ /** The node ID of the root inode */
+ #define FUSE_ROOT_ID 1
+@@ -320,6 +323,11 @@ struct fuse_file_lock {
+  *		       foffset and moffset fields in struct
+  *		       fuse_setupmapping_out and fuse_removemapping_one.
+  * FUSE_SUBMOUNTS: kernel supports auto-mounting directory submounts
++ * FUSE_HANDLE_KILLPRIV_V2: fs kills suid/sgid/cap on write/chown/trunc.
++ *			Upon write/truncate suid/sgid is only killed if caller
++ *			does not have CAP_FSETID. Additionally upon
++ *			write/truncate sgid is killed only if file has group
++ *			execute permission. (Same as Linux VFS behavior).
+  */
+ #define FUSE_ASYNC_READ		(1 << 0)
+ #define FUSE_POSIX_LOCKS	(1 << 1)
+@@ -349,6 +357,7 @@ struct fuse_file_lock {
+ #define FUSE_EXPLICIT_INVAL_DATA (1 << 25)
+ #define FUSE_MAP_ALIGNMENT	(1 << 26)
+ #define FUSE_SUBMOUNTS		(1 << 27)
++#define FUSE_HANDLE_KILLPRIV_V2	(1 << 28)
+ 
+ /**
+  * CUSE INIT request/reply flags
+-- 
+2.26.2
+

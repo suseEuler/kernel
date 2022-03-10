@@ -5,7 +5,8 @@ Subject: [PATCH] xfs: AIL needs asynchronous CIL forcing
 Git-commit: 0020a190cf3eac16995143db41b21b82bacdcbe3
 Patch-mainline: v5.15-rc1
 References: bsn#12
-Modified-by-SEL: Yes, modified according to openEuler commit 854c6d59b4f8e1f237e61f3f314e4e5ced3890a1
+Modified-by-SEL: No
+
 
 The AIL pushing is stalling on log forces when it comes across
 pinned items. This is happening on removal workloads where the AIL
@@ -102,27 +103,24 @@ Signed-off-by: Dave Chinner <dchinner@redhat.com>
 Reviewed-by: Darrick J. Wong <djwong@kernel.org>
 Reviewed-by: Allison Henderson <allison.henderson@oracle.com>
 Signed-off-by: Darrick J. Wong <djwong@kernel.org>
-Signed-off-by: Lihong Kou <koulihong@huawei.com>
-Reviewed-by: Zhang Yi <yi.zhang@huawei.com>
-Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
 Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
 Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 ---
- fs/xfs/xfs_log.c       | 38 +++++++++++++-----------
+ fs/xfs/xfs_log.c       | 38 ++++++++++++++------------
  fs/xfs/xfs_log.h       |  1 +
- fs/xfs/xfs_log_cil.c   | 65 ++++++++++++++++++++++++++++++++++++------
+ fs/xfs/xfs_log_cil.c   | 62 ++++++++++++++++++++++++++++++++++++------
  fs/xfs/xfs_log_priv.h  |  4 +++
  fs/xfs/xfs_sysfs.c     |  1 +
  fs/xfs/xfs_trace.c     |  1 +
  fs/xfs/xfs_trans.c     |  2 +-
- fs/xfs/xfs_trans_ail.c | 11 +++++--
- 8 files changed, 94 insertions(+), 29 deletions(-)
+ fs/xfs/xfs_trans_ail.c | 11 ++++++--
+ 8 files changed, 91 insertions(+), 29 deletions(-)
 
 diff --git a/fs/xfs/xfs_log.c b/fs/xfs/xfs_log.c
-index 205bce9cf6f9..b9f2ad4e8345 100644
+index 098f5c8ceb29..c738e8c79efa 100644
 --- a/fs/xfs/xfs_log.c
 +++ b/fs/xfs/xfs_log.c
-@@ -50,11 +50,6 @@ xlog_state_get_iclog_space(
+@@ -52,11 +52,6 @@ xlog_state_get_iclog_space(
  	int			*continued_write,
  	int			*logoffsetp);
  STATIC void
@@ -134,7 +132,7 @@ index 205bce9cf6f9..b9f2ad4e8345 100644
  xlog_grant_push_ail(
  	struct xlog		*log,
  	int			need_bytes);
-@@ -3020,7 +3015,7 @@ xfs_log_ticket_ungrant(
+@@ -3174,7 +3169,7 @@ xfs_log_ticket_ungrant(
   * This routine will mark the current iclog in the ring as WANT_SYNC and move
   * the current iclog pointer to the next iclog in the ring.
   */
@@ -143,7 +141,7 @@ index 205bce9cf6f9..b9f2ad4e8345 100644
  xlog_state_switch_iclogs(
  	struct xlog		*log,
  	struct xlog_in_core	*iclog,
-@@ -3192,6 +3187,20 @@ xfs_log_force(
+@@ -3346,6 +3341,20 @@ xfs_log_force(
  	return -EIO;
  }
  
@@ -164,7 +162,7 @@ index 205bce9cf6f9..b9f2ad4e8345 100644
  static int
  xlog_force_lsn(
  	struct xlog		*log,
-@@ -3277,18 +3286,13 @@ xlog_force_lsn(
+@@ -3431,18 +3440,13 @@ xlog_force_lsn(
  }
  
  /*
@@ -190,7 +188,7 @@ index 205bce9cf6f9..b9f2ad4e8345 100644
  int
  xfs_log_force_seq(
 diff --git a/fs/xfs/xfs_log.h b/fs/xfs/xfs_log.h
-index 93fbb8fbbc8c..66bd673344a8 100644
+index 8431a2f4bd13..dc1b77b92fc1 100644
 --- a/fs/xfs/xfs_log.h
 +++ b/fs/xfs/xfs_log.h
 @@ -104,6 +104,7 @@ struct xlog_ticket;
@@ -202,10 +200,10 @@ index 93fbb8fbbc8c..66bd673344a8 100644
  int	  xfs_log_force(struct xfs_mount *mp, uint flags);
  int	  xfs_log_force_seq(struct xfs_mount *mp, xfs_csn_t seq, uint flags,
 diff --git a/fs/xfs/xfs_log_cil.c b/fs/xfs/xfs_log_cil.c
-index 4e41130f206f..f31e72f5cd2c 100644
+index f6c4e4e8f112..59d3bd45543b 100644
 --- a/fs/xfs/xfs_log_cil.c
 +++ b/fs/xfs/xfs_log_cil.c
-@@ -667,6 +667,7 @@ xlog_cil_push_work(
+@@ -840,6 +840,7 @@ xlog_cil_push_work(
  	xfs_csn_t		push_seq;
  	struct bio		bio;
  	DECLARE_COMPLETION_ONSTACK(bdev_flush);
@@ -213,7 +211,7 @@ index 4e41130f206f..f31e72f5cd2c 100644
  
  	new_ctx = kmem_zalloc(sizeof(*new_ctx), KM_NOFS);
  	new_ctx->ticket = xlog_cil_ticket_alloc(log);
-@@ -677,6 +678,8 @@ xlog_cil_push_work(
+@@ -850,6 +851,8 @@ xlog_cil_push_work(
  	spin_lock(&cil->xc_push_lock);
  	push_seq = cil->xc_push_seq;
  	ASSERT(push_seq <= ctx->sequence);
@@ -222,7 +220,7 @@ index 4e41130f206f..f31e72f5cd2c 100644
  
  	/*
  	 * As we are about to switch to a new, empty CIL context, we no longer
-@@ -956,9 +959,20 @@ xlog_cil_push_work(
+@@ -1066,8 +1069,16 @@ xlog_cil_push_work(
  	 * The commit iclog must be written to stable storage to guarantee
  	 * journal IO vs metadata writeback IO is correctly ordered on stable
  	 * storage.
@@ -232,18 +230,14 @@ index 4e41130f206f..f31e72f5cd2c 100644
 +	 * will be written when released, switch it's state to WANT_SYNC right
 +	 * now.
  	 */
- 	commit_iclog->ic_flags |= XLOG_ICL_NEED_FUA;
+ 	ctx->commit_iclog->ic_flags |= XLOG_ICL_NEED_FUA;
 +	if (push_commit_stable &&
-+	    commit_iclog->ic_state == XLOG_STATE_ACTIVE)
-+		xlog_state_switch_iclogs(log, commit_iclog, 0);
- 	xlog_state_release_iclog(log, commit_iclog, preflush_tail_lsn);
-+
-+	/* Not safe to reference ctx now! */
-+
- 	spin_unlock(&log->l_icloglock);
- 	return;
++	    ctx->commit_iclog->ic_state == XLOG_STATE_ACTIVE)
++		xlog_state_switch_iclogs(log, ctx->commit_iclog, 0);
+ 	xlog_state_release_iclog(log, ctx->commit_iclog, preflush_tail_lsn);
  
-@@ -1042,13 +1056,26 @@ xlog_cil_push_background(
+ 	/* Not safe to reference ctx now! */
+@@ -1161,13 +1172,26 @@ xlog_cil_push_background(
  /*
   * xlog_cil_push_now() is used to trigger an immediate CIL push to the sequence
   * number that is passed. When it returns, the work will be queued for
@@ -273,7 +267,7 @@ index 4e41130f206f..f31e72f5cd2c 100644
  {
  	struct xfs_cil	*cil = log->l_cilp;
  
-@@ -1058,7 +1085,8 @@ xlog_cil_push_now(
+@@ -1177,7 +1201,8 @@ xlog_cil_push_now(
  	ASSERT(push_seq && push_seq <= cil->xc_current_sequence);
  
  	/* start on any pending background push to minimise wait time on it */
@@ -283,7 +277,7 @@ index 4e41130f206f..f31e72f5cd2c 100644
  
  	/*
  	 * If the CIL is empty or we've already pushed the sequence then
-@@ -1071,6 +1099,7 @@ xlog_cil_push_now(
+@@ -1190,6 +1215,7 @@ xlog_cil_push_now(
  	}
  
  	cil->xc_push_seq = push_seq;
@@ -291,7 +285,7 @@ index 4e41130f206f..f31e72f5cd2c 100644
  	queue_work(log->l_mp->m_cil_workqueue, &cil->xc_push_work);
  	spin_unlock(&cil->xc_push_lock);
  }
-@@ -1155,12 +1184,27 @@ xlog_cil_commit(
+@@ -1274,12 +1300,27 @@ xlog_cil_commit(
  	xlog_cil_push_background(log);
  }
  
@@ -322,7 +316,7 @@ index 4e41130f206f..f31e72f5cd2c 100644
   *
   * We return the current commit lsn to allow the callers to determine if a
   * iclog flush is necessary following this call.
-@@ -1176,13 +1220,17 @@ xlog_cil_force_seq(
+@@ -1295,13 +1336,17 @@ xlog_cil_force_seq(
  
  	ASSERT(sequence <= cil->xc_current_sequence);
  
@@ -341,7 +335,7 @@ index 4e41130f206f..f31e72f5cd2c 100644
  
  	/*
  	 * See if we can find a previous sequence still committing.
-@@ -1206,6 +1254,7 @@ xlog_cil_force_seq(
+@@ -1325,6 +1370,7 @@ xlog_cil_force_seq(
  			 * It is still being pushed! Wait for the push to
  			 * complete, then start again from the beginning.
  			 */
@@ -350,18 +344,18 @@ index 4e41130f206f..f31e72f5cd2c 100644
  			goto restart;
  		}
 diff --git a/fs/xfs/xfs_log_priv.h b/fs/xfs/xfs_log_priv.h
-index 7cbde0b4f990..90fee866c613 100644
+index 1ed299803904..014e0dc0ba97 100644
 --- a/fs/xfs/xfs_log_priv.h
 +++ b/fs/xfs/xfs_log_priv.h
-@@ -280,6 +280,7 @@ struct xfs_cil {
+@@ -277,6 +277,7 @@ struct xfs_cil {
  
  	spinlock_t		xc_push_lock ____cacheline_aligned_in_smp;
  	xfs_csn_t		xc_push_seq;
 +	bool			xc_push_commit_stable;
  	struct list_head	xc_committing;
  	wait_queue_head_t	xc_commit_wait;
- 	xfs_csn_t		xc_current_sequence;
-@@ -497,6 +498,8 @@ int	xlog_commit_record(struct xlog *log, struct xlog_ticket *ticket,
+ 	wait_queue_head_t	xc_start_wait;
+@@ -520,6 +521,8 @@ int	xlog_write(struct xlog *log, struct xfs_cil_ctx *ctx,
  void	xfs_log_ticket_ungrant(struct xlog *log, struct xlog_ticket *ticket);
  void	xfs_log_ticket_regrant(struct xlog *log, struct xlog_ticket *ticket);
  
@@ -370,7 +364,7 @@ index 7cbde0b4f990..90fee866c613 100644
  int xlog_state_release_iclog(struct xlog *log, struct xlog_in_core *iclog,
  		xfs_lsn_t log_tail_lsn);
  
-@@ -568,6 +571,7 @@ void	xlog_cil_commit(struct xlog *log, struct xfs_trans *tp,
+@@ -594,6 +597,7 @@ void	xlog_cil_set_ctx_write_state(struct xfs_cil_ctx *ctx,
  /*
   * CIL force routines
   */
@@ -391,7 +385,7 @@ index f1bc88f4367c..18dc5eca6c04 100644
  #include "xfs_mount.h"
  
 diff --git a/fs/xfs/xfs_trace.c b/fs/xfs/xfs_trace.c
-index 9b8d703dc9fd..d111a994b7b6 100644
+index 7e01e00550ac..4c86afad1617 100644
 --- a/fs/xfs/xfs_trace.c
 +++ b/fs/xfs/xfs_trace.c
 @@ -20,6 +20,7 @@
@@ -403,7 +397,7 @@ index 9b8d703dc9fd..d111a994b7b6 100644
  #include "xfs_buf_item.h"
  #include "xfs_quota.h"
 diff --git a/fs/xfs/xfs_trans.c b/fs/xfs/xfs_trans.c
-index ac2a1eb74a4f..3d1c4a4cb16e 100644
+index b52394b0e1f4..70868f8b5911 100644
 --- a/fs/xfs/xfs_trans.c
 +++ b/fs/xfs/xfs_trans.c
 @@ -9,7 +9,6 @@
@@ -459,5 +453,5 @@ index dbb69b4bf3ed..69aac416e2ce 100644
  
  	spin_lock(&ailp->ail_lock);
 -- 
-2.31.1
+2.26.2
 

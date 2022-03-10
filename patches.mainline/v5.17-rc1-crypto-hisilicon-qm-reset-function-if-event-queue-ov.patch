@@ -1,0 +1,136 @@
+From 95f0b6d536374ea1796bd0d9024faaca9c4f3380 Mon Sep 17 00:00:00 2001
+From: Weili Qian <qianweili@huawei.com>
+Date: Sat, 11 Dec 2021 19:25:18 +0800
+Subject: [PATCH] crypto: hisilicon/qm - reset function if event queue
+ overflows
+Git-commit: 95f0b6d536374ea1796bd0d9024faaca9c4f3380
+Patch-mainline: v5.17-rc1
+References: bsn#12
+Modified-by-SEL: Yes, refreshed due to different context
+
+
+If the hardware reports the event queue overflow by the abnormal interrupt,
+the driver needs to reset the function and re-enable the event queue
+interrupt and abnormal interrupt.
+
+Signed-off-by: Weili Qian <qianweili@huawei.com>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/crypto/hisilicon/qm.c |   68 +++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 57 insertions(+), 11 deletions(-)
+
+--- a/drivers/crypto/hisilicon/qm.c
++++ b/drivers/crypto/hisilicon/qm.c
+@@ -89,6 +89,7 @@
+ 
+ #define QM_AEQE_PHASE(aeqe)		((le32_to_cpu((aeqe)->dw0) >> 16) & 0x1)
+ #define QM_AEQE_TYPE_SHIFT		17
++#define QM_EQ_OVERFLOW			1
+ 
+ #define QM_DOORBELL_CMD_SQ		0
+ #define QM_DOORBELL_CMD_CQ		1
+@@ -952,6 +953,35 @@ static irqreturn_t qm_mb_cmd_irq(int irq
+ 	return IRQ_HANDLED;
+ }
+ 
++static void qm_reset_function(struct hisi_qm *qm)
++{
++	struct hisi_qm *pf_qm = pci_get_drvdata(pci_physfn(qm->pdev));
++	struct device *dev = &qm->pdev->dev;
++	int ret;
++
++	if (qm_check_dev_error(pf_qm))
++		return;
++
++	ret = qm_reset_prepare_ready(qm);
++	if (ret) {
++		dev_err(dev, "reset function not ready\n");
++		return;
++	}
++
++	ret = hisi_qm_stop(qm, QM_FLR);
++	if (ret) {
++		dev_err(dev, "failed to stop qm when reset function\n");
++		goto clear_bit;
++	}
++
++	ret = hisi_qm_start(qm);
++	if (ret)
++		dev_err(dev, "failed to start qm when reset function\n");
++
++clear_bit:
++	qm_reset_bit_clear(qm);
++}
++
+ static irqreturn_t qm_aeq_thread(int irq, void *data)
+ {
+ 	struct hisi_qm *qm = data;
+@@ -960,12 +990,17 @@ static irqreturn_t qm_aeq_thread(int irq
+ 
+ 	while (QM_AEQE_PHASE(aeqe) == qm->status.aeqc_phase) {
+ 		type = le32_to_cpu(aeqe->dw0) >> QM_AEQE_TYPE_SHIFT;
+-		if (type < ARRAY_SIZE(qm_fifo_overflow))
+-			dev_err(&qm->pdev->dev, "%s overflow\n",
+-				qm_fifo_overflow[type]);
+-		else
++
++		switch (type) {
++		case QM_EQ_OVERFLOW:
++			dev_err(&qm->pdev->dev, "eq overflow, reset function\n");
++			qm_reset_function(qm);
++			return IRQ_HANDLED;
++		default:
+ 			dev_err(&qm->pdev->dev, "unknown error type %u\n",
+ 				type);
++			break;
++		}
+ 
+ 		if (qm->status.aeq_head == QM_Q_DEPTH - 1) {
+ 			qm->status.aeqc_phase = !qm->status.aeqc_phase;
+@@ -3484,6 +3519,22 @@ static void qm_init_eq_aeq_status(struct
+ 	status->aeqc_phase = true;
+ }
+ 
++static void qm_enable_eq_aeq_interrupts(struct hisi_qm *qm)
++{
++	/* Clear eq/aeq interrupt source */
++	qm_db(qm, 0, QM_DOORBELL_CMD_AEQ, qm->status.aeq_head, 0);
++	qm_db(qm, 0, QM_DOORBELL_CMD_EQ, qm->status.eq_head, 0);
++
++	writel(0x0, qm->io_base + QM_VF_EQ_INT_MASK);
++	writel(0x0, qm->io_base + QM_VF_AEQ_INT_MASK);
++}
++
++static void qm_disable_eq_aeq_interrupts(struct hisi_qm *qm)
++{
++	writel(0x1, qm->io_base + QM_VF_EQ_INT_MASK);
++	writel(0x1, qm->io_base + QM_VF_AEQ_INT_MASK);
++}
++
+ static int qm_eq_ctx_cfg(struct hisi_qm *qm)
+ {
+ 	struct device *dev = &qm->pdev->dev;
+@@ -3585,9 +3636,7 @@ static int __hisi_qm_start(struct hisi_q
+ 		return ret;
+ 
+ 	qm_init_prefetch(qm);
+-
+-	writel(0x0, qm->io_base + QM_VF_EQ_INT_MASK);
+-	writel(0x0, qm->io_base + QM_VF_AEQ_INT_MASK);
++	qm_enable_eq_aeq_interrupts(qm);
+ 
+ 	return 0;
+ }
+@@ -3733,10 +3782,7 @@ int hisi_qm_stop(struct hisi_qm *qm, enu
+ 		}
+ 	}
+ 
+-	/* Mask eq and aeq irq */
+-	writel(0x1, qm->io_base + QM_VF_EQ_INT_MASK);
+-	writel(0x1, qm->io_base + QM_VF_AEQ_INT_MASK);
+-
++	qm_disable_eq_aeq_interrupts(qm);
+ 	if (qm->fun_type == QM_HW_PF) {
+ 		ret = hisi_qm_set_vft(qm, 0, 0, 0);
+ 		if (ret < 0) {

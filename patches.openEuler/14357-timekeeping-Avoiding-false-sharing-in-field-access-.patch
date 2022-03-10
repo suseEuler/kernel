@@ -1,0 +1,215 @@
+From ee0afb75f8d2909203478c33daf5ff85d35fa6c8 Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Tue, 8 Mar 2022 22:06:02 +0800
+Subject: [PATCH] timekeeping: Avoiding false sharing in field access of
+ tk_core
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: ee0afb75f8d2909203478c33daf5ff85d35fa6c8
+Modified-by-SEL: No
+
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I47W8L
+CVE: NA
+
+---------------------------
+
+We detect a performance deterioration when using Unixbench, we use the dichotomy to
+locate the patch 7e66740ad725 ("MPAM / ACPI: Refactoring MPAM init process and set
+MPAM ACPI as entrance"), In comparing two commit df5defd901ff ("KVM: X86: MMU: Use
+the correct inherited permissions to get shadow page") and ac4dbb7554ef ("ACPI 6.x:
+Add definitions for MPAM table") we get following testing result:
+
+CMD: ./Run -c xx context1
+RESULT:
++-------------UnixBench context1-----------+
++---------+--------------+-----------------+
++         + ac4dbb7554ef +  df5defd901ff   +
++---------+--------------+---------+-------+
++  Cores  +    Score     +      Score      +
++---------+--------------+-----------------+
++    1    +    522.8     +      535.7      +
++---------+--------------+-----------------+
++   24    +   11231.5    +     12111.2     +
++---------+--------------+-----------------+
++   48    +   8535.1     +     8745.1      +
++---------+--------------+-----------------+
++   72    +   10821.9    +     10343.8     +
++---------+--------------+-----------------+
++   96    +   15238.5    +     42947.8     +
++---------+--------------+-----------------+
+
+We found a irrefutable difference in latency sampling when using the perf tool:
+
+HEAD:ac4dbb7554ef                                   HEAD:df5defd901ff
+
+45.18% [kernel] [k] ktime_get_coarse_real_ts64  ->  1.78% [kernel] [k] ktime_get_coarse_real_ts64
+                                                                               ...
+                                                                       65.87 │ dmb ishld //smp_rmb()
+
+Through ftrace we get the calltrace and and detected the number of visits of
+ktime_get_coarse_real_ts64, which frequently visits tk_core->seq and
+tk_core->timekeeper->tkr_mono:
+
+-   48.86%  [kernel]                 [k] ktime_get_coarse_real_ts64
+   - 5.76% ktime_get_coarse_real_ts64   #about 111437657 times per 10 seconds
+      - 14.70% __audit_syscall_entry
+           syscall_trace_enter
+           el0_svc_common
+           el0_svc_handler
+         + el0_svc
+      - 2.85% current_time
+
+So this may be performance degradation caused by interference when happened different
+fields access, We compare .bss and .data section of this two version:
+
+    HEAD:ac4dbb7554ef
+`->
+    ffff00000962e680 l     O .bss   0000000000000110 tk_core
+    ffff000009355680 l     O .data  0000000000000078 tk_fast_mono
+    ffff0000093557a0 l     O .data  0000000000000090 dummy_clock
+    ffff000009355700 l     O .data  0000000000000078 tk_fast_raw
+    ffff000009355778 l     O .data  0000000000000028 timekeeping_syscore_ops
+    ffff00000962e640 l     O .bss   0000000000000008 cycles_at_suspend
+
+    HEAD:df5defd901ff
+`->
+    ffff00000957dbc0 l     O .bss   0000000000000110 tk_core
+    ffff0000092b4e80 l     O .data  0000000000000078 tk_fast_mono
+    ffff0000092b4fa0 l     O .data  0000000000000090 dummy_clock
+    ffff0000092b4f00 l     O .data  0000000000000078 tk_fast_raw
+    ffff0000092b4f78 l     O .data  0000000000000028 timekeeping_syscore_ops
+    ffff00000957db80 l     O .bss   0000000000000008 cycles_at_suspend
+
+By comparing this two version tk_core's address: ffff00000962e680 is 128Byte aligned
+but latter df5defd901ff is 64Byte aligned, the memory storage layout of tk_core has
+undergone subtle changes:
+
+    HEAD:ac4dbb7554ef
+`->                     |<--------formmer 64Bytes---------->|<------------latter 64Byte------------->|
+    0xffff00000957dbc0_>|<-seq 8Bytes->|<-tkr_mono 56Bytes->|<-thr_raw 56Bytes->|<-xtime_sec 8Bytes->|
+    0xffff00000957dc00_>...
+
+    HEAD:df5defd901ff
+`->                     |<------formmer 64Bytes---->|<------------latter 64Byte-------->|
+    0xffff00000962e680_>|<-Other variables 64Bytes->|<-seq 8Bytes->|<-tkr_mono 56Bytes->|
+    0xffff00000962e6c0_>..
+
+We testified thr_raw,xtime_sec fields interfere strongly with seq,tkr_mono field because of
+frequent load/store operation, this will cause as known false sharing.
+
+We add a 64Bytes padding field in tk_core for reservation of any after usefull usage and
+keep tk_core 128Byte aligned, this can avoid changes in the way tk_core's layout is stored,
+In this solution, layout of tk_core always like this:
+
+crash>  struct -o tk_core_t
+struct tk_core_t {
+    [0] u64 padding[8];
+   [64] seqcount_t seq;
+   [72] struct timekeeper timekeeper;
+}
+SIZE: 336
+crash> struct -o timekeeper
+struct timekeeper {
+    [0] struct tk_read_base tkr_mono;
+   [56] struct tk_read_base tkr_raw;
+  [112] u64 xtime_sec;
+  [120] unsigned long ktime_sec;
+  ...
+}
+SIZE: 264
+
+After appling our own solution:
+
++---------+--------------+
++         + Our solution +
++---------+--------------+
++  Cores  +    Score     +
++---------+--------------+
++    1    +    548.9     +
++---------+--------------+
++   24    +   11018.3    +
++---------+--------------+
++   48    +   8938.2     +
++---------+--------------+
++   72    +   14610.7    +
++---------+--------------+
++   96    +   40811.7    +
++---------+--------------+
+
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Reviewed-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/Kconfig             | 9 +++++++++
+ arch/arm64/include/asm/cache.h | 6 ++++++
+ kernel/time/timekeeping.c      | 7 +++++++
+ 3 files changed, 22 insertions(+)
+
+diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
+index c0f6a275f798..9c6ad627ba4f 100644
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -1155,6 +1155,15 @@ config ARCH_WANT_HUGE_PMD_SHARE
+ config ARCH_HAS_CACHE_LINE_SIZE
+ 	def_bool y
+ 
++config ARCH_LLC_128_LINE_SIZE
++	bool "Force 128 bytes alignment for fitting LLC cacheline"
++	depends on ARM64
++	default y
++	help
++	  As specific machine's LLC cacheline size may be up to
++	  128 bytes, gaining performance improvement from fitting
++	  128 Bytes LLC cache aligned.
++
+ config ARCH_HAS_FILTER_PGPROT
+ 	def_bool y
+ 
+diff --git a/arch/arm64/include/asm/cache.h b/arch/arm64/include/asm/cache.h
+index cf8e78585865..f7e1d1bb8172 100644
+--- a/arch/arm64/include/asm/cache.h
++++ b/arch/arm64/include/asm/cache.h
+@@ -31,6 +31,12 @@
+ #define L1_CACHE_SHIFT		(6)
+ #define L1_CACHE_BYTES		(1 << L1_CACHE_SHIFT)
+ 
++#ifdef CONFIG_ARCH_LLC_128_LINE_SIZE
++#ifndef ____cacheline_aligned_128
++#define ____cacheline_aligned_128  __attribute__((__aligned__(128)))
++#endif
++#endif
++
+ 
+ #define CLIDR_LOUU_SHIFT	27
+ #define CLIDR_LOC_SHIFT		24
+diff --git a/kernel/time/timekeeping.c b/kernel/time/timekeeping.c
+index cc4dc2857a87..72cad9bf19d7 100644
+--- a/kernel/time/timekeeping.c
++++ b/kernel/time/timekeeping.c
+@@ -46,9 +46,16 @@ DEFINE_RAW_SPINLOCK(timekeeper_lock);
+  * cache line.
+  */
+ static struct {
++#ifdef CONFIG_ARCH_LLC_128_LINE_SIZE
++	u64		padding[8];
++#endif
+ 	seqcount_raw_spinlock_t	seq;
+ 	struct timekeeper	timekeeper;
++#ifdef CONFIG_ARCH_LLC_128_LINE_SIZE
++} tk_core ____cacheline_aligned_128 = {
++#else
+ } tk_core ____cacheline_aligned = {
++#endif
+ 	.seq = SEQCNT_RAW_SPINLOCK_ZERO(tk_core.seq, &timekeeper_lock),
+ };
+ 
+-- 
+2.26.2
+

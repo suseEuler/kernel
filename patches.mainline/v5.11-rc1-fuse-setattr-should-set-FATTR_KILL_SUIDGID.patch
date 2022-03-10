@@ -1,0 +1,80 @@
+From 3179216135ec09825d7c7875580951a6e69dc5df Mon Sep 17 00:00:00 2001
+From: Vivek Goyal <vgoyal@redhat.com>
+Date: Fri, 9 Oct 2020 14:15:09 -0400
+Subject: [PATCH] fuse: setattr should set FATTR_KILL_SUIDGID
+Git-commit: 3179216135ec09825d7c7875580951a6e69dc5df
+Patch-mainline: v5.11-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+If fc->handle_killpriv_v2 is enabled, we expect file server to clear
+suid/sgid/security.capbility upon chown/truncate/write as appropriate.
+
+Upon truncate (ATTR_SIZE), suid/sgid are cleared only if caller does not
+have CAP_FSETID.  File server does not know whether caller has CAP_FSETID
+or not.  Hence set FATTR_KILL_SUIDGID upon truncate to let file server know
+that caller does not have CAP_FSETID and it should kill suid/sgid as
+appropriate.
+
+On chown (ATTR_UID/ATTR_GID) suid/sgid need to be cleared irrespective of
+capabilities of calling process, so set FATTR_KILL_SUIDGID unconditionally
+in that case.
+
+Signed-off-by: Vivek Goyal <vgoyal@redhat.com>
+Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/fuse/dir.c             | 10 ++++++++++
+ include/uapi/linux/fuse.h |  3 ++-
+ 2 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/fs/fuse/dir.c b/fs/fuse/dir.c
+index c3e22a3dd323..28b07ae5e55f 100644
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -1648,10 +1648,20 @@ int fuse_do_setattr(struct dentry *dentry, struct iattr *attr,
+ 		inarg.valid |= FATTR_FH;
+ 		inarg.fh = ff->fh;
+ 	}
++
++	/* Kill suid/sgid for non-directory chown unconditionally */
++	if (fc->handle_killpriv_v2 && !S_ISDIR(inode->i_mode) &&
++	    attr->ia_valid & (ATTR_UID | ATTR_GID))
++		inarg.valid |= FATTR_KILL_SUIDGID;
++
+ 	if (attr->ia_valid & ATTR_SIZE) {
+ 		/* For mandatory locking in truncate */
+ 		inarg.valid |= FATTR_LOCKOWNER;
+ 		inarg.lock_owner = fuse_lock_owner_id(fc, current->files);
++
++		/* Kill suid/sgid for truncate only if no CAP_FSETID */
++		if (fc->handle_killpriv_v2 && !capable(CAP_FSETID))
++			inarg.valid |= FATTR_KILL_SUIDGID;
+ 	}
+ 	fuse_setattr_fill(fc, &args, inode, &inarg, &outarg);
+ 	err = fuse_simple_request(fm, &args);
+diff --git a/include/uapi/linux/fuse.h b/include/uapi/linux/fuse.h
+index 2623c75b94a5..9eb96e0564be 100644
+--- a/include/uapi/linux/fuse.h
++++ b/include/uapi/linux/fuse.h
+@@ -177,7 +177,7 @@
+  *  - add flags to fuse_attr, add FUSE_ATTR_SUBMOUNT, add FUSE_SUBMOUNTS
+  *
+  *  7.33
+- *  - add FUSE_HANDLE_KILLPRIV_V2, FUSE_WRITE_KILL_SUIDGID
++ *  - add FUSE_HANDLE_KILLPRIV_V2, FUSE_WRITE_KILL_SUIDGID, FATTR_KILL_SUIDGID
+  */
+ 
+ #ifndef _LINUX_FUSE_H
+@@ -274,6 +274,7 @@ struct fuse_file_lock {
+ #define FATTR_MTIME_NOW	(1 << 8)
+ #define FATTR_LOCKOWNER	(1 << 9)
+ #define FATTR_CTIME	(1 << 10)
++#define FATTR_KILL_SUIDGID	(1 << 11)
+ 
+ /**
+  * Flags returned by the OPEN request
+-- 
+2.26.2
+

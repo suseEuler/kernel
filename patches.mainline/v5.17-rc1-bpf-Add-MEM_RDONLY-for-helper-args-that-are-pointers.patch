@@ -1,0 +1,527 @@
+From c33ae9a02ec81185e967f54289f2f1c996d84f10 Mon Sep 17 00:00:00 2001
+From: Hao Luo <haoluo@google.com>
+Date: Tue, 8 Mar 2022 22:06:23 +0800
+Subject: [PATCH] bpf: Add MEM_RDONLY for helper args that are pointers to
+ rdonly mem.
+Git-commit: 216e3cd2f28dbbf1fe86848e0e29e6693b9f0a20
+Patch-mainline: v5.17-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified per openEuler commit c33ae9a02ec81185e967f54289f2f1c996d84f10
+
+
+Some helper functions may modify its arguments, for example,
+bpf_d_path, bpf_get_stack etc. Previously, their argument types
+were marked as ARG_PTR_TO_MEM, which is compatible with read-only
+mem types, such as PTR_TO_RDONLY_BUF. Therefore it's legitimate,
+but technically incorrect, to modify a read-only memory by passing
+it into one of such helper functions.
+
+This patch tags the bpf_args compatible with immutable memory with
+MEM_RDONLY flag. The arguments that don't have this flag will be
+only compatible with mutable memory types, preventing the helper
+from modifying a read-only memory. The bpf_args that have
+MEM_RDONLY are compatible with both mutable memory and immutable
+memory.
+
+Signed-off-by: Hao Luo <haoluo@google.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20211217003152.48334-9-haoluo@google.com
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/bpf.h      |  4 ++-
+ kernel/bpf/cgroup.c      |  2 +-
+ kernel/bpf/helpers.c     |  6 ++--
+ kernel/bpf/ringbuf.c     |  2 +-
+ kernel/bpf/verifier.c    | 20 +++++++++++--
+ kernel/trace/bpf_trace.c | 22 +++++++-------
+ net/core/filter.c        | 62 ++++++++++++++++++++--------------------
+ 7 files changed, 67 insertions(+), 51 deletions(-)
+
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 3eb4dcb2655a..ea822e084793 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -268,7 +268,9 @@ enum bpf_type_flag {
+ 	/* PTR may be NULL. */
+ 	PTR_MAYBE_NULL		= BIT(0 + BPF_BASE_TYPE_BITS),
+ 
+-	/* MEM is read-only. */
++	/* MEM is read-only. When applied on bpf_arg, it indicates the arg is
++	 * compatible with both mutable and immutable memory.
++	 */
+ 	MEM_RDONLY		= BIT(1 + BPF_BASE_TYPE_BITS),
+ 
+ 	__BPF_TYPE_LAST_FLAG	= MEM_RDONLY,
+diff --git a/kernel/bpf/cgroup.c b/kernel/bpf/cgroup.c
+index 8f53be0558c1..7e1e5051468f 100644
+--- a/kernel/bpf/cgroup.c
++++ b/kernel/bpf/cgroup.c
+@@ -1703,7 +1703,7 @@ static const struct bpf_func_proto bpf_sysctl_set_new_value_proto = {
+ 	.gpl_only	= false,
+ 	.ret_type	= RET_INTEGER,
+ 	.arg1_type	= ARG_PTR_TO_CTX,
+-	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg2_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg3_type	= ARG_CONST_SIZE,
+ };
+ 
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 45e72c262caf..4bb5921a7d21 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -499,7 +499,7 @@ const struct bpf_func_proto bpf_strtol_proto = {
+ 	.func		= bpf_strtol,
+ 	.gpl_only	= false,
+ 	.ret_type	= RET_INTEGER,
+-	.arg1_type	= ARG_PTR_TO_MEM,
++	.arg1_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg2_type	= ARG_CONST_SIZE,
+ 	.arg3_type	= ARG_ANYTHING,
+ 	.arg4_type	= ARG_PTR_TO_LONG,
+@@ -527,7 +527,7 @@ const struct bpf_func_proto bpf_strtoul_proto = {
+ 	.func		= bpf_strtoul,
+ 	.gpl_only	= false,
+ 	.ret_type	= RET_INTEGER,
+-	.arg1_type	= ARG_PTR_TO_MEM,
++	.arg1_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg2_type	= ARG_CONST_SIZE,
+ 	.arg3_type	= ARG_ANYTHING,
+ 	.arg4_type	= ARG_PTR_TO_LONG,
+@@ -599,7 +599,7 @@ const struct bpf_func_proto bpf_event_output_data_proto =  {
+ 	.arg1_type      = ARG_PTR_TO_CTX,
+ 	.arg2_type      = ARG_CONST_MAP_PTR,
+ 	.arg3_type      = ARG_ANYTHING,
+-	.arg4_type      = ARG_PTR_TO_MEM,
++	.arg4_type      = ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg5_type      = ARG_CONST_SIZE_OR_ZERO,
+ };
+ 
+diff --git a/kernel/bpf/ringbuf.c b/kernel/bpf/ringbuf.c
+index f9913bc65ef8..e69d067f7e7f 100644
+--- a/kernel/bpf/ringbuf.c
++++ b/kernel/bpf/ringbuf.c
+@@ -463,7 +463,7 @@ const struct bpf_func_proto bpf_ringbuf_output_proto = {
+ 	.func		= bpf_ringbuf_output,
+ 	.ret_type	= RET_INTEGER,
+ 	.arg1_type	= ARG_CONST_MAP_PTR,
+-	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg2_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg3_type	= ARG_CONST_SIZE_OR_ZERO,
+ 	.arg4_type	= ARG_ANYTHING,
+ };
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index c8c71b9250f2..bd2349fb83fc 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -4365,7 +4365,6 @@ static const struct bpf_reg_types mem_types = {
+ 		PTR_TO_MAP_VALUE,
+ 		PTR_TO_MEM,
+ 		PTR_TO_BUF,
+-		PTR_TO_BUF | MEM_RDONLY,
+ 	},
+ };
+ 
+@@ -4426,6 +4425,21 @@ static int check_reg_type(struct bpf_verifier_env *env, u32 regno,
+ 		return -EFAULT;
+ 	}
+ 
++	/* ARG_PTR_TO_MEM + RDONLY is compatible with PTR_TO_MEM and PTR_TO_MEM + RDONLY,
++	 * but ARG_PTR_TO_MEM is compatible only with PTR_TO_MEM and NOT with PTR_TO_MEM + RDONLY
++	 *
++	 * Same for MAYBE_NULL:
++	 *
++	 * ARG_PTR_TO_MEM + MAYBE_NULL is compatible with PTR_TO_MEM and PTR_TO_MEM + MAYBE_NULL,
++	 * but ARG_PTR_TO_MEM is compatible only with PTR_TO_MEM but NOT with PTR_TO_MEM + MAYBE_NULL
++	 *
++	 * Therefore we fold these flags depending on the arg_type before comparison.
++	 */
++	if (arg_type & MEM_RDONLY)
++		type &= ~MEM_RDONLY;
++	if (arg_type & PTR_MAYBE_NULL)
++		type &= ~PTR_MAYBE_NULL;
++
+ 	for (i = 0; i < ARRAY_SIZE(compatible->types); i++) {
+ 		expected = compatible->types[i];
+ 		if (expected == NOT_INIT)
+@@ -4435,14 +4449,14 @@ static int check_reg_type(struct bpf_verifier_env *env, u32 regno,
+ 			goto found;
+ 	}
+ 
+-	verbose(env, "R%d type=%s expected=", regno, reg_type_str(env, type));
++	verbose(env, "R%d type=%s expected=", regno, reg_type_str(env, reg->type));
+ 	for (j = 0; j + 1 < i; j++)
+ 		verbose(env, "%s, ", reg_type_str(env, compatible->types[j]));
+ 	verbose(env, "%s\n", reg_type_str(env, compatible->types[j]));
+ 	return -EACCES;
+ 
+ found:
+-	if (type == PTR_TO_BTF_ID) {
++	if (reg->type == PTR_TO_BTF_ID) {
+ 		if (!arg_btf_id) {
+ 			if (!compatible->btf_id) {
+ 				verbose(env, "verifier internal error: missing arg compatible BTF ID\n");
+diff --git a/kernel/trace/bpf_trace.c b/kernel/trace/bpf_trace.c
+index 1228e56853e0..b838148d73fc 100644
+--- a/kernel/trace/bpf_trace.c
++++ b/kernel/trace/bpf_trace.c
+@@ -342,7 +342,7 @@ static const struct bpf_func_proto bpf_probe_write_user_proto = {
+ 	.gpl_only	= true,
+ 	.ret_type	= RET_INTEGER,
+ 	.arg1_type	= ARG_ANYTHING,
+-	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg2_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg3_type	= ARG_CONST_SIZE,
+ };
+ 
+@@ -545,7 +545,7 @@ static const struct bpf_func_proto bpf_trace_printk_proto = {
+ 	.func		= bpf_trace_printk,
+ 	.gpl_only	= true,
+ 	.ret_type	= RET_INTEGER,
+-	.arg1_type	= ARG_PTR_TO_MEM,
++	.arg1_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg2_type	= ARG_CONST_SIZE,
+ };
+ 
+@@ -754,9 +754,9 @@ static const struct bpf_func_proto bpf_seq_printf_proto = {
+ 	.ret_type	= RET_INTEGER,
+ 	.arg1_type	= ARG_PTR_TO_BTF_ID,
+ 	.arg1_btf_id	= &btf_seq_file_ids[0],
+-	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg2_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg3_type	= ARG_CONST_SIZE,
+-	.arg4_type      = ARG_PTR_TO_MEM_OR_NULL,
++	.arg4_type      = ARG_PTR_TO_MEM | PTR_MAYBE_NULL | MEM_RDONLY,
+ 	.arg5_type      = ARG_CONST_SIZE_OR_ZERO,
+ };
+ 
+@@ -771,7 +771,7 @@ static const struct bpf_func_proto bpf_seq_write_proto = {
+ 	.ret_type	= RET_INTEGER,
+ 	.arg1_type	= ARG_PTR_TO_BTF_ID,
+ 	.arg1_btf_id	= &btf_seq_file_ids[0],
+-	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg2_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg3_type	= ARG_CONST_SIZE_OR_ZERO,
+ };
+ 
+@@ -795,7 +795,7 @@ static const struct bpf_func_proto bpf_seq_printf_btf_proto = {
+ 	.ret_type	= RET_INTEGER,
+ 	.arg1_type	= ARG_PTR_TO_BTF_ID,
+ 	.arg1_btf_id	= &btf_seq_file_ids[0],
+-	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg2_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg3_type	= ARG_CONST_SIZE_OR_ZERO,
+ 	.arg4_type	= ARG_ANYTHING,
+ };
+@@ -956,7 +956,7 @@ static const struct bpf_func_proto bpf_perf_event_output_proto = {
+ 	.arg1_type	= ARG_PTR_TO_CTX,
+ 	.arg2_type	= ARG_CONST_MAP_PTR,
+ 	.arg3_type	= ARG_ANYTHING,
+-	.arg4_type	= ARG_PTR_TO_MEM,
++	.arg4_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg5_type	= ARG_CONST_SIZE_OR_ZERO,
+ };
+ 
+@@ -1229,7 +1229,7 @@ const struct bpf_func_proto bpf_snprintf_btf_proto = {
+ 	.ret_type	= RET_INTEGER,
+ 	.arg1_type	= ARG_PTR_TO_MEM,
+ 	.arg2_type	= ARG_CONST_SIZE,
+-	.arg3_type	= ARG_PTR_TO_MEM,
++	.arg3_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg4_type	= ARG_CONST_SIZE,
+ 	.arg5_type	= ARG_ANYTHING,
+ };
+@@ -1404,7 +1404,7 @@ static const struct bpf_func_proto bpf_perf_event_output_proto_tp = {
+ 	.arg1_type	= ARG_PTR_TO_CTX,
+ 	.arg2_type	= ARG_CONST_MAP_PTR,
+ 	.arg3_type	= ARG_ANYTHING,
+-	.arg4_type	= ARG_PTR_TO_MEM,
++	.arg4_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg5_type	= ARG_CONST_SIZE_OR_ZERO,
+ };
+ 
+@@ -1626,7 +1626,7 @@ static const struct bpf_func_proto bpf_perf_event_output_proto_raw_tp = {
+ 	.arg1_type	= ARG_PTR_TO_CTX,
+ 	.arg2_type	= ARG_CONST_MAP_PTR,
+ 	.arg3_type	= ARG_ANYTHING,
+-	.arg4_type	= ARG_PTR_TO_MEM,
++	.arg4_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg5_type	= ARG_CONST_SIZE_OR_ZERO,
+ };
+ 
+@@ -1680,7 +1680,7 @@ static const struct bpf_func_proto bpf_get_stack_proto_raw_tp = {
+ 	.gpl_only	= true,
+ 	.ret_type	= RET_INTEGER,
+ 	.arg1_type	= ARG_PTR_TO_CTX,
+-	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg2_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg3_type	= ARG_CONST_SIZE_OR_ZERO,
+ 	.arg4_type	= ARG_ANYTHING,
+ };
+diff --git a/net/core/filter.c b/net/core/filter.c
+index 42d15942ce90..51514e41025e 100644
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -1712,7 +1712,7 @@ static const struct bpf_func_proto bpf_skb_store_bytes_proto = {
+ 	.ret_type	= RET_INTEGER,
+ 	.arg1_type	= ARG_PTR_TO_CTX,
+ 	.arg2_type	= ARG_ANYTHING,
+-	.arg3_type	= ARG_PTR_TO_MEM,
++	.arg3_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg4_type	= ARG_CONST_SIZE,
+ 	.arg5_type	= ARG_ANYTHING,
+ };
+@@ -2020,9 +2020,9 @@ static const struct bpf_func_proto bpf_csum_diff_proto = {
+ 	.gpl_only	= false,
+ 	.pkt_access	= true,
+ 	.ret_type	= RET_INTEGER,
+-	.arg1_type	= ARG_PTR_TO_MEM_OR_NULL,
++	.arg1_type	= ARG_PTR_TO_MEM | PTR_MAYBE_NULL | MEM_RDONLY,
+ 	.arg2_type	= ARG_CONST_SIZE_OR_ZERO,
+-	.arg3_type	= ARG_PTR_TO_MEM_OR_NULL,
++	.arg3_type	= ARG_PTR_TO_MEM | PTR_MAYBE_NULL | MEM_RDONLY,
+ 	.arg4_type	= ARG_CONST_SIZE_OR_ZERO,
+ 	.arg5_type	= ARG_ANYTHING,
+ };
+@@ -2560,7 +2560,7 @@ static const struct bpf_func_proto bpf_redirect_neigh_proto = {
+ 	.gpl_only	= false,
+ 	.ret_type	= RET_INTEGER,
+ 	.arg1_type	= ARG_ANYTHING,
+-	.arg2_type      = ARG_PTR_TO_MEM_OR_NULL,
++	.arg2_type      = ARG_PTR_TO_MEM | PTR_MAYBE_NULL | MEM_RDONLY,
+ 	.arg3_type      = ARG_CONST_SIZE_OR_ZERO,
+ 	.arg4_type	= ARG_ANYTHING,
+ };
+@@ -4177,7 +4177,7 @@ static const struct bpf_func_proto bpf_skb_event_output_proto = {
+ 	.arg1_type	= ARG_PTR_TO_CTX,
+ 	.arg2_type	= ARG_CONST_MAP_PTR,
+ 	.arg3_type	= ARG_ANYTHING,
+-	.arg4_type	= ARG_PTR_TO_MEM,
++	.arg4_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg5_type	= ARG_CONST_SIZE_OR_ZERO,
+ };
+ 
+@@ -4191,7 +4191,7 @@ const struct bpf_func_proto bpf_skb_output_proto = {
+ 	.arg1_btf_id	= &bpf_skb_output_btf_ids[0],
+ 	.arg2_type	= ARG_CONST_MAP_PTR,
+ 	.arg3_type	= ARG_ANYTHING,
+-	.arg4_type	= ARG_PTR_TO_MEM,
++	.arg4_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg5_type	= ARG_CONST_SIZE_OR_ZERO,
+ };
+ 
+@@ -4374,7 +4374,7 @@ static const struct bpf_func_proto bpf_skb_set_tunnel_key_proto = {
+ 	.gpl_only	= false,
+ 	.ret_type	= RET_INTEGER,
+ 	.arg1_type	= ARG_PTR_TO_CTX,
+-	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg2_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg3_type	= ARG_CONST_SIZE,
+ 	.arg4_type	= ARG_ANYTHING,
+ };
+@@ -4400,7 +4400,7 @@ static const struct bpf_func_proto bpf_skb_set_tunnel_opt_proto = {
+ 	.gpl_only	= false,
+ 	.ret_type	= RET_INTEGER,
+ 	.arg1_type	= ARG_PTR_TO_CTX,
+-	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg2_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg3_type	= ARG_CONST_SIZE,
+ };
+ 
+@@ -4570,7 +4570,7 @@ static const struct bpf_func_proto bpf_xdp_event_output_proto = {
+ 	.arg1_type	= ARG_PTR_TO_CTX,
+ 	.arg2_type	= ARG_CONST_MAP_PTR,
+ 	.arg3_type	= ARG_ANYTHING,
+-	.arg4_type	= ARG_PTR_TO_MEM,
++	.arg4_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg5_type	= ARG_CONST_SIZE_OR_ZERO,
+ };
+ 
+@@ -4584,7 +4584,7 @@ const struct bpf_func_proto bpf_xdp_output_proto = {
+ 	.arg1_btf_id	= &bpf_xdp_output_btf_ids[0],
+ 	.arg2_type	= ARG_CONST_MAP_PTR,
+ 	.arg3_type	= ARG_ANYTHING,
+-	.arg4_type	= ARG_PTR_TO_MEM,
++	.arg4_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg5_type	= ARG_CONST_SIZE_OR_ZERO,
+ };
+ 
+@@ -5000,7 +5000,7 @@ static const struct bpf_func_proto bpf_sock_addr_setsockopt_proto = {
+ 	.arg1_type	= ARG_PTR_TO_CTX,
+ 	.arg2_type	= ARG_ANYTHING,
+ 	.arg3_type	= ARG_ANYTHING,
+-	.arg4_type	= ARG_PTR_TO_MEM,
++	.arg4_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg5_type	= ARG_CONST_SIZE,
+ };
+ 
+@@ -5034,7 +5034,7 @@ static const struct bpf_func_proto bpf_sock_ops_setsockopt_proto = {
+ 	.arg1_type	= ARG_PTR_TO_CTX,
+ 	.arg2_type	= ARG_ANYTHING,
+ 	.arg3_type	= ARG_ANYTHING,
+-	.arg4_type	= ARG_PTR_TO_MEM,
++	.arg4_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg5_type	= ARG_CONST_SIZE,
+ };
+ 
+@@ -5209,7 +5209,7 @@ static const struct bpf_func_proto bpf_bind_proto = {
+ 	.gpl_only	= false,
+ 	.ret_type	= RET_INTEGER,
+ 	.arg1_type	= ARG_PTR_TO_CTX,
+-	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg2_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg3_type	= ARG_CONST_SIZE,
+ };
+ 
+@@ -5671,7 +5671,7 @@ static const struct bpf_func_proto bpf_lwt_in_push_encap_proto = {
+ 	.ret_type	= RET_INTEGER,
+ 	.arg1_type	= ARG_PTR_TO_CTX,
+ 	.arg2_type	= ARG_ANYTHING,
+-	.arg3_type	= ARG_PTR_TO_MEM,
++	.arg3_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg4_type	= ARG_CONST_SIZE
+ };
+ 
+@@ -5681,7 +5681,7 @@ static const struct bpf_func_proto bpf_lwt_xmit_push_encap_proto = {
+ 	.ret_type	= RET_INTEGER,
+ 	.arg1_type	= ARG_PTR_TO_CTX,
+ 	.arg2_type	= ARG_ANYTHING,
+-	.arg3_type	= ARG_PTR_TO_MEM,
++	.arg3_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg4_type	= ARG_CONST_SIZE
+ };
+ 
+@@ -5724,7 +5724,7 @@ static const struct bpf_func_proto bpf_lwt_seg6_store_bytes_proto = {
+ 	.ret_type	= RET_INTEGER,
+ 	.arg1_type	= ARG_PTR_TO_CTX,
+ 	.arg2_type	= ARG_ANYTHING,
+-	.arg3_type	= ARG_PTR_TO_MEM,
++	.arg3_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg4_type	= ARG_CONST_SIZE
+ };
+ 
+@@ -5812,7 +5812,7 @@ static const struct bpf_func_proto bpf_lwt_seg6_action_proto = {
+ 	.ret_type	= RET_INTEGER,
+ 	.arg1_type	= ARG_PTR_TO_CTX,
+ 	.arg2_type	= ARG_ANYTHING,
+-	.arg3_type	= ARG_PTR_TO_MEM,
++	.arg3_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg4_type	= ARG_CONST_SIZE
+ };
+ 
+@@ -6037,7 +6037,7 @@ static const struct bpf_func_proto bpf_skc_lookup_tcp_proto = {
+ 	.pkt_access	= true,
+ 	.ret_type	= RET_PTR_TO_SOCK_COMMON_OR_NULL,
+ 	.arg1_type	= ARG_PTR_TO_CTX,
+-	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg2_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg3_type	= ARG_CONST_SIZE,
+ 	.arg4_type	= ARG_ANYTHING,
+ 	.arg5_type	= ARG_ANYTHING,
+@@ -6056,7 +6056,7 @@ static const struct bpf_func_proto bpf_sk_lookup_tcp_proto = {
+ 	.pkt_access	= true,
+ 	.ret_type	= RET_PTR_TO_SOCKET_OR_NULL,
+ 	.arg1_type	= ARG_PTR_TO_CTX,
+-	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg2_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg3_type	= ARG_CONST_SIZE,
+ 	.arg4_type	= ARG_ANYTHING,
+ 	.arg5_type	= ARG_ANYTHING,
+@@ -6075,7 +6075,7 @@ static const struct bpf_func_proto bpf_sk_lookup_udp_proto = {
+ 	.pkt_access	= true,
+ 	.ret_type	= RET_PTR_TO_SOCKET_OR_NULL,
+ 	.arg1_type	= ARG_PTR_TO_CTX,
+-	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg2_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg3_type	= ARG_CONST_SIZE,
+ 	.arg4_type	= ARG_ANYTHING,
+ 	.arg5_type	= ARG_ANYTHING,
+@@ -6112,7 +6112,7 @@ static const struct bpf_func_proto bpf_xdp_sk_lookup_udp_proto = {
+ 	.pkt_access     = true,
+ 	.ret_type       = RET_PTR_TO_SOCKET_OR_NULL,
+ 	.arg1_type      = ARG_PTR_TO_CTX,
+-	.arg2_type      = ARG_PTR_TO_MEM,
++	.arg2_type      = ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg3_type      = ARG_CONST_SIZE,
+ 	.arg4_type      = ARG_ANYTHING,
+ 	.arg5_type      = ARG_ANYTHING,
+@@ -6135,7 +6135,7 @@ static const struct bpf_func_proto bpf_xdp_skc_lookup_tcp_proto = {
+ 	.pkt_access     = true,
+ 	.ret_type       = RET_PTR_TO_SOCK_COMMON_OR_NULL,
+ 	.arg1_type      = ARG_PTR_TO_CTX,
+-	.arg2_type      = ARG_PTR_TO_MEM,
++	.arg2_type      = ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg3_type      = ARG_CONST_SIZE,
+ 	.arg4_type      = ARG_ANYTHING,
+ 	.arg5_type      = ARG_ANYTHING,
+@@ -6158,7 +6158,7 @@ static const struct bpf_func_proto bpf_xdp_sk_lookup_tcp_proto = {
+ 	.pkt_access     = true,
+ 	.ret_type       = RET_PTR_TO_SOCKET_OR_NULL,
+ 	.arg1_type      = ARG_PTR_TO_CTX,
+-	.arg2_type      = ARG_PTR_TO_MEM,
++	.arg2_type      = ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg3_type      = ARG_CONST_SIZE,
+ 	.arg4_type      = ARG_ANYTHING,
+ 	.arg5_type      = ARG_ANYTHING,
+@@ -6177,7 +6177,7 @@ static const struct bpf_func_proto bpf_sock_addr_skc_lookup_tcp_proto = {
+ 	.gpl_only	= false,
+ 	.ret_type	= RET_PTR_TO_SOCK_COMMON_OR_NULL,
+ 	.arg1_type	= ARG_PTR_TO_CTX,
+-	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg2_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg3_type	= ARG_CONST_SIZE,
+ 	.arg4_type	= ARG_ANYTHING,
+ 	.arg5_type	= ARG_ANYTHING,
+@@ -6196,7 +6196,7 @@ static const struct bpf_func_proto bpf_sock_addr_sk_lookup_tcp_proto = {
+ 	.gpl_only	= false,
+ 	.ret_type	= RET_PTR_TO_SOCKET_OR_NULL,
+ 	.arg1_type	= ARG_PTR_TO_CTX,
+-	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg2_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg3_type	= ARG_CONST_SIZE,
+ 	.arg4_type	= ARG_ANYTHING,
+ 	.arg5_type	= ARG_ANYTHING,
+@@ -6215,7 +6215,7 @@ static const struct bpf_func_proto bpf_sock_addr_sk_lookup_udp_proto = {
+ 	.gpl_only	= false,
+ 	.ret_type	= RET_PTR_TO_SOCKET_OR_NULL,
+ 	.arg1_type	= ARG_PTR_TO_CTX,
+-	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg2_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg3_type	= ARG_CONST_SIZE,
+ 	.arg4_type	= ARG_ANYTHING,
+ 	.arg5_type	= ARG_ANYTHING,
+@@ -6528,9 +6528,9 @@ static const struct bpf_func_proto bpf_tcp_check_syncookie_proto = {
+ 	.pkt_access	= true,
+ 	.ret_type	= RET_INTEGER,
+ 	.arg1_type	= ARG_PTR_TO_BTF_ID_SOCK_COMMON,
+-	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg2_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg3_type	= ARG_CONST_SIZE,
+-	.arg4_type	= ARG_PTR_TO_MEM,
++	.arg4_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg5_type	= ARG_CONST_SIZE,
+ };
+ 
+@@ -6597,9 +6597,9 @@ static const struct bpf_func_proto bpf_tcp_gen_syncookie_proto = {
+ 	.pkt_access	= true,
+ 	.ret_type	= RET_INTEGER,
+ 	.arg1_type	= ARG_PTR_TO_BTF_ID_SOCK_COMMON,
+-	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg2_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg3_type	= ARG_CONST_SIZE,
+-	.arg4_type	= ARG_PTR_TO_MEM,
++	.arg4_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg5_type	= ARG_CONST_SIZE,
+ };
+ 
+@@ -6828,7 +6828,7 @@ static const struct bpf_func_proto bpf_sock_ops_store_hdr_opt_proto = {
+ 	.gpl_only	= false,
+ 	.ret_type	= RET_INTEGER,
+ 	.arg1_type	= ARG_PTR_TO_CTX,
+-	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg2_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
+ 	.arg3_type	= ARG_CONST_SIZE,
+ 	.arg4_type	= ARG_ANYTHING,
+ };
+-- 
+2.26.2
+

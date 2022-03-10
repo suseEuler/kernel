@@ -1,0 +1,304 @@
+From 326d641b8338bbaec5623e091a5249492d8c43ff Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Tue, 8 Mar 2022 22:06:14 +0800
+Subject: [PATCH] blk-mq: decrease pending_queues when it expires
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 326d641b8338bbaec5623e091a5249492d8c43ff
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: performance
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4S8DW
+
+---------------------------
+
+If pending_queues is increased once, it will only be decreased when
+nr_active is zero, and that will lead to the under-utilization of
+host tags because pending_queues is non-zero and the available
+tags for the queue will be max(host tags / active_queues, 4)
+instead of the needed tags of the queue.
+
+Fix it by adding an expiration time for the increasement of pending_queues,
+and decrease it when it expires, so pending_queues will be decreased
+to zero if there is no tag allocation failure, and the available tags
+for the queue will be the whole host tags.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Hou Tao <houtao1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ block/blk-mq-debugfs.c | 29 +++++++++++++++++++++++++++++
+ block/blk-mq-tag.c     | 34 +++++++++++++++++++++++++++++++---
+ block/blk-mq-tag.h     |  6 +++---
+ block/blk-mq.c         | 11 +++++++----
+ include/linux/blk-mq.h |  6 ++++++
+ include/linux/blkdev.h |  1 +
+ 6 files changed, 77 insertions(+), 10 deletions(-)
+
+diff --git a/block/blk-mq-debugfs.c b/block/blk-mq-debugfs.c
+index f7ababd06f77..f3a263a1bb43 100644
+--- a/block/blk-mq-debugfs.c
++++ b/block/blk-mq-debugfs.c
+@@ -224,6 +224,19 @@ static int queue_tag_set_show(void *data, struct seq_file *m)
+ 	return 0;
+ }
+ 
++static int queue_dtag_wait_time_show(void *data, struct seq_file *m)
++{
++	struct request_queue *q = data;
++	unsigned int time = 0;
++
++	if (test_bit(QUEUE_FLAG_HCTX_WAIT, &q->queue_flags))
++		time = jiffies_to_msecs(jiffies - READ_ONCE(q->dtag_wait_time));
++
++	seq_printf(m, "%u\n", time);
++
++	return 0;
++}
++
+ static const struct blk_mq_debugfs_attr blk_mq_debugfs_queue_attrs[] = {
+ 	{ "poll_stat", 0400, queue_poll_stat_show },
+ 	{ "requeue_list", 0400, .seq_ops = &queue_requeue_list_seq_ops },
+@@ -232,6 +245,7 @@ static const struct blk_mq_debugfs_attr blk_mq_debugfs_queue_attrs[] = {
+ 	{ "write_hints", 0600, queue_write_hint_show, queue_write_hint_store },
+ 	{ "zone_wlock", 0400, queue_zone_wlock_show, NULL },
+ 	{ "tag_set", 0400, queue_tag_set_show, NULL },
++	{ "dtag_wait_time_ms", 0400, queue_dtag_wait_time_show, NULL },
+ 	{ },
+ };
+ 
+@@ -651,6 +665,20 @@ static int hctx_dispatch_busy_show(void *data, struct seq_file *m)
+ 	return 0;
+ }
+ 
++static int hctx_dtag_wait_time_show(void *data, struct seq_file *m)
++{
++	struct blk_mq_hw_ctx *hctx = data;
++	unsigned int time = 0;
++
++	if (test_bit(BLK_MQ_S_DTAG_WAIT, &hctx->state))
++		time = jiffies_to_msecs(jiffies -
++					READ_ONCE(hctx->dtag_wait_time));
++
++	seq_printf(m, "%u\n", time);
++
++	return 0;
++}
++
+ #define CTX_RQ_SEQ_OPS(name, type)					\
+ static void *ctx_##name##_rq_list_start(struct seq_file *m, loff_t *pos) \
+ 	__acquires(&ctx->lock)						\
+@@ -821,6 +849,7 @@ static const struct blk_mq_debugfs_attr blk_mq_debugfs_hctx_attrs[] = {
+ 	{"active", 0400, hctx_active_show},
+ 	{"dispatch_busy", 0400, hctx_dispatch_busy_show},
+ 	{"type", 0400, hctx_type_show},
++	{"dtag_wait_time_ms", 0400, hctx_dtag_wait_time_show},
+ 	{},
+ };
+ 
+diff --git a/block/blk-mq-tag.c b/block/blk-mq-tag.c
+index 69f5c170d1f4..64c9633d5d5a 100644
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@ -15,6 +15,8 @@
+ #include "blk-mq.h"
+ #include "blk-mq-tag.h"
+ 
++#define BLK_MQ_DTAG_WAIT_EXPIRE (5 * HZ)
++
+ /*
+  * If a previously inactive queue goes active, bump the active user count.
+  * We need to do this before try to allocate driver tag, then even if fail
+@@ -80,29 +82,53 @@ void __blk_mq_dtag_busy(struct blk_mq_hw_ctx *hctx)
+ 		struct blk_mq_tag_set *set = q->tag_set;
+ 
+ 		if (!test_bit(QUEUE_FLAG_HCTX_WAIT, &q->queue_flags) &&
+-		    !test_and_set_bit(QUEUE_FLAG_HCTX_WAIT, &q->queue_flags))
++		    !test_and_set_bit(QUEUE_FLAG_HCTX_WAIT, &q->queue_flags)) {
++			WRITE_ONCE(q->dtag_wait_time, jiffies);
+ 			atomic_inc(&set->pending_queues_shared_sbitmap);
++		}
+ 	} else {
+ 		if (!test_bit(BLK_MQ_S_DTAG_WAIT, &hctx->state) &&
+-		    !test_and_set_bit(BLK_MQ_S_DTAG_WAIT, &hctx->state))
++		    !test_and_set_bit(BLK_MQ_S_DTAG_WAIT, &hctx->state)) {
++			WRITE_ONCE(hctx->dtag_wait_time, jiffies);
+ 			atomic_inc(&hctx->tags->pending_queues);
++		}
+ 	}
+ }
+ 
+-void __blk_mq_dtag_idle(struct blk_mq_hw_ctx *hctx)
++void __blk_mq_dtag_idle(struct blk_mq_hw_ctx *hctx, bool force)
+ {
+ 	struct blk_mq_tags *tags = hctx->tags;
+ 	struct request_queue *q = hctx->queue;
+ 	struct blk_mq_tag_set *set = q->tag_set;
+ 
+ 	if (blk_mq_is_sbitmap_shared(hctx->flags)) {
++		if (!test_bit(QUEUE_FLAG_HCTX_WAIT, &q->queue_flags))
++			return;
++
++		if (!force && time_before(jiffies,
++					  READ_ONCE(q->dtag_wait_time) +
++					  BLK_MQ_DTAG_WAIT_EXPIRE))
++			return;
++
+ 		if (!test_and_clear_bit(QUEUE_FLAG_HCTX_WAIT,
+ 					&q->queue_flags))
+ 			return;
++
++		WRITE_ONCE(q->dtag_wait_time, jiffies);
+ 		atomic_dec(&set->pending_queues_shared_sbitmap);
+ 	} else {
++		if (!test_bit(BLK_MQ_S_DTAG_WAIT, &hctx->state))
++			return;
++
++		if (!force && time_before(jiffies,
++					  READ_ONCE(hctx->dtag_wait_time) +
++					  BLK_MQ_DTAG_WAIT_EXPIRE))
++			return;
++
+ 		if (!test_and_clear_bit(BLK_MQ_S_DTAG_WAIT, &hctx->state))
+ 			return;
++
++		WRITE_ONCE(hctx->dtag_wait_time, jiffies);
+ 		atomic_dec(&tags->pending_queues);
+ 	}
+ }
+@@ -206,6 +232,8 @@ unsigned int blk_mq_get_tag(struct blk_mq_alloc_data *data)
+ 	sbitmap_finish_wait(bt, ws, &wait);
+ 
+ found_tag:
++	if (!data->q->elevator)
++		blk_mq_dtag_idle(data->hctx, false);
+ 	/*
+ 	 * Give up this allocation if the hctx is inactive.  The caller will
+ 	 * retry on an active hctx.
+diff --git a/block/blk-mq-tag.h b/block/blk-mq-tag.h
+index 33579a1e967e..25f30fa99857 100644
+--- a/block/blk-mq-tag.h
++++ b/block/blk-mq-tag.h
+@@ -82,7 +82,7 @@ enum {
+ extern bool __blk_mq_tag_busy(struct blk_mq_hw_ctx *hctx);
+ extern void __blk_mq_tag_idle(struct blk_mq_hw_ctx *hctx);
+ extern void __blk_mq_dtag_busy(struct blk_mq_hw_ctx *hctx);
+-extern void __blk_mq_dtag_idle(struct blk_mq_hw_ctx *hctx);
++extern void __blk_mq_dtag_idle(struct blk_mq_hw_ctx *hctx, bool force);
+ 
+ 
+ static inline bool blk_mq_tag_busy(struct blk_mq_hw_ctx *hctx)
+@@ -109,12 +109,12 @@ static inline void blk_mq_dtag_busy(struct blk_mq_hw_ctx *hctx)
+ 	__blk_mq_dtag_busy(hctx);
+ }
+ 
+-static inline void blk_mq_dtag_idle(struct blk_mq_hw_ctx *hctx)
++static inline void blk_mq_dtag_idle(struct blk_mq_hw_ctx *hctx, bool force)
+ {
+ 	if (!(mq_unfair_dtag && (hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED)))
+ 		return;
+ 
+-	__blk_mq_dtag_idle(hctx);
++	__blk_mq_dtag_idle(hctx, force);
+ }
+ 
+ static inline bool blk_mq_tag_is_reserved(struct blk_mq_tags *tags,
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 3220c68f4503..c3beaca1f4fb 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -542,7 +542,7 @@ void blk_mq_free_request(struct request *rq)
+ 		__blk_mq_dec_active_requests(hctx);
+ 		if (mq_unfair_dtag && !__blk_mq_active_requests(hctx)) {
+ 			blk_mq_tag_idle(hctx);
+-			blk_mq_dtag_idle(hctx);
++			blk_mq_dtag_idle(hctx, true);
+ 		}
+ 	}
+ 
+@@ -1013,7 +1013,7 @@ static void blk_mq_timeout_work(struct work_struct *work)
+ 			/* the hctx may be unmapped, so check it here */
+ 			if (blk_mq_hw_queue_mapped(hctx)) {
+ 				blk_mq_tag_idle(hctx);
+-				blk_mq_dtag_idle(hctx);
++				blk_mq_dtag_idle(hctx, true);
+ 			}
+ 		}
+ 	}
+@@ -1124,6 +1124,7 @@ static bool __blk_mq_get_driver_tag(struct request *rq)
+ 		return false;
+ 	}
+ 
++	blk_mq_dtag_idle(rq->mq_hctx, false);
+ 	rq->tag = tag + tag_offset;
+ 	return true;
+ }
+@@ -2725,7 +2726,7 @@ static void blk_mq_exit_hctx(struct request_queue *q,
+ 
+ 	if (blk_mq_hw_queue_mapped(hctx)) {
+ 		blk_mq_tag_idle(hctx);
+-		blk_mq_dtag_idle(hctx);
++		blk_mq_dtag_idle(hctx, true);
+ 	}
+ 
+ 	blk_mq_clear_flush_rq_mapping(set->tags[hctx_idx],
+@@ -2825,6 +2826,7 @@ blk_mq_alloc_hctx(struct request_queue *q, struct blk_mq_tag_set *set,
+ 	INIT_LIST_HEAD(&hctx->dispatch);
+ 	hctx->queue = q;
+ 	hctx->flags = set->flags & ~BLK_MQ_F_TAG_QUEUE_SHARED;
++	hctx->dtag_wait_time = jiffies;
+ 
+ 	INIT_LIST_HEAD(&hctx->hctx_list);
+ 
+@@ -3047,7 +3049,7 @@ static void queue_set_hctx_shared(struct request_queue *q, bool shared)
+ 			hctx->flags |= BLK_MQ_F_TAG_QUEUE_SHARED;
+ 		} else {
+ 			blk_mq_tag_idle(hctx);
+-			blk_mq_dtag_idle(hctx);
++			blk_mq_dtag_idle(hctx, true);
+ 			hctx->flags &= ~BLK_MQ_F_TAG_QUEUE_SHARED;
+ 		}
+ 	}
+@@ -3375,6 +3377,7 @@ struct request_queue *blk_mq_init_allocated_queue(struct blk_mq_tag_set *set,
+ 	spin_lock_init(&q->requeue_lock);
+ 
+ 	q->nr_requests = set->queue_depth;
++	q->dtag_wait_time = jiffies;
+ 
+ 	/*
+ 	 * Default to classic polling
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index f0b5519a3f5d..b2db9a5c10e8 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -172,6 +172,12 @@ struct blk_mq_hw_ctx {
+ 	 */
+ 	struct list_head	hctx_list;
+ 
++	/**
++	 * @dtag_wait_time: record when hardware queue is pending, specifically
++	 * when BLK_MQ_S_DTAG_WAIT is set in state.
++	 */
++	unsigned long		dtag_wait_time;
++
+ 	KABI_RESERVE(1)
+ 	KABI_RESERVE(2)
+ 	KABI_RESERVE(3)
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index f1513c3308fb..433485f8b1cc 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -602,6 +602,7 @@ struct request_queue {
+ #define BLK_MAX_WRITE_HINTS	5
+ 	u64			write_hints[BLK_MAX_WRITE_HINTS];
+ 
++	unsigned long		dtag_wait_time;
+ 	KABI_RESERVE(1)
+ 	KABI_RESERVE(2)
+ 	KABI_RESERVE(3)
+-- 
+2.26.2
+

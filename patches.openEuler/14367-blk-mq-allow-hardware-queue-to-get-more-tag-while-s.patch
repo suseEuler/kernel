@@ -1,0 +1,330 @@
+From c6f9c0e2d53d0ea8fb4ae6edf5a37b459a42bc6a Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Tue, 8 Mar 2022 22:06:12 +0800
+Subject: [PATCH] blk-mq: allow hardware queue to get more tag while sharing a
+ tag set
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: c6f9c0e2d53d0ea8fb4ae6edf5a37b459a42bc6a
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: performance
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4S8DW
+
+---------------------------
+
+When sharing a tag set, if most disks are issuing small amount of IO, and
+only a few is issuing a large amount of IO. Current approach is to limit
+the max amount of tags a disk can get equally to the average of total
+tags. Thus the few heavy load disk can't get enough tags while many tags
+are still free in the tag set.
+
+We add 'pending_queues' in blk_mq_tag_set to count how many queues can't
+get driver tag. Thus if this value is zero, there is no need to limit
+the max number of available tags.
+
+On the other hand, if a queue doesn't issue IO, the 'active_queues' will
+not be decreased in a period of time(request timeout), thus a lot of tags
+will not be available because max number of available tags is set to
+max(total tags / active_queues, 4). Thus we decreased it when
+'nr_active' is 0.
+
+This functionality is enabled by default, to disable it, add
+"blk_mq.unfair_dtag=0" to boot cmd.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Hou Tao <houtao1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ block/blk-mq-debugfs.c |  2 ++
+ block/blk-mq-tag.c     | 41 ++++++++++++++++++++++++++++++++++++++++-
+ block/blk-mq-tag.h     | 29 +++++++++++++++++++++++++++--
+ block/blk-mq.c         | 24 ++++++++++++++++++++----
+ block/blk-mq.h         |  5 +++++
+ include/linux/blk-mq.h |  4 ++++
+ include/linux/blkdev.h |  2 ++
+ 7 files changed, 100 insertions(+), 7 deletions(-)
+
+diff --git a/block/blk-mq-debugfs.c b/block/blk-mq-debugfs.c
+index b5f26082b959..91a3314dde8b 100644
+--- a/block/blk-mq-debugfs.c
++++ b/block/blk-mq-debugfs.c
+@@ -453,6 +453,8 @@ static void blk_mq_debugfs_tags_show(struct seq_file *m,
+ 	seq_printf(m, "nr_reserved_tags=%u\n", tags->nr_reserved_tags);
+ 	seq_printf(m, "active_queues=%d\n",
+ 		   atomic_read(&tags->active_queues));
++	seq_printf(m, "pending_queues=%d\n",
++		   atomic_read(&tags->pending_queues));
+ 
+ 	seq_puts(m, "\nbitmap_tags:\n");
+ 	sbitmap_queue_show(tags->bitmap_tags, m);
+diff --git a/block/blk-mq-tag.c b/block/blk-mq-tag.c
+index 16ad9e656610..69f5c170d1f4 100644
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@ -73,6 +73,40 @@ void __blk_mq_tag_idle(struct blk_mq_hw_ctx *hctx)
+ 	blk_mq_tag_wakeup_all(tags, false);
+ }
+ 
++void __blk_mq_dtag_busy(struct blk_mq_hw_ctx *hctx)
++{
++	if (blk_mq_is_sbitmap_shared(hctx->flags)) {
++		struct request_queue *q = hctx->queue;
++		struct blk_mq_tag_set *set = q->tag_set;
++
++		if (!test_bit(QUEUE_FLAG_HCTX_WAIT, &q->queue_flags) &&
++		    !test_and_set_bit(QUEUE_FLAG_HCTX_WAIT, &q->queue_flags))
++			atomic_inc(&set->pending_queues_shared_sbitmap);
++	} else {
++		if (!test_bit(BLK_MQ_S_DTAG_WAIT, &hctx->state) &&
++		    !test_and_set_bit(BLK_MQ_S_DTAG_WAIT, &hctx->state))
++			atomic_inc(&hctx->tags->pending_queues);
++	}
++}
++
++void __blk_mq_dtag_idle(struct blk_mq_hw_ctx *hctx)
++{
++	struct blk_mq_tags *tags = hctx->tags;
++	struct request_queue *q = hctx->queue;
++	struct blk_mq_tag_set *set = q->tag_set;
++
++	if (blk_mq_is_sbitmap_shared(hctx->flags)) {
++		if (!test_and_clear_bit(QUEUE_FLAG_HCTX_WAIT,
++					&q->queue_flags))
++			return;
++		atomic_dec(&set->pending_queues_shared_sbitmap);
++	} else {
++		if (!test_and_clear_bit(BLK_MQ_S_DTAG_WAIT, &hctx->state))
++			return;
++		atomic_dec(&tags->pending_queues);
++	}
++}
++
+ static int __blk_mq_get_tag(struct blk_mq_alloc_data *data,
+ 			    struct sbitmap_queue *bt)
+ {
+@@ -111,8 +145,11 @@ unsigned int blk_mq_get_tag(struct blk_mq_alloc_data *data)
+ 	if (tag != BLK_MQ_NO_TAG)
+ 		goto found_tag;
+ 
+-	if (data->flags & BLK_MQ_REQ_NOWAIT)
++	if (data->flags & BLK_MQ_REQ_NOWAIT) {
++		if (!data->q->elevator)
++			blk_mq_dtag_busy(data->hctx);
+ 		return BLK_MQ_NO_TAG;
++	}
+ 
+ 	ws = bt_wait_ptr(bt, data->hctx);
+ 	do {
+@@ -139,6 +176,8 @@ unsigned int blk_mq_get_tag(struct blk_mq_alloc_data *data)
+ 		if (tag != BLK_MQ_NO_TAG)
+ 			break;
+ 
++		if (!data->q->elevator)
++			blk_mq_dtag_busy(data->hctx);
+ 		bt_prev = bt;
+ 		io_schedule();
+ 
+diff --git a/block/blk-mq-tag.h b/block/blk-mq-tag.h
+index 674b0d80f4d2..33579a1e967e 100644
+--- a/block/blk-mq-tag.h
++++ b/block/blk-mq-tag.h
+@@ -4,6 +4,7 @@
+ 
+ #include <linux/kabi.h>
+ 
++extern bool mq_unfair_dtag;
+ /*
+  * Tag address space map.
+  */
+@@ -12,6 +13,11 @@ struct blk_mq_tags {
+ 	unsigned int nr_reserved_tags;
+ 
+ 	atomic_t active_queues;
++	/*
++	 * If multiple queues share a tag set, pending_queues record the
++	 * number of queues that can't get driver tag.
++	 */
++	atomic_t pending_queues;
+ 
+ 	struct sbitmap_queue *bitmap_tags;
+ 	struct sbitmap_queue *breserved_tags;
+@@ -73,8 +79,11 @@ enum {
+ 	BLK_MQ_TAG_MAX		= BLK_MQ_NO_TAG - 1,
+ };
+ 
+-extern bool __blk_mq_tag_busy(struct blk_mq_hw_ctx *);
+-extern void __blk_mq_tag_idle(struct blk_mq_hw_ctx *);
++extern bool __blk_mq_tag_busy(struct blk_mq_hw_ctx *hctx);
++extern void __blk_mq_tag_idle(struct blk_mq_hw_ctx *hctx);
++extern void __blk_mq_dtag_busy(struct blk_mq_hw_ctx *hctx);
++extern void __blk_mq_dtag_idle(struct blk_mq_hw_ctx *hctx);
++
+ 
+ static inline bool blk_mq_tag_busy(struct blk_mq_hw_ctx *hctx)
+ {
+@@ -92,6 +101,22 @@ static inline void blk_mq_tag_idle(struct blk_mq_hw_ctx *hctx)
+ 	__blk_mq_tag_idle(hctx);
+ }
+ 
++static inline void blk_mq_dtag_busy(struct blk_mq_hw_ctx *hctx)
++{
++	if (!(mq_unfair_dtag && (hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED)))
++		return;
++
++	__blk_mq_dtag_busy(hctx);
++}
++
++static inline void blk_mq_dtag_idle(struct blk_mq_hw_ctx *hctx)
++{
++	if (!(mq_unfair_dtag && (hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED)))
++		return;
++
++	__blk_mq_dtag_idle(hctx);
++}
++
+ static inline bool blk_mq_tag_is_reserved(struct blk_mq_tags *tags,
+ 					  unsigned int tag)
+ {
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index e0b833120498..3220c68f4503 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -41,6 +41,9 @@
+ #include "blk-mq-sched.h"
+ #include "blk-rq-qos.h"
+ 
++bool mq_unfair_dtag = true;
++module_param_named(unfair_dtag, mq_unfair_dtag, bool, 0444);
++
+ static DEFINE_PER_CPU(struct list_head, blk_cpu_done);
+ 
+ static void blk_mq_poll_stats_start(struct request_queue *q);
+@@ -535,8 +538,13 @@ void blk_mq_free_request(struct request *rq)
+ 	}
+ 
+ 	ctx->rq_completed[rq_is_sync(rq)]++;
+-	if (rq->rq_flags & RQF_MQ_INFLIGHT)
++	if (rq->rq_flags & RQF_MQ_INFLIGHT) {
+ 		__blk_mq_dec_active_requests(hctx);
++		if (mq_unfair_dtag && !__blk_mq_active_requests(hctx)) {
++			blk_mq_tag_idle(hctx);
++			blk_mq_dtag_idle(hctx);
++		}
++	}
+ 
+ 	if (unlikely(laptop_mode && !blk_rq_is_passthrough(rq)))
+ 		laptop_io_completion(q->backing_dev_info);
+@@ -1003,8 +1011,10 @@ static void blk_mq_timeout_work(struct work_struct *work)
+ 		 */
+ 		queue_for_each_hw_ctx(q, hctx, i) {
+ 			/* the hctx may be unmapped, so check it here */
+-			if (blk_mq_hw_queue_mapped(hctx))
++			if (blk_mq_hw_queue_mapped(hctx)) {
+ 				blk_mq_tag_idle(hctx);
++				blk_mq_dtag_idle(hctx);
++			}
+ 		}
+ 	}
+ 	blk_queue_exit(q);
+@@ -1109,8 +1119,10 @@ static bool __blk_mq_get_driver_tag(struct request *rq)
+ 	}
+ 
+ 	tag = __sbitmap_queue_get(bt);
+-	if (tag == BLK_MQ_NO_TAG)
++	if (tag == BLK_MQ_NO_TAG) {
++		blk_mq_dtag_busy(rq->mq_hctx);
+ 		return false;
++	}
+ 
+ 	rq->tag = tag + tag_offset;
+ 	return true;
+@@ -2711,8 +2723,10 @@ static void blk_mq_exit_hctx(struct request_queue *q,
+ {
+ 	struct request *flush_rq = hctx->fq->flush_rq;
+ 
+-	if (blk_mq_hw_queue_mapped(hctx))
++	if (blk_mq_hw_queue_mapped(hctx)) {
+ 		blk_mq_tag_idle(hctx);
++		blk_mq_dtag_idle(hctx);
++	}
+ 
+ 	blk_mq_clear_flush_rq_mapping(set->tags[hctx_idx],
+ 			set->queue_depth, flush_rq);
+@@ -3033,6 +3047,7 @@ static void queue_set_hctx_shared(struct request_queue *q, bool shared)
+ 			hctx->flags |= BLK_MQ_F_TAG_QUEUE_SHARED;
+ 		} else {
+ 			blk_mq_tag_idle(hctx);
++			blk_mq_dtag_idle(hctx);
+ 			hctx->flags &= ~BLK_MQ_F_TAG_QUEUE_SHARED;
+ 		}
+ 	}
+@@ -3589,6 +3604,7 @@ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
+ 
+ 	if (blk_mq_is_sbitmap_shared(set->flags)) {
+ 		atomic_set(&set->active_queues_shared_sbitmap, 0);
++		atomic_set(&set->pending_queues_shared_sbitmap, 0);
+ 
+ 		if (blk_mq_init_shared_sbitmap(set, set->flags)) {
+ 			ret = -ENOMEM;
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index 7f3194657dff..bb58c68b8274 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -316,10 +316,15 @@ static inline bool hctx_may_queue(struct blk_mq_hw_ctx *hctx,
+ 		struct request_queue *q = hctx->queue;
+ 		struct blk_mq_tag_set *set = q->tag_set;
+ 
++		if (mq_unfair_dtag &&
++		    !atomic_read(&set->pending_queues_shared_sbitmap))
++			return true;
+ 		if (!test_bit(QUEUE_FLAG_HCTX_ACTIVE, &q->queue_flags))
+ 			return true;
+ 		users = atomic_read(&set->active_queues_shared_sbitmap);
+ 	} else {
++		if (mq_unfair_dtag && !atomic_read(&hctx->tags->pending_queues))
++			return true;
+ 		if (!test_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
+ 			return true;
+ 		users = atomic_read(&hctx->tags->active_queues);
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index adcbef9705ca..f0b5519a3f5d 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -266,6 +266,7 @@ struct blk_mq_tag_set {
+ 	unsigned int		flags;
+ 	void			*driver_data;
+ 	atomic_t		active_queues_shared_sbitmap;
++	atomic_t		pending_queues_shared_sbitmap;
+ 
+ 	struct sbitmap_queue	__bitmap_tags;
+ 	struct sbitmap_queue	__breserved_tags;
+@@ -442,6 +443,9 @@ enum {
+ 	/* hw queue is inactive after all its CPUs become offline */
+ 	BLK_MQ_S_INACTIVE	= 3,
+ 
++	/* hw queue is waiting for driver tag */
++	BLK_MQ_S_DTAG_WAIT	= 4,
++
+ 	BLK_MQ_MAX_DEPTH	= 10240,
+ 
+ 	BLK_MQ_CPU_WORK_BATCH	= 8,
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index eae4a046037e..f1513c3308fb 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -640,6 +640,8 @@ struct request_queue {
+ #define QUEUE_FLAG_RQ_ALLOC_TIME 27	/* record rq->alloc_time_ns */
+ #define QUEUE_FLAG_HCTX_ACTIVE	28	/* at least one blk-mq hctx is active */
+ #define QUEUE_FLAG_NOWAIT       29	/* device supports NOWAIT */
++/*at least one blk-mq hctx can't get driver tag */
++#define QUEUE_FLAG_HCTX_WAIT	30
+ 
+ #define QUEUE_FLAG_MQ_DEFAULT	((1 << QUEUE_FLAG_IO_STAT) |		\
+ 				 (1 << QUEUE_FLAG_SAME_COMP) |		\
+-- 
+2.26.2
+
