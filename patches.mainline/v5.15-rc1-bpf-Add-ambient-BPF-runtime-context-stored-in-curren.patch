@@ -5,6 +5,7 @@ Subject: [PATCH] bpf: Add ambient BPF runtime context stored in current
 Git-commit: c7603cfa04e7c3a435b31d065f7cbdc829428f6e
 Patch-mainline: v5.15-rc1
 References: bsn#12
+Modified-by-SEL: Yes, refreshed due to context changes
 
 
 b910eaaaa4b8 ("bpf: Fix NULL pointer dereference in bpf_get_local_storage()
@@ -325,7 +326,7 @@ Signed-off-by: Chenxi Mao <chenxi.mao@suse.com>
  	retval = sched_fork(clone_flags, p);
 --- a/net/bpf/test_run.c
 +++ b/net/bpf/test_run.c
-@@ -19,18 +19,20 @@
+@@ -86,17 +86,19 @@ reset:
  static int bpf_test_run(struct bpf_prog *prog, void *ctx, u32 repeat,
  			u32 *retval, u32 *time, bool xdp)
  {
@@ -333,10 +334,9 @@ Signed-off-by: Chenxi Mao <chenxi.mao@suse.com>
 +	struct bpf_prog_array_item item = {.prog = prog};
 +	struct bpf_run_ctx *old_ctx;
 +	struct bpf_cg_run_ctx run_ctx;
+ 	struct bpf_test_timer t = { NO_MIGRATE };
  	enum bpf_cgroup_storage_type stype;
- 	u64 time_start, time_spent = 0;
- 	int ret = 0;
- 	u32 i;
+ 	int ret;
  
  	for_each_cgroup_storage_type(stype) {
 -		storage[stype] = bpf_cgroup_storage_alloc(prog, stype);
@@ -351,12 +351,12 @@ Signed-off-by: Chenxi Mao <chenxi.mao@suse.com>
  			return -ENOMEM;
  		}
  	}
-@@ -41,18 +43,15 @@ static int bpf_test_run(struct bpf_prog
- 	rcu_read_lock();
- 	migrate_disable();
- 	time_start = ktime_get_ns();
+@@ -105,23 +107,21 @@ static int bpf_test_run(struct bpf_prog
+ 		repeat = 1;
+ 
+ 	bpf_test_timer_enter(&t);
 +	old_ctx = bpf_set_run_ctx(&run_ctx.run_ctx);
- 	for (i = 0; i < repeat; i++) {
+ 	do {
 -		ret = bpf_cgroup_storage_set(storage);
 -		if (ret)
 -			break;
@@ -369,19 +369,9 @@ Signed-off-by: Chenxi Mao <chenxi.mao@suse.com>
  
 -		bpf_cgroup_storage_unset();
 -
- 		if (signal_pending(current)) {
- 			ret = -EINTR;
- 			break;
-@@ -70,6 +69,7 @@ static int bpf_test_run(struct bpf_prog
- 			time_start = ktime_get_ns();
- 		}
- 	}
+ 	} while (bpf_test_timer_continue(&t, repeat, &ret, time));
 +	bpf_reset_run_ctx(old_ctx);
- 	time_spent += ktime_get_ns() - time_start;
- 	migrate_enable();
- 	rcu_read_unlock();
-@@ -78,7 +78,7 @@ static int bpf_test_run(struct bpf_prog
- 	*time = time_spent > U32_MAX ? U32_MAX : (u32)time_spent;
+ 	bpf_test_timer_leave(&t);
  
  	for_each_cgroup_storage_type(stype)
 -		bpf_cgroup_storage_free(storage[stype]);
