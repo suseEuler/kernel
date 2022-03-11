@@ -5,6 +5,7 @@ Subject: [PATCH] mm: memcontrol: use obj_cgroup APIs to charge kmem pages
 Git-commit: b4e0b68fbd9d1fd7e31cbe8adca3ad6cf556e2ee
 Patch-mainline: v5.13-rc1
 References: bsn#12
+Modified-by-SEL: Yes, refreshed due to context changes
 
 
 Since Roman's series "The new cgroup slab memory controller" applied.
@@ -79,11 +80,9 @@ Signed-off-by: Jun Yang <jun.yang@suse.com>
  mm/memcontrol.c            | 116 +++++++++++++++++------------------
  2 files changed, 156 insertions(+), 82 deletions(-)
 
-diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
-index e946c96daa32..78ca34c935ab 100644
 --- a/include/linux/memcontrol.h
 +++ b/include/linux/memcontrol.h
-@@ -371,6 +371,62 @@ enum page_memcg_data_flags {
+@@ -378,6 +378,62 @@ enum page_memcg_data_flags {
  
  #define MEMCG_DATA_FLAGS_MASK (__NR_MEMCG_DATA_FLAGS - 1)
  
@@ -146,7 +145,7 @@ index e946c96daa32..78ca34c935ab 100644
  /*
   * page_memcg - get the memory cgroup associated with a page
   * @page: a pointer to the page struct
-@@ -380,20 +436,23 @@ enum page_memcg_data_flags {
+@@ -387,20 +443,23 @@ enum page_memcg_data_flags {
   * proper memory cgroup pointer. It's not safe to call this function
   * against some type of pages, e.g. slab pages or ex-slab pages.
   *
@@ -177,7 +176,7 @@ index e946c96daa32..78ca34c935ab 100644
  }
  
  /*
-@@ -407,11 +466,19 @@ static inline struct mem_cgroup *page_memcg(struct page *page)
+@@ -414,11 +473,19 @@ static inline struct mem_cgroup *page_me
   */
  static inline struct mem_cgroup *page_memcg_rcu(struct page *page)
  {
@@ -199,7 +198,7 @@ index e946c96daa32..78ca34c935ab 100644
  }
  
  /*
-@@ -419,15 +486,21 @@ static inline struct mem_cgroup *page_memcg_rcu(struct page *page)
+@@ -426,15 +493,21 @@ static inline struct mem_cgroup *page_me
   * @page: a pointer to the page struct
   *
   * Returns a pointer to the memory cgroup associated with the page,
@@ -224,7 +223,7 @@ index e946c96daa32..78ca34c935ab 100644
   */
  static inline struct mem_cgroup *page_memcg_check(struct page *page)
  {
-@@ -440,6 +513,13 @@ static inline struct mem_cgroup *page_memcg_check(struct page *page)
+@@ -447,6 +520,13 @@ static inline struct mem_cgroup *page_me
  	if (memcg_data & MEMCG_DATA_OBJCGS)
  		return NULL;
  
@@ -238,7 +237,7 @@ index e946c96daa32..78ca34c935ab 100644
  	return (struct mem_cgroup *)(memcg_data & ~MEMCG_DATA_FLAGS_MASK);
  }
  
-@@ -740,21 +820,15 @@ static inline void obj_cgroup_get(struct obj_cgroup *objcg)
+@@ -728,21 +808,15 @@ static inline void obj_cgroup_get(struct
  	percpu_ref_get(&objcg->refcnt);
  }
  
@@ -265,8 +264,10 @@ index e946c96daa32..78ca34c935ab 100644
  }
  
  static inline void mem_cgroup_put(struct mem_cgroup *memcg)
-@@ -1066,18 +1140,22 @@ static inline void __mod_lruvec_page_state(struct page *page,
- 					   enum node_stat_item idx, int val)
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -866,18 +866,22 @@ void __mod_lruvec_page_state(struct page
+ 			     int val)
  {
  	struct page *head = compound_head(page); /* rmap on tail pages */
 -	struct mem_cgroup *memcg = page_memcg(head);
@@ -287,13 +288,9 @@ index e946c96daa32..78ca34c935ab 100644
  	__mod_lruvec_state(lruvec, idx, val);
 +	rcu_read_unlock();
  }
+ EXPORT_SYMBOL(__mod_lruvec_page_state);
  
- static inline void mod_lruvec_page_state(struct page *page,
-diff --git a/mm/memcontrol.c b/mm/memcontrol.c
-index b68ab450c8d9..a3c7fea9ab0a 100644
---- a/mm/memcontrol.c
-+++ b/mm/memcontrol.c
-@@ -947,20 +947,6 @@ static __always_inline struct mem_cgroup *active_memcg(void)
+@@ -1086,20 +1090,6 @@ static __always_inline struct mem_cgroup
  		return current->active_memcg;
  }
  
@@ -314,11 +311,10 @@ index b68ab450c8d9..a3c7fea9ab0a 100644
  static __always_inline bool memcg_kmem_bypass(void)
  {
  	/* Allow remote memcg charging from any context. */
-@@ -1078,20 +1068,6 @@ static __always_inline bool memcg_kmem_bypass(void)
- 	return false;
+@@ -1114,20 +1104,6 @@ static __always_inline bool memcg_kmem_b
  }
  
--/**
+ /**
 - * If active memcg is set, do not fallback to current->mm->memcg.
 - */
 -static __always_inline struct mem_cgroup *get_mem_cgroup_from_current(void)
@@ -332,10 +328,11 @@ index b68ab450c8d9..a3c7fea9ab0a 100644
 -	return get_mem_cgroup_from_mm(current->mm);
 -}
 -
- /**
+-/**
   * mem_cgroup_iter - iterate over memory cgroup hierarchy
   * @root: hierarchy root
-@@ -3121,18 +3097,18 @@ static void __memcg_kmem_uncharge(struct mem_cgroup *memcg, unsigned int nr_page
+  * @prev: previously returned memcg, NULL on first invocation
+@@ -3200,18 +3176,18 @@ void __memcg_kmem_uncharge(struct mem_cg
   */
  int __memcg_kmem_charge_page(struct page *page, gfp_t gfp, int order)
  {
@@ -360,7 +357,7 @@ index b68ab450c8d9..a3c7fea9ab0a 100644
  	}
  	return ret;
  }
-@@ -3144,16 +3120,16 @@ int __memcg_kmem_charge_page(struct page *page, gfp_t gfp, int order)
+@@ -3223,16 +3199,16 @@ int __memcg_kmem_charge_page(struct page
   */
  void __memcg_kmem_uncharge_page(struct page *page, int order)
  {
@@ -382,7 +379,7 @@ index b68ab450c8d9..a3c7fea9ab0a 100644
  }
  
  static bool consume_obj_stock(struct obj_cgroup *objcg, unsigned int nr_bytes)
-@@ -3255,12 +3227,13 @@ void split_page_memcg(struct page *head, unsigned int nr)
+@@ -3371,12 +3347,13 @@ void split_page_memcg(struct page *head,
  	if (mem_cgroup_disabled() || !memcg)
  		return;
  
@@ -402,7 +399,7 @@ index b68ab450c8d9..a3c7fea9ab0a 100644
  }
  
  #ifdef CONFIG_MEMCG_SWAP
-@@ -6788,7 +6768,7 @@ void mem_cgroup_swapin_uncharge_swap(swp_entry_t entry)
+@@ -6916,7 +6893,7 @@ out:
  
  struct uncharge_gather {
  	struct mem_cgroup *memcg;
@@ -411,7 +408,7 @@ index b68ab450c8d9..a3c7fea9ab0a 100644
  	unsigned long pgpgout;
  	unsigned long nr_kmem;
  	struct page *dummy_page;
-@@ -6803,10 +6783,10 @@ static void uncharge_batch(const struct uncharge_gather *ug)
+@@ -6931,10 +6908,10 @@ static void uncharge_batch(const struct
  {
  	unsigned long flags;
  
@@ -425,7 +422,7 @@ index b68ab450c8d9..a3c7fea9ab0a 100644
  		if (!cgroup_subsys_on_dfl(memory_cgrp_subsys) && ug->nr_kmem)
  			page_counter_uncharge(&ug->memcg->kmem, ug->nr_kmem);
  		memcg_oom_recover(ug->memcg);
-@@ -6814,7 +6794,7 @@ static void uncharge_batch(const struct uncharge_gather *ug)
+@@ -6942,7 +6919,7 @@ static void uncharge_batch(const struct
  
  	local_irq_save(flags);
  	__count_memcg_events(ug->memcg, PGPGOUT, ug->pgpgout);
@@ -434,7 +431,7 @@ index b68ab450c8d9..a3c7fea9ab0a 100644
  	memcg_check_events(ug->memcg, ug->dummy_page);
  	local_irq_restore(flags);
  
-@@ -6825,40 +6805,60 @@ static void uncharge_batch(const struct uncharge_gather *ug)
+@@ -6953,40 +6930,60 @@ static void uncharge_batch(const struct
  static void uncharge_page(struct page *page, struct uncharge_gather *ug)
  {
  	unsigned long nr_pages;
@@ -462,11 +459,11 @@ index b68ab450c8d9..a3c7fea9ab0a 100644
 +	} else {
 +		memcg = __page_memcg(page);
 +	}
-+
-+	if (!memcg)
-+		return;
  
 -	if (ug->memcg != page_memcg(page)) {
++	if (!memcg)
++		return;
++
 +	if (ug->memcg != memcg) {
  		if (ug->memcg) {
  			uncharge_batch(ug);
@@ -507,6 +504,3 @@ index b68ab450c8d9..a3c7fea9ab0a 100644
  }
  
  static void uncharge_list(struct list_head *page_list)
--- 
-2.31.1
-

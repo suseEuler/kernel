@@ -1,0 +1,327 @@
+From c47d5032ed3002311a4188eae51f4641ec436beb Mon Sep 17 00:00:00 2001
+Message-Id: <c47d5032ed3002311a4188eae51f4641ec436beb.1646972988.git.geliang.tang@suse.com>
+From: Shakeel Butt <shakeelb@google.com>
+Date: Mon, 14 Dec 2020 19:07:14 -0800
+Subject: [PATCH] mm: move lruvec stats update functions to vmstat.h
+Git-commit: c47d5032ed3002311a4188eae51f4641ec436beb
+Patch-mainline: v5.11-rc1
+References: bsn#140
+Modified-by-SEL: Yes, refreshed due to context changes
+
+Patch series "memcg: add pagetable comsumption to memory.stat", v2.
+
+Many workloads consumes significant amount of memory in pagetables.  One
+specific use-case is the user space network driver which mmaps the
+application memory to provide zero copy transfer.  This driver can consume
+a large amount memory in page tables.  This patch series exposes the
+pagetable comsumption for each memory cgroup.
+
+This patch (of 2):
+
+This does not change any functionality and only move the functions which
+update the lruvec stats to vmstat.h from memcontrol.h.  The main reason
+for this patch is to be able to use these functions in the page table
+contructor function which is defined in mm.h and we can not include the
+memcontrol.h in that file.  Also this is a better place for this interface
+in general.  The lruvec abstraction, while invented for memcg, isn't
+specific to memcg at all.
+
+Link: https://lkml.kernel.org/r/20201130212541.2781790-2-shakeelb@google.com
+Signed-off-by: Shakeel Butt <shakeelb@google.com>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Acked-by: Roman Gushchin <guro@fb.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ include/linux/memcontrol.h | 111 -------------------------------------
+ include/linux/vmstat.h     | 104 ++++++++++++++++++++++++++++++++++
+ mm/memcontrol.c            |  17 ++++++
+ 3 files changed, 121 insertions(+), 111 deletions(-)
+
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -795,8 +795,6 @@ static inline unsigned long lruvec_page_
+ 
+ void __mod_memcg_lruvec_state(struct lruvec *lruvec, enum node_stat_item idx,
+ 			      int val);
+-void __mod_lruvec_state(struct lruvec *lruvec, enum node_stat_item idx,
+-			int val);
+ void __mod_lruvec_slab_state(void *p, enum node_stat_item idx, int val);
+ 
+ void mod_memcg_obj_state(void *p, int idx, int val);
+@@ -821,43 +819,6 @@ static inline void mod_memcg_lruvec_stat
+ 	local_irq_restore(flags);
+ }
+ 
+-static inline void mod_lruvec_state(struct lruvec *lruvec,
+-				    enum node_stat_item idx, int val)
+-{
+-	unsigned long flags;
+-
+-	local_irq_save(flags);
+-	__mod_lruvec_state(lruvec, idx, val);
+-	local_irq_restore(flags);
+-}
+-
+-static inline void __mod_lruvec_page_state(struct page *page,
+-					   enum node_stat_item idx, int val)
+-{
+-	struct page *head = compound_head(page); /* rmap on tail pages */
+-	pg_data_t *pgdat = page_pgdat(page);
+-	struct lruvec *lruvec;
+-
+-	/* Untracked pages have no memcg, no lruvec. Update only the node */
+-	if (!head->mem_cgroup) {
+-		__mod_node_page_state(pgdat, idx, val);
+-		return;
+-	}
+-
+-	lruvec = mem_cgroup_lruvec(head->mem_cgroup, pgdat);
+-	__mod_lruvec_state(lruvec, idx, val);
+-}
+-
+-static inline void mod_lruvec_page_state(struct page *page,
+-					 enum node_stat_item idx, int val)
+-{
+-	unsigned long flags;
+-
+-	local_irq_save(flags);
+-	__mod_lruvec_page_state(page, idx, val);
+-	local_irq_restore(flags);
+-}
+-
+ unsigned long mem_cgroup_soft_limit_reclaim(pg_data_t *pgdat, int order,
+ 						gfp_t gfp_mask,
+ 						unsigned long *total_scanned);
+@@ -1215,30 +1176,6 @@ static inline void __mod_memcg_lruvec_st
+ {
+ }
+ 
+-static inline void __mod_lruvec_state(struct lruvec *lruvec,
+-				      enum node_stat_item idx, int val)
+-{
+-	__mod_node_page_state(lruvec_pgdat(lruvec), idx, val);
+-}
+-
+-static inline void mod_lruvec_state(struct lruvec *lruvec,
+-				    enum node_stat_item idx, int val)
+-{
+-	mod_node_page_state(lruvec_pgdat(lruvec), idx, val);
+-}
+-
+-static inline void __mod_lruvec_page_state(struct page *page,
+-					   enum node_stat_item idx, int val)
+-{
+-	__mod_node_page_state(page_pgdat(page), idx, val);
+-}
+-
+-static inline void mod_lruvec_page_state(struct page *page,
+-					 enum node_stat_item idx, int val)
+-{
+-	mod_node_page_state(page_pgdat(page), idx, val);
+-}
+-
+ static inline void __mod_lruvec_slab_state(void *p, enum node_stat_item idx,
+ 					   int val)
+ {
+@@ -1322,30 +1259,6 @@ static inline void __dec_memcg_page_stat
+ 	__mod_memcg_page_state(page, idx, -1);
+ }
+ 
+-static inline void __inc_lruvec_state(struct lruvec *lruvec,
+-				      enum node_stat_item idx)
+-{
+-	__mod_lruvec_state(lruvec, idx, 1);
+-}
+-
+-static inline void __dec_lruvec_state(struct lruvec *lruvec,
+-				      enum node_stat_item idx)
+-{
+-	__mod_lruvec_state(lruvec, idx, -1);
+-}
+-
+-static inline void __inc_lruvec_page_state(struct page *page,
+-					   enum node_stat_item idx)
+-{
+-	__mod_lruvec_page_state(page, idx, 1);
+-}
+-
+-static inline void __dec_lruvec_page_state(struct page *page,
+-					   enum node_stat_item idx)
+-{
+-	__mod_lruvec_page_state(page, idx, -1);
+-}
+-
+ static inline void __inc_lruvec_slab_state(void *p, enum node_stat_item idx)
+ {
+ 	__mod_lruvec_slab_state(p, idx, 1);
+@@ -1384,30 +1297,6 @@ static inline void dec_memcg_page_state(
+ 	mod_memcg_page_state(page, idx, -1);
+ }
+ 
+-static inline void inc_lruvec_state(struct lruvec *lruvec,
+-				    enum node_stat_item idx)
+-{
+-	mod_lruvec_state(lruvec, idx, 1);
+-}
+-
+-static inline void dec_lruvec_state(struct lruvec *lruvec,
+-				    enum node_stat_item idx)
+-{
+-	mod_lruvec_state(lruvec, idx, -1);
+-}
+-
+-static inline void inc_lruvec_page_state(struct page *page,
+-					 enum node_stat_item idx)
+-{
+-	mod_lruvec_page_state(page, idx, 1);
+-}
+-
+-static inline void dec_lruvec_page_state(struct page *page,
+-					 enum node_stat_item idx)
+-{
+-	mod_lruvec_page_state(page, idx, -1);
+-}
+-
+ static inline struct lruvec *parent_lruvec(struct lruvec *lruvec)
+ {
+ 	struct mem_cgroup *memcg;
+--- a/include/linux/vmstat.h
++++ b/include/linux/vmstat.h
+@@ -450,4 +450,108 @@ static inline const char *vm_event_name(
+ }
+ #endif /* CONFIG_VM_EVENT_COUNTERS || CONFIG_MEMCG */
+ 
++#ifdef CONFIG_MEMCG
++
++void __mod_lruvec_state(struct lruvec *lruvec, enum node_stat_item idx,
++			int val);
++
++static inline void mod_lruvec_state(struct lruvec *lruvec,
++				    enum node_stat_item idx, int val)
++{
++	unsigned long flags;
++
++	local_irq_save(flags);
++	__mod_lruvec_state(lruvec, idx, val);
++	local_irq_restore(flags);
++}
++
++void __mod_lruvec_page_state(struct page *page,
++			     enum node_stat_item idx, int val);
++
++static inline void mod_lruvec_page_state(struct page *page,
++					 enum node_stat_item idx, int val)
++{
++	unsigned long flags;
++
++	local_irq_save(flags);
++	__mod_lruvec_page_state(page, idx, val);
++	local_irq_restore(flags);
++}
++
++#else
++
++static inline void __mod_lruvec_state(struct lruvec *lruvec,
++				      enum node_stat_item idx, int val)
++{
++	__mod_node_page_state(lruvec_pgdat(lruvec), idx, val);
++}
++
++static inline void mod_lruvec_state(struct lruvec *lruvec,
++				    enum node_stat_item idx, int val)
++{
++	mod_node_page_state(lruvec_pgdat(lruvec), idx, val);
++}
++
++static inline void __mod_lruvec_page_state(struct page *page,
++					   enum node_stat_item idx, int val)
++{
++	__mod_node_page_state(page_pgdat(page), idx, val);
++}
++
++static inline void mod_lruvec_page_state(struct page *page,
++					 enum node_stat_item idx, int val)
++{
++	mod_node_page_state(page_pgdat(page), idx, val);
++}
++
++#endif /* CONFIG_MEMCG */
++
++static inline void __inc_lruvec_state(struct lruvec *lruvec,
++				      enum node_stat_item idx)
++{
++	__mod_lruvec_state(lruvec, idx, 1);
++}
++
++static inline void __dec_lruvec_state(struct lruvec *lruvec,
++				      enum node_stat_item idx)
++{
++	__mod_lruvec_state(lruvec, idx, -1);
++}
++
++static inline void __inc_lruvec_page_state(struct page *page,
++					   enum node_stat_item idx)
++{
++	__mod_lruvec_page_state(page, idx, 1);
++}
++
++static inline void __dec_lruvec_page_state(struct page *page,
++					   enum node_stat_item idx)
++{
++	__mod_lruvec_page_state(page, idx, -1);
++}
++
++static inline void inc_lruvec_state(struct lruvec *lruvec,
++				    enum node_stat_item idx)
++{
++	mod_lruvec_state(lruvec, idx, 1);
++}
++
++static inline void dec_lruvec_state(struct lruvec *lruvec,
++				    enum node_stat_item idx)
++{
++	mod_lruvec_state(lruvec, idx, -1);
++}
++
++static inline void inc_lruvec_page_state(struct page *page,
++					 enum node_stat_item idx)
++{
++	mod_lruvec_page_state(page, idx, 1);
++}
++
++static inline void dec_lruvec_page_state(struct page *page,
++					 enum node_stat_item idx)
++{
++	mod_lruvec_page_state(page, idx, -1);
++}
++
+ #endif /* _LINUX_VMSTAT_H */
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -858,6 +858,23 @@ void __mod_lruvec_state(struct lruvec *l
+ 		__mod_memcg_lruvec_state(lruvec, idx, val);
+ }
+ 
++void __mod_lruvec_page_state(struct page *page, enum node_stat_item idx,
++			     int val)
++{
++	struct page *head = compound_head(page); /* rmap on tail pages */
++	pg_data_t *pgdat = page_pgdat(page);
++	struct lruvec *lruvec;
++
++	/* Untracked pages have no memcg, no lruvec. Update only the node */
++	if (!head->mem_cgroup) {
++		__mod_node_page_state(pgdat, idx, val);
++		return;
++	}
++
++	lruvec = mem_cgroup_lruvec(head->mem_cgroup, pgdat);
++	__mod_lruvec_state(lruvec, idx, val);
++}
++
+ void __mod_lruvec_slab_state(void *p, enum node_stat_item idx, int val)
+ {
+ 	pg_data_t *pgdat = page_pgdat(virt_to_page(p));
