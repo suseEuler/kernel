@@ -1,0 +1,113 @@
+From 4abb1e5b63ac3281275315fc6b0cde0b9c2e2e42 Mon Sep 17 00:00:00 2001
+From: David Hildenbrand <david@redhat.com>
+Date: Wed, 11 Nov 2020 15:53:17 +0100
+Subject: [PATCH] powerpc/mm: factor out creating/removing linear mapping
+Git-commit: 4abb1e5b63ac3281275315fc6b0cde0b9c2e2e42
+Patch-mainline: v5.11-rc1
+References: bsn#118
+Modified-by-SEL: Yes, refreshed due to context change
+
+
+We want to stop abusing memory hotplug infrastructure in memtrace code
+to perform allocations and remove the linear mapping. Instead we will use
+alloc_contig_pages() and remove the linear mapping manually.
+
+Let's factor out creating/removing the linear mapping into
+arch_create_linear_mapping() / arch_remove_linear_mapping() - so in the
+future, we might be able to have whole arch_add_memory() /
+arch_remove_memory() be implemented in common code.
+
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Reviewed-by: Oscar Salvador <osalvador@suse.de>
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20201111145322.15793-4-david@redhat.com
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ arch/powerpc/mm/mem.c          |   41 ++++++++++++++++++++++++++++-------------
+ include/linux/memory_hotplug.h |    3 +++
+ 2 files changed, 31 insertions(+), 13 deletions(-)
+
+--- a/arch/powerpc/mm/mem.c
++++ b/arch/powerpc/mm/mem.c
+@@ -121,34 +121,26 @@ static void flush_dcache_range_chunked(u
+ 	}
+ }
+ 
+-int __ref arch_add_memory(int nid, u64 start, u64 size,
+-			  struct mhp_params *params)
++int __ref arch_create_linear_mapping(int nid, u64 start, u64 size,
++				     struct mhp_params *params)
+ {
+-	unsigned long start_pfn = start >> PAGE_SHIFT;
+-	unsigned long nr_pages = size >> PAGE_SHIFT;
+ 	int rc;
+ 
+ 	start = (unsigned long)__va(start);
+ 	rc = create_section_mapping(start, start + size, nid,
+ 				    params->pgprot);
+ 	if (rc) {
+-		pr_warn("Unable to create mapping for hot added memory 0x%llx..0x%llx: %d\n",
++		pr_warn("Unable to create linear mapping for 0x%llx..0x%llx: %d\n",
+ 			start, start + size, rc);
+ 		return -EFAULT;
+ 	}
+-
+-	return __add_pages(nid, start_pfn, nr_pages, params);
++	return 0;
+ }
+ 
+-void __ref arch_remove_memory(int nid, u64 start, u64 size,
+-			     struct vmem_altmap *altmap)
++void __ref arch_remove_linear_mapping(u64 start, u64 size)
+ {
+-	unsigned long start_pfn = start >> PAGE_SHIFT;
+-	unsigned long nr_pages = size >> PAGE_SHIFT;
+ 	int ret;
+ 
+-	__remove_pages(start_pfn, nr_pages, altmap);
+-
+ 	/* Remove htab bolted mappings for this section of memory */
+ 	start = (unsigned long)__va(start);
+ 	flush_dcache_range_chunked(start, start + size, FLUSH_CHUNK_SIZE);
+@@ -161,6 +153,29 @@ void __ref arch_remove_memory(int nid, u
+ 	 */
+ 	vm_unmap_aliases();
+ }
++
++int __ref arch_add_memory(int nid, u64 start, u64 size,
++			  struct mhp_params *params)
++{
++	unsigned long start_pfn = start >> PAGE_SHIFT;
++	unsigned long nr_pages = size >> PAGE_SHIFT;
++	int rc;
++
++	rc = arch_create_linear_mapping(nid, start, size, params);
++	if (rc)
++		return rc;
++	return __add_pages(nid, start_pfn, nr_pages, params);
++}
++
++void __ref arch_remove_memory(int nid, u64 start, u64 size,
++			      struct vmem_altmap *altmap)
++{
++	unsigned long start_pfn = start >> PAGE_SHIFT;
++	unsigned long nr_pages = size >> PAGE_SHIFT;
++
++	__remove_pages(start_pfn, nr_pages, altmap);
++	arch_remove_linear_mapping(start, size);
++}
+ #endif
+ 
+ #ifndef CONFIG_NEED_MULTIPLE_NODES
+--- a/include/linux/memory_hotplug.h
++++ b/include/linux/memory_hotplug.h
+@@ -361,6 +361,9 @@ extern struct page *sparse_decode_mem_ma
+ 					  unsigned long pnum);
+ extern struct zone *zone_for_pfn_range(int online_type, int nid,
+ 		unsigned long start_pfn, unsigned long nr_pages);
++extern int arch_create_linear_mapping(int nid, u64 start, u64 size,
++				      struct mhp_params *params);
++void arch_remove_linear_mapping(u64 start, u64 size);
+ #endif /* CONFIG_MEMORY_HOTPLUG */
+ 
+ #endif /* __LINUX_MEMORY_HOTPLUG_H */

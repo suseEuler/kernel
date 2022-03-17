@@ -1,0 +1,113 @@
+From 27cacaad16c549ce5dd30ae84100b7e680536822 Mon Sep 17 00:00:00 2001
+From: Oscar Salvador <osalvador@suse.de>
+Date: Wed, 30 Jun 2021 18:52:46 -0700
+Subject: [PATCH] mm,memory_hotplug: drop unneeded locking
+Git-commit: 27cacaad16c549ce5dd30ae84100b7e680536822
+Patch-mainline: v5.14-rc1
+References: bsn#118
+Modified-by-SEL: No
+
+
+Currently, memory-hotplug code takes zone's span_writelock and pgdat's
+resize_lock when resizing the node/zone's spanned pages via
+{move_pfn_range_to_zone(),remove_pfn_range_from_zone()} and when resizing
+node and zone's present pages via adjust_present_page_count().
+
+These locks are also taken during the initialization of the system at boot
+time, where it protects parallel struct page initialization, but they
+should not really be needed in memory-hotplug where all operations are a)
+synchronized on device level and b) serialized by the mem_hotplug_lock
+lock.
+
+[akpm@linux-foundation.org: remove now-unused locals]
+
+Link: https://lkml.kernel.org/r/20210531093958.15021-1-osalvador@suse.de
+Signed-off-by: Oscar Salvador <osalvador@suse.de>
+Acked-by: David Hildenbrand <david@redhat.com>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Pavel Tatashin <pasha.tatashin@soleen.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ mm/memory_hotplug.c | 16 +---------------
+ 1 file changed, 1 insertion(+), 15 deletions(-)
+
+diff --git a/mm/memory_hotplug.c b/mm/memory_hotplug.c
+index 1a9568d90ea7..553c52751249 100644
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@ -329,7 +329,6 @@ static void shrink_zone_span(struct zone *zone, unsigned long start_pfn,
+ 	unsigned long pfn;
+ 	int nid = zone_to_nid(zone);
+ 
+-	zone_span_writelock(zone);
+ 	if (zone->zone_start_pfn == start_pfn) {
+ 		/*
+ 		 * If the section is smallest section in the zone, it need
+@@ -362,7 +361,6 @@ static void shrink_zone_span(struct zone *zone, unsigned long start_pfn,
+ 			zone->spanned_pages = 0;
+ 		}
+ 	}
+-	zone_span_writeunlock(zone);
+ }
+ 
+ static void update_pgdat_span(struct pglist_data *pgdat)
+@@ -399,7 +397,7 @@ void __ref remove_pfn_range_from_zone(struct zone *zone,
+ {
+ 	const unsigned long end_pfn = start_pfn + nr_pages;
+ 	struct pglist_data *pgdat = zone->zone_pgdat;
+-	unsigned long pfn, cur_nr_pages, flags;
++	unsigned long pfn, cur_nr_pages;
+ 
+ 	/* Poison struct pages because they are now uninitialized again. */
+ 	for (pfn = start_pfn; pfn < end_pfn; pfn += cur_nr_pages) {
+@@ -424,10 +422,8 @@ void __ref remove_pfn_range_from_zone(struct zone *zone,
+ 
+ 	clear_zone_contiguous(zone);
+ 
+-	pgdat_resize_lock(zone->zone_pgdat, &flags);
+ 	shrink_zone_span(zone, start_pfn, start_pfn + nr_pages);
+ 	update_pgdat_span(pgdat);
+-	pgdat_resize_unlock(zone->zone_pgdat, &flags);
+ 
+ 	set_zone_contiguous(zone);
+ }
+@@ -634,19 +630,13 @@ void __ref move_pfn_range_to_zone(struct zone *zone, unsigned long start_pfn,
+ {
+ 	struct pglist_data *pgdat = zone->zone_pgdat;
+ 	int nid = pgdat->node_id;
+-	unsigned long flags;
+ 
+ 	clear_zone_contiguous(zone);
+ 
+-	/* TODO Huh pgdat is irqsave while zone is not. It used to be like that before */
+-	pgdat_resize_lock(pgdat, &flags);
+-	zone_span_writelock(zone);
+ 	if (zone_is_empty(zone))
+ 		init_currently_empty_zone(zone, start_pfn, nr_pages);
+ 	resize_zone_range(zone, start_pfn, nr_pages);
+-	zone_span_writeunlock(zone);
+ 	resize_pgdat_range(pgdat, start_pfn, nr_pages);
+-	pgdat_resize_unlock(pgdat, &flags);
+ 
+ 	/*
+ 	 * Subsection population requires care in pfn_to_online_page().
+@@ -736,12 +726,8 @@ struct zone *zone_for_pfn_range(int online_type, int nid, unsigned start_pfn,
+  */
+ void adjust_present_page_count(struct zone *zone, long nr_pages)
+ {
+-	unsigned long flags;
+-
+ 	zone->present_pages += nr_pages;
+-	pgdat_resize_lock(zone->zone_pgdat, &flags);
+ 	zone->zone_pgdat->node_present_pages += nr_pages;
+-	pgdat_resize_unlock(zone->zone_pgdat, &flags);
+ }
+ 
+ int mhp_init_memmap_on_memory(unsigned long pfn, unsigned long nr_pages,
+-- 
+2.34.1
+

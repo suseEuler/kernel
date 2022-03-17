@@ -1,0 +1,96 @@
+From da6df1b0fcfa97b2e3394df8622128bb810e1093 Mon Sep 17 00:00:00 2001
+From: Pavel Tatashin <pasha.tatashin@soleen.com>
+Date: Tue, 4 May 2021 18:38:57 -0700
+Subject: [PATCH] mm: apply per-task gfp constraints in fast path
+Git-commit: da6df1b0fcfa97b2e3394df8622128bb810e1093
+Patch-mainline: v5.13-rc1
+References: bsn#118
+Modified-by-SEL: No
+
+
+Function current_gfp_context() is called after fast path.  However, soon
+we will add more constraints which will also limit zones based on
+context.  Move this call into fast path, and apply the correct
+constraints for all allocations.
+
+Also update .reclaim_idx based on value returned by
+current_gfp_context() because it soon will modify the allowed zones.
+
+Note:
+With this patch we will do one extra current->flags load during fast path,
+but we already load current->flags in fast-path:
+
+__alloc_pages()
+ prepare_alloc_pages()
+  current_alloc_flags(gfp_mask, *alloc_flags);
+
+Later, when we add the zone constrain logic to current_gfp_context() we
+will be able to remove current->flags load from current_alloc_flags, and
+therefore return fast-path to the current performance level.
+
+Link: https://lkml.kernel.org/r/20210215161349.246722-7-pasha.tatashin@soleen.com
+Signed-off-by: Pavel Tatashin <pasha.tatashin@soleen.com>
+Suggested-by: Michal Hocko <mhocko@kernel.org>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Cc: Dan Williams <dan.j.williams@intel.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Ira Weiny <ira.weiny@intel.com>
+Cc: James Morris <jmorris@namei.org>
+Cc: Jason Gunthorpe <jgg@nvidia.com>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Sasha Levin <sashal@kernel.org>
+Cc: Steven Rostedt (VMware) <rostedt@goodmis.org>
+Cc: Tyler Hicks <tyhicks@linux.microsoft.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ mm/page_alloc.c | 15 ++++++++-------
+ 1 file changed, 8 insertions(+), 7 deletions(-)
+
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index c2fc6a64bef9..3c55eaafede1 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -5180,6 +5180,13 @@ struct page *__alloc_pages(gfp_t gfp, unsigned int order, int preferred_nid,
+ 	}
+ 
+ 	gfp &= gfp_allowed_mask;
++	/*
++	 * Apply scoped allocation constraints. This is mainly about GFP_NOFS
++	 * resp. GFP_NOIO which has to be inherited for all allocation requests
++	 * from a particular context which has been marked by
++	 * memalloc_no{fs,io}_{save,restore}.
++	 */
++	gfp = current_gfp_context(gfp);
+ 	alloc_gfp = gfp;
+ 	if (!prepare_alloc_pages(gfp, order, preferred_nid, nodemask, &ac,
+ 			&alloc_gfp, &alloc_flags))
+@@ -5196,13 +5203,7 @@ struct page *__alloc_pages(gfp_t gfp, unsigned int order, int preferred_nid,
+ 	if (likely(page))
+ 		goto out;
+ 
+-	/*
+-	 * Apply scoped allocation constraints. This is mainly about GFP_NOFS
+-	 * resp. GFP_NOIO which has to be inherited for all allocation requests
+-	 * from a particular context which has been marked by
+-	 * memalloc_no{fs,io}_{save,restore}.
+-	 */
+-	alloc_gfp = current_gfp_context(gfp);
++	alloc_gfp = gfp;
+ 	ac.spread_dirty_pages = false;
+ 
+ 	/*
+-- 
+2.34.1
+
