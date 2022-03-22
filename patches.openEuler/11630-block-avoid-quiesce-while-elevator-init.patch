@@ -1,0 +1,100 @@
+From 1509607853c0a3440f0f6464d3f0562de56b6cf0 Mon Sep 17 00:00:00 2001
+From: Ye Bin <yebin10@huawei.com>
+Date: Tue, 30 Nov 2021 16:32:15 +0800
+Subject: [PATCH] block: avoid quiesce while elevator init
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 1509607853c0a3440f0f6464d3f0562de56b6cf0
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 185781 https://gitee.com/openeuler/kernel/issues/I4DDEL
+
+-----------------------------------------------
+
+As blk_mq_quiesce_queue in elevator_init_mq will wait a RCU gap which want to
+make sure no IO will happen while blk_mq_init_sched. If there is lots of
+device will lead to boot slowly.
+To address this issue, according to Lei Ming's suggestion:
+"We are called before adding disk, when there isn't any FS I/O, so freezing
+queue plus canceling dispatch work is enough to drain any dispatch activities
+originated from passthrough requests, then no need to quiesce queue which may
+add long boot latency, especially when lots of disks are involved."
+
+Signed-off-by: Ye Bin <yebin10@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Chen Jun <chenjun102@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ block/blk-mq.c   | 13 +++++++++++++
+ block/blk-mq.h   |  1 +
+ block/elevator.c | 10 ++++++++--
+ 3 files changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 01ec97aa9ec8..4b2507cdece3 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -3990,6 +3990,19 @@ unsigned int blk_mq_rq_cpu(struct request *rq)
+ }
+ EXPORT_SYMBOL(blk_mq_rq_cpu);
+ 
++void blk_mq_cancel_work_sync(struct request_queue *q)
++{
++	if (queue_is_mq(q)) {
++		struct blk_mq_hw_ctx *hctx;
++		int i;
++
++		cancel_delayed_work_sync(&q->requeue_work);
++
++		queue_for_each_hw_ctx(q, hctx, i)
++			cancel_delayed_work_sync(&hctx->run_work);
++	}
++}
++
+ static int __init blk_mq_init(void)
+ {
+ 	int i;
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index f792a0920ebb..6f87c0681443 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -129,6 +129,7 @@ extern int blk_mq_sysfs_register(struct request_queue *q);
+ extern void blk_mq_sysfs_unregister(struct request_queue *q);
+ extern void blk_mq_hctx_kobj_init(struct blk_mq_hw_ctx *hctx);
+ 
++void blk_mq_cancel_work_sync(struct request_queue *q);
+ void blk_mq_release(struct request_queue *q);
+ 
+ static inline struct blk_mq_ctx *__blk_mq_get_ctx(struct request_queue *q,
+diff --git a/block/elevator.c b/block/elevator.c
+index 4ce6b22813a1..27eb70ec277a 100644
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@ -684,12 +684,18 @@ void elevator_init_mq(struct request_queue *q)
+ 	if (!e)
+ 		return;
+ 
++	/*
++	 * We are called before adding disk, when there isn't any FS I/O,
++	 * so freezing queue plus canceling dispatch work is enough to
++	 * drain any dispatch activities originated from passthrough
++	 * requests, then no need to quiesce queue which may add long boot
++	 * latency, especially when lots of disks are involved.
++	 */
+ 	blk_mq_freeze_queue(q);
+-	blk_mq_quiesce_queue(q);
++	blk_mq_cancel_work_sync(q);
+ 
+ 	err = blk_mq_init_sched(q, e);
+ 
+-	blk_mq_unquiesce_queue(q);
+ 	blk_mq_unfreeze_queue(q);
+ 
+ 	if (err) {
+-- 
+2.26.2
+
