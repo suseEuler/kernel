@@ -1,0 +1,110 @@
+From 64233338499126c5c31e07165735ab5441c7e45a Mon Sep 17 00:00:00 2001
+From: Chen Yu <yu.c.chen@intel.com>
+Date: Fri, 28 May 2021 11:20:54 +0800
+Subject: [PATCH] intel_idle: Adjust the SKX C6 parameters if PC6 is disabled
+Git-commit: 64233338499126c5c31e07165735ab5441c7e45a
+Patch-mainline: v5.14-rc1
+References: bsn#122
+Modified-by-SEL: No
+
+
+Because cpuidle assumes worst-case C-state parameters, PC6 parameters
+are used for describing C6, which is worst-case for requesting CC6.
+When PC6 is enabled, this is appropriate. But if PC6 is disabled
+in the BIOS, the exit latency and target residency should be adjusted
+accordingly.
+
+Exit latency:
+Previously the C6 exit latency was measured as the PC6 exit latency.
+With PC6 disabled, the C6 exit latency should be the one of CC6.
+
+Target residency:
+With PC6 disabled, the idle duration within [CC6, PC6) would make the
+idle governor choose C1E over C6. This would cause low energy-efficiency.
+We should lower the bar to request C6 when PC6 is disabled.
+
+To fill this gap, check if PC6 is disabled in the BIOS in the
+MSR_PKG_CST_CONFIG_CONTROL(0xe2) register. If so, use the CC6 exit latency
+for C6 and set target_residency to 3 times of the new exit latency. [This
+is consistent with how intel_idle driver uses _CST to calculate the
+target_residency.] As a result, the OS would be more likely to choose C6
+over C1E when PC6 is disabled, which is reasonable, because if C6 is
+enabled, it implies that the user cares about energy, so choosing C6 more
+frequently makes sense.
+
+The new CC6 exit latency of 92us was measured with wult[1] on SKX via NIC
+wakeup as the 99.99th percentile. Also CLX and CPX both have the same CPU
+model number as SkX, but their CC6 exit latencies are similar to the SKX
+one, 96us and 89us respectively, so reuse the SKX value for them.
+
+There is a concern that it might be better to use a more generic approach
+instead of optimizing every platform. However, if the required code
+complexity and different PC6 bit interpretation on different platforms
+are taken into account, tuning the code per platform seems to be an
+acceptable tradeoff.
+
+Link: https://intel.github.io/wult/ # [1]
+Suggested-by: Len Brown <len.brown@intel.com>
+Signed-off-by: Chen Yu <yu.c.chen@intel.com>
+Reviewed-by: Artem Bityutskiy <artem.bityutskiy@linux.intel.com>
+[ rjw: Subject and changelog edits ]
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ drivers/idle/intel_idle.c | 33 +++++++++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/drivers/idle/intel_idle.c b/drivers/idle/intel_idle.c
+index ec1b9d306ba6..e6c543b5ee1d 100644
+--- a/drivers/idle/intel_idle.c
++++ b/drivers/idle/intel_idle.c
+@@ -1484,6 +1484,36 @@ static void __init sklh_idle_state_table_update(void)
+ 	skl_cstates[6].flags |= CPUIDLE_FLAG_UNUSABLE;	/* C9-SKL */
+ }
+ 
++/**
++ * skx_idle_state_table_update - Adjust the Sky Lake/Cascade Lake
++ * idle states table.
++ */
++static void __init skx_idle_state_table_update(void)
++{
++	unsigned long long msr;
++
++	rdmsrl(MSR_PKG_CST_CONFIG_CONTROL, msr);
++
++	/*
++	 * 000b: C0/C1 (no package C-state support)
++	 * 001b: C2
++	 * 010b: C6 (non-retention)
++	 * 011b: C6 (retention)
++	 * 111b: No Package C state limits.
++	 */
++	if ((msr & 0x7) < 2) {
++		/*
++		 * Uses the CC6 + PC0 latency and 3 times of
++		 * latency for target_residency if the PC6
++		 * is disabled in BIOS. This is consistent
++		 * with how intel_idle driver uses _CST
++		 * to set the target_residency.
++		 */
++		skx_cstates[2].exit_latency = 92;
++		skx_cstates[2].target_residency = 276;
++	}
++}
++
+ static bool __init intel_idle_verify_cstate(unsigned int mwait_hint)
+ {
+ 	unsigned int mwait_cstate = MWAIT_HINT2CSTATE(mwait_hint) + 1;
+@@ -1515,6 +1545,9 @@ static void __init intel_idle_init_cstates_icpu(struct cpuidle_driver *drv)
+ 	case INTEL_FAM6_SKYLAKE:
+ 		sklh_idle_state_table_update();
+ 		break;
++	case INTEL_FAM6_SKYLAKE_X:
++		skx_idle_state_table_update();
++		break;
+ 	}
+ 
+ 	for (cstate = 0; cstate < CPUIDLE_STATE_MAX; ++cstate) {
+-- 
+2.34.1
+
