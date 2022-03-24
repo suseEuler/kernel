@@ -1,0 +1,88 @@
+From a15d81bae5473eaf5e98a6a4591c22637f4e9809 Mon Sep 17 00:00:00 2001
+From: Liu Shixin <liushixin2@huawei.com>
+Date: Sun, 20 Mar 2022 10:48:19 +0800
+Subject: [PATCH] mm/dynamic_hugetlb: hold the lock until pages back to hugetlb
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: a15d81bae5473eaf5e98a6a4591c22637f4e9809
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 46904 https://gitee.com/openeuler/kernel/issues/I4Y0XO
+
+--------------------------------
+
+Do not release the lock after merging all pages, otherwise some other process
+may allocate the pages, and then some pages can't be put back to hugetlb.
+
+Signed-off-by: Liu Shixin <liushixin2@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/dynamic_hugetlb.c | 15 +++++++++------
+ 1 file changed, 9 insertions(+), 6 deletions(-)
+
+diff --git a/mm/dynamic_hugetlb.c b/mm/dynamic_hugetlb.c
+index 8366b54dfcfe..d07877559bac 100644
+--- a/mm/dynamic_hugetlb.c
++++ b/mm/dynamic_hugetlb.c
+@@ -305,7 +305,8 @@ static int hugetlb_pool_merge_all_pages(struct dhugetlb_pool *hpool)
+ {
+ 	int ret = 0;
+ 
+-	spin_lock(&hpool->lock);
++	lockdep_assert_held(&hpool->lock);
++
+ 	while (hpool->hpages_pool[HUGE_PAGES_POOL_2M].split_normal_pages) {
+ 		ret = hpool_merge_page(hpool, HUGE_PAGES_POOL_2M, true);
+ 		if (ret) {
+@@ -329,7 +330,6 @@ static int hugetlb_pool_merge_all_pages(struct dhugetlb_pool *hpool)
+ 		goto out;
+ 	}
+ out:
+-	spin_unlock(&hpool->lock);
+ 	return ret;
+ }
+ 
+@@ -767,7 +767,8 @@ static int free_hugepage_to_hugetlb(struct dhugetlb_pool *hpool)
+ 	if (!h)
+ 		return ret;
+ 
+-	spin_lock(&hpool->lock);
++	lockdep_assert_held(&hpool->lock);
++
+ 	spin_lock(&hugetlb_lock);
+ 	list_for_each_entry_safe(page, next, &hpages_pool->hugepage_freelists, lru) {
+ 		nr_pages = 1 << huge_page_order(h);
+@@ -791,7 +792,6 @@ static int free_hugepage_to_hugetlb(struct dhugetlb_pool *hpool)
+ 			break;
+ 	}
+ 	spin_unlock(&hugetlb_lock);
+-	spin_unlock(&hpool->lock);
+ 	return ret;
+ }
+ 
+@@ -855,12 +855,15 @@ int hugetlb_pool_destroy(struct cgroup *cgrp)
+ 	 */
+ 	mem_cgroup_force_empty(hpool->attach_memcg);
+ 
++	spin_lock(&hpool->lock);
+ 	ret = hugetlb_pool_merge_all_pages(hpool);
+-	if (ret)
++	if (ret) {
++		spin_unlock(&hpool->lock);
+ 		return -ENOMEM;
++	}
+ 	ret = free_hugepage_to_hugetlb(hpool);
+ 	memcg->hpool = NULL;
+-
++	spin_unlock(&hpool->lock);
+ 	put_hpool(hpool);
+ 	return ret;
+ }
+-- 
+2.26.2
+
