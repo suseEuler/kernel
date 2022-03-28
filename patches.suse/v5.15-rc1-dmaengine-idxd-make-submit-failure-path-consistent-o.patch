@@ -1,0 +1,106 @@
+From 0b030f54f094fcd42f4a607a675c1851129a58c8 Mon Sep 17 00:00:00 2001
+From: Dave Jiang <dave.jiang@intel.com>
+Date: Fri, 6 Aug 2021 10:37:40 -0700
+Subject: [PATCH] dmaengine: idxd: make submit failure path consistent on desc
+ freeing
+Git-commit: 0b030f54f094fcd42f4a607a675c1851129a58c8
+Patch-mainline: v5.15-rc1
+References: bsn#161
+Modified-by-SEL: Yes, modified due to different context
+
+
+The submission path for dmaengine API does not do descriptor freeing on
+failure. Also, with the abort mechanism, the freeing of descriptor happens
+when the abort callback is completed. Therefore free descriptor on all
+error paths for submission call to make things consistent. Also remove the
+double free that would happen on abort in idxd_dma_tx_submit() call.
+
+Fixes: 6b4b87f2c31a ("dmaengine: idxd: fix submission race window")
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Link: https://lore.kernel.org/r/162827146072.3459011.10255348500504659810.stgit@djiang5-desk3.ch.intel.com
+Signed-off-by: Vinod Koul <vkoul@kernel.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/dma/idxd/dma.c    |    4 +---
+ drivers/dma/idxd/submit.c |   32 ++++++++++++++++++++++----------
+ 2 files changed, 23 insertions(+), 13 deletions(-)
+
+--- a/drivers/dma/idxd/dma.c
++++ b/drivers/dma/idxd/dma.c
+@@ -149,10 +149,8 @@ static dma_cookie_t idxd_dma_tx_submit(s
+ 	cookie = dma_cookie_assign(tx);
+ 
+ 	rc = idxd_submit_desc(wq, desc);
+-	if (rc < 0) {
+-		idxd_free_desc(wq, desc);
++	if (rc < 0)
+ 		return rc;
+-	}
+ 
+ 	return cookie;
+ }
+--- a/drivers/dma/idxd/submit.c
++++ b/drivers/dma/idxd/submit.c
+@@ -135,14 +135,19 @@ static void llist_abort_desc(struct idxd
+ int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc)
+ {
+ 	struct idxd_device *idxd = wq->idxd;
++	struct idxd_irq_entry *ie = NULL;
+ 	void __iomem *portal;
+ 	int rc;
+ 
+-	if (idxd->state != IDXD_DEV_ENABLED)
++	if (idxd->state != IDXD_DEV_ENABLED) {
++		idxd_free_desc(wq, desc);
+ 		return -EIO;
++	}
+ 	
+-	if (!percpu_ref_tryget_live(&wq->wq_active))
++	if (!percpu_ref_tryget_live(&wq->wq_active)) {
++		idxd_free_desc(wq, desc);
+ 		return -ENXIO;
++	}
+ 
+ 	portal = idxd_wq_portal_addr(wq);
+ 
+@@ -152,6 +157,16 @@ int idxd_submit_desc(struct idxd_wq *wq,
+ 	 * even on UP because the recipient is a device.
+ 	 */
+ 	wmb();
++
++	/*
++	 * Pending the descriptor to the lockless list for the irq_entry
++	 * that we designated the descriptor to.
++	 */
++	if (desc->hw->flags & IDXD_OP_FLAG_RCI) {
++		ie = &idxd->irq_entries[wq->id + 1];
++		llist_add(&desc->llnode, &ie->pending_llist);
++	}
++
+ 	if (wq_dedicated(wq)) {
+ 		iosubmit_cmds512(portal, desc->hw, 1);
+ 	} else {
+@@ -164,18 +179,15 @@ int idxd_submit_desc(struct idxd_wq *wq,
+ 		rc = enqcmds(portal, desc->hw);
+ 		if (rc < 0) {
+ 			percpu_ref_put(&wq->wq_active);
++			/* abort operation frees the descriptor */
++			if (ie)
++				llist_abort_desc(wq, ie, desc);
++			else
++				idxd_free_desc(wq, desc);
+ 			return rc;
+ 		}
+ 	}
+ 
+ 	percpu_ref_put(&wq->wq_active);
+-
+-	/*
+-	 * Pending the descriptor to the lockless list for the irq_entry
+-	 * that we designated the descriptor to.
+-	 */
+-	if (desc->hw->flags & IDXD_OP_FLAG_RCI)
+-		llist_add(&desc->llnode, &idxd->irq_entries[wq->id + 1].pending_llist);
+-
+ 	return 0;
+ }

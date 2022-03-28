@@ -1,0 +1,139 @@
+From 5b0c68c473a131c2acb21abad44b0047b200e185 Mon Sep 17 00:00:00 2001
+From: Dave Jiang <dave.jiang@intel.com>
+Date: Tue, 20 Apr 2021 11:46:51 -0700
+Subject: [PATCH] dmaengine: idxd: support reporting of halt interrupt
+Git-commit: 5b0c68c473a131c2acb21abad44b0047b200e185
+Patch-mainline: v5.13-rc1
+References: bsn#161
+Modified-by-SEL: No
+
+
+Unmask the halt error interrupt so it gets reported to the interrupt
+handler. When halt state interrupt is received, quiesce the kernel
+WQs and unmap the portals to stop submission.
+
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Link: https://lore.kernel.org/r/161894441167.3202472.9485946398140619501.stgit@djiang5-desk3.ch.intel.com
+Signed-off-by: Vinod Koul <vkoul@kernel.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/dma/idxd/device.c    | 15 +++++++++++++++
+ drivers/dma/idxd/idxd.h      |  2 ++
+ drivers/dma/idxd/init.c      | 12 ++++++++++++
+ drivers/dma/idxd/irq.c       |  2 ++
+ drivers/dma/idxd/registers.h |  3 ++-
+ 5 files changed, 33 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/dma/idxd/device.c b/drivers/dma/idxd/device.c
+index 54d5afec81cf..3934e660d951 100644
+--- a/drivers/dma/idxd/device.c
++++ b/drivers/dma/idxd/device.c
+@@ -47,6 +47,7 @@ void idxd_unmask_error_interrupts(struct idxd_device *idxd)
+ 
+ 	genctrl.bits = ioread32(idxd->reg_base + IDXD_GENCTRL_OFFSET);
+ 	genctrl.softerr_int_en = 1;
++	genctrl.halt_int_en = 1;
+ 	iowrite32(genctrl.bits, idxd->reg_base + IDXD_GENCTRL_OFFSET);
+ }
+ 
+@@ -56,6 +57,7 @@ void idxd_mask_error_interrupts(struct idxd_device *idxd)
+ 
+ 	genctrl.bits = ioread32(idxd->reg_base + IDXD_GENCTRL_OFFSET);
+ 	genctrl.softerr_int_en = 0;
++	genctrl.halt_int_en = 0;
+ 	iowrite32(genctrl.bits, idxd->reg_base + IDXD_GENCTRL_OFFSET);
+ }
+ 
+@@ -312,6 +314,19 @@ void idxd_wq_unmap_portal(struct idxd_wq *wq)
+ 	struct device *dev = &wq->idxd->pdev->dev;
+ 
+ 	devm_iounmap(dev, wq->portal);
++	wq->portal = NULL;
++}
++
++void idxd_wqs_unmap_portal(struct idxd_device *idxd)
++{
++	int i;
++
++	for (i = 0; i < idxd->max_wqs; i++) {
++		struct idxd_wq *wq = idxd->wqs[i];
++
++		if (wq->portal)
++			idxd_wq_unmap_portal(wq);
++	}
+ }
+ 
+ int idxd_wq_set_pasid(struct idxd_wq *wq, int pasid)
+diff --git a/drivers/dma/idxd/idxd.h b/drivers/dma/idxd/idxd.h
+index c1d4a1976206..d7185c6bfade 100644
+--- a/drivers/dma/idxd/idxd.h
++++ b/drivers/dma/idxd/idxd.h
+@@ -371,6 +371,7 @@ int idxd_register_devices(struct idxd_device *idxd);
+ void idxd_unregister_devices(struct idxd_device *idxd);
+ int idxd_register_driver(void);
+ void idxd_unregister_driver(void);
++void idxd_wqs_quiesce(struct idxd_device *idxd);
+ 
+ /* device interrupt control */
+ void idxd_msix_perm_setup(struct idxd_device *idxd);
+@@ -400,6 +401,7 @@ int idxd_device_release_int_handle(struct idxd_device *idxd, int handle,
+ 				   enum idxd_interrupt_type irq_type);
+ 
+ /* work queue control */
++void idxd_wqs_unmap_portal(struct idxd_device *idxd);
+ int idxd_wq_alloc_resources(struct idxd_wq *wq);
+ void idxd_wq_free_resources(struct idxd_wq *wq);
+ int idxd_wq_enable(struct idxd_wq *wq);
+diff --git a/drivers/dma/idxd/init.c b/drivers/dma/idxd/init.c
+index eb0b3a00a2d7..e6bfd55e421b 100644
+--- a/drivers/dma/idxd/init.c
++++ b/drivers/dma/idxd/init.c
+@@ -647,6 +647,18 @@ static void idxd_flush_work_list(struct idxd_irq_entry *ie)
+ 	}
+ }
+ 
++void idxd_wqs_quiesce(struct idxd_device *idxd)
++{
++	struct idxd_wq *wq;
++	int i;
++
++	for (i = 0; i < idxd->max_wqs; i++) {
++		wq = idxd->wqs[i];
++		if (wq->state == IDXD_WQ_ENABLED && wq->type == IDXD_WQT_KERNEL)
++			idxd_wq_quiesce(wq);
++	}
++}
++
+ static void idxd_release_int_handles(struct idxd_device *idxd)
+ {
+ 	struct device *dev = &idxd->pdev->dev;
+diff --git a/drivers/dma/idxd/irq.c b/drivers/dma/idxd/irq.c
+index fc0781e3f36d..43eea5c9cbd4 100644
+--- a/drivers/dma/idxd/irq.c
++++ b/drivers/dma/idxd/irq.c
+@@ -202,6 +202,8 @@ static int process_misc_interrupts(struct idxd_device *idxd, u32 cause)
+ 			queue_work(idxd->wq, &idxd->work);
+ 		} else {
+ 			spin_lock_bh(&idxd->dev_lock);
++			idxd_wqs_quiesce(idxd);
++			idxd_wqs_unmap_portal(idxd);
+ 			idxd_device_wqs_clear_state(idxd);
+ 			dev_err(&idxd->pdev->dev,
+ 				"idxd halted, need %s.\n",
+diff --git a/drivers/dma/idxd/registers.h b/drivers/dma/idxd/registers.h
+index 5cbf368c7367..6c11375cc56a 100644
+--- a/drivers/dma/idxd/registers.h
++++ b/drivers/dma/idxd/registers.h
+@@ -120,7 +120,8 @@ union gencfg_reg {
+ union genctrl_reg {
+ 	struct {
+ 		u32 softerr_int_en:1;
+-		u32 rsvd:31;
++		u32 halt_int_en:1;
++		u32 rsvd:30;
+ 	};
+ 	u32 bits;
+ } __packed;
+-- 
+2.26.2
+

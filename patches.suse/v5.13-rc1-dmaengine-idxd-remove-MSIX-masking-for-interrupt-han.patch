@@ -1,0 +1,103 @@
+From a16104617d212d4b482568847b25172972b87e60 Mon Sep 17 00:00:00 2001
+From: Dave Jiang <dave.jiang@intel.com>
+Date: Tue, 20 Apr 2021 12:00:34 -0700
+Subject: [PATCH] dmaengine: idxd: remove MSIX masking for interrupt handlers
+Git-commit: a16104617d212d4b482568847b25172972b87e60
+Patch-mainline: v5.13-rc1
+References: bsn#161
+Modified-by-SEL: No
+
+
+Remove interrupt masking and just let the hard irq handler keep
+firing for new events. This is less of a performance impact vs
+the MMIO readback inside the pci_msi_{mask,unmas}_irq(). Especially
+with a loaded system those flushes can be stuck behind large amounts
+of MMIO writes to flush. When guest kernel is running on top of VFIO
+mdev, mask/unmask causes a vmexit each time and is not desirable.
+
+Suggested-by: Dan Williams <dan.j.williams@intel.com>
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+Link: https://lore.kernel.org/r/161894523436.3210025.1834640110556139277.stgit@djiang5-desk3.ch.intel.com
+Signed-off-by: Vinod Koul <vkoul@kernel.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/dma/idxd/idxd.h |  1 -
+ drivers/dma/idxd/init.c |  4 ++--
+ drivers/dma/idxd/irq.c  | 12 ------------
+ 3 files changed, 2 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/dma/idxd/idxd.h b/drivers/dma/idxd/idxd.h
+index 87330b6940fa..97c96ca6ab70 100644
+--- a/drivers/dma/idxd/idxd.h
++++ b/drivers/dma/idxd/idxd.h
+@@ -377,7 +377,6 @@ void idxd_wqs_quiesce(struct idxd_device *idxd);
+ /* device interrupt control */
+ void idxd_msix_perm_setup(struct idxd_device *idxd);
+ void idxd_msix_perm_clear(struct idxd_device *idxd);
+-irqreturn_t idxd_irq_handler(int vec, void *data);
+ irqreturn_t idxd_misc_thread(int vec, void *data);
+ irqreturn_t idxd_wq_thread(int irq, void *data);
+ void idxd_mask_error_interrupts(struct idxd_device *idxd);
+diff --git a/drivers/dma/idxd/init.c b/drivers/dma/idxd/init.c
+index 64dab4de217e..8003f8a25fff 100644
+--- a/drivers/dma/idxd/init.c
++++ b/drivers/dma/idxd/init.c
+@@ -102,7 +102,7 @@ static int idxd_setup_interrupts(struct idxd_device *idxd)
+ 	}
+ 
+ 	irq_entry = &idxd->irq_entries[0];
+-	rc = request_threaded_irq(irq_entry->vector, idxd_irq_handler, idxd_misc_thread,
++	rc = request_threaded_irq(irq_entry->vector, NULL, idxd_misc_thread,
+ 				  0, "idxd-misc", irq_entry);
+ 	if (rc < 0) {
+ 		dev_err(dev, "Failed to allocate misc interrupt.\n");
+@@ -119,7 +119,7 @@ static int idxd_setup_interrupts(struct idxd_device *idxd)
+ 
+ 		init_llist_head(&idxd->irq_entries[i].pending_llist);
+ 		INIT_LIST_HEAD(&idxd->irq_entries[i].work_list);
+-		rc = request_threaded_irq(irq_entry->vector, idxd_irq_handler,
++		rc = request_threaded_irq(irq_entry->vector, NULL,
+ 					  idxd_wq_thread, 0, "idxd-portal", irq_entry);
+ 		if (rc < 0) {
+ 			dev_err(dev, "Failed to allocate irq %d.\n", irq_entry->vector);
+diff --git a/drivers/dma/idxd/irq.c b/drivers/dma/idxd/irq.c
+index 43eea5c9cbd4..afee571e0194 100644
+--- a/drivers/dma/idxd/irq.c
++++ b/drivers/dma/idxd/irq.c
+@@ -102,15 +102,6 @@ static int idxd_device_schedule_fault_process(struct idxd_device *idxd,
+ 	return 0;
+ }
+ 
+-irqreturn_t idxd_irq_handler(int vec, void *data)
+-{
+-	struct idxd_irq_entry *irq_entry = data;
+-	struct idxd_device *idxd = irq_entry->idxd;
+-
+-	idxd_mask_msix_vector(idxd, irq_entry->id);
+-	return IRQ_WAKE_THREAD;
+-}
+-
+ static int process_misc_interrupts(struct idxd_device *idxd, u32 cause)
+ {
+ 	struct device *dev = &idxd->pdev->dev;
+@@ -237,7 +228,6 @@ irqreturn_t idxd_misc_thread(int vec, void *data)
+ 			iowrite32(cause, idxd->reg_base + IDXD_INTCAUSE_OFFSET);
+ 	}
+ 
+-	idxd_unmask_msix_vector(idxd, irq_entry->id);
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -394,8 +384,6 @@ irqreturn_t idxd_wq_thread(int irq, void *data)
+ 	int processed;
+ 
+ 	processed = idxd_desc_process(irq_entry);
+-	idxd_unmask_msix_vector(irq_entry->idxd, irq_entry->id);
+-
+ 	if (processed == 0)
+ 		return IRQ_NONE;
+ 
+-- 
+2.26.2
+

@@ -1,0 +1,122 @@
+From 53b2ee7f637c4f1fa2f50dbdb210088e30c11d2b Mon Sep 17 00:00:00 2001
+From: Dave Jiang <dave.jiang@intel.com>
+Date: Tue, 20 Apr 2021 12:00:56 -0700
+Subject: [PATCH] dmaengine: idxd: device cmd should use dedicated lock
+Git-commit: 53b2ee7f637c4f1fa2f50dbdb210088e30c11d2b
+Patch-mainline: v5.13-rc1
+References: bsn#161
+Modified-by-SEL: No
+
+
+Create a dedicated lock for device command operations. Put the device
+command operation under finer grained locking instead of using the
+idxd->dev_lock.
+
+Suggested-by: Sanjay Kumar <sanjay.k.kumar@intel.com>
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Link: https://lore.kernel.org/r/161894525685.3210132.16160045731436382560.stgit@djiang5-desk3.ch.intel.com
+Signed-off-by: Vinod Koul <vkoul@kernel.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/dma/idxd/device.c | 18 +++++++++---------
+ drivers/dma/idxd/idxd.h   |  1 +
+ drivers/dma/idxd/init.c   |  1 +
+ 3 files changed, 11 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/dma/idxd/device.c b/drivers/dma/idxd/device.c
+index 3934e660d951..420b93fe5feb 100644
+--- a/drivers/dma/idxd/device.c
++++ b/drivers/dma/idxd/device.c
+@@ -465,13 +465,13 @@ int idxd_device_init_reset(struct idxd_device *idxd)
+ 	memset(&cmd, 0, sizeof(cmd));
+ 	cmd.cmd = IDXD_CMD_RESET_DEVICE;
+ 	dev_dbg(dev, "%s: sending reset for init.\n", __func__);
+-	spin_lock_irqsave(&idxd->dev_lock, flags);
++	spin_lock_irqsave(&idxd->cmd_lock, flags);
+ 	iowrite32(cmd.bits, idxd->reg_base + IDXD_CMD_OFFSET);
+ 
+ 	while (ioread32(idxd->reg_base + IDXD_CMDSTS_OFFSET) &
+ 	       IDXD_CMDSTS_ACTIVE)
+ 		cpu_relax();
+-	spin_unlock_irqrestore(&idxd->dev_lock, flags);
++	spin_unlock_irqrestore(&idxd->cmd_lock, flags);
+ 	return 0;
+ }
+ 
+@@ -494,10 +494,10 @@ static void idxd_cmd_exec(struct idxd_device *idxd, int cmd_code, u32 operand,
+ 	cmd.operand = operand;
+ 	cmd.int_req = 1;
+ 
+-	spin_lock_irqsave(&idxd->dev_lock, flags);
++	spin_lock_irqsave(&idxd->cmd_lock, flags);
+ 	wait_event_lock_irq(idxd->cmd_waitq,
+ 			    !test_bit(IDXD_FLAG_CMD_RUNNING, &idxd->flags),
+-			    idxd->dev_lock);
++			    idxd->cmd_lock);
+ 
+ 	dev_dbg(&idxd->pdev->dev, "%s: sending cmd: %#x op: %#x\n",
+ 		__func__, cmd_code, operand);
+@@ -511,9 +511,9 @@ static void idxd_cmd_exec(struct idxd_device *idxd, int cmd_code, u32 operand,
+ 	 * After command submitted, release lock and go to sleep until
+ 	 * the command completes via interrupt.
+ 	 */
+-	spin_unlock_irqrestore(&idxd->dev_lock, flags);
++	spin_unlock_irqrestore(&idxd->cmd_lock, flags);
+ 	wait_for_completion(&done);
+-	spin_lock_irqsave(&idxd->dev_lock, flags);
++	spin_lock_irqsave(&idxd->cmd_lock, flags);
+ 	if (status) {
+ 		*status = ioread32(idxd->reg_base + IDXD_CMDSTS_OFFSET);
+ 		idxd->cmd_status = *status & GENMASK(7, 0);
+@@ -522,7 +522,7 @@ static void idxd_cmd_exec(struct idxd_device *idxd, int cmd_code, u32 operand,
+ 	__clear_bit(IDXD_FLAG_CMD_RUNNING, &idxd->flags);
+ 	/* Wake up other pending commands */
+ 	wake_up(&idxd->cmd_waitq);
+-	spin_unlock_irqrestore(&idxd->dev_lock, flags);
++	spin_unlock_irqrestore(&idxd->cmd_lock, flags);
+ }
+ 
+ int idxd_device_enable(struct idxd_device *idxd)
+@@ -667,13 +667,13 @@ int idxd_device_release_int_handle(struct idxd_device *idxd, int handle,
+ 
+ 	dev_dbg(dev, "cmd: %u operand: %#x\n", IDXD_CMD_RELEASE_INT_HANDLE, operand);
+ 
+-	spin_lock_irqsave(&idxd->dev_lock, flags);
++	spin_lock_irqsave(&idxd->cmd_lock, flags);
+ 	iowrite32(cmd.bits, idxd->reg_base + IDXD_CMD_OFFSET);
+ 
+ 	while (ioread32(idxd->reg_base + IDXD_CMDSTS_OFFSET) & IDXD_CMDSTS_ACTIVE)
+ 		cpu_relax();
+ 	status = ioread32(idxd->reg_base + IDXD_CMDSTS_OFFSET);
+-	spin_unlock_irqrestore(&idxd->dev_lock, flags);
++	spin_unlock_irqrestore(&idxd->cmd_lock, flags);
+ 
+ 	if ((status & IDXD_CMDSTS_ERR_MASK) != IDXD_CMDSTS_SUCCESS) {
+ 		dev_dbg(dev, "release int handle failed: %#x\n", status);
+diff --git a/drivers/dma/idxd/idxd.h b/drivers/dma/idxd/idxd.h
+index d7185c6bfade..87330b6940fa 100644
+--- a/drivers/dma/idxd/idxd.h
++++ b/drivers/dma/idxd/idxd.h
+@@ -204,6 +204,7 @@ struct idxd_device {
+ 	void __iomem *reg_base;
+ 
+ 	spinlock_t dev_lock;	/* spinlock for device */
++	spinlock_t cmd_lock;	/* spinlock for device commands */
+ 	struct completion *cmd_done;
+ 	struct idxd_group **groups;
+ 	struct idxd_wq **wqs;
+diff --git a/drivers/dma/idxd/init.c b/drivers/dma/idxd/init.c
+index e6bfd55e421b..64dab4de217e 100644
+--- a/drivers/dma/idxd/init.c
++++ b/drivers/dma/idxd/init.c
+@@ -449,6 +449,7 @@ static struct idxd_device *idxd_alloc(struct pci_dev *pdev, struct idxd_driver_d
+ 	}
+ 
+ 	spin_lock_init(&idxd->dev_lock);
++	spin_lock_init(&idxd->cmd_lock);
+ 
+ 	return idxd;
+ }
+-- 
+2.26.2
+

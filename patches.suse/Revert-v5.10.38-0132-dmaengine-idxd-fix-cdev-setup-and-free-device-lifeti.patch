@@ -1,0 +1,301 @@
+From 1da7774bde0081a44aa8600495ce3ec95f0db31f Mon Sep 17 00:00:00 2001
+From: Guoqing Jiang <guoqing.jiang@suse.com>
+Date: Mon, 28 Mar 2022 14:19:36 +0800
+Subject: [PATCH] Revert "dmaengine: idxd: fix cdev setup and free device
+ lifetime issues"
+Patch-mainline: Never, revert stable patch which is added again in sorted section
+References: bsn#161
+Modified-by-SEL: No
+
+
+This reverts commit dd41a0e515322221954258e2fd27b726bef6383a.
+
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/dma/idxd/cdev.c  | 129 +++++++++++++++++++++++++--------------
+ drivers/dma/idxd/idxd.h  |   7 +--
+ drivers/dma/idxd/init.c  |   2 +-
+ drivers/dma/idxd/irq.c   |   4 +-
+ drivers/dma/idxd/sysfs.c |  10 +--
+ 5 files changed, 89 insertions(+), 63 deletions(-)
+
+diff --git a/drivers/dma/idxd/cdev.c b/drivers/dma/idxd/cdev.c
+index 4da88578ed64..c3976156db2f 100644
+--- a/drivers/dma/idxd/cdev.c
++++ b/drivers/dma/idxd/cdev.c
+@@ -35,15 +35,15 @@ struct idxd_user_context {
+ 	unsigned int flags;
+ };
+ 
++enum idxd_cdev_cleanup {
++	CDEV_NORMAL = 0,
++	CDEV_FAILED,
++};
++
+ static void idxd_cdev_dev_release(struct device *dev)
+ {
+-	struct idxd_cdev *idxd_cdev = container_of(dev, struct idxd_cdev, dev);
+-	struct idxd_cdev_context *cdev_ctx;
+-	struct idxd_wq *wq = idxd_cdev->wq;
+-
+-	cdev_ctx = &ictx[wq->idxd->type];
+-	ida_simple_remove(&cdev_ctx->minor_ida, idxd_cdev->minor);
+-	kfree(idxd_cdev);
++	dev_dbg(dev, "releasing cdev device\n");
++	kfree(dev);
+ }
+ 
+ static struct device_type idxd_cdev_device_type = {
+@@ -58,11 +58,14 @@ static inline struct idxd_cdev *inode_idxd_cdev(struct inode *inode)
+ 	return container_of(cdev, struct idxd_cdev, cdev);
+ }
+ 
+-static inline struct idxd_wq *inode_wq(struct inode *inode)
++static inline struct idxd_wq *idxd_cdev_wq(struct idxd_cdev *idxd_cdev)
+ {
+-	struct idxd_cdev *idxd_cdev = inode_idxd_cdev(inode);
++	return container_of(idxd_cdev, struct idxd_wq, idxd_cdev);
++}
+ 
+-	return idxd_cdev->wq;
++static inline struct idxd_wq *inode_wq(struct inode *inode)
++{
++	return idxd_cdev_wq(inode_idxd_cdev(inode));
+ }
+ 
+ static int idxd_cdev_open(struct inode *inode, struct file *filp)
+@@ -169,10 +172,11 @@ static __poll_t idxd_cdev_poll(struct file *filp,
+ 	struct idxd_user_context *ctx = filp->private_data;
+ 	struct idxd_wq *wq = ctx->wq;
+ 	struct idxd_device *idxd = wq->idxd;
++	struct idxd_cdev *idxd_cdev = &wq->idxd_cdev;
+ 	unsigned long flags;
+ 	__poll_t out = 0;
+ 
+-	poll_wait(filp, &wq->err_queue, wait);
++	poll_wait(filp, &idxd_cdev->err_queue, wait);
+ 	spin_lock_irqsave(&idxd->dev_lock, flags);
+ 	if (idxd->sw_err.valid)
+ 		out = EPOLLIN | EPOLLRDNORM;
+@@ -194,67 +198,98 @@ int idxd_cdev_get_major(struct idxd_device *idxd)
+ 	return MAJOR(ictx[idxd->type].devt);
+ }
+ 
+-int idxd_wq_add_cdev(struct idxd_wq *wq)
++static int idxd_wq_cdev_dev_setup(struct idxd_wq *wq)
+ {
+ 	struct idxd_device *idxd = wq->idxd;
+-	struct idxd_cdev *idxd_cdev;
+-	struct cdev *cdev;
+-	struct device *dev;
++	struct idxd_cdev *idxd_cdev = &wq->idxd_cdev;
+ 	struct idxd_cdev_context *cdev_ctx;
+-	int rc, minor;
++	struct device *dev;
++	int minor, rc;
+ 
+-	idxd_cdev = kzalloc(sizeof(*idxd_cdev), GFP_KERNEL);
+-	if (!idxd_cdev)
++	idxd_cdev->dev = kzalloc(sizeof(*idxd_cdev->dev), GFP_KERNEL);
++	if (!idxd_cdev->dev)
+ 		return -ENOMEM;
+ 
+-	idxd_cdev->wq = wq;
+-	cdev = &idxd_cdev->cdev;
+-	dev = &idxd_cdev->dev;
++	dev = idxd_cdev->dev;
++	dev->parent = &idxd->pdev->dev;
++	dev_set_name(dev, "%s/wq%u.%u", idxd_get_dev_name(idxd),
++		     idxd->id, wq->id);
++	dev->bus = idxd_get_bus_type(idxd);
++
+ 	cdev_ctx = &ictx[wq->idxd->type];
+ 	minor = ida_simple_get(&cdev_ctx->minor_ida, 0, MINORMASK, GFP_KERNEL);
+ 	if (minor < 0) {
+-		kfree(idxd_cdev);
+-		return minor;
++		rc = minor;
++		kfree(dev);
++		goto ida_err;
+ 	}
+-	idxd_cdev->minor = minor;
+ 
+-	device_initialize(dev);
+-	dev->parent = &wq->conf_dev;
+-	dev->bus = idxd_get_bus_type(idxd);
+-	dev->type = &idxd_cdev_device_type;
+ 	dev->devt = MKDEV(MAJOR(cdev_ctx->devt), minor);
++	dev->type = &idxd_cdev_device_type;
++	rc = device_register(dev);
++	if (rc < 0) {
++		dev_err(&idxd->pdev->dev, "device register failed\n");
++		goto dev_reg_err;
++	}
++	idxd_cdev->minor = minor;
+ 
+-	rc = dev_set_name(dev, "%s/wq%u.%u", idxd_get_dev_name(idxd),
+-			  idxd->id, wq->id);
++	return 0;
++
++ dev_reg_err:
++	ida_simple_remove(&cdev_ctx->minor_ida, MINOR(dev->devt));
++	put_device(dev);
++ ida_err:
++	idxd_cdev->dev = NULL;
++	return rc;
++}
++
++static void idxd_wq_cdev_cleanup(struct idxd_wq *wq,
++				 enum idxd_cdev_cleanup cdev_state)
++{
++	struct idxd_cdev *idxd_cdev = &wq->idxd_cdev;
++	struct idxd_cdev_context *cdev_ctx;
++
++	cdev_ctx = &ictx[wq->idxd->type];
++	if (cdev_state == CDEV_NORMAL)
++		cdev_del(&idxd_cdev->cdev);
++	device_unregister(idxd_cdev->dev);
++	/*
++	 * The device_type->release() will be called on the device and free
++	 * the allocated struct device. We can just forget it.
++	 */
++	ida_simple_remove(&cdev_ctx->minor_ida, idxd_cdev->minor);
++	idxd_cdev->dev = NULL;
++	idxd_cdev->minor = -1;
++}
++
++int idxd_wq_add_cdev(struct idxd_wq *wq)
++{
++	struct idxd_cdev *idxd_cdev = &wq->idxd_cdev;
++	struct cdev *cdev = &idxd_cdev->cdev;
++	struct device *dev;
++	int rc;
++
++	rc = idxd_wq_cdev_dev_setup(wq);
+ 	if (rc < 0)
+-		goto err;
++		return rc;
+ 
+-	wq->idxd_cdev = idxd_cdev;
++	dev = idxd_cdev->dev;
+ 	cdev_init(cdev, &idxd_cdev_fops);
+-	rc = cdev_device_add(cdev, dev);
++	cdev_set_parent(cdev, &dev->kobj);
++	rc = cdev_add(cdev, dev->devt, 1);
+ 	if (rc) {
+ 		dev_dbg(&wq->idxd->pdev->dev, "cdev_add failed: %d\n", rc);
+-		goto err;
++		idxd_wq_cdev_cleanup(wq, CDEV_FAILED);
++		return rc;
+ 	}
+ 
++	init_waitqueue_head(&idxd_cdev->err_queue);
+ 	return 0;
+-
+- err:
+-	put_device(dev);
+-	wq->idxd_cdev = NULL;
+-	return rc;
+ }
+ 
+ void idxd_wq_del_cdev(struct idxd_wq *wq)
+ {
+-	struct idxd_cdev *idxd_cdev;
+-	struct idxd_cdev_context *cdev_ctx;
+-
+-	cdev_ctx = &ictx[wq->idxd->type];
+-	idxd_cdev = wq->idxd_cdev;
+-	wq->idxd_cdev = NULL;
+-	cdev_device_del(&idxd_cdev->cdev, &idxd_cdev->dev);
+-	put_device(&idxd_cdev->dev);
++	idxd_wq_cdev_cleanup(wq, CDEV_NORMAL);
+ }
+ 
+ int idxd_cdev_register(void)
+diff --git a/drivers/dma/idxd/idxd.h b/drivers/dma/idxd/idxd.h
+index eef6996ecc59..adf30dc23685 100644
+--- a/drivers/dma/idxd/idxd.h
++++ b/drivers/dma/idxd/idxd.h
+@@ -71,10 +71,10 @@ enum idxd_wq_type {
+ };
+ 
+ struct idxd_cdev {
+-	struct idxd_wq *wq;
+ 	struct cdev cdev;
+-	struct device dev;
++	struct device *dev;
+ 	int minor;
++	struct wait_queue_head err_queue;
+ };
+ 
+ #define IDXD_ALLOCATED_BATCH_SIZE	128U
+@@ -99,8 +99,7 @@ struct idxd_dma_chan {
+ struct idxd_wq {
+ 	void __iomem *dportal;
+ 	struct device conf_dev;
+-	struct idxd_cdev *idxd_cdev;
+-	struct wait_queue_head err_queue;
++	struct idxd_cdev idxd_cdev;
+ 	struct idxd_device *idxd;
+ 	int id;
+ 	enum idxd_wq_type type;
+diff --git a/drivers/dma/idxd/init.c b/drivers/dma/idxd/init.c
+index f4c7ce8cb399..fa8c4228f358 100644
+--- a/drivers/dma/idxd/init.c
++++ b/drivers/dma/idxd/init.c
+@@ -175,7 +175,7 @@ static int idxd_setup_internals(struct idxd_device *idxd)
+ 		wq->id = i;
+ 		wq->idxd = idxd;
+ 		mutex_init(&wq->wq_lock);
+-		init_waitqueue_head(&wq->err_queue);
++		wq->idxd_cdev.minor = -1;
+ 		wq->max_xfer_bytes = idxd->max_xfer_bytes;
+ 		wq->max_batch_size = idxd->max_batch_size;
+ 		wq->wqcfg = devm_kzalloc(dev, idxd->wqcfg_size, GFP_KERNEL);
+diff --git a/drivers/dma/idxd/irq.c b/drivers/dma/idxd/irq.c
+index fc9579180705..6bb1c1773aae 100644
+--- a/drivers/dma/idxd/irq.c
++++ b/drivers/dma/idxd/irq.c
+@@ -75,7 +75,7 @@ static int process_misc_interrupts(struct idxd_device *idxd, u32 cause)
+ 			struct idxd_wq *wq = &idxd->wqs[id];
+ 
+ 			if (wq->type == IDXD_WQT_USER)
+-				wake_up_interruptible(&wq->err_queue);
++				wake_up_interruptible(&wq->idxd_cdev.err_queue);
+ 		} else {
+ 			int i;
+ 
+@@ -83,7 +83,7 @@ static int process_misc_interrupts(struct idxd_device *idxd, u32 cause)
+ 				struct idxd_wq *wq = &idxd->wqs[i];
+ 
+ 				if (wq->type == IDXD_WQT_USER)
+-					wake_up_interruptible(&wq->err_queue);
++					wake_up_interruptible(&wq->idxd_cdev.err_queue);
+ 			}
+ 		}
+ 
+diff --git a/drivers/dma/idxd/sysfs.c b/drivers/dma/idxd/sysfs.c
+index 7b41cdff1a2c..7566b573d546 100644
+--- a/drivers/dma/idxd/sysfs.c
++++ b/drivers/dma/idxd/sysfs.c
+@@ -1052,16 +1052,8 @@ static ssize_t wq_cdev_minor_show(struct device *dev,
+ 				  struct device_attribute *attr, char *buf)
+ {
+ 	struct idxd_wq *wq = container_of(dev, struct idxd_wq, conf_dev);
+-	int minor = -1;
+ 
+-	mutex_lock(&wq->wq_lock);
+-	if (wq->idxd_cdev)
+-		minor = wq->idxd_cdev->minor;
+-	mutex_unlock(&wq->wq_lock);
+-
+-	if (minor == -1)
+-		return -ENXIO;
+-	return sysfs_emit(buf, "%d\n", minor);
++	return sprintf(buf, "%d\n", wq->idxd_cdev.minor);
+ }
+ 
+ static struct device_attribute dev_attr_wq_cdev_minor =
+-- 
+2.26.2
+
