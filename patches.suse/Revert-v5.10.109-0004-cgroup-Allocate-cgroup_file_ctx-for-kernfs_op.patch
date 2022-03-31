@@ -1,0 +1,252 @@
+From: Jun Yang <jun.yang@suse.com>
+Date: Thu, 31 Mar 2022 13:32:21 +0800
+Subject: [PATCH] Revert "cgroup: Allocate cgroup_file_ctx for
+ kernfs_open_file->priv"
+Patch-mainline: Never, revert stable patch which is added again in sorted section
+References: bsn#83
+Modified-by-SEL: No
+
+This reverts commit f28364fe384feffbe7d44b095ef4571285465c47.
+
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ kernel/cgroup/cgroup-internal.h | 17 -----------
+ kernel/cgroup/cgroup-v1.c       | 26 ++++++++--------
+ kernel/cgroup/cgroup.c          | 54 ++++++++++++---------------------
+ 3 files changed, 32 insertions(+), 65 deletions(-)
+
+diff --git a/kernel/cgroup/cgroup-internal.h b/kernel/cgroup/cgroup-internal.h
+index cf637bc4ab45..bfbeabc17a9d 100644
+--- a/kernel/cgroup/cgroup-internal.h
++++ b/kernel/cgroup/cgroup-internal.h
+@@ -65,23 +65,6 @@ static inline struct cgroup_fs_context *cgroup_fc2context(struct fs_context *fc)
+ 	return container_of(kfc, struct cgroup_fs_context, kfc);
+ }
+ 
+-struct cgroup_pidlist;
+-
+-struct cgroup_file_ctx {
+-	struct {
+-		void			*trigger;
+-	} psi;
+-
+-	struct {
+-		bool			started;
+-		struct css_task_iter	iter;
+-	} procs;
+-
+-	struct {
+-		struct cgroup_pidlist	*pidlist;
+-	} procs1;
+-};
+-
+ /*
+  * A cgroup can be associated with multiple css_sets as different tasks may
+  * belong to different cgroups on different hierarchies.  In the other
+diff --git a/kernel/cgroup/cgroup-v1.c b/kernel/cgroup/cgroup-v1.c
+index 8f0ea12d7cee..09fdbd83b2f0 100644
+--- a/kernel/cgroup/cgroup-v1.c
++++ b/kernel/cgroup/cgroup-v1.c
+@@ -393,7 +393,6 @@ static void *cgroup_pidlist_start(struct seq_file *s, loff_t *pos)
+ 	 * next pid to display, if any
+ 	 */
+ 	struct kernfs_open_file *of = s->private;
+-	struct cgroup_file_ctx *ctx = of->priv;
+ 	struct cgroup *cgrp = seq_css(s)->cgroup;
+ 	struct cgroup_pidlist *l;
+ 	enum cgroup_filetype type = seq_cft(s)->private;
+@@ -403,24 +402,25 @@ static void *cgroup_pidlist_start(struct seq_file *s, loff_t *pos)
+ 	mutex_lock(&cgrp->pidlist_mutex);
+ 
+ 	/*
+-	 * !NULL @ctx->procs1.pidlist indicates that this isn't the first
+-	 * start() after open. If the matching pidlist is around, we can use
+-	 * that. Look for it. Note that @ctx->procs1.pidlist can't be used
+-	 * directly. It could already have been destroyed.
++	 * !NULL @of->priv indicates that this isn't the first start()
++	 * after open.  If the matching pidlist is around, we can use that.
++	 * Look for it.  Note that @of->priv can't be used directly.  It
++	 * could already have been destroyed.
+ 	 */
+-	if (ctx->procs1.pidlist)
+-		ctx->procs1.pidlist = cgroup_pidlist_find(cgrp, type);
++	if (of->priv)
++		of->priv = cgroup_pidlist_find(cgrp, type);
+ 
+ 	/*
+ 	 * Either this is the first start() after open or the matching
+ 	 * pidlist has been destroyed inbetween.  Create a new one.
+ 	 */
+-	if (!ctx->procs1.pidlist) {
+-		ret = pidlist_array_load(cgrp, type, &ctx->procs1.pidlist);
++	if (!of->priv) {
++		ret = pidlist_array_load(cgrp, type,
++					 (struct cgroup_pidlist **)&of->priv);
+ 		if (ret)
+ 			return ERR_PTR(ret);
+ 	}
+-	l = ctx->procs1.pidlist;
++	l = of->priv;
+ 
+ 	if (pid) {
+ 		int end = l->length;
+@@ -448,8 +448,7 @@ static void *cgroup_pidlist_start(struct seq_file *s, loff_t *pos)
+ static void cgroup_pidlist_stop(struct seq_file *s, void *v)
+ {
+ 	struct kernfs_open_file *of = s->private;
+-	struct cgroup_file_ctx *ctx = of->priv;
+-	struct cgroup_pidlist *l = ctx->procs1.pidlist;
++	struct cgroup_pidlist *l = of->priv;
+ 
+ 	if (l)
+ 		mod_delayed_work(cgroup_pidlist_destroy_wq, &l->destroy_dwork,
+@@ -460,8 +459,7 @@ static void cgroup_pidlist_stop(struct seq_file *s, void *v)
+ static void *cgroup_pidlist_next(struct seq_file *s, void *v, loff_t *pos)
+ {
+ 	struct kernfs_open_file *of = s->private;
+-	struct cgroup_file_ctx *ctx = of->priv;
+-	struct cgroup_pidlist *l = ctx->procs1.pidlist;
++	struct cgroup_pidlist *l = of->priv;
+ 	pid_t *p = v;
+ 	pid_t *end = l->list + l->length;
+ 	/*
+diff --git a/kernel/cgroup/cgroup.c b/kernel/cgroup/cgroup.c
+index ddfe6983ea7c..4927289a91a9 100644
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@ -3590,7 +3590,6 @@ static int cgroup_cpu_pressure_show(struct seq_file *seq, void *v)
+ static ssize_t cgroup_pressure_write(struct kernfs_open_file *of, char *buf,
+ 					  size_t nbytes, enum psi_res res)
+ {
+-	struct cgroup_file_ctx *ctx = of->priv;
+ 	struct psi_trigger *new;
+ 	struct cgroup *cgrp;
+ 	struct psi_group *psi;
+@@ -3603,7 +3602,7 @@ static ssize_t cgroup_pressure_write(struct kernfs_open_file *of, char *buf,
+ 	cgroup_kn_unlock(of->kn);
+ 
+ 	/* Allow only one trigger per file descriptor */
+-	if (ctx->psi.trigger) {
++	if (of->priv) {
+ 		cgroup_put(cgrp);
+ 		return -EBUSY;
+ 	}
+@@ -3615,7 +3614,7 @@ static ssize_t cgroup_pressure_write(struct kernfs_open_file *of, char *buf,
+ 		return PTR_ERR(new);
+ 	}
+ 
+-	smp_store_release(&ctx->psi.trigger, new);
++	smp_store_release(&of->priv, new);
+ 	cgroup_put(cgrp);
+ 
+ 	return nbytes;
+@@ -3645,15 +3644,12 @@ static ssize_t cgroup_cpu_pressure_write(struct kernfs_open_file *of,
+ static __poll_t cgroup_pressure_poll(struct kernfs_open_file *of,
+ 					  poll_table *pt)
+ {
+-	struct cgroup_file_ctx *ctx = of->priv;
+-	return psi_trigger_poll(&ctx->psi.trigger, of->file, pt);
++	return psi_trigger_poll(&of->priv, of->file, pt);
+ }
+ 
+ static void cgroup_pressure_release(struct kernfs_open_file *of)
+ {
+-	struct cgroup_file_ctx *ctx = of->priv;
+-
+-	psi_trigger_destroy(ctx->psi.trigger);
++	psi_trigger_destroy(of->priv);
+ }
+ #endif /* CONFIG_PSI */
+ 
+@@ -3694,31 +3690,18 @@ static ssize_t cgroup_freeze_write(struct kernfs_open_file *of,
+ static int cgroup_file_open(struct kernfs_open_file *of)
+ {
+ 	struct cftype *cft = of->kn->priv;
+-	struct cgroup_file_ctx *ctx;
+-	int ret;
+-
+-	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+-	if (!ctx)
+-		return -ENOMEM;
+-	of->priv = ctx;
+-
+-	if (!cft->open)
+-		return 0;
+ 
+-	ret = cft->open(of);
+-	if (ret)
+-		kfree(ctx);
+-	return ret;
++	if (cft->open)
++		return cft->open(of);
++	return 0;
+ }
+ 
+ static void cgroup_file_release(struct kernfs_open_file *of)
+ {
+ 	struct cftype *cft = of->kn->priv;
+-	struct cgroup_file_ctx *ctx = of->priv;
+ 
+ 	if (cft->release)
+ 		cft->release(of);
+-	kfree(ctx);
+ }
+ 
+ static ssize_t cgroup_file_write(struct kernfs_open_file *of, char *buf,
+@@ -4642,21 +4625,21 @@ void css_task_iter_end(struct css_task_iter *it)
+ 
+ static void cgroup_procs_release(struct kernfs_open_file *of)
+ {
+-	struct cgroup_file_ctx *ctx = of->priv;
+-
+-	if (ctx->procs.started)
+-		css_task_iter_end(&ctx->procs.iter);
++	if (of->priv) {
++		css_task_iter_end(of->priv);
++		kfree(of->priv);
++	}
+ }
+ 
+ static void *cgroup_procs_next(struct seq_file *s, void *v, loff_t *pos)
+ {
+ 	struct kernfs_open_file *of = s->private;
+-	struct cgroup_file_ctx *ctx = of->priv;
++	struct css_task_iter *it = of->priv;
+ 
+ 	if (pos)
+ 		(*pos)++;
+ 
+-	return css_task_iter_next(&ctx->procs.iter);
++	return css_task_iter_next(it);
+ }
+ 
+ static void *__cgroup_procs_start(struct seq_file *s, loff_t *pos,
+@@ -4664,18 +4647,21 @@ static void *__cgroup_procs_start(struct seq_file *s, loff_t *pos,
+ {
+ 	struct kernfs_open_file *of = s->private;
+ 	struct cgroup *cgrp = seq_css(s)->cgroup;
+-	struct cgroup_file_ctx *ctx = of->priv;
+-	struct css_task_iter *it = &ctx->procs.iter;
++	struct css_task_iter *it = of->priv;
+ 
+ 	/*
+ 	 * When a seq_file is seeked, it's always traversed sequentially
+ 	 * from position 0, so we can simply keep iterating on !0 *pos.
+ 	 */
+-	if (!ctx->procs.started) {
++	if (!it) {
+ 		if (WARN_ON_ONCE((*pos)))
+ 			return ERR_PTR(-EINVAL);
++
++		it = kzalloc(sizeof(*it), GFP_KERNEL);
++		if (!it)
++			return ERR_PTR(-ENOMEM);
++		of->priv = it;
+ 		css_task_iter_start(&cgrp->self, iter_flags, it);
+-		ctx->procs.started = true;
+ 	} else if (!(*pos)) {
+ 		css_task_iter_end(it);
+ 		css_task_iter_start(&cgrp->self, iter_flags, it);
+-- 
+2.34.1
+
