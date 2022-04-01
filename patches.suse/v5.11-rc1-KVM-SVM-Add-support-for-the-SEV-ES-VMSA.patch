@@ -1,0 +1,214 @@
+From add5e2f045414523aa6dc29d69b21e8f82e5ffb8 Mon Sep 17 00:00:00 2001
+From: Tom Lendacky <thomas.lendacky@amd.com>
+Date: Thu, 10 Dec 2020 11:09:40 -0600
+Subject: [PATCH] KVM: SVM: Add support for the SEV-ES VMSA
+Git-commit: add5e2f045414523aa6dc29d69b21e8f82e5ffb8
+Patch-mainline: v5.11-rc1
+References: bsn#178
+Modified-by-SEL: Yes, modified due to different context
+
+
+Allocate a page during vCPU creation to be used as the encrypted VM save
+area (VMSA) for the SEV-ES guest. Provide a flag in the kvm_vcpu_arch
+structure that indicates whether the guest state is protected.
+
+When freeing a VMSA page that has been encrypted, the cache contents must
+be flushed using the MSR_AMD64_VM_PAGE_FLUSH before freeing the page.
+
+[ i386 build warnings ]
+Reported-by: kernel test robot <lkp@intel.com>
+Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+Message-Id: <fde272b17eec804f3b9db18c131262fe074015c5.1607620209.git.thomas.lendacky@amd.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/include/asm/kvm_host.h |    3 +
+ arch/x86/kvm/svm/sev.c          |   67 ++++++++++++++++++++++++++++++++++++++++
+ arch/x86/kvm/svm/svm.c          |   24 +++++++++++++-
+ arch/x86/kvm/svm/svm.h          |    5 ++
+ 4 files changed, 97 insertions(+), 2 deletions(-)
+
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -804,6 +804,9 @@ struct kvm_vcpu_arch {
+ 		 */
+ 		bool enforce;
+ 	} pv_cpuid;
++
++	/* Protected Guests */
++	bool guest_state_protected;
+ };
+ 
+ struct kvm_lpage_info {
+--- a/arch/x86/kvm/svm/sev.c
++++ b/arch/x86/kvm/svm/sev.c
+@@ -14,6 +14,7 @@
+ #include <linux/psp-sev.h>
+ #include <linux/pagemap.h>
+ #include <linux/swap.h>
++#include <linux/processor.h>
+ 
+ #include "x86.h"
+ #include "svm.h"
+@@ -1206,6 +1207,72 @@ void sev_hardware_teardown(void)
+ 	sev_flush_asids();
+ }
+ 
++/*
++ * Pages used by hardware to hold guest encrypted state must be flushed before
++ * returning them to the system.
++ */
++static void sev_flush_guest_memory(struct vcpu_svm *svm, void *va,
++				   unsigned long len)
++{
++	/*
++	 * If hardware enforced cache coherency for encrypted mappings of the
++	 * same physical page is supported, nothing to do.
++	 */
++	if (boot_cpu_has(X86_FEATURE_SME_COHERENT))
++		return;
++
++	/*
++	 * If the VM Page Flush MSR is supported, use it to flush the page
++	 * (using the page virtual address and the guest ASID).
++	 */
++	if (boot_cpu_has(X86_FEATURE_VM_PAGE_FLUSH)) {
++		struct kvm_sev_info *sev;
++		unsigned long va_start;
++		u64 start, stop;
++
++		/* Align start and stop to page boundaries. */
++		va_start = (unsigned long)va;
++		start = (u64)va_start & PAGE_MASK;
++		stop = PAGE_ALIGN((u64)va_start + len);
++
++		if (start < stop) {
++			sev = &to_kvm_svm(svm->vcpu.kvm)->sev_info;
++
++			while (start < stop) {
++				wrmsrl(MSR_AMD64_VM_PAGE_FLUSH,
++				       start | sev->asid);
++
++				start += PAGE_SIZE;
++			}
++
++			return;
++		}
++
++		WARN(1, "Address overflow, using WBINVD\n");
++	}
++
++	/*
++	 * Hardware should always have one of the above features,
++	 * but if not, use WBINVD and issue a warning.
++	 */
++	WARN_ONCE(1, "Using WBINVD to flush guest memory\n");
++	wbinvd_on_all_cpus();
++}
++
++void sev_free_vcpu(struct kvm_vcpu *vcpu)
++{
++	struct vcpu_svm *svm;
++
++	if (!sev_es_guest(vcpu->kvm))
++		return;
++
++	svm = to_svm(vcpu);
++
++	if (vcpu->arch.guest_state_protected)
++		sev_flush_guest_memory(svm, svm->vmsa, PAGE_SIZE);
++	__free_page(virt_to_page(svm->vmsa));
++}
++
+ void pre_sev_run(struct vcpu_svm *svm, int cpu)
+ {
+ 	struct svm_cpu_data *sd = per_cpu(svm_data, cpu);
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -1294,6 +1294,7 @@ static int svm_create_vcpu(struct kvm_vc
+ {
+ 	struct vcpu_svm *svm;
+ 	struct page *vmcb_page;
++	struct page *vmsa_page = NULL;
+ 	int err;
+ 
+ 	BUILD_BUG_ON(offsetof(struct vcpu_svm, vcpu) != 0);
+@@ -1304,9 +1305,19 @@ static int svm_create_vcpu(struct kvm_vc
+ 	if (!vmcb_page)
+ 		goto out;
+ 
++	if (sev_es_guest(svm->vcpu.kvm)) {
++		/*
++		 * SEV-ES guests require a separate VMSA page used to contain
++		 * the encrypted register state of the guest.
++		 */
++		vmsa_page = alloc_page(GFP_KERNEL_ACCOUNT | __GFP_ZERO);
++		if (!vmsa_page)
++			goto error_free_vmcb_page;
++	}
++
+ 	err = avic_init_vcpu(svm);
+ 	if (err)
+-		goto error_free_vmcb_page;
++		goto error_free_vmsa_page;
+ 
+ 	/* We initialize this flag to true to make sure that the is_running
+ 	 * bit would be set the first time the vcpu is loaded.
+@@ -1317,13 +1328,17 @@ static int svm_create_vcpu(struct kvm_vc
+ 	svm->msrpm = svm_vcpu_alloc_msrpm();
+ 	if (!svm->msrpm) {
+ 		err = -ENOMEM;
+-		goto error_free_vmcb_page;
++		goto error_free_vmsa_page;
+ 	}
+ 
+ 	svm_vcpu_init_msrpm(vcpu, svm->msrpm);
+ 
+ 	svm->vmcb = page_address(vmcb_page);
+ 	svm->vmcb_pa = __sme_set(page_to_pfn(vmcb_page) << PAGE_SHIFT);
++
++	if (vmsa_page)
++		svm->vmsa = page_address(vmsa_page);
++
+ 	svm->asid_generation = 0;
+ 	init_vmcb(svm);
+ 
+@@ -1332,6 +1347,9 @@ static int svm_create_vcpu(struct kvm_vc
+ 
+ 	return 0;
+ 
++error_free_vmsa_page:
++	if (vmsa_page)
++		__free_page(vmsa_page);
+ error_free_vmcb_page:
+ 	__free_page(vmcb_page);
+ out:
+@@ -1359,6 +1377,8 @@ static void svm_free_vcpu(struct kvm_vcp
+ 
+ 	svm_free_nested(svm);
+ 
++	sev_free_vcpu(vcpu);
++
+ 	__free_page(pfn_to_page(__sme_clr(svm->vmcb_pa) >> PAGE_SHIFT));
+ 	__free_pages(virt_to_page(svm->msrpm), MSRPM_ALLOC_ORDER);
+ }
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@ -167,6 +167,10 @@ struct vcpu_svm {
+ 		DECLARE_BITMAP(read, MAX_DIRECT_ACCESS_MSRS);
+ 		DECLARE_BITMAP(write, MAX_DIRECT_ACCESS_MSRS);
+ 	} shadow_msr_intercept;
++
++	/* SEV-ES support */
++	struct vmcb_save_area *vmsa;
++	struct ghcb *ghcb;
+ };
+ 
+ struct svm_cpu_data {
+@@ -509,5 +513,6 @@ int svm_unregister_enc_region(struct kvm
+ void pre_sev_run(struct vcpu_svm *svm, int cpu);
+ void __init sev_hardware_setup(void);
+ void sev_hardware_teardown(void);
++void sev_free_vcpu(struct kvm_vcpu *vcpu);
+ 
+ #endif

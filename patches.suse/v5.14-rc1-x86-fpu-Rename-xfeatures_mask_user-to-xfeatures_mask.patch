@@ -1,0 +1,204 @@
+From 65e952102122bf89f0e4f1bebf8664e32587aaed Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Wed, 23 Jun 2021 14:02:16 +0200
+Subject: [PATCH] x86/fpu: Rename xfeatures_mask_user() to
+ xfeatures_mask_uabi()
+Git-commit: 65e952102122bf89f0e4f1bebf8664e32587aaed
+Patch-mainline: v5.14-rc1
+References: bsn#178
+Modified-by-SEL: No
+
+
+Rename it so it's clear that this is about user ABI features which can
+differ from the feature set which the kernel saves and restores because the
+kernel handles e.g. PKRU differently. But the user ABI (ptrace, signal
+frame) expects it to be there.
+
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Reviewed-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20210623121456.211585137@linutronix.de
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/include/asm/fpu/internal.h |  7 ++++++-
+ arch/x86/include/asm/fpu/xstate.h   |  6 +++++-
+ arch/x86/kernel/fpu/core.c          |  2 +-
+ arch/x86/kernel/fpu/signal.c        | 10 +++++-----
+ arch/x86/kernel/fpu/xstate.c        | 18 +++++++++---------
+ 5 files changed, 26 insertions(+), 17 deletions(-)
+
+diff --git a/arch/x86/include/asm/fpu/internal.h b/arch/x86/include/asm/fpu/internal.h
+index 63d979656437..bcfb6365a76b 100644
+--- a/arch/x86/include/asm/fpu/internal.h
++++ b/arch/x86/include/asm/fpu/internal.h
+@@ -324,7 +324,12 @@ static inline void os_xrstor(struct xregs_state *xstate, u64 mask)
+  */
+ static inline int xsave_to_user_sigframe(struct xregs_state __user *buf)
+ {
+-	u64 mask = xfeatures_mask_user();
++	/*
++	 * Include the features which are not xsaved/rstored by the kernel
++	 * internally, e.g. PKRU. That's user space ABI and also required
++	 * to allow the signal handler to modify PKRU.
++	 */
++	u64 mask = xfeatures_mask_uabi();
+ 	u32 lmask = mask;
+ 	u32 hmask = mask >> 32;
+ 	int err;
+diff --git a/arch/x86/include/asm/fpu/xstate.h b/arch/x86/include/asm/fpu/xstate.h
+index 5764cbe39014..af9ea134bf5e 100644
+--- a/arch/x86/include/asm/fpu/xstate.h
++++ b/arch/x86/include/asm/fpu/xstate.h
+@@ -83,7 +83,11 @@ static inline u64 xfeatures_mask_supervisor(void)
+ 	return xfeatures_mask_all & XFEATURE_MASK_SUPERVISOR_SUPPORTED;
+ }
+ 
+-static inline u64 xfeatures_mask_user(void)
++/*
++ * The xfeatures which are enabled in XCR0 and expected to be in ptrace
++ * buffers and signal frames.
++ */
++static inline u64 xfeatures_mask_uabi(void)
+ {
+ 	return xfeatures_mask_all & XFEATURE_MASK_USER_SUPPORTED;
+ }
+diff --git a/arch/x86/kernel/fpu/core.c b/arch/x86/kernel/fpu/core.c
+index afd0deee8cfd..12437383ff79 100644
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@ -404,7 +404,7 @@ void fpu__clear_user_states(struct fpu *fpu)
+ 	}
+ 
+ 	/* Reset user states in registers. */
+-	restore_fpregs_from_init_fpstate(xfeatures_mask_user());
++	restore_fpregs_from_init_fpstate(xfeatures_mask_uabi());
+ 
+ 	/*
+ 	 * Now all FPU registers have their desired values.  Inform the FPU
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index b12665c38a30..a42bc9d0b1cc 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -257,14 +257,14 @@ static int copy_user_to_fpregs_zeroing(void __user *buf, u64 xbv, int fx_only)
+ 
+ 	if (use_xsave()) {
+ 		if (fx_only) {
+-			init_bv = xfeatures_mask_user() & ~XFEATURE_MASK_FPSSE;
++			init_bv = xfeatures_mask_uabi() & ~XFEATURE_MASK_FPSSE;
+ 
+ 			r = fxrstor_from_user_sigframe(buf);
+ 			if (!r)
+ 				os_xrstor(&init_fpstate.xsave, init_bv);
+ 			return r;
+ 		} else {
+-			init_bv = xfeatures_mask_user() & ~xbv;
++			init_bv = xfeatures_mask_uabi() & ~xbv;
+ 
+ 			r = xrstor_from_user_sigframe(buf, xbv);
+ 			if (!r && unlikely(init_bv))
+@@ -420,7 +420,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 	fpregs_unlock();
+ 
+ 	if (use_xsave() && !fx_only) {
+-		u64 init_bv = xfeatures_mask_user() & ~user_xfeatures;
++		u64 init_bv = xfeatures_mask_uabi() & ~user_xfeatures;
+ 
+ 		ret = copy_sigframe_from_user_to_xstate(&fpu->state.xsave, buf_fx);
+ 		if (ret)
+@@ -454,7 +454,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		if (use_xsave()) {
+ 			u64 init_bv;
+ 
+-			init_bv = xfeatures_mask_user() & ~XFEATURE_MASK_FPSSE;
++			init_bv = xfeatures_mask_uabi() & ~XFEATURE_MASK_FPSSE;
+ 			os_xrstor(&init_fpstate.xsave, init_bv);
+ 		}
+ 
+@@ -549,7 +549,7 @@ void fpu__init_prepare_fx_sw_frame(void)
+ 
+ 	fx_sw_reserved.magic1 = FP_XSTATE_MAGIC1;
+ 	fx_sw_reserved.extended_size = size;
+-	fx_sw_reserved.xfeatures = xfeatures_mask_user();
++	fx_sw_reserved.xfeatures = xfeatures_mask_uabi();
+ 	fx_sw_reserved.xstate_size = fpu_user_xstate_size;
+ 
+ 	if (IS_ENABLED(CONFIG_IA32_EMULATION) ||
+diff --git a/arch/x86/kernel/fpu/xstate.c b/arch/x86/kernel/fpu/xstate.c
+index bc71609ba65a..c513596f8ec9 100644
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@ -144,7 +144,7 @@ void fpu__init_cpu_xstate(void)
+ 	 * managed by XSAVE{C, OPT, S} and XRSTOR{S}.  Only XSAVE user
+ 	 * states can be set here.
+ 	 */
+-	xsetbv(XCR_XFEATURE_ENABLED_MASK, xfeatures_mask_user());
++	xsetbv(XCR_XFEATURE_ENABLED_MASK, xfeatures_mask_uabi());
+ 
+ 	/*
+ 	 * MSR_IA32_XSS sets supervisor states managed by XSAVES.
+@@ -453,7 +453,7 @@ int xfeature_size(int xfeature_nr)
+ static int validate_user_xstate_header(const struct xstate_header *hdr)
+ {
+ 	/* No unknown or supervisor features may be set */
+-	if (hdr->xfeatures & ~xfeatures_mask_user())
++	if (hdr->xfeatures & ~xfeatures_mask_uabi())
+ 		return -EINVAL;
+ 
+ 	/* Userspace must use the uncompacted format */
+@@ -756,7 +756,7 @@ void __init fpu__init_system_xstate(void)
+ 	cpuid_count(XSTATE_CPUID, 1, &eax, &ebx, &ecx, &edx);
+ 	xfeatures_mask_all |= ecx + ((u64)edx << 32);
+ 
+-	if ((xfeatures_mask_user() & XFEATURE_MASK_FPSSE) != XFEATURE_MASK_FPSSE) {
++	if ((xfeatures_mask_uabi() & XFEATURE_MASK_FPSSE) != XFEATURE_MASK_FPSSE) {
+ 		/*
+ 		 * This indicates that something really unexpected happened
+ 		 * with the enumeration.  Disable XSAVE and try to continue
+@@ -791,7 +791,7 @@ void __init fpu__init_system_xstate(void)
+ 	 * Update info used for ptrace frames; use standard-format size and no
+ 	 * supervisor xstates:
+ 	 */
+-	update_regset_xstate_info(fpu_user_xstate_size, xfeatures_mask_user());
++	update_regset_xstate_info(fpu_user_xstate_size, xfeatures_mask_uabi());
+ 
+ 	fpu__init_prepare_fx_sw_frame();
+ 	setup_init_fpu_buf();
+@@ -828,14 +828,14 @@ void fpu__resume_cpu(void)
+ 	/*
+ 	 * Restore XCR0 on xsave capable CPUs:
+ 	 */
+-	if (boot_cpu_has(X86_FEATURE_XSAVE))
+-		xsetbv(XCR_XFEATURE_ENABLED_MASK, xfeatures_mask_user());
++	if (cpu_feature_enabled(X86_FEATURE_XSAVE))
++		xsetbv(XCR_XFEATURE_ENABLED_MASK, xfeatures_mask_uabi());
+ 
+ 	/*
+ 	 * Restore IA32_XSS. The same CPUID bit enumerates support
+ 	 * of XSAVES and MSR_IA32_XSS.
+ 	 */
+-	if (boot_cpu_has(X86_FEATURE_XSAVES)) {
++	if (cpu_feature_enabled(X86_FEATURE_XSAVES)) {
+ 		wrmsrl(MSR_IA32_XSS, xfeatures_mask_supervisor()  |
+ 				     xfeatures_mask_independent());
+ 	}
+@@ -993,7 +993,7 @@ void copy_xstate_to_uabi_buf(struct membuf to, struct xregs_state *xsave,
+ 		break;
+ 
+ 	case XSTATE_COPY_XSAVE:
+-		header.xfeatures &= xfeatures_mask_user();
++		header.xfeatures &= xfeatures_mask_uabi();
+ 		break;
+ 	}
+ 
+@@ -1038,7 +1038,7 @@ void copy_xstate_to_uabi_buf(struct membuf to, struct xregs_state *xsave,
+ 		 * compacted init_fpstate. The gap tracking will zero this
+ 		 * later.
+ 		 */
+-		if (!(xfeatures_mask_user() & BIT_ULL(i)))
++		if (!(xfeatures_mask_uabi() & BIT_ULL(i)))
+ 			continue;
+ 
+ 		/*
+-- 
+2.26.2
+

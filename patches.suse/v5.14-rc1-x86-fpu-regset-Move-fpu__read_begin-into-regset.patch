@@ -1,0 +1,124 @@
+From 5a32fac8dbe8adc08c10e2c8770c95aebfc627cd Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Wed, 23 Jun 2021 14:01:46 +0200
+Subject: [PATCH] x86/fpu/regset: Move fpu__read_begin() into regset
+Git-commit: 5a32fac8dbe8adc08c10e2c8770c95aebfc627cd
+Patch-mainline: v5.14-rc1
+References: bsn#178
+Modified-by-SEL: No
+
+
+The function can only be used from the regset get() callbacks safely. So
+there is no reason to have it globally exposed.
+
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Reviewed-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20210623121453.234942936@linutronix.de
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/include/asm/fpu/internal.h |  1 -
+ arch/x86/kernel/fpu/core.c          | 20 --------------------
+ arch/x86/kernel/fpu/regset.c        | 22 +++++++++++++++++++---
+ 3 files changed, 19 insertions(+), 24 deletions(-)
+
+diff --git a/arch/x86/include/asm/fpu/internal.h b/arch/x86/include/asm/fpu/internal.h
+index 0148791acc49..4c669f3b54b4 100644
+--- a/arch/x86/include/asm/fpu/internal.h
++++ b/arch/x86/include/asm/fpu/internal.h
+@@ -26,7 +26,6 @@
+ /*
+  * High level FPU state handling functions:
+  */
+-extern void fpu__prepare_read(struct fpu *fpu);
+ extern void fpu__prepare_write(struct fpu *fpu);
+ extern void fpu__save(struct fpu *fpu);
+ extern int  fpu__restore_sig(void __user *buf, int ia32_frame);
+diff --git a/arch/x86/kernel/fpu/core.c b/arch/x86/kernel/fpu/core.c
+index 9ff467bb4894..d390644e5fa1 100644
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@ -281,26 +281,6 @@ static void fpu__initialize(struct fpu *fpu)
+ 	trace_x86_fpu_init_state(fpu);
+ }
+ 
+-/*
+- * This function must be called before we read a task's fpstate.
+- *
+- * There's two cases where this gets called:
+- *
+- * - for the current task (when coredumping), in which case we have
+- *   to save the latest FPU registers into the fpstate,
+- *
+- * - or it's called for stopped tasks (ptrace), in which case the
+- *   registers were already saved by the context-switch code when
+- *   the task scheduled out.
+- *
+- * If the task has used the FPU before then save it.
+- */
+-void fpu__prepare_read(struct fpu *fpu)
+-{
+-	if (fpu == &current->thread.fpu)
+-		fpu__save(fpu);
+-}
+-
+ /*
+  * This function must be called before we write a task's fpstate.
+  *
+diff --git a/arch/x86/kernel/fpu/regset.c b/arch/x86/kernel/fpu/regset.c
+index 4b799e42ebc7..937adf702b37 100644
+--- a/arch/x86/kernel/fpu/regset.c
++++ b/arch/x86/kernel/fpu/regset.c
+@@ -28,6 +28,22 @@ int regset_xregset_fpregs_active(struct task_struct *target, const struct user_r
+ 		return 0;
+ }
+ 
++/*
++ * The regset get() functions are invoked from:
++ *
++ *   - coredump to dump the current task's fpstate. If the current task
++ *     owns the FPU then the memory state has to be synchronized and the
++ *     FPU register state preserved. Otherwise fpstate is already in sync.
++ *
++ *   - ptrace to dump fpstate of a stopped task, in which case the registers
++ *     have already been saved to fpstate on context switch.
++ */
++static void sync_fpstate(struct fpu *fpu)
++{
++	if (fpu == &current->thread.fpu)
++		fpu__save(fpu);
++}
++
+ int xfpregs_get(struct task_struct *target, const struct user_regset *regset,
+ 		struct membuf to)
+ {
+@@ -36,7 +52,7 @@ int xfpregs_get(struct task_struct *target, const struct user_regset *regset,
+ 	if (!cpu_feature_enabled(X86_FEATURE_FXSR))
+ 		return -ENODEV;
+ 
+-	fpu__prepare_read(fpu);
++	sync_fpstate(fpu);
+ 
+ 	if (!use_xsave()) {
+ 		return membuf_write(&to, &fpu->state.fxsave,
+@@ -96,7 +112,7 @@ int xstateregs_get(struct task_struct *target, const struct user_regset *regset,
+ 	if (!cpu_feature_enabled(X86_FEATURE_XSAVE))
+ 		return -ENODEV;
+ 
+-	fpu__prepare_read(fpu);
++	sync_fpstate(fpu);
+ 
+ 	copy_xstate_to_uabi_buf(to, &fpu->state.xsave, XSTATE_COPY_XSAVE);
+ 	return 0;
+@@ -287,7 +303,7 @@ int fpregs_get(struct task_struct *target, const struct user_regset *regset,
+ 	struct user_i387_ia32_struct env;
+ 	struct fxregs_state fxsave, *fx;
+ 
+-	fpu__prepare_read(fpu);
++	sync_fpstate(fpu);
+ 
+ 	if (!cpu_feature_enabled(X86_FEATURE_FPU))
+ 		return fpregs_soft_get(target, regset, to);
+-- 
+2.26.2
+

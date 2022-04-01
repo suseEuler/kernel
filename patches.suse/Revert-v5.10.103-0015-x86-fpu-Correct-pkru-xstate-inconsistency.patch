@@ -1,0 +1,129 @@
+From 6b3444791af3fda333ab7dee7d368a8320df6c8e Mon Sep 17 00:00:00 2001
+From: Guoqing Jiang <guoqing.jiang@suse.com>
+Date: Fri, 1 Apr 2022 13:44:22 +0800
+Subject: [PATCH] Revert "x86/fpu: Correct pkru/xstate inconsistency"
+Patch-mainline: Never, revert stable patch which is added again in sorted section
+References: bsn#178
+Modified-by-SEL: No
+
+
+This reverts commit bae7fc6f0dc66d8a80316c09ed7ee286f33cd731.
+
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/include/asm/fpu/internal.h | 13 +++++--------
+ arch/x86/kernel/process_32.c        |  6 ++++--
+ arch/x86/kernel/process_64.c        |  6 ++++--
+ 3 files changed, 13 insertions(+), 12 deletions(-)
+
+diff --git a/arch/x86/include/asm/fpu/internal.h b/arch/x86/include/asm/fpu/internal.h
+index 70b9bc5403c5..4e5af2b00d89 100644
+--- a/arch/x86/include/asm/fpu/internal.h
++++ b/arch/x86/include/asm/fpu/internal.h
+@@ -531,11 +531,9 @@ static inline void __fpregs_load_activate(void)
+  * The FPU context is only stored/restored for a user task and
+  * PF_KTHREAD is used to distinguish between kernel and user threads.
+  */
+-static inline void switch_fpu_prepare(struct task_struct *prev, int cpu)
++static inline void switch_fpu_prepare(struct fpu *old_fpu, int cpu)
+ {
+-	struct fpu *old_fpu = &prev->thread.fpu;
+-
+-	if (static_cpu_has(X86_FEATURE_FPU) && !(prev->flags & PF_KTHREAD)) {
++	if (static_cpu_has(X86_FEATURE_FPU) && !(current->flags & PF_KTHREAD)) {
+ 		if (!copy_fpregs_to_fpstate(old_fpu))
+ 			old_fpu->last_cpu = -1;
+ 		else
+@@ -554,11 +552,10 @@ static inline void switch_fpu_prepare(struct task_struct *prev, int cpu)
+  * Load PKRU from the FPU context if available. Delay loading of the
+  * complete FPU state until the return to userland.
+  */
+-static inline void switch_fpu_finish(struct task_struct *next)
++static inline void switch_fpu_finish(struct fpu *new_fpu)
+ {
+ 	u32 pkru_val = init_pkru_value;
+ 	struct pkru_state *pk;
+-	struct fpu *next_fpu = &next->thread.fpu;
+ 
+ 	if (!static_cpu_has(X86_FEATURE_FPU))
+ 		return;
+@@ -572,7 +569,7 @@ static inline void switch_fpu_finish(struct task_struct *next)
+ 	 * PKRU state is switched eagerly because it needs to be valid before we
+ 	 * return to userland e.g. for a copy_to_user() operation.
+ 	 */
+-	if (!(next->flags & PF_KTHREAD)) {
++	if (!(current->flags & PF_KTHREAD)) {
+ 		/*
+ 		 * If the PKRU bit in xsave.header.xfeatures is not set,
+ 		 * then the PKRU component was in init state, which means
+@@ -581,7 +578,7 @@ static inline void switch_fpu_finish(struct task_struct *next)
+ 		 * in memory is not valid. This means pkru_val has to be
+ 		 * set to 0 and not to init_pkru_value.
+ 		 */
+-		pk = get_xsave_addr(&next_fpu->state.xsave, XFEATURE_PKRU);
++		pk = get_xsave_addr(&new_fpu->state.xsave, XFEATURE_PKRU);
+ 		pkru_val = pk ? pk->pkru : 0;
+ 	}
+ 	__write_pkru(pkru_val);
+diff --git a/arch/x86/kernel/process_32.c b/arch/x86/kernel/process_32.c
+index 98bf8fd18902..4f2f54e1281c 100644
+--- a/arch/x86/kernel/process_32.c
++++ b/arch/x86/kernel/process_32.c
+@@ -159,12 +159,14 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
+ {
+ 	struct thread_struct *prev = &prev_p->thread,
+ 			     *next = &next_p->thread;
++	struct fpu *prev_fpu = &prev->fpu;
++	struct fpu *next_fpu = &next->fpu;
+ 	int cpu = smp_processor_id();
+ 
+ 	/* never put a printk in __switch_to... printk() calls wake_up*() indirectly */
+ 
+ 	if (!test_thread_flag(TIF_NEED_FPU_LOAD))
+-		switch_fpu_prepare(prev_p, cpu);
++		switch_fpu_prepare(prev_fpu, cpu);
+ 
+ 	/*
+ 	 * Save away %gs. No need to save %fs, as it was saved on the
+@@ -211,7 +213,7 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
+ 
+ 	this_cpu_write(current_task, next_p);
+ 
+-	switch_fpu_finish(next_p);
++	switch_fpu_finish(next_fpu);
+ 
+ 	/* Load the Intel cache allocation PQR MSR. */
+ 	resctrl_sched_in();
+diff --git a/arch/x86/kernel/process_64.c b/arch/x86/kernel/process_64.c
+index ad3f82a18de9..df342bedea88 100644
+--- a/arch/x86/kernel/process_64.c
++++ b/arch/x86/kernel/process_64.c
+@@ -535,13 +535,15 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
+ {
+ 	struct thread_struct *prev = &prev_p->thread;
+ 	struct thread_struct *next = &next_p->thread;
++	struct fpu *prev_fpu = &prev->fpu;
++	struct fpu *next_fpu = &next->fpu;
+ 	int cpu = smp_processor_id();
+ 
+ 	WARN_ON_ONCE(IS_ENABLED(CONFIG_DEBUG_ENTRY) &&
+ 		     this_cpu_read(irq_count) != -1);
+ 
+ 	if (!test_thread_flag(TIF_NEED_FPU_LOAD))
+-		switch_fpu_prepare(prev_p, cpu);
++		switch_fpu_prepare(prev_fpu, cpu);
+ 
+ 	/* We must save %fs and %gs before load_TLS() because
+ 	 * %fs and %gs may be cleared by load_TLS().
+@@ -593,7 +595,7 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
+ 	this_cpu_write(current_task, next_p);
+ 	this_cpu_write(cpu_current_top_of_stack, task_top_of_stack(next_p));
+ 
+-	switch_fpu_finish(next_p);
++	switch_fpu_finish(next_fpu);
+ 
+ 	/* Reload sp0. */
+ 	update_task_stack(next_p);
+-- 
+2.26.2
+

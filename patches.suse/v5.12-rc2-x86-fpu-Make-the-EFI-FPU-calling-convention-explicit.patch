@@ -1,0 +1,112 @@
+From b0dc553cfc9d3bc2c7b8672b0b2fcf0edf0c3b6e Mon Sep 17 00:00:00 2001
+From: Andy Lutomirski <luto@kernel.org>
+Date: Wed, 20 Jan 2021 21:09:50 -0800
+Subject: [PATCH] x86/fpu: Make the EFI FPU calling convention explicit
+Git-commit: b0dc553cfc9d3bc2c7b8672b0b2fcf0edf0c3b6e
+Patch-mainline: v5.12-rc2
+References: bsn#178
+Modified-by-SEL: No
+
+
+EFI uses kernel_fpu_begin() to conform to the UEFI calling convention.
+This specifically requires initializing FCW (FPU Control Word), whereas
+no sane 64-bit kernel code should use legacy 387 operations that
+reference FCW.
+
+This should allow to safely change the default semantics of
+kernel_fpu_begin() to stop initializing FCW on 64-bit kernels.
+
+ [ bp: Massage commit message a little. ]
+
+Signed-off-by: Andy Lutomirski <luto@kernel.org>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/25d392fff64680e0f4bb8cf0b1003314dc29eafe.1611205691.git.luto@kernel.org
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/include/asm/efi.h     | 24 ++++++++++++++++++++----
+ arch/x86/platform/efi/efi_64.c |  4 ++--
+ 2 files changed, 22 insertions(+), 6 deletions(-)
+
+diff --git a/arch/x86/include/asm/efi.h b/arch/x86/include/asm/efi.h
+index c98f78330b09..c81e68f00071 100644
+--- a/arch/x86/include/asm/efi.h
++++ b/arch/x86/include/asm/efi.h
+@@ -68,17 +68,33 @@ extern unsigned long efi_fw_vendor, efi_config_table;
+ 		#f " called with too many arguments (" #p ">" #n ")");	\
+ })
+ 
++static inline void efi_fpu_begin(void)
++{
++	/*
++	 * The UEFI calling convention (UEFI spec 2.3.2 and 2.3.4) requires
++	 * that FCW and MXCSR (64-bit) must be initialized prior to calling
++	 * UEFI code.  (Oddly the spec does not require that the FPU stack
++	 * be empty.)
++	 */
++	kernel_fpu_begin_mask(KFPU_387 | KFPU_MXCSR);
++}
++
++static inline void efi_fpu_end(void)
++{
++	kernel_fpu_end();
++}
++
+ #ifdef CONFIG_X86_32
+ #define arch_efi_call_virt_setup()					\
+ ({									\
+-	kernel_fpu_begin();						\
++	efi_fpu_begin();						\
+ 	firmware_restrict_branch_speculation_start();			\
+ })
+ 
+ #define arch_efi_call_virt_teardown()					\
+ ({									\
+ 	firmware_restrict_branch_speculation_end();			\
+-	kernel_fpu_end();						\
++	efi_fpu_end();							\
+ })
+ 
+ #define arch_efi_call_virt(p, f, args...)	p->f(args)
+@@ -107,7 +123,7 @@ struct efi_scratch {
+ #define arch_efi_call_virt_setup()					\
+ ({									\
+ 	efi_sync_low_kernel_mappings();					\
+-	kernel_fpu_begin();						\
++	efi_fpu_begin();						\
+ 	firmware_restrict_branch_speculation_start();			\
+ 	efi_switch_mm(&efi_mm);						\
+ })
+@@ -119,7 +135,7 @@ struct efi_scratch {
+ ({									\
+ 	efi_switch_mm(efi_scratch.prev_mm);				\
+ 	firmware_restrict_branch_speculation_end();			\
+-	kernel_fpu_end();						\
++	efi_fpu_end();							\
+ })
+ 
+ #ifdef CONFIG_KASAN
+diff --git a/arch/x86/platform/efi/efi_64.c b/arch/x86/platform/efi/efi_64.c
+index e1e8d4e3a213..cf7b3bfe1a1e 100644
+--- a/arch/x86/platform/efi/efi_64.c
++++ b/arch/x86/platform/efi/efi_64.c
+@@ -850,7 +850,7 @@ efi_set_virtual_address_map(unsigned long memory_map_size,
+ 							 virtual_map);
+ 	efi_switch_mm(&efi_mm);
+ 
+-	kernel_fpu_begin();
++	efi_fpu_begin();
+ 
+ 	/* Disable interrupts around EFI calls: */
+ 	local_irq_save(flags);
+@@ -859,7 +859,7 @@ efi_set_virtual_address_map(unsigned long memory_map_size,
+ 			  descriptor_version, virtual_map);
+ 	local_irq_restore(flags);
+ 
+-	kernel_fpu_end();
++	efi_fpu_end();
+ 
+ 	/* grab the virtually remapped EFI runtime services table pointer */
+ 	efi.runtime = READ_ONCE(systab->runtime);
+-- 
+2.26.2
+

@@ -1,0 +1,138 @@
+From e84ba47e313dbc097bf859bb6e4f9219883d5f78 Mon Sep 17 00:00:00 2001
+From: Dave Hansen <dave.hansen@linux.intel.com>
+Date: Wed, 23 Jun 2021 14:02:19 +0200
+Subject: [PATCH] x86/fpu: Hook up PKRU into ptrace()
+Git-commit: e84ba47e313dbc097bf859bb6e4f9219883d5f78
+Patch-mainline: v5.14-rc1
+References: bsn#178
+Modified-by-SEL: No
+
+
+One nice thing about having PKRU be XSAVE-managed is that it gets naturally
+exposed into the XSAVE-using ABIs.  Now that XSAVE will not be used to
+manage PKRU, these ABIs need to be manually enabled to deal with PKRU.
+
+ptrace() uses copy_uabi_xstate_to_kernel() to collect the tracee's
+XSTATE. As PKRU is not in the task's XSTATE buffer, use task->thread.pkru
+for filling in up the ptrace buffer.
+
+Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Reviewed-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20210623121456.508770763@linutronix.de
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/include/asm/fpu/xstate.h |  2 +-
+ arch/x86/kernel/fpu/regset.c      | 10 ++++------
+ arch/x86/kernel/fpu/xstate.c      | 25 ++++++++++++++++++-------
+ 3 files changed, 23 insertions(+), 14 deletions(-)
+
+diff --git a/arch/x86/include/asm/fpu/xstate.h b/arch/x86/include/asm/fpu/xstate.h
+index 6a0aaafb93ec..4ff4a0093a48 100644
+--- a/arch/x86/include/asm/fpu/xstate.h
++++ b/arch/x86/include/asm/fpu/xstate.h
+@@ -139,7 +139,7 @@ enum xstate_copy_mode {
+ };
+ 
+ struct membuf;
+-void copy_xstate_to_uabi_buf(struct membuf to, struct xregs_state *xsave,
++void copy_xstate_to_uabi_buf(struct membuf to, struct task_struct *tsk,
+ 			     enum xstate_copy_mode mode);
+ 
+ #endif
+diff --git a/arch/x86/kernel/fpu/regset.c b/arch/x86/kernel/fpu/regset.c
+index 4575796d547b..66ed317ebc0d 100644
+--- a/arch/x86/kernel/fpu/regset.c
++++ b/arch/x86/kernel/fpu/regset.c
+@@ -78,7 +78,7 @@ int xfpregs_get(struct task_struct *target, const struct user_regset *regset,
+ 				    sizeof(fpu->state.fxsave));
+ 	}
+ 
+-	copy_xstate_to_uabi_buf(to, &fpu->state.xsave, XSTATE_COPY_FX);
++	copy_xstate_to_uabi_buf(to, target, XSTATE_COPY_FX);
+ 	return 0;
+ }
+ 
+@@ -126,14 +126,12 @@ int xfpregs_set(struct task_struct *target, const struct user_regset *regset,
+ int xstateregs_get(struct task_struct *target, const struct user_regset *regset,
+ 		struct membuf to)
+ {
+-	struct fpu *fpu = &target->thread.fpu;
+-
+ 	if (!cpu_feature_enabled(X86_FEATURE_XSAVE))
+ 		return -ENODEV;
+ 
+-	sync_fpstate(fpu);
++	sync_fpstate(&target->thread.fpu);
+ 
+-	copy_xstate_to_uabi_buf(to, &fpu->state.xsave, XSTATE_COPY_XSAVE);
++	copy_xstate_to_uabi_buf(to, target, XSTATE_COPY_XSAVE);
+ 	return 0;
+ }
+ 
+@@ -336,7 +334,7 @@ int fpregs_get(struct task_struct *target, const struct user_regset *regset,
+ 		struct membuf mb = { .p = &fxsave, .left = sizeof(fxsave) };
+ 
+ 		/* Handle init state optimized xstate correctly */
+-		copy_xstate_to_uabi_buf(mb, &fpu->state.xsave, XSTATE_COPY_FP);
++		copy_xstate_to_uabi_buf(mb, target, XSTATE_COPY_FP);
+ 		fx = &fxsave;
+ 	} else {
+ 		fx = &fpu->state.fxsave;
+diff --git a/arch/x86/kernel/fpu/xstate.c b/arch/x86/kernel/fpu/xstate.c
+index c513596f8ec9..9fd124a001b0 100644
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@ -962,7 +962,7 @@ static void copy_feature(bool from_xstate, struct membuf *to, void *xstate,
+ /**
+  * copy_xstate_to_uabi_buf - Copy kernel saved xstate to a UABI buffer
+  * @to:		membuf descriptor
+- * @xsave:	The kernel xstate buffer to copy from
++ * @tsk:	The task from which to copy the saved xstate
+  * @copy_mode:	The requested copy mode
+  *
+  * Converts from kernel XSAVE or XSAVES compacted format to UABI conforming
+@@ -971,10 +971,11 @@ static void copy_feature(bool from_xstate, struct membuf *to, void *xstate,
+  *
+  * It supports partial copy but @to.pos always starts from zero.
+  */
+-void copy_xstate_to_uabi_buf(struct membuf to, struct xregs_state *xsave,
++void copy_xstate_to_uabi_buf(struct membuf to, struct task_struct *tsk,
+ 			     enum xstate_copy_mode copy_mode)
+ {
+ 	const unsigned int off_mxcsr = offsetof(struct fxregs_state, mxcsr);
++	struct xregs_state *xsave = &tsk->thread.fpu.state.xsave;
+ 	struct xregs_state *xinit = &init_fpstate.xsave;
+ 	struct xstate_header header;
+ 	unsigned int zerofrom;
+@@ -1048,11 +1049,21 @@ void copy_xstate_to_uabi_buf(struct membuf to, struct xregs_state *xsave,
+ 		if (zerofrom < xstate_offsets[i])
+ 			membuf_zero(&to, xstate_offsets[i] - zerofrom);
+ 
+-		copy_feature(header.xfeatures & BIT_ULL(i), &to,
+-			     __raw_xsave_addr(xsave, i),
+-			     __raw_xsave_addr(xinit, i),
+-			     xstate_sizes[i]);
+-
++		if (i == XFEATURE_PKRU) {
++			struct pkru_state pkru = {0};
++			/*
++			 * PKRU is not necessarily up to date in the
++			 * thread's XSAVE buffer.  Fill this part from the
++			 * per-thread storage.
++			 */
++			pkru.pkru = tsk->thread.pkru;
++			membuf_write(&to, &pkru, sizeof(pkru));
++		} else {
++			copy_feature(header.xfeatures & BIT_ULL(i), &to,
++				     __raw_xsave_addr(xsave, i),
++				     __raw_xsave_addr(xinit, i),
++				     xstate_sizes[i]);
++		}
+ 		/*
+ 		 * Keep track of the last copied state in the non-compacted
+ 		 * target buffer for gap zeroing.
+-- 
+2.26.2
+

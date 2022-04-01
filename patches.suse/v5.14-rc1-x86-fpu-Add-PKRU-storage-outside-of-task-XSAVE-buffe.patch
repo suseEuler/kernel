@@ -1,0 +1,122 @@
+From 9782a712eb971ce483442076e79eb1d8d608646e Mon Sep 17 00:00:00 2001
+From: Dave Hansen <dave.hansen@linux.intel.com>
+Date: Wed, 23 Jun 2021 14:02:18 +0200
+Subject: [PATCH] x86/fpu: Add PKRU storage outside of task XSAVE buffer
+Git-commit: 9782a712eb971ce483442076e79eb1d8d608646e
+Patch-mainline: v5.14-rc1
+References: bsn#178
+Modified-by-SEL: Yes, refreshed due to different context
+
+
+PKRU is currently partly XSAVE-managed and partly not. It has space
+in the task XSAVE buffer and is context-switched by XSAVE/XRSTOR.
+However, it is switched more eagerly than FPU because there may be a
+need for PKRU to be up-to-date for things like copy_to/from_user() since
+PKRU affects user-permission memory accesses, not just accesses from
+userspace itself.
+
+This leaves PKRU in a very odd position. XSAVE brings very little value
+to the table for how Linux uses PKRU except for signal related XSTATE
+handling.
+
+Prepare to move PKRU away from being XSAVE-managed. Allocate space in
+the thread_struct for it and save/restore it in the context-switch path
+separately from the XSAVE-managed features. task->thread_struct.pkru
+is only valid when the task is scheduled out. For the current task the
+authoritative source is the hardware, i.e. it has to be retrieved via
+rdpkru().
+
+Leave the XSAVE code in place for now to ensure bisectability.
+
+Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Reviewed-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20210623121456.399107624@linutronix.de
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/include/asm/processor.h |    9 +++++++++
+ arch/x86/kernel/process.c        |    7 +++++++
+ arch/x86/kernel/process_64.c     |   25 +++++++++++++++++++++++++
+ 3 files changed, 41 insertions(+)
+
+--- a/arch/x86/include/asm/processor.h
++++ b/arch/x86/include/asm/processor.h
+@@ -537,6 +537,15 @@ struct thread_struct {
+ 	unsigned int		iopl_warn:1;
+ 	unsigned int		sig_on_uaccess_err:1;
+ 
++	/*
++	 * Protection Keys Register for Userspace.  Loaded immediately on
++	 * context switch. Store it in thread_struct to avoid a lookup in
++	 * the tasks's FPU xstate buffer. This value is only valid when a
++	 * task is scheduled out. For 'current' the authoritative source of
++	 * PKRU is the hardware itself.
++	 */
++	u32			pkru;
++
+ 	/* Floating point and extended processor state */
+ 	struct fpu		fpu;
+ 	/*
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@ -162,11 +162,18 @@ int copy_thread(unsigned long clone_flag
+ 
+ 	/* Kernel thread ? */
+ 	if (unlikely(p->flags & PF_KTHREAD)) {
++		p->thread.pkru = pkru_get_init_value();
+ 		memset(childregs, 0, sizeof(struct pt_regs));
+ 		kthread_frame_init(frame, sp, arg);
+ 		return 0;
+ 	}
+ 
++	/*
++	 * Clone current's PKRU value from hardware. tsk->thread.pkru
++	 * is only valid when scheduled out.
++	 */
++	p->thread.pkru = read_pkru();
++
+ 	frame->bx = 0;
+ 	*childregs = *current_pt_regs();
+ 	childregs->ax = 0;
+--- a/arch/x86/kernel/process_64.c
++++ b/arch/x86/kernel/process_64.c
+@@ -339,6 +339,29 @@ static __always_inline void load_seg_leg
+ 	}
+ }
+ 
++/*
++ * Store prev's PKRU value and load next's PKRU value if they differ. PKRU
++ * is not XSTATE managed on context switch because that would require a
++ * lookup in the task's FPU xsave buffer and require to keep that updated
++ * in various places.
++ */
++static __always_inline void x86_pkru_load(struct thread_struct *prev,
++					  struct thread_struct *next)
++{
++	if (!cpu_feature_enabled(X86_FEATURE_OSPKE))
++		return;
++
++	/* Stash the prev task's value: */
++	prev->pkru = rdpkru();
++
++	/*
++	 * PKRU writes are slightly expensive.  Avoid them when not
++	 * strictly necessary:
++	 */
++	if (prev->pkru != next->pkru)
++		wrpkru(next->pkru);
++}
++
+ static __always_inline void x86_fsgsbase_load(struct thread_struct *prev,
+ 					      struct thread_struct *next)
+ {
+@@ -589,6 +612,8 @@ __switch_to(struct task_struct *prev_p,
+ 
+ 	x86_fsgsbase_load(prev, next);
+ 
++	x86_pkru_load(prev, next);
++
+ 	/*
+ 	 * Switch the PDA and FPU contexts.
+ 	 */

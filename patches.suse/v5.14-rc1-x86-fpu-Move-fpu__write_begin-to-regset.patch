@@ -1,0 +1,134 @@
+From dbb60ac764581e62f2116c5a6b8926ba3a872dd4 Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Wed, 23 Jun 2021 14:01:47 +0200
+Subject: [PATCH] x86/fpu: Move fpu__write_begin() to regset
+Git-commit: dbb60ac764581e62f2116c5a6b8926ba3a872dd4
+Patch-mainline: v5.14-rc1
+References: bsn#178
+Modified-by-SEL: No
+
+
+The only usecase for fpu__write_begin is the set() callback of regset, so
+the function is pointlessly global.
+
+Move it to the regset code and rename it to fpu_force_restore() which is
+exactly decribing what the function does.
+
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Reviewed-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20210623121453.328652975@linutronix.de
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/include/asm/fpu/internal.h |  1 -
+ arch/x86/kernel/fpu/core.c          | 24 ------------------------
+ arch/x86/kernel/fpu/regset.c        | 25 ++++++++++++++++++++++---
+ 3 files changed, 22 insertions(+), 28 deletions(-)
+
+diff --git a/arch/x86/include/asm/fpu/internal.h b/arch/x86/include/asm/fpu/internal.h
+index 4c669f3b54b4..854bfb03645e 100644
+--- a/arch/x86/include/asm/fpu/internal.h
++++ b/arch/x86/include/asm/fpu/internal.h
+@@ -26,7 +26,6 @@
+ /*
+  * High level FPU state handling functions:
+  */
+-extern void fpu__prepare_write(struct fpu *fpu);
+ extern void fpu__save(struct fpu *fpu);
+ extern int  fpu__restore_sig(void __user *buf, int ia32_frame);
+ extern void fpu__drop(struct fpu *fpu);
+diff --git a/arch/x86/kernel/fpu/core.c b/arch/x86/kernel/fpu/core.c
+index d390644e5fa1..22437011f4f0 100644
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@ -281,30 +281,6 @@ static void fpu__initialize(struct fpu *fpu)
+ 	trace_x86_fpu_init_state(fpu);
+ }
+ 
+-/*
+- * This function must be called before we write a task's fpstate.
+- *
+- * Invalidate any cached FPU registers.
+- *
+- * After this function call, after registers in the fpstate are
+- * modified and the child task has woken up, the child task will
+- * restore the modified FPU state from the modified context. If we
+- * didn't clear its cached status here then the cached in-registers
+- * state pending on its former CPU could be restored, corrupting
+- * the modifications.
+- */
+-void fpu__prepare_write(struct fpu *fpu)
+-{
+-	/*
+-	 * Only stopped child tasks can be used to modify the FPU
+-	 * state in the fpstate buffer:
+-	 */
+-	WARN_ON_FPU(fpu == &current->thread.fpu);
+-
+-	/* Invalidate any cached state: */
+-	__fpu_invalidate_fpregs_state(fpu);
+-}
+-
+ /*
+  * Drops current FPU state: deactivates the fpregs and
+  * the fpstate. NOTE: it still leaves previous contents
+diff --git a/arch/x86/kernel/fpu/regset.c b/arch/x86/kernel/fpu/regset.c
+index 937adf702b37..ddc290d9bf8e 100644
+--- a/arch/x86/kernel/fpu/regset.c
++++ b/arch/x86/kernel/fpu/regset.c
+@@ -44,6 +44,25 @@ static void sync_fpstate(struct fpu *fpu)
+ 		fpu__save(fpu);
+ }
+ 
++/*
++ * Invalidate cached FPU registers before modifying the stopped target
++ * task's fpstate.
++ *
++ * This forces the target task on resume to restore the FPU registers from
++ * modified fpstate. Otherwise the task might skip the restore and operate
++ * with the cached FPU registers which discards the modifications.
++ */
++static void fpu_force_restore(struct fpu *fpu)
++{
++	/*
++	 * Only stopped child tasks can be used to modify the FPU
++	 * state in the fpstate buffer:
++	 */
++	WARN_ON_FPU(fpu == &current->thread.fpu);
++
++	__fpu_invalidate_fpregs_state(fpu);
++}
++
+ int xfpregs_get(struct task_struct *target, const struct user_regset *regset,
+ 		struct membuf to)
+ {
+@@ -88,7 +107,7 @@ int xfpregs_set(struct task_struct *target, const struct user_regset *regset,
+ 	if (newstate.mxcsr & ~mxcsr_feature_mask)
+ 		return -EINVAL;
+ 
+-	fpu__prepare_write(fpu);
++	fpu_force_restore(fpu);
+ 
+ 	/* Copy the state  */
+ 	memcpy(&fpu->state.fxsave, &newstate, sizeof(newstate));
+@@ -146,7 +165,7 @@ int xstateregs_set(struct task_struct *target, const struct user_regset *regset,
+ 		}
+ 	}
+ 
+-	fpu__prepare_write(fpu);
++	fpu_force_restore(fpu);
+ 	ret = copy_kernel_to_xstate(&fpu->state.xsave, kbuf ?: tmpbuf);
+ 
+ out:
+@@ -346,7 +365,7 @@ int fpregs_set(struct task_struct *target, const struct user_regset *regset,
+ 	if (ret)
+ 		return ret;
+ 
+-	fpu__prepare_write(fpu);
++	fpu_force_restore(fpu);
+ 
+ 	if (cpu_feature_enabled(X86_FEATURE_FXSR))
+ 		convert_to_fxsr(&fpu->state.fxsave, &env);
+-- 
+2.26.2
+

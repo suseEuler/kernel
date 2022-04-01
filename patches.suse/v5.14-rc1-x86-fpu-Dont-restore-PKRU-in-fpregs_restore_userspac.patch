@@ -1,0 +1,110 @@
+From 2ebe81c6d800576e1213f9d7cf0068017ae610c1 Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Wed, 23 Jun 2021 14:02:17 +0200
+Subject: [PATCH] x86/fpu: Dont restore PKRU in fpregs_restore_userspace()
+Git-commit: 2ebe81c6d800576e1213f9d7cf0068017ae610c1
+Patch-mainline: v5.14-rc1
+References: bsn#178
+Modified-by-SEL: No
+
+
+switch_to() and flush_thread() write the task's PKRU value eagerly so
+the PKRU value of current is always valid in the hardware.
+
+That means there is no point in restoring PKRU on exit to user or when
+reactivating the task's FPU registers in the signal frame setup path.
+
+This allows to remove all the xstate buffer updates with PKRU values once
+the PKRU state is stored in thread struct while a task is scheduled out.
+
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Reviewed-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20210623121456.303919033@linutronix.de
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/include/asm/fpu/internal.h | 16 +++++++++++++++-
+ arch/x86/include/asm/fpu/xstate.h   | 19 +++++++++++++++++++
+ arch/x86/kernel/fpu/core.c          |  2 +-
+ 3 files changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/arch/x86/include/asm/fpu/internal.h b/arch/x86/include/asm/fpu/internal.h
+index bcfb6365a76b..521774320e6a 100644
+--- a/arch/x86/include/asm/fpu/internal.h
++++ b/arch/x86/include/asm/fpu/internal.h
+@@ -457,7 +457,21 @@ static inline void fpregs_restore_userregs(void)
+ 		return;
+ 
+ 	if (!fpregs_state_valid(fpu, cpu)) {
+-		restore_fpregs_from_fpstate(&fpu->state);
++		u64 mask;
++
++		/*
++		 * This restores _all_ xstate which has not been
++		 * established yet.
++		 *
++		 * If PKRU is enabled, then the PKRU value is already
++		 * correct because it was either set in switch_to() or in
++		 * flush_thread(). So it is excluded because it might be
++		 * not up to date in current->thread.fpu.xsave state.
++		 */
++		mask = xfeatures_mask_restore_user() |
++			xfeatures_mask_supervisor();
++		__restore_fpregs_from_fpstate(&fpu->state, mask);
++
+ 		fpregs_activate(fpu);
+ 		fpu->last_cpu = cpu;
+ 	}
+diff --git a/arch/x86/include/asm/fpu/xstate.h b/arch/x86/include/asm/fpu/xstate.h
+index af9ea134bf5e..6a0aaafb93ec 100644
+--- a/arch/x86/include/asm/fpu/xstate.h
++++ b/arch/x86/include/asm/fpu/xstate.h
+@@ -35,6 +35,14 @@
+ 				      XFEATURE_MASK_BNDREGS | \
+ 				      XFEATURE_MASK_BNDCSR)
+ 
++/*
++ * Features which are restored when returning to user space.
++ * PKRU is not restored on return to user space because PKRU
++ * is switched eagerly in switch_to() and flush_thread()
++ */
++#define XFEATURE_MASK_USER_RESTORE	\
++	(XFEATURE_MASK_USER_SUPPORTED & ~XFEATURE_MASK_PKRU)
++
+ /* All currently supported supervisor features */
+ #define XFEATURE_MASK_SUPERVISOR_SUPPORTED (XFEATURE_MASK_PASID)
+ 
+@@ -92,6 +100,17 @@ static inline u64 xfeatures_mask_uabi(void)
+ 	return xfeatures_mask_all & XFEATURE_MASK_USER_SUPPORTED;
+ }
+ 
++/*
++ * The xfeatures which are restored by the kernel when returning to user
++ * mode. This is not necessarily the same as xfeatures_mask_uabi() as the
++ * kernel does not manage all XCR0 enabled features via xsave/xrstor as
++ * some of them have to be switched eagerly on context switch and exec().
++ */
++static inline u64 xfeatures_mask_restore_user(void)
++{
++	return xfeatures_mask_all & XFEATURE_MASK_USER_RESTORE;
++}
++
+ static inline u64 xfeatures_mask_independent(void)
+ {
+ 	if (!boot_cpu_has(X86_FEATURE_ARCH_LBR))
+diff --git a/arch/x86/kernel/fpu/core.c b/arch/x86/kernel/fpu/core.c
+index 12437383ff79..470576ced907 100644
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@ -404,7 +404,7 @@ void fpu__clear_user_states(struct fpu *fpu)
+ 	}
+ 
+ 	/* Reset user states in registers. */
+-	restore_fpregs_from_init_fpstate(xfeatures_mask_uabi());
++	restore_fpregs_from_init_fpstate(xfeatures_mask_restore_user());
+ 
+ 	/*
+ 	 * Now all FPU registers have their desired values.  Inform the FPU
+-- 
+2.26.2
+

@@ -1,0 +1,118 @@
+From 4889c07c44d2a639db5fdd872bdb561d5a54269b Mon Sep 17 00:00:00 2001
+From: Guoqing Jiang <guoqing.jiang@suse.com>
+Date: Thu, 7 Apr 2022 13:55:26 +0800
+Subject: [PATCH] Revert "x86/signal: Detect and prevent an alternate signal
+ stack overflow"
+Patch-mainline: Never, revert stable patch which is added again in sorted section
+References: bsn#178
+Modified-by-SEL: No
+
+
+This reverts commit 74569cb9ed7bc60e395927f55d3dc3be143a0164.
+
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/kernel/signal.c     | 24 ++++--------------------
+ include/linux/sched/signal.h | 19 +++++++------------
+ 2 files changed, 11 insertions(+), 32 deletions(-)
+
+diff --git a/arch/x86/kernel/signal.c b/arch/x86/kernel/signal.c
+index b001ba811cab..f51cab3e983d 100644
+--- a/arch/x86/kernel/signal.c
++++ b/arch/x86/kernel/signal.c
+@@ -234,11 +234,10 @@ get_sigframe(struct k_sigaction *ka, struct pt_regs *regs, size_t frame_size,
+ 	     void __user **fpstate)
+ {
+ 	/* Default to using normal stack */
+-	bool nested_altstack = on_sig_stack(regs->sp);
+-	bool entering_altstack = false;
+ 	unsigned long math_size = 0;
+ 	unsigned long sp = regs->sp;
+ 	unsigned long buf_fx = 0;
++	int onsigstack = on_sig_stack(sp);
+ 	int ret;
+ 
+ 	/* redzone */
+@@ -247,23 +246,15 @@ get_sigframe(struct k_sigaction *ka, struct pt_regs *regs, size_t frame_size,
+ 
+ 	/* This is the X/Open sanctioned signal stack switching.  */
+ 	if (ka->sa.sa_flags & SA_ONSTACK) {
+-		/*
+-		 * This checks nested_altstack via sas_ss_flags(). Sensible
+-		 * programs use SS_AUTODISARM, which disables that check, and
+-		 * programs that don't use SS_AUTODISARM get compatible.
+-		 */
+-		if (sas_ss_flags(sp) == 0) {
++		if (sas_ss_flags(sp) == 0)
+ 			sp = current->sas_ss_sp + current->sas_ss_size;
+-			entering_altstack = true;
+-		}
+ 	} else if (IS_ENABLED(CONFIG_X86_32) &&
+-		   !nested_altstack &&
++		   !onsigstack &&
+ 		   regs->ss != __USER_DS &&
+ 		   !(ka->sa.sa_flags & SA_RESTORER) &&
+ 		   ka->sa.sa_restorer) {
+ 		/* This is the legacy signal stack switching. */
+ 		sp = (unsigned long) ka->sa.sa_restorer;
+-		entering_altstack = true;
+ 	}
+ 
+ 	sp = fpu__alloc_mathframe(sp, IS_ENABLED(CONFIG_X86_32),
+@@ -276,15 +267,8 @@ get_sigframe(struct k_sigaction *ka, struct pt_regs *regs, size_t frame_size,
+ 	 * If we are on the alternate signal stack and would overflow it, don't.
+ 	 * Return an always-bogus address instead so we will die with SIGSEGV.
+ 	 */
+-	if (unlikely((nested_altstack || entering_altstack) &&
+-		     !__on_sig_stack(sp))) {
+-
+-		if (show_unhandled_signals && printk_ratelimit())
+-			pr_info("%s[%d] overflowed sigaltstack\n",
+-				current->comm, task_pid_nr(current));
+-
++	if (onsigstack && !likely(on_sig_stack(sp)))
+ 		return (void __user *)-1L;
+-	}
+ 
+ 	/* save i387 and extended state */
+ 	ret = copy_fpstate_to_sigframe(*fpstate, (void __user *)buf_fx, math_size);
+diff --git a/include/linux/sched/signal.h b/include/linux/sched/signal.h
+index 657640015b33..4b6a8234d7fc 100644
+--- a/include/linux/sched/signal.h
++++ b/include/linux/sched/signal.h
+@@ -525,17 +525,6 @@ static inline int kill_cad_pid(int sig, int priv)
+ #define SEND_SIG_NOINFO ((struct kernel_siginfo *) 0)
+ #define SEND_SIG_PRIV	((struct kernel_siginfo *) 1)
+ 
+-static inline int __on_sig_stack(unsigned long sp)
+-{
+-#ifdef CONFIG_STACK_GROWSUP
+-	return sp >= current->sas_ss_sp &&
+-		sp - current->sas_ss_sp < current->sas_ss_size;
+-#else
+-	return sp > current->sas_ss_sp &&
+-		sp - current->sas_ss_sp <= current->sas_ss_size;
+-#endif
+-}
+-
+ /*
+  * True if we are on the alternate signal stack.
+  */
+@@ -553,7 +542,13 @@ static inline int on_sig_stack(unsigned long sp)
+ 	if (current->sas_ss_flags & SS_AUTODISARM)
+ 		return 0;
+ 
+-	return __on_sig_stack(sp);
++#ifdef CONFIG_STACK_GROWSUP
++	return sp >= current->sas_ss_sp &&
++		sp - current->sas_ss_sp < current->sas_ss_size;
++#else
++	return sp > current->sas_ss_sp &&
++		sp - current->sas_ss_sp <= current->sas_ss_size;
++#endif
+ }
+ 
+ static inline int sas_ss_flags(unsigned long sp)
+-- 
+2.26.2
+

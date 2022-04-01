@@ -1,0 +1,180 @@
+From 43be46e89698a41dbf4fff81a322f4c2ae21b5e2 Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Wed, 23 Jun 2021 14:01:36 +0200
+Subject: [PATCH] x86/fpu: Sanitize xstateregs_set()
+Git-commit: 43be46e89698a41dbf4fff81a322f4c2ae21b5e2
+Patch-mainline: v5.14-rc1
+References: bsn#178
+Modified-by-SEL: No
+
+
+xstateregs_set() operates on a stopped task and tries to copy the provided
+buffer into the task's fpu.state.xsave buffer.
+
+Any error while copying or invalid state detected after copying results in
+wiping the target task's FPU state completely including supervisor states.
+
+That's just wrong. The caller supplied invalid data or has a problem with
+unmapped memory, so there is absolutely no justification to corrupt the
+target state.
+
+Fix this with the following modifications:
+
+ 1) If data has to be copied from userspace, allocate a buffer and copy from
+    user first.
+
+ 2) Use copy_kernel_to_xstate() unconditionally so that header checking
+    works correctly.
+
+ 3) Return on error without corrupting the target state.
+
+This prevents corrupting states and lets the caller deal with the problem
+it caused in the first place.
+
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Reviewed-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20210623121452.214903673@linutronix.de
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/include/asm/fpu/xstate.h |  4 ---
+ arch/x86/kernel/fpu/regset.c      | 42 +++++++++++++------------------
+ arch/x86/kernel/fpu/xstate.c      | 14 ++++++-----
+ 3 files changed, 25 insertions(+), 35 deletions(-)
+
+diff --git a/arch/x86/include/asm/fpu/xstate.h b/arch/x86/include/asm/fpu/xstate.h
+index d22e973845c6..1bb2d16f485b 100644
+--- a/arch/x86/include/asm/fpu/xstate.h
++++ b/arch/x86/include/asm/fpu/xstate.h
+@@ -111,8 +111,4 @@ void copy_supervisor_to_kernel(struct xregs_state *xsave);
+ void copy_dynamic_supervisor_to_kernel(struct xregs_state *xstate, u64 mask);
+ void copy_kernel_to_dynamic_supervisor(struct xregs_state *xstate, u64 mask);
+ 
+-
+-/* Validate an xstate header supplied by userspace (ptrace or sigreturn) */
+-int validate_user_xstate_header(const struct xstate_header *hdr);
+-
+ #endif
+diff --git a/arch/x86/kernel/fpu/regset.c b/arch/x86/kernel/fpu/regset.c
+index 6bb874441de8..a50c0a935499 100644
+--- a/arch/x86/kernel/fpu/regset.c
++++ b/arch/x86/kernel/fpu/regset.c
+@@ -2,11 +2,13 @@
+ /*
+  * FPU register's regset abstraction, for ptrace, core dumps, etc.
+  */
++#include <linux/sched/task_stack.h>
++#include <linux/vmalloc.h>
++
+ #include <asm/fpu/internal.h>
+ #include <asm/fpu/signal.h>
+ #include <asm/fpu/regset.h>
+ #include <asm/fpu/xstate.h>
+-#include <linux/sched/task_stack.h>
+ 
+ /*
+  * The xstateregs_active() routine is the same as the regset_fpregs_active() routine,
+@@ -108,10 +110,10 @@ int xstateregs_set(struct task_struct *target, const struct user_regset *regset,
+ 		  const void *kbuf, const void __user *ubuf)
+ {
+ 	struct fpu *fpu = &target->thread.fpu;
+-	struct xregs_state *xsave;
++	struct xregs_state *tmpbuf = NULL;
+ 	int ret;
+ 
+-	if (!boot_cpu_has(X86_FEATURE_XSAVE))
++	if (!cpu_feature_enabled(X86_FEATURE_XSAVE))
+ 		return -ENODEV;
+ 
+ 	/*
+@@ -120,32 +122,22 @@ int xstateregs_set(struct task_struct *target, const struct user_regset *regset,
+ 	if (pos != 0 || count != fpu_user_xstate_size)
+ 		return -EFAULT;
+ 
+-	xsave = &fpu->state.xsave;
+-
+-	fpu__prepare_write(fpu);
++	if (!kbuf) {
++		tmpbuf = vmalloc(count);
++		if (!tmpbuf)
++			return -ENOMEM;
+ 
+-	if (using_compacted_format()) {
+-		if (kbuf)
+-			ret = copy_kernel_to_xstate(xsave, kbuf);
+-		else
+-			ret = copy_user_to_xstate(xsave, ubuf);
+-	} else {
+-		ret = user_regset_copyin(&pos, &count, &kbuf, &ubuf, xsave, 0, -1);
+-		if (!ret)
+-			ret = validate_user_xstate_header(&xsave->header);
++		if (copy_from_user(tmpbuf, ubuf, count)) {
++			ret = -EFAULT;
++			goto out;
++		}
+ 	}
+ 
+-	/*
+-	 * mxcsr reserved bits must be masked to zero for security reasons.
+-	 */
+-	xsave->i387.mxcsr &= mxcsr_feature_mask;
+-
+-	/*
+-	 * In case of failure, mark all states as init:
+-	 */
+-	if (ret)
+-		fpstate_init(&fpu->state);
++	fpu__prepare_write(fpu);
++	ret = copy_kernel_to_xstate(&fpu->state.xsave, kbuf ?: tmpbuf);
+ 
++out:
++	vfree(tmpbuf);
+ 	return ret;
+ }
+ 
+diff --git a/arch/x86/kernel/fpu/xstate.c b/arch/x86/kernel/fpu/xstate.c
+index b82879cd9151..2b7b579f06b6 100644
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@ -543,7 +543,7 @@ int using_compacted_format(void)
+ }
+ 
+ /* Validate an xstate header supplied by userspace (ptrace or sigreturn) */
+-int validate_user_xstate_header(const struct xstate_header *hdr)
++static int validate_user_xstate_header(const struct xstate_header *hdr)
+ {
+ 	/* No unknown or supervisor features may be set */
+ 	if (hdr->xfeatures & ~xfeatures_mask_user())
+@@ -1155,7 +1155,7 @@ void copy_xstate_to_kernel(struct membuf to, struct xregs_state *xsave)
+ }
+ 
+ /*
+- * Convert from a ptrace standard-format kernel buffer to kernel XSAVES format
++ * Convert from a ptrace standard-format kernel buffer to kernel XSAVE[S] format
+  * and copy to the target thread. This is called from xstateregs_set().
+  */
+ int copy_kernel_to_xstate(struct xregs_state *xsave, const void *kbuf)
+@@ -1202,14 +1202,16 @@ int copy_kernel_to_xstate(struct xregs_state *xsave, const void *kbuf)
+ 	 */
+ 	xsave->header.xfeatures |= hdr.xfeatures;
+ 
++	/* mxcsr reserved bits must be masked to zero for historical reasons. */
++	xsave->i387.mxcsr &= mxcsr_feature_mask;
++
+ 	return 0;
+ }
+ 
+ /*
+- * Convert from a ptrace or sigreturn standard-format user-space buffer to
+- * kernel XSAVES format and copy to the target thread. This is called from
+- * xstateregs_set(), as well as potentially from the sigreturn() and
+- * rt_sigreturn() system calls.
++ * Convert from a sigreturn standard-format user-space buffer to kernel
++ * XSAVE[S] format and copy to the target thread. This is called from the
++ * sigreturn() and rt_sigreturn() system calls.
+  */
+ int copy_user_to_xstate(struct xregs_state *xsave, const void __user *ubuf)
+ {
+-- 
+2.26.2
+

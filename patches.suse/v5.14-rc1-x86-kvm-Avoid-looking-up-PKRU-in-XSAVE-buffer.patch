@@ -1,0 +1,105 @@
+From 71ef453355a9197fcfd8ff22391a4ad7861d79e6 Mon Sep 17 00:00:00 2001
+From: Dave Hansen <dave.hansen@linux.intel.com>
+Date: Wed, 23 Jun 2021 14:01:49 +0200
+Subject: [PATCH] x86/kvm: Avoid looking up PKRU in XSAVE buffer
+Git-commit: 71ef453355a9197fcfd8ff22391a4ad7861d79e6
+Patch-mainline: v5.14-rc1
+References: bsn#178
+Modified-by-SEL: No
+
+
+PKRU is being removed from the kernel XSAVE/FPU buffers.  This removal
+will probably include warnings for code that look up PKRU in those
+buffers.
+
+KVM currently looks up the location of PKRU but doesn't even use the
+pointer that it gets back.  Rework the code to avoid calling
+get_xsave_addr() except in cases where its result is actually used.
+
+This makes the code more clear and also avoids the inevitable PKRU
+warnings.
+
+This is probably a good cleanup and could go upstream idependently
+of any PKRU rework.
+
+Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Reviewed-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20210623121453.541037562@linutronix.de
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/kvm/x86.c | 45 ++++++++++++++++++++++++---------------------
+ 1 file changed, 24 insertions(+), 21 deletions(-)
+
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index e0f4a46649d7..c25bf240eb26 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -4604,20 +4604,21 @@ static void fill_xsave(u8 *dest, struct kvm_vcpu *vcpu)
+ 	 */
+ 	valid = xstate_bv & ~XFEATURE_MASK_FPSSE;
+ 	while (valid) {
++		u32 size, offset, ecx, edx;
+ 		u64 xfeature_mask = valid & -valid;
+ 		int xfeature_nr = fls64(xfeature_mask) - 1;
+-		void *src = get_xsave_addr(xsave, xfeature_nr);
+-
+-		if (src) {
+-			u32 size, offset, ecx, edx;
+-			cpuid_count(XSTATE_CPUID, xfeature_nr,
+-				    &size, &offset, &ecx, &edx);
+-			if (xfeature_nr == XFEATURE_PKRU)
+-				memcpy(dest + offset, &vcpu->arch.pkru,
+-				       sizeof(vcpu->arch.pkru));
+-			else
+-				memcpy(dest + offset, src, size);
++		void *src;
++
++		cpuid_count(XSTATE_CPUID, xfeature_nr,
++			    &size, &offset, &ecx, &edx);
+ 
++		if (xfeature_nr == XFEATURE_PKRU) {
++			memcpy(dest + offset, &vcpu->arch.pkru,
++			       sizeof(vcpu->arch.pkru));
++		} else {
++			src = get_xsave_addr(xsave, xfeature_nr);
++			if (src)
++				memcpy(dest + offset, src, size);
+ 		}
+ 
+ 		valid -= xfeature_mask;
+@@ -4647,18 +4648,20 @@ static void load_xsave(struct kvm_vcpu *vcpu, u8 *src)
+ 	 */
+ 	valid = xstate_bv & ~XFEATURE_MASK_FPSSE;
+ 	while (valid) {
++		u32 size, offset, ecx, edx;
+ 		u64 xfeature_mask = valid & -valid;
+ 		int xfeature_nr = fls64(xfeature_mask) - 1;
+-		void *dest = get_xsave_addr(xsave, xfeature_nr);
+-
+-		if (dest) {
+-			u32 size, offset, ecx, edx;
+-			cpuid_count(XSTATE_CPUID, xfeature_nr,
+-				    &size, &offset, &ecx, &edx);
+-			if (xfeature_nr == XFEATURE_PKRU)
+-				memcpy(&vcpu->arch.pkru, src + offset,
+-				       sizeof(vcpu->arch.pkru));
+-			else
++
++		cpuid_count(XSTATE_CPUID, xfeature_nr,
++			    &size, &offset, &ecx, &edx);
++
++		if (xfeature_nr == XFEATURE_PKRU) {
++			memcpy(&vcpu->arch.pkru, src + offset,
++			       sizeof(vcpu->arch.pkru));
++		} else {
++			void *dest = get_xsave_addr(xsave, xfeature_nr);
++
++			if (dest)
+ 				memcpy(dest, src + offset, size);
+ 		}
+ 
+-- 
+2.26.2
+

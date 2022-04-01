@@ -1,0 +1,136 @@
+From 35e0f8060ca8b91c8994af4063f3cc800432312b Mon Sep 17 00:00:00 2001
+From: Guoqing Jiang <guoqing.jiang@suse.com>
+Date: Fri, 1 Apr 2022 10:40:32 +0800
+Subject: [PATCH] Revert "x86/fpu: Make init_fpstate correct with optimized
+ XSAVE"
+Patch-mainline: Never, revert stable patch which is added again in sorted section
+References: bsn#178
+Modified-by-SEL: No
+
+
+This reverts commit 130a1d76ee0b206f96d885cefca5282fd2b7c44a.
+
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/include/asm/fpu/internal.h | 30 +++++++++++++++------
+ arch/x86/kernel/fpu/xstate.c        | 41 +++--------------------------
+ 2 files changed, 25 insertions(+), 46 deletions(-)
+
+diff --git a/arch/x86/include/asm/fpu/internal.h b/arch/x86/include/asm/fpu/internal.h
+index 16bf4d4a8159..fdee23ea4e17 100644
+--- a/arch/x86/include/asm/fpu/internal.h
++++ b/arch/x86/include/asm/fpu/internal.h
+@@ -204,14 +204,6 @@ static inline void copy_fxregs_to_kernel(struct fpu *fpu)
+ 		asm volatile("fxsaveq %[fx]" : [fx] "=m" (fpu->state.fxsave));
+ }
+ 
+-static inline void fxsave(struct fxregs_state *fx)
+-{
+-	if (IS_ENABLED(CONFIG_X86_32))
+-		asm volatile( "fxsave %[fx]" : [fx] "=m" (*fx));
+-	else
+-		asm volatile("fxsaveq %[fx]" : [fx] "=m" (*fx));
+-}
+-
+ /* These macros all use (%edi)/(%rdi) as the single memory argument. */
+ #define XSAVE		".byte " REX_PREFIX "0x0f,0xae,0x27"
+ #define XSAVEOPT	".byte " REX_PREFIX "0x0f,0xae,0x37"
+@@ -276,6 +268,28 @@ static inline void fxsave(struct fxregs_state *fx)
+ 		     : "D" (st), "m" (*st), "a" (lmask), "d" (hmask)	\
+ 		     : "memory")
+ 
++/*
++ * This function is called only during boot time when x86 caps are not set
++ * up and alternative can not be used yet.
++ */
++static inline void copy_xregs_to_kernel_booting(struct xregs_state *xstate)
++{
++	u64 mask = xfeatures_mask_all;
++	u32 lmask = mask;
++	u32 hmask = mask >> 32;
++	int err;
++
++	WARN_ON(system_state != SYSTEM_BOOTING);
++
++	if (boot_cpu_has(X86_FEATURE_XSAVES))
++		XSTATE_OP(XSAVES, xstate, lmask, hmask, err);
++	else
++		XSTATE_OP(XSAVE, xstate, lmask, hmask, err);
++
++	/* We should never fault when copying to a kernel buffer: */
++	WARN_ON_FPU(err);
++}
++
+ /*
+  * This function is called only during boot time when x86 caps are not set
+  * up and alternative can not be used yet.
+diff --git a/arch/x86/kernel/fpu/xstate.c b/arch/x86/kernel/fpu/xstate.c
+index 80dcf0417f30..67f1a03b9b23 100644
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@ -440,25 +440,6 @@ static void __init print_xstate_offset_size(void)
+ 	}
+ }
+ 
+-/*
+- * All supported features have either init state all zeros or are
+- * handled in setup_init_fpu() individually. This is an explicit
+- * feature list and does not use XFEATURE_MASK*SUPPORTED to catch
+- * newly added supported features at build time and make people
+- * actually look at the init state for the new feature.
+- */
+-#define XFEATURES_INIT_FPSTATE_HANDLED		\
+-	(XFEATURE_MASK_FP |			\
+-	 XFEATURE_MASK_SSE |			\
+-	 XFEATURE_MASK_YMM |			\
+-	 XFEATURE_MASK_OPMASK |			\
+-	 XFEATURE_MASK_ZMM_Hi256 |		\
+-	 XFEATURE_MASK_Hi16_ZMM	 |		\
+-	 XFEATURE_MASK_PKRU |			\
+-	 XFEATURE_MASK_BNDREGS |		\
+-	 XFEATURE_MASK_BNDCSR |			\
+-	 XFEATURE_MASK_PASID)
+-
+ /*
+  * setup the xstate image representing the init state
+  */
+@@ -466,10 +447,6 @@ static void __init setup_init_fpu_buf(void)
+ {
+ 	static int on_boot_cpu __initdata = 1;
+ 
+-	BUILD_BUG_ON((XFEATURE_MASK_USER_SUPPORTED |
+-		      XFEATURE_MASK_SUPERVISOR_SUPPORTED) !=
+-		     XFEATURES_INIT_FPSTATE_HANDLED);
+-
+ 	WARN_ON_FPU(!on_boot_cpu);
+ 	on_boot_cpu = 0;
+ 
+@@ -489,22 +466,10 @@ static void __init setup_init_fpu_buf(void)
+ 	copy_kernel_to_xregs_booting(&init_fpstate.xsave);
+ 
+ 	/*
+-	 * All components are now in init state. Read the state back so
+-	 * that init_fpstate contains all non-zero init state. This only
+-	 * works with XSAVE, but not with XSAVEOPT and XSAVES because
+-	 * those use the init optimization which skips writing data for
+-	 * components in init state.
+-	 *
+-	 * XSAVE could be used, but that would require to reshuffle the
+-	 * data when XSAVES is available because XSAVES uses xstate
+-	 * compaction. But doing so is a pointless exercise because most
+-	 * components have an all zeros init state except for the legacy
+-	 * ones (FP and SSE). Those can be saved with FXSAVE into the
+-	 * legacy area. Adding new features requires to ensure that init
+-	 * state is all zeroes or if not to add the necessary handling
+-	 * here.
++	 * Dump the init state again. This is to identify the init state
++	 * of any feature which is not represented by all zero's.
+ 	 */
+-	fxsave(&init_fpstate.fxsave);
++	copy_xregs_to_kernel_booting(&init_fpstate.xsave);
+ }
+ 
+ static int xfeature_uncompacted_offset(int xfeature_nr)
+-- 
+2.26.2
+

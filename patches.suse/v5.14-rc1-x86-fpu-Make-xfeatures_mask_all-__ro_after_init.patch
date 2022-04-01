@@ -1,0 +1,113 @@
+From 4e8e4313cf81add679e1c57677d689c02e382a67 Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Wed, 23 Jun 2021 14:01:31 +0200
+Subject: [PATCH] x86/fpu: Make xfeatures_mask_all __ro_after_init
+Git-commit: 4e8e4313cf81add679e1c57677d689c02e382a67
+Patch-mainline: v5.14-rc1
+References: bsn#178
+Modified-by-SEL: No
+
+
+Nothing has to modify this after init.
+
+But of course there is code which unconditionally masks
+xfeatures_mask_all on CPU hotplug. This goes unnoticed during boot
+hotplug because at that point the variable is still RW mapped.
+
+This is broken in several ways:
+
+  1) Masking this in post init CPU hotplug means that any
+     modification of this state goes unnoticed until actual hotplug
+     happens.
+
+  2) If that ever happens then these bogus feature bits are already
+     populated all over the place and the system is in inconsistent state
+     vs. the compacted XSTATE offsets. If at all then this has to panic the
+     machine because the inconsistency cannot be undone anymore.
+
+Make this a one-time paranoia check in xstate init code and disable
+xsave when this happens.
+
+Reported-by: Kan Liang <kan.liang@linux.intel.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Reviewed-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20210623121451.712803952@linutronix.de
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/kernel/fpu/xstate.c | 28 +++++++++++++++-------------
+ 1 file changed, 15 insertions(+), 13 deletions(-)
+
+diff --git a/arch/x86/kernel/fpu/xstate.c b/arch/x86/kernel/fpu/xstate.c
+index bcb9f5648cfd..a64f61ae8540 100644
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@ -59,7 +59,7 @@ static short xsave_cpuid_features[] __initdata = {
+  * This represents the full set of bits that should ever be set in a kernel
+  * XSAVE buffer, both supervisor and user xstates.
+  */
+-u64 xfeatures_mask_all __read_mostly;
++u64 xfeatures_mask_all __ro_after_init;
+ 
+ static unsigned int xstate_offsets[XFEATURE_MAX] __ro_after_init =
+ 	{ [ 0 ... XFEATURE_MAX - 1] = -1};
+@@ -213,19 +213,8 @@ void fpstate_sanitize_xstate(struct fpu *fpu)
+  */
+ void fpu__init_cpu_xstate(void)
+ {
+-	u64 unsup_bits;
+-
+ 	if (!boot_cpu_has(X86_FEATURE_XSAVE) || !xfeatures_mask_all)
+ 		return;
+-	/*
+-	 * Unsupported supervisor xstates should not be found in
+-	 * the xfeatures mask.
+-	 */
+-	unsup_bits = xfeatures_mask_all & XFEATURE_MASK_SUPERVISOR_UNSUPPORTED;
+-	WARN_ONCE(unsup_bits, "x86/fpu: Found unsupported supervisor xstates: 0x%llx\n",
+-		  unsup_bits);
+-
+-	xfeatures_mask_all &= ~XFEATURE_MASK_SUPERVISOR_UNSUPPORTED;
+ 
+ 	cr4_set_bits(X86_CR4_OSXSAVE);
+ 
+@@ -825,6 +814,7 @@ void __init fpu__init_system_xstate(void)
+ {
+ 	unsigned int eax, ebx, ecx, edx;
+ 	static int on_boot_cpu __initdata = 1;
++	u64 xfeatures;
+ 	int err;
+ 	int i;
+ 
+@@ -879,6 +869,8 @@ void __init fpu__init_system_xstate(void)
+ 	}
+ 
+ 	xfeatures_mask_all &= fpu__get_supported_xfeatures_mask();
++	/* Store it for paranoia check at the end */
++	xfeatures = xfeatures_mask_all;
+ 
+ 	/* Enable xstate instructions to be able to continue with initialization: */
+ 	fpu__init_cpu_xstate();
+@@ -896,8 +888,18 @@ void __init fpu__init_system_xstate(void)
+ 	setup_init_fpu_buf();
+ 	setup_xstate_comp_offsets();
+ 	setup_supervisor_only_offsets();
+-	print_xstate_offset_size();
+ 
++	/*
++	 * Paranoia check whether something in the setup modified the
++	 * xfeatures mask.
++	 */
++	if (xfeatures != xfeatures_mask_all) {
++		pr_err("x86/fpu: xfeatures modified from 0x%016llx to 0x%016llx during init, disabling XSAVE\n",
++		       xfeatures, xfeatures_mask_all);
++		goto out_disable;
++	}
++
++	print_xstate_offset_size();
+ 	pr_info("x86/fpu: Enabled xstate features 0x%llx, context size is %d bytes, using '%s' format.\n",
+ 		xfeatures_mask_all,
+ 		fpu_kernel_xstate_size,
+-- 
+2.26.2
+

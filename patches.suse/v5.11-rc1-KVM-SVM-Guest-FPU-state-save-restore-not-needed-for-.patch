@@ -1,0 +1,189 @@
+From ed02b213098a90c2a415a0da18f05841f8cf0a81 Mon Sep 17 00:00:00 2001
+From: Tom Lendacky <thomas.lendacky@amd.com>
+Date: Thu, 10 Dec 2020 11:10:01 -0600
+Subject: [PATCH] KVM: SVM: Guest FPU state save/restore not needed for SEV-ES
+ guest
+Git-commit: ed02b213098a90c2a415a0da18f05841f8cf0a81
+Patch-mainline: v5.11-rc1
+References: bsn#178
+Modified-by-SEL: Yes, modified due to different context
+
+
+The guest FPU state is automatically restored on VMRUN and saved on VMEXIT
+by the hardware, so there is no reason to do this in KVM. Eliminate the
+allocation of the guest_fpu save area and key off that to skip operations
+related to the guest FPU state.
+
+Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+Message-Id: <173e429b4d0d962c6a443c4553ffdaf31b7665a4.1607620209.git.thomas.lendacky@amd.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/include/asm/kvm_host.h |    2 +
+ arch/x86/kvm/svm/svm.c          |    8 +++++
+ arch/x86/kvm/x86.c              |   56 ++++++++++++++++++++++++++++++++--------
+ 3 files changed, 56 insertions(+), 10 deletions(-)
+
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1477,6 +1477,8 @@ void kvm_vcpu_deliver_sipi_vector(struct
+ int kvm_task_switch(struct kvm_vcpu *vcpu, u16 tss_selector, int idt_index,
+ 		    int reason, bool has_error_code, u32 error_code);
+ 
++void kvm_free_guest_fpu(struct kvm_vcpu *vcpu);
++
+ int kvm_set_cr0(struct kvm_vcpu *vcpu, unsigned long cr0);
+ int kvm_set_cr3(struct kvm_vcpu *vcpu, unsigned long cr3);
+ int kvm_set_cr4(struct kvm_vcpu *vcpu, unsigned long cr4);
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -1313,6 +1313,14 @@ static int svm_create_vcpu(struct kvm_vc
+ 		vmsa_page = alloc_page(GFP_KERNEL_ACCOUNT | __GFP_ZERO);
+ 		if (!vmsa_page)
+ 			goto error_free_vmcb_page;
++
++		/*
++		 * SEV-ES guests maintain an encrypted version of their FPU
++		 * state which is restored and saved on VMRUN and VMEXIT.
++		 * Free the fpu structure to prevent KVM from attempting to
++		 * access the FPU state.
++		 */
++		kvm_free_guest_fpu(vcpu);
+ 	}
+ 
+ 	err = avic_init_vcpu(svm);
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -4540,6 +4540,9 @@ static void load_xsave(struct kvm_vcpu *
+ static void kvm_vcpu_ioctl_x86_get_xsave(struct kvm_vcpu *vcpu,
+ 					 struct kvm_xsave *guest_xsave)
+ {
++	if (!vcpu->arch.guest_fpu)
++		return;
++
+ 	if (boot_cpu_has(X86_FEATURE_XSAVE)) {
+ 		memset(guest_xsave, 0, sizeof(struct kvm_xsave));
+ 		fill_xsave((u8 *) guest_xsave->region, vcpu);
+@@ -4557,9 +4560,14 @@ static void kvm_vcpu_ioctl_x86_get_xsave
+ static int kvm_vcpu_ioctl_x86_set_xsave(struct kvm_vcpu *vcpu,
+ 					struct kvm_xsave *guest_xsave)
+ {
+-	u64 xstate_bv =
+-		*(u64 *)&guest_xsave->region[XSAVE_HDR_OFFSET / sizeof(u32)];
+-	u32 mxcsr = *(u32 *)&guest_xsave->region[XSAVE_MXCSR_OFFSET / sizeof(u32)];
++	u64 xstate_bv;
++	u32 mxcsr;
++
++	if (!vcpu->arch.guest_fpu)
++		return 0;
++
++	xstate_bv = *(u64 *)&guest_xsave->region[XSAVE_HDR_OFFSET / sizeof(u32)];
++	mxcsr = *(u32 *)&guest_xsave->region[XSAVE_MXCSR_OFFSET / sizeof(u32)];
+ 
+ 	if (boot_cpu_has(X86_FEATURE_XSAVE)) {
+ 		/*
+@@ -9353,9 +9361,14 @@ static void kvm_load_guest_fpu(struct kv
+ 
+ 	kvm_save_current_fpu(vcpu->arch.user_fpu);
+ 
+-	/* PKRU is separately restored in kvm_x86_ops.run.  */
+-	__copy_kernel_to_fpregs(&vcpu->arch.guest_fpu->state,
+-				~XFEATURE_MASK_PKRU);
++	/*
++	 * Guests with protected state can't have it set by the hypervisor,
++	 * so skip trying to set it.
++	 */
++	if (vcpu->arch.guest_fpu)
++		/* PKRU is separately restored in kvm_x86_ops.run. */
++		__copy_kernel_to_fpregs(&vcpu->arch.guest_fpu->state,
++					~XFEATURE_MASK_PKRU);
+ 
+ 	fpregs_mark_activate();
+ 	fpregs_unlock();
+@@ -9368,7 +9381,12 @@ static void kvm_put_guest_fpu(struct kvm
+ {
+ 	fpregs_lock();
+ 
+-	kvm_save_current_fpu(vcpu->arch.guest_fpu);
++	/*
++	 * Guests with protected state can't have it read by the hypervisor,
++	 * so skip trying to save it.
++	 */
++	if (vcpu->arch.guest_fpu)
++		kvm_save_current_fpu(vcpu->arch.guest_fpu);
+ 
+ 	copy_kernel_to_fpregs(&vcpu->arch.user_fpu->state);
+ 
+@@ -9874,6 +9892,9 @@ int kvm_arch_vcpu_ioctl_get_fpu(struct k
+ {
+ 	struct fxregs_state *fxsave;
+ 
++	if (!vcpu->arch.guest_fpu)
++		return 0;
++
+ 	vcpu_load(vcpu);
+ 
+ 	fxsave = &vcpu->arch.guest_fpu->state.fxsave;
+@@ -9894,6 +9915,9 @@ int kvm_arch_vcpu_ioctl_set_fpu(struct k
+ {
+ 	struct fxregs_state *fxsave;
+ 
++	if (!vcpu->arch.guest_fpu)
++		return 0;
++
+ 	vcpu_load(vcpu);
+ 
+ 	fxsave = &vcpu->arch.guest_fpu->state.fxsave;
+@@ -9952,6 +9976,9 @@ static int sync_regs(struct kvm_vcpu *vc
+ 
+ static void fx_init(struct kvm_vcpu *vcpu)
+ {
++	if (!vcpu->arch.guest_fpu)
++		return;
++
+ 	fpstate_init(&vcpu->arch.guest_fpu->state);
+ 	if (boot_cpu_has(X86_FEATURE_XSAVES))
+ 		vcpu->arch.guest_fpu->state.xsave.header.xcomp_bv =
+@@ -9965,6 +9992,15 @@ static void fx_init(struct kvm_vcpu *vcp
+ 	vcpu->arch.cr0 |= X86_CR0_ET;
+ }
+ 
++void kvm_free_guest_fpu(struct kvm_vcpu *vcpu)
++{
++	if (vcpu->arch.guest_fpu) {
++		kmem_cache_free(x86_fpu_cache, vcpu->arch.guest_fpu);
++		vcpu->arch.guest_fpu = NULL;
++	}
++}
++EXPORT_SYMBOL_GPL(kvm_free_guest_fpu);
++
+ int kvm_arch_vcpu_precreate(struct kvm *kvm, unsigned int id)
+ {
+ 	if (kvm_check_tsc_unstable() && atomic_read(&kvm->online_vcpus) != 0)
+@@ -10061,7 +10097,7 @@ int kvm_arch_vcpu_create(struct kvm_vcpu
+ 	return 0;
+ 
+ free_guest_fpu:
+-	kmem_cache_free(x86_fpu_cache, vcpu->arch.guest_fpu);
++	kvm_free_guest_fpu(vcpu);
+ free_user_fpu:
+ 	kmem_cache_free(x86_fpu_cache, vcpu->arch.user_fpu);
+ free_emulate_ctxt:
+@@ -10115,7 +10151,7 @@ void kvm_arch_vcpu_destroy(struct kvm_vc
+ 	kmem_cache_free(x86_emulator_cache, vcpu->arch.emulate_ctxt);
+ 	free_cpumask_var(vcpu->arch.wbinvd_dirty_mask);
+ 	kmem_cache_free(x86_fpu_cache, vcpu->arch.user_fpu);
+-	kmem_cache_free(x86_fpu_cache, vcpu->arch.guest_fpu);
++	kvm_free_guest_fpu(vcpu);
+ 
+ 	kvm_hv_vcpu_uninit(vcpu);
+ 	kvm_pmu_destroy(vcpu);
+@@ -10163,7 +10199,7 @@ void kvm_vcpu_reset(struct kvm_vcpu *vcp
+ 	kvm_async_pf_hash_reset(vcpu);
+ 	vcpu->arch.apf.halted = false;
+ 
+-	if (kvm_mpx_supported()) {
++	if (vcpu->arch.guest_fpu && kvm_mpx_supported()) {
+ 		void *mpx_state_buffer;
+ 
+ 		/*

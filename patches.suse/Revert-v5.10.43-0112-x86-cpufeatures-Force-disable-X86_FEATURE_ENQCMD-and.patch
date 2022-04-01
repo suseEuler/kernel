@@ -1,0 +1,140 @@
+From 2843ef8e124c2be901c43b977115d643450a2292 Mon Sep 17 00:00:00 2001
+From: Guoqing Jiang <guoqing.jiang@suse.com>
+Date: Fri, 1 Apr 2022 13:44:08 +0800
+Subject: [PATCH] Revert "x86/cpufeatures: Force disable X86_FEATURE_ENQCMD and
+ remove update_pasid()"
+Patch-mainline: Never, revert stable patch which is added again in sorted section
+References: bsn#178
+Modified-by-SEL: No
+
+
+This reverts commit 942c5864de85dc14602ec875e88e0337896db6d9.
+
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/include/asm/disabled-features.h |  7 ++-
+ arch/x86/include/asm/fpu/api.h           |  6 ++-
+ arch/x86/include/asm/fpu/internal.h      |  7 +++
+ arch/x86/kernel/fpu/xstate.c             | 57 ++++++++++++++++++++++++
+ 4 files changed, 74 insertions(+), 3 deletions(-)
+
+diff --git a/arch/x86/include/asm/disabled-features.h b/arch/x86/include/asm/disabled-features.h
+index 09db5b8f1444..5861d34f9771 100644
+--- a/arch/x86/include/asm/disabled-features.h
++++ b/arch/x86/include/asm/disabled-features.h
+@@ -56,8 +56,11 @@
+ # define DISABLE_PTI		(1 << (X86_FEATURE_PTI & 31))
+ #endif
+ 
+-/* Force disable because it's broken beyond repair */
+-#define DISABLE_ENQCMD		(1 << (X86_FEATURE_ENQCMD & 31))
++#ifdef CONFIG_IOMMU_SUPPORT
++# define DISABLE_ENQCMD	0
++#else
++# define DISABLE_ENQCMD (1 << (X86_FEATURE_ENQCMD & 31))
++#endif
+ 
+ /*
+  * Make sure to add features to the correct mask
+diff --git a/arch/x86/include/asm/fpu/api.h b/arch/x86/include/asm/fpu/api.h
+index 8b9bfaad6e66..38f4936045ab 100644
+--- a/arch/x86/include/asm/fpu/api.h
++++ b/arch/x86/include/asm/fpu/api.h
+@@ -79,6 +79,10 @@ extern int cpu_has_xfeatures(u64 xfeatures_mask, const char **feature_name);
+  */
+ #define PASID_DISABLED	0
+ 
++#ifdef CONFIG_IOMMU_SUPPORT
++/* Update current's PASID MSR/state by mm's PASID. */
++void update_pasid(void);
++#else
+ static inline void update_pasid(void) { }
+-
++#endif
+ #endif /* _ASM_X86_FPU_API_H */
+diff --git a/arch/x86/include/asm/fpu/internal.h b/arch/x86/include/asm/fpu/internal.h
+index ceeba9f63172..8d33ad80704f 100644
+--- a/arch/x86/include/asm/fpu/internal.h
++++ b/arch/x86/include/asm/fpu/internal.h
+@@ -584,6 +584,13 @@ static inline void switch_fpu_finish(struct fpu *new_fpu)
+ 			pkru_val = pk->pkru;
+ 	}
+ 	__write_pkru(pkru_val);
++
++	/*
++	 * Expensive PASID MSR write will be avoided in update_pasid() because
++	 * TIF_NEED_FPU_LOAD was set. And the PASID state won't be updated
++	 * unless it's different from mm->pasid to reduce overhead.
++	 */
++	update_pasid();
+ }
+ 
+ #endif /* _ASM_X86_FPU_INTERNAL_H */
+diff --git a/arch/x86/kernel/fpu/xstate.c b/arch/x86/kernel/fpu/xstate.c
+index 67f1a03b9b23..5d8047441a0a 100644
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@ -1402,3 +1402,60 @@ int proc_pid_arch_status(struct seq_file *m, struct pid_namespace *ns,
+ 	return 0;
+ }
+ #endif /* CONFIG_PROC_PID_ARCH_STATUS */
++
++#ifdef CONFIG_IOMMU_SUPPORT
++void update_pasid(void)
++{
++	u64 pasid_state;
++	u32 pasid;
++
++	if (!cpu_feature_enabled(X86_FEATURE_ENQCMD))
++		return;
++
++	if (!current->mm)
++		return;
++
++	pasid = READ_ONCE(current->mm->pasid);
++	/* Set the valid bit in the PASID MSR/state only for valid pasid. */
++	pasid_state = pasid == PASID_DISABLED ?
++		      pasid : pasid | MSR_IA32_PASID_VALID;
++
++	/*
++	 * No need to hold fregs_lock() since the task's fpstate won't
++	 * be changed by others (e.g. ptrace) while the task is being
++	 * switched to or is in IPI.
++	 */
++	if (!test_thread_flag(TIF_NEED_FPU_LOAD)) {
++		/* The MSR is active and can be directly updated. */
++		wrmsrl(MSR_IA32_PASID, pasid_state);
++	} else {
++		struct fpu *fpu = &current->thread.fpu;
++		struct ia32_pasid_state *ppasid_state;
++		struct xregs_state *xsave;
++
++		/*
++		 * The CPU's xstate registers are not currently active. Just
++		 * update the PASID state in the memory buffer here. The
++		 * PASID MSR will be loaded when returning to user mode.
++		 */
++		xsave = &fpu->state.xsave;
++		xsave->header.xfeatures |= XFEATURE_MASK_PASID;
++		ppasid_state = get_xsave_addr(xsave, XFEATURE_PASID);
++		/*
++		 * Since XFEATURE_MASK_PASID is set in xfeatures, ppasid_state
++		 * won't be NULL and no need to check its value.
++		 *
++		 * Only update the task's PASID state when it's different
++		 * from the mm's pasid.
++		 */
++		if (ppasid_state->pasid != pasid_state) {
++			/*
++			 * Invalid fpregs so that state restoring will pick up
++			 * the PASID state.
++			 */
++			__fpu_invalidate_fpregs_state(fpu);
++			ppasid_state->pasid = pasid_state;
++		}
++	}
++}
++#endif /* CONFIG_IOMMU_SUPPORT */
+-- 
+2.26.2
+
