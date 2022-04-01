@@ -1,0 +1,95 @@
+From 0d2c4f9640501ff57ba0be1f5644a02c29a02fa1 Mon Sep 17 00:00:00 2001
+Message-Id: <0d2c4f9640501ff57ba0be1f5644a02c29a02fa1.1648803883.git.geliang.tang@suse.com>
+In-Reply-To: <ddf8503c7c434374a1112e89bcedfe1ccb3057df.1648803883.git.geliang.tang@suse.com>
+References: <ddf8503c7c434374a1112e89bcedfe1ccb3057df.1648803883.git.geliang.tang@suse.com>
+From: Roman Gushchin <guro@fb.com>
+Date: Tue, 1 Dec 2020 13:58:54 -0800
+Subject: [PATCH 24/29] bpf: Eliminate rlimit-based memory accounting for
+ sockmap and sockhash maps
+Git-commit: 0d2c4f9640501ff57ba0be1f5644a02c29a02fa1
+Patch-mainline: v5.11-rc1
+References: bsn#127
+Modified-by-SEL: Yes, refreshed due to context changes
+
+Do not use rlimit-based memory accounting for sockmap and sockhash maps.
+It has been replaced with the memcg-based memory accounting.
+
+Signed-off-by: Roman Gushchin <guro@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Song Liu <songliubraving@fb.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+Link: https://lore.kernel.org/bpf/20201201215900.3569844-29-guro@fb.com
+---
+ net/core/sock_map.c | 33 ++++++---------------------------
+ 1 file changed, 6 insertions(+), 27 deletions(-)
+
+--- a/net/core/sock_map.c
++++ b/net/core/sock_map.c
+@@ -27,8 +27,6 @@ struct bpf_stab {
+ static struct bpf_map *sock_map_alloc(union bpf_attr *attr)
+ {
+ 	struct bpf_stab *stab;
+-	u64 cost;
+-	int err;
+ 
+ 	if (!capable(CAP_NET_ADMIN))
+ 		return ERR_PTR(-EPERM);
+@@ -46,22 +44,15 @@ static struct bpf_map *sock_map_alloc(un
+ 	bpf_map_init_from_attr(&stab->map, attr);
+ 	raw_spin_lock_init(&stab->lock);
+ 
+-	/* Make sure page count doesn't overflow. */
+-	cost = (u64) stab->map.max_entries * sizeof(struct sock *);
+-	err = bpf_map_charge_init(&stab->map.memory, cost);
+-	if (err)
+-		goto free_stab;
+-
+ 	stab->sks = bpf_map_area_alloc((u64) stab->map.max_entries *
+ 				       sizeof(struct sock *),
+ 				       stab->map.numa_node);
+-	if (stab->sks)
+-		return &stab->map;
+-	err = -ENOMEM;
+-	bpf_map_charge_finish(&stab->map.memory);
+-free_stab:
+-	kfree(stab);
+-	return ERR_PTR(err);
++	if (!stab->sks) {
++		kfree(stab);
++		return ERR_PTR(-ENOMEM);
++	}
++
++	return &stab->map;
+ }
+ 
+ int sock_map_get_from_fd(const union bpf_attr *attr, struct bpf_prog *prog)
+@@ -1104,7 +1095,6 @@ static struct bpf_map *sock_hash_alloc(u
+ {
+ 	struct bpf_shtab *htab;
+ 	int i, err;
+-	u64 cost;
+ 
+ 	if (!capable(CAP_NET_ADMIN))
+ 		return ERR_PTR(-EPERM);
+@@ -1132,21 +1122,10 @@ static struct bpf_map *sock_hash_alloc(u
+ 		goto free_htab;
+ 	}
+ 
+-	cost = (u64) htab->buckets_num * sizeof(struct bpf_shtab_bucket) +
+-	       (u64) htab->elem_size * htab->map.max_entries;
+-	if (cost >= U32_MAX - PAGE_SIZE) {
+-		err = -EINVAL;
+-		goto free_htab;
+-	}
+-	err = bpf_map_charge_init(&htab->map.memory, cost);
+-	if (err)
+-		goto free_htab;
+-
+ 	htab->buckets = bpf_map_area_alloc(htab->buckets_num *
+ 					   sizeof(struct bpf_shtab_bucket),
+ 					   htab->map.numa_node);
+ 	if (!htab->buckets) {
+-		bpf_map_charge_finish(&htab->map.memory);
+ 		err = -ENOMEM;
+ 		goto free_htab;
+ 	}

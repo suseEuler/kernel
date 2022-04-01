@@ -1,0 +1,231 @@
+From dba4a9256bb4d78ef89aaad5f49787aa27fcd5b4 Mon Sep 17 00:00:00 2001
+Message-Id: <dba4a9256bb4d78ef89aaad5f49787aa27fcd5b4.1648821118.git.geliang.tang@suse.com>
+From: Florent Revest <revest@chromium.org>
+Date: Fri, 4 Dec 2020 12:36:04 +0100
+Subject: [PATCH] net: Remove the err argument from sock_from_file
+Git-commit: dba4a9256bb4d78ef89aaad5f49787aa27fcd5b4
+Patch-mainline: v5.11-rc1
+References: bsn#127
+Modified-by-SEL: Yes, refreshed due to context changes
+
+Currently, the sock_from_file prototype takes an "err" pointer that is
+either not set or set to -ENOTSOCK IFF the returned socket is NULL. This
+makes the error redundant and it is ignored by a few callers.
+
+This patch simplifies the API by letting callers deduce the error based
+on whether the returned socket is NULL or not.
+
+Suggested-by: Al Viro <viro@zeniv.linux.org.uk>
+Signed-off-by: Florent Revest <revest@google.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Reviewed-by: KP Singh <kpsingh@google.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+Link: https://lore.kernel.org/bpf/20201204113609.1850150-1-revest@google.com
+---
+ fs/eventpoll.c               |  3 +--
+ fs/io_uring.c                | 16 ++++++++--------
+ include/linux/net.h          |  2 +-
+ net/core/netclassid_cgroup.c |  3 +--
+ net/core/netprio_cgroup.c    |  3 +--
+ net/core/sock.c              |  8 +-------
+ net/socket.c                 | 27 ++++++++++++++++-----------
+ 7 files changed, 29 insertions(+), 33 deletions(-)
+
+--- a/fs/eventpoll.c
++++ b/fs/eventpoll.c
+@@ -416,12 +416,11 @@ static inline void ep_set_busy_poll_napi
+ 	unsigned int napi_id;
+ 	struct socket *sock;
+ 	struct sock *sk;
+-	int err;
+ 
+ 	if (!net_busy_loop_on())
+ 		return;
+ 
+-	sock = sock_from_file(epi->ffd.file, &err);
++	sock = sock_from_file(epi->ffd.file);
+ 	if (!sock)
+ 		return;
+ 
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -4425,9 +4425,9 @@ static int io_sendmsg(struct io_kiocb *r
+ 	int min_ret = 0;
+ 	int ret;
+ 
+-	sock = sock_from_file(req->file, &ret);
++	sock = sock_from_file(req->file);
+ 	if (unlikely(!sock))
+-		return ret;
++		return -ENOTSOCK;
+ 
+ 	if (req->async_data) {
+ 		kmsg = req->async_data;
+@@ -4478,9 +4478,9 @@ static int io_send(struct io_kiocb *req,
+ 	int min_ret = 0;
+ 	int ret;
+ 
+-	sock = sock_from_file(req->file, &ret);
++	sock = sock_from_file(req->file);
+ 	if (unlikely(!sock))
+-		return ret;
++		return -ENOTSOCK;
+ 
+ 	ret = import_single_range(WRITE, sr->buf, sr->len, &iov, &msg.msg_iter);
+ 	if (unlikely(ret))
+@@ -4662,9 +4662,9 @@ static int io_recvmsg(struct io_kiocb *r
+ 	int min_ret = 0;
+ 	int ret, cflags = 0;
+ 
+-	sock = sock_from_file(req->file, &ret);
++	sock = sock_from_file(req->file);
+ 	if (unlikely(!sock))
+-		return ret;
++		return -ENOTSOCK;
+ 
+ 	if (req->async_data) {
+ 		kmsg = req->async_data;
+@@ -4729,9 +4729,9 @@ static int io_recv(struct io_kiocb *req,
+ 	int min_ret = 0;
+ 	int ret, cflags = 0;
+ 
+-	sock = sock_from_file(req->file, &ret);
++	sock = sock_from_file(req->file);
+ 	if (unlikely(!sock))
+-		return ret;
++		return -ENOTSOCK;
+ 
+ 	if (req->flags & REQ_F_BUFFER_SELECT) {
+ 		kbuf = io_recv_buffer_select(req, !force_nonblock);
+--- a/include/linux/net.h
++++ b/include/linux/net.h
+@@ -240,7 +240,7 @@ int sock_sendmsg(struct socket *sock, st
+ int sock_recvmsg(struct socket *sock, struct msghdr *msg, int flags);
+ struct file *sock_alloc_file(struct socket *sock, int flags, const char *dname);
+ struct socket *sockfd_lookup(int fd, int *err);
+-struct socket *sock_from_file(struct file *file, int *err);
++struct socket *sock_from_file(struct file *file);
+ #define		     sockfd_put(sock) fput(sock->file)
+ int net_ratelimit(void);
+ 
+--- a/net/core/netclassid_cgroup.c
++++ b/net/core/netclassid_cgroup.c
+@@ -68,9 +68,8 @@ struct update_classid_context {
+ 
+ static int update_classid_sock(const void *v, struct file *file, unsigned n)
+ {
+-	int err;
+ 	struct update_classid_context *ctx = (void *)v;
+-	struct socket *sock = sock_from_file(file, &err);
++	struct socket *sock = sock_from_file(file);
+ 
+ 	if (sock) {
+ 		spin_lock(&cgroup_sk_update_lock);
+--- a/net/core/netprio_cgroup.c
++++ b/net/core/netprio_cgroup.c
+@@ -220,8 +220,7 @@ static ssize_t write_priomap(struct kern
+ 
+ static int update_netprio(const void *v, struct file *file, unsigned n)
+ {
+-	int err;
+-	struct socket *sock = sock_from_file(file, &err);
++	struct socket *sock = sock_from_file(file);
+ 	if (sock) {
+ 		spin_lock(&cgroup_sk_update_lock);
+ 		sock_cgroup_set_prioidx(&sock->sk->sk_cgrp_data,
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -2844,14 +2844,8 @@ EXPORT_SYMBOL(sock_no_mmap);
+ void __receive_sock(struct file *file)
+ {
+ 	struct socket *sock;
+-	int error;
+ 
+-	/*
+-	 * The resulting value of "error" is ignored here since we only
+-	 * need to take action when the file is a socket and testing
+-	 * "sock" for NULL is sufficient.
+-	 */
+-	sock = sock_from_file(file, &error);
++	sock = sock_from_file(file);
+ 	if (sock) {
+ 		sock_update_netprioidx(&sock->sk->sk_cgrp_data);
+ 		sock_update_classid(&sock->sk->sk_cgrp_data);
+--- a/net/socket.c
++++ b/net/socket.c
+@@ -446,17 +446,15 @@ static int sock_map_fd(struct socket *so
+ /**
+  *	sock_from_file - Return the &socket bounded to @file.
+  *	@file: file
+- *	@err: pointer to an error code return
+  *
+- *	On failure returns %NULL and assigns -ENOTSOCK to @err.
++ *	On failure returns %NULL.
+  */
+ 
+-struct socket *sock_from_file(struct file *file, int *err)
++struct socket *sock_from_file(struct file *file)
+ {
+ 	if (file->f_op == &socket_file_ops)
+ 		return file->private_data;	/* set in sock_map_fd */
+ 
+-	*err = -ENOTSOCK;
+ 	return NULL;
+ }
+ EXPORT_SYMBOL(sock_from_file);
+@@ -485,9 +483,11 @@ struct socket *sockfd_lookup(int fd, int
+ 		return NULL;
+ 	}
+ 
+-	sock = sock_from_file(file, err);
+-	if (!sock)
++	sock = sock_from_file(file);
++	if (!sock) {
++		*err = -ENOTSOCK;
+ 		fput(file);
++	}
+ 	return sock;
+ }
+ EXPORT_SYMBOL(sockfd_lookup);
+@@ -499,11 +499,12 @@ static struct socket *sockfd_lookup_ligh
+ 
+ 	*err = -EBADF;
+ 	if (f.file) {
+-		sock = sock_from_file(f.file, err);
++		sock = sock_from_file(f.file);
+ 		if (likely(sock)) {
+ 			*fput_needed = f.flags & FDPUT_FPUT;
+ 			return sock;
+ 		}
++		*err = -ENOTSOCK;
+ 		fdput(f);
+ 	}
+ 	return NULL;
+@@ -1705,9 +1706,11 @@ int __sys_accept4_file(struct file *file
+ 	if (SOCK_NONBLOCK != O_NONBLOCK && (flags & SOCK_NONBLOCK))
+ 		flags = (flags & ~SOCK_NONBLOCK) | O_NONBLOCK;
+ 
+-	sock = sock_from_file(file, &err);
+-	if (!sock)
++	sock = sock_from_file(file);
++	if (!sock) {
++		err = -ENOTSOCK;
+ 		goto out;
++	}
+ 
+ 	err = -ENFILE;
+ 	newsock = sock_alloc();
+@@ -1830,9 +1833,11 @@ int __sys_connect_file(struct file *file
+ 	struct socket *sock;
+ 	int err;
+ 
+-	sock = sock_from_file(file, &err);
+-	if (!sock)
++	sock = sock_from_file(file);
++	if (!sock) {
++		err = -ENOTSOCK;
+ 		goto out;
++	}
+ 
+ 	err =
+ 	    security_socket_connect(sock, (struct sockaddr *)address, addrlen);

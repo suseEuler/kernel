@@ -1,0 +1,168 @@
+From d055126180564a57fe533728a4e93d0cb53d49b3 Mon Sep 17 00:00:00 2001
+Message-Id: <d055126180564a57fe533728a4e93d0cb53d49b3.1648737976.git.geliang.tang@suse.com>
+From: Dmitrii Banshchikov <me@ubique.spb.ru>
+Date: Tue, 17 Nov 2020 18:45:49 +0000
+Subject: [PATCH] bpf: Add bpf_ktime_get_coarse_ns helper
+Git-commit: d055126180564a57fe533728a4e93d0cb53d49b3
+Patch-mainline: v5.11-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+The helper uses CLOCK_MONOTONIC_COARSE source of time that is less
+accurate but more performant.
+
+We have a BPF CGROUP_SKB firewall that supports event logging through
+bpf_perf_event_output(). Each event has a timestamp and currently we use
+bpf_ktime_get_ns() for it. Use of bpf_ktime_get_coarse_ns() saves ~15-20
+ns in time required for event logging.
+
+bpf_ktime_get_ns():
+EgressLogByRemoteEndpoint                              113.82ns    8.79M
+
+bpf_ktime_get_coarse_ns():
+EgressLogByRemoteEndpoint                               95.40ns   10.48M
+
+Signed-off-by: Dmitrii Banshchikov <me@ubique.spb.ru>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Martin KaFai Lau <kafai@fb.com>
+Link: https://lore.kernel.org/bpf/20201117184549.257280-1-me@ubique.spb.ru
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ include/linux/bpf.h            |  1 +
+ include/uapi/linux/bpf.h       | 11 +++++++++++
+ kernel/bpf/core.c              |  1 +
+ kernel/bpf/helpers.c           | 13 +++++++++++++
+ kernel/trace/bpf_trace.c       |  2 ++
+ tools/include/uapi/linux/bpf.h | 11 +++++++++++
+ 6 files changed, 39 insertions(+)
+
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 581b2a2e78eb..e1bcb6d7345c 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1842,6 +1842,7 @@ extern const struct bpf_func_proto bpf_copy_from_user_proto;
+ extern const struct bpf_func_proto bpf_snprintf_btf_proto;
+ extern const struct bpf_func_proto bpf_per_cpu_ptr_proto;
+ extern const struct bpf_func_proto bpf_this_cpu_ptr_proto;
++extern const struct bpf_func_proto bpf_ktime_get_coarse_ns_proto;
+ 
+ const struct bpf_func_proto *bpf_tracing_func_proto(
+ 	enum bpf_func_id func_id, const struct bpf_prog *prog);
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index a52299b80b9d..3ca6146f001a 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -3797,6 +3797,16 @@ union bpf_attr {
+  *		is cleared if the flag is not specified.
+  *	Return
+  *		**-EINVAL** if invalid *flags* are passed, zero otherwise.
++ *
++ * u64 bpf_ktime_get_coarse_ns(void)
++ * 	Description
++ * 		Return a coarse-grained version of the time elapsed since
++ * 		system boot, in nanoseconds. Does not include time the system
++ * 		was suspended.
++ *
++ * 		See: **clock_gettime**\ (**CLOCK_MONOTONIC_COARSE**)
++ * 	Return
++ * 		Current *ktime*.
+  */
+ #define __BPF_FUNC_MAPPER(FN)		\
+ 	FN(unspec),			\
+@@ -3959,6 +3969,7 @@ union bpf_attr {
+ 	FN(task_storage_delete),	\
+ 	FN(get_current_task_btf),	\
+ 	FN(bprm_opts_set),		\
++	FN(ktime_get_coarse_ns),	\
+ 	/* */
+ 
+ /* integer value in 'imm' field of BPF_CALL instruction selects which helper
+diff --git a/kernel/bpf/core.c b/kernel/bpf/core.c
+index 55454d2278b1..ff55cbcfbab4 100644
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -2211,6 +2211,7 @@ const struct bpf_func_proto bpf_get_smp_processor_id_proto __weak;
+ const struct bpf_func_proto bpf_get_numa_node_id_proto __weak;
+ const struct bpf_func_proto bpf_ktime_get_ns_proto __weak;
+ const struct bpf_func_proto bpf_ktime_get_boot_ns_proto __weak;
++const struct bpf_func_proto bpf_ktime_get_coarse_ns_proto __weak;
+ 
+ const struct bpf_func_proto bpf_get_current_pid_tgid_proto __weak;
+ const struct bpf_func_proto bpf_get_current_uid_gid_proto __weak;
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 25520f5eeaf6..2c395deae279 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -167,6 +167,17 @@ const struct bpf_func_proto bpf_ktime_get_boot_ns_proto = {
+ 	.ret_type	= RET_INTEGER,
+ };
+ 
++BPF_CALL_0(bpf_ktime_get_coarse_ns)
++{
++	return ktime_get_coarse_ns();
++}
++
++const struct bpf_func_proto bpf_ktime_get_coarse_ns_proto = {
++	.func		= bpf_ktime_get_coarse_ns,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++};
++
+ BPF_CALL_0(bpf_get_current_pid_tgid)
+ {
+ 	struct task_struct *task = current;
+@@ -685,6 +696,8 @@ bpf_base_func_proto(enum bpf_func_id func_id)
+ 		return &bpf_ktime_get_ns_proto;
+ 	case BPF_FUNC_ktime_get_boot_ns:
+ 		return &bpf_ktime_get_boot_ns_proto;
++	case BPF_FUNC_ktime_get_coarse_ns:
++		return &bpf_ktime_get_coarse_ns_proto;
+ 	case BPF_FUNC_ringbuf_output:
+ 		return &bpf_ringbuf_output_proto;
+ 	case BPF_FUNC_ringbuf_reserve:
+diff --git a/kernel/trace/bpf_trace.c b/kernel/trace/bpf_trace.c
+index 02986c7b90eb..d255bc9b2bfa 100644
+--- a/kernel/trace/bpf_trace.c
++++ b/kernel/trace/bpf_trace.c
+@@ -1280,6 +1280,8 @@ bpf_tracing_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+ 		return &bpf_ktime_get_ns_proto;
+ 	case BPF_FUNC_ktime_get_boot_ns:
+ 		return &bpf_ktime_get_boot_ns_proto;
++	case BPF_FUNC_ktime_get_coarse_ns:
++		return &bpf_ktime_get_coarse_ns_proto;
+ 	case BPF_FUNC_tail_call:
+ 		return &bpf_tail_call_proto;
+ 	case BPF_FUNC_get_current_pid_tgid:
+diff --git a/tools/include/uapi/linux/bpf.h b/tools/include/uapi/linux/bpf.h
+index a52299b80b9d..3ca6146f001a 100644
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -3797,6 +3797,16 @@ union bpf_attr {
+  *		is cleared if the flag is not specified.
+  *	Return
+  *		**-EINVAL** if invalid *flags* are passed, zero otherwise.
++ *
++ * u64 bpf_ktime_get_coarse_ns(void)
++ * 	Description
++ * 		Return a coarse-grained version of the time elapsed since
++ * 		system boot, in nanoseconds. Does not include time the system
++ * 		was suspended.
++ *
++ * 		See: **clock_gettime**\ (**CLOCK_MONOTONIC_COARSE**)
++ * 	Return
++ * 		Current *ktime*.
+  */
+ #define __BPF_FUNC_MAPPER(FN)		\
+ 	FN(unspec),			\
+@@ -3959,6 +3969,7 @@ union bpf_attr {
+ 	FN(task_storage_delete),	\
+ 	FN(get_current_task_btf),	\
+ 	FN(bprm_opts_set),		\
++	FN(ktime_get_coarse_ns),	\
+ 	/* */
+ 
+ /* integer value in 'imm' field of BPF_CALL instruction selects which helper
+-- 
+2.34.1
+

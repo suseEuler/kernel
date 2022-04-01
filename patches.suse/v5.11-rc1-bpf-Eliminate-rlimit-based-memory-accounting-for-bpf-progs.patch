@@ -1,0 +1,213 @@
+From 3ac1f01b43b6e2759cc34d3a715ba5eed04c5805 Mon Sep 17 00:00:00 2001
+Message-Id: <3ac1f01b43b6e2759cc34d3a715ba5eed04c5805.1648803883.git.geliang.tang@suse.com>
+In-Reply-To: <ddf8503c7c434374a1112e89bcedfe1ccb3057df.1648803883.git.geliang.tang@suse.com>
+References: <ddf8503c7c434374a1112e89bcedfe1ccb3057df.1648803883.git.geliang.tang@suse.com>
+From: Roman Gushchin <guro@fb.com>
+Date: Tue, 1 Dec 2020 13:58:59 -0800
+Subject: [PATCH 29/29] bpf: Eliminate rlimit-based memory accounting for bpf
+ progs
+Git-commit: 3ac1f01b43b6e2759cc34d3a715ba5eed04c5805
+Patch-mainline: v5.11-rc1
+References: bsn#127
+Modified-by-SEL: Yes, refreshed due to context changes
+
+Do not use rlimit-based memory accounting for bpf progs. It has been
+replaced with memcg-based memory accounting.
+
+Signed-off-by: Roman Gushchin <guro@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Song Liu <songliubraving@fb.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+Link: https://lore.kernel.org/bpf/20201201215900.3569844-34-guro@fb.com
+---
+ include/linux/bpf.h  | 11 -------
+ kernel/bpf/core.c    | 12 ++------
+ kernel/bpf/syscall.c | 69 +++++++-------------------------------------
+ 3 files changed, 12 insertions(+), 80 deletions(-)
+
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1233,8 +1233,6 @@ void bpf_prog_sub(struct bpf_prog *prog,
+ void bpf_prog_inc(struct bpf_prog *prog);
+ struct bpf_prog * __must_check bpf_prog_inc_not_zero(struct bpf_prog *prog);
+ void bpf_prog_put(struct bpf_prog *prog);
+-int __bpf_prog_charge(struct user_struct *user, u32 pages);
+-void __bpf_prog_uncharge(struct user_struct *user, u32 pages);
+ 
+ void bpf_prog_free_id(struct bpf_prog *prog, bool do_idr_lock);
+ void bpf_map_free_id(struct bpf_map *map, bool do_idr_lock);
+@@ -1556,15 +1554,6 @@ bpf_prog_inc_not_zero(struct bpf_prog *p
+ 	return ERR_PTR(-EOPNOTSUPP);
+ }
+ 
+-static inline int __bpf_prog_charge(struct user_struct *user, u32 pages)
+-{
+-	return 0;
+-}
+-
+-static inline void __bpf_prog_uncharge(struct user_struct *user, u32 pages)
+-{
+-}
+-
+ static inline void bpf_link_init(struct bpf_link *link, enum bpf_link_type type,
+ 				 const struct bpf_link_ops *ops,
+ 				 struct bpf_prog *prog)
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -223,23 +223,15 @@ struct bpf_prog *bpf_prog_realloc(struct
+ {
+ 	gfp_t gfp_flags = GFP_KERNEL_ACCOUNT | __GFP_ZERO | gfp_extra_flags;
+ 	struct bpf_prog *fp;
+-	u32 pages, delta;
+-	int ret;
++	u32 pages;
+ 
+ 	size = round_up(size, PAGE_SIZE);
+ 	pages = size / PAGE_SIZE;
+ 	if (pages <= fp_old->pages)
+ 		return fp_old;
+ 
+-	delta = pages - fp_old->pages;
+-	ret = __bpf_prog_charge(fp_old->aux->user, delta);
+-	if (ret)
+-		return NULL;
+-
+ 	fp = __vmalloc(size, gfp_flags);
+-	if (fp == NULL) {
+-		__bpf_prog_uncharge(fp_old->aux->user, delta);
+-	} else {
++	if (fp) {
+ 		memcpy(fp, fp_old, fp_old->pages * PAGE_SIZE);
+ 		fp->pages = pages;
+ 		fp->aux->prog = fp;
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -1653,51 +1653,6 @@ static void bpf_audit_prog(const struct
+ 	audit_log_end(ab);
+ }
+ 
+-int __bpf_prog_charge(struct user_struct *user, u32 pages)
+-{
+-	unsigned long memlock_limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
+-	unsigned long user_bufs;
+-
+-	if (user) {
+-		user_bufs = atomic_long_add_return(pages, &user->locked_vm);
+-		if (user_bufs > memlock_limit) {
+-			atomic_long_sub(pages, &user->locked_vm);
+-			return -EPERM;
+-		}
+-	}
+-
+-	return 0;
+-}
+-
+-void __bpf_prog_uncharge(struct user_struct *user, u32 pages)
+-{
+-	if (user)
+-		atomic_long_sub(pages, &user->locked_vm);
+-}
+-
+-static int bpf_prog_charge_memlock(struct bpf_prog *prog)
+-{
+-	struct user_struct *user = get_current_user();
+-	int ret;
+-
+-	ret = __bpf_prog_charge(user, prog->pages);
+-	if (ret) {
+-		free_uid(user);
+-		return ret;
+-	}
+-
+-	prog->aux->user = user;
+-	return 0;
+-}
+-
+-static void bpf_prog_uncharge_memlock(struct bpf_prog *prog)
+-{
+-	struct user_struct *user = prog->aux->user;
+-
+-	__bpf_prog_uncharge(user, prog->pages);
+-	free_uid(user);
+-}
+-
+ static int bpf_prog_alloc_id(struct bpf_prog *prog)
+ {
+ 	int id;
+@@ -1747,7 +1702,7 @@ static void __bpf_prog_put_rcu(struct rc
+ 
+ 	kvfree(aux->func_info);
+ 	kfree(aux->func_info_aux);
+-	bpf_prog_uncharge_memlock(aux->prog);
++	free_uid(aux->user);
+ 	security_bpf_prog_free(aux);
+ 	bpf_prog_free(aux->prog);
+ }
+@@ -2185,7 +2140,7 @@ static int bpf_prog_load(union bpf_attr
+ 		dst_prog = bpf_prog_get(attr->attach_prog_fd);
+ 		if (IS_ERR(dst_prog)) {
+ 			err = PTR_ERR(dst_prog);
+-			goto free_prog_nouncharge;
++			goto free_prog;
+ 		}
+ 		prog->aux->dst_prog = dst_prog;
+ 	}
+@@ -2195,18 +2150,15 @@ static int bpf_prog_load(union bpf_attr
+ 
+ 	err = security_bpf_prog_alloc(prog->aux);
+ 	if (err)
+-		goto free_prog_nouncharge;
+-
+-	err = bpf_prog_charge_memlock(prog);
+-	if (err)
+-		goto free_prog_sec;
++		goto free_prog;
+ 
++	prog->aux->user = get_current_user();
+ 	prog->len = attr->insn_cnt;
+ 
+ 	err = -EFAULT;
+ 	if (copy_from_user(prog->insns, u64_to_user_ptr(attr->insns),
+ 			   bpf_prog_insn_size(prog)) != 0)
+-		goto free_prog;
++		goto free_prog_sec;
+ 
+ 	prog->orig_prog = NULL;
+ 	prog->jited = 0;
+@@ -2217,19 +2169,19 @@ static int bpf_prog_load(union bpf_attr
+ 	if (bpf_prog_is_dev_bound(prog->aux)) {
+ 		err = bpf_prog_offload_init(prog, attr);
+ 		if (err)
+-			goto free_prog;
++			goto free_prog_sec;
+ 	}
+ 
+ 	/* find program type: socket_filter vs tracing_filter */
+ 	err = find_prog_type(type, prog);
+ 	if (err < 0)
+-		goto free_prog;
++		goto free_prog_sec;
+ 
+ 	prog->aux->load_time = ktime_get_boottime_ns();
+ 	err = bpf_obj_name_cpy(prog->aux->name, attr->prog_name,
+ 			       sizeof(attr->prog_name));
+ 	if (err < 0)
+-		goto free_prog;
++		goto free_prog_sec;
+ 
+ 	/* run eBPF verifier */
+ 	err = bpf_check(&prog, attr, uattr);
+@@ -2274,11 +2226,10 @@ free_used_maps:
+ 	 */
+ 	__bpf_prog_put_noref(prog, prog->aux->func_cnt);
+ 	return err;
+-free_prog:
+-	bpf_prog_uncharge_memlock(prog);
+ free_prog_sec:
++	free_uid(prog->aux->user);
+ 	security_bpf_prog_free(prog->aux);
+-free_prog_nouncharge:
++free_prog:
+ 	bpf_prog_free(prog);
+ 	return err;
+ }

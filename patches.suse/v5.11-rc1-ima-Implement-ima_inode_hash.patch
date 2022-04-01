@@ -1,0 +1,166 @@
+From 403319be5de51167cd70ddf594b76c95e6d26844 Mon Sep 17 00:00:00 2001
+Message-Id: <403319be5de51167cd70ddf594b76c95e6d26844.1648819188.git.geliang.tang@suse.com>
+From: KP Singh <kpsingh@google.com>
+Date: Tue, 24 Nov 2020 15:12:08 +0000
+Subject: [PATCH] ima: Implement ima_inode_hash
+Git-commit: 403319be5de51167cd70ddf594b76c95e6d26844
+Patch-mainline: v5.11-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+This is in preparation to add a helper for BPF LSM programs to use
+IMA hashes when attached to LSM hooks. There are LSM hooks like
+inode_unlink which do not have a struct file * argument and cannot
+use the existing ima_file_hash API.
+
+An inode based API is, therefore, useful in LSM based detections like an
+executable trying to delete itself which rely on the inode_unlink LSM
+hook.
+
+Moreover, the ima_file_hash function does nothing with the struct file
+pointer apart from calling file_inode on it and converting it to an
+inode.
+
+Signed-off-by: KP Singh <kpsingh@google.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Yonghong Song <yhs@fb.com>
+Acked-by: Mimi Zohar <zohar@linux.ibm.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+Link: https://lore.kernel.org/bpf/20201124151210.1081188-2-kpsingh@chromium.org
+---
+ include/linux/ima.h               |  6 +++
+ security/integrity/ima/ima_main.c | 78 +++++++++++++++++++++----------
+ 2 files changed, 60 insertions(+), 24 deletions(-)
+
+diff --git a/include/linux/ima.h b/include/linux/ima.h
+index 8fa7bcfb2da2..7233a2751754 100644
+--- a/include/linux/ima.h
++++ b/include/linux/ima.h
+@@ -29,6 +29,7 @@ extern int ima_post_read_file(struct file *file, void *buf, loff_t size,
+ 			      enum kernel_read_file_id id);
+ extern void ima_post_path_mknod(struct dentry *dentry);
+ extern int ima_file_hash(struct file *file, char *buf, size_t buf_size);
++extern int ima_inode_hash(struct inode *inode, char *buf, size_t buf_size);
+ extern void ima_kexec_cmdline(int kernel_fd, const void *buf, int size);
+ 
+ #ifdef CONFIG_IMA_KEXEC
+@@ -115,6 +116,11 @@ static inline int ima_file_hash(struct file *file, char *buf, size_t buf_size)
+ 	return -EOPNOTSUPP;
+ }
+ 
++static inline int ima_inode_hash(struct inode *inode, char *buf, size_t buf_size)
++{
++	return -EOPNOTSUPP;
++}
++
+ static inline void ima_kexec_cmdline(int kernel_fd, const void *buf, int size) {}
+ #endif /* CONFIG_IMA */
+ 
+diff --git a/security/integrity/ima/ima_main.c b/security/integrity/ima/ima_main.c
+index 2d1af8899cab..cb2deaa188e7 100644
+--- a/security/integrity/ima/ima_main.c
++++ b/security/integrity/ima/ima_main.c
+@@ -501,37 +501,14 @@ int ima_file_check(struct file *file, int mask)
+ }
+ EXPORT_SYMBOL_GPL(ima_file_check);
+ 
+-/**
+- * ima_file_hash - return the stored measurement if a file has been hashed and
+- * is in the iint cache.
+- * @file: pointer to the file
+- * @buf: buffer in which to store the hash
+- * @buf_size: length of the buffer
+- *
+- * On success, return the hash algorithm (as defined in the enum hash_algo).
+- * If buf is not NULL, this function also outputs the hash into buf.
+- * If the hash is larger than buf_size, then only buf_size bytes will be copied.
+- * It generally just makes sense to pass a buffer capable of holding the largest
+- * possible hash: IMA_MAX_DIGEST_SIZE.
+- * The file hash returned is based on the entire file, including the appended
+- * signature.
+- *
+- * If IMA is disabled or if no measurement is available, return -EOPNOTSUPP.
+- * If the parameters are incorrect, return -EINVAL.
+- */
+-int ima_file_hash(struct file *file, char *buf, size_t buf_size)
++static int __ima_inode_hash(struct inode *inode, char *buf, size_t buf_size)
+ {
+-	struct inode *inode;
+ 	struct integrity_iint_cache *iint;
+ 	int hash_algo;
+ 
+-	if (!file)
+-		return -EINVAL;
+-
+ 	if (!ima_policy_flag)
+ 		return -EOPNOTSUPP;
+ 
+-	inode = file_inode(file);
+ 	iint = integrity_iint_find(inode);
+ 	if (!iint)
+ 		return -EOPNOTSUPP;
+@@ -558,8 +535,61 @@ int ima_file_hash(struct file *file, char *buf, size_t buf_size)
+ 
+ 	return hash_algo;
+ }
++
++/**
++ * ima_file_hash - return the stored measurement if a file has been hashed and
++ * is in the iint cache.
++ * @file: pointer to the file
++ * @buf: buffer in which to store the hash
++ * @buf_size: length of the buffer
++ *
++ * On success, return the hash algorithm (as defined in the enum hash_algo).
++ * If buf is not NULL, this function also outputs the hash into buf.
++ * If the hash is larger than buf_size, then only buf_size bytes will be copied.
++ * It generally just makes sense to pass a buffer capable of holding the largest
++ * possible hash: IMA_MAX_DIGEST_SIZE.
++ * The file hash returned is based on the entire file, including the appended
++ * signature.
++ *
++ * If IMA is disabled or if no measurement is available, return -EOPNOTSUPP.
++ * If the parameters are incorrect, return -EINVAL.
++ */
++int ima_file_hash(struct file *file, char *buf, size_t buf_size)
++{
++	if (!file)
++		return -EINVAL;
++
++	return __ima_inode_hash(file_inode(file), buf, buf_size);
++}
+ EXPORT_SYMBOL_GPL(ima_file_hash);
+ 
++/**
++ * ima_inode_hash - return the stored measurement if the inode has been hashed
++ * and is in the iint cache.
++ * @inode: pointer to the inode
++ * @buf: buffer in which to store the hash
++ * @buf_size: length of the buffer
++ *
++ * On success, return the hash algorithm (as defined in the enum hash_algo).
++ * If buf is not NULL, this function also outputs the hash into buf.
++ * If the hash is larger than buf_size, then only buf_size bytes will be copied.
++ * It generally just makes sense to pass a buffer capable of holding the largest
++ * possible hash: IMA_MAX_DIGEST_SIZE.
++ * The hash returned is based on the entire contents, including the appended
++ * signature.
++ *
++ * If IMA is disabled or if no measurement is available, return -EOPNOTSUPP.
++ * If the parameters are incorrect, return -EINVAL.
++ */
++int ima_inode_hash(struct inode *inode, char *buf, size_t buf_size)
++{
++	if (!inode)
++		return -EINVAL;
++
++	return __ima_inode_hash(inode, buf, buf_size);
++}
++EXPORT_SYMBOL_GPL(ima_inode_hash);
++
+ /**
+  * ima_post_create_tmpfile - mark newly created tmpfile as new
+  * @file : newly created tmpfile
+-- 
+2.34.1
+

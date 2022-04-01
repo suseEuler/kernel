@@ -1,0 +1,95 @@
+From 881456811a33b9d3952897f4d01ee4d74fa2f30e Mon Sep 17 00:00:00 2001
+Message-Id: <881456811a33b9d3952897f4d01ee4d74fa2f30e.1648737821.git.geliang.tang@suse.com>
+From: Roman Gushchin <guro@fb.com>
+Date: Tue, 1 Dec 2020 13:58:38 -0800
+Subject: [PATCH] bpf: Refine memcg-based memory accounting for hashtab maps
+Git-commit: 881456811a33b9d3952897f4d01ee4d74fa2f30e
+Patch-mainline: v5.11-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+Include percpu objects and the size of map metadata into the
+accounting.
+
+Signed-off-by: Roman Gushchin <guro@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20201201215900.3569844-13-guro@fb.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ kernel/bpf/hashtab.c | 24 ++++++++++++++----------
+ 1 file changed, 14 insertions(+), 10 deletions(-)
+
+diff --git a/kernel/bpf/hashtab.c b/kernel/bpf/hashtab.c
+index ec46266aaf1c..bf70fb3ed9c1 100644
+--- a/kernel/bpf/hashtab.c
++++ b/kernel/bpf/hashtab.c
+@@ -292,7 +292,8 @@ static int prealloc_init(struct bpf_htab *htab)
+ 		u32 size = round_up(htab->map.value_size, 8);
+ 		void __percpu *pptr;
+ 
+-		pptr = __alloc_percpu_gfp(size, 8, GFP_USER | __GFP_NOWARN);
++		pptr = bpf_map_alloc_percpu(&htab->map, size, 8,
++					    GFP_USER | __GFP_NOWARN);
+ 		if (!pptr)
+ 			goto free_elems;
+ 		htab_elem_set_ptr(get_htab_elem(htab, i), htab->map.key_size,
+@@ -346,8 +347,8 @@ static int alloc_extra_elems(struct bpf_htab *htab)
+ 	struct pcpu_freelist_node *l;
+ 	int cpu;
+ 
+-	pptr = __alloc_percpu_gfp(sizeof(struct htab_elem *), 8,
+-				  GFP_USER | __GFP_NOWARN);
++	pptr = bpf_map_alloc_percpu(&htab->map, sizeof(struct htab_elem *), 8,
++				    GFP_USER | __GFP_NOWARN);
+ 	if (!pptr)
+ 		return -ENOMEM;
+ 
+@@ -444,7 +445,7 @@ static struct bpf_map *htab_map_alloc(union bpf_attr *attr)
+ 	int err, i;
+ 	u64 cost;
+ 
+-	htab = kzalloc(sizeof(*htab), GFP_USER);
++	htab = kzalloc(sizeof(*htab), GFP_USER | __GFP_ACCOUNT);
+ 	if (!htab)
+ 		return ERR_PTR(-ENOMEM);
+ 
+@@ -502,8 +503,10 @@ static struct bpf_map *htab_map_alloc(union bpf_attr *attr)
+ 		goto free_charge;
+ 
+ 	for (i = 0; i < HASHTAB_MAP_LOCK_COUNT; i++) {
+-		htab->map_locked[i] = __alloc_percpu_gfp(sizeof(int),
+-							 sizeof(int), GFP_USER);
++		htab->map_locked[i] = bpf_map_alloc_percpu(&htab->map,
++							   sizeof(int),
++							   sizeof(int),
++							   GFP_USER);
+ 		if (!htab->map_locked[i])
+ 			goto free_map_locked;
+ 	}
+@@ -925,8 +928,9 @@ static struct htab_elem *alloc_htab_elem(struct bpf_htab *htab, void *key,
+ 				l_new = ERR_PTR(-E2BIG);
+ 				goto dec_count;
+ 			}
+-		l_new = kmalloc_node(htab->elem_size, GFP_ATOMIC | __GFP_NOWARN,
+-				     htab->map.numa_node);
++		l_new = bpf_map_kmalloc_node(&htab->map, htab->elem_size,
++					     GFP_ATOMIC | __GFP_NOWARN,
++					     htab->map.numa_node);
+ 		if (!l_new) {
+ 			l_new = ERR_PTR(-ENOMEM);
+ 			goto dec_count;
+@@ -942,8 +946,8 @@ static struct htab_elem *alloc_htab_elem(struct bpf_htab *htab, void *key,
+ 			pptr = htab_elem_get_ptr(l_new, key_size);
+ 		} else {
+ 			/* alloc_percpu zero-fills */
+-			pptr = __alloc_percpu_gfp(size, 8,
+-						  GFP_ATOMIC | __GFP_NOWARN);
++			pptr = bpf_map_alloc_percpu(&htab->map, size, 8,
++						    GFP_ATOMIC | __GFP_NOWARN);
+ 			if (!pptr) {
+ 				kfree(l_new);
+ 				l_new = ERR_PTR(-ENOMEM);
+-- 
+2.34.1
+
