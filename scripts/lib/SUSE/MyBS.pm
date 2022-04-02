@@ -408,11 +408,13 @@ sub create_project {
 	for my $package (@{$options->{add_packages} || []}) {
 		$prjconf .= "Support: $package\n";
 	}
-	$prjconf .= "Macros:\n";
-	for my $macro (@{$options->{macros} || []}) {
-		$prjconf .= "$macro\n";
+	if ($#{$options->{macros}} > -1) {
+		$prjconf .= "Macros:\n";
+		for my $macro (@{$options->{macros} || []}) {
+			$prjconf .= "$macro\n";
+		}
+		$prjconf .= ":Macros\n";
 	}
-	$prjconf .= ":Macros\n";
 	$self->put("/source/$project/_config", $prjconf);
 	return { name => $project, qa_repos => \@qa_repos };
 }
