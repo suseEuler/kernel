@@ -1,0 +1,133 @@
+From 114004696bf23499ca834e784d91bd82de195d76 Mon Sep 17 00:00:00 2001
+From: Tianjia Zhang <tianjia.zhang@linux.alibaba.com>
+Date: Fri, 7 Jan 2022 20:06:57 +0800
+Subject: [PATCH] crypto: sm2 - make dependent on sm3 library
+Git-commit: 114004696bf23499ca834e784d91bd82de195d76
+Patch-mainline: v5.18-rc1
+References: bsn#130
+Modified-by-SEL: No
+
+
+SM3 generic library is stand-alone implementation, it is necessary
+for the calculation of sm2 z digest to depends on SM3 library
+instead of sm3-generic.
+
+Signed-off-by: Tianjia Zhang <tianjia.zhang@linux.alibaba.com>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ crypto/Kconfig |  2 +-
+ crypto/sm2.c   | 38 +++++++++++++++++++-------------------
+ 2 files changed, 20 insertions(+), 20 deletions(-)
+
+diff --git a/crypto/Kconfig b/crypto/Kconfig
+index 442765219c37..833da41860b9 100644
+--- a/crypto/Kconfig
++++ b/crypto/Kconfig
+@@ -267,7 +267,7 @@ config CRYPTO_ECRDSA
+ 
+ config CRYPTO_SM2
+ 	tristate "SM2 algorithm"
+-	select CRYPTO_SM3
++	select CRYPTO_LIB_SM3
+ 	select CRYPTO_AKCIPHER
+ 	select CRYPTO_MANAGER
+ 	select MPILIB
+diff --git a/crypto/sm2.c b/crypto/sm2.c
+index db8a4a265669..ae3f77a66070 100644
+--- a/crypto/sm2.c
++++ b/crypto/sm2.c
+@@ -13,7 +13,7 @@
+ #include <crypto/internal/akcipher.h>
+ #include <crypto/akcipher.h>
+ #include <crypto/hash.h>
+-#include <crypto/sm3_base.h>
++#include <crypto/sm3.h>
+ #include <crypto/rng.h>
+ #include <crypto/sm2.h>
+ #include "sm2signature.asn1.h"
+@@ -213,7 +213,7 @@ int sm2_get_signature_s(void *context, size_t hdrlen, unsigned char tag,
+ 	return 0;
+ }
+ 
+-static int sm2_z_digest_update(struct shash_desc *desc,
++static int sm2_z_digest_update(struct sm3_state *sctx,
+ 			MPI m, unsigned int pbytes)
+ {
+ 	static const unsigned char zero[32];
+@@ -226,20 +226,20 @@ static int sm2_z_digest_update(struct shash_desc *desc,
+ 
+ 	if (inlen < pbytes) {
+ 		/* padding with zero */
+-		crypto_sm3_update(desc, zero, pbytes - inlen);
+-		crypto_sm3_update(desc, in, inlen);
++		sm3_update(sctx, zero, pbytes - inlen);
++		sm3_update(sctx, in, inlen);
+ 	} else if (inlen > pbytes) {
+ 		/* skip the starting zero */
+-		crypto_sm3_update(desc, in + inlen - pbytes, pbytes);
++		sm3_update(sctx, in + inlen - pbytes, pbytes);
+ 	} else {
+-		crypto_sm3_update(desc, in, inlen);
++		sm3_update(sctx, in, inlen);
+ 	}
+ 
+ 	kfree(in);
+ 	return 0;
+ }
+ 
+-static int sm2_z_digest_update_point(struct shash_desc *desc,
++static int sm2_z_digest_update_point(struct sm3_state *sctx,
+ 		MPI_POINT point, struct mpi_ec_ctx *ec, unsigned int pbytes)
+ {
+ 	MPI x, y;
+@@ -249,8 +249,8 @@ static int sm2_z_digest_update_point(struct shash_desc *desc,
+ 	y = mpi_new(0);
+ 
+ 	if (!mpi_ec_get_affine(x, y, point, ec) &&
+-		!sm2_z_digest_update(desc, x, pbytes) &&
+-		!sm2_z_digest_update(desc, y, pbytes))
++	    !sm2_z_digest_update(sctx, x, pbytes) &&
++	    !sm2_z_digest_update(sctx, y, pbytes))
+ 		ret = 0;
+ 
+ 	mpi_free(x);
+@@ -265,7 +265,7 @@ int sm2_compute_z_digest(struct crypto_akcipher *tfm,
+ 	struct mpi_ec_ctx *ec = akcipher_tfm_ctx(tfm);
+ 	uint16_t bits_len;
+ 	unsigned char entl[2];
+-	SHASH_DESC_ON_STACK(desc, NULL);
++	struct sm3_state sctx;
+ 	unsigned int pbytes;
+ 
+ 	if (id_len > (USHRT_MAX / 8) || !ec->Q)
+@@ -278,17 +278,17 @@ int sm2_compute_z_digest(struct crypto_akcipher *tfm,
+ 	pbytes = MPI_NBYTES(ec->p);
+ 
+ 	/* ZA = H256(ENTLA | IDA | a | b | xG | yG | xA | yA) */
+-	sm3_base_init(desc);
+-	crypto_sm3_update(desc, entl, 2);
+-	crypto_sm3_update(desc, id, id_len);
+-
+-	if (sm2_z_digest_update(desc, ec->a, pbytes) ||
+-		sm2_z_digest_update(desc, ec->b, pbytes) ||
+-		sm2_z_digest_update_point(desc, ec->G, ec, pbytes) ||
+-		sm2_z_digest_update_point(desc, ec->Q, ec, pbytes))
++	sm3_init(&sctx);
++	sm3_update(&sctx, entl, 2);
++	sm3_update(&sctx, id, id_len);
++
++	if (sm2_z_digest_update(&sctx, ec->a, pbytes) ||
++	    sm2_z_digest_update(&sctx, ec->b, pbytes) ||
++	    sm2_z_digest_update_point(&sctx, ec->G, ec, pbytes) ||
++	    sm2_z_digest_update_point(&sctx, ec->Q, ec, pbytes))
+ 		return -EINVAL;
+ 
+-	crypto_sm3_final(desc, dgst);
++	sm3_final(&sctx, dgst);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(sm2_compute_z_digest);
+-- 
+2.34.1
+
