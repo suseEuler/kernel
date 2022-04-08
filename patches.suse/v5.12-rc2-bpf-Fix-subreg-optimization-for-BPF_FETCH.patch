@@ -1,0 +1,73 @@
+From b2e37a7114ef52b862b4421ed4cd40c4ed2a0642 Mon Sep 17 00:00:00 2001
+Message-Id: <b2e37a7114ef52b862b4421ed4cd40c4ed2a0642.1648736604.git.geliang.tang@suse.com>
+From: Ilya Leoshkevich <iii@linux.ibm.com>
+Date: Wed, 10 Feb 2021 21:45:02 +0100
+Subject: [PATCH] bpf: Fix subreg optimization for BPF_FETCH
+Git-commit: b2e37a7114ef52b862b4421ed4cd40c4ed2a0642
+Patch-mainline: v5.12-rc2
+References: bsn#127
+Modified-by-SEL: No
+
+
+All 32-bit variants of BPF_FETCH (add, and, or, xor, xchg, cmpxchg)
+define a 32-bit subreg and thus have zext_dst set. Their encoding,
+however, uses dst_reg field as a base register, which causes
+opt_subreg_zext_lo32_rnd_hi32() to zero-extend said base register
+instead of the one the insn really defines (r0 or src_reg).
+
+Fix by properly choosing a register being defined, similar to how
+check_atomic() already does that.
+
+Signed-off-by: Ilya Leoshkevich <iii@linux.ibm.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20210210204502.83429-1-iii@linux.ibm.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ kernel/bpf/verifier.c | 23 +++++++++++++++++++++--
+ 1 file changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 15c15ea0abf5..beae700bb56e 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -10957,6 +10957,7 @@ static int opt_subreg_zext_lo32_rnd_hi32(struct bpf_verifier_env *env,
+ 	for (i = 0; i < len; i++) {
+ 		int adj_idx = i + delta;
+ 		struct bpf_insn insn;
++		u8 load_reg;
+ 
+ 		insn = insns[adj_idx];
+ 		if (!aux[adj_idx].zext_dst) {
+@@ -10999,9 +11000,27 @@ static int opt_subreg_zext_lo32_rnd_hi32(struct bpf_verifier_env *env,
+ 		if (!bpf_jit_needs_zext())
+ 			continue;
+ 
++		/* zext_dst means that we want to zero-extend whatever register
++		 * the insn defines, which is dst_reg most of the time, with
++		 * the notable exception of BPF_STX + BPF_ATOMIC + BPF_FETCH.
++		 */
++		if (BPF_CLASS(insn.code) == BPF_STX &&
++		    BPF_MODE(insn.code) == BPF_ATOMIC) {
++			/* BPF_STX + BPF_ATOMIC insns without BPF_FETCH do not
++			 * define any registers, therefore zext_dst cannot be
++			 * set.
++			 */
++			if (WARN_ON(!(insn.imm & BPF_FETCH)))
++				return -EINVAL;
++			load_reg = insn.imm == BPF_CMPXCHG ? BPF_REG_0
++							   : insn.src_reg;
++		} else {
++			load_reg = insn.dst_reg;
++		}
++
+ 		zext_patch[0] = insn;
+-		zext_patch[1].dst_reg = insn.dst_reg;
+-		zext_patch[1].src_reg = insn.dst_reg;
++		zext_patch[1].dst_reg = load_reg;
++		zext_patch[1].src_reg = load_reg;
+ 		patch = zext_patch;
+ 		patch_len = 2;
+ apply_patch_buffer:
+-- 
+2.34.1
+

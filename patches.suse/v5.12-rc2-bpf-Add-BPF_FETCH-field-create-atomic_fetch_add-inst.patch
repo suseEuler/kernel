@@ -1,0 +1,202 @@
+From 5ca419f2864a2c60940dcf4bbaeb69546200e36f Mon Sep 17 00:00:00 2001
+Message-Id: <5ca419f2864a2c60940dcf4bbaeb69546200e36f.1648737215.git.geliang.tang@suse.com>
+From: Brendan Jackman <jackmanb@google.com>
+Date: Thu, 14 Jan 2021 18:17:46 +0000
+Subject: [PATCH] bpf: Add BPF_FETCH field / create atomic_fetch_add
+ instruction
+Git-commit: 5ca419f2864a2c60940dcf4bbaeb69546200e36f
+Patch-mainline: v5.12-rc2
+References: bsn#127
+Modified-by-SEL: Yes, refreshed due to context changes
+
+
+The BPF_FETCH field can be set in bpf_insn.imm, for BPF_ATOMIC
+instructions, in order to have the previous value of the
+atomically-modified memory location loaded into the src register
+after an atomic op is carried out.
+
+Suggested-by: Yonghong Song <yhs@fb.com>
+Signed-off-by: Brendan Jackman <jackmanb@google.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: John Fastabend <john.fastabend@gmail.com>
+Link: https://lore.kernel.org/bpf/20210114181751.768687-7-jackmanb@google.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ arch/x86/net/bpf_jit_comp.c    |  4 ++++
+ include/linux/filter.h         |  1 +
+ include/uapi/linux/bpf.h       |  3 +++
+ kernel/bpf/core.c              | 13 +++++++++++++
+ kernel/bpf/disasm.c            |  7 +++++++
+ kernel/bpf/verifier.c          | 33 ++++++++++++++++++++++++---------
+ tools/include/linux/filter.h   |  1 +
+ tools/include/uapi/linux/bpf.h |  3 +++
+ 8 files changed, 56 insertions(+), 9 deletions(-)
+
+--- a/arch/x86/net/bpf_jit_comp.c
++++ b/arch/x86/net/bpf_jit_comp.c
+@@ -787,6 +787,10 @@ static int emit_atomic(u8 **pprog, u8 at
+ 		/* lock *(u32/u64*)(dst_reg + off) <op>= src_reg */
+ 		EMIT1(simple_alu_opcodes[atomic_op]);
+ 		break;
++	case BPF_ADD | BPF_FETCH:
++		/* src_reg = atomic_fetch_add(dst_reg + off, src_reg); */
++		EMIT2(0x0F, 0xC1);
++		break;
+ 	default:
+ 		pr_err("bpf_jit: unknown atomic opcode %02x\n", atomic_op);
+ 		return -EFAULT;
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -269,6 +269,7 @@ static inline bool insn_is_zext(const st
+  * Atomic operations:
+  *
+  *   BPF_ADD                  *(uint *) (dst_reg + off16) += src_reg
++ *   BPF_ADD | BPF_FETCH      src_reg = atomic_fetch_add(dst_reg + off16, src_reg);
+  */
+ 
+ #define BPF_ATOMIC_OP(SIZE, OP, DST, SRC, OFF)			\
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -44,6 +44,9 @@
+ #define BPF_CALL	0x80	/* function call */
+ #define BPF_EXIT	0x90	/* function return */
+ 
++/* atomic op type fields (stored in immediate) */
++#define BPF_FETCH	0x01	/* fetch previous value into src reg */
++
+ /* Register numbers */
+ enum {
+ 	BPF_REG_0 = 0,
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -1668,16 +1668,29 @@ out:
+ 			/* lock xadd *(u32 *)(dst_reg + off16) += src_reg */
+ 			atomic_add((u32) SRC, (atomic_t *)(unsigned long)
+ 				   (DST + insn->off));
++			break;
++		case BPF_ADD | BPF_FETCH:
++			SRC = (u32) atomic_fetch_add(
++				(u32) SRC,
++				(atomic_t *)(unsigned long) (DST + insn->off));
++			break;
+ 		default:
+ 			goto default_label;
+ 		}
+ 		CONT;
++
+ 	STX_ATOMIC_DW:
+ 		switch (IMM) {
+ 		case BPF_ADD:
+ 			/* lock xadd *(u64 *)(dst_reg + off16) += src_reg */
+ 			atomic64_add((u64) SRC, (atomic64_t *)(unsigned long)
+ 				     (DST + insn->off));
++			break;
++		case BPF_ADD | BPF_FETCH:
++			SRC = (u64) atomic64_fetch_add(
++				(u64) SRC,
++				(atomic64_t *)(unsigned long) (DST + insn->off));
++			break;
+ 		default:
+ 			goto default_label;
+ 		}
+--- a/kernel/bpf/disasm.c
++++ b/kernel/bpf/disasm.c
+@@ -160,6 +160,13 @@ void print_bpf_insn(const struct bpf_ins
+ 				bpf_ldst_string[BPF_SIZE(insn->code) >> 3],
+ 				insn->dst_reg, insn->off,
+ 				insn->src_reg);
++		} else if (BPF_MODE(insn->code) == BPF_ATOMIC &&
++			   insn->imm == (BPF_ADD | BPF_FETCH)) {
++			verbose(cbs->private_data, "(%02x) r%d = atomic%s_fetch_add((%s *)(r%d %+d), r%d)\n",
++				insn->code, insn->src_reg,
++				BPF_SIZE(insn->code) == BPF_DW ? "64" : "",
++				bpf_ldst_string[BPF_SIZE(insn->code) >> 3],
++				insn->dst_reg, insn->off, insn->src_reg);
+ 		} else {
+ 			verbose(cbs->private_data, "BUG_%02x\n", insn->code);
+ 		}
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -3947,7 +3947,11 @@ static int check_atomic(struct bpf_verif
+ {
+ 	int err;
+ 
+-	if (insn->imm != BPF_ADD) {
++	switch (insn->imm) {
++	case BPF_ADD:
++	case BPF_ADD | BPF_FETCH:
++		break;
++	default:
+ 		verbose(env, "BPF_ATOMIC uses invalid atomic opcode %02x\n", insn->imm);
+ 		return -EINVAL;
+ 	}
+@@ -3989,8 +3993,20 @@ static int check_atomic(struct bpf_verif
+ 		return err;
+ 
+ 	/* check whether we can write into the same memory */
+-	return check_mem_access(env, insn_idx, insn->dst_reg, insn->off,
+-				BPF_SIZE(insn->code), BPF_WRITE, -1, true);
++	err = check_mem_access(env, insn_idx, insn->dst_reg, insn->off,
++			       BPF_SIZE(insn->code), BPF_WRITE, -1, true);
++	if (err)
++		return err;
++
++	if (!(insn->imm & BPF_FETCH))
++		return 0;
++
++	/* check and record load of old value into src reg  */
++	err = check_reg_arg(env, insn->src_reg, DST_OP);
++	if (err)
++		return err;
++
++	return 0;
+ }
+ 
+ /* When register 'regno' is used to read the stack (either directly or through
+@@ -10045,12 +10061,6 @@ static int do_check(struct bpf_verifier_
+ 		} else if (class == BPF_STX) {
+ 			enum bpf_reg_type *prev_dst_type, dst_reg_type;
+ 
+-			if (((BPF_MODE(insn->code) != BPF_MEM &&
+-			      BPF_MODE(insn->code) != BPF_ATOMIC) || insn->imm != 0)) {
+-				verbose(env, "BPF_STX uses reserved fields\n");
+-				return -EINVAL;
+-			}
+-
+ 			if (BPF_MODE(insn->code) == BPF_ATOMIC) {
+ 				err = check_atomic(env, env->insn_idx, insn);
+ 				if (err)
+@@ -10059,6 +10069,11 @@ static int do_check(struct bpf_verifier_
+ 				continue;
+ 			}
+ 
++			if (BPF_MODE(insn->code) != BPF_MEM || insn->imm != 0) {
++				verbose(env, "BPF_STX uses reserved fields\n");
++				return -EINVAL;
++			}
++
+ 			/* check src1 operand */
+ 			err = check_reg_arg(env, insn->src_reg, SRC_OP);
+ 			if (err)
+--- a/tools/include/linux/filter.h
++++ b/tools/include/linux/filter.h
+@@ -173,6 +173,7 @@
+  * Atomic operations:
+  *
+  *   BPF_ADD                  *(uint *) (dst_reg + off16) += src_reg
++ *   BPF_ADD | BPF_FETCH      src_reg = atomic_fetch_add(dst_reg + off16, src_reg);
+  */
+ 
+ #define BPF_ATOMIC_OP(SIZE, OP, DST, SRC, OFF)			\
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -44,6 +44,9 @@
+ #define BPF_CALL	0x80	/* function call */
+ #define BPF_EXIT	0x90	/* function return */
+ 
++/* atomic op type fields (stored in immediate) */
++#define BPF_FETCH	0x01	/* fetch previous value into src reg */
++
+ /* Register numbers */
+ enum {
+ 	BPF_REG_0 = 0,

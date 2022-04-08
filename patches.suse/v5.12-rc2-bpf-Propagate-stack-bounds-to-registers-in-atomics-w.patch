@@ -1,0 +1,184 @@
+From 37086bfdc737ea6f66bf68dcf16757004d68e1e1 Mon Sep 17 00:00:00 2001
+Message-Id: <37086bfdc737ea6f66bf68dcf16757004d68e1e1.1648736869.git.geliang.tang@suse.com>
+From: Brendan Jackman <jackmanb@google.com>
+Date: Tue, 2 Feb 2021 13:50:02 +0000
+Subject: [PATCH] bpf: Propagate stack bounds to registers in atomics w/
+ BPF_FETCH
+Git-commit: 37086bfdc737ea6f66bf68dcf16757004d68e1e1
+Patch-mainline: v5.12-rc2
+References: bsn#127
+Modified-by-SEL: No
+
+
+When BPF_FETCH is set, atomic instructions load a value from memory
+into a register. The current verifier code first checks via
+check_mem_access whether we can access the memory, and then checks
+via check_reg_arg whether we can write into the register.
+
+For loads, check_reg_arg has the side-effect of marking the
+register's value as unkonwn, and check_mem_access has the side effect
+of propagating bounds from memory to the register. This currently only
+takes effect for stack memory.
+
+Therefore with the current order, bounds information is thrown away,
+but by simply reversing the order of check_reg_arg
+vs. check_mem_access, we can instead propagate bounds smartly.
+
+A simple test is added with an infinite loop that can only be proved
+unreachable if this propagation is present. This is implemented both
+with C and directly in test_verifier using assembly.
+
+Suggested-by: John Fastabend <john.fastabend@gmail.com>
+Signed-off-by: Brendan Jackman <jackmanb@google.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20210202135002.4024825-1-jackmanb@google.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ kernel/bpf/verifier.c                         | 32 +++++++++++--------
+ .../selftests/bpf/prog_tests/atomic_bounds.c  | 15 +++++++++
+ .../selftests/bpf/progs/atomic_bounds.c       | 24 ++++++++++++++
+ .../selftests/bpf/verifier/atomic_bounds.c    | 27 ++++++++++++++++
+ 4 files changed, 84 insertions(+), 14 deletions(-)
+ create mode 100644 tools/testing/selftests/bpf/prog_tests/atomic_bounds.c
+ create mode 100644 tools/testing/selftests/bpf/progs/atomic_bounds.c
+ create mode 100644 tools/testing/selftests/bpf/verifier/atomic_bounds.c
+
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 972fc38eb62d..5e09632efddb 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -3665,9 +3665,26 @@ static int check_atomic(struct bpf_verifier_env *env, int insn_idx, struct bpf_i
+ 		return -EACCES;
+ 	}
+ 
++	if (insn->imm & BPF_FETCH) {
++		if (insn->imm == BPF_CMPXCHG)
++			load_reg = BPF_REG_0;
++		else
++			load_reg = insn->src_reg;
++
++		/* check and record load of old value */
++		err = check_reg_arg(env, load_reg, DST_OP);
++		if (err)
++			return err;
++	} else {
++		/* This instruction accesses a memory location but doesn't
++		 * actually load it into a register.
++		 */
++		load_reg = -1;
++	}
++
+ 	/* check whether we can read the memory */
+ 	err = check_mem_access(env, insn_idx, insn->dst_reg, insn->off,
+-			       BPF_SIZE(insn->code), BPF_READ, -1, true);
++			       BPF_SIZE(insn->code), BPF_READ, load_reg, true);
+ 	if (err)
+ 		return err;
+ 
+@@ -3677,19 +3694,6 @@ static int check_atomic(struct bpf_verifier_env *env, int insn_idx, struct bpf_i
+ 	if (err)
+ 		return err;
+ 
+-	if (!(insn->imm & BPF_FETCH))
+-		return 0;
+-
+-	if (insn->imm == BPF_CMPXCHG)
+-		load_reg = BPF_REG_0;
+-	else
+-		load_reg = insn->src_reg;
+-
+-	/* check and record load of old value */
+-	err = check_reg_arg(env, load_reg, DST_OP);
+-	if (err)
+-		return err;
+-
+ 	return 0;
+ }
+ 
+diff --git a/tools/testing/selftests/bpf/prog_tests/atomic_bounds.c b/tools/testing/selftests/bpf/prog_tests/atomic_bounds.c
+new file mode 100644
+index 000000000000..addf127068e4
+--- /dev/null
++++ b/tools/testing/selftests/bpf/prog_tests/atomic_bounds.c
+@@ -0,0 +1,15 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include <test_progs.h>
++
++#include "atomic_bounds.skel.h"
++
++void test_atomic_bounds(void)
++{
++	struct atomic_bounds *skel;
++	__u32 duration = 0;
++
++	skel = atomic_bounds__open_and_load();
++	if (CHECK(!skel, "skel_load", "couldn't load program\n"))
++		return;
++}
+diff --git a/tools/testing/selftests/bpf/progs/atomic_bounds.c b/tools/testing/selftests/bpf/progs/atomic_bounds.c
+new file mode 100644
+index 000000000000..e5fff7fc7f8f
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/atomic_bounds.c
+@@ -0,0 +1,24 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/bpf.h>
++#include <bpf/bpf_helpers.h>
++#include <bpf/bpf_tracing.h>
++#include <stdbool.h>
++
++#ifdef ENABLE_ATOMICS_TESTS
++bool skip_tests __attribute((__section__(".data"))) = false;
++#else
++bool skip_tests = true;
++#endif
++
++SEC("fentry/bpf_fentry_test1")
++int BPF_PROG(sub, int x)
++{
++#ifdef ENABLE_ATOMICS_TESTS
++	int a = 0;
++	int b = __sync_fetch_and_add(&a, 1);
++	/* b is certainly 0 here. Can the verifier tell? */
++	while (b)
++		continue;
++#endif
++	return 0;
++}
+diff --git a/tools/testing/selftests/bpf/verifier/atomic_bounds.c b/tools/testing/selftests/bpf/verifier/atomic_bounds.c
+new file mode 100644
+index 000000000000..e82183e4914f
+--- /dev/null
++++ b/tools/testing/selftests/bpf/verifier/atomic_bounds.c
+@@ -0,0 +1,27 @@
++{
++	"BPF_ATOMIC bounds propagation, mem->reg",
++	.insns = {
++		/* a = 0; */
++		/*
++		 * Note this is implemented with two separate instructions,
++		 * where you might think one would suffice:
++		 *
++		 * BPF_ST_MEM(BPF_DW, BPF_REG_10, -8, 0),
++		 *
++		 * This is because BPF_ST_MEM doesn't seem to set the stack slot
++		 * type to 0 when storing an immediate.
++		 */
++		BPF_MOV64_IMM(BPF_REG_0, 0),
++		BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_0, -8),
++		/* b = atomic_fetch_add(&a, 1); */
++		BPF_MOV64_IMM(BPF_REG_1, 1),
++		BPF_ATOMIC_OP(BPF_DW, BPF_ADD | BPF_FETCH, BPF_REG_10, BPF_REG_1, -8),
++		/* Verifier should be able to tell that this infinite loop isn't reachable. */
++		/* if (b) while (true) continue; */
++		BPF_JMP_IMM(BPF_JNE, BPF_REG_1, 0, -1),
++		BPF_EXIT_INSN(),
++	},
++	.result = ACCEPT,
++	.result_unpriv = REJECT,
++	.errstr_unpriv = "back-edge",
++},
+-- 
+2.34.1
+

@@ -1,0 +1,131 @@
+From 462910670e4ac91509829c5549bd0227668176fb Mon Sep 17 00:00:00 2001
+Message-Id: <462910670e4ac91509829c5549bd0227668176fb.1648737192.git.geliang.tang@suse.com>
+From: Brendan Jackman <jackmanb@google.com>
+Date: Thu, 14 Jan 2021 18:17:48 +0000
+Subject: [PATCH] bpf: Pull out a macro for interpreting atomic ALU operations
+Git-commit: 462910670e4ac91509829c5549bd0227668176fb
+Patch-mainline: v5.12-rc2
+References: bsn#127
+Modified-by-SEL: No
+
+
+Since the atomic operations that are added in subsequent commits are
+all isomorphic with BPF_ADD, pull out a macro to avoid the
+interpreter becoming dominated by lines of atomic-related code.
+
+Note that this sacrificies interpreter performance (combining
+STX_ATOMIC_W and STX_ATOMIC_DW into single switch case means that we
+need an extra conditional branch to differentiate them) in favour of
+compact and (relatively!) simple C code.
+
+Signed-off-by: Brendan Jackman <jackmanb@google.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Yonghong Song <yhs@fb.com>
+Link: https://lore.kernel.org/bpf/20210114181751.768687-9-jackmanb@google.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ kernel/bpf/core.c | 80 +++++++++++++++++++++++------------------------
+ 1 file changed, 39 insertions(+), 41 deletions(-)
+
+diff --git a/kernel/bpf/core.c b/kernel/bpf/core.c
+index 4df6daba43ef..8669e685825f 100644
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -1618,55 +1618,53 @@ static u64 ___bpf_prog_run(u64 *regs, const struct bpf_insn *insn, u64 *stack)
+ 	LDX_PROBE(DW, 8)
+ #undef LDX_PROBE
+ 
+-	STX_ATOMIC_W:
+-		switch (IMM) {
+-		case BPF_ADD:
+-			/* lock xadd *(u32 *)(dst_reg + off16) += src_reg */
+-			atomic_add((u32) SRC, (atomic_t *)(unsigned long)
+-				   (DST + insn->off));
+-			break;
+-		case BPF_ADD | BPF_FETCH:
+-			SRC = (u32) atomic_fetch_add(
+-				(u32) SRC,
+-				(atomic_t *)(unsigned long) (DST + insn->off));
+-			break;
+-		case BPF_XCHG:
+-			SRC = (u32) atomic_xchg(
+-				(atomic_t *)(unsigned long) (DST + insn->off),
+-				(u32) SRC);
+-			break;
+-		case BPF_CMPXCHG:
+-			BPF_R0 = (u32) atomic_cmpxchg(
+-				(atomic_t *)(unsigned long) (DST + insn->off),
+-				(u32) BPF_R0, (u32) SRC);
++#define ATOMIC_ALU_OP(BOP, KOP)						\
++		case BOP:						\
++			if (BPF_SIZE(insn->code) == BPF_W)		\
++				atomic_##KOP((u32) SRC, (atomic_t *)(unsigned long) \
++					     (DST + insn->off));	\
++			else						\
++				atomic64_##KOP((u64) SRC, (atomic64_t *)(unsigned long) \
++					       (DST + insn->off));	\
++			break;						\
++		case BOP | BPF_FETCH:					\
++			if (BPF_SIZE(insn->code) == BPF_W)		\
++				SRC = (u32) atomic_fetch_##KOP(		\
++					(u32) SRC,			\
++					(atomic_t *)(unsigned long) (DST + insn->off)); \
++			else						\
++				SRC = (u64) atomic64_fetch_##KOP(	\
++					(u64) SRC,			\
++					(atomic64_t *)(unsigned long) (DST + insn->off)); \
+ 			break;
+-		default:
+-			goto default_label;
+-		}
+-		CONT;
+ 
+ 	STX_ATOMIC_DW:
++	STX_ATOMIC_W:
+ 		switch (IMM) {
+-		case BPF_ADD:
+-			/* lock xadd *(u64 *)(dst_reg + off16) += src_reg */
+-			atomic64_add((u64) SRC, (atomic64_t *)(unsigned long)
+-				     (DST + insn->off));
+-			break;
+-		case BPF_ADD | BPF_FETCH:
+-			SRC = (u64) atomic64_fetch_add(
+-				(u64) SRC,
+-				(atomic64_t *)(unsigned long) (DST + insn->off));
+-			break;
++		ATOMIC_ALU_OP(BPF_ADD, add)
++#undef ATOMIC_ALU_OP
++
+ 		case BPF_XCHG:
+-			SRC = (u64) atomic64_xchg(
+-				(atomic64_t *)(unsigned long) (DST + insn->off),
+-				(u64) SRC);
++			if (BPF_SIZE(insn->code) == BPF_W)
++				SRC = (u32) atomic_xchg(
++					(atomic_t *)(unsigned long) (DST + insn->off),
++					(u32) SRC);
++			else
++				SRC = (u64) atomic64_xchg(
++					(atomic64_t *)(unsigned long) (DST + insn->off),
++					(u64) SRC);
+ 			break;
+ 		case BPF_CMPXCHG:
+-			BPF_R0 = (u64) atomic64_cmpxchg(
+-				(atomic64_t *)(unsigned long) (DST + insn->off),
+-				(u64) BPF_R0, (u64) SRC);
++			if (BPF_SIZE(insn->code) == BPF_W)
++				BPF_R0 = (u32) atomic_cmpxchg(
++					(atomic_t *)(unsigned long) (DST + insn->off),
++					(u32) BPF_R0, (u32) SRC);
++			else
++				BPF_R0 = (u64) atomic64_cmpxchg(
++					(atomic64_t *)(unsigned long) (DST + insn->off),
++					(u64) BPF_R0, (u64) SRC);
+ 			break;
++
+ 		default:
+ 			goto default_label;
+ 		}
+-- 
+2.34.1
+

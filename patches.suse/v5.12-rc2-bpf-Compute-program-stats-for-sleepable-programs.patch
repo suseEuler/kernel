@@ -1,0 +1,180 @@
+From f2dd3b39467411c53703125a111f45b3672c1771 Mon Sep 17 00:00:00 2001
+Message-Id: <f2dd3b39467411c53703125a111f45b3672c1771.1648736739.git.geliang.tang@suse.com>
+From: Alexei Starovoitov <ast@kernel.org>
+Date: Tue, 9 Feb 2021 19:36:28 -0800
+Subject: [PATCH] bpf: Compute program stats for sleepable programs
+Git-commit: f2dd3b39467411c53703125a111f45b3672c1771
+Patch-mainline: v5.12-rc2
+References: bsn#127
+Modified-by-SEL: Yes, refreshed due to context changes
+
+
+Since sleepable programs don't migrate from the cpu the excution stats can be
+computed for them as well. Reuse the same infrastructure for both sleepable and
+non-sleepable programs.
+
+run_cnt     -> the number of times the program was executed.
+run_time_ns -> the program execution time in nanoseconds including the
+               off-cpu time when the program was sleeping.
+
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Acked-by: KP Singh <kpsingh@kernel.org>
+Link: https://lore.kernel.org/bpf/20210210033634.62081-4-alexei.starovoitov@gmail.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ arch/x86/net/bpf_jit_comp.c | 31 +++++++++++----------------
+ include/linux/bpf.h         |  4 ++--
+ kernel/bpf/trampoline.c     | 42 ++++++++++++++++++++++++-------------
+ 3 files changed, 42 insertions(+), 35 deletions(-)
+
+--- a/arch/x86/net/bpf_jit_comp.c
++++ b/arch/x86/net/bpf_jit_comp.c
+@@ -1641,15 +1641,12 @@ static int invoke_bpf_prog(const struct
+ 	u8 *prog = *pprog;
+ 	int cnt = 0;
+ 
+-	if (p->aux->sleepable) {
+-		if (emit_call(&prog, __bpf_prog_enter_sleepable, prog))
++	if (emit_call(&prog,
++		      p->aux->sleepable ? __bpf_prog_enter_sleepable :
++		      __bpf_prog_enter, prog))
+ 			return -EINVAL;
+-	} else {
+-		if (emit_call(&prog, __bpf_prog_enter, prog))
+-			return -EINVAL;
+-		/* remember prog start time returned by __bpf_prog_enter */
+-		emit_mov_reg(&prog, true, BPF_REG_6, BPF_REG_0);
+-	}
++	/* remember prog start time returned by __bpf_prog_enter */
++	emit_mov_reg(&prog, true, BPF_REG_6, BPF_REG_0);
+ 
+ 	/* arg1: lea rdi, [rbp - stack_size] */
+ 	EMIT4(0x48, 0x8D, 0x7D, -stack_size);
+@@ -1673,18 +1670,14 @@ static int invoke_bpf_prog(const struct
+ 	if (save_ret)
+ 		emit_stx(&prog, BPF_DW, BPF_REG_FP, BPF_REG_0, -8);
+ 
+-	if (p->aux->sleepable) {
+-		if (emit_call(&prog, __bpf_prog_exit_sleepable, prog))
+-			return -EINVAL;
+-	} else {
+-		/* arg1: mov rdi, progs[i] */
+-		emit_mov_imm64(&prog, BPF_REG_1, (long) p >> 32,
+-			       (u32) (long) p);
+-		/* arg2: mov rsi, rbx <- start time in nsec */
+-		emit_mov_reg(&prog, true, BPF_REG_2, BPF_REG_6);
+-		if (emit_call(&prog, __bpf_prog_exit, prog))
++	/* arg1: mov rdi, progs[i] */
++	emit_mov_imm64(&prog, BPF_REG_1, (long) p >> 32, (u32) (long) p);
++	/* arg2: mov rsi, rbx <- start time in nsec */
++	emit_mov_reg(&prog, true, BPF_REG_2, BPF_REG_6);
++	if (emit_call(&prog,
++		      p->aux->sleepable ? __bpf_prog_exit_sleepable :
++		      __bpf_prog_exit, prog))
+ 			return -EINVAL;
+-	}
+ 
+ 	*pprog = prog;
+ 	return 0;
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -567,8 +567,8 @@ int arch_prepare_bpf_trampoline(struct b
+ /* these two functions are called from generated trampoline */
+ u64 notrace __bpf_prog_enter(void);
+ void notrace __bpf_prog_exit(struct bpf_prog *prog, u64 start);
+-void notrace __bpf_prog_enter_sleepable(void);
+-void notrace __bpf_prog_exit_sleepable(void);
++u64 notrace __bpf_prog_enter_sleepable(void);
++void notrace __bpf_prog_exit_sleepable(struct bpf_prog *prog, u64 start);
+ void notrace __bpf_tramp_enter(struct bpf_tramp_image *tr);
+ void notrace __bpf_tramp_exit(struct bpf_tramp_image *tr);
+ 
+--- a/kernel/bpf/trampoline.c
++++ b/kernel/bpf/trampoline.c
+@@ -489,56 +489,70 @@ out:
+ 	mutex_unlock(&trampoline_mutex);
+ }
+ 
++#define NO_START_TIME 0
++static u64 notrace bpf_prog_start_time(void)
++{
++	u64 start = NO_START_TIME;
++
++	if (static_branch_unlikely(&bpf_stats_enabled_key))
++		start = sched_clock();
++	return start;
++}
++
+ /* The logic is similar to BPF_PROG_RUN, but with an explicit
+  * rcu_read_lock() and migrate_disable() which are required
+  * for the trampoline. The macro is split into
+- * call _bpf_prog_enter
++ * call __bpf_prog_enter
+  * call prog->bpf_func
+  * call __bpf_prog_exit
+  */
+ u64 notrace __bpf_prog_enter(void)
+ 	__acquires(RCU)
+ {
+-	u64 start = 0;
+-
+ 	rcu_read_lock();
+ 	migrate_disable();
+-	if (static_branch_unlikely(&bpf_stats_enabled_key))
+-		start = sched_clock();
+-	return start;
++	return bpf_prog_start_time();
+ }
+ 
+-void notrace __bpf_prog_exit(struct bpf_prog *prog, u64 start)
+-	__releases(RCU)
++static void notrace update_prog_stats(struct bpf_prog *prog,
++				      u64 start)
+ {
+ 	struct bpf_prog_stats *stats;
+ 
+ 	if (static_branch_unlikely(&bpf_stats_enabled_key) &&
+-	    /* static_key could be enabled in __bpf_prog_enter
+-	     * and disabled in __bpf_prog_exit.
++	    /* static_key could be enabled in __bpf_prog_enter*
++	     * and disabled in __bpf_prog_exit*.
+ 	     * And vice versa.
+-	     * Hence check that 'start' is not zero.
++	     * Hence check that 'start' is valid.
+ 	     */
+-	    start) {
++	    start > NO_START_TIME) {
+ 		stats = this_cpu_ptr(prog->stats);
+ 		u64_stats_update_begin(&stats->syncp);
+ 		stats->cnt++;
+ 		stats->nsecs += sched_clock() - start;
+ 		u64_stats_update_end(&stats->syncp);
+ 	}
++}
++
++void notrace __bpf_prog_exit(struct bpf_prog *prog, u64 start)
++	__releases(RCU)
++{
++	update_prog_stats(prog, start);
+ 	migrate_enable();
+ 	rcu_read_unlock();
+ }
+ 
+-void notrace __bpf_prog_enter_sleepable(void)
++u64 notrace __bpf_prog_enter_sleepable(void)
+ {
+ 	rcu_read_lock_trace();
+ 	migrate_disable();
+ 	might_fault();
++	return bpf_prog_start_time();
+ }
+ 
+-void notrace __bpf_prog_exit_sleepable(void)
++void notrace __bpf_prog_exit_sleepable(struct bpf_prog *prog, u64 start)
+ {
++	update_prog_stats(prog, start);
+ 	migrate_enable();
+ 	rcu_read_unlock_trace();
+ }

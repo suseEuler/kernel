@@ -1,0 +1,126 @@
+From 13ca51d5eb358edcb673afccb48c3440b9fda21b Mon Sep 17 00:00:00 2001
+Message-Id: <13ca51d5eb358edcb673afccb48c3440b9fda21b.1648737105.git.geliang.tang@suse.com>
+From: Yonghong Song <yhs@fb.com>
+Date: Tue, 19 Jan 2021 07:35:18 -0800
+Subject: [PATCH] bpf: Permit size-0 datasec
+Git-commit: 13ca51d5eb358edcb673afccb48c3440b9fda21b
+Patch-mainline: v5.12-rc2
+References: bsn#127
+Modified-by-SEL: No
+
+
+llvm patch https://reviews.llvm.org/D84002 permitted
+to emit empty rodata datasec if the elf .rodata section
+contains read-only data from local variables. These
+local variables will be not emitted as BTF_KIND_VARs
+since llvm converted these local variables as
+static variables with private linkage without debuginfo
+types. Such an empty rodata datasec will make
+skeleton code generation easy since for skeleton
+a rodata struct will be generated if there is a
+.rodata elf section. The existence of a rodata
+btf datasec is also consistent with the existence
+of a rodata map created by libbpf.
+
+The btf with such an empty rodata datasec will fail
+in the kernel though as kernel will reject a datasec
+with zero vlen and zero size. For example, for the below code,
+    int sys_enter(void *ctx)
+    {
+       int fmt[6] = {1, 2, 3, 4, 5, 6};
+       int dst[6];
+
+       bpf_probe_read(dst, sizeof(dst), fmt);
+       return 0;
+    }
+We got the below btf (bpftool btf dump ./test.o):
+    [1] PTR '(anon)' type_id=0
+    [2] FUNC_PROTO '(anon)' ret_type_id=3 vlen=1
+            'ctx' type_id=1
+    [3] INT 'int' size=4 bits_offset=0 nr_bits=32 encoding=SIGNED
+    [4] FUNC 'sys_enter' type_id=2 linkage=global
+    [5] INT 'char' size=1 bits_offset=0 nr_bits=8 encoding=SIGNED
+    [6] ARRAY '(anon)' type_id=5 index_type_id=7 nr_elems=4
+    [7] INT '__ARRAY_SIZE_TYPE__' size=4 bits_offset=0 nr_bits=32 encoding=(none)
+    [8] VAR '_license' type_id=6, linkage=global-alloc
+    [9] DATASEC '.rodata' size=0 vlen=0
+    [10] DATASEC 'license' size=0 vlen=1
+            type_id=8 offset=0 size=4
+When loading the ./test.o to the kernel with bpftool,
+we see the following error:
+    libbpf: Error loading BTF: Invalid argument(22)
+    libbpf: magic: 0xeb9f
+    ...
+    [6] ARRAY (anon) type_id=5 index_type_id=7 nr_elems=4
+    [7] INT __ARRAY_SIZE_TYPE__ size=4 bits_offset=0 nr_bits=32 encoding=(none)
+    [8] VAR _license type_id=6 linkage=1
+    [9] DATASEC .rodata size=24 vlen=0 vlen == 0
+    libbpf: Error loading .BTF into kernel: -22. BTF is optional, ignoring.
+
+Basically, libbpf changed .rodata datasec size to 24 since elf .rodata
+section size is 24. The kernel then rejected the BTF since vlen = 0.
+Note that the above kernel verifier failure can be worked around with
+changing local variable "fmt" to a static or global, optionally const, variable.
+
+This patch permits a datasec with vlen = 0 in kernel.
+
+Signed-off-by: Yonghong Song <yhs@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20210119153519.3901963-1-yhs@fb.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ kernel/bpf/btf.c                             |  5 -----
+ tools/testing/selftests/bpf/prog_tests/btf.c | 21 ++++++++++++++++++++
+ 2 files changed, 21 insertions(+), 5 deletions(-)
+
+diff --git a/kernel/bpf/btf.c b/kernel/bpf/btf.c
+index 8962f988514f..756a93f534b6 100644
+--- a/kernel/bpf/btf.c
++++ b/kernel/bpf/btf.c
+@@ -3540,11 +3540,6 @@ static s32 btf_datasec_check_meta(struct btf_verifier_env *env,
+ 		return -EINVAL;
+ 	}
+ 
+-	if (!btf_type_vlen(t)) {
+-		btf_verifier_log_type(env, t, "vlen == 0");
+-		return -EINVAL;
+-	}
+-
+ 	if (!t->size) {
+ 		btf_verifier_log_type(env, t, "size == 0");
+ 		return -EINVAL;
+diff --git a/tools/testing/selftests/bpf/prog_tests/btf.c b/tools/testing/selftests/bpf/prog_tests/btf.c
+index 8ae97e2a4b9d..055d2c0486ed 100644
+--- a/tools/testing/selftests/bpf/prog_tests/btf.c
++++ b/tools/testing/selftests/bpf/prog_tests/btf.c
+@@ -3509,6 +3509,27 @@ static struct btf_raw_test raw_tests[] = {
+ 	.value_type_id = 3 /* arr_t */,
+ 	.max_entries = 4,
+ },
++/*
++ * elf .rodata section size 4 and btf .rodata section vlen 0.
++ */
++{
++	.descr = "datasec: vlen == 0",
++	.raw_types = {
++		/* int */
++		BTF_TYPE_INT_ENC(0, BTF_INT_SIGNED, 0, 32, 4),	/* [1] */
++		/* .rodata section */
++		BTF_TYPE_ENC(NAME_NTH(1), BTF_INFO_ENC(BTF_KIND_DATASEC, 0, 0), 4),
++								 /* [2] */
++		BTF_END_RAW,
++	},
++	BTF_STR_SEC("\0.rodata"),
++	.map_type = BPF_MAP_TYPE_ARRAY,
++	.key_size = sizeof(int),
++	.value_size = sizeof(int),
++	.key_type_id = 1,
++	.value_type_id = 1,
++	.max_entries = 1,
++},
+ 
+ }; /* struct btf_raw_test raw_tests[] */
+ 
+-- 
+2.34.1
+

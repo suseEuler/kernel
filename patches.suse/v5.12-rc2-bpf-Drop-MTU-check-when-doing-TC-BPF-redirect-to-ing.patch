@@ -1,0 +1,181 @@
+From 5f7d57280c1982d993d5f4ff0edac310f820f607 Mon Sep 17 00:00:00 2001
+Message-Id: <5f7d57280c1982d993d5f4ff0edac310f820f607.1648736378.git.geliang.tang@suse.com>
+From: Jesper Dangaard Brouer <brouer@redhat.com>
+Date: Tue, 9 Feb 2021 14:38:29 +0100
+Subject: [PATCH] bpf: Drop MTU check when doing TC-BPF redirect to ingress
+Git-commit: 5f7d57280c1982d993d5f4ff0edac310f820f607
+Patch-mainline: v5.12-rc2
+References: bsn#127
+Modified-by-SEL: No
+
+
+The use-case for dropping the MTU check when TC-BPF does redirect to
+ingress, is described by Eyal Birger in email[0]. The summary is the
+ability to increase packet size (e.g. with IPv6 headers for NAT64) and
+ingress redirect packet and let normal netstack fragment packet as needed.
+
+[0] https://lore.kernel.org/netdev/CAHsH6Gug-hsLGHQ6N0wtixdOa85LDZ3HNRHVd0opR=19Qo4W4Q@mail.gmail.com/
+
+V15:
+ - missing static for function declaration
+
+V9:
+ - Make net_device "up" (IFF_UP) check explicit in skb_do_redirect
+
+V4:
+ - Keep net_device "up" (IFF_UP) check.
+ - Adjustment to handle bpf_redirect_peer() helper
+
+Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: John Fastabend <john.fastabend@gmail.com>
+Link: https://lore.kernel.org/bpf/161287790971.790810.11785274340154740591.stgit@firesoul
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ include/linux/netdevice.h | 32 ++++++++++++++++++++++++++++++--
+ net/core/dev.c            | 32 ++++++++++++++------------------
+ net/core/filter.c         |  6 +++---
+ 3 files changed, 47 insertions(+), 23 deletions(-)
+
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index ef517254367d..b9bcbfde7849 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -3931,14 +3931,42 @@ int xdp_umem_query(struct net_device *dev, u16 queue_id);
+ 
+ int __dev_forward_skb(struct net_device *dev, struct sk_buff *skb);
+ int dev_forward_skb(struct net_device *dev, struct sk_buff *skb);
++int dev_forward_skb_nomtu(struct net_device *dev, struct sk_buff *skb);
+ bool is_skb_forwardable(const struct net_device *dev,
+ 			const struct sk_buff *skb);
+ 
++static __always_inline bool __is_skb_forwardable(const struct net_device *dev,
++						 const struct sk_buff *skb,
++						 const bool check_mtu)
++{
++	const u32 vlan_hdr_len = 4; /* VLAN_HLEN */
++	unsigned int len;
++
++	if (!(dev->flags & IFF_UP))
++		return false;
++
++	if (!check_mtu)
++		return true;
++
++	len = dev->mtu + dev->hard_header_len + vlan_hdr_len;
++	if (skb->len <= len)
++		return true;
++
++	/* if TSO is enabled, we don't care about the length as the packet
++	 * could be forwarded without being segmented before
++	 */
++	if (skb_is_gso(skb))
++		return true;
++
++	return false;
++}
++
+ static __always_inline int ____dev_forward_skb(struct net_device *dev,
+-					       struct sk_buff *skb)
++					       struct sk_buff *skb,
++					       const bool check_mtu)
+ {
+ 	if (skb_orphan_frags(skb, GFP_ATOMIC) ||
+-	    unlikely(!is_skb_forwardable(dev, skb))) {
++	    unlikely(!__is_skb_forwardable(dev, skb, check_mtu))) {
+ 		atomic_long_inc(&dev->rx_dropped);
+ 		kfree_skb(skb);
+ 		return NET_RX_DROP;
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 07a0347c33fb..8c820fe0eff3 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -2194,28 +2194,14 @@ static inline void net_timestamp_set(struct sk_buff *skb)
+ 
+ bool is_skb_forwardable(const struct net_device *dev, const struct sk_buff *skb)
+ {
+-	unsigned int len;
+-
+-	if (!(dev->flags & IFF_UP))
+-		return false;
+-
+-	len = dev->mtu + dev->hard_header_len + VLAN_HLEN;
+-	if (skb->len <= len)
+-		return true;
+-
+-	/* if TSO is enabled, we don't care about the length as the packet
+-	 * could be forwarded without being segmented before
+-	 */
+-	if (skb_is_gso(skb))
+-		return true;
+-
+-	return false;
++	return __is_skb_forwardable(dev, skb, true);
+ }
+ EXPORT_SYMBOL_GPL(is_skb_forwardable);
+ 
+-int __dev_forward_skb(struct net_device *dev, struct sk_buff *skb)
++static int __dev_forward_skb2(struct net_device *dev, struct sk_buff *skb,
++			      bool check_mtu)
+ {
+-	int ret = ____dev_forward_skb(dev, skb);
++	int ret = ____dev_forward_skb(dev, skb, check_mtu);
+ 
+ 	if (likely(!ret)) {
+ 		skb->protocol = eth_type_trans(skb, dev);
+@@ -2224,6 +2210,11 @@ int __dev_forward_skb(struct net_device *dev, struct sk_buff *skb)
+ 
+ 	return ret;
+ }
++
++int __dev_forward_skb(struct net_device *dev, struct sk_buff *skb)
++{
++	return __dev_forward_skb2(dev, skb, true);
++}
+ EXPORT_SYMBOL_GPL(__dev_forward_skb);
+ 
+ /**
+@@ -2250,6 +2241,11 @@ int dev_forward_skb(struct net_device *dev, struct sk_buff *skb)
+ }
+ EXPORT_SYMBOL_GPL(dev_forward_skb);
+ 
++int dev_forward_skb_nomtu(struct net_device *dev, struct sk_buff *skb)
++{
++	return __dev_forward_skb2(dev, skb, false) ?: netif_rx_internal(skb);
++}
++
+ static inline int deliver_skb(struct sk_buff *skb,
+ 			      struct packet_type *pt_prev,
+ 			      struct net_device *orig_dev)
+diff --git a/net/core/filter.c b/net/core/filter.c
+index 439f43f00483..7059cf604d94 100644
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -2083,13 +2083,13 @@ static const struct bpf_func_proto bpf_csum_level_proto = {
+ 
+ static inline int __bpf_rx_skb(struct net_device *dev, struct sk_buff *skb)
+ {
+-	return dev_forward_skb(dev, skb);
++	return dev_forward_skb_nomtu(dev, skb);
+ }
+ 
+ static inline int __bpf_rx_skb_no_mac(struct net_device *dev,
+ 				      struct sk_buff *skb)
+ {
+-	int ret = ____dev_forward_skb(dev, skb);
++	int ret = ____dev_forward_skb(dev, skb, false);
+ 
+ 	if (likely(!ret)) {
+ 		skb->dev = dev;
+@@ -2480,7 +2480,7 @@ int skb_do_redirect(struct sk_buff *skb)
+ 			goto out_drop;
+ 		dev = ops->ndo_get_peer_dev(dev);
+ 		if (unlikely(!dev ||
+-			     !is_skb_forwardable(dev, skb) ||
++			     !(dev->flags & IFF_UP) ||
+ 			     net_eq(net, dev_net(dev))))
+ 			goto out_drop;
+ 		skb->dev = dev;
+-- 
+2.34.1
+
