@@ -1,0 +1,120 @@
+From 774e132e83d0f10a7ebbfe7db1debdaed6013f83 Mon Sep 17 00:00:00 2001
+Message-Id: <774e132e83d0f10a7ebbfe7db1debdaed6013f83.1649662452.git.geliang.tang@suse.com>
+From: Martin KaFai Lau <kafai@fb.com>
+Date: Wed, 24 Mar 2021 18:52:14 -0700
+Subject: [PATCH] libbpf: Refactor codes for finding btf id of a kernel symbol
+Git-commit: 774e132e83d0f10a7ebbfe7db1debdaed6013f83
+Patch-mainline: v5.13-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+This patch refactors code, that finds kernel btf_id by kind
+and symbol name, to a new function find_ksym_btf_id().
+
+It also adds a new helper __btf_kind_str() to return
+a string by the numeric kind value.
+
+Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20210325015214.1547069-1-kafai@fb.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/lib/bpf/libbpf.c | 44 +++++++++++++++++++++++++++++++-----------
+ 1 file changed, 33 insertions(+), 11 deletions(-)
+
+diff --git a/tools/lib/bpf/libbpf.c b/tools/lib/bpf/libbpf.c
+index e289155510ca..2f5595ae0b84 100644
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@ -1921,9 +1921,9 @@ resolve_func_ptr(const struct btf *btf, __u32 id, __u32 *res_id)
+ 	return btf_is_func_proto(t) ? t : NULL;
+ }
+ 
+-static const char *btf_kind_str(const struct btf_type *t)
++static const char *__btf_kind_str(__u16 kind)
+ {
+-	switch (btf_kind(t)) {
++	switch (kind) {
+ 	case BTF_KIND_UNKN: return "void";
+ 	case BTF_KIND_INT: return "int";
+ 	case BTF_KIND_PTR: return "ptr";
+@@ -1945,6 +1945,11 @@ static const char *btf_kind_str(const struct btf_type *t)
+ 	}
+ }
+ 
++static const char *btf_kind_str(const struct btf_type *t)
++{
++	return __btf_kind_str(btf_kind(t));
++}
++
+ /*
+  * Fetch integer attribute of BTF map definition. Such attributes are
+  * represented using a pointer to an array, in which dimensionality of array
+@@ -7395,18 +7400,17 @@ static int bpf_object__read_kallsyms_file(struct bpf_object *obj)
+ 	return err;
+ }
+ 
+-static int bpf_object__resolve_ksym_var_btf_id(struct bpf_object *obj,
+-					       struct extern_desc *ext)
++static int find_ksym_btf_id(struct bpf_object *obj, const char *ksym_name,
++			    __u16 kind, struct btf **res_btf,
++			    int *res_btf_fd)
+ {
+-	const struct btf_type *targ_var, *targ_type;
+-	__u32 targ_type_id, local_type_id;
+-	const char *targ_var_name;
+ 	int i, id, btf_fd, err;
+ 	struct btf *btf;
+ 
+ 	btf = obj->btf_vmlinux;
+ 	btf_fd = 0;
+-	id = btf__find_by_name_kind(btf, ext->name, BTF_KIND_VAR);
++	id = btf__find_by_name_kind(btf, ksym_name, kind);
++
+ 	if (id == -ENOENT) {
+ 		err = load_module_btfs(obj);
+ 		if (err)
+@@ -7416,17 +7420,35 @@ static int bpf_object__resolve_ksym_var_btf_id(struct bpf_object *obj,
+ 			btf = obj->btf_modules[i].btf;
+ 			/* we assume module BTF FD is always >0 */
+ 			btf_fd = obj->btf_modules[i].fd;
+-			id = btf__find_by_name_kind(btf, ext->name, BTF_KIND_VAR);
++			id = btf__find_by_name_kind(btf, ksym_name, kind);
+ 			if (id != -ENOENT)
+ 				break;
+ 		}
+ 	}
+ 	if (id <= 0) {
+-		pr_warn("extern (var ksym) '%s': failed to find BTF ID in kernel BTF(s).\n",
+-			ext->name);
++		pr_warn("extern (%s ksym) '%s': failed to find BTF ID in kernel BTF(s).\n",
++			__btf_kind_str(kind), ksym_name);
+ 		return -ESRCH;
+ 	}
+ 
++	*res_btf = btf;
++	*res_btf_fd = btf_fd;
++	return id;
++}
++
++static int bpf_object__resolve_ksym_var_btf_id(struct bpf_object *obj,
++					       struct extern_desc *ext)
++{
++	const struct btf_type *targ_var, *targ_type;
++	__u32 targ_type_id, local_type_id;
++	const char *targ_var_name;
++	int id, btf_fd = 0, err;
++	struct btf *btf = NULL;
++
++	id = find_ksym_btf_id(obj, ext->name, BTF_KIND_VAR, &btf, &btf_fd);
++	if (id < 0)
++		return id;
++
+ 	/* find local type_id */
+ 	local_type_id = ext->ksym.type_id;
+ 
+-- 
+2.34.1
+

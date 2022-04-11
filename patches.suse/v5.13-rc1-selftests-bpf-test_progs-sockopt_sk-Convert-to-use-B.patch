@@ -1,0 +1,119 @@
+From cad99cce133dd5377f22da1e75d7eb5c4b886d75 Mon Sep 17 00:00:00 2001
+Message-Id: <cad99cce133dd5377f22da1e75d7eb5c4b886d75.1649662021.git.geliang.tang@suse.com>
+From: Yauheni Kaliuta <yauheni.kaliuta@redhat.com>
+Date: Thu, 8 Apr 2021 09:13:03 +0300
+Subject: [PATCH] selftests/bpf: test_progs/sockopt_sk: Convert to use BPF
+ skeleton
+Git-commit: cad99cce133dd5377f22da1e75d7eb5c4b886d75
+Patch-mainline: v5.13-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+Switch the test to use BPF skeleton to save some boilerplate and
+make it easy to access bpf program bss segment.
+
+The latter will be used to pass PAGE_SIZE from userspace since there
+is no convenient way for bpf program to get it from inside of the
+kernel.
+
+Signed-off-by: Yauheni Kaliuta <yauheni.kaliuta@redhat.com>
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20210408061310.95877-2-yauheni.kaliuta@redhat.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ .../selftests/bpf/prog_tests/sockopt_sk.c     | 65 +++++--------------
+ 1 file changed, 17 insertions(+), 48 deletions(-)
+
+diff --git a/tools/testing/selftests/bpf/prog_tests/sockopt_sk.c b/tools/testing/selftests/bpf/prog_tests/sockopt_sk.c
+index d5b44b135c00..7274b12abe17 100644
+--- a/tools/testing/selftests/bpf/prog_tests/sockopt_sk.c
++++ b/tools/testing/selftests/bpf/prog_tests/sockopt_sk.c
+@@ -3,6 +3,7 @@
+ #include "cgroup_helpers.h"
+ 
+ #include <linux/tcp.h>
++#include "sockopt_sk.skel.h"
+ 
+ #ifndef SOL_TCP
+ #define SOL_TCP IPPROTO_TCP
+@@ -191,60 +192,28 @@ static int getsetsockopt(void)
+ 	return -1;
+ }
+ 
+-static int prog_attach(struct bpf_object *obj, int cgroup_fd, const char *title)
+-{
+-	enum bpf_attach_type attach_type;
+-	enum bpf_prog_type prog_type;
+-	struct bpf_program *prog;
+-	int err;
+-
+-	err = libbpf_prog_type_by_name(title, &prog_type, &attach_type);
+-	if (err) {
+-		log_err("Failed to deduct types for %s BPF program", title);
+-		return -1;
+-	}
+-
+-	prog = bpf_object__find_program_by_title(obj, title);
+-	if (!prog) {
+-		log_err("Failed to find %s BPF program", title);
+-		return -1;
+-	}
+-
+-	err = bpf_prog_attach(bpf_program__fd(prog), cgroup_fd,
+-			      attach_type, 0);
+-	if (err) {
+-		log_err("Failed to attach %s BPF program", title);
+-		return -1;
+-	}
+-
+-	return 0;
+-}
+-
+ static void run_test(int cgroup_fd)
+ {
+-	struct bpf_prog_load_attr attr = {
+-		.file = "./sockopt_sk.o",
+-	};
+-	struct bpf_object *obj;
+-	int ignored;
+-	int err;
+-
+-	err = bpf_prog_load_xattr(&attr, &obj, &ignored);
+-	if (CHECK_FAIL(err))
+-		return;
++	struct sockopt_sk *skel;
++
++	skel = sockopt_sk__open_and_load();
++	if (!ASSERT_OK_PTR(skel, "skel_load"))
++		goto cleanup;
+ 
+-	err = prog_attach(obj, cgroup_fd, "cgroup/getsockopt");
+-	if (CHECK_FAIL(err))
+-		goto close_bpf_object;
++	skel->links._setsockopt =
++		bpf_program__attach_cgroup(skel->progs._setsockopt, cgroup_fd);
++	if (!ASSERT_OK_PTR(skel->links._setsockopt, "setsockopt_link"))
++		goto cleanup;
+ 
+-	err = prog_attach(obj, cgroup_fd, "cgroup/setsockopt");
+-	if (CHECK_FAIL(err))
+-		goto close_bpf_object;
++	skel->links._getsockopt =
++		bpf_program__attach_cgroup(skel->progs._getsockopt, cgroup_fd);
++	if (!ASSERT_OK_PTR(skel->links._getsockopt, "getsockopt_link"))
++		goto cleanup;
+ 
+-	CHECK_FAIL(getsetsockopt());
++	ASSERT_OK(getsetsockopt(), "getsetsockopt");
+ 
+-close_bpf_object:
+-	bpf_object__close(obj);
++cleanup:
++	sockopt_sk__destroy(skel);
+ }
+ 
+ void test_sockopt_sk(void)
+-- 
+2.34.1
+

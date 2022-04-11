@@ -1,0 +1,193 @@
+From 39491867ace594b4912c35f576864d204beed2b3 Mon Sep 17 00:00:00 2001
+Message-Id: <39491867ace594b4912c35f576864d204beed2b3.1649663071.git.geliang.tang@suse.com>
+From: Brendan Jackman <jackmanb@google.com>
+Date: Thu, 4 Mar 2021 18:56:46 -0800
+Subject: [PATCH] bpf: Explicitly zero-extend R0 after 32-bit cmpxchg
+Git-commit: 39491867ace594b4912c35f576864d204beed2b3
+Patch-mainline: v5.12-rc3
+References: bsn#127
+Modified-by-SEL: No
+
+
+As pointed out by Ilya and explained in the new comment, there's a
+discrepancy between x86 and BPF CMPXCHG semantics: BPF always loads
+the value from memory into r0, while x86 only does so when r0 and the
+value in memory are different. The same issue affects s390.
+
+At first this might sound like pure semantics, but it makes a real
+difference when the comparison is 32-bit, since the load will
+zero-extend r0/rax.
+
+The fix is to explicitly zero-extend rax after doing such a
+CMPXCHG. Since this problem affects multiple archs, this is done in
+the verifier by patching in a BPF_ZEXT_REG instruction after every
+32-bit cmpxchg. Any archs that don't need such manual zero-extension
+can do a look-ahead with insn_is_zext to skip the unnecessary mov.
+
+Note this still goes on top of Ilya's patch:
+
+https://lore.kernel.org/bpf/20210301154019.129110-1-iii@linux.ibm.com/T/#u
+
+Differences v5->v6[1]:
+ - Moved is_cmpxchg_insn and ensured it can be safely re-used. Also renamed it
+   and removed 'inline' to match the style of the is_*_function helpers.
+ - Fixed up comments in verifier test (thanks for the careful review, Martin!)
+
+Differences v4->v5[1]:
+ - Moved the logic entirely into opt_subreg_zext_lo32_rnd_hi32, thanks to Martin
+   for suggesting this.
+
+Differences v3->v4[1]:
+ - Moved the optimization against pointless zext into the correct place:
+   opt_subreg_zext_lo32_rnd_hi32 is called _after_ fixup_bpf_calls.
+
+Differences v2->v3[1]:
+ - Moved patching into fixup_bpf_calls (patch incoming to rename this function)
+ - Added extra commentary on bpf_jit_needs_zext
+ - Added check to avoid adding a pointless zext(r0) if there's already one there.
+
+Difference v1->v2[1]: Now solved centrally in the verifier instead of
+  specifically for the x86 JIT. Thanks to Ilya and Daniel for the suggestions!
+
+[1] v5: https://lore.kernel.org/bpf/CA+i-1C3ytZz6FjcPmUg5s4L51pMQDxWcZNvM86w4RHZ_o2khwg@mail.gmail.com/T/#t
+    v4: https://lore.kernel.org/bpf/CA+i-1C3ytZz6FjcPmUg5s4L51pMQDxWcZNvM86w4RHZ_o2khwg@mail.gmail.com/T/#t
+    v3: https://lore.kernel.org/bpf/08669818-c99d-0d30-e1db-53160c063611@iogearbox.net/T/#t
+    v2: https://lore.kernel.org/bpf/08669818-c99d-0d30-e1db-53160c063611@iogearbox.net/T/#t
+    v1: https://lore.kernel.org/bpf/d7ebaefb-bfd6-a441-3ff2-2fdfe699b1d2@iogearbox.net/T/#t
+
+Reported-by: Ilya Leoshkevich <iii@linux.ibm.com>
+Fixes: 5ffa25502b5a ("bpf: Add instructions for atomic_[cmp]xchg")
+Signed-off-by: Brendan Jackman <jackmanb@google.com>
+Acked-by: Martin KaFai Lau <kafai@fb.com>
+Acked-by: Ilya Leoshkevich <iii@linux.ibm.com>
+Tested-by: Ilya Leoshkevich <iii@linux.ibm.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ kernel/bpf/core.c                             |  4 +++
+ kernel/bpf/verifier.c                         | 19 +++++++++++++-
+ .../selftests/bpf/verifier/atomic_cmpxchg.c   | 25 +++++++++++++++++++
+ .../selftests/bpf/verifier/atomic_or.c        | 25 +++++++++++++++++++
+ 4 files changed, 72 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/bpf/core.c b/kernel/bpf/core.c
+index aa1e64196d8d..3a283bf97f2f 100644
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -2344,6 +2344,10 @@ bool __weak bpf_helper_changes_pkt_data(void *func)
+ /* Return TRUE if the JIT backend wants verifier to enable sub-register usage
+  * analysis code and wants explicit zero extension inserted by verifier.
+  * Otherwise, return FALSE.
++ *
++ * The verifier inserts an explicit zero extension after BPF_CMPXCHGs even if
++ * you don't override this. JITs that don't want these extra insns can detect
++ * them using insn_is_zext.
+  */
+ bool __weak bpf_jit_needs_zext(void)
+ {
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index bb3eaab934f3..c56e3fcb5f1a 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -504,6 +504,13 @@ static bool is_ptr_cast_function(enum bpf_func_id func_id)
+ 		func_id == BPF_FUNC_skc_to_tcp_request_sock;
+ }
+ 
++static bool is_cmpxchg_insn(const struct bpf_insn *insn)
++{
++	return BPF_CLASS(insn->code) == BPF_STX &&
++	       BPF_MODE(insn->code) == BPF_ATOMIC &&
++	       insn->imm == BPF_CMPXCHG;
++}
++
+ /* string representation of 'enum bpf_reg_type' */
+ static const char * const reg_type_str[] = {
+ 	[NOT_INIT]		= "?",
+@@ -11067,7 +11074,17 @@ static int opt_subreg_zext_lo32_rnd_hi32(struct bpf_verifier_env *env,
+ 			goto apply_patch_buffer;
+ 		}
+ 
+-		if (!bpf_jit_needs_zext())
++		/* Add in an zero-extend instruction if a) the JIT has requested
++		 * it or b) it's a CMPXCHG.
++		 *
++		 * The latter is because: BPF_CMPXCHG always loads a value into
++		 * R0, therefore always zero-extends. However some archs'
++		 * equivalent instruction only does this load when the
++		 * comparison is successful. This detail of CMPXCHG is
++		 * orthogonal to the general zero-extension behaviour of the
++		 * CPU, so it's treated independently of bpf_jit_needs_zext.
++		 */
++		if (!bpf_jit_needs_zext() && !is_cmpxchg_insn(&insn))
+ 			continue;
+ 
+ 		if (WARN_ON(load_reg == -1)) {
+diff --git a/tools/testing/selftests/bpf/verifier/atomic_cmpxchg.c b/tools/testing/selftests/bpf/verifier/atomic_cmpxchg.c
+index 2efd8bcf57a1..6e52dfc64415 100644
+--- a/tools/testing/selftests/bpf/verifier/atomic_cmpxchg.c
++++ b/tools/testing/selftests/bpf/verifier/atomic_cmpxchg.c
+@@ -94,3 +94,28 @@
+ 	.result = REJECT,
+ 	.errstr = "invalid read from stack",
+ },
++{
++	"BPF_W cmpxchg should zero top 32 bits",
++	.insns = {
++		/* r0 = U64_MAX; */
++		BPF_MOV64_IMM(BPF_REG_0, 0),
++		BPF_ALU64_IMM(BPF_SUB, BPF_REG_0, 1),
++		/* u64 val = r0; */
++		BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_0, -8),
++		/* r0 = (u32)atomic_cmpxchg((u32 *)&val, r0, 1); */
++		BPF_MOV32_IMM(BPF_REG_1, 1),
++		BPF_ATOMIC_OP(BPF_W, BPF_CMPXCHG, BPF_REG_10, BPF_REG_1, -8),
++		/* r1 = 0x00000000FFFFFFFFull; */
++		BPF_MOV64_IMM(BPF_REG_1, 1),
++		BPF_ALU64_IMM(BPF_LSH, BPF_REG_1, 32),
++		BPF_ALU64_IMM(BPF_SUB, BPF_REG_1, 1),
++		/* if (r0 != r1) exit(1); */
++		BPF_JMP_REG(BPF_JEQ, BPF_REG_0, BPF_REG_1, 2),
++		BPF_MOV32_IMM(BPF_REG_0, 1),
++		BPF_EXIT_INSN(),
++		/* exit(0); */
++		BPF_MOV32_IMM(BPF_REG_0, 0),
++		BPF_EXIT_INSN(),
++	},
++	.result = ACCEPT,
++},
+diff --git a/tools/testing/selftests/bpf/verifier/atomic_or.c b/tools/testing/selftests/bpf/verifier/atomic_or.c
+index 70f982e1f9f0..9d0716ac5080 100644
+--- a/tools/testing/selftests/bpf/verifier/atomic_or.c
++++ b/tools/testing/selftests/bpf/verifier/atomic_or.c
+@@ -75,3 +75,28 @@
+ 	},
+ 	.result = ACCEPT,
+ },
++{
++	"BPF_W atomic_fetch_or should zero top 32 bits",
++	.insns = {
++		/* r1 = U64_MAX; */
++		BPF_MOV64_IMM(BPF_REG_1, 0),
++		BPF_ALU64_IMM(BPF_SUB, BPF_REG_1, 1),
++		/* u64 val = r1; */
++		BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, -8),
++		/* r1 = (u32)atomic_fetch_or((u32 *)&val, 2); */
++		BPF_MOV32_IMM(BPF_REG_1, 2),
++		BPF_ATOMIC_OP(BPF_W, BPF_OR | BPF_FETCH, BPF_REG_10, BPF_REG_1, -8),
++		/* r2 = 0x00000000FFFFFFFF; */
++		BPF_MOV64_IMM(BPF_REG_2, 1),
++		BPF_ALU64_IMM(BPF_LSH, BPF_REG_2, 32),
++		BPF_ALU64_IMM(BPF_SUB, BPF_REG_2, 1),
++		/* if (r2 != r1) exit(1); */
++		BPF_JMP_REG(BPF_JEQ, BPF_REG_2, BPF_REG_1, 2),
++		BPF_MOV64_REG(BPF_REG_0, BPF_REG_1),
++		BPF_EXIT_INSN(),
++		/* exit(0); */
++		BPF_MOV32_IMM(BPF_REG_0, 0),
++		BPF_EXIT_INSN(),
++	},
++	.result = ACCEPT,
++},
+-- 
+2.34.1
+

@@ -1,0 +1,148 @@
+From 593f6d41abbbc63e1ad297f7a36ab6060a812f0c Mon Sep 17 00:00:00 2001
+Message-Id: <593f6d41abbbc63e1ad297f7a36ab6060a812f0c.1649664581.git.geliang.tang@suse.com>
+From: Florent Revest <revest@chromium.org>
+Date: Fri, 4 Dec 2020 12:36:07 +0100
+Subject: [PATCH] selftests/bpf: Add an iterator selftest for
+ bpf_sk_storage_delete
+Git-commit: 593f6d41abbbc63e1ad297f7a36ab6060a812f0c
+Patch-mainline: v5.11-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+The eBPF program iterates over all entries (well, only one) of a socket
+local storage map and deletes them all. The test makes sure that the
+entry is indeed deleted.
+
+Signed-off-by: Florent Revest <revest@google.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Martin KaFai Lau <kafai@fb.com>
+Link: https://lore.kernel.org/bpf/20201204113609.1850150-4-revest@google.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ .../selftests/bpf/prog_tests/bpf_iter.c       | 64 +++++++++++++++++++
+ .../progs/bpf_iter_bpf_sk_storage_helpers.c   | 23 +++++++
+ 2 files changed, 87 insertions(+)
+ create mode 100644 tools/testing/selftests/bpf/progs/bpf_iter_bpf_sk_storage_helpers.c
+
+diff --git a/tools/testing/selftests/bpf/prog_tests/bpf_iter.c b/tools/testing/selftests/bpf/prog_tests/bpf_iter.c
+index 448885b95eed..bb4a638f2e6f 100644
+--- a/tools/testing/selftests/bpf/prog_tests/bpf_iter.c
++++ b/tools/testing/selftests/bpf/prog_tests/bpf_iter.c
+@@ -20,6 +20,7 @@
+ #include "bpf_iter_bpf_percpu_hash_map.skel.h"
+ #include "bpf_iter_bpf_array_map.skel.h"
+ #include "bpf_iter_bpf_percpu_array_map.skel.h"
++#include "bpf_iter_bpf_sk_storage_helpers.skel.h"
+ #include "bpf_iter_bpf_sk_storage_map.skel.h"
+ #include "bpf_iter_test_kern5.skel.h"
+ #include "bpf_iter_test_kern6.skel.h"
+@@ -913,6 +914,67 @@ static void test_bpf_percpu_array_map(void)
+ 	bpf_iter_bpf_percpu_array_map__destroy(skel);
+ }
+ 
++/* An iterator program deletes all local storage in a map. */
++static void test_bpf_sk_storage_delete(void)
++{
++	DECLARE_LIBBPF_OPTS(bpf_iter_attach_opts, opts);
++	struct bpf_iter_bpf_sk_storage_helpers *skel;
++	union bpf_iter_link_info linfo;
++	int err, len, map_fd, iter_fd;
++	struct bpf_link *link;
++	int sock_fd = -1;
++	__u32 val = 42;
++	char buf[64];
++
++	skel = bpf_iter_bpf_sk_storage_helpers__open_and_load();
++	if (CHECK(!skel, "bpf_iter_bpf_sk_storage_helpers__open_and_load",
++		  "skeleton open_and_load failed\n"))
++		return;
++
++	map_fd = bpf_map__fd(skel->maps.sk_stg_map);
++
++	sock_fd = socket(AF_INET6, SOCK_STREAM, 0);
++	if (CHECK(sock_fd < 0, "socket", "errno: %d\n", errno))
++		goto out;
++	err = bpf_map_update_elem(map_fd, &sock_fd, &val, BPF_NOEXIST);
++	if (CHECK(err, "map_update", "map_update failed\n"))
++		goto out;
++
++	memset(&linfo, 0, sizeof(linfo));
++	linfo.map.map_fd = map_fd;
++	opts.link_info = &linfo;
++	opts.link_info_len = sizeof(linfo);
++	link = bpf_program__attach_iter(skel->progs.delete_bpf_sk_storage_map,
++					&opts);
++	if (CHECK(IS_ERR(link), "attach_iter", "attach_iter failed\n"))
++		goto out;
++
++	iter_fd = bpf_iter_create(bpf_link__fd(link));
++	if (CHECK(iter_fd < 0, "create_iter", "create_iter failed\n"))
++		goto free_link;
++
++	/* do some tests */
++	while ((len = read(iter_fd, buf, sizeof(buf))) > 0)
++		;
++	if (CHECK(len < 0, "read", "read failed: %s\n", strerror(errno)))
++		goto close_iter;
++
++	/* test results */
++	err = bpf_map_lookup_elem(map_fd, &sock_fd, &val);
++	if (CHECK(!err || errno != ENOENT, "bpf_map_lookup_elem",
++		  "map value wasn't deleted (err=%d, errno=%d)\n", err, errno))
++		goto close_iter;
++
++close_iter:
++	close(iter_fd);
++free_link:
++	bpf_link__destroy(link);
++out:
++	if (sock_fd >= 0)
++		close(sock_fd);
++	bpf_iter_bpf_sk_storage_helpers__destroy(skel);
++}
++
+ static void test_bpf_sk_storage_map(void)
+ {
+ 	DECLARE_LIBBPF_OPTS(bpf_iter_attach_opts, opts);
+@@ -1067,6 +1129,8 @@ void test_bpf_iter(void)
+ 		test_bpf_percpu_array_map();
+ 	if (test__start_subtest("bpf_sk_storage_map"))
+ 		test_bpf_sk_storage_map();
++	if (test__start_subtest("bpf_sk_storage_delete"))
++		test_bpf_sk_storage_delete();
+ 	if (test__start_subtest("rdonly-buf-out-of-bound"))
+ 		test_rdonly_buf_out_of_bound();
+ 	if (test__start_subtest("buf-neg-offset"))
+diff --git a/tools/testing/selftests/bpf/progs/bpf_iter_bpf_sk_storage_helpers.c b/tools/testing/selftests/bpf/progs/bpf_iter_bpf_sk_storage_helpers.c
+new file mode 100644
+index 000000000000..01ff3235e413
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/bpf_iter_bpf_sk_storage_helpers.c
+@@ -0,0 +1,23 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2020 Google LLC. */
++#include "bpf_iter.h"
++#include <bpf/bpf_helpers.h>
++#include <bpf/bpf_tracing.h>
++
++char _license[] SEC("license") = "GPL";
++
++struct {
++	__uint(type, BPF_MAP_TYPE_SK_STORAGE);
++	__uint(map_flags, BPF_F_NO_PREALLOC);
++	__type(key, int);
++	__type(value, int);
++} sk_stg_map SEC(".maps");
++
++SEC("iter/bpf_sk_storage_map")
++int delete_bpf_sk_storage_map(struct bpf_iter__bpf_sk_storage_map *ctx)
++{
++	if (ctx->sk)
++		bpf_sk_storage_delete(&sk_stg_map, ctx->sk);
++
++	return 0;
++}
+-- 
+2.34.1
+

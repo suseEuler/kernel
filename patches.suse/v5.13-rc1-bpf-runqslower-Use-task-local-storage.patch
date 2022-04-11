@@ -1,0 +1,130 @@
+From ced47e30ab8b3ed986e28411f63e041b51c1fdf8 Mon Sep 17 00:00:00 2001
+Message-Id: <ced47e30ab8b3ed986e28411f63e041b51c1fdf8.1649663376.git.geliang.tang@suse.com>
+From: Song Liu <songliubraving@fb.com>
+Date: Thu, 25 Feb 2021 15:43:19 -0800
+Subject: [PATCH] bpf: runqslower: Use task local storage
+Git-commit: ced47e30ab8b3ed986e28411f63e041b51c1fdf8
+Patch-mainline: v5.13-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+Replace hashtab with task local storage in runqslower. This improves the
+performance of these BPF programs. The following table summarizes average
+runtime of these programs, in nanoseconds:
+
+                          task-local   hash-prealloc   hash-no-prealloc
+handle__sched_wakeup             125             340               3124
+handle__sched_wakeup_new        2812            1510               2998
+handle__sched_switch             151             208                991
+
+Note that, task local storage gives better performance than hashtab for
+handle__sched_wakeup and handle__sched_switch. On the other hand, for
+handle__sched_wakeup_new, task local storage is slower than hashtab with
+prealloc. This is because handle__sched_wakeup_new accesses the data for
+the first time, so it has to allocate the data for task local storage.
+Once the initial allocation is done, subsequent accesses, as those in
+handle__sched_wakeup, are much faster with task local storage. If we
+disable hashtab prealloc, task local storage is much faster for all 3
+functions.
+
+Signed-off-by: Song Liu <songliubraving@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20210225234319.336131-7-songliubraving@fb.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/bpf/runqslower/runqslower.bpf.c | 33 +++++++++++++++++----------
+ 1 file changed, 21 insertions(+), 12 deletions(-)
+
+diff --git a/tools/bpf/runqslower/runqslower.bpf.c b/tools/bpf/runqslower/runqslower.bpf.c
+index 1f18a409f044..645530ca7e98 100644
+--- a/tools/bpf/runqslower/runqslower.bpf.c
++++ b/tools/bpf/runqslower/runqslower.bpf.c
+@@ -11,9 +11,9 @@ const volatile __u64 min_us = 0;
+ const volatile pid_t targ_pid = 0;
+ 
+ struct {
+-	__uint(type, BPF_MAP_TYPE_HASH);
+-	__uint(max_entries, 10240);
+-	__type(key, u32);
++	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
++	__uint(map_flags, BPF_F_NO_PREALLOC);
++	__type(key, int);
+ 	__type(value, u64);
+ } start SEC(".maps");
+ 
+@@ -25,15 +25,20 @@ struct {
+ 
+ /* record enqueue timestamp */
+ __always_inline
+-static int trace_enqueue(u32 tgid, u32 pid)
++static int trace_enqueue(struct task_struct *t)
+ {
+-	u64 ts;
++	u32 pid = t->pid;
++	u64 *ptr;
+ 
+ 	if (!pid || (targ_pid && targ_pid != pid))
+ 		return 0;
+ 
+-	ts = bpf_ktime_get_ns();
+-	bpf_map_update_elem(&start, &pid, &ts, 0);
++	ptr = bpf_task_storage_get(&start, t, 0,
++				   BPF_LOCAL_STORAGE_GET_F_CREATE);
++	if (!ptr)
++		return 0;
++
++	*ptr = bpf_ktime_get_ns();
+ 	return 0;
+ }
+ 
+@@ -43,7 +48,7 @@ int handle__sched_wakeup(u64 *ctx)
+ 	/* TP_PROTO(struct task_struct *p) */
+ 	struct task_struct *p = (void *)ctx[0];
+ 
+-	return trace_enqueue(p->tgid, p->pid);
++	return trace_enqueue(p);
+ }
+ 
+ SEC("tp_btf/sched_wakeup_new")
+@@ -52,7 +57,7 @@ int handle__sched_wakeup_new(u64 *ctx)
+ 	/* TP_PROTO(struct task_struct *p) */
+ 	struct task_struct *p = (void *)ctx[0];
+ 
+-	return trace_enqueue(p->tgid, p->pid);
++	return trace_enqueue(p);
+ }
+ 
+ SEC("tp_btf/sched_switch")
+@@ -70,12 +75,16 @@ int handle__sched_switch(u64 *ctx)
+ 
+ 	/* ivcsw: treat like an enqueue event and store timestamp */
+ 	if (prev->state == TASK_RUNNING)
+-		trace_enqueue(prev->tgid, prev->pid);
++		trace_enqueue(prev);
+ 
+ 	pid = next->pid;
+ 
++	/* For pid mismatch, save a bpf_task_storage_get */
++	if (!pid || (targ_pid && targ_pid != pid))
++		return 0;
++
+ 	/* fetch timestamp and calculate delta */
+-	tsp = bpf_map_lookup_elem(&start, &pid);
++	tsp = bpf_task_storage_get(&start, next, 0, 0);
+ 	if (!tsp)
+ 		return 0;   /* missed enqueue */
+ 
+@@ -91,7 +100,7 @@ int handle__sched_switch(u64 *ctx)
+ 	bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU,
+ 			      &event, sizeof(event));
+ 
+-	bpf_map_delete_elem(&start, &pid);
++	bpf_task_storage_delete(&start, next);
+ 	return 0;
+ }
+ 
+-- 
+2.34.1
+

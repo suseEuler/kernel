@@ -1,0 +1,86 @@
+From fa4528379a51ff8d5271e1bcfa0d5ef71657869f Mon Sep 17 00:00:00 2001
+Message-Id: <fa4528379a51ff8d5271e1bcfa0d5ef71657869f.1649664846.git.geliang.tang@suse.com>
+From: Andrii Nakryiko <andrii@kernel.org>
+Date: Tue, 1 Dec 2020 22:52:43 -0800
+Subject: [PATCH] tools/bpftool: Auto-detect split BTFs in common cases
+Git-commit: fa4528379a51ff8d5271e1bcfa0d5ef71657869f
+Patch-mainline: v5.11-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+In case of working with module's split BTF from /sys/kernel/btf/*,
+auto-substitute /sys/kernel/btf/vmlinux as the base BTF. This makes using
+bpftool with module BTFs faster and simpler.
+
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20201202065244.530571-4-andrii@kernel.org
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/bpf/bpftool/btf.c | 25 +++++++++++++++++++++----
+ 1 file changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/tools/bpf/bpftool/btf.c b/tools/bpf/bpftool/btf.c
+index bd46af6a61cc..94cd3bad5430 100644
+--- a/tools/bpf/bpftool/btf.c
++++ b/tools/bpf/bpftool/btf.c
+@@ -357,11 +357,13 @@ static int dump_btf_raw(const struct btf *btf,
+ 			dump_btf_type(btf, root_type_ids[i], t);
+ 		}
+ 	} else {
++		const struct btf *base;
+ 		int cnt = btf__get_nr_types(btf);
+ 		int start_id = 1;
+ 
+-		if (base_btf)
+-			start_id = btf__get_nr_types(base_btf) + 1;
++		base = btf__base_btf(btf);
++		if (base)
++			start_id = btf__get_nr_types(base) + 1;
+ 
+ 		for (i = start_id; i <= cnt; i++) {
+ 			t = btf__type_by_id(btf, i);
+@@ -428,7 +430,7 @@ static int dump_btf_c(const struct btf *btf,
+ 
+ static int do_dump(int argc, char **argv)
+ {
+-	struct btf *btf = NULL;
++	struct btf *btf = NULL, *base = NULL;
+ 	__u32 root_type_ids[2];
+ 	int root_type_cnt = 0;
+ 	bool dump_c = false;
+@@ -502,7 +504,21 @@ static int do_dump(int argc, char **argv)
+ 		}
+ 		NEXT_ARG();
+ 	} else if (is_prefix(src, "file")) {
+-		btf = btf__parse_split(*argv, base_btf);
++		const char sysfs_prefix[] = "/sys/kernel/btf/";
++		const char sysfs_vmlinux[] = "/sys/kernel/btf/vmlinux";
++
++		if (!base_btf &&
++		    strncmp(*argv, sysfs_prefix, sizeof(sysfs_prefix) - 1) == 0 &&
++		    strcmp(*argv, sysfs_vmlinux) != 0) {
++			base = btf__parse(sysfs_vmlinux, NULL);
++			if (libbpf_get_error(base)) {
++				p_err("failed to parse vmlinux BTF at '%s': %ld\n",
++				      sysfs_vmlinux, libbpf_get_error(base));
++				base = NULL;
++			}
++		}
++
++		btf = btf__parse_split(*argv, base ?: base_btf);
+ 		if (IS_ERR(btf)) {
+ 			err = -PTR_ERR(btf);
+ 			btf = NULL;
+@@ -567,6 +583,7 @@ static int do_dump(int argc, char **argv)
+ done:
+ 	close(fd);
+ 	btf__free(btf);
++	btf__free(base);
+ 	return err;
+ }
+ 
+-- 
+2.34.1
+

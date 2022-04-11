@@ -1,0 +1,329 @@
+From 22541a9eeb0d968c133aaebd95fa59da3208e705 Mon Sep 17 00:00:00 2001
+Message-Id: <22541a9eeb0d968c133aaebd95fa59da3208e705.1649663163.git.geliang.tang@suse.com>
+From: Ilya Leoshkevich <iii@linux.ibm.com>
+Date: Fri, 26 Feb 2021 21:22:49 +0100
+Subject: [PATCH] libbpf: Add BTF_KIND_FLOAT support
+Git-commit: 22541a9eeb0d968c133aaebd95fa59da3208e705
+Patch-mainline: v5.13-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+The logic follows that of BTF_KIND_INT most of the time. Sanitization
+replaces BTF_KIND_FLOATs with equally-sized empty BTF_KIND_STRUCTs on
+older kernels, for example, the following:
+
+    [4] FLOAT 'float' size=4
+
+becomes the following:
+
+    [4] STRUCT '(anon)' size=4 vlen=0
+
+With dwarves patch [1] and this patch, the older kernels, which were
+failing with the floating-point-related errors, will now start working
+correctly.
+
+[1] https://github.com/iii-i/dwarves/commit/btf-kind-float-v2
+
+Signed-off-by: Ilya Leoshkevich <iii@linux.ibm.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20210226202256.116518-4-iii@linux.ibm.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/lib/bpf/btf.c             | 49 +++++++++++++++++++++++++++++++++
+ tools/lib/bpf/btf.h             |  6 ++++
+ tools/lib/bpf/btf_dump.c        |  4 +++
+ tools/lib/bpf/libbpf.c          | 29 ++++++++++++++++++-
+ tools/lib/bpf/libbpf.map        |  5 ++++
+ tools/lib/bpf/libbpf_internal.h |  2 ++
+ 6 files changed, 94 insertions(+), 1 deletion(-)
+
+diff --git a/tools/lib/bpf/btf.c b/tools/lib/bpf/btf.c
+index 0797ab714830..3aa58f2ac183 100644
+--- a/tools/lib/bpf/btf.c
++++ b/tools/lib/bpf/btf.c
+@@ -291,6 +291,7 @@ static int btf_type_size(const struct btf_type *t)
+ 	case BTF_KIND_PTR:
+ 	case BTF_KIND_TYPEDEF:
+ 	case BTF_KIND_FUNC:
++	case BTF_KIND_FLOAT:
+ 		return base_size;
+ 	case BTF_KIND_INT:
+ 		return base_size + sizeof(__u32);
+@@ -338,6 +339,7 @@ static int btf_bswap_type_rest(struct btf_type *t)
+ 	case BTF_KIND_PTR:
+ 	case BTF_KIND_TYPEDEF:
+ 	case BTF_KIND_FUNC:
++	case BTF_KIND_FLOAT:
+ 		return 0;
+ 	case BTF_KIND_INT:
+ 		*(__u32 *)(t + 1) = bswap_32(*(__u32 *)(t + 1));
+@@ -578,6 +580,7 @@ __s64 btf__resolve_size(const struct btf *btf, __u32 type_id)
+ 		case BTF_KIND_UNION:
+ 		case BTF_KIND_ENUM:
+ 		case BTF_KIND_DATASEC:
++		case BTF_KIND_FLOAT:
+ 			size = t->size;
+ 			goto done;
+ 		case BTF_KIND_PTR:
+@@ -621,6 +624,7 @@ int btf__align_of(const struct btf *btf, __u32 id)
+ 	switch (kind) {
+ 	case BTF_KIND_INT:
+ 	case BTF_KIND_ENUM:
++	case BTF_KIND_FLOAT:
+ 		return min(btf_ptr_sz(btf), (size_t)t->size);
+ 	case BTF_KIND_PTR:
+ 		return btf_ptr_sz(btf);
+@@ -1756,6 +1760,47 @@ int btf__add_int(struct btf *btf, const char *name, size_t byte_sz, int encoding
+ 	return btf_commit_type(btf, sz);
+ }
+ 
++/*
++ * Append new BTF_KIND_FLOAT type with:
++ *   - *name* - non-empty, non-NULL type name;
++ *   - *sz* - size of the type, in bytes;
++ * Returns:
++ *   - >0, type ID of newly added BTF type;
++ *   - <0, on error.
++ */
++int btf__add_float(struct btf *btf, const char *name, size_t byte_sz)
++{
++	struct btf_type *t;
++	int sz, name_off;
++
++	/* non-empty name */
++	if (!name || !name[0])
++		return -EINVAL;
++
++	/* byte_sz must be one of the explicitly allowed values */
++	if (byte_sz != 2 && byte_sz != 4 && byte_sz != 8 && byte_sz != 12 &&
++	    byte_sz != 16)
++		return -EINVAL;
++
++	if (btf_ensure_modifiable(btf))
++		return -ENOMEM;
++
++	sz = sizeof(struct btf_type);
++	t = btf_add_type_mem(btf, sz);
++	if (!t)
++		return -ENOMEM;
++
++	name_off = btf__add_str(btf, name);
++	if (name_off < 0)
++		return name_off;
++
++	t->name_off = name_off;
++	t->info = btf_type_info(BTF_KIND_FLOAT, 0, 0);
++	t->size = byte_sz;
++
++	return btf_commit_type(btf, sz);
++}
++
+ /* it's completely legal to append BTF types with type IDs pointing forward to
+  * types that haven't been appended yet, so we only make sure that id looks
+  * sane, we can't guarantee that ID will always be valid
+@@ -3626,6 +3671,7 @@ static int btf_dedup_prep(struct btf_dedup *d)
+ 		case BTF_KIND_FWD:
+ 		case BTF_KIND_TYPEDEF:
+ 		case BTF_KIND_FUNC:
++		case BTF_KIND_FLOAT:
+ 			h = btf_hash_common(t);
+ 			break;
+ 		case BTF_KIND_INT:
+@@ -3722,6 +3768,7 @@ static int btf_dedup_prim_type(struct btf_dedup *d, __u32 type_id)
+ 		break;
+ 
+ 	case BTF_KIND_FWD:
++	case BTF_KIND_FLOAT:
+ 		h = btf_hash_common(t);
+ 		for_each_dedup_cand(d, hash_entry, h) {
+ 			cand_id = (__u32)(long)hash_entry->value;
+@@ -3983,6 +4030,7 @@ static int btf_dedup_is_equiv(struct btf_dedup *d, __u32 cand_id,
+ 			return btf_compat_enum(cand_type, canon_type);
+ 
+ 	case BTF_KIND_FWD:
++	case BTF_KIND_FLOAT:
+ 		return btf_equal_common(cand_type, canon_type);
+ 
+ 	case BTF_KIND_CONST:
+@@ -4479,6 +4527,7 @@ static int btf_dedup_remap_type(struct btf_dedup *d, __u32 type_id)
+ 	switch (btf_kind(t)) {
+ 	case BTF_KIND_INT:
+ 	case BTF_KIND_ENUM:
++	case BTF_KIND_FLOAT:
+ 		break;
+ 
+ 	case BTF_KIND_FWD:
+diff --git a/tools/lib/bpf/btf.h b/tools/lib/bpf/btf.h
+index 1237bcd1dd17..029a9cfc8c2d 100644
+--- a/tools/lib/bpf/btf.h
++++ b/tools/lib/bpf/btf.h
+@@ -95,6 +95,7 @@ LIBBPF_API int btf__find_str(struct btf *btf, const char *s);
+ LIBBPF_API int btf__add_str(struct btf *btf, const char *s);
+ 
+ LIBBPF_API int btf__add_int(struct btf *btf, const char *name, size_t byte_sz, int encoding);
++LIBBPF_API int btf__add_float(struct btf *btf, const char *name, size_t byte_sz);
+ LIBBPF_API int btf__add_ptr(struct btf *btf, int ref_type_id);
+ LIBBPF_API int btf__add_array(struct btf *btf,
+ 			      int index_type_id, int elem_type_id, __u32 nr_elems);
+@@ -294,6 +295,11 @@ static inline bool btf_is_datasec(const struct btf_type *t)
+ 	return btf_kind(t) == BTF_KIND_DATASEC;
+ }
+ 
++static inline bool btf_is_float(const struct btf_type *t)
++{
++	return btf_kind(t) == BTF_KIND_FLOAT;
++}
++
+ static inline __u8 btf_int_encoding(const struct btf_type *t)
+ {
+ 	return BTF_INT_ENCODING(*(__u32 *)(t + 1));
+diff --git a/tools/lib/bpf/btf_dump.c b/tools/lib/bpf/btf_dump.c
+index 2f9d685bd522..5e957fcceee6 100644
+--- a/tools/lib/bpf/btf_dump.c
++++ b/tools/lib/bpf/btf_dump.c
+@@ -279,6 +279,7 @@ static int btf_dump_mark_referenced(struct btf_dump *d)
+ 		case BTF_KIND_INT:
+ 		case BTF_KIND_ENUM:
+ 		case BTF_KIND_FWD:
++		case BTF_KIND_FLOAT:
+ 			break;
+ 
+ 		case BTF_KIND_VOLATILE:
+@@ -453,6 +454,7 @@ static int btf_dump_order_type(struct btf_dump *d, __u32 id, bool through_ptr)
+ 
+ 	switch (btf_kind(t)) {
+ 	case BTF_KIND_INT:
++	case BTF_KIND_FLOAT:
+ 		tstate->order_state = ORDERED;
+ 		return 0;
+ 
+@@ -1133,6 +1135,7 @@ static void btf_dump_emit_type_decl(struct btf_dump *d, __u32 id,
+ 		case BTF_KIND_STRUCT:
+ 		case BTF_KIND_UNION:
+ 		case BTF_KIND_TYPEDEF:
++		case BTF_KIND_FLOAT:
+ 			goto done;
+ 		default:
+ 			pr_warn("unexpected type in decl chain, kind:%u, id:[%u]\n",
+@@ -1247,6 +1250,7 @@ static void btf_dump_emit_type_chain(struct btf_dump *d,
+ 
+ 		switch (kind) {
+ 		case BTF_KIND_INT:
++		case BTF_KIND_FLOAT:
+ 			btf_dump_emit_mods(d, decls);
+ 			name = btf_name_of(d, t->name_off);
+ 			btf_dump_printf(d, "%s", name);
+diff --git a/tools/lib/bpf/libbpf.c b/tools/lib/bpf/libbpf.c
+index 62d9ed56b081..2f351d3ad3e7 100644
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@ -178,6 +178,8 @@ enum kern_feature_id {
+ 	FEAT_PROG_BIND_MAP,
+ 	/* Kernel support for module BTFs */
+ 	FEAT_MODULE_BTF,
++	/* BTF_KIND_FLOAT support */
++	FEAT_BTF_FLOAT,
+ 	__FEAT_CNT,
+ };
+ 
+@@ -1946,6 +1948,7 @@ static const char *btf_kind_str(const struct btf_type *t)
+ 	case BTF_KIND_FUNC_PROTO: return "func_proto";
+ 	case BTF_KIND_VAR: return "var";
+ 	case BTF_KIND_DATASEC: return "datasec";
++	case BTF_KIND_FLOAT: return "float";
+ 	default: return "unknown";
+ 	}
+ }
+@@ -2395,15 +2398,17 @@ static bool btf_needs_sanitization(struct bpf_object *obj)
+ {
+ 	bool has_func_global = kernel_supports(FEAT_BTF_GLOBAL_FUNC);
+ 	bool has_datasec = kernel_supports(FEAT_BTF_DATASEC);
++	bool has_float = kernel_supports(FEAT_BTF_FLOAT);
+ 	bool has_func = kernel_supports(FEAT_BTF_FUNC);
+ 
+-	return !has_func || !has_datasec || !has_func_global;
++	return !has_func || !has_datasec || !has_func_global || !has_float;
+ }
+ 
+ static void bpf_object__sanitize_btf(struct bpf_object *obj, struct btf *btf)
+ {
+ 	bool has_func_global = kernel_supports(FEAT_BTF_GLOBAL_FUNC);
+ 	bool has_datasec = kernel_supports(FEAT_BTF_DATASEC);
++	bool has_float = kernel_supports(FEAT_BTF_FLOAT);
+ 	bool has_func = kernel_supports(FEAT_BTF_FUNC);
+ 	struct btf_type *t;
+ 	int i, j, vlen;
+@@ -2456,6 +2461,13 @@ static void bpf_object__sanitize_btf(struct bpf_object *obj, struct btf *btf)
+ 		} else if (!has_func_global && btf_is_func(t)) {
+ 			/* replace BTF_FUNC_GLOBAL with BTF_FUNC_STATIC */
+ 			t->info = BTF_INFO_ENC(BTF_KIND_FUNC, 0, 0);
++		} else if (!has_float && btf_is_float(t)) {
++			/* replace FLOAT with an equally-sized empty STRUCT;
++			 * since C compilers do not accept e.g. "float" as a
++			 * valid struct name, make it anonymous
++			 */
++			t->name_off = 0;
++			t->info = BTF_INFO_ENC(BTF_KIND_STRUCT, 0, 0);
+ 		}
+ 	}
+ }
+@@ -3927,6 +3939,18 @@ static int probe_kern_btf_datasec(void)
+ 					     strs, sizeof(strs)));
+ }
+ 
++static int probe_kern_btf_float(void)
++{
++	static const char strs[] = "\0float";
++	__u32 types[] = {
++		/* float */
++		BTF_TYPE_FLOAT_ENC(1, 4),
++	};
++
++	return probe_fd(libbpf__load_raw_btf((char *)types, sizeof(types),
++					     strs, sizeof(strs)));
++}
++
+ static int probe_kern_array_mmap(void)
+ {
+ 	struct bpf_create_map_attr attr = {
+@@ -4106,6 +4130,9 @@ static struct kern_feature_desc {
+ 	[FEAT_MODULE_BTF] = {
+ 		"module BTF support", probe_module_btf,
+ 	},
++	[FEAT_BTF_FLOAT] = {
++		"BTF_KIND_FLOAT support", probe_kern_btf_float,
++	},
+ };
+ 
+ static bool kernel_supports(enum kern_feature_id feat_id)
+diff --git a/tools/lib/bpf/libbpf.map b/tools/lib/bpf/libbpf.map
+index 1c0fd2dd233a..ec898f464ab9 100644
+--- a/tools/lib/bpf/libbpf.map
++++ b/tools/lib/bpf/libbpf.map
+@@ -350,3 +350,8 @@ LIBBPF_0.3.0 {
+ 		xsk_setup_xdp_prog;
+ 		xsk_socket__update_xskmap;
+ } LIBBPF_0.2.0;
++
++LIBBPF_0.4.0 {
++	global:
++		btf__add_float;
++} LIBBPF_0.3.0;
+diff --git a/tools/lib/bpf/libbpf_internal.h b/tools/lib/bpf/libbpf_internal.h
+index 969d0ac592ba..343f6eb05637 100644
+--- a/tools/lib/bpf/libbpf_internal.h
++++ b/tools/lib/bpf/libbpf_internal.h
+@@ -31,6 +31,8 @@
+ #define BTF_MEMBER_ENC(name, type, bits_offset) (name), (type), (bits_offset)
+ #define BTF_PARAM_ENC(name, type) (name), (type)
+ #define BTF_VAR_SECINFO_ENC(type, offset, size) (type), (offset), (size)
++#define BTF_TYPE_FLOAT_ENC(name, sz) \
++	BTF_TYPE_ENC(name, BTF_INFO_ENC(BTF_KIND_FLOAT, 0, 0), sz)
+ 
+ #ifndef likely
+ #define likely(x) __builtin_expect(!!(x), 1)
+-- 
+2.34.1
+

@@ -1,0 +1,78 @@
+From c77cec5c207b68a3cbc2af2f81070ec428f41145 Mon Sep 17 00:00:00 2001
+Message-Id: <c77cec5c207b68a3cbc2af2f81070ec428f41145.1649661818.git.geliang.tang@suse.com>
+From: Dave Marchevsky <davemarchevsky@fb.com>
+Date: Fri, 16 Apr 2021 13:47:04 -0700
+Subject: [PATCH] bpf/selftests: Add bpf_get_task_stack retval bounds test_prog
+Git-commit: c77cec5c207b68a3cbc2af2f81070ec428f41145
+Patch-mainline: v5.13-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+Add a libbpf test prog which feeds bpf_get_task_stack's return value
+into seq_write after confirming it's positive. No attempt to bound the
+value from above is made.
+
+Load will fail if verifier does not refine retval range based on buf sz
+input to bpf_get_task_stack.
+
+Signed-off-by: Dave Marchevsky <davemarchevsky@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Song Liu <songliubraving@fb.com>
+Link: https://lore.kernel.org/bpf/20210416204704.2816874-4-davemarchevsky@fb.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ .../selftests/bpf/prog_tests/bpf_iter.c       |  1 +
+ .../selftests/bpf/progs/bpf_iter_task_stack.c | 27 +++++++++++++++++++
+ 2 files changed, 28 insertions(+)
+
+diff --git a/tools/testing/selftests/bpf/prog_tests/bpf_iter.c b/tools/testing/selftests/bpf/prog_tests/bpf_iter.c
+index 74c45d557a2b..2d3590cfb5e1 100644
+--- a/tools/testing/selftests/bpf/prog_tests/bpf_iter.c
++++ b/tools/testing/selftests/bpf/prog_tests/bpf_iter.c
+@@ -147,6 +147,7 @@ static void test_task_stack(void)
+ 		return;
+ 
+ 	do_dummy_read(skel->progs.dump_task_stack);
++	do_dummy_read(skel->progs.get_task_user_stacks);
+ 
+ 	bpf_iter_task_stack__destroy(skel);
+ }
+diff --git a/tools/testing/selftests/bpf/progs/bpf_iter_task_stack.c b/tools/testing/selftests/bpf/progs/bpf_iter_task_stack.c
+index 50e59a2e142e..43c36f5f7649 100644
+--- a/tools/testing/selftests/bpf/progs/bpf_iter_task_stack.c
++++ b/tools/testing/selftests/bpf/progs/bpf_iter_task_stack.c
+@@ -35,3 +35,30 @@ int dump_task_stack(struct bpf_iter__task *ctx)
+ 
+ 	return 0;
+ }
++
++SEC("iter/task")
++int get_task_user_stacks(struct bpf_iter__task *ctx)
++{
++	struct seq_file *seq = ctx->meta->seq;
++	struct task_struct *task = ctx->task;
++	uint64_t buf_sz = 0;
++	int64_t res;
++
++	if (task == (void *)0)
++		return 0;
++
++	res = bpf_get_task_stack(task, entries,
++			MAX_STACK_TRACE_DEPTH * SIZE_OF_ULONG, BPF_F_USER_STACK);
++	if (res <= 0)
++		return 0;
++
++	buf_sz += res;
++
++	/* If the verifier doesn't refine bpf_get_task_stack res, and instead
++	 * assumes res is entirely unknown, this program will fail to load as
++	 * the verifier will believe that max buf_sz value allows reading
++	 * past the end of entries in bpf_seq_write call
++	 */
++	bpf_seq_write(seq, &entries, buf_sz);
++	return 0;
++}
+-- 
+2.34.1
+

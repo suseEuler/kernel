@@ -1,0 +1,231 @@
+From 86a35af628e539f7ae9796f1984761e8d3232ac0 Mon Sep 17 00:00:00 2001
+Message-Id: <86a35af628e539f7ae9796f1984761e8d3232ac0.1649663183.git.geliang.tang@suse.com>
+From: Yonghong Song <yhs@fb.com>
+Date: Fri, 26 Feb 2021 14:38:10 -0800
+Subject: [PATCH] selftests/bpf: Add a verifier scale test with unknown bounded
+ loop
+Git-commit: 86a35af628e539f7ae9796f1984761e8d3232ac0
+Patch-mainline: v5.13-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+The original bcc pull request https://github.com/iovisor/bcc/pull/3270 exposed
+a verifier failure with Clang 12/13 while Clang 4 works fine.
+
+Further investigation exposed two issues:
+
+  Issue 1: LLVM may generate code which uses less refined value. The issue is
+           fixed in LLVM patch: https://reviews.llvm.org/D97479
+
+  Issue 2: Spills with initial value 0 are marked as precise which makes later
+           state pruning less effective. This is my rough initial analysis and
+           further investigation is needed to find how to improve verifier
+           pruning in such cases.
+
+With the above LLVM patch, for the new loop6.c test, which has smaller loop
+bound compared to original test, I got:
+
+  $ test_progs -s -n 10/16
+  ...
+  stack depth 64
+  processed 390735 insns (limit 1000000) max_states_per_insn 87
+      total_states 8658 peak_states 964 mark_read 6
+  #10/16 loop6.o:OK
+
+Use the original loop bound, i.e., commenting out "#define WORKAROUND", I got:
+
+  $ test_progs -s -n 10/16
+  ...
+  BPF program is too large. Processed 1000001 insn
+  stack depth 64
+  processed 1000001 insns (limit 1000000) max_states_per_insn 91
+      total_states 23176 peak_states 5069 mark_read 6
+  ...
+  #10/16 loop6.o:FAIL
+
+The purpose of this patch is to provide a regression test for the above LLVM fix
+and also provide a test case for further analyzing the verifier pruning issue.
+
+Signed-off-by: Yonghong Song <yhs@fb.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Cc: Zhenwei Pi <pizhenwei@bytedance.com>
+Link: https://lore.kernel.org/bpf/20210226223810.236472-1-yhs@fb.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/testing/selftests/bpf/README.rst        | 39 ++++++++
+ .../bpf/prog_tests/bpf_verif_scale.c          |  1 +
+ tools/testing/selftests/bpf/progs/loop6.c     | 99 +++++++++++++++++++
+ 3 files changed, 139 insertions(+)
+ create mode 100644 tools/testing/selftests/bpf/progs/loop6.c
+
+diff --git a/tools/testing/selftests/bpf/README.rst b/tools/testing/selftests/bpf/README.rst
+index fd148b8410fa..dbc8f6cc5c67 100644
+--- a/tools/testing/selftests/bpf/README.rst
++++ b/tools/testing/selftests/bpf/README.rst
+@@ -111,6 +111,45 @@ available in 10.0.1. The patch is available in llvm 11.0.0 trunk.
+ 
+ __  https://reviews.llvm.org/D78466
+ 
++bpf_verif_scale/loop6.o test failure with Clang 12
++==================================================
++
++With Clang 12, the following bpf_verif_scale test failed:
++  * ``bpf_verif_scale/loop6.o``
++
++The verifier output looks like
++
++.. code-block:: c
++
++  R1 type=ctx expected=fp
++  The sequence of 8193 jumps is too complex.
++
++The reason is compiler generating the following code
++
++.. code-block:: c
++
++  ;       for (i = 0; (i < VIRTIO_MAX_SGS) && (i < num); i++) {
++      14:       16 05 40 00 00 00 00 00 if w5 == 0 goto +64 <LBB0_6>
++      15:       bc 51 00 00 00 00 00 00 w1 = w5
++      16:       04 01 00 00 ff ff ff ff w1 += -1
++      17:       67 05 00 00 20 00 00 00 r5 <<= 32
++      18:       77 05 00 00 20 00 00 00 r5 >>= 32
++      19:       a6 01 01 00 05 00 00 00 if w1 < 5 goto +1 <LBB0_4>
++      20:       b7 05 00 00 06 00 00 00 r5 = 6
++  00000000000000a8 <LBB0_4>:
++      21:       b7 02 00 00 00 00 00 00 r2 = 0
++      22:       b7 01 00 00 00 00 00 00 r1 = 0
++  ;       for (i = 0; (i < VIRTIO_MAX_SGS) && (i < num); i++) {
++      23:       7b 1a e0 ff 00 00 00 00 *(u64 *)(r10 - 32) = r1
++      24:       7b 5a c0 ff 00 00 00 00 *(u64 *)(r10 - 64) = r5
++
++Note that insn #15 has w1 = w5 and w1 is refined later but
++r5(w5) is eventually saved on stack at insn #24 for later use.
++This cause later verifier failure. The bug has been `fixed`__ in
++Clang 13.
++
++__  https://reviews.llvm.org/D97479
++
+ BPF CO-RE-based tests and Clang version
+ =======================================
+ 
+diff --git a/tools/testing/selftests/bpf/prog_tests/bpf_verif_scale.c b/tools/testing/selftests/bpf/prog_tests/bpf_verif_scale.c
+index e698ee6bb6c2..3d002c245d2b 100644
+--- a/tools/testing/selftests/bpf/prog_tests/bpf_verif_scale.c
++++ b/tools/testing/selftests/bpf/prog_tests/bpf_verif_scale.c
+@@ -76,6 +76,7 @@ void test_bpf_verif_scale(void)
+ 		{ "loop2.o", BPF_PROG_TYPE_RAW_TRACEPOINT },
+ 		{ "loop4.o", BPF_PROG_TYPE_SCHED_CLS },
+ 		{ "loop5.o", BPF_PROG_TYPE_SCHED_CLS },
++		{ "loop6.o", BPF_PROG_TYPE_KPROBE },
+ 
+ 		/* partial unroll. 19k insn in a loop.
+ 		 * Total program size 20.8k insn.
+diff --git a/tools/testing/selftests/bpf/progs/loop6.c b/tools/testing/selftests/bpf/progs/loop6.c
+new file mode 100644
+index 000000000000..2a7141ac1656
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/loop6.c
+@@ -0,0 +1,99 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include <linux/ptrace.h>
++#include <stddef.h>
++#include <linux/bpf.h>
++#include <bpf/bpf_helpers.h>
++#include <bpf/bpf_tracing.h>
++
++char _license[] SEC("license") = "GPL";
++
++/* typically virtio scsi has max SGs of 6 */
++#define VIRTIO_MAX_SGS	6
++
++/* Verifier will fail with SG_MAX = 128. The failure can be
++ * workarounded with a smaller SG_MAX, e.g. 10.
++ */
++#define WORKAROUND
++#ifdef WORKAROUND
++#define SG_MAX		10
++#else
++/* typically virtio blk has max SEG of 128 */
++#define SG_MAX		128
++#endif
++
++#define SG_CHAIN	0x01UL
++#define SG_END		0x02UL
++
++struct scatterlist {
++	unsigned long   page_link;
++	unsigned int    offset;
++	unsigned int    length;
++};
++
++#define sg_is_chain(sg)		((sg)->page_link & SG_CHAIN)
++#define sg_is_last(sg)		((sg)->page_link & SG_END)
++#define sg_chain_ptr(sg)	\
++	((struct scatterlist *) ((sg)->page_link & ~(SG_CHAIN | SG_END)))
++
++static inline struct scatterlist *__sg_next(struct scatterlist *sgp)
++{
++	struct scatterlist sg;
++
++	bpf_probe_read_kernel(&sg, sizeof(sg), sgp);
++	if (sg_is_last(&sg))
++		return NULL;
++
++	sgp++;
++
++	bpf_probe_read_kernel(&sg, sizeof(sg), sgp);
++	if (sg_is_chain(&sg))
++		sgp = sg_chain_ptr(&sg);
++
++	return sgp;
++}
++
++static inline struct scatterlist *get_sgp(struct scatterlist **sgs, int i)
++{
++	struct scatterlist *sgp;
++
++	bpf_probe_read_kernel(&sgp, sizeof(sgp), sgs + i);
++	return sgp;
++}
++
++int config = 0;
++int result = 0;
++
++SEC("kprobe/virtqueue_add_sgs")
++BPF_KPROBE(trace_virtqueue_add_sgs, void *unused, struct scatterlist **sgs,
++	   unsigned int out_sgs, unsigned int in_sgs)
++{
++	struct scatterlist *sgp = NULL;
++	__u64 length1 = 0, length2 = 0;
++	unsigned int i, n, len;
++
++	if (config != 0)
++		return 0;
++
++	for (i = 0; (i < VIRTIO_MAX_SGS) && (i < out_sgs); i++) {
++		for (n = 0, sgp = get_sgp(sgs, i); sgp && (n < SG_MAX);
++		     sgp = __sg_next(sgp)) {
++			bpf_probe_read_kernel(&len, sizeof(len), &sgp->length);
++			length1 += len;
++			n++;
++		}
++	}
++
++	for (i = 0; (i < VIRTIO_MAX_SGS) && (i < in_sgs); i++) {
++		for (n = 0, sgp = get_sgp(sgs, i); sgp && (n < SG_MAX);
++		     sgp = __sg_next(sgp)) {
++			bpf_probe_read_kernel(&len, sizeof(len), &sgp->length);
++			length2 += len;
++			n++;
++		}
++	}
++
++	config = 1;
++	result = length2 - length1;
++	return 0;
++}
+-- 
+2.34.1
+

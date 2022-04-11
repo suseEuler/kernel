@@ -1,0 +1,89 @@
+From 36e7985160782bc683001afe09e33a288435def0 Mon Sep 17 00:00:00 2001
+Message-Id: <36e7985160782bc683001afe09e33a288435def0.1649662493.git.geliang.tang@suse.com>
+From: Andrii Nakryiko <andrii@kernel.org>
+Date: Thu, 25 Mar 2021 21:30:36 -0700
+Subject: [PATCH] libbpf: Preserve empty DATASEC BTFs during static linking
+Git-commit: 36e7985160782bc683001afe09e33a288435def0
+Patch-mainline: v5.13-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+Ensure that BPF static linker preserves all DATASEC BTF types, even if some of
+them might not have any variable information at all. This may happen if the
+compiler promotes local initialized variable contents into .rodata section and
+there are no global or static functions in the program.
+
+For example,
+
+  $ cat t.c
+  struct t { char a; char b; char c; };
+  void bar(struct t*);
+  void find() {
+     struct t tmp = {1, 2, 3};
+     bar(&tmp);
+  }
+
+  $ clang -target bpf -O2 -g -S t.c
+         .long   104                             # BTF_KIND_DATASEC(id = 8)
+         .long   251658240                       # 0xf000000
+         .long   0
+
+         .ascii  ".rodata"                       # string offset=104
+
+  $ clang -target bpf -O2 -g -c t.c
+  $ readelf -S t.o | grep data
+     [ 4] .rodata           PROGBITS         0000000000000000  00000090
+
+Fixes: 8fd27bf69b86 ("libbpf: Add BPF static linker BTF and BTF.ext support")
+Reported-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Yonghong Song <yhs@fb.com>
+Link: https://lore.kernel.org/bpf/20210326043036.3081011-1-andrii@kernel.org
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/lib/bpf/linker.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/tools/lib/bpf/linker.c b/tools/lib/bpf/linker.c
+index 5e0aa2f2c0ca..a29d62ff8041 100644
+--- a/tools/lib/bpf/linker.c
++++ b/tools/lib/bpf/linker.c
+@@ -94,6 +94,7 @@ struct dst_sec {
+ 	int sec_sym_idx;
+ 
+ 	/* section's DATASEC variable info, emitted on BTF finalization */
++	bool has_btf;
+ 	int sec_var_cnt;
+ 	struct btf_var_secinfo *sec_vars;
+ 
+@@ -1436,6 +1437,16 @@ static int linker_append_btf(struct bpf_linker *linker, struct src_obj *obj)
+ 			continue;
+ 		dst_sec = &linker->secs[src_sec->dst_id];
+ 
++		/* Mark section as having BTF regardless of the presence of
++		 * variables. In some cases compiler might generate empty BTF
++		 * with no variables information. E.g., when promoting local
++		 * array/structure variable initial values and BPF object
++		 * file otherwise has no read-only static variables in
++		 * .rodata. We need to preserve such empty BTF and just set
++		 * correct section size.
++		 */
++		dst_sec->has_btf = true;
++
+ 		t = btf__type_by_id(obj->btf, src_sec->sec_type_id);
+ 		src_var = btf_var_secinfos(t);
+ 		n = btf_vlen(t);
+@@ -1717,7 +1728,7 @@ static int finalize_btf(struct bpf_linker *linker)
+ 	for (i = 1; i < linker->sec_cnt; i++) {
+ 		struct dst_sec *sec = &linker->secs[i];
+ 
+-		if (!sec->sec_var_cnt)
++		if (!sec->has_btf)
+ 			continue;
+ 
+ 		id = btf__add_datasec(btf, sec->sec_name, sec->sec_sz);
+-- 
+2.34.1
+

@@ -1,0 +1,136 @@
+From 75fa1777694c245c1e59ac774cb1d58a15ecefeb Mon Sep 17 00:00:00 2001
+Message-Id: <75fa1777694c245c1e59ac774cb1d58a15ecefeb.1649665268.git.geliang.tang@suse.com>
+From: Andrii Nakryiko <andrii@kernel.org>
+Date: Wed, 4 Nov 2020 20:34:01 -0800
+Subject: [PATCH] tools/bpftool: Add bpftool support for split BTF
+Git-commit: 75fa1777694c245c1e59ac774cb1d58a15ecefeb
+Patch-mainline: v5.11-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+Add ability to work with split BTF by providing extra -B flag, which allows to
+specify the path to the base BTF file.
+
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Song Liu <songliubraving@fb.com>
+Link: https://lore.kernel.org/bpf/20201105043402.2530976-12-andrii@kernel.org
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/bpf/bpftool/btf.c  |  9 ++++++---
+ tools/bpf/bpftool/main.c | 15 ++++++++++++++-
+ tools/bpf/bpftool/main.h |  1 +
+ 3 files changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/tools/bpf/bpftool/btf.c b/tools/bpf/bpftool/btf.c
+index 8ab142ff5eac..c96b56e8e3a4 100644
+--- a/tools/bpf/bpftool/btf.c
++++ b/tools/bpf/bpftool/btf.c
+@@ -358,8 +358,12 @@ static int dump_btf_raw(const struct btf *btf,
+ 		}
+ 	} else {
+ 		int cnt = btf__get_nr_types(btf);
++		int start_id = 1;
+ 
+-		for (i = 1; i <= cnt; i++) {
++		if (base_btf)
++			start_id = btf__get_nr_types(base_btf) + 1;
++
++		for (i = start_id; i <= cnt; i++) {
+ 			t = btf__type_by_id(btf, i);
+ 			dump_btf_type(btf, i, t);
+ 		}
+@@ -438,7 +442,6 @@ static int do_dump(int argc, char **argv)
+ 		return -1;
+ 	}
+ 	src = GET_ARG();
+-
+ 	if (is_prefix(src, "map")) {
+ 		struct bpf_map_info info = {};
+ 		__u32 len = sizeof(info);
+@@ -499,7 +502,7 @@ static int do_dump(int argc, char **argv)
+ 		}
+ 		NEXT_ARG();
+ 	} else if (is_prefix(src, "file")) {
+-		btf = btf__parse(*argv, NULL);
++		btf = btf__parse_split(*argv, base_btf);
+ 		if (IS_ERR(btf)) {
+ 			err = -PTR_ERR(btf);
+ 			btf = NULL;
+diff --git a/tools/bpf/bpftool/main.c b/tools/bpf/bpftool/main.c
+index 682daaa49e6a..b86f450e6fce 100644
+--- a/tools/bpf/bpftool/main.c
++++ b/tools/bpf/bpftool/main.c
+@@ -11,6 +11,7 @@
+ 
+ #include <bpf/bpf.h>
+ #include <bpf/libbpf.h>
++#include <bpf/btf.h>
+ 
+ #include "main.h"
+ 
+@@ -28,6 +29,7 @@ bool show_pinned;
+ bool block_mount;
+ bool verifier_logs;
+ bool relaxed_maps;
++struct btf *base_btf;
+ struct pinned_obj_table prog_table;
+ struct pinned_obj_table map_table;
+ struct pinned_obj_table link_table;
+@@ -391,6 +393,7 @@ int main(int argc, char **argv)
+ 		{ "mapcompat",	no_argument,	NULL,	'm' },
+ 		{ "nomount",	no_argument,	NULL,	'n' },
+ 		{ "debug",	no_argument,	NULL,	'd' },
++		{ "base-btf",	required_argument, NULL, 'B' },
+ 		{ 0 }
+ 	};
+ 	int opt, ret;
+@@ -407,7 +410,7 @@ int main(int argc, char **argv)
+ 	hash_init(link_table.table);
+ 
+ 	opterr = 0;
+-	while ((opt = getopt_long(argc, argv, "Vhpjfmnd",
++	while ((opt = getopt_long(argc, argv, "VhpjfmndB:",
+ 				  options, NULL)) >= 0) {
+ 		switch (opt) {
+ 		case 'V':
+@@ -441,6 +444,15 @@ int main(int argc, char **argv)
+ 			libbpf_set_print(print_all_levels);
+ 			verifier_logs = true;
+ 			break;
++		case 'B':
++			base_btf = btf__parse(optarg, NULL);
++			if (libbpf_get_error(base_btf)) {
++				p_err("failed to parse base BTF at '%s': %ld\n",
++				      optarg, libbpf_get_error(base_btf));
++				base_btf = NULL;
++				return -1;
++			}
++			break;
+ 		default:
+ 			p_err("unrecognized option '%s'", argv[optind - 1]);
+ 			if (json_output)
+@@ -465,6 +477,7 @@ int main(int argc, char **argv)
+ 		delete_pinned_obj_table(&map_table);
+ 		delete_pinned_obj_table(&link_table);
+ 	}
++	btf__free(base_btf);
+ 
+ 	return ret;
+ }
+diff --git a/tools/bpf/bpftool/main.h b/tools/bpf/bpftool/main.h
+index c46e52137b87..76e91641262b 100644
+--- a/tools/bpf/bpftool/main.h
++++ b/tools/bpf/bpftool/main.h
+@@ -90,6 +90,7 @@ extern bool show_pids;
+ extern bool block_mount;
+ extern bool verifier_logs;
+ extern bool relaxed_maps;
++extern struct btf *base_btf;
+ extern struct pinned_obj_table prog_table;
+ extern struct pinned_obj_table map_table;
+ extern struct pinned_obj_table link_table;
+-- 
+2.34.1
+

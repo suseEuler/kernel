@@ -1,0 +1,164 @@
+From 9103a8594d9324d8e1512442ba580e4e91d42c2d Mon Sep 17 00:00:00 2001
+Message-Id: <9103a8594d9324d8e1512442ba580e4e91d42c2d.1649664521.git.geliang.tang@suse.com>
+From: Weqaar Janjua <weqaar.janjua@gmail.com>
+Date: Mon, 7 Dec 2020 21:53:31 +0000
+Subject: [PATCH] selftests/bpf: Xsk selftests - DRV POLL, NOPOLL
+MIME-Version: 1.0
+Git-commit: 9103a8594d9324d8e1512442ba580e4e91d42c2d
+Patch-mainline: v5.11-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds following tests:
+
+2. AF_XDP DRV/Native mode
+   Works on any netdevice with XDP_REDIRECT support, driver dependent.
+   Processes packets before SKB allocation. Provides better performance
+   than SKB. Driver hook available just after DMA of buffer descriptor.
+   a. nopoll
+   b. poll
+   * Only copy mode is supported because veth does not currently support
+     zero-copy mode
+
+Signed-off-by: Weqaar Janjua <weqaar.a.janjua@intel.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Tested-by: Yonghong Song <yhs@fb.com>
+Acked-by: Björn Töpel <bjorn.topel@intel.com>
+Link: https://lore.kernel.org/bpf/20201207215333.11586-4-weqaar.a.janjua@intel.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/testing/selftests/bpf/test_xsk.sh  | 24 ++++++++++++++++++++++++
+ tools/testing/selftests/bpf/xdpxceiver.c | 22 +++++++++++++++++++---
+ tools/testing/selftests/bpf/xdpxceiver.h |  3 ++-
+ 3 files changed, 45 insertions(+), 4 deletions(-)
+
+diff --git a/tools/testing/selftests/bpf/test_xsk.sh b/tools/testing/selftests/bpf/test_xsk.sh
+index 0b7bafb65f43..aad8065637fd 100755
+--- a/tools/testing/selftests/bpf/test_xsk.sh
++++ b/tools/testing/selftests/bpf/test_xsk.sh
+@@ -173,6 +173,30 @@ retval=$?
+ test_status $retval "${TEST_NAME}"
+ statusList+=($retval)
+ 
++### TEST 4
++TEST_NAME="DRV NOPOLL"
++
++vethXDPnative ${VETH0} ${VETH1} ${NS1}
++
++params=("-N")
++execxdpxceiver params
++
++retval=$?
++test_status $retval "${TEST_NAME}"
++statusList+=($retval)
++
++### TEST 5
++TEST_NAME="DRV POLL"
++
++vethXDPnative ${VETH0} ${VETH1} ${NS1}
++
++params=("-N" "-p")
++execxdpxceiver params
++
++retval=$?
++test_status $retval "${TEST_NAME}"
++statusList+=($retval)
++
+ ## END TESTS
+ 
+ cleanup_exit ${VETH0} ${VETH1} ${NS1}
+diff --git a/tools/testing/selftests/bpf/xdpxceiver.c b/tools/testing/selftests/bpf/xdpxceiver.c
+index 3f2a65b6a9f5..9fcd80a38b07 100644
+--- a/tools/testing/selftests/bpf/xdpxceiver.c
++++ b/tools/testing/selftests/bpf/xdpxceiver.c
+@@ -27,7 +27,16 @@
+  *    a. nopoll - soft-irq processing
+  *    b. poll - using poll() syscall
+  *
+- * Total tests: 2
++ * 2. AF_XDP DRV/Native mode
++ *    Works on any netdevice with XDP_REDIRECT support, driver dependent. Processes
++ *    packets before SKB allocation. Provides better performance than SKB. Driver
++ *    hook available just after DMA of buffer descriptor.
++ *    a. nopoll
++ *    b. poll
++ *    - Only copy mode is supported because veth does not currently support
++ *      zero-copy mode
++ *
++ * Total tests: 4
+  *
+  * Flow:
+  * -----
+@@ -88,7 +97,7 @@ static void __exit_with_error(int error, const char *file, const char *func, int
+ #define exit_with_error(error) __exit_with_error(error, __FILE__, __func__, __LINE__)
+ 
+ #define print_ksft_result(void)\
+-	(ksft_test_result_pass("PASS: %s %s\n", uut ? "" : "SKB", opt_poll ? "POLL" : "NOPOLL"))
++	(ksft_test_result_pass("PASS: %s %s\n", uut ? "DRV" : "SKB", opt_poll ? "POLL" : "NOPOLL"))
+ 
+ static void pthread_init_mutex(void)
+ {
+@@ -311,6 +320,7 @@ static struct option long_options[] = {
+ 	{"queue", optional_argument, 0, 'q'},
+ 	{"poll", no_argument, 0, 'p'},
+ 	{"xdp-skb", no_argument, 0, 'S'},
++	{"xdp-native", no_argument, 0, 'N'},
+ 	{"copy", no_argument, 0, 'c'},
+ 	{"debug", optional_argument, 0, 'D'},
+ 	{"tx-pkt-count", optional_argument, 0, 'C'},
+@@ -326,6 +336,7 @@ static void usage(const char *prog)
+ 	    "  -q, --queue=n        Use queue n (default 0)\n"
+ 	    "  -p, --poll           Use poll syscall\n"
+ 	    "  -S, --xdp-skb=n      Use XDP SKB mode\n"
++	    "  -N, --xdp-native=n   Enforce XDP DRV (native) mode\n"
+ 	    "  -c, --copy           Force copy mode\n"
+ 	    "  -D, --debug          Debug mode - dump packets L2 - L5\n"
+ 	    "  -C, --tx-pkt-count=n Number of packets to send\n";
+@@ -417,7 +428,7 @@ static void parse_command_line(int argc, char **argv)
+ 	opterr = 0;
+ 
+ 	for (;;) {
+-		c = getopt_long(argc, argv, "i:q:pScDC:", long_options, &option_index);
++		c = getopt_long(argc, argv, "i:q:pSNcDC:", long_options, &option_index);
+ 
+ 		if (c == -1)
+ 			break;
+@@ -448,6 +459,11 @@ static void parse_command_line(int argc, char **argv)
+ 			opt_xdp_bind_flags |= XDP_COPY;
+ 			uut = ORDER_CONTENT_VALIDATE_XDP_SKB;
+ 			break;
++		case 'N':
++			opt_xdp_flags |= XDP_FLAGS_DRV_MODE;
++			opt_xdp_bind_flags |= XDP_COPY;
++			uut = ORDER_CONTENT_VALIDATE_XDP_DRV;
++			break;
+ 		case 'c':
+ 			opt_xdp_bind_flags |= XDP_COPY;
+ 			break;
+diff --git a/tools/testing/selftests/bpf/xdpxceiver.h b/tools/testing/selftests/bpf/xdpxceiver.h
+index 5929f2fc1224..12070d66344b 100644
+--- a/tools/testing/selftests/bpf/xdpxceiver.h
++++ b/tools/testing/selftests/bpf/xdpxceiver.h
+@@ -38,7 +38,7 @@
+ #define SOCK_RECONF_CTR 10
+ #define BATCH_SIZE 64
+ #define POLL_TMOUT 1000
+-#define NEED_WAKEUP 1
++#define NEED_WAKEUP true
+ 
+ typedef __u32 u32;
+ typedef __u16 u16;
+@@ -46,6 +46,7 @@ typedef __u8 u8;
+ 
+ enum TESTS {
+ 	ORDER_CONTENT_VALIDATE_XDP_SKB = 0,
++	ORDER_CONTENT_VALIDATE_XDP_DRV = 1,
+ };
+ 
+ u8 uut;
+-- 
+2.34.1
+

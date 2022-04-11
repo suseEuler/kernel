@@ -1,0 +1,122 @@
+From 96539f1c5efb0022b94412e8623722aad23dee6b Mon Sep 17 00:00:00 2001
+Message-Id: <96539f1c5efb0022b94412e8623722aad23dee6b.1649662207.git.geliang.tang@suse.com>
+From: =?UTF-8?q?Bj=C3=B6rn=20T=C3=B6pel?= <bjorn.topel@intel.com>
+Date: Tue, 30 Mar 2021 00:43:15 +0200
+Subject: [PATCH] selftests: xsk: Remove mutex and condition variable
+MIME-Version: 1.0
+Git-commit: 96539f1c5efb0022b94412e8623722aad23dee6b
+Patch-mainline: v5.13-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The usage of the condition variable is broken, and overkill. Replace it
+with a pthread barrier.
+
+Signed-off-by: Björn Töpel <bjorn.topel@intel.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20210329224316.17793-17-maciej.fijalkowski@intel.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/testing/selftests/bpf/xdpxceiver.c | 33 ++++--------------------
+ tools/testing/selftests/bpf/xdpxceiver.h |  3 +--
+ 2 files changed, 6 insertions(+), 30 deletions(-)
+
+diff --git a/tools/testing/selftests/bpf/xdpxceiver.c b/tools/testing/selftests/bpf/xdpxceiver.c
+index ec09b8fe1178..6d87bdf3574a 100644
+--- a/tools/testing/selftests/bpf/xdpxceiver.c
++++ b/tools/testing/selftests/bpf/xdpxceiver.c
+@@ -126,18 +126,6 @@ static void __exit_with_error(int error, const char *file, const char *func, int
+ 			       test_type == TEST_TYPE_STATS ? "Stats" : "",\
+ 			       test_type == TEST_TYPE_BPF_RES ? "BPF RES" : ""))
+ 
+-static void init_sync_resources(void)
+-{
+-	pthread_mutex_init(&sync_mutex, NULL);
+-	pthread_cond_init(&signal_rx_condition, NULL);
+-}
+-
+-static void destroy_sync_resources(void)
+-{
+-	pthread_mutex_destroy(&sync_mutex);
+-	pthread_cond_destroy(&signal_rx_condition);
+-}
+-
+ static void *memset32_htonl(void *dest, u32 val, u32 size)
+ {
+ 	u32 *ptr = (u32 *)dest;
+@@ -876,9 +864,7 @@ static void *worker_testapp_validate_rx(void *arg)
+ 	fds[0].fd = xsk_socket__fd(ifobject->xsk->xsk);
+ 	fds[0].events = POLLIN;
+ 
+-	pthread_mutex_lock(&sync_mutex);
+-	pthread_cond_signal(&signal_rx_condition);
+-	pthread_mutex_unlock(&sync_mutex);
++	pthread_barrier_wait(&barr);
+ 
+ 	while (1) {
+ 		if (test_type != TEST_TYPE_STATS) {
+@@ -903,24 +889,19 @@ static void *worker_testapp_validate_rx(void *arg)
+ 
+ static void testapp_validate(void)
+ {
+-	struct timespec max_wait = { 0, 0 };
+ 	bool bidi = test_type == TEST_TYPE_BIDI;
+ 	bool bpf = test_type == TEST_TYPE_BPF_RES;
+ 
+-	pthread_mutex_lock(&sync_mutex);
++	if (pthread_barrier_init(&barr, NULL, 2))
++		exit_with_error(errno);
+ 
+ 	/*Spawn RX thread */
+ 	pthread_create(&t0, NULL, ifdict_rx->func_ptr, ifdict_rx);
+ 
+-	if (clock_gettime(CLOCK_REALTIME, &max_wait))
+-		exit_with_error(errno);
+-	max_wait.tv_sec += TMOUT_SEC;
+-
+-	if (pthread_cond_timedwait(&signal_rx_condition, &sync_mutex, &max_wait) == ETIMEDOUT)
++	pthread_barrier_wait(&barr);
++	if (pthread_barrier_destroy(&barr))
+ 		exit_with_error(errno);
+ 
+-	pthread_mutex_unlock(&sync_mutex);
+-
+ 	/*Spawn TX thread */
+ 	pthread_create(&t1, NULL, ifdict_tx->func_ptr, ifdict_tx);
+ 
+@@ -1160,15 +1141,11 @@ int main(int argc, char **argv)
+ 
+ 	ksft_set_plan(TEST_MODE_MAX * TEST_TYPE_MAX);
+ 
+-	init_sync_resources();
+-
+ 	for (i = 0; i < TEST_MODE_MAX; i++) {
+ 		for (j = 0; j < TEST_TYPE_MAX; j++)
+ 			run_pkt_test(i, j);
+ 	}
+ 
+-	destroy_sync_resources();
+-
+ cleanup:
+ 	for (int i = 0; i < MAX_INTERFACES; i++) {
+ 		if (ifdict[i]->ns_fd != -1)
+diff --git a/tools/testing/selftests/bpf/xdpxceiver.h b/tools/testing/selftests/bpf/xdpxceiver.h
+index 78863820fb81..ef219c0785eb 100644
+--- a/tools/testing/selftests/bpf/xdpxceiver.h
++++ b/tools/testing/selftests/bpf/xdpxceiver.h
+@@ -148,8 +148,7 @@ static struct ifobject *ifdict_rx;
+ static struct ifobject *ifdict_tx;
+ 
+ /*threads*/
+-pthread_mutex_t sync_mutex;
+-pthread_cond_t signal_rx_condition;
++pthread_barrier_t barr;
+ pthread_t t0, t1;
+ 
+ TAILQ_HEAD(head_s, pkt) head = TAILQ_HEAD_INITIALIZER(head);
+-- 
+2.34.1
+

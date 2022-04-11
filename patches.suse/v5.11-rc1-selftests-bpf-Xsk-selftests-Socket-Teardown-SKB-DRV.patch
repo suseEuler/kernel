@@ -1,0 +1,209 @@
+From 6674bf66560a6c55aada1e3cd4fca7a3ed204075 Mon Sep 17 00:00:00 2001
+Message-Id: <6674bf66560a6c55aada1e3cd4fca7a3ed204075.1649664511.git.geliang.tang@suse.com>
+From: Weqaar Janjua <weqaar.janjua@gmail.com>
+Date: Mon, 7 Dec 2020 21:53:32 +0000
+Subject: [PATCH] selftests/bpf: Xsk selftests - Socket Teardown - SKB, DRV
+MIME-Version: 1.0
+Git-commit: 6674bf66560a6c55aada1e3cd4fca7a3ed204075
+Patch-mainline: v5.11-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds following tests:
+
+1. AF_XDP SKB mode
+   c. Socket Teardown
+      Create a Tx and a Rx socket, Tx from one socket, Rx on another.
+      Destroy both sockets, then repeat multiple times. Only nopoll mode
+      is used
+
+2. AF_XDP DRV/Native mode
+   c. Socket Teardown
+   * Only copy mode is supported because veth does not currently support
+     zero-copy mode
+
+Signed-off-by: Weqaar Janjua <weqaar.a.janjua@intel.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Tested-by: Yonghong Song <yhs@fb.com>
+Acked-by: Björn Töpel <bjorn.topel@intel.com>
+Link: https://lore.kernel.org/bpf/20201207215333.11586-5-weqaar.a.janjua@intel.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/testing/selftests/bpf/test_xsk.sh  | 24 ++++++++++++++++
+ tools/testing/selftests/bpf/xdpxceiver.c | 35 +++++++++++++++++++++---
+ tools/testing/selftests/bpf/xdpxceiver.h |  2 ++
+ 3 files changed, 57 insertions(+), 4 deletions(-)
+
+diff --git a/tools/testing/selftests/bpf/test_xsk.sh b/tools/testing/selftests/bpf/test_xsk.sh
+index aad8065637fd..9be9dff25560 100755
+--- a/tools/testing/selftests/bpf/test_xsk.sh
++++ b/tools/testing/selftests/bpf/test_xsk.sh
+@@ -197,6 +197,30 @@ retval=$?
+ test_status $retval "${TEST_NAME}"
+ statusList+=($retval)
+ 
++### TEST 6
++TEST_NAME="SKB SOCKET TEARDOWN"
++
++vethXDPgeneric ${VETH0} ${VETH1} ${NS1}
++
++params=("-S" "-T")
++execxdpxceiver params
++
++retval=$?
++test_status $retval "${TEST_NAME}"
++statusList+=($retval)
++
++### TEST 7
++TEST_NAME="DRV SOCKET TEARDOWN"
++
++vethXDPnative ${VETH0} ${VETH1} ${NS1}
++
++params=("-N" "-T")
++execxdpxceiver params
++
++retval=$?
++test_status $retval "${TEST_NAME}"
++statusList+=($retval)
++
+ ## END TESTS
+ 
+ cleanup_exit ${VETH0} ${VETH1} ${NS1}
+diff --git a/tools/testing/selftests/bpf/xdpxceiver.c b/tools/testing/selftests/bpf/xdpxceiver.c
+index 9fcd80a38b07..e8907109782d 100644
+--- a/tools/testing/selftests/bpf/xdpxceiver.c
++++ b/tools/testing/selftests/bpf/xdpxceiver.c
+@@ -26,6 +26,9 @@
+  *    generic XDP path. XDP hook from netif_receive_skb().
+  *    a. nopoll - soft-irq processing
+  *    b. poll - using poll() syscall
++ *    c. Socket Teardown
++ *       Create a Tx and a Rx socket, Tx from one socket, Rx on another. Destroy
++ *       both sockets, then repeat multiple times. Only nopoll mode is used
+  *
+  * 2. AF_XDP DRV/Native mode
+  *    Works on any netdevice with XDP_REDIRECT support, driver dependent. Processes
+@@ -33,10 +36,11 @@
+  *    hook available just after DMA of buffer descriptor.
+  *    a. nopoll
+  *    b. poll
++ *    c. Socket Teardown
+  *    - Only copy mode is supported because veth does not currently support
+  *      zero-copy mode
+  *
+- * Total tests: 4
++ * Total tests: 6
+  *
+  * Flow:
+  * -----
+@@ -97,7 +101,8 @@ static void __exit_with_error(int error, const char *file, const char *func, int
+ #define exit_with_error(error) __exit_with_error(error, __FILE__, __func__, __LINE__)
+ 
+ #define print_ksft_result(void)\
+-	(ksft_test_result_pass("PASS: %s %s\n", uut ? "DRV" : "SKB", opt_poll ? "POLL" : "NOPOLL"))
++	(ksft_test_result_pass("PASS: %s %s %s\n", uut ? "DRV" : "SKB", opt_poll ? "POLL" :\
++			       "NOPOLL", opt_teardown ? "Socket Teardown" : ""))
+ 
+ static void pthread_init_mutex(void)
+ {
+@@ -322,6 +327,7 @@ static struct option long_options[] = {
+ 	{"xdp-skb", no_argument, 0, 'S'},
+ 	{"xdp-native", no_argument, 0, 'N'},
+ 	{"copy", no_argument, 0, 'c'},
++	{"tear-down", no_argument, 0, 'T'},
+ 	{"debug", optional_argument, 0, 'D'},
+ 	{"tx-pkt-count", optional_argument, 0, 'C'},
+ 	{0, 0, 0, 0}
+@@ -338,6 +344,7 @@ static void usage(const char *prog)
+ 	    "  -S, --xdp-skb=n      Use XDP SKB mode\n"
+ 	    "  -N, --xdp-native=n   Enforce XDP DRV (native) mode\n"
+ 	    "  -c, --copy           Force copy mode\n"
++	    "  -T, --tear-down      Tear down sockets by repeatedly recreating them\n"
+ 	    "  -D, --debug          Debug mode - dump packets L2 - L5\n"
+ 	    "  -C, --tx-pkt-count=n Number of packets to send\n";
+ 	ksft_print_msg(str, prog);
+@@ -428,7 +435,7 @@ static void parse_command_line(int argc, char **argv)
+ 	opterr = 0;
+ 
+ 	for (;;) {
+-		c = getopt_long(argc, argv, "i:q:pSNcDC:", long_options, &option_index);
++		c = getopt_long(argc, argv, "i:q:pSNcTDC:", long_options, &option_index);
+ 
+ 		if (c == -1)
+ 			break;
+@@ -467,6 +474,9 @@ static void parse_command_line(int argc, char **argv)
+ 		case 'c':
+ 			opt_xdp_bind_flags |= XDP_COPY;
+ 			break;
++		case 'T':
++			opt_teardown = 1;
++			break;
+ 		case 'D':
+ 			debug_pkt_dump = 1;
+ 			break;
+@@ -871,6 +881,9 @@ static void *worker_testapp_validate(void *arg)
+ 
+ 		ksft_print_msg("Received %d packets on interface %s\n",
+ 			       pkt_counter, ((struct ifobject *)arg)->ifname);
++
++		if (opt_teardown)
++			ksft_print_msg("Destroying socket\n");
+ 	}
+ 
+ 	xsk_socket__delete(((struct ifobject *)arg)->xsk->xsk);
+@@ -916,6 +929,20 @@ static void testapp_validate(void)
+ 		free(pkt_buf);
+ 	}
+ 
++	if (!opt_teardown)
++		print_ksft_result();
++}
++
++static void testapp_sockets(void)
++{
++	for (int i = 0; i < MAX_TEARDOWN_ITER; i++) {
++		pkt_counter = 0;
++		prev_pkt = -1;
++		sigvar = 0;
++		ksft_print_msg("Creating socket\n");
++		testapp_validate();
++	}
++
+ 	print_ksft_result();
+ }
+ 
+@@ -982,7 +1009,7 @@ int main(int argc, char **argv)
+ 
+ 	ksft_set_plan(1);
+ 
+-	testapp_validate();
++	opt_teardown ? testapp_sockets() : testapp_validate();
+ 
+ 	for (int i = 0; i < MAX_INTERFACES; i++)
+ 		free(ifdict[i]);
+diff --git a/tools/testing/selftests/bpf/xdpxceiver.h b/tools/testing/selftests/bpf/xdpxceiver.h
+index 12070d66344b..58185b914f99 100644
+--- a/tools/testing/selftests/bpf/xdpxceiver.h
++++ b/tools/testing/selftests/bpf/xdpxceiver.h
+@@ -21,6 +21,7 @@
+ #define MAX_INTERFACE_NAME_CHARS 7
+ #define MAX_INTERFACES_NAMESPACE_CHARS 10
+ #define MAX_SOCKS 1
++#define MAX_TEARDOWN_ITER 10
+ #define PKT_HDR_SIZE (sizeof(struct ethhdr) + sizeof(struct iphdr) + \
+ 			sizeof(struct udphdr))
+ #define MIN_PKT_SIZE 64
+@@ -57,6 +58,7 @@ static u32 opt_xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST;
+ static int opt_queue;
+ static int opt_pkt_count;
+ static int opt_poll;
++static int opt_teardown;
+ static u32 opt_xdp_bind_flags = XDP_USE_NEED_WAKEUP;
+ static u8 pkt_data[XSK_UMEM__DEFAULT_FRAME_SIZE];
+ static u32 pkt_counter;
+-- 
+2.34.1
+

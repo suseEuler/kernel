@@ -1,0 +1,160 @@
+From 1e38abefcfd65f3ef7b12895dfd48db80aca28da Mon Sep 17 00:00:00 2001
+Message-Id: <1e38abefcfd65f3ef7b12895dfd48db80aca28da.1649664630.git.geliang.tang@suse.com>
+From: Andrii Nakryiko <andrii@kernel.org>
+Date: Thu, 3 Dec 2020 12:46:34 -0800
+Subject: [PATCH] selftests/bpf: Add fentry/fexit/fmod_ret selftest for kernel
+ module
+Git-commit: 1e38abefcfd65f3ef7b12895dfd48db80aca28da
+Patch-mainline: v5.11-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+Add new selftest checking attachment of fentry/fexit/fmod_ret (and raw
+tracepoint ones for completeness) BPF programs to kernel module function.
+
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20201203204634.1325171-15-andrii@kernel.org
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ .../selftests/bpf/prog_tests/module_attach.c  | 53 +++++++++++++++
+ .../selftests/bpf/progs/test_module_attach.c  | 66 +++++++++++++++++++
+ 2 files changed, 119 insertions(+)
+ create mode 100644 tools/testing/selftests/bpf/prog_tests/module_attach.c
+ create mode 100644 tools/testing/selftests/bpf/progs/test_module_attach.c
+
+diff --git a/tools/testing/selftests/bpf/prog_tests/module_attach.c b/tools/testing/selftests/bpf/prog_tests/module_attach.c
+new file mode 100644
+index 000000000000..4b65e9918764
+--- /dev/null
++++ b/tools/testing/selftests/bpf/prog_tests/module_attach.c
+@@ -0,0 +1,53 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2020 Facebook */
++
++#include <test_progs.h>
++#include "test_module_attach.skel.h"
++
++static int duration;
++
++static int trigger_module_test_read(int read_sz)
++{
++	int fd, err;
++
++	fd = open("/sys/kernel/bpf_testmod", O_RDONLY);
++	err = -errno;
++	if (CHECK(fd < 0, "testmod_file_open", "failed: %d\n", err))
++		return err;
++
++	read(fd, NULL, read_sz);
++	close(fd);
++
++	return 0;
++}
++
++void test_module_attach(void)
++{
++	const int READ_SZ = 456;
++	struct test_module_attach* skel;
++	struct test_module_attach__bss *bss;
++	int err;
++
++	skel = test_module_attach__open_and_load();
++	if (CHECK(!skel, "skel_open", "failed to open skeleton\n"))
++		return;
++
++	bss = skel->bss;
++
++	err = test_module_attach__attach(skel);
++	if (CHECK(err, "skel_attach", "skeleton attach failed: %d\n", err))
++		goto cleanup;
++
++	/* trigger tracepoint */
++	ASSERT_OK(trigger_module_test_read(READ_SZ), "trigger_read");
++
++	ASSERT_EQ(bss->raw_tp_read_sz, READ_SZ, "raw_tp");
++	ASSERT_EQ(bss->tp_btf_read_sz, READ_SZ, "tp_btf");
++	ASSERT_EQ(bss->fentry_read_sz, READ_SZ, "fentry");
++	ASSERT_EQ(bss->fexit_read_sz, READ_SZ, "fexit");
++	ASSERT_EQ(bss->fexit_ret, -EIO, "fexit_tet");
++	ASSERT_EQ(bss->fmod_ret_read_sz, READ_SZ, "fmod_ret");
++
++cleanup:
++	test_module_attach__destroy(skel);
++}
+diff --git a/tools/testing/selftests/bpf/progs/test_module_attach.c b/tools/testing/selftests/bpf/progs/test_module_attach.c
+new file mode 100644
+index 000000000000..b563563df172
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/test_module_attach.c
+@@ -0,0 +1,66 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2020 Facebook */
++
++#include "vmlinux.h"
++#include <bpf/bpf_helpers.h>
++#include <bpf/bpf_tracing.h>
++#include <bpf/bpf_core_read.h>
++#include "../bpf_testmod/bpf_testmod.h"
++
++__u32 raw_tp_read_sz = 0;
++
++SEC("raw_tp/bpf_testmod_test_read")
++int BPF_PROG(handle_raw_tp,
++	     struct task_struct *task, struct bpf_testmod_test_read_ctx *read_ctx)
++{
++	raw_tp_read_sz = BPF_CORE_READ(read_ctx, len);
++	return 0;
++}
++
++__u32 tp_btf_read_sz = 0;
++
++SEC("tp_btf/bpf_testmod_test_read")
++int BPF_PROG(handle_tp_btf,
++	     struct task_struct *task, struct bpf_testmod_test_read_ctx *read_ctx)
++{
++	tp_btf_read_sz = read_ctx->len;
++	return 0;
++}
++
++__u32 fentry_read_sz = 0;
++
++SEC("fentry/bpf_testmod_test_read")
++int BPF_PROG(handle_fentry,
++	     struct file *file, struct kobject *kobj,
++	     struct bin_attribute *bin_attr, char *buf, loff_t off, size_t len)
++{
++	fentry_read_sz = len;
++	return 0;
++}
++
++__u32 fexit_read_sz = 0;
++int fexit_ret = 0;
++
++SEC("fexit/bpf_testmod_test_read")
++int BPF_PROG(handle_fexit,
++	     struct file *file, struct kobject *kobj,
++	     struct bin_attribute *bin_attr, char *buf, loff_t off, size_t len,
++	     int ret)
++{
++	fexit_read_sz = len;
++	fexit_ret = ret;
++	return 0;
++}
++
++__u32 fmod_ret_read_sz = 0;
++
++SEC("fmod_ret/bpf_testmod_test_read")
++int BPF_PROG(handle_fmod_ret,
++	     struct file *file, struct kobject *kobj,
++	     struct bin_attribute *bin_attr, char *buf, loff_t off, size_t len)
++{
++	fmod_ret_read_sz = len;
++	return 0; /* don't override the exit code */
++}
++
++char _license[] SEC("license") = "GPL";
+-- 
+2.34.1
+

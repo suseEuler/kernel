@@ -1,0 +1,121 @@
+From 430d97a8a7bf1500c081ce756ff2ead73d2303c5 Mon Sep 17 00:00:00 2001
+Message-Id: <430d97a8a7bf1500c081ce756ff2ead73d2303c5.1649664233.git.geliang.tang@suse.com>
+From: Andrii Nakryiko <andrii@kernel.org>
+Date: Mon, 11 Jan 2021 23:55:20 -0800
+Subject: [PATCH] selftests/bpf: Test kernel module ksym externs
+Git-commit: 430d97a8a7bf1500c081ce756ff2ead73d2303c5
+Patch-mainline: v5.12-rc2
+References: bsn#127
+Modified-by-SEL: No
+
+
+Add per-CPU variable to bpf_testmod.ko and use those from new selftest to
+validate it works end-to-end.
+
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Yonghong Song <yhs@fb.com>
+Acked-by: Hao Luo <haoluo@google.com>
+Link: https://lore.kernel.org/bpf/20210112075520.4103414-8-andrii@kernel.org
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ .../selftests/bpf/bpf_testmod/bpf_testmod.c   |  3 ++
+ .../selftests/bpf/prog_tests/ksyms_module.c   | 31 +++++++++++++++++++
+ .../selftests/bpf/progs/test_ksyms_module.c   | 26 ++++++++++++++++
+ 3 files changed, 60 insertions(+)
+ create mode 100644 tools/testing/selftests/bpf/prog_tests/ksyms_module.c
+ create mode 100644 tools/testing/selftests/bpf/progs/test_ksyms_module.c
+
+diff --git a/tools/testing/selftests/bpf/bpf_testmod/bpf_testmod.c b/tools/testing/selftests/bpf/bpf_testmod/bpf_testmod.c
+index 2df19d73ca49..0b991e115d1f 100644
+--- a/tools/testing/selftests/bpf/bpf_testmod/bpf_testmod.c
++++ b/tools/testing/selftests/bpf/bpf_testmod/bpf_testmod.c
+@@ -3,6 +3,7 @@
+ #include <linux/error-injection.h>
+ #include <linux/init.h>
+ #include <linux/module.h>
++#include <linux/percpu-defs.h>
+ #include <linux/sysfs.h>
+ #include <linux/tracepoint.h>
+ #include "bpf_testmod.h"
+@@ -10,6 +11,8 @@
+ #define CREATE_TRACE_POINTS
+ #include "bpf_testmod-events.h"
+ 
++DEFINE_PER_CPU(int, bpf_testmod_ksym_percpu) = 123;
++
+ noinline ssize_t
+ bpf_testmod_test_read(struct file *file, struct kobject *kobj,
+ 		      struct bin_attribute *bin_attr,
+diff --git a/tools/testing/selftests/bpf/prog_tests/ksyms_module.c b/tools/testing/selftests/bpf/prog_tests/ksyms_module.c
+new file mode 100644
+index 000000000000..4c232b456479
+--- /dev/null
++++ b/tools/testing/selftests/bpf/prog_tests/ksyms_module.c
+@@ -0,0 +1,31 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2021 Facebook */
++
++#include <test_progs.h>
++#include <bpf/libbpf.h>
++#include <bpf/btf.h>
++#include "test_ksyms_module.skel.h"
++
++static int duration;
++
++void test_ksyms_module(void)
++{
++	struct test_ksyms_module* skel;
++	int err;
++
++	skel = test_ksyms_module__open_and_load();
++	if (CHECK(!skel, "skel_open", "failed to open skeleton\n"))
++		return;
++
++	err = test_ksyms_module__attach(skel);
++	if (CHECK(err, "skel_attach", "skeleton attach failed: %d\n", err))
++		goto cleanup;
++
++	usleep(1);
++
++	ASSERT_EQ(skel->bss->triggered, true, "triggered");
++	ASSERT_EQ(skel->bss->out_mod_ksym_global, 123, "global_ksym_val");
++
++cleanup:
++	test_ksyms_module__destroy(skel);
++}
+diff --git a/tools/testing/selftests/bpf/progs/test_ksyms_module.c b/tools/testing/selftests/bpf/progs/test_ksyms_module.c
+new file mode 100644
+index 000000000000..d6a0b3086b90
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/test_ksyms_module.c
+@@ -0,0 +1,26 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2021 Facebook */
++
++#include "vmlinux.h"
++
++#include <bpf/bpf_helpers.h>
++
++extern const int bpf_testmod_ksym_percpu __ksym;
++
++int out_mod_ksym_global = 0;
++bool triggered = false;
++
++SEC("raw_tp/sys_enter")
++int handler(const void *ctx)
++{
++	int *val;
++	__u32 cpu;
++
++	val = (int *)bpf_this_cpu_ptr(&bpf_testmod_ksym_percpu);
++	out_mod_ksym_global = *val;
++	triggered = true;
++
++	return 0;
++}
++
++char LICENSE[] SEC("license") = "GPL";
+-- 
+2.34.1
+

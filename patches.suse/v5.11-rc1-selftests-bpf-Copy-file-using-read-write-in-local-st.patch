@@ -1,0 +1,94 @@
+From a874c8c389a12b9f5ab67ba01995f06bf82e94fe Mon Sep 17 00:00:00 2001
+Message-Id: <a874c8c389a12b9f5ab67ba01995f06bf82e94fe.1649664836.git.geliang.tang@suse.com>
+From: Stanislav Fomichev <sdf@google.com>
+Date: Wed, 2 Dec 2020 09:49:47 -0800
+Subject: [PATCH] selftests/bpf: Copy file using read/write in local storage
+ test
+Git-commit: a874c8c389a12b9f5ab67ba01995f06bf82e94fe
+Patch-mainline: v5.11-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+Splice (copy_file_range) doesn't work on all filesystems. I'm running
+test kernels on top of my read-only disk image and it uses plan9 under the
+hood. This prevents test_local_storage from successfully passing.
+
+There is really no technical reason to use splice, so lets do
+old-school read/write to copy file; this should work in all
+environments.
+
+Signed-off-by: Stanislav Fomichev <sdf@google.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20201202174947.3621989-1-sdf@google.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ .../bpf/prog_tests/test_local_storage.c       | 28 ++++++++++++-------
+ 1 file changed, 18 insertions(+), 10 deletions(-)
+
+diff --git a/tools/testing/selftests/bpf/prog_tests/test_local_storage.c b/tools/testing/selftests/bpf/prog_tests/test_local_storage.c
+index fcca7ba1f368..c0fe73a17ed1 100644
+--- a/tools/testing/selftests/bpf/prog_tests/test_local_storage.c
++++ b/tools/testing/selftests/bpf/prog_tests/test_local_storage.c
+@@ -21,14 +21,6 @@ static inline int sys_pidfd_open(pid_t pid, unsigned int flags)
+ 	return syscall(__NR_pidfd_open, pid, flags);
+ }
+ 
+-static inline ssize_t copy_file_range(int fd_in, loff_t *off_in, int fd_out,
+-				      loff_t *off_out, size_t len,
+-				      unsigned int flags)
+-{
+-	return syscall(__NR_copy_file_range, fd_in, off_in, fd_out, off_out,
+-		       len, flags);
+-}
+-
+ static unsigned int duration;
+ 
+ #define TEST_STORAGE_VALUE 0xbeefdead
+@@ -47,6 +39,7 @@ static int copy_rm(char *dest)
+ {
+ 	int fd_in, fd_out = -1, ret = 0;
+ 	struct stat stat;
++	char *buf = NULL;
+ 
+ 	fd_in = open("/bin/rm", O_RDONLY);
+ 	if (fd_in < 0)
+@@ -64,18 +57,33 @@ static int copy_rm(char *dest)
+ 		goto out;
+ 	}
+ 
+-	ret = copy_file_range(fd_in, NULL, fd_out, NULL, stat.st_size, 0);
+-	if (ret == -1) {
++	buf = malloc(stat.st_blksize);
++	if (!buf) {
+ 		ret = -errno;
+ 		goto out;
+ 	}
+ 
++	while (ret = read(fd_in, buf, stat.st_blksize), ret > 0) {
++		ret = write(fd_out, buf, ret);
++		if (ret < 0) {
++			ret = -errno;
++			goto out;
++
++		}
++	}
++	if (ret < 0) {
++		ret = -errno;
++		goto out;
++
++	}
++
+ 	/* Set executable permission on the copied file */
+ 	ret = chmod(dest, 0100);
+ 	if (ret == -1)
+ 		ret = -errno;
+ 
+ out:
++	free(buf);
+ 	close(fd_in);
+ 	close(fd_out);
+ 	return ret;
+-- 
+2.34.1
+

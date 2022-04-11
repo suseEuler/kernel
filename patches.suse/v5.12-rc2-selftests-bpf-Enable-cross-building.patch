@@ -1,0 +1,138 @@
+From de11ae4f56fdc53474c08b03142860428e6c5655 Mon Sep 17 00:00:00 2001
+Message-Id: <de11ae4f56fdc53474c08b03142860428e6c5655.1649664222.git.geliang.tang@suse.com>
+From: Jean-Philippe Brucker <jean-philippe@linaro.org>
+Date: Wed, 13 Jan 2021 17:33:16 +0100
+Subject: [PATCH] selftests/bpf: Enable cross-building
+Git-commit: de11ae4f56fdc53474c08b03142860428e6c5655
+Patch-mainline: v5.12-rc2
+References: bsn#127
+Modified-by-SEL: Yes, refreshed due to context changes
+
+
+Build bpftool and resolve_btfids using the host toolchain when
+cross-compiling, since they are executed during build to generate the
+selftests. Add a host build directory in order to build both host and
+target version of libbpf. Build host tools using $(HOSTCC) defined in
+Makefile.include.
+
+Signed-off-by: Jean-Philippe Brucker <jean-philippe@linaro.org>
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20210113163319.1516382-2-jean-philippe@linaro.org
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/testing/selftests/bpf/Makefile |   46 ++++++++++++++++++++++++++---------
+ 1 file changed, 35 insertions(+), 11 deletions(-)
+
+--- a/tools/testing/selftests/bpf/Makefile
++++ b/tools/testing/selftests/bpf/Makefile
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ include ../../../../scripts/Kbuild.include
+ include ../../../scripts/Makefile.arch
++include ../../../scripts/Makefile.include
+ 
+ CXX ?= $(CROSS_COMPILE)g++
+ 
+@@ -113,7 +114,15 @@ SCRATCH_DIR := $(OUTPUT)/tools
+ BUILD_DIR := $(SCRATCH_DIR)/build
+ INCLUDE_DIR := $(SCRATCH_DIR)/include
+ BPFOBJ := $(BUILD_DIR)/libbpf/libbpf.a
+-RESOLVE_BTFIDS := $(BUILD_DIR)/resolve_btfids/resolve_btfids
++ifneq ($(CROSS_COMPILE),)
++HOST_BUILD_DIR		:= $(BUILD_DIR)/host
++HOST_SCRATCH_DIR	:= $(OUTPUT)/host-tools
++else
++HOST_BUILD_DIR		:= $(BUILD_DIR)
++HOST_SCRATCH_DIR	:= $(SCRATCH_DIR)
++endif
++HOST_BPFOBJ := $(HOST_BUILD_DIR)/libbpf/libbpf.a
++RESOLVE_BTFIDS := $(HOST_BUILD_DIR)/resolve_btfids/resolve_btfids
+ 
+ VMLINUX_BTF_PATHS ?= $(if $(O),$(O)/vmlinux)				\
+ 		     $(if $(KBUILD_OUTPUT),$(KBUILD_OUTPUT)/vmlinux)	\
+@@ -132,6 +141,14 @@ $(notdir $(TEST_GEN_PROGS)						\
+ 	 $(TEST_GEN_PROGS_EXTENDED)					\
+ 	 $(TEST_CUSTOM_PROGS)): %: $(OUTPUT)/% ;
+ 
++# sort removes libbpf duplicates when not cross-building
++MAKE_DIRS := $(sort $(BUILD_DIR)/libbpf $(HOST_BUILD_DIR)/libbpf	       \
++	       $(HOST_BUILD_DIR)/bpftool $(HOST_BUILD_DIR)/resolve_btfids      \
++	       $(INCLUDE_DIR))
++$(MAKE_DIRS):
++	$(call msg,MKDIR,,$@)
++	$(Q)mkdir -p $@
++
+ $(OUTPUT)/%.o: %.c
+ 	$(call msg,CC,,$@)
+ 	$(Q)$(CC) $(CFLAGS) -c $(filter %.c,$^) $(LDLIBS) -o $@
+@@ -154,7 +171,7 @@ $(OUTPUT)/test_stub.o: test_stub.c $(BPF
+ 	$(call msg,CC,,$@)
+ 	$(Q)$(CC) -c $(CFLAGS) -o $@ $<
+ 
+-DEFAULT_BPFTOOL := $(SCRATCH_DIR)/sbin/bpftool
++DEFAULT_BPFTOOL := $(HOST_SCRATCH_DIR)/sbin/bpftool
+ 
+ $(OUTPUT)/runqslower: $(BPFOBJ) | $(DEFAULT_BPFTOOL)
+ 	$(Q)$(MAKE) $(submake_extras) -C $(TOOLSDIR)/bpf/runqslower	\
+@@ -179,10 +196,11 @@ $(OUTPUT)/test_sysctl: cgroup_helpers.c
+ 
+ BPFTOOL ?= $(DEFAULT_BPFTOOL)
+ $(DEFAULT_BPFTOOL): $(wildcard $(BPFTOOLDIR)/*.[ch] $(BPFTOOLDIR)/Makefile)    \
+-		    $(BPFOBJ) | $(BUILD_DIR)/bpftool
++		    $(HOST_BPFOBJ) | $(HOST_BUILD_DIR)/bpftool
+ 	$(Q)$(MAKE) $(submake_extras)  -C $(BPFTOOLDIR)			       \
+-		    OUTPUT=$(BUILD_DIR)/bpftool/			       \
+-		    prefix= DESTDIR=$(SCRATCH_DIR)/ install
++		    CC=$(HOSTCC) LD=$(HOSTLD)				       \
++		    OUTPUT=$(HOST_BUILD_DIR)/bpftool/			       \
++		    prefix= DESTDIR=$(HOST_SCRATCH_DIR)/ install
+ 	$(Q)mkdir -p $(BUILD_DIR)/bpftool/Documentation
+ 	$(Q)RST2MAN_OPTS="--exit-status=1" $(MAKE) $(submake_extras)	       \
+ 		    -C $(BPFTOOLDIR)/Documentation			       \
+@@ -195,9 +213,14 @@ $(BPFOBJ): $(wildcard $(BPFDIR)/*.[ch] $
+ 	$(Q)$(MAKE) $(submake_extras) -C $(BPFDIR) OUTPUT=$(BUILD_DIR)/libbpf/ \
+ 		    DESTDIR=$(SCRATCH_DIR) prefix= all install_headers
+ 
+-$(BUILD_DIR)/libbpf $(BUILD_DIR)/bpftool $(BUILD_DIR)/resolve_btfids $(INCLUDE_DIR):
+-	$(call msg,MKDIR,,$@)
+-	$(Q)mkdir -p $@
++ifneq ($(BPFOBJ),$(HOST_BPFOBJ))
++$(HOST_BPFOBJ): $(wildcard $(BPFDIR)/*.[ch] $(BPFDIR)/Makefile)                \
++	   ../../../include/uapi/linux/bpf.h                                   \
++	   | $(INCLUDE_DIR) $(HOST_BUILD_DIR)/libbpf
++	$(Q)$(MAKE) $(submake_extras) -C $(BPFDIR)                             \
++		OUTPUT=$(HOST_BUILD_DIR)/libbpf/ CC=$(HOSTCC) LD=$(HOSTLD)     \
++		    DESTDIR=$(HOST_SCRATCH_DIR)/ prefix= all install_headers
++endif
+ 
+ $(INCLUDE_DIR)/vmlinux.h: $(VMLINUX_BTF) $(BPFTOOL) | $(INCLUDE_DIR)
+ ifeq ($(VMLINUX_H),)
+@@ -208,7 +231,7 @@ else
+ 	$(Q)cp "$(VMLINUX_H)" $@
+ endif
+ 
+-$(RESOLVE_BTFIDS): $(BPFOBJ) | $(BUILD_DIR)/resolve_btfids	\
++$(RESOLVE_BTFIDS): $(HOST_BPFOBJ) | $(HOST_BUILD_DIR)/resolve_btfids	\
+ 		       $(TOOLSDIR)/bpf/resolve_btfids/main.c	\
+ 		       $(TOOLSDIR)/lib/rbtree.c			\
+ 		       $(TOOLSDIR)/lib/zalloc.c			\
+@@ -216,7 +239,8 @@ $(RESOLVE_BTFIDS): $(BPFOBJ) | $(BUILD_D
+ 		       $(TOOLSDIR)/lib/ctype.c			\
+ 		       $(TOOLSDIR)/lib/str_error_r.c
+ 	$(Q)$(MAKE) $(submake_extras) -C $(TOOLSDIR)/bpf/resolve_btfids	\
+-		OUTPUT=$(BUILD_DIR)/resolve_btfids/ BPFOBJ=$(BPFOBJ)
++		CC=$(HOSTCC) LD=$(HOSTLD) AR=$(HOSTAR) \
++		OUTPUT=$(HOST_BUILD_DIR)/resolve_btfids/ BPFOBJ=$(HOST_BPFOBJ)
+ 
+ # Get Clang's default includes on this system, as opposed to those seen by
+ # '-target bpf'. This fixes "missing" files on some architectures/distros,
+@@ -449,7 +473,7 @@ $(OUTPUT)/bench: $(OUTPUT)/bench.o $(OUT
+ 	$(call msg,BINARY,,$@)
+ 	$(Q)$(CC) $(LDFLAGS) -o $@ $(filter %.a %.o,$^) $(LDLIBS)
+ 
+-EXTRA_CLEAN := $(TEST_CUSTOM_PROGS) $(SCRATCH_DIR)			\
++EXTRA_CLEAN := $(TEST_CUSTOM_PROGS) $(SCRATCH_DIR) $(HOST_SCRATCH_DIR)	\
+ 	prog_tests/tests.h map_tests/tests.h verifier/tests.h		\
+ 	feature								\
+ 	$(addprefix $(OUTPUT)/,*.o *.skel.h no_alu32 bpf_gcc bpf_testmod.ko)

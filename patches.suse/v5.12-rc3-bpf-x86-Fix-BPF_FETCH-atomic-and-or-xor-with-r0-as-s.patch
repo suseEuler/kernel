@@ -1,0 +1,112 @@
+From b29dd96b905f3dd543f4ca729447286adf934dd6 Mon Sep 17 00:00:00 2001
+Message-Id: <b29dd96b905f3dd543f4ca729447286adf934dd6.1649663458.git.geliang.tang@suse.com>
+From: Brendan Jackman <jackmanb@google.com>
+Date: Tue, 16 Feb 2021 12:53:07 +0000
+Subject: [PATCH] bpf, x86: Fix BPF_FETCH atomic and/or/xor with r0 as src
+Git-commit: b29dd96b905f3dd543f4ca729447286adf934dd6
+Patch-mainline: v5.12-rc3
+References: bsn#127
+Modified-by-SEL: No
+
+
+This code generates a CMPXCHG loop in order to implement atomic_fetch
+bitwise operations. Because CMPXCHG is hard-coded to use rax (which
+holds the BPF r0 value), it saves the _real_ r0 value into the
+internal "ax" temporary register and restores it once the loop is
+complete.
+
+In the middle of the loop, the actual bitwise operation is performed
+using src_reg. The bug occurs when src_reg is r0: as described above,
+r0 has been clobbered and the real r0 value is in the ax register.
+
+Therefore, perform this operation on the ax register instead, when
+src_reg is r0.
+
+Fixes: 981f94c3e921 ("bpf: Add bitwise atomic instructions")
+Signed-off-by: Brendan Jackman <jackmanb@google.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: KP Singh <kpsingh@kernel.org>
+Link: https://lore.kernel.org/bpf/20210216125307.1406237-1-jackmanb@google.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ arch/x86/net/bpf_jit_comp.c                   | 10 +++++---
+ .../selftests/bpf/verifier/atomic_and.c       | 23 +++++++++++++++++++
+ 2 files changed, 30 insertions(+), 3 deletions(-)
+
+diff --git a/arch/x86/net/bpf_jit_comp.c b/arch/x86/net/bpf_jit_comp.c
+index 79e7a0ec1da5..6926d0ca6c71 100644
+--- a/arch/x86/net/bpf_jit_comp.c
++++ b/arch/x86/net/bpf_jit_comp.c
+@@ -1349,6 +1349,7 @@ st:			if (is_imm8(insn->off))
+ 			    insn->imm == (BPF_XOR | BPF_FETCH)) {
+ 				u8 *branch_target;
+ 				bool is64 = BPF_SIZE(insn->code) == BPF_DW;
++				u32 real_src_reg = src_reg;
+ 
+ 				/*
+ 				 * Can't be implemented with a single x86 insn.
+@@ -1357,6 +1358,9 @@ st:			if (is_imm8(insn->off))
+ 
+ 				/* Will need RAX as a CMPXCHG operand so save R0 */
+ 				emit_mov_reg(&prog, true, BPF_REG_AX, BPF_REG_0);
++				if (src_reg == BPF_REG_0)
++					real_src_reg = BPF_REG_AX;
++
+ 				branch_target = prog;
+ 				/* Load old value */
+ 				emit_ldx(&prog, BPF_SIZE(insn->code),
+@@ -1366,9 +1370,9 @@ st:			if (is_imm8(insn->off))
+ 				 * put the result in the AUX_REG.
+ 				 */
+ 				emit_mov_reg(&prog, is64, AUX_REG, BPF_REG_0);
+-				maybe_emit_mod(&prog, AUX_REG, src_reg, is64);
++				maybe_emit_mod(&prog, AUX_REG, real_src_reg, is64);
+ 				EMIT2(simple_alu_opcodes[BPF_OP(insn->imm)],
+-				      add_2reg(0xC0, AUX_REG, src_reg));
++				      add_2reg(0xC0, AUX_REG, real_src_reg));
+ 				/* Attempt to swap in new value */
+ 				err = emit_atomic(&prog, BPF_CMPXCHG,
+ 						  dst_reg, AUX_REG, insn->off,
+@@ -1381,7 +1385,7 @@ st:			if (is_imm8(insn->off))
+ 				 */
+ 				EMIT2(X86_JNE, -(prog - branch_target) - 2);
+ 				/* Return the pre-modification value */
+-				emit_mov_reg(&prog, is64, src_reg, BPF_REG_0);
++				emit_mov_reg(&prog, is64, real_src_reg, BPF_REG_0);
+ 				/* Restore R0 after clobbering RAX */
+ 				emit_mov_reg(&prog, true, BPF_REG_0, BPF_REG_AX);
+ 				break;
+diff --git a/tools/testing/selftests/bpf/verifier/atomic_and.c b/tools/testing/selftests/bpf/verifier/atomic_and.c
+index 1bdc8e6684f7..fe4bb70eb9c5 100644
+--- a/tools/testing/selftests/bpf/verifier/atomic_and.c
++++ b/tools/testing/selftests/bpf/verifier/atomic_and.c
+@@ -75,3 +75,26 @@
+ 	},
+ 	.result = ACCEPT,
+ },
++{
++	"BPF_ATOMIC_AND with fetch - r0 as source reg",
++	.insns = {
++		/* val = 0x110; */
++		BPF_ST_MEM(BPF_DW, BPF_REG_10, -8, 0x110),
++		/* old = atomic_fetch_and(&val, 0x011); */
++		BPF_MOV64_IMM(BPF_REG_0, 0x011),
++		BPF_ATOMIC_OP(BPF_DW, BPF_AND | BPF_FETCH, BPF_REG_10, BPF_REG_0, -8),
++		/* if (old != 0x110) exit(3); */
++		BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0x110, 2),
++		BPF_MOV64_IMM(BPF_REG_0, 3),
++		BPF_EXIT_INSN(),
++		/* if (val != 0x010) exit(2); */
++		BPF_LDX_MEM(BPF_DW, BPF_REG_1, BPF_REG_10, -8),
++		BPF_JMP_IMM(BPF_JEQ, BPF_REG_1, 0x010, 2),
++		BPF_MOV64_IMM(BPF_REG_1, 2),
++		BPF_EXIT_INSN(),
++		/* exit(0); */
++		BPF_MOV64_IMM(BPF_REG_0, 0),
++		BPF_EXIT_INSN(),
++	},
++	.result = ACCEPT,
++},
+-- 
+2.34.1
+

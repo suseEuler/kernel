@@ -1,0 +1,115 @@
+From 89ad7420b25c2b40a4d916f4fd43b9ccacd50500 Mon Sep 17 00:00:00 2001
+Message-Id: <89ad7420b25c2b40a4d916f4fd43b9ccacd50500.1649664452.git.geliang.tang@suse.com>
+From: Andrew Delgadillo <adelg@google.com>
+Date: Fri, 11 Dec 2020 00:43:44 +0000
+Subject: [PATCH] selftests/bpf: Drop the need for LLVM's llc
+Git-commit: 89ad7420b25c2b40a4d916f4fd43b9ccacd50500
+Patch-mainline: v5.11-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+LLC is meant for compiler development and debugging. Consequently, it
+exposes many low level options about its backend. To avoid future bugs
+introduced by using the raw LLC tool, use clang directly so that all
+appropriate options are passed to the back end.
+
+Additionally, simplify the Makefile by removing the
+CLANG_NATIVE_BPF_BUILD_RULE as it is not being use, stop passing
+dwarfris attr since elfutils/libdw now supports the bpf backend (which
+should work with any recent pahole), and stop passing alu32 since
+-mcpu=v3 implies alu32.
+
+Signed-off-by: Andrew Delgadillo <adelg@google.com>
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Acked-by: Yonghong Song <yhs@fb.com>
+Link: https://lore.kernel.org/bpf/20201211004344.3355074-1-adelg@google.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/testing/selftests/bpf/Makefile |   28 +++++-----------------------
+ 1 file changed, 5 insertions(+), 23 deletions(-)
+
+--- a/tools/testing/selftests/bpf/Makefile
++++ b/tools/testing/selftests/bpf/Makefile
+@@ -19,7 +19,6 @@ ifneq ($(wildcard $(GENHDR)),)
+ endif
+ 
+ CLANG		?= clang
+-LLC		?= llc
+ LLVM_OBJCOPY	?= llvm-objcopy
+ BPF_GCC		?= $(shell command -v bpf-gcc;)
+ SAN_CFLAGS	?=
+@@ -256,31 +255,19 @@ $(OUTPUT)/flow_dissector_load.o: flow_di
+ # $1 - input .c file
+ # $2 - output .o file
+ # $3 - CFLAGS
+-# $4 - LDFLAGS
+ define CLANG_BPF_BUILD_RULE
+-	$(call msg,CLNG-LLC,$(TRUNNER_BINARY),$2)
+-	$(Q)($(CLANG) $3 -O2 -target bpf -emit-llvm			\
+-		-c $1 -o - || echo "BPF obj compilation failed") | 	\
+-	$(LLC) -mattr=dwarfris -march=bpf -mcpu=v3 $4 -filetype=obj -o $2
++	$(call msg,CLNG-BPF,$(TRUNNER_BINARY),$2)
++	$(Q)$(CLANG) $3 -O2 -target bpf -c $1 -o $2 -mcpu=v3
+ endef
+ # Similar to CLANG_BPF_BUILD_RULE, but with disabled alu32
+ define CLANG_NOALU32_BPF_BUILD_RULE
+-	$(call msg,CLNG-LLC,$(TRUNNER_BINARY),$2)
+-	$(Q)($(CLANG) $3 -O2 -target bpf -emit-llvm			\
+-		-c $1 -o - || echo "BPF obj compilation failed") | 	\
+-	$(LLC) -march=bpf -mcpu=v2 $4 -filetype=obj -o $2
+-endef
+-# Similar to CLANG_BPF_BUILD_RULE, but using native Clang and bpf LLC
+-define CLANG_NATIVE_BPF_BUILD_RULE
+ 	$(call msg,CLNG-BPF,$(TRUNNER_BINARY),$2)
+-	$(Q)($(CLANG) $3 -O2 -emit-llvm					\
+-		-c $1 -o - || echo "BPF obj compilation failed") | 	\
+-	$(LLC) -march=bpf -mcpu=v3 $4 -filetype=obj -o $2
++	$(Q)$(CLANG) $3 -O2 -target bpf -c $1 -o $2 -mcpu=v2
+ endef
+ # Build BPF object using GCC
+ define GCC_BPF_BUILD_RULE
+ 	$(call msg,GCC-BPF,$(TRUNNER_BINARY),$2)
+-	$(Q)$(BPF_GCC) $3 $4 -O2 -c $1 -o $2
++	$(Q)$(BPF_GCC) $3 -O2 -c $1 -o $2
+ endef
+ 
+ SKEL_BLACKLIST := btf__% test_pinning_invalid.c test_sk_assign.c
+@@ -336,8 +323,7 @@ $(TRUNNER_BPF_OBJS): $(TRUNNER_OUTPUT)/%
+ 		     $(wildcard $(BPFDIR)/bpf_*.h)			\
+ 		     | $(TRUNNER_OUTPUT) $$(BPFOBJ)
+ 	$$(call $(TRUNNER_BPF_BUILD_RULE),$$<,$$@,			\
+-					  $(TRUNNER_BPF_CFLAGS),	\
+-					  $(TRUNNER_BPF_LDFLAGS))
++					  $(TRUNNER_BPF_CFLAGS))
+ 
+ $(TRUNNER_BPF_SKELS): $(TRUNNER_OUTPUT)/%.skel.h:			\
+ 		      $(TRUNNER_OUTPUT)/%.o				\
+@@ -406,19 +392,16 @@ TRUNNER_EXTRA_FILES := $(OUTPUT)/urandom
+ 		       $(wildcard progs/btf_dump_test_case_*.c)
+ TRUNNER_BPF_BUILD_RULE := CLANG_BPF_BUILD_RULE
+ TRUNNER_BPF_CFLAGS := $(BPF_CFLAGS) $(CLANG_CFLAGS)
+-TRUNNER_BPF_LDFLAGS := -mattr=+alu32
+ $(eval $(call DEFINE_TEST_RUNNER,test_progs))
+ 
+ # Define test_progs-no_alu32 test runner.
+ TRUNNER_BPF_BUILD_RULE := CLANG_NOALU32_BPF_BUILD_RULE
+-TRUNNER_BPF_LDFLAGS :=
+ $(eval $(call DEFINE_TEST_RUNNER,test_progs,no_alu32))
+ 
+ # Define test_progs BPF-GCC-flavored test runner.
+ ifneq ($(BPF_GCC),)
+ TRUNNER_BPF_BUILD_RULE := GCC_BPF_BUILD_RULE
+ TRUNNER_BPF_CFLAGS := $(BPF_CFLAGS) $(call get_sys_includes,gcc)
+-TRUNNER_BPF_LDFLAGS :=
+ $(eval $(call DEFINE_TEST_RUNNER,test_progs,bpf_gcc))
+ endif
+ 
+@@ -429,7 +412,6 @@ TRUNNER_EXTRA_SOURCES := test_maps.c
+ TRUNNER_EXTRA_FILES :=
+ TRUNNER_BPF_BUILD_RULE := $$(error no BPF objects should be built)
+ TRUNNER_BPF_CFLAGS :=
+-TRUNNER_BPF_LDFLAGS :=
+ $(eval $(call DEFINE_TEST_RUNNER,test_maps))
+ 
+ # Define test_verifier test runner.

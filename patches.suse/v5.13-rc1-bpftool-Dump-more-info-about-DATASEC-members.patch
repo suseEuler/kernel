@@ -1,0 +1,119 @@
+From 5b438f01d7eb2dc9bec7cd79de881b5f155d9a71 Mon Sep 17 00:00:00 2001
+Message-Id: <5b438f01d7eb2dc9bec7cd79de881b5f155d9a71.1649661787.git.geliang.tang@suse.com>
+From: Andrii Nakryiko <andrii@kernel.org>
+Date: Fri, 23 Apr 2021 11:13:32 -0700
+Subject: [PATCH] bpftool: Dump more info about DATASEC members
+Git-commit: 5b438f01d7eb2dc9bec7cd79de881b5f155d9a71
+Patch-mainline: v5.13-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+Dump succinct information for each member of DATASEC: its kinds and name. This
+is extremely helpful to see at a quick glance what is inside each DATASEC of
+a given BTF. Without this, one has to jump around BTF data to just find out
+the name of a VAR or FUNC. DATASEC's var_secinfo member is special in that
+regard because it doesn't itself contain the name of the member, delegating
+that to the referenced VAR and FUNC kinds. Other kinds, like
+STRUCT/UNION/FUNC/ENUM, encode member names directly and thus are clearly
+identifiable in BTF dump.
+
+The new output looks like this:
+
+[35] DATASEC '.bss' size=0 vlen=6
+        type_id=8 offset=0 size=4 (VAR 'input_bss1')
+        type_id=13 offset=0 size=4 (VAR 'input_bss_weak')
+        type_id=16 offset=0 size=4 (VAR 'output_bss1')
+        type_id=17 offset=0 size=4 (VAR 'output_data1')
+        type_id=18 offset=0 size=4 (VAR 'output_rodata1')
+        type_id=20 offset=0 size=8 (VAR 'output_sink1')
+[36] DATASEC '.data' size=0 vlen=2
+        type_id=9 offset=0 size=4 (VAR 'input_data1')
+        type_id=14 offset=0 size=4 (VAR 'input_data_weak')
+[37] DATASEC '.kconfig' size=0 vlen=2
+        type_id=25 offset=0 size=4 (VAR 'LINUX_KERNEL_VERSION')
+        type_id=28 offset=0 size=1 (VAR 'CONFIG_BPF_SYSCALL')
+[38] DATASEC '.ksyms' size=0 vlen=1
+        type_id=30 offset=0 size=1 (VAR 'bpf_link_fops')
+[39] DATASEC '.rodata' size=0 vlen=2
+        type_id=12 offset=0 size=4 (VAR 'input_rodata1')
+        type_id=15 offset=0 size=4 (VAR 'input_rodata_weak')
+[40] DATASEC 'license' size=0 vlen=1
+        type_id=24 offset=0 size=4 (VAR 'LICENSE')
+
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Yonghong Song <yhs@fb.com>
+Link: https://lore.kernel.org/bpf/20210423181348.1801389-3-andrii@kernel.org
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/bpf/bpftool/btf.c | 26 ++++++++++++++++++--------
+ 1 file changed, 18 insertions(+), 8 deletions(-)
+
+diff --git a/tools/bpf/bpftool/btf.c b/tools/bpf/bpftool/btf.c
+index 001749a34899..385d5c955cf3 100644
+--- a/tools/bpf/bpftool/btf.c
++++ b/tools/bpf/bpftool/btf.c
+@@ -100,26 +100,28 @@ static const char *btf_str(const struct btf *btf, __u32 off)
+ 	return btf__name_by_offset(btf, off) ? : "(invalid)";
+ }
+ 
++static int btf_kind_safe(int kind)
++{
++	return kind <= BTF_KIND_MAX ? kind : BTF_KIND_UNKN;
++}
++
+ static int dump_btf_type(const struct btf *btf, __u32 id,
+ 			 const struct btf_type *t)
+ {
+ 	json_writer_t *w = json_wtr;
+-	int kind, safe_kind;
+-
+-	kind = BTF_INFO_KIND(t->info);
+-	safe_kind = kind <= BTF_KIND_MAX ? kind : BTF_KIND_UNKN;
++	int kind = btf_kind(t);
+ 
+ 	if (json_output) {
+ 		jsonw_start_object(w);
+ 		jsonw_uint_field(w, "id", id);
+-		jsonw_string_field(w, "kind", btf_kind_str[safe_kind]);
++		jsonw_string_field(w, "kind", btf_kind_str[btf_kind_safe(kind)]);
+ 		jsonw_string_field(w, "name", btf_str(btf, t->name_off));
+ 	} else {
+-		printf("[%u] %s '%s'", id, btf_kind_str[safe_kind],
++		printf("[%u] %s '%s'", id, btf_kind_str[btf_kind_safe(kind)],
+ 		       btf_str(btf, t->name_off));
+ 	}
+ 
+-	switch (BTF_INFO_KIND(t->info)) {
++	switch (kind) {
+ 	case BTF_KIND_INT: {
+ 		__u32 v = *(__u32 *)(t + 1);
+ 		const char *enc;
+@@ -302,7 +304,8 @@ static int dump_btf_type(const struct btf *btf, __u32 id,
+ 		break;
+ 	}
+ 	case BTF_KIND_DATASEC: {
+-		const struct btf_var_secinfo *v = (const void *)(t+1);
++		const struct btf_var_secinfo *v = (const void *)(t + 1);
++		const struct btf_type *vt;
+ 		__u16 vlen = BTF_INFO_VLEN(t->info);
+ 		int i;
+ 
+@@ -324,6 +327,13 @@ static int dump_btf_type(const struct btf *btf, __u32 id,
+ 			} else {
+ 				printf("\n\ttype_id=%u offset=%u size=%u",
+ 				       v->type, v->offset, v->size);
++
++				if (v->type <= btf__get_nr_types(btf)) {
++					vt = btf__type_by_id(btf, v->type);
++					printf(" (%s '%s')",
++					       btf_kind_str[btf_kind_safe(btf_kind(vt))],
++					       btf_str(btf, vt->name_off));
++				}
+ 			}
+ 		}
+ 		if (json_output)
+-- 
+2.34.1
+

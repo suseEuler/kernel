@@ -1,0 +1,143 @@
+From 5f10c1aac8b29d225d19a74656865d1ee3db6eaa Mon Sep 17 00:00:00 2001
+Message-Id: <5f10c1aac8b29d225d19a74656865d1ee3db6eaa.1649663799.git.geliang.tang@suse.com>
+From: Andrii Nakryiko <andrii@kernel.org>
+Date: Wed, 3 Feb 2021 12:34:45 -0800
+Subject: [PATCH] libbpf: Stop using feature-detection Makefiles
+Git-commit: 5f10c1aac8b29d225d19a74656865d1ee3db6eaa
+Patch-mainline: v5.12-rc2
+References: bsn#127
+Modified-by-SEL: No
+
+
+Libbpf's Makefile relies on Linux tools infrastructure's feature detection
+framework, but libbpf's needs are very modest: it detects the presence of
+libelf and libz, both of which are mandatory. So it doesn't benefit much from
+the framework, but pays significant costs in terms of maintainability and
+debugging experience, when something goes wrong. The other feature detector,
+testing for the presernce of minimal BPF API in system headers is long
+obsolete as well, providing no value.
+
+So stop using feature detection and just assume the presence of libelf and
+libz during build time. Worst case, user will get a clear and actionable
+linker error, e.g.:
+
+  /usr/bin/ld: cannot find -lelf
+
+On the other hand, we completely bypass recurring issues various users
+reported over time with false negatives of feature detection (libelf or libz
+not being detected, while they are actually present in the system).
+
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: John Fastabend <john.fastabend@gmail.com>
+Acked-by: Randy Dunlap <rdunlap@infradead.org>
+Link: https://lore.kernel.org/bpf/20210203203445.3356114-1-andrii@kernel.org
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/lib/bpf/.gitignore |  1 -
+ tools/lib/bpf/Makefile   | 47 ++++------------------------------------
+ 2 files changed, 4 insertions(+), 44 deletions(-)
+
+diff --git a/tools/lib/bpf/.gitignore b/tools/lib/bpf/.gitignore
+index 8a81b3679d2b..5d4cfac671d5 100644
+--- a/tools/lib/bpf/.gitignore
++++ b/tools/lib/bpf/.gitignore
+@@ -1,7 +1,6 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ libbpf_version.h
+ libbpf.pc
+-FEATURE-DUMP.libbpf
+ libbpf.so.*
+ TAGS
+ tags
+diff --git a/tools/lib/bpf/Makefile b/tools/lib/bpf/Makefile
+index 55bd78b3496f..887a494ad5fc 100644
+--- a/tools/lib/bpf/Makefile
++++ b/tools/lib/bpf/Makefile
+@@ -58,28 +58,7 @@ ifndef VERBOSE
+   VERBOSE = 0
+ endif
+ 
+-FEATURE_USER = .libbpf
+-FEATURE_TESTS = libelf zlib bpf
+-FEATURE_DISPLAY = libelf zlib bpf
+-
+ INCLUDES = -I. -I$(srctree)/tools/include -I$(srctree)/tools/include/uapi
+-FEATURE_CHECK_CFLAGS-bpf = $(INCLUDES)
+-
+-check_feat := 1
+-NON_CHECK_FEAT_TARGETS := clean TAGS tags cscope help
+-ifdef MAKECMDGOALS
+-ifeq ($(filter-out $(NON_CHECK_FEAT_TARGETS),$(MAKECMDGOALS)),)
+-  check_feat := 0
+-endif
+-endif
+-
+-ifeq ($(check_feat),1)
+-ifeq ($(FEATURES_DUMP),)
+-include $(srctree)/tools/build/Makefile.feature
+-else
+-include $(FEATURES_DUMP)
+-endif
+-endif
+ 
+ export prefix libdir src obj
+ 
+@@ -157,7 +136,7 @@ all: fixdep
+ 
+ all_cmd: $(CMD_TARGETS) check
+ 
+-$(BPF_IN_SHARED): force elfdep zdep bpfdep $(BPF_HELPER_DEFS)
++$(BPF_IN_SHARED): force $(BPF_HELPER_DEFS)
+ 	@(test -f ../../include/uapi/linux/bpf.h -a -f ../../../include/uapi/linux/bpf.h && ( \
+ 	(diff -B ../../include/uapi/linux/bpf.h ../../../include/uapi/linux/bpf.h >/dev/null) || \
+ 	echo "Warning: Kernel ABI header at 'tools/include/uapi/linux/bpf.h' differs from latest version at 'include/uapi/linux/bpf.h'" >&2 )) || true
+@@ -175,7 +154,7 @@ $(BPF_IN_SHARED): force elfdep zdep bpfdep $(BPF_HELPER_DEFS)
+ 	echo "Warning: Kernel ABI header at 'tools/include/uapi/linux/if_xdp.h' differs from latest version at 'include/uapi/linux/if_xdp.h'" >&2 )) || true
+ 	$(Q)$(MAKE) $(build)=libbpf OUTPUT=$(SHARED_OBJDIR) CFLAGS="$(CFLAGS) $(SHLIB_FLAGS)"
+ 
+-$(BPF_IN_STATIC): force elfdep zdep bpfdep $(BPF_HELPER_DEFS)
++$(BPF_IN_STATIC): force $(BPF_HELPER_DEFS)
+ 	$(Q)$(MAKE) $(build)=libbpf OUTPUT=$(STATIC_OBJDIR)
+ 
+ $(BPF_HELPER_DEFS): $(srctree)/tools/include/uapi/linux/bpf.h
+@@ -264,34 +243,16 @@ install_pkgconfig: $(PC_FILE)
+ 
+ install: install_lib install_pkgconfig install_headers
+ 
+-### Cleaning rules
+-
+-config-clean:
+-	$(call QUIET_CLEAN, feature-detect)
+-	$(Q)$(MAKE) -C $(srctree)/tools/build/feature/ clean >/dev/null
+-
+-clean: config-clean
++clean:
+ 	$(call QUIET_CLEAN, libbpf) $(RM) -rf $(CMD_TARGETS)		     \
+ 		*~ .*.d .*.cmd LIBBPF-CFLAGS $(BPF_HELPER_DEFS)		     \
+ 		$(SHARED_OBJDIR) $(STATIC_OBJDIR)			     \
+ 		$(addprefix $(OUTPUT),					     \
+ 			    *.o *.a *.so *.so.$(LIBBPF_MAJOR_VERSION) *.pc)
+-	$(call QUIET_CLEAN, core-gen) $(RM) $(OUTPUT)FEATURE-DUMP.libbpf
+-
+-
+ 
+-PHONY += force elfdep zdep bpfdep cscope tags
++PHONY += force cscope tags
+ force:
+ 
+-elfdep:
+-	@if [ "$(feature-libelf)" != "1" ]; then echo "No libelf found"; exit 1 ; fi
+-
+-zdep:
+-	@if [ "$(feature-zlib)" != "1" ]; then echo "No zlib found"; exit 1 ; fi
+-
+-bpfdep:
+-	@if [ "$(feature-bpf)" != "1" ]; then echo "BPF API too old"; exit 1 ; fi
+-
+ cscope:
+ 	ls *.c *.h > cscope.files
+ 	cscope -b -q -I $(srctree)/include -f cscope.out
+-- 
+2.34.1
+

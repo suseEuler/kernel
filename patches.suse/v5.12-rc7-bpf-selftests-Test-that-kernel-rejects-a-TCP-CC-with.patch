@@ -1,0 +1,123 @@
+From d8e8052e42d0f8ff59898b9b4142b16958627ac9 Mon Sep 17 00:00:00 2001
+Message-Id: <d8e8052e42d0f8ff59898b9b4142b16958627ac9.1649662483.git.geliang.tang@suse.com>
+From: =?UTF-8?q?Toke=20H=C3=B8iland-J=C3=B8rgensen?= <toke@redhat.com>
+Date: Fri, 26 Mar 2021 11:03:14 +0100
+Subject: [PATCH] bpf/selftests: Test that kernel rejects a TCP CC with an
+ invalid license
+Git-commit: d8e8052e42d0f8ff59898b9b4142b16958627ac9
+Patch-mainline: v5.12-rc7
+References: bsn#127
+Modified-by-SEL: No
+
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This adds a selftest to check that the verifier rejects a TCP CC struct_ops
+with a non-GPL license.
+
+Signed-off-by: Toke Høiland-Jørgensen <toke@redhat.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Martin KaFai Lau <kafai@fb.com>
+Link: https://lore.kernel.org/bpf/20210326100314.121853-2-toke@redhat.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ .../selftests/bpf/prog_tests/bpf_tcp_ca.c     | 44 +++++++++++++++++++
+ .../selftests/bpf/progs/bpf_tcp_nogpl.c       | 19 ++++++++
+ 2 files changed, 63 insertions(+)
+ create mode 100644 tools/testing/selftests/bpf/progs/bpf_tcp_nogpl.c
+
+diff --git a/tools/testing/selftests/bpf/prog_tests/bpf_tcp_ca.c b/tools/testing/selftests/bpf/prog_tests/bpf_tcp_ca.c
+index 37c5494a0381..e25917f04602 100644
+--- a/tools/testing/selftests/bpf/prog_tests/bpf_tcp_ca.c
++++ b/tools/testing/selftests/bpf/prog_tests/bpf_tcp_ca.c
+@@ -6,6 +6,7 @@
+ #include <test_progs.h>
+ #include "bpf_dctcp.skel.h"
+ #include "bpf_cubic.skel.h"
++#include "bpf_tcp_nogpl.skel.h"
+ 
+ #define min(a, b) ((a) < (b) ? (a) : (b))
+ 
+@@ -227,10 +228,53 @@ static void test_dctcp(void)
+ 	bpf_dctcp__destroy(dctcp_skel);
+ }
+ 
++static char *err_str;
++static bool found;
++
++static int libbpf_debug_print(enum libbpf_print_level level,
++			      const char *format, va_list args)
++{
++	char *log_buf;
++
++	if (level != LIBBPF_WARN ||
++	    strcmp(format, "libbpf: \n%s\n")) {
++		vprintf(format, args);
++		return 0;
++	}
++
++	log_buf = va_arg(args, char *);
++	if (!log_buf)
++		goto out;
++	if (err_str && strstr(log_buf, err_str) != NULL)
++		found = true;
++out:
++	printf(format, log_buf);
++	return 0;
++}
++
++static void test_invalid_license(void)
++{
++	libbpf_print_fn_t old_print_fn;
++	struct bpf_tcp_nogpl *skel;
++
++	err_str = "struct ops programs must have a GPL compatible license";
++	found = false;
++	old_print_fn = libbpf_set_print(libbpf_debug_print);
++
++	skel = bpf_tcp_nogpl__open_and_load();
++	ASSERT_NULL(skel, "bpf_tcp_nogpl");
++	ASSERT_EQ(found, true, "expected_err_msg");
++
++	bpf_tcp_nogpl__destroy(skel);
++	libbpf_set_print(old_print_fn);
++}
++
+ void test_bpf_tcp_ca(void)
+ {
+ 	if (test__start_subtest("dctcp"))
+ 		test_dctcp();
+ 	if (test__start_subtest("cubic"))
+ 		test_cubic();
++	if (test__start_subtest("invalid_license"))
++		test_invalid_license();
+ }
+diff --git a/tools/testing/selftests/bpf/progs/bpf_tcp_nogpl.c b/tools/testing/selftests/bpf/progs/bpf_tcp_nogpl.c
+new file mode 100644
+index 000000000000..2ecd833dcd41
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/bpf_tcp_nogpl.c
+@@ -0,0 +1,19 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include <linux/bpf.h>
++#include <linux/types.h>
++#include <bpf/bpf_helpers.h>
++#include <bpf/bpf_tracing.h>
++#include "bpf_tcp_helpers.h"
++
++char _license[] SEC("license") = "X";
++
++void BPF_STRUCT_OPS(nogpltcp_init, struct sock *sk)
++{
++}
++
++SEC(".struct_ops")
++struct tcp_congestion_ops bpf_nogpltcp = {
++	.init           = (void *)nogpltcp_init,
++	.name           = "bpf_nogpltcp",
++};
+-- 
+2.34.1
+

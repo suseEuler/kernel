@@ -1,0 +1,102 @@
+From 34da87213d3ddd26643aa83deff7ffc6463da0fc Mon Sep 17 00:00:00 2001
+Message-Id: <34da87213d3ddd26643aa83deff7ffc6463da0fc.1649664561.git.geliang.tang@suse.com>
+From: Florent Revest <revest@chromium.org>
+Date: Fri, 4 Dec 2020 12:36:09 +0100
+Subject: [PATCH] selftests/bpf: Test bpf_sk_storage_get in tcp iterators
+Git-commit: 34da87213d3ddd26643aa83deff7ffc6463da0fc
+Patch-mainline: v5.11-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+This extends the existing bpf_sk_storage_get test where a socket is
+created and tagged with its creator's pid by a task_file iterator.
+
+A TCP iterator is now also used at the end of the test to negate the
+values already stored in the local storage. The test therefore expects
+-getpid() to be stored in the local storage.
+
+Signed-off-by: Florent Revest <revest@google.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Yonghong Song <yhs@fb.com>
+Acked-by: Martin KaFai Lau <kafai@fb.com>
+Link: https://lore.kernel.org/bpf/20201204113609.1850150-6-revest@google.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ .../selftests/bpf/prog_tests/bpf_iter.c        | 18 ++++++++++++++++--
+ .../progs/bpf_iter_bpf_sk_storage_helpers.c    | 18 ++++++++++++++++++
+ 2 files changed, 34 insertions(+), 2 deletions(-)
+
+diff --git a/tools/testing/selftests/bpf/prog_tests/bpf_iter.c b/tools/testing/selftests/bpf/prog_tests/bpf_iter.c
+index 9336d0f18331..0e586368948d 100644
+--- a/tools/testing/selftests/bpf/prog_tests/bpf_iter.c
++++ b/tools/testing/selftests/bpf/prog_tests/bpf_iter.c
+@@ -978,6 +978,8 @@ static void test_bpf_sk_storage_delete(void)
+ /* This creates a socket and its local storage. It then runs a task_iter BPF
+  * program that replaces the existing socket local storage with the tgid of the
+  * only task owning a file descriptor to this socket, this process, prog_tests.
++ * It then runs a tcp socket iterator that negates the value in the existing
++ * socket local storage, the test verifies that the resulting value is -pid.
+  */
+ static void test_bpf_sk_storage_get(void)
+ {
+@@ -994,6 +996,10 @@ static void test_bpf_sk_storage_get(void)
+ 	if (CHECK(sock_fd < 0, "socket", "errno: %d\n", errno))
+ 		goto out;
+ 
++	err = listen(sock_fd, 1);
++	if (CHECK(err != 0, "listen", "errno: %d\n", errno))
++		goto close_socket;
++
+ 	map_fd = bpf_map__fd(skel->maps.sk_stg_map);
+ 
+ 	err = bpf_map_update_elem(map_fd, &sock_fd, &val, BPF_NOEXIST);
+@@ -1003,9 +1009,17 @@ static void test_bpf_sk_storage_get(void)
+ 	do_dummy_read(skel->progs.fill_socket_owner);
+ 
+ 	err = bpf_map_lookup_elem(map_fd, &sock_fd, &val);
+-	CHECK(err || val != getpid(), "bpf_map_lookup_elem",
++	if (CHECK(err || val != getpid(), "bpf_map_lookup_elem",
++	    "map value wasn't set correctly (expected %d, got %d, err=%d)\n",
++	    getpid(), val, err))
++		goto close_socket;
++
++	do_dummy_read(skel->progs.negate_socket_local_storage);
++
++	err = bpf_map_lookup_elem(map_fd, &sock_fd, &val);
++	CHECK(err || val != -getpid(), "bpf_map_lookup_elem",
+ 	      "map value wasn't set correctly (expected %d, got %d, err=%d)\n",
+-	      getpid(), val, err);
++	      -getpid(), val, err);
+ 
+ close_socket:
+ 	close(sock_fd);
+diff --git a/tools/testing/selftests/bpf/progs/bpf_iter_bpf_sk_storage_helpers.c b/tools/testing/selftests/bpf/progs/bpf_iter_bpf_sk_storage_helpers.c
+index dde53df37de8..6cecab2b32ba 100644
+--- a/tools/testing/selftests/bpf/progs/bpf_iter_bpf_sk_storage_helpers.c
++++ b/tools/testing/selftests/bpf/progs/bpf_iter_bpf_sk_storage_helpers.c
+@@ -45,3 +45,21 @@ int fill_socket_owner(struct bpf_iter__task_file *ctx)
+ 
+ 	return 0;
+ }
++
++SEC("iter/tcp")
++int negate_socket_local_storage(struct bpf_iter__tcp *ctx)
++{
++	struct sock_common *sk_common = ctx->sk_common;
++	int *sock_tgid;
++
++	if (!sk_common)
++		return 0;
++
++	sock_tgid = bpf_sk_storage_get(&sk_stg_map, sk_common, 0, 0);
++	if (!sock_tgid)
++		return 0;
++
++	*sock_tgid = -*sock_tgid;
++
++	return 0;
++}
+-- 
+2.34.1
+

@@ -1,0 +1,156 @@
+From 9e80114b1a271803767d4c5baa11ea9e8678aac3 Mon Sep 17 00:00:00 2001
+Message-Id: <9e80114b1a271803767d4c5baa11ea9e8678aac3.1649664314.git.geliang.tang@suse.com>
+From: Andrii Nakryiko <andrii@kernel.org>
+Date: Fri, 18 Dec 2020 15:56:14 -0800
+Subject: [PATCH] selftests/bpf: Add tests for user- and non-CO-RE
+ BPF_CORE_READ() variants
+Git-commit: 9e80114b1a271803767d4c5baa11ea9e8678aac3
+Patch-mainline: v5.12-rc2
+References: bsn#127
+Modified-by-SEL: No
+
+
+Add selftests validating that newly added variations of BPF_CORE_READ(), for
+use with user-space addresses and for non-CO-RE reads, work as expected.
+
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Link: https://lore.kernel.org/bpf/20201218235614.2284956-4-andrii@kernel.org
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ .../bpf/prog_tests/core_read_macros.c         | 64 +++++++++++++++++++
+ .../bpf/progs/test_core_read_macros.c         | 50 +++++++++++++++
+ 2 files changed, 114 insertions(+)
+ create mode 100644 tools/testing/selftests/bpf/prog_tests/core_read_macros.c
+ create mode 100644 tools/testing/selftests/bpf/progs/test_core_read_macros.c
+
+diff --git a/tools/testing/selftests/bpf/prog_tests/core_read_macros.c b/tools/testing/selftests/bpf/prog_tests/core_read_macros.c
+new file mode 100644
+index 000000000000..96f5cf3c6fa2
+--- /dev/null
++++ b/tools/testing/selftests/bpf/prog_tests/core_read_macros.c
+@@ -0,0 +1,64 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2020 Facebook */
++
++#include <test_progs.h>
++
++struct callback_head {
++	struct callback_head *next;
++	void (*func)(struct callback_head *head);
++};
++
++/* ___shuffled flavor is just an illusion for BPF code, it doesn't really
++ * exist and user-space needs to provide data in the memory layout that
++ * matches callback_head. We just defined ___shuffled flavor to make it easier
++ * to work with the skeleton
++ */
++struct callback_head___shuffled {
++	struct callback_head___shuffled *next;
++	void (*func)(struct callback_head *head);
++};
++
++#include "test_core_read_macros.skel.h"
++
++void test_core_read_macros(void)
++{
++	int duration = 0, err;
++	struct test_core_read_macros* skel;
++	struct test_core_read_macros__bss *bss;
++	struct callback_head u_probe_in;
++	struct callback_head___shuffled u_core_in;
++
++	skel = test_core_read_macros__open_and_load();
++	if (CHECK(!skel, "skel_open", "failed to open skeleton\n"))
++		return;
++	bss = skel->bss;
++	bss->my_pid = getpid();
++
++	/* next pointers have to be set from the kernel side */
++	bss->k_probe_in.func = (void *)(long)0x1234;
++	bss->k_core_in.func = (void *)(long)0xabcd;
++
++	u_probe_in.next = &u_probe_in;
++	u_probe_in.func = (void *)(long)0x5678;
++	bss->u_probe_in = &u_probe_in;
++
++	u_core_in.next = &u_core_in;
++	u_core_in.func = (void *)(long)0xdbca;
++	bss->u_core_in = &u_core_in;
++
++	err = test_core_read_macros__attach(skel);
++	if (CHECK(err, "skel_attach", "skeleton attach failed: %d\n", err))
++		goto cleanup;
++
++	/* trigger tracepoint */
++	usleep(1);
++
++	ASSERT_EQ(bss->k_probe_out, 0x1234, "k_probe_out");
++	ASSERT_EQ(bss->k_core_out, 0xabcd, "k_core_out");
++
++	ASSERT_EQ(bss->u_probe_out, 0x5678, "u_probe_out");
++	ASSERT_EQ(bss->u_core_out, 0xdbca, "u_core_out");
++
++cleanup:
++	test_core_read_macros__destroy(skel);
++}
+diff --git a/tools/testing/selftests/bpf/progs/test_core_read_macros.c b/tools/testing/selftests/bpf/progs/test_core_read_macros.c
+new file mode 100644
+index 000000000000..fd54caa17319
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/test_core_read_macros.c
+@@ -0,0 +1,50 @@
++// SPDX-License-Identifier: GPL-2.0
++// Copyright (c) 2020 Facebook
++
++#include "vmlinux.h"
++#include <bpf/bpf_helpers.h>
++#include <bpf/bpf_core_read.h>
++
++char _license[] SEC("license") = "GPL";
++
++/* shuffled layout for relocatable (CO-RE) reads */
++struct callback_head___shuffled {
++	void (*func)(struct callback_head___shuffled *head);
++	struct callback_head___shuffled *next;
++};
++
++struct callback_head k_probe_in = {};
++struct callback_head___shuffled k_core_in = {};
++
++struct callback_head *u_probe_in = 0;
++struct callback_head___shuffled *u_core_in = 0;
++
++long k_probe_out = 0;
++long u_probe_out = 0;
++
++long k_core_out = 0;
++long u_core_out = 0;
++
++int my_pid = 0;
++
++SEC("raw_tracepoint/sys_enter")
++int handler(void *ctx)
++{
++	int pid = bpf_get_current_pid_tgid() >> 32;
++
++	if (my_pid != pid)
++		return 0;
++
++	/* next pointers for kernel address space have to be initialized from
++	 * BPF side, user-space mmaped addresses are stil user-space addresses
++	 */
++	k_probe_in.next = &k_probe_in;
++	__builtin_preserve_access_index(({k_core_in.next = &k_core_in;}));
++
++	k_probe_out = (long)BPF_PROBE_READ(&k_probe_in, next, next, func);
++	k_core_out = (long)BPF_CORE_READ(&k_core_in, next, next, func);
++	u_probe_out = (long)BPF_PROBE_READ_USER(u_probe_in, next, next, func);
++	u_core_out = (long)BPF_CORE_READ_USER(u_core_in, next, next, func);
++
++	return 0;
++}
+-- 
+2.34.1
+

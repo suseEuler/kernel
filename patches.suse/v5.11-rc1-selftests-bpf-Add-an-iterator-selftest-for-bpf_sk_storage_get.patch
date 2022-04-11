@@ -1,0 +1,125 @@
+From bd9b327e58f98aa7126291bf12b50720c660e787 Mon Sep 17 00:00:00 2001
+Message-Id: <bd9b327e58f98aa7126291bf12b50720c660e787.1649667351.git.geliang.tang@suse.com>
+From: Florent Revest <revest@chromium.org>
+Date: Fri, 4 Dec 2020 12:36:08 +0100
+Subject: [PATCH] selftests/bpf: Add an iterator selftest for
+ bpf_sk_storage_get
+Git-commit: bd9b327e58f98aa7126291bf12b50720c660e787
+Patch-mainline: v5.11-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+The eBPF program iterates over all files and tasks. For all socket
+files, it stores the tgid of the last task it encountered with a handle
+to that socket. This is a heuristic for finding the "owner" of a socket
+similar to what's done by lsof, ss, netstat or fuser. Potentially, this
+information could be used from a cgroup_skb/*gress hook to try to
+associate network traffic with processes.
+
+The test makes sure that a socket it created is tagged with prog_tests's
+pid.
+
+Signed-off-by: Florent Revest <revest@google.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Yonghong Song <yhs@fb.com>
+Acked-by: Martin KaFai Lau <kafai@fb.com>
+Link: https://lore.kernel.org/bpf/20201204113609.1850150-5-revest@google.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ .../selftests/bpf/prog_tests/bpf_iter.c       | 40 +++++++++++++++++++
+ .../progs/bpf_iter_bpf_sk_storage_helpers.c   | 24 +++++++++++
+ 2 files changed, 64 insertions(+)
+
+diff --git a/tools/testing/selftests/bpf/prog_tests/bpf_iter.c b/tools/testing/selftests/bpf/prog_tests/bpf_iter.c
+index bb4a638f2e6f..9336d0f18331 100644
+--- a/tools/testing/selftests/bpf/prog_tests/bpf_iter.c
++++ b/tools/testing/selftests/bpf/prog_tests/bpf_iter.c
+@@ -975,6 +975,44 @@ static void test_bpf_sk_storage_delete(void)
+ 	bpf_iter_bpf_sk_storage_helpers__destroy(skel);
+ }
+ 
++/* This creates a socket and its local storage. It then runs a task_iter BPF
++ * program that replaces the existing socket local storage with the tgid of the
++ * only task owning a file descriptor to this socket, this process, prog_tests.
++ */
++static void test_bpf_sk_storage_get(void)
++{
++	struct bpf_iter_bpf_sk_storage_helpers *skel;
++	int err, map_fd, val = -1;
++	int sock_fd = -1;
++
++	skel = bpf_iter_bpf_sk_storage_helpers__open_and_load();
++	if (CHECK(!skel, "bpf_iter_bpf_sk_storage_helpers__open_and_load",
++		  "skeleton open_and_load failed\n"))
++		return;
++
++	sock_fd = socket(AF_INET6, SOCK_STREAM, 0);
++	if (CHECK(sock_fd < 0, "socket", "errno: %d\n", errno))
++		goto out;
++
++	map_fd = bpf_map__fd(skel->maps.sk_stg_map);
++
++	err = bpf_map_update_elem(map_fd, &sock_fd, &val, BPF_NOEXIST);
++	if (CHECK(err, "bpf_map_update_elem", "map_update_failed\n"))
++		goto close_socket;
++
++	do_dummy_read(skel->progs.fill_socket_owner);
++
++	err = bpf_map_lookup_elem(map_fd, &sock_fd, &val);
++	CHECK(err || val != getpid(), "bpf_map_lookup_elem",
++	      "map value wasn't set correctly (expected %d, got %d, err=%d)\n",
++	      getpid(), val, err);
++
++close_socket:
++	close(sock_fd);
++out:
++	bpf_iter_bpf_sk_storage_helpers__destroy(skel);
++}
++
+ static void test_bpf_sk_storage_map(void)
+ {
+ 	DECLARE_LIBBPF_OPTS(bpf_iter_attach_opts, opts);
+@@ -1131,6 +1169,8 @@ void test_bpf_iter(void)
+ 		test_bpf_sk_storage_map();
+ 	if (test__start_subtest("bpf_sk_storage_delete"))
+ 		test_bpf_sk_storage_delete();
++	if (test__start_subtest("bpf_sk_storage_get"))
++		test_bpf_sk_storage_get();
+ 	if (test__start_subtest("rdonly-buf-out-of-bound"))
+ 		test_rdonly_buf_out_of_bound();
+ 	if (test__start_subtest("buf-neg-offset"))
+diff --git a/tools/testing/selftests/bpf/progs/bpf_iter_bpf_sk_storage_helpers.c b/tools/testing/selftests/bpf/progs/bpf_iter_bpf_sk_storage_helpers.c
+index 01ff3235e413..dde53df37de8 100644
+--- a/tools/testing/selftests/bpf/progs/bpf_iter_bpf_sk_storage_helpers.c
++++ b/tools/testing/selftests/bpf/progs/bpf_iter_bpf_sk_storage_helpers.c
+@@ -21,3 +21,27 @@ int delete_bpf_sk_storage_map(struct bpf_iter__bpf_sk_storage_map *ctx)
+ 
+ 	return 0;
+ }
++
++SEC("iter/task_file")
++int fill_socket_owner(struct bpf_iter__task_file *ctx)
++{
++	struct task_struct *task = ctx->task;
++	struct file *file = ctx->file;
++	struct socket *sock;
++	int *sock_tgid;
++
++	if (!task || !file)
++		return 0;
++
++	sock = bpf_sock_from_file(file);
++	if (!sock)
++		return 0;
++
++	sock_tgid = bpf_sk_storage_get(&sk_stg_map, sock->sk, 0, 0);
++	if (!sock_tgid)
++		return 0;
++
++	*sock_tgid = task->tgid;
++
++	return 0;
++}
+-- 
+2.34.1
+

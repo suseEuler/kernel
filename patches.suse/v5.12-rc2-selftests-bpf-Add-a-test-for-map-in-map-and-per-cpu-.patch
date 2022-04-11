@@ -1,0 +1,121 @@
+From 750e5d7649b1415e27979f91f917fa5e103714d9 Mon Sep 17 00:00:00 2001
+Message-Id: <750e5d7649b1415e27979f91f917fa5e103714d9.1649663587.git.geliang.tang@suse.com>
+From: Alexei Starovoitov <ast@kernel.org>
+Date: Tue, 9 Feb 2021 19:36:34 -0800
+Subject: [PATCH] selftests/bpf: Add a test for map-in-map and per-cpu maps in
+ sleepable progs
+Git-commit: 750e5d7649b1415e27979f91f917fa5e103714d9
+Patch-mainline: v5.12-rc2
+References: bsn#127
+Modified-by-SEL: No
+
+
+Add a basic test for map-in-map and per-cpu maps in sleepable programs.
+
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Acked-by: KP Singh <kpsingh@kernel.org>
+Link: https://lore.kernel.org/bpf/20210210033634.62081-10-alexei.starovoitov@gmail.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/testing/selftests/bpf/progs/lsm.c | 69 +++++++++++++++++++++++++
+ 1 file changed, 69 insertions(+)
+
+diff --git a/tools/testing/selftests/bpf/progs/lsm.c b/tools/testing/selftests/bpf/progs/lsm.c
+index ff4d343b94b5..33694ef8acfa 100644
+--- a/tools/testing/selftests/bpf/progs/lsm.c
++++ b/tools/testing/selftests/bpf/progs/lsm.c
+@@ -30,6 +30,53 @@ struct {
+ 	__type(value, __u64);
+ } lru_hash SEC(".maps");
+ 
++struct {
++	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
++	__uint(max_entries, 1);
++	__type(key, __u32);
++	__type(value, __u64);
++} percpu_array SEC(".maps");
++
++struct {
++	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
++	__uint(max_entries, 1);
++	__type(key, __u32);
++	__type(value, __u64);
++} percpu_hash SEC(".maps");
++
++struct {
++	__uint(type, BPF_MAP_TYPE_LRU_PERCPU_HASH);
++	__uint(max_entries, 1);
++	__type(key, __u32);
++	__type(value, __u64);
++} lru_percpu_hash SEC(".maps");
++
++struct inner_map {
++	__uint(type, BPF_MAP_TYPE_ARRAY);
++	__uint(max_entries, 1);
++	__type(key, int);
++	__type(value, __u64);
++} inner_map SEC(".maps");
++
++struct outer_arr {
++	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
++	__uint(max_entries, 1);
++	__uint(key_size, sizeof(int));
++	__uint(value_size, sizeof(int));
++	__array(values, struct inner_map);
++} outer_arr SEC(".maps") = {
++	.values = { [0] = &inner_map },
++};
++
++struct outer_hash {
++	__uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
++	__uint(max_entries, 1);
++	__uint(key_size, sizeof(int));
++	__array(values, struct inner_map);
++} outer_hash SEC(".maps") = {
++	.values = { [0] = &inner_map },
++};
++
+ char _license[] SEC("license") = "GPL";
+ 
+ int monitored_pid = 0;
+@@ -61,6 +108,7 @@ SEC("lsm.s/bprm_committed_creds")
+ int BPF_PROG(test_void_hook, struct linux_binprm *bprm)
+ {
+ 	__u32 pid = bpf_get_current_pid_tgid() >> 32;
++	struct inner_map *inner_map;
+ 	char args[64];
+ 	__u32 key = 0;
+ 	__u64 *value;
+@@ -80,6 +128,27 @@ int BPF_PROG(test_void_hook, struct linux_binprm *bprm)
+ 	value = bpf_map_lookup_elem(&lru_hash, &key);
+ 	if (value)
+ 		*value = 0;
++	value = bpf_map_lookup_elem(&percpu_array, &key);
++	if (value)
++		*value = 0;
++	value = bpf_map_lookup_elem(&percpu_hash, &key);
++	if (value)
++		*value = 0;
++	value = bpf_map_lookup_elem(&lru_percpu_hash, &key);
++	if (value)
++		*value = 0;
++	inner_map = bpf_map_lookup_elem(&outer_arr, &key);
++	if (inner_map) {
++		value = bpf_map_lookup_elem(inner_map, &key);
++		if (value)
++			*value = 0;
++	}
++	inner_map = bpf_map_lookup_elem(&outer_hash, &key);
++	if (inner_map) {
++		value = bpf_map_lookup_elem(inner_map, &key);
++		if (value)
++			*value = 0;
++	}
+ 
+ 	return 0;
+ }
+-- 
+2.34.1
+

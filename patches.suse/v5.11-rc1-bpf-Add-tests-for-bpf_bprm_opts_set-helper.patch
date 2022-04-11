@@ -1,0 +1,203 @@
+From ea87ae85c9b31303a2e9d4c769d9f3ee8a3a60d1 Mon Sep 17 00:00:00 2001
+Message-Id: <ea87ae85c9b31303a2e9d4c769d9f3ee8a3a60d1.1649665013.git.geliang.tang@suse.com>
+From: KP Singh <kpsingh@google.com>
+Date: Tue, 17 Nov 2020 23:29:29 +0000
+Subject: [PATCH] bpf: Add tests for bpf_bprm_opts_set helper
+Git-commit: ea87ae85c9b31303a2e9d4c769d9f3ee8a3a60d1
+Patch-mainline: v5.11-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+The test forks a child process, updates the local storage to set/unset
+the securexec bit.
+
+The BPF program in the test attaches to bprm_creds_for_exec which checks
+the local storage of the current task to set the secureexec bit on the
+binary parameters (bprm).
+
+The child then execs a bash command with the environment variable
+TMPDIR set in the envp.  The bash command returns a different exit code
+based on its observed value of the TMPDIR variable.
+
+Since TMPDIR is one of the variables that is ignored by the dynamic
+loader when the secureexec bit is set, one should expect the
+child execution to not see this value when the secureexec bit is set.
+
+Signed-off-by: KP Singh <kpsingh@google.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Martin KaFai Lau <kafai@fb.com>
+Link: https://lore.kernel.org/bpf/20201117232929.2156341-2-kpsingh@chromium.org
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ .../selftests/bpf/prog_tests/test_bprm_opts.c | 116 ++++++++++++++++++
+ tools/testing/selftests/bpf/progs/bprm_opts.c |  34 +++++
+ 2 files changed, 150 insertions(+)
+ create mode 100644 tools/testing/selftests/bpf/prog_tests/test_bprm_opts.c
+ create mode 100644 tools/testing/selftests/bpf/progs/bprm_opts.c
+
+diff --git a/tools/testing/selftests/bpf/prog_tests/test_bprm_opts.c b/tools/testing/selftests/bpf/prog_tests/test_bprm_opts.c
+new file mode 100644
+index 000000000000..2559bb775762
+--- /dev/null
++++ b/tools/testing/selftests/bpf/prog_tests/test_bprm_opts.c
+@@ -0,0 +1,116 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/*
++ * Copyright (C) 2020 Google LLC.
++ */
++
++#include <test_progs.h>
++#include <linux/limits.h>
++
++#include "bprm_opts.skel.h"
++#include "network_helpers.h"
++
++#ifndef __NR_pidfd_open
++#define __NR_pidfd_open 434
++#endif
++
++static const char * const bash_envp[] = { "TMPDIR=shouldnotbeset", NULL };
++
++static inline int sys_pidfd_open(pid_t pid, unsigned int flags)
++{
++	return syscall(__NR_pidfd_open, pid, flags);
++}
++
++static int update_storage(int map_fd, int secureexec)
++{
++	int task_fd, ret = 0;
++
++	task_fd = sys_pidfd_open(getpid(), 0);
++	if (task_fd < 0)
++		return errno;
++
++	ret = bpf_map_update_elem(map_fd, &task_fd, &secureexec, BPF_NOEXIST);
++	if (ret)
++		ret = errno;
++
++	close(task_fd);
++	return ret;
++}
++
++static int run_set_secureexec(int map_fd, int secureexec)
++{
++	int child_pid, child_status, ret, null_fd;
++
++	child_pid = fork();
++	if (child_pid == 0) {
++		null_fd = open("/dev/null", O_WRONLY);
++		if (null_fd == -1)
++			exit(errno);
++		dup2(null_fd, STDOUT_FILENO);
++		dup2(null_fd, STDERR_FILENO);
++		close(null_fd);
++
++		/* Ensure that all executions from hereon are
++		 * secure by setting a local storage which is read by
++		 * the bprm_creds_for_exec hook and sets bprm->secureexec.
++		 */
++		ret = update_storage(map_fd, secureexec);
++		if (ret)
++			exit(ret);
++
++		/* If the binary is executed with securexec=1, the dynamic
++		 * loader ingores and unsets certain variables like LD_PRELOAD,
++		 * TMPDIR etc. TMPDIR is used here to simplify the example, as
++		 * LD_PRELOAD requires a real .so file.
++		 *
++		 * If the value of TMPDIR is set, the bash command returns 10
++		 * and if the value is unset, it returns 20.
++		 */
++		execle("/bin/bash", "bash", "-c",
++		       "[[ -z \"${TMPDIR}\" ]] || exit 10 && exit 20", NULL,
++		       bash_envp);
++		exit(errno);
++	} else if (child_pid > 0) {
++		waitpid(child_pid, &child_status, 0);
++		ret = WEXITSTATUS(child_status);
++
++		/* If a secureexec occurred, the exit status should be 20 */
++		if (secureexec && ret == 20)
++			return 0;
++
++		/* If normal execution happened, the exit code should be 10 */
++		if (!secureexec && ret == 10)
++			return 0;
++	}
++
++	return -EINVAL;
++}
++
++void test_test_bprm_opts(void)
++{
++	int err, duration = 0;
++	struct bprm_opts *skel = NULL;
++
++	skel = bprm_opts__open_and_load();
++	if (CHECK(!skel, "skel_load", "skeleton failed\n"))
++		goto close_prog;
++
++	err = bprm_opts__attach(skel);
++	if (CHECK(err, "attach", "attach failed: %d\n", err))
++		goto close_prog;
++
++	/* Run the test with the secureexec bit unset */
++	err = run_set_secureexec(bpf_map__fd(skel->maps.secure_exec_task_map),
++				 0 /* secureexec */);
++	if (CHECK(err, "run_set_secureexec:0", "err = %d\n", err))
++		goto close_prog;
++
++	/* Run the test with the secureexec bit set */
++	err = run_set_secureexec(bpf_map__fd(skel->maps.secure_exec_task_map),
++				 1 /* secureexec */);
++	if (CHECK(err, "run_set_secureexec:1", "err = %d\n", err))
++		goto close_prog;
++
++close_prog:
++	bprm_opts__destroy(skel);
++}
+diff --git a/tools/testing/selftests/bpf/progs/bprm_opts.c b/tools/testing/selftests/bpf/progs/bprm_opts.c
+new file mode 100644
+index 000000000000..5bfef2887e70
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/bprm_opts.c
+@@ -0,0 +1,34 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/*
++ * Copyright 2020 Google LLC.
++ */
++
++#include "vmlinux.h"
++#include <errno.h>
++#include <bpf/bpf_helpers.h>
++#include <bpf/bpf_tracing.h>
++
++char _license[] SEC("license") = "GPL";
++
++struct {
++	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
++	__uint(map_flags, BPF_F_NO_PREALLOC);
++	__type(key, int);
++	__type(value, int);
++} secure_exec_task_map SEC(".maps");
++
++SEC("lsm/bprm_creds_for_exec")
++int BPF_PROG(secure_exec, struct linux_binprm *bprm)
++{
++	int *secureexec;
++
++	secureexec = bpf_task_storage_get(&secure_exec_task_map,
++				   bpf_get_current_task_btf(), 0,
++				   BPF_LOCAL_STORAGE_GET_F_CREATE);
++
++	if (secureexec && *secureexec)
++		bpf_bprm_opts_set(bprm, BPF_F_BPRM_SECUREEXEC);
++
++	return 0;
++}
+-- 
+2.34.1
+

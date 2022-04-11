@@ -1,0 +1,145 @@
+From a19f93cfafdf85851c69bc9f677aa4f40c53610f Mon Sep 17 00:00:00 2001
+Message-Id: <a19f93cfafdf85851c69bc9f677aa4f40c53610f.1649664718.git.geliang.tang@suse.com>
+From: Andrii Nakryiko <andrii@kernel.org>
+Date: Thu, 3 Dec 2020 12:46:23 -0800
+Subject: [PATCH] libbpf: Add internal helper to load BTF data by FD
+Git-commit: a19f93cfafdf85851c69bc9f677aa4f40c53610f
+Patch-mainline: v5.11-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+Add a btf_get_from_fd() helper, which constructs struct btf from in-kernel BTF
+data by FD. This is used for loading module BTFs.
+
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20201203204634.1325171-4-andrii@kernel.org
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/lib/bpf/btf.c             | 61 +++++++++++++++++++--------------
+ tools/lib/bpf/libbpf_internal.h |  1 +
+ 2 files changed, 36 insertions(+), 26 deletions(-)
+
+diff --git a/tools/lib/bpf/btf.c b/tools/lib/bpf/btf.c
+index 1935e83d309c..3c3f2bc6c652 100644
+--- a/tools/lib/bpf/btf.c
++++ b/tools/lib/bpf/btf.c
+@@ -1323,35 +1323,27 @@ const char *btf__name_by_offset(const struct btf *btf, __u32 offset)
+ 	return btf__str_by_offset(btf, offset);
+ }
+ 
+-int btf__get_from_id(__u32 id, struct btf **btf)
++struct btf *btf_get_from_fd(int btf_fd, struct btf *base_btf)
+ {
+-	struct bpf_btf_info btf_info = { 0 };
++	struct bpf_btf_info btf_info;
+ 	__u32 len = sizeof(btf_info);
+ 	__u32 last_size;
+-	int btf_fd;
++	struct btf *btf;
+ 	void *ptr;
+ 	int err;
+ 
+-	err = 0;
+-	*btf = NULL;
+-	btf_fd = bpf_btf_get_fd_by_id(id);
+-	if (btf_fd < 0)
+-		return 0;
+-
+ 	/* we won't know btf_size until we call bpf_obj_get_info_by_fd(). so
+ 	 * let's start with a sane default - 4KiB here - and resize it only if
+ 	 * bpf_obj_get_info_by_fd() needs a bigger buffer.
+ 	 */
+-	btf_info.btf_size = 4096;
+-	last_size = btf_info.btf_size;
++	last_size = 4096;
+ 	ptr = malloc(last_size);
+-	if (!ptr) {
+-		err = -ENOMEM;
+-		goto exit_free;
+-	}
++	if (!ptr)
++		return ERR_PTR(-ENOMEM);
+ 
+-	memset(ptr, 0, last_size);
++	memset(&btf_info, 0, sizeof(btf_info));
+ 	btf_info.btf = ptr_to_u64(ptr);
++	btf_info.btf_size = last_size;
+ 	err = bpf_obj_get_info_by_fd(btf_fd, &btf_info, &len);
+ 
+ 	if (!err && btf_info.btf_size > last_size) {
+@@ -1360,31 +1352,48 @@ int btf__get_from_id(__u32 id, struct btf **btf)
+ 		last_size = btf_info.btf_size;
+ 		temp_ptr = realloc(ptr, last_size);
+ 		if (!temp_ptr) {
+-			err = -ENOMEM;
++			btf = ERR_PTR(-ENOMEM);
+ 			goto exit_free;
+ 		}
+ 		ptr = temp_ptr;
+-		memset(ptr, 0, last_size);
++
++		len = sizeof(btf_info);
++		memset(&btf_info, 0, sizeof(btf_info));
+ 		btf_info.btf = ptr_to_u64(ptr);
++		btf_info.btf_size = last_size;
++
+ 		err = bpf_obj_get_info_by_fd(btf_fd, &btf_info, &len);
+ 	}
+ 
+ 	if (err || btf_info.btf_size > last_size) {
+-		err = errno;
++		btf = err ? ERR_PTR(-errno) : ERR_PTR(-E2BIG);
+ 		goto exit_free;
+ 	}
+ 
+-	*btf = btf__new((__u8 *)(long)btf_info.btf, btf_info.btf_size);
+-	if (IS_ERR(*btf)) {
+-		err = PTR_ERR(*btf);
+-		*btf = NULL;
+-	}
++	btf = btf_new(ptr, btf_info.btf_size, base_btf);
+ 
+ exit_free:
+-	close(btf_fd);
+ 	free(ptr);
++	return btf;
++}
+ 
+-	return err;
++int btf__get_from_id(__u32 id, struct btf **btf)
++{
++	struct btf *res;
++	int btf_fd;
++
++	*btf = NULL;
++	btf_fd = bpf_btf_get_fd_by_id(id);
++	if (btf_fd < 0)
++		return -errno;
++
++	res = btf_get_from_fd(btf_fd, NULL);
++	close(btf_fd);
++	if (IS_ERR(res))
++		return PTR_ERR(res);
++
++	*btf = res;
++	return 0;
+ }
+ 
+ int btf__get_map_kv_tids(const struct btf *btf, const char *map_name,
+diff --git a/tools/lib/bpf/libbpf_internal.h b/tools/lib/bpf/libbpf_internal.h
+index d99bc847bf84..e569ae63808e 100644
+--- a/tools/lib/bpf/libbpf_internal.h
++++ b/tools/lib/bpf/libbpf_internal.h
+@@ -155,6 +155,7 @@ int bpf_object__section_size(const struct bpf_object *obj, const char *name,
+ 			     __u32 *size);
+ int bpf_object__variable_offset(const struct bpf_object *obj, const char *name,
+ 				__u32 *off);
++struct btf *btf_get_from_fd(int btf_fd, struct btf *base_btf);
+ 
+ struct btf_ext_info {
+ 	/*
+-- 
+2.34.1
+

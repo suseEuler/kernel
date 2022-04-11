@@ -1,0 +1,160 @@
+From e5e010a3063ad801cb3f85793cbada9c2a654e40 Mon Sep 17 00:00:00 2001
+Message-Id: <e5e010a3063ad801cb3f85793cbada9c2a654e40.1649662950.git.geliang.tang@suse.com>
+From: Jesper Dangaard Brouer <brouer@redhat.com>
+Date: Mon, 8 Mar 2021 15:59:23 +0100
+Subject: [PATCH] selftests/bpf: Tests using bpf_check_mtu BPF-helper input
+ mtu_len param
+Git-commit: e5e010a3063ad801cb3f85793cbada9c2a654e40
+Patch-mainline: v5.12-rc5
+References: bsn#127
+Modified-by-SEL: No
+
+
+Add tests that use mtu_len as input parameter in BPF-helper
+bpf_check_mtu().
+
+The BPF-helper is avail from both XDP and TC context. Add two tests
+per context, one that tests below MTU and one that exceeds the MTU.
+
+Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: John Fastabend <john.fastabend@gmail.com>
+Link: https://lore.kernel.org/bpf/161521556358.3515614.5915221479709358964.stgit@firesoul
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ .../selftests/bpf/prog_tests/check_mtu.c      |  4 +
+ .../selftests/bpf/progs/test_check_mtu.c      | 92 +++++++++++++++++++
+ 2 files changed, 96 insertions(+)
+
+diff --git a/tools/testing/selftests/bpf/prog_tests/check_mtu.c b/tools/testing/selftests/bpf/prog_tests/check_mtu.c
+index 36af1c138faf..b62a39315336 100644
+--- a/tools/testing/selftests/bpf/prog_tests/check_mtu.c
++++ b/tools/testing/selftests/bpf/prog_tests/check_mtu.c
+@@ -128,6 +128,8 @@ static void test_check_mtu_xdp(__u32 mtu, __u32 ifindex)
+ 	test_check_mtu_run_xdp(skel, skel->progs.xdp_use_helper, mtu);
+ 	test_check_mtu_run_xdp(skel, skel->progs.xdp_exceed_mtu, mtu);
+ 	test_check_mtu_run_xdp(skel, skel->progs.xdp_minus_delta, mtu);
++	test_check_mtu_run_xdp(skel, skel->progs.xdp_input_len, mtu);
++	test_check_mtu_run_xdp(skel, skel->progs.xdp_input_len_exceed, mtu);
+ 
+ cleanup:
+ 	test_check_mtu__destroy(skel);
+@@ -187,6 +189,8 @@ static void test_check_mtu_tc(__u32 mtu, __u32 ifindex)
+ 	test_check_mtu_run_tc(skel, skel->progs.tc_exceed_mtu, mtu);
+ 	test_check_mtu_run_tc(skel, skel->progs.tc_exceed_mtu_da, mtu);
+ 	test_check_mtu_run_tc(skel, skel->progs.tc_minus_delta, mtu);
++	test_check_mtu_run_tc(skel, skel->progs.tc_input_len, mtu);
++	test_check_mtu_run_tc(skel, skel->progs.tc_input_len_exceed, mtu);
+ cleanup:
+ 	test_check_mtu__destroy(skel);
+ }
+diff --git a/tools/testing/selftests/bpf/progs/test_check_mtu.c b/tools/testing/selftests/bpf/progs/test_check_mtu.c
+index b7787b43f9db..c4a9bae96e75 100644
+--- a/tools/testing/selftests/bpf/progs/test_check_mtu.c
++++ b/tools/testing/selftests/bpf/progs/test_check_mtu.c
+@@ -105,6 +105,54 @@ int xdp_minus_delta(struct xdp_md *ctx)
+ 	return retval;
+ }
+ 
++SEC("xdp")
++int xdp_input_len(struct xdp_md *ctx)
++{
++	int retval = XDP_PASS; /* Expected retval on successful test */
++	void *data_end = (void *)(long)ctx->data_end;
++	void *data = (void *)(long)ctx->data;
++	__u32 ifindex = GLOBAL_USER_IFINDEX;
++	__u32 data_len = data_end - data;
++
++	/* API allow user give length to check as input via mtu_len param,
++	 * resulting MTU value is still output in mtu_len param after call.
++	 *
++	 * Input len is L3, like MTU and iph->tot_len.
++	 * Remember XDP data_len is L2.
++	 */
++	__u32 mtu_len = data_len - ETH_HLEN;
++
++	if (bpf_check_mtu(ctx, ifindex, &mtu_len, 0, 0))
++		retval = XDP_ABORTED;
++
++	global_bpf_mtu_xdp = mtu_len;
++	return retval;
++}
++
++SEC("xdp")
++int xdp_input_len_exceed(struct xdp_md *ctx)
++{
++	int retval = XDP_ABORTED; /* Fail */
++	__u32 ifindex = GLOBAL_USER_IFINDEX;
++	int err;
++
++	/* API allow user give length to check as input via mtu_len param,
++	 * resulting MTU value is still output in mtu_len param after call.
++	 *
++	 * Input length value is L3 size like MTU.
++	 */
++	__u32 mtu_len = GLOBAL_USER_MTU;
++
++	mtu_len += 1; /* Exceed with 1 */
++
++	err = bpf_check_mtu(ctx, ifindex, &mtu_len, 0, 0);
++	if (err == BPF_MTU_CHK_RET_FRAG_NEEDED)
++		retval = XDP_PASS ; /* Success in exceeding MTU check */
++
++	global_bpf_mtu_xdp = mtu_len;
++	return retval;
++}
++
+ SEC("classifier")
+ int tc_use_helper(struct __sk_buff *ctx)
+ {
+@@ -196,3 +244,47 @@ int tc_minus_delta(struct __sk_buff *ctx)
+ 	global_bpf_mtu_xdp = mtu_len;
+ 	return retval;
+ }
++
++SEC("classifier")
++int tc_input_len(struct __sk_buff *ctx)
++{
++	int retval = BPF_OK; /* Expected retval on successful test */
++	__u32 ifindex = GLOBAL_USER_IFINDEX;
++
++	/* API allow user give length to check as input via mtu_len param,
++	 * resulting MTU value is still output in mtu_len param after call.
++	 *
++	 * Input length value is L3 size.
++	 */
++	__u32 mtu_len = GLOBAL_USER_MTU;
++
++	if (bpf_check_mtu(ctx, ifindex, &mtu_len, 0, 0))
++		retval = BPF_DROP;
++
++	global_bpf_mtu_xdp = mtu_len;
++	return retval;
++}
++
++SEC("classifier")
++int tc_input_len_exceed(struct __sk_buff *ctx)
++{
++	int retval = BPF_DROP; /* Fail */
++	__u32 ifindex = GLOBAL_USER_IFINDEX;
++	int err;
++
++	/* API allow user give length to check as input via mtu_len param,
++	 * resulting MTU value is still output in mtu_len param after call.
++	 *
++	 * Input length value is L3 size like MTU.
++	 */
++	__u32 mtu_len = GLOBAL_USER_MTU;
++
++	mtu_len += 1; /* Exceed with 1 */
++
++	err = bpf_check_mtu(ctx, ifindex, &mtu_len, 0, 0);
++	if (err == BPF_MTU_CHK_RET_FRAG_NEEDED)
++		retval = BPF_OK; /* Success in exceeding MTU check */
++
++	global_bpf_mtu_xdp = mtu_len;
++	return retval;
++}
+-- 
+2.34.1
+

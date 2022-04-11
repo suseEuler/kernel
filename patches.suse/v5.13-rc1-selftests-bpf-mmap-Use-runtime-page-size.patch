@@ -1,0 +1,95 @@
+From 34090aaf256e469a39401cc04d5cd43275ccd97d Mon Sep 17 00:00:00 2001
+Message-Id: <34090aaf256e469a39401cc04d5cd43275ccd97d.1649661991.git.geliang.tang@suse.com>
+From: Yauheni Kaliuta <yauheni.kaliuta@redhat.com>
+Date: Thu, 8 Apr 2021 09:13:06 +0300
+Subject: [PATCH] selftests/bpf: mmap: Use runtime page size
+Git-commit: 34090aaf256e469a39401cc04d5cd43275ccd97d
+Patch-mainline: v5.13-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+Replace hardcoded 4096 with runtime value in the userspace part of
+the test and set bpf table sizes dynamically according to the value.
+
+Do not switch to ASSERT macros, keep CHECK, for consistency with the
+rest of the test. Can be a separate cleanup patch.
+
+Signed-off-by: Yauheni Kaliuta <yauheni.kaliuta@redhat.com>
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20210408061310.95877-5-yauheni.kaliuta@redhat.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/testing/selftests/bpf/prog_tests/mmap.c | 24 +++++++++++++++----
+ tools/testing/selftests/bpf/progs/test_mmap.c |  2 --
+ 2 files changed, 19 insertions(+), 7 deletions(-)
+
+diff --git a/tools/testing/selftests/bpf/prog_tests/mmap.c b/tools/testing/selftests/bpf/prog_tests/mmap.c
+index 9c3c5c0f068f..37b002ca1167 100644
+--- a/tools/testing/selftests/bpf/prog_tests/mmap.c
++++ b/tools/testing/selftests/bpf/prog_tests/mmap.c
+@@ -29,22 +29,36 @@ void test_mmap(void)
+ 	struct test_mmap *skel;
+ 	__u64 val = 0;
+ 
+-	skel = test_mmap__open_and_load();
+-	if (CHECK(!skel, "skel_open_and_load", "skeleton open/load failed\n"))
++	skel = test_mmap__open();
++	if (CHECK(!skel, "skel_open", "skeleton open failed\n"))
+ 		return;
+ 
++	err = bpf_map__set_max_entries(skel->maps.rdonly_map, page_size);
++	if (CHECK(err != 0, "bpf_map__set_max_entries", "bpf_map__set_max_entries failed\n"))
++		goto cleanup;
++
++	/* at least 4 pages of data */
++	err = bpf_map__set_max_entries(skel->maps.data_map,
++				       4 * (page_size / sizeof(u64)));
++	if (CHECK(err != 0, "bpf_map__set_max_entries", "bpf_map__set_max_entries failed\n"))
++		goto cleanup;
++
++	err = test_mmap__load(skel);
++	if (CHECK(err != 0, "skel_load", "skeleton load failed\n"))
++		goto cleanup;
++
+ 	bss_map = skel->maps.bss;
+ 	data_map = skel->maps.data_map;
+ 	data_map_fd = bpf_map__fd(data_map);
+ 
+ 	rdmap_fd = bpf_map__fd(skel->maps.rdonly_map);
+-	tmp1 = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, rdmap_fd, 0);
++	tmp1 = mmap(NULL, page_size, PROT_READ | PROT_WRITE, MAP_SHARED, rdmap_fd, 0);
+ 	if (CHECK(tmp1 != MAP_FAILED, "rdonly_write_mmap", "unexpected success\n")) {
+-		munmap(tmp1, 4096);
++		munmap(tmp1, page_size);
+ 		goto cleanup;
+ 	}
+ 	/* now double-check if it's mmap()'able at all */
+-	tmp1 = mmap(NULL, 4096, PROT_READ, MAP_SHARED, rdmap_fd, 0);
++	tmp1 = mmap(NULL, page_size, PROT_READ, MAP_SHARED, rdmap_fd, 0);
+ 	if (CHECK(tmp1 == MAP_FAILED, "rdonly_read_mmap", "failed: %d\n", errno))
+ 		goto cleanup;
+ 
+diff --git a/tools/testing/selftests/bpf/progs/test_mmap.c b/tools/testing/selftests/bpf/progs/test_mmap.c
+index 4eb42cff5fe9..5a5cc19a15bf 100644
+--- a/tools/testing/selftests/bpf/progs/test_mmap.c
++++ b/tools/testing/selftests/bpf/progs/test_mmap.c
+@@ -9,7 +9,6 @@ char _license[] SEC("license") = "GPL";
+ 
+ struct {
+ 	__uint(type, BPF_MAP_TYPE_ARRAY);
+-	__uint(max_entries, 4096);
+ 	__uint(map_flags, BPF_F_MMAPABLE | BPF_F_RDONLY_PROG);
+ 	__type(key, __u32);
+ 	__type(value, char);
+@@ -17,7 +16,6 @@ struct {
+ 
+ struct {
+ 	__uint(type, BPF_MAP_TYPE_ARRAY);
+-	__uint(max_entries, 512 * 4); /* at least 4 pages of data */
+ 	__uint(map_flags, BPF_F_MMAPABLE);
+ 	__type(key, __u32);
+ 	__type(value, __u64);
+-- 
+2.34.1
+

@@ -1,0 +1,74 @@
+From 6b6e6b1d09aa20c351a1fce0ea6402da436624a4 Mon Sep 17 00:00:00 2001
+Message-Id: <6b6e6b1d09aa20c351a1fce0ea6402da436624a4.1649665288.git.geliang.tang@suse.com>
+From: Andrii Nakryiko <andrii@kernel.org>
+Date: Wed, 4 Nov 2020 20:33:59 -0800
+Subject: [PATCH] libbpf: Accomodate DWARF/compiler bug with duplicated
+ identical arrays
+Git-commit: 6b6e6b1d09aa20c351a1fce0ea6402da436624a4
+Patch-mainline: v5.11-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+In some cases compiler seems to generate distinct DWARF types for identical
+arrays within the same CU. That seems like a bug, but it's already out there
+and breaks type graph equivalence checks, so accommodate it anyway by checking
+for identical arrays, regardless of their type ID.
+
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Song Liu <songliubraving@fb.com>
+Link: https://lore.kernel.org/bpf/20201105043402.2530976-10-andrii@kernel.org
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/lib/bpf/btf.c | 27 +++++++++++++++++++++++++--
+ 1 file changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/tools/lib/bpf/btf.c b/tools/lib/bpf/btf.c
+index 8d04d9becb67..2d0d064c6d31 100644
+--- a/tools/lib/bpf/btf.c
++++ b/tools/lib/bpf/btf.c
+@@ -3785,6 +3785,19 @@ static inline __u16 btf_fwd_kind(struct btf_type *t)
+ 	return btf_kflag(t) ? BTF_KIND_UNION : BTF_KIND_STRUCT;
+ }
+ 
++/* Check if given two types are identical ARRAY definitions */
++static int btf_dedup_identical_arrays(struct btf_dedup *d, __u32 id1, __u32 id2)
++{
++	struct btf_type *t1, *t2;
++
++	t1 = btf_type_by_id(d->btf, id1);
++	t2 = btf_type_by_id(d->btf, id2);
++	if (!btf_is_array(t1) || !btf_is_array(t2))
++		return 0;
++
++	return btf_equal_array(t1, t2);
++}
++
+ /*
+  * Check equivalence of BTF type graph formed by candidate struct/union (we'll
+  * call it "candidate graph" in this description for brevity) to a type graph
+@@ -3895,8 +3908,18 @@ static int btf_dedup_is_equiv(struct btf_dedup *d, __u32 cand_id,
+ 	canon_id = resolve_fwd_id(d, canon_id);
+ 
+ 	hypot_type_id = d->hypot_map[canon_id];
+-	if (hypot_type_id <= BTF_MAX_NR_TYPES)
+-		return hypot_type_id == cand_id;
++	if (hypot_type_id <= BTF_MAX_NR_TYPES) {
++		/* In some cases compiler will generate different DWARF types
++		 * for *identical* array type definitions and use them for
++		 * different fields within the *same* struct. This breaks type
++		 * equivalence check, which makes an assumption that candidate
++		 * types sub-graph has a consistent and deduped-by-compiler
++		 * types within a single CU. So work around that by explicitly
++		 * allowing identical array types here.
++		 */
++		return hypot_type_id == cand_id ||
++		       btf_dedup_identical_arrays(d, hypot_type_id, cand_id);
++	}
+ 
+ 	if (btf_dedup_hypot_map_add(d, canon_id, cand_id))
+ 		return -ENOMEM;
+-- 
+2.34.1
+

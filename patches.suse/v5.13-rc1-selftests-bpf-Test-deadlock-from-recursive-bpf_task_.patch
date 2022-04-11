@@ -1,0 +1,150 @@
+From c540957a4d1d13934e93e53ce3056ac4108ffc29 Mon Sep 17 00:00:00 2001
+Message-Id: <c540957a4d1d13934e93e53ce3056ac4108ffc29.1649663397.git.geliang.tang@suse.com>
+From: Song Liu <songliubraving@fb.com>
+Date: Thu, 25 Feb 2021 15:43:17 -0800
+Subject: [PATCH] selftests/bpf: Test deadlock from recursive
+ bpf_task_storage_[get|delete]
+Git-commit: c540957a4d1d13934e93e53ce3056ac4108ffc29
+Patch-mainline: v5.13-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+Add a test with recursive bpf_task_storage_[get|delete] from fentry
+programs on bpf_local_storage_lookup and bpf_local_storage_update. Without
+proper deadlock prevent mechanism, this test would cause deadlock.
+
+Signed-off-by: Song Liu <songliubraving@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20210225234319.336131-5-songliubraving@fb.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ .../bpf/prog_tests/task_local_storage.c       | 23 ++++++
+ .../selftests/bpf/progs/task_ls_recursion.c   | 70 +++++++++++++++++++
+ 2 files changed, 93 insertions(+)
+ create mode 100644 tools/testing/selftests/bpf/progs/task_ls_recursion.c
+
+diff --git a/tools/testing/selftests/bpf/prog_tests/task_local_storage.c b/tools/testing/selftests/bpf/prog_tests/task_local_storage.c
+index dbb7525cdd56..035c263aab1b 100644
+--- a/tools/testing/selftests/bpf/prog_tests/task_local_storage.c
++++ b/tools/testing/selftests/bpf/prog_tests/task_local_storage.c
+@@ -8,6 +8,7 @@
+ #include <test_progs.h>
+ #include "task_local_storage.skel.h"
+ #include "task_local_storage_exit_creds.skel.h"
++#include "task_ls_recursion.skel.h"
+ 
+ static void test_sys_enter_exit(void)
+ {
+@@ -60,10 +61,32 @@ static void test_exit_creds(void)
+ 	task_local_storage_exit_creds__destroy(skel);
+ }
+ 
++static void test_recursion(void)
++{
++	struct task_ls_recursion *skel;
++	int err;
++
++	skel = task_ls_recursion__open_and_load();
++	if (!ASSERT_OK_PTR(skel, "skel_open_and_load"))
++		return;
++
++	err = task_ls_recursion__attach(skel);
++	if (!ASSERT_OK(err, "skel_attach"))
++		goto out;
++
++	/* trigger sys_enter, make sure it does not cause deadlock */
++	syscall(SYS_gettid);
++
++out:
++	task_ls_recursion__destroy(skel);
++}
++
+ void test_task_local_storage(void)
+ {
+ 	if (test__start_subtest("sys_enter_exit"))
+ 		test_sys_enter_exit();
+ 	if (test__start_subtest("exit_creds"))
+ 		test_exit_creds();
++	if (test__start_subtest("recursion"))
++		test_recursion();
+ }
+diff --git a/tools/testing/selftests/bpf/progs/task_ls_recursion.c b/tools/testing/selftests/bpf/progs/task_ls_recursion.c
+new file mode 100644
+index 000000000000..564583dca7c8
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/task_ls_recursion.c
+@@ -0,0 +1,70 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2021 Facebook */
++
++#include "vmlinux.h"
++#include <bpf/bpf_helpers.h>
++#include <bpf/bpf_tracing.h>
++
++char _license[] SEC("license") = "GPL";
++
++struct {
++	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
++	__uint(map_flags, BPF_F_NO_PREALLOC);
++	__type(key, int);
++	__type(value, long);
++} map_a SEC(".maps");
++
++struct {
++	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
++	__uint(map_flags, BPF_F_NO_PREALLOC);
++	__type(key, int);
++	__type(value, long);
++} map_b SEC(".maps");
++
++SEC("fentry/bpf_local_storage_lookup")
++int BPF_PROG(on_lookup)
++{
++	struct task_struct *task = bpf_get_current_task_btf();
++
++	bpf_task_storage_delete(&map_a, task);
++	bpf_task_storage_delete(&map_b, task);
++	return 0;
++}
++
++SEC("fentry/bpf_local_storage_update")
++int BPF_PROG(on_update)
++{
++	struct task_struct *task = bpf_get_current_task_btf();
++	long *ptr;
++
++	ptr = bpf_task_storage_get(&map_a, task, 0,
++				   BPF_LOCAL_STORAGE_GET_F_CREATE);
++	if (ptr)
++		*ptr += 1;
++
++	ptr = bpf_task_storage_get(&map_b, task, 0,
++				   BPF_LOCAL_STORAGE_GET_F_CREATE);
++	if (ptr)
++		*ptr += 1;
++
++	return 0;
++}
++
++SEC("tp_btf/sys_enter")
++int BPF_PROG(on_enter, struct pt_regs *regs, long id)
++{
++	struct task_struct *task;
++	long *ptr;
++
++	task = bpf_get_current_task_btf();
++	ptr = bpf_task_storage_get(&map_a, task, 0,
++				   BPF_LOCAL_STORAGE_GET_F_CREATE);
++	if (ptr)
++		*ptr = 200;
++
++	ptr = bpf_task_storage_get(&map_b, task, 0,
++				   BPF_LOCAL_STORAGE_GET_F_CREATE);
++	if (ptr)
++		*ptr = 100;
++	return 0;
++}
+-- 
+2.34.1
+
