@@ -1,0 +1,106 @@
+From fff13c4bb646ef849fd74ced87eef54340d28c21 Mon Sep 17 00:00:00 2001
+Message-Id: <fff13c4bb646ef849fd74ced87eef54340d28c21.1648734472.git.geliang.tang@suse.com>
+From: Florent Revest <revest@chromium.org>
+Date: Mon, 19 Apr 2021 17:52:39 +0200
+Subject: [PATCH] bpf: Add a ARG_PTR_TO_CONST_STR argument type
+Git-commit: fff13c4bb646ef849fd74ced87eef54340d28c21
+Patch-mainline: v5.13-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+This type provides the guarantee that an argument is going to be a const
+pointer to somewhere in a read-only map value. It also checks that this
+pointer is followed by a zero character before the end of the map value.
+
+Signed-off-by: Florent Revest <revest@chromium.org>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20210419155243.1632274-3-revest@chromium.org
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ include/linux/bpf.h   |  1 +
+ kernel/bpf/verifier.c | 41 +++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 42 insertions(+)
+
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 77d1d8c65b81..c160526fc8bf 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -309,6 +309,7 @@ enum bpf_arg_type {
+ 	ARG_PTR_TO_PERCPU_BTF_ID,	/* pointer to in-kernel percpu type */
+ 	ARG_PTR_TO_FUNC,	/* pointer to a bpf program function */
+ 	ARG_PTR_TO_STACK_OR_NULL,	/* pointer to stack or NULL */
++	ARG_PTR_TO_CONST_STR,	/* pointer to a null terminated read-only string */
+ 	__BPF_ARG_TYPE_MAX,
+ };
+ 
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 852541a435ef..5f46dd6f3383 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -4787,6 +4787,7 @@ static const struct bpf_reg_types spin_lock_types = { .types = { PTR_TO_MAP_VALU
+ static const struct bpf_reg_types percpu_btf_ptr_types = { .types = { PTR_TO_PERCPU_BTF_ID } };
+ static const struct bpf_reg_types func_ptr_types = { .types = { PTR_TO_FUNC } };
+ static const struct bpf_reg_types stack_ptr_types = { .types = { PTR_TO_STACK } };
++static const struct bpf_reg_types const_str_ptr_types = { .types = { PTR_TO_MAP_VALUE } };
+ 
+ static const struct bpf_reg_types *compatible_reg_types[__BPF_ARG_TYPE_MAX] = {
+ 	[ARG_PTR_TO_MAP_KEY]		= &map_key_value_types,
+@@ -4817,6 +4818,7 @@ static const struct bpf_reg_types *compatible_reg_types[__BPF_ARG_TYPE_MAX] = {
+ 	[ARG_PTR_TO_PERCPU_BTF_ID]	= &percpu_btf_ptr_types,
+ 	[ARG_PTR_TO_FUNC]		= &func_ptr_types,
+ 	[ARG_PTR_TO_STACK_OR_NULL]	= &stack_ptr_types,
++	[ARG_PTR_TO_CONST_STR]		= &const_str_ptr_types,
+ };
+ 
+ static int check_reg_type(struct bpf_verifier_env *env, u32 regno,
+@@ -5067,6 +5069,45 @@ static int check_func_arg(struct bpf_verifier_env *env, u32 arg,
+ 		if (err)
+ 			return err;
+ 		err = check_ptr_alignment(env, reg, 0, size, true);
++	} else if (arg_type == ARG_PTR_TO_CONST_STR) {
++		struct bpf_map *map = reg->map_ptr;
++		int map_off;
++		u64 map_addr;
++		char *str_ptr;
++
++		if (reg->type != PTR_TO_MAP_VALUE || !map ||
++		    !bpf_map_is_rdonly(map)) {
++			verbose(env, "R%d does not point to a readonly map'\n", regno);
++			return -EACCES;
++		}
++
++		if (!tnum_is_const(reg->var_off)) {
++			verbose(env, "R%d is not a constant address'\n", regno);
++			return -EACCES;
++		}
++
++		if (!map->ops->map_direct_value_addr) {
++			verbose(env, "no direct value access support for this map type\n");
++			return -EACCES;
++		}
++
++		err = check_map_access(env, regno, reg->off,
++				       map->value_size - reg->off, false);
++		if (err)
++			return err;
++
++		map_off = reg->off + reg->var_off.value;
++		err = map->ops->map_direct_value_addr(map, &map_addr, map_off);
++		if (err) {
++			verbose(env, "direct value access on string failed\n");
++			return err;
++		}
++
++		str_ptr = (char *)(long)(map_addr);
++		if (!strnchr(str_ptr + map_off, map->value_size - map_off, 0)) {
++			verbose(env, "string is not zero-terminated\n");
++			return -EINVAL;
++		}
+ 	}
+ 
+ 	return err;
+-- 
+2.34.1
+

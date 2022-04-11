@@ -1,0 +1,734 @@
+From 69c087ba6225b574afb6e505b72cb75242a3d844 Mon Sep 17 00:00:00 2001
+Message-Id: <69c087ba6225b574afb6e505b72cb75242a3d844.1648735521.git.geliang.tang@suse.com>
+From: Yonghong Song <yhs@fb.com>
+Date: Fri, 26 Feb 2021 12:49:25 -0800
+Subject: [PATCH] bpf: Add bpf_for_each_map_elem() helper
+Git-commit: 69c087ba6225b574afb6e505b72cb75242a3d844
+Patch-mainline: v5.13-rc1
+References: bsn#127
+Modified-by-SEL: Yes, refreshed due to context changes
+
+
+The bpf_for_each_map_elem() helper is introduced which
+iterates all map elements with a callback function. The
+helper signature looks like
+  long bpf_for_each_map_elem(map, callback_fn, callback_ctx, flags)
+and for each map element, the callback_fn will be called. For example,
+like hashmap, the callback signature may look like
+  long callback_fn(map, key, val, callback_ctx)
+
+There are two known use cases for this. One is from upstream ([1]) where
+a for_each_map_elem helper may help implement a timeout mechanism
+in a more generic way. Another is from our internal discussion
+for a firewall use case where a map contains all the rules. The packet
+data can be compared to all these rules to decide allow or deny
+the packet.
+
+For array maps, users can already use a bounded loop to traverse
+elements. Using this helper can avoid using bounded loop. For other
+type of maps (e.g., hash maps) where bounded loop is hard or
+impossible to use, this helper provides a convenient way to
+operate on all elements.
+
+For callback_fn, besides map and map element, a callback_ctx,
+allocated on caller stack, is also passed to the callback
+function. This callback_ctx argument can provide additional
+input and allow to write to caller stack for output.
+
+If the callback_fn returns 0, the helper will iterate through next
+element if available. If the callback_fn returns 1, the helper
+will stop iterating and returns to the bpf program. Other return
+values are not used for now.
+
+Currently, this helper is only available with jit. It is possible
+to make it work with interpreter with so effort but I leave it
+as the future work.
+
+[1]: https://lore.kernel.org/bpf/20210122205415.113822-1-xiyou.wangcong@gmail.com/
+
+Signed-off-by: Yonghong Song <yhs@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20210226204925.3884923-1-yhs@fb.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ include/linux/bpf.h            |  13 +++
+ include/linux/bpf_verifier.h   |   3 +
+ include/uapi/linux/bpf.h       |  38 ++++++
+ kernel/bpf/bpf_iter.c          |  16 +++
+ kernel/bpf/helpers.c           |   2 +
+ kernel/bpf/verifier.c          | 208 ++++++++++++++++++++++++++++++---
+ kernel/trace/bpf_trace.c       |   2 +
+ tools/include/uapi/linux/bpf.h |  38 ++++++
+ 8 files changed, 307 insertions(+), 13 deletions(-)
+
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -41,6 +41,7 @@ struct bpf_local_storage_map;
+ struct kobject;
+ struct mem_cgroup;
+ struct module;
++struct bpf_func_state;
+ 
+ extern struct idr btf_idr;
+ extern spinlock_t btf_idr_lock;
+@@ -131,6 +132,13 @@ struct bpf_map_ops {
+ 	bool (*map_meta_equal)(const struct bpf_map *meta0,
+ 			       const struct bpf_map *meta1);
+ 
++
++	int (*map_set_for_each_callback_args)(struct bpf_verifier_env *env,
++					      struct bpf_func_state *caller,
++					      struct bpf_func_state *callee);
++	int (*map_for_each_callback)(struct bpf_map *map, void *callback_fn,
++				     void *callback_ctx, u64 flags);
++
+ 	/* BTF name and id of struct allocated by map_alloc */
+ 	const char * const map_btf_name;
+ 	int *map_btf_id;
+@@ -297,6 +305,8 @@ enum bpf_arg_type {
+ 	ARG_CONST_ALLOC_SIZE_OR_ZERO,	/* number of allocated bytes requested */
+ 	ARG_PTR_TO_BTF_ID_SOCK_COMMON,	/* pointer to in-kernel sock_common or bpf-mirrored bpf_sock */
+ 	ARG_PTR_TO_PERCPU_BTF_ID,	/* pointer to in-kernel percpu type */
++	ARG_PTR_TO_FUNC,	/* pointer to a bpf program function */
++	ARG_PTR_TO_STACK_OR_NULL,	/* pointer to stack or NULL */
+ 	__BPF_ARG_TYPE_MAX,
+ };
+ 
+@@ -413,6 +423,8 @@ enum bpf_reg_type {
+ 	PTR_TO_RDWR_BUF,	 /* reg points to a read/write buffer */
+ 	PTR_TO_RDWR_BUF_OR_NULL, /* reg points to a read/write buffer or NULL */
+ 	PTR_TO_PERCPU_BTF_ID,	 /* reg points to a percpu kernel variable */
++	PTR_TO_FUNC,		 /* reg points to a bpf program function */
++	PTR_TO_MAP_KEY,		 /* reg points to a map element key */
+ };
+ 
+ /* The information passed from prog-specific *_is_valid_access
+@@ -1931,6 +1943,7 @@ extern const struct bpf_func_proto bpf_s
+ extern const struct bpf_func_proto bpf_get_socket_ptr_cookie_proto;
+ extern const struct bpf_func_proto bpf_task_storage_get_proto;
+ extern const struct bpf_func_proto bpf_task_storage_delete_proto;
++extern const struct bpf_func_proto bpf_for_each_map_elem_proto;
+ 
+ const struct bpf_func_proto *bpf_tracing_func_proto(
+ 	enum bpf_func_id func_id, const struct bpf_prog *prog);
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -68,6 +68,8 @@ struct bpf_reg_state {
+ 			unsigned long raw1;
+ 			unsigned long raw2;
+ 		} raw;
++
++		u32 subprogno; /* for PTR_TO_FUNC */
+ 	};
+ 	/* For PTR_TO_PACKET, used to find other pointers with the same variable
+ 	 * offset, so they can share range knowledge.
+@@ -204,6 +206,7 @@ struct bpf_func_state {
+ 	int acquired_refs;
+ 	struct bpf_reference_state *refs;
+ 	int allocated_stack;
++	bool in_callback_fn;
+ 	struct bpf_stack_state *stack;
+ };
+ 
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -393,6 +393,15 @@ enum bpf_link_type {
+  *                   is struct/union.
+  */
+ #define BPF_PSEUDO_BTF_ID	3
++/* insn[0].src_reg:  BPF_PSEUDO_FUNC
++ * insn[0].imm:      insn offset to the func
++ * insn[1].imm:      0
++ * insn[0].off:      0
++ * insn[1].off:      0
++ * ldimm64 rewrite:  address of the function
++ * verifier type:    PTR_TO_FUNC.
++ */
++#define BPF_PSEUDO_FUNC		4
+ 
+ /* when bpf_call->src_reg == BPF_PSEUDO_CALL, bpf_call->imm == pc-relative
+  * offset to another bpf function
+@@ -3915,6 +3924,34 @@ union bpf_attr {
+  *		* **BPF_MTU_CHK_RET_FRAG_NEEDED**
+  *		* **BPF_MTU_CHK_RET_SEGS_TOOBIG**
+  *
++ * long bpf_for_each_map_elem(struct bpf_map *map, void *callback_fn, void *callback_ctx, u64 flags)
++ *	Description
++ *		For each element in **map**, call **callback_fn** function with
++ *		**map**, **callback_ctx** and other map-specific parameters.
++ *		The **callback_fn** should be a static function and
++ *		the **callback_ctx** should be a pointer to the stack.
++ *		The **flags** is used to control certain aspects of the helper.
++ *		Currently, the **flags** must be 0.
++ *
++ *		The following are a list of supported map types and their
++ *		respective expected callback signatures:
++ *
++ *		BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_PERCPU_HASH,
++ *		BPF_MAP_TYPE_LRU_HASH, BPF_MAP_TYPE_LRU_PERCPU_HASH,
++ *		BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_PERCPU_ARRAY
++ *
++ *		long (\*callback_fn)(struct bpf_map \*map, const void \*key, void \*value, void \*ctx);
++ *
++ *		For per_cpu maps, the map_value is the value on the cpu where the
++ *		bpf_prog is running.
++ *
++ *		If **callback_fn** return 0, the helper will continue to the next
++ *		element. If return value is 1, the helper will skip the rest of
++ *		elements and return. Other return values are not used now.
++ *
++ *	Return
++ *		The number of traversed map elements for success, **-EINVAL** for
++ *		invalid **flags**.
+  */
+ #define __BPF_FUNC_MAPPER(FN)		\
+ 	FN(unspec),			\
+@@ -4081,6 +4118,7 @@ union bpf_attr {
+ 	FN(ima_inode_hash),		\
+ 	FN(sock_from_file),		\
+ 	FN(check_mtu),			\
++	FN(for_each_map_elem),		\
+ 	/* */
+ 
+ /* integer value in 'imm' field of BPF_CALL instruction selects which helper
+--- a/kernel/bpf/bpf_iter.c
++++ b/kernel/bpf/bpf_iter.c
+@@ -675,3 +675,19 @@ int bpf_iter_run_prog(struct bpf_prog *p
+ 	 */
+ 	return ret == 0 ? 0 : -EAGAIN;
+ }
++
++BPF_CALL_4(bpf_for_each_map_elem, struct bpf_map *, map, void *, callback_fn,
++	   void *, callback_ctx, u64, flags)
++{
++	return map->ops->map_for_each_callback(map, callback_fn, callback_ctx, flags);
++}
++
++const struct bpf_func_proto bpf_for_each_map_elem_proto = {
++	.func		= bpf_for_each_map_elem,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_CONST_MAP_PTR,
++	.arg2_type	= ARG_PTR_TO_FUNC,
++	.arg3_type	= ARG_PTR_TO_STACK_OR_NULL,
++	.arg4_type	= ARG_ANYTHING,
++};
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -716,6 +716,8 @@ bpf_base_func_proto(enum bpf_func_id fun
+ 		return &bpf_ringbuf_discard_proto;
+ 	case BPF_FUNC_ringbuf_query:
+ 		return &bpf_ringbuf_query_proto;
++	case BPF_FUNC_for_each_map_elem:
++		return &bpf_for_each_map_elem_proto;
+ 	default:
+ 		break;
+ 	}
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -234,6 +234,12 @@ static bool bpf_pseudo_call(const struct
+ 	       insn->src_reg == BPF_PSEUDO_CALL;
+ }
+ 
++static bool bpf_pseudo_func(const struct bpf_insn *insn)
++{
++	return insn->code == (BPF_LD | BPF_IMM | BPF_DW) &&
++	       insn->src_reg == BPF_PSEUDO_FUNC;
++}
++
+ struct bpf_call_arg_meta {
+ 	struct bpf_map *map_ptr;
+ 	bool raw_mode;
+@@ -248,6 +254,7 @@ struct bpf_call_arg_meta {
+ 	u32 btf_id;
+ 	struct btf *ret_btf;
+ 	u32 ret_btf_id;
++	u32 subprogno;
+ };
+ 
+ struct btf *btf_vmlinux;
+@@ -427,6 +434,7 @@ static bool reg_type_not_null(enum bpf_r
+ 	return type == PTR_TO_SOCKET ||
+ 		type == PTR_TO_TCP_SOCK ||
+ 		type == PTR_TO_MAP_VALUE ||
++		type == PTR_TO_MAP_KEY ||
+ 		type == PTR_TO_SOCK_COMMON;
+ }
+ 
+@@ -469,7 +477,8 @@ static bool arg_type_may_be_null(enum bp
+ 	       type == ARG_PTR_TO_MEM_OR_NULL ||
+ 	       type == ARG_PTR_TO_CTX_OR_NULL ||
+ 	       type == ARG_PTR_TO_SOCKET_OR_NULL ||
+-	       type == ARG_PTR_TO_ALLOC_MEM_OR_NULL;
++	       type == ARG_PTR_TO_ALLOC_MEM_OR_NULL ||
++	       type == ARG_PTR_TO_STACK_OR_NULL;
+ }
+ 
+ /* Determine whether the function releases some resources allocated by another
+@@ -552,6 +561,8 @@ static const char * const reg_type_str[]
+ 	[PTR_TO_RDONLY_BUF_OR_NULL] = "rdonly_buf_or_null",
+ 	[PTR_TO_RDWR_BUF]	= "rdwr_buf",
+ 	[PTR_TO_RDWR_BUF_OR_NULL] = "rdwr_buf_or_null",
++	[PTR_TO_FUNC]		= "func",
++	[PTR_TO_MAP_KEY]	= "map_key",
+ };
+ 
+ static char slot_type_char[] = {
+@@ -623,6 +634,7 @@ static void print_verifier_state(struct
+ 			if (type_is_pkt_pointer(t))
+ 				verbose(env, ",r=%d", reg->range);
+ 			else if (t == CONST_PTR_TO_MAP ||
++				 t == PTR_TO_MAP_KEY ||
+ 				 t == PTR_TO_MAP_VALUE ||
+ 				 t == PTR_TO_MAP_VALUE_OR_NULL)
+ 				verbose(env, ",ks=%d,vs=%d",
+@@ -1559,6 +1571,19 @@ static int check_subprogs(struct bpf_ver
+ 
+ 	/* determine subprog starts. The end is one before the next starts */
+ 	for (i = 0; i < insn_cnt; i++) {
++		if (bpf_pseudo_func(insn + i)) {
++			if (!env->bpf_capable) {
++				verbose(env,
++					"function pointers are allowed for CAP_BPF and CAP_SYS_ADMIN\n");
++				return -EPERM;
++			}
++			ret = add_subprog(env, i + insn[i].imm + 1);
++			if (ret < 0)
++				return ret;
++			/* remember subprog */
++			insn[i + 1].imm = ret;
++			continue;
++		}
+ 		if (!bpf_pseudo_call(insn + i))
+ 			continue;
+ 		if (!env->bpf_capable) {
+@@ -2310,6 +2335,8 @@ static bool is_spillable_regtype(enum bp
+ 	case PTR_TO_PERCPU_BTF_ID:
+ 	case PTR_TO_MEM:
+ 	case PTR_TO_MEM_OR_NULL:
++	case PTR_TO_FUNC:
++	case PTR_TO_MAP_KEY:
+ 		return true;
+ 	default:
+ 		return false;
+@@ -2890,6 +2917,10 @@ static int __check_mem_access(struct bpf
+ 
+ 	reg = &cur_regs(env)[regno];
+ 	switch (reg->type) {
++	case PTR_TO_MAP_KEY:
++		verbose(env, "invalid access to map key, key_size=%d off=%d size=%d\n",
++			mem_size, off, size);
++		break;
+ 	case PTR_TO_MAP_VALUE:
+ 		verbose(env, "invalid access to map value, value_size=%d off=%d size=%d\n",
+ 			mem_size, off, size);
+@@ -3295,6 +3326,9 @@ static int check_ptr_alignment(struct bp
+ 	case PTR_TO_FLOW_KEYS:
+ 		pointer_desc = "flow keys ";
+ 		break;
++	case PTR_TO_MAP_KEY:
++		pointer_desc = "key ";
++		break;
+ 	case PTR_TO_MAP_VALUE:
+ 		pointer_desc = "value ";
+ 		break;
+@@ -3396,7 +3430,7 @@ process_func:
+ continue_func:
+ 	subprog_end = subprog[idx + 1].start;
+ 	for (; i < subprog_end; i++) {
+-		if (!bpf_pseudo_call(insn + i))
++		if (!bpf_pseudo_call(insn + i) && !bpf_pseudo_func(insn + i))
+ 			continue;
+ 		/* remember insn and function to return to */
+ 		ret_insn[frame] = i + 1;
+@@ -3850,7 +3884,19 @@ static int check_mem_access(struct bpf_v
+ 	/* for access checks, reg->off is just part of off */
+ 	off += reg->off;
+ 
+-	if (reg->type == PTR_TO_MAP_VALUE) {
++	if (reg->type == PTR_TO_MAP_KEY) {
++		if (t == BPF_WRITE) {
++			verbose(env, "write to change key R%d not allowed\n", regno);
++			return -EACCES;
++		}
++
++		err = check_mem_region_access(env, regno, off, size,
++					      reg->map_ptr->key_size, false);
++		if (err)
++			return err;
++		if (value_regno >= 0)
++			mark_reg_unknown(env, regs, value_regno);
++	} else if (reg->type == PTR_TO_MAP_VALUE) {
+ 		if (t == BPF_WRITE && value_regno >= 0 &&
+ 		    is_pointer_value(env, value_regno)) {
+ 			verbose(env, "R%d leaks addr into map\n", value_regno);
+@@ -4266,6 +4312,9 @@ static int check_helper_mem_access(struc
+ 	case PTR_TO_PACKET_META:
+ 		return check_packet_access(env, regno, reg->off, access_size,
+ 					   zero_size_allowed);
++	case PTR_TO_MAP_KEY:
++		return check_mem_region_access(env, regno, reg->off, access_size,
++					       reg->map_ptr->key_size, false);
+ 	case PTR_TO_MAP_VALUE:
+ 		if (check_map_access_type(env, regno, reg->off, access_size,
+ 					  meta && meta->raw_mode ? BPF_WRITE :
+@@ -4490,6 +4539,7 @@ static const struct bpf_reg_types mem_ty
+ 		PTR_TO_STACK,
+ 		PTR_TO_PACKET,
+ 		PTR_TO_PACKET_META,
++		PTR_TO_MAP_KEY,
+ 		PTR_TO_MAP_VALUE,
+ 		PTR_TO_MEM,
+ 		PTR_TO_RDONLY_BUF,
+@@ -4502,6 +4552,7 @@ static const struct bpf_reg_types int_pt
+ 		PTR_TO_STACK,
+ 		PTR_TO_PACKET,
+ 		PTR_TO_PACKET_META,
++		PTR_TO_MAP_KEY,
+ 		PTR_TO_MAP_VALUE,
+ 	},
+ };
+@@ -4514,6 +4565,8 @@ static const struct bpf_reg_types const_
+ static const struct bpf_reg_types btf_ptr_types = { .types = { PTR_TO_BTF_ID } };
+ static const struct bpf_reg_types spin_lock_types = { .types = { PTR_TO_MAP_VALUE } };
+ static const struct bpf_reg_types percpu_btf_ptr_types = { .types = { PTR_TO_PERCPU_BTF_ID } };
++static const struct bpf_reg_types func_ptr_types = { .types = { PTR_TO_FUNC } };
++static const struct bpf_reg_types stack_ptr_types = { .types = { PTR_TO_STACK } };
+ 
+ static const struct bpf_reg_types *compatible_reg_types[__BPF_ARG_TYPE_MAX] = {
+ 	[ARG_PTR_TO_MAP_KEY]		= &map_key_value_types,
+@@ -4542,6 +4595,8 @@ static const struct bpf_reg_types *compa
+ 	[ARG_PTR_TO_INT]		= &int_ptr_types,
+ 	[ARG_PTR_TO_LONG]		= &int_ptr_types,
+ 	[ARG_PTR_TO_PERCPU_BTF_ID]	= &percpu_btf_ptr_types,
++	[ARG_PTR_TO_FUNC]		= &func_ptr_types,
++	[ARG_PTR_TO_STACK_OR_NULL]	= &stack_ptr_types,
+ };
+ 
+ static int check_reg_type(struct bpf_verifier_env *env, u32 regno,
+@@ -4723,6 +4778,8 @@ skip_type_check:
+ 			verbose(env, "verifier internal error\n");
+ 			return -EFAULT;
+ 		}
++	} else if (arg_type == ARG_PTR_TO_FUNC) {
++		meta->subprogno = reg->subprogno;
+ 	} else if (arg_type_is_mem_ptr(arg_type)) {
+ 		/* The access to this pointer is only checked when we hit the
+ 		 * next is_mem_size argument below.
+@@ -5373,6 +5430,35 @@ static int check_func_call(struct bpf_ve
+ 	return __check_func_call(env, insn, insn_idx, subprog, set_callee_state);
+ }
+ 
++static int set_map_elem_callback_state(struct bpf_verifier_env *env,
++				       struct bpf_func_state *caller,
++				       struct bpf_func_state *callee,
++				       int insn_idx)
++{
++	struct bpf_insn_aux_data *insn_aux = &env->insn_aux_data[insn_idx];
++	struct bpf_map *map;
++	int err;
++
++	if (bpf_map_ptr_poisoned(insn_aux)) {
++		verbose(env, "tail_call abusing map_ptr\n");
++		return -EINVAL;
++	}
++
++	map = BPF_MAP_PTR(insn_aux->map_ptr_state);
++	if (!map->ops->map_set_for_each_callback_args ||
++	    !map->ops->map_for_each_callback) {
++		verbose(env, "callback function not allowed for map\n");
++		return -ENOTSUPP;
++	}
++
++	err = map->ops->map_set_for_each_callback_args(env, caller, callee);
++	if (err)
++		return err;
++
++	callee->in_callback_fn = true;
++	return 0;
++}
++
+ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
+ {
+ 	struct bpf_verifier_state *state = env->cur_state;
+@@ -5395,8 +5481,22 @@ static int prepare_func_exit(struct bpf_
+ 
+ 	state->curframe--;
+ 	caller = state->frame[state->curframe];
+-	/* return to the caller whatever r0 had in the callee */
+-	caller->regs[BPF_REG_0] = *r0;
++	if (callee->in_callback_fn) {
++		/* enforce R0 return value range [0, 1]. */
++		struct tnum range = tnum_range(0, 1);
++
++		if (r0->type != SCALAR_VALUE) {
++			verbose(env, "R0 not a scalar value\n");
++			return -EACCES;
++		}
++		if (!tnum_in(range, r0->var_off)) {
++			verbose_invalid_scalar(env, r0, &range, "callback return", "R0");
++			return -EINVAL;
++		}
++	} else {
++		/* return to the caller whatever r0 had in the callee */
++		caller->regs[BPF_REG_0] = *r0;
++	}
+ 
+ 	/* Transfer references to the caller */
+ 	err = transfer_reference_state(caller, callee);
+@@ -5451,7 +5551,8 @@ record_func_map(struct bpf_verifier_env
+ 	    func_id != BPF_FUNC_map_delete_elem &&
+ 	    func_id != BPF_FUNC_map_push_elem &&
+ 	    func_id != BPF_FUNC_map_pop_elem &&
+-	    func_id != BPF_FUNC_map_peek_elem)
++	    func_id != BPF_FUNC_map_peek_elem &&
++	    func_id != BPF_FUNC_for_each_map_elem)
+ 		return 0;
+ 
+ 	if (map == NULL) {
+@@ -5532,15 +5633,18 @@ static int check_reference_leak(struct b
+ 	return state->acquired_refs ? -EINVAL : 0;
+ }
+ 
+-static int check_helper_call(struct bpf_verifier_env *env, int func_id, int insn_idx)
++static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
++			     int *insn_idx_p)
+ {
+ 	const struct bpf_func_proto *fn = NULL;
+ 	struct bpf_reg_state *regs;
+ 	struct bpf_call_arg_meta meta;
++	int insn_idx = *insn_idx_p;
+ 	bool changes_data;
+-	int i, err;
++	int i, err, func_id;
+ 
+ 	/* find function prototype */
++	func_id = insn->imm;
+ 	if (func_id < 0 || func_id >= __BPF_FUNC_MAX_ID) {
+ 		verbose(env, "invalid func %s#%d\n", func_id_name(func_id),
+ 			func_id);
+@@ -5636,6 +5740,13 @@ static int check_helper_call(struct bpf_
+ 		return -EINVAL;
+ 	}
+ 
++	if (func_id == BPF_FUNC_for_each_map_elem) {
++		err = __check_func_call(env, insn, insn_idx_p, meta.subprogno,
++					set_map_elem_callback_state);
++		if (err < 0)
++			return -EINVAL;
++	}
++
+ 	/* reset caller saved regs */
+ 	for (i = 0; i < CALLER_SAVED_REGS; i++) {
+ 		mark_reg_not_init(env, regs, caller_saved[i]);
+@@ -8427,6 +8538,24 @@ static int check_ld_imm(struct bpf_verif
+ 		return 0;
+ 	}
+ 
++	if (insn->src_reg == BPF_PSEUDO_FUNC) {
++		struct bpf_prog_aux *aux = env->prog->aux;
++		u32 subprogno = insn[1].imm;
++
++		if (!aux->func_info) {
++			verbose(env, "missing btf func_info\n");
++			return -EINVAL;
++		}
++		if (aux->func_info_aux[subprogno].linkage != BTF_FUNC_STATIC) {
++			verbose(env, "callback function not static\n");
++			return -EINVAL;
++		}
++
++		dst_reg->type = PTR_TO_FUNC;
++		dst_reg->subprogno = subprogno;
++		return 0;
++	}
++
+ 	map = env->used_maps[aux->map_index];
+ 	mark_reg_known_zero(env, regs, insn->dst_reg);
+ 	dst_reg->map_ptr = map;
+@@ -8813,6 +8942,9 @@ static int visit_insn(int t, int insn_cn
+ 	struct bpf_insn *insns = env->prog->insnsi;
+ 	int ret;
+ 
++	if (bpf_pseudo_func(insns + t))
++		return visit_func_call_insn(t, insn_cnt, insns, env, true);
++
+ 	/* All non-branch instructions have a single fall-through edge. */
+ 	if (BPF_CLASS(insns[t].code) != BPF_JMP &&
+ 	    BPF_CLASS(insns[t].code) != BPF_JMP32)
+@@ -9434,6 +9566,7 @@ static bool regsafe(struct bpf_verifier_
+ 			 */
+ 			return false;
+ 		}
++	case PTR_TO_MAP_KEY:
+ 	case PTR_TO_MAP_VALUE:
+ 		/* If the new min/max/var_off satisfy the old ones and
+ 		 * everything else matches, we are OK.
+@@ -10270,10 +10403,9 @@ static int do_check(struct bpf_verifier_
+ 				if (insn->src_reg == BPF_PSEUDO_CALL)
+ 					err = check_func_call(env, insn, &env->insn_idx);
+ 				else
+-					err = check_helper_call(env, insn->imm, env->insn_idx);
++					err = check_helper_call(env, insn, &env->insn_idx);
+ 				if (err)
+ 					return err;
+-
+ 			} else if (opcode == BPF_JA) {
+ 				if (BPF_SRC(insn->code) != BPF_K ||
+ 				    insn->imm != 0 ||
+@@ -10702,6 +10834,12 @@ static int resolve_pseudo_ldimm64(struct
+ 				goto next_insn;
+ 			}
+ 
++			if (insn[0].src_reg == BPF_PSEUDO_FUNC) {
++				aux = &env->insn_aux_data[i];
++				aux->ptr_type = PTR_TO_FUNC;
++				goto next_insn;
++			}
++
+ 			/* In final convert_pseudo_ld_imm64() step, this is
+ 			 * converted into regular 64-bit imm load insn.
+ 			 */
+@@ -10834,9 +10972,13 @@ static void convert_pseudo_ld_imm64(stru
+ 	int insn_cnt = env->prog->len;
+ 	int i;
+ 
+-	for (i = 0; i < insn_cnt; i++, insn++)
+-		if (insn->code == (BPF_LD | BPF_IMM | BPF_DW))
+-			insn->src_reg = 0;
++	for (i = 0; i < insn_cnt; i++, insn++) {
++		if (insn->code != (BPF_LD | BPF_IMM | BPF_DW))
++			continue;
++		if (insn->src_reg == BPF_PSEUDO_FUNC)
++			continue;
++		insn->src_reg = 0;
++	}
+ }
+ 
+ /* single env->prog->insni[off] instruction was replaced with the range
+@@ -11480,6 +11622,12 @@ static int jit_subprogs(struct bpf_verif
+ 		return 0;
+ 
+ 	for (i = 0, insn = prog->insnsi; i < prog->len; i++, insn++) {
++		if (bpf_pseudo_func(insn)) {
++			env->insn_aux_data[i].call_imm = insn->imm;
++			/* subprog is encoded in insn[1].imm */
++			continue;
++		}
++
+ 		if (!bpf_pseudo_call(insn))
+ 			continue;
+ 		/* Upon error here we cannot fall back to interpreter but
+@@ -11583,6 +11731,12 @@ static int jit_subprogs(struct bpf_verif
+ 	for (i = 0; i < env->subprog_cnt; i++) {
+ 		insn = func[i]->insnsi;
+ 		for (j = 0; j < func[i]->len; j++, insn++) {
++			if (bpf_pseudo_func(insn)) {
++				subprog = insn[1].imm;
++				insn[0].imm = (u32)(long)func[subprog]->bpf_func;
++				insn[1].imm = ((u64)(long)func[subprog]->bpf_func) >> 32;
++				continue;
++			}
+ 			if (!bpf_pseudo_call(insn))
+ 				continue;
+ 			subprog = insn->off;
+@@ -11628,6 +11782,11 @@ static int jit_subprogs(struct bpf_verif
+ 	 * later look the same as if they were interpreted only.
+ 	 */
+ 	for (i = 0, insn = prog->insnsi; i < prog->len; i++, insn++) {
++		if (bpf_pseudo_func(insn)) {
++			insn[0].imm = env->insn_aux_data[i].call_imm;
++			insn[1].imm = find_subprog(env, i + insn[0].imm + 1);
++			continue;
++		}
+ 		if (!bpf_pseudo_call(insn))
+ 			continue;
+ 		insn->off = env->insn_aux_data[i].call_imm;
+@@ -11700,6 +11859,14 @@ static int fixup_call_args(struct bpf_ve
+ 		return -EINVAL;
+ 	}
+ 	for (i = 0; i < prog->len; i++, insn++) {
++		if (bpf_pseudo_func(insn)) {
++			/* When JIT fails the progs with callback calls
++			 * have to be rejected, since interpreter doesn't support them yet.
++			 */
++			verbose(env, "callbacks are not allowed in non-JITed programs\n");
++			return -EINVAL;
++		}
++
+ 		if (!bpf_pseudo_call(insn))
+ 			continue;
+ 		depth = get_callee_stack_depth(env, insn, i);
+--- a/kernel/trace/bpf_trace.c
++++ b/kernel/trace/bpf_trace.c
+@@ -1353,6 +1353,8 @@ bpf_tracing_func_proto(enum bpf_func_id
+ 		return &bpf_task_storage_get_proto;
+ 	case BPF_FUNC_task_storage_delete:
+ 		return &bpf_task_storage_delete_proto;
++	case BPF_FUNC_for_each_map_elem:
++		return &bpf_for_each_map_elem_proto;
+ 	default:
+ 		return NULL;
+ 	}
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -393,6 +393,15 @@ enum bpf_link_type {
+  *                   is struct/union.
+  */
+ #define BPF_PSEUDO_BTF_ID	3
++/* insn[0].src_reg:  BPF_PSEUDO_FUNC
++ * insn[0].imm:      insn offset to the func
++ * insn[1].imm:      0
++ * insn[0].off:      0
++ * insn[1].off:      0
++ * ldimm64 rewrite:  address of the function
++ * verifier type:    PTR_TO_FUNC.
++ */
++#define BPF_PSEUDO_FUNC		4
+ 
+ /* when bpf_call->src_reg == BPF_PSEUDO_CALL, bpf_call->imm == pc-relative
+  * offset to another bpf function
+@@ -3909,6 +3918,34 @@ union bpf_attr {
+  *		* **BPF_MTU_CHK_RET_FRAG_NEEDED**
+  *		* **BPF_MTU_CHK_RET_SEGS_TOOBIG**
+  *
++ * long bpf_for_each_map_elem(struct bpf_map *map, void *callback_fn, void *callback_ctx, u64 flags)
++ *	Description
++ *		For each element in **map**, call **callback_fn** function with
++ *		**map**, **callback_ctx** and other map-specific parameters.
++ *		The **callback_fn** should be a static function and
++ *		the **callback_ctx** should be a pointer to the stack.
++ *		The **flags** is used to control certain aspects of the helper.
++ *		Currently, the **flags** must be 0.
++ *
++ *		The following are a list of supported map types and their
++ *		respective expected callback signatures:
++ *
++ *		BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_PERCPU_HASH,
++ *		BPF_MAP_TYPE_LRU_HASH, BPF_MAP_TYPE_LRU_PERCPU_HASH,
++ *		BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_PERCPU_ARRAY
++ *
++ *		long (\*callback_fn)(struct bpf_map \*map, const void \*key, void \*value, void \*ctx);
++ *
++ *		For per_cpu maps, the map_value is the value on the cpu where the
++ *		bpf_prog is running.
++ *
++ *		If **callback_fn** return 0, the helper will continue to the next
++ *		element. If return value is 1, the helper will skip the rest of
++ *		elements and return. Other return values are not used now.
++ *
++ *	Return
++ *		The number of traversed map elements for success, **-EINVAL** for
++ *		invalid **flags**.
+  */
+ #define __BPF_FUNC_MAPPER(FN)		\
+ 	FN(unspec),			\
+@@ -4075,6 +4112,7 @@ union bpf_attr {
+ 	FN(ima_inode_hash),		\
+ 	FN(sock_from_file),		\
+ 	FN(check_mtu),			\
++	FN(for_each_map_elem),		\
+ 	/* */
+ 
+ /* integer value in 'imm' field of BPF_CALL instruction selects which helper

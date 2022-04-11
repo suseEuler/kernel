@@ -1,0 +1,242 @@
+From bc235cdb423a2daed6f337676006a66557429cd1 Mon Sep 17 00:00:00 2001
+Message-Id: <bc235cdb423a2daed6f337676006a66557429cd1.1648735988.git.geliang.tang@suse.com>
+From: Song Liu <songliubraving@fb.com>
+Date: Thu, 25 Feb 2021 15:43:15 -0800
+Subject: [PATCH] bpf: Prevent deadlock from recursive
+ bpf_task_storage_[get|delete]
+Git-commit: bc235cdb423a2daed6f337676006a66557429cd1
+Patch-mainline: v5.13-rc1
+References: bsn#127
+Modified-by-SEL: Yes, refreshed due to context changes
+
+
+BPF helpers bpf_task_storage_[get|delete] could hold two locks:
+bpf_local_storage_map_bucket->lock and bpf_local_storage->lock. Calling
+these helpers from fentry/fexit programs on functions in bpf_*_storage.c
+may cause deadlock on either locks.
+
+Prevent such deadlock with a per cpu counter, bpf_task_storage_busy. We
+need this counter to be global, because the two locks here belong to two
+different objects: bpf_local_storage_map and bpf_local_storage. If we
+pick one of them as the owner of the counter, it is still possible to
+trigger deadlock on the other lock. For example, if bpf_local_storage_map
+owns the counters, it cannot prevent deadlock on bpf_local_storage->lock
+when two maps are used.
+
+Signed-off-by: Song Liu <songliubraving@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Martin KaFai Lau <kafai@fb.com>
+Link: https://lore.kernel.org/bpf/20210225234319.336131-3-songliubraving@fb.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ include/linux/bpf_local_storage.h |  3 +-
+ kernel/bpf/bpf_inode_storage.c    |  2 +-
+ kernel/bpf/bpf_local_storage.c    | 11 +++++-
+ kernel/bpf/bpf_task_storage.c     | 59 ++++++++++++++++++++++++++-----
+ net/core/bpf_sk_storage.c         |  2 +-
+ 5 files changed, 65 insertions(+), 12 deletions(-)
+
+--- a/include/linux/bpf_local_storage.h
++++ b/include/linux/bpf_local_storage.h
+@@ -126,7 +126,8 @@ bpf_local_storage_lookup(struct bpf_loca
+ 			 struct bpf_local_storage_map *smap,
+ 			 bool cacheit_lockit);
+ 
+-void bpf_local_storage_map_free(struct bpf_local_storage_map *smap);
++void bpf_local_storage_map_free(struct bpf_local_storage_map *smap,
++				int __percpu *busy_counter);
+ 
+ int bpf_local_storage_map_check_btf(const struct bpf_map *map,
+ 				    const struct btf *btf,
+--- a/kernel/bpf/bpf_inode_storage.c
++++ b/kernel/bpf/bpf_inode_storage.c
+@@ -237,7 +237,7 @@ static void inode_storage_map_free(struc
+ 
+ 	smap = (struct bpf_local_storage_map *)map;
+ 	bpf_local_storage_cache_idx_free(&inode_cache, smap->cache_idx);
+-	bpf_local_storage_map_free(smap);
++	bpf_local_storage_map_free(smap, NULL);
+ }
+ 
+ static int inode_storage_map_btf_id;
+--- a/kernel/bpf/bpf_local_storage.c
++++ b/kernel/bpf/bpf_local_storage.c
+@@ -474,7 +474,8 @@ void bpf_local_storage_cache_idx_free(st
+ 	spin_unlock(&cache->idx_lock);
+ }
+ 
+-void bpf_local_storage_map_free(struct bpf_local_storage_map *smap)
++void bpf_local_storage_map_free(struct bpf_local_storage_map *smap,
++				int __percpu *busy_counter)
+ {
+ 	struct bpf_local_storage_elem *selem;
+ 	struct bpf_local_storage_map_bucket *b;
+@@ -503,7 +504,15 @@ void bpf_local_storage_map_free(struct b
+ 		while ((selem = hlist_entry_safe(
+ 				rcu_dereference_raw(hlist_first_rcu(&b->list)),
+ 				struct bpf_local_storage_elem, map_node))) {
++			if (busy_counter) {
++				migrate_disable();
++				__this_cpu_inc(*busy_counter);
++			}
+ 			bpf_selem_unlink(selem);
++			if (busy_counter) {
++				__this_cpu_dec(*busy_counter);
++				migrate_enable();
++			}
+ 			cond_resched_rcu();
+ 		}
+ 		rcu_read_unlock();
+--- a/kernel/bpf/bpf_task_storage.c
++++ b/kernel/bpf/bpf_task_storage.c
+@@ -20,6 +20,31 @@
+ 
+ DEFINE_BPF_STORAGE_CACHE(task_cache);
+ 
++DEFINE_PER_CPU(int, bpf_task_storage_busy);
++
++static void bpf_task_storage_lock(void)
++{
++	migrate_disable();
++	__this_cpu_inc(bpf_task_storage_busy);
++}
++
++static void bpf_task_storage_unlock(void)
++{
++	__this_cpu_dec(bpf_task_storage_busy);
++	migrate_enable();
++}
++
++static bool bpf_task_storage_trylock(void)
++{
++	migrate_disable();
++	if (unlikely(__this_cpu_inc_return(bpf_task_storage_busy) != 1)) {
++		__this_cpu_dec(bpf_task_storage_busy);
++		migrate_enable();
++		return false;
++	}
++	return true;
++}
++
+ static struct bpf_local_storage __rcu **task_storage_ptr(void *owner)
+ {
+ 	struct task_struct *task = owner;
+@@ -67,6 +92,7 @@ void bpf_task_storage_free(struct task_s
+ 	 * when unlinking elem from the local_storage->list and
+ 	 * the map's bucket->list.
+ 	 */
++	bpf_task_storage_lock();
+ 	raw_spin_lock_irqsave(&local_storage->lock, flags);
+ 	hlist_for_each_entry_safe(selem, n, &local_storage->list, snode) {
+ 		/* Always unlink from map before unlinking from
+@@ -77,6 +103,7 @@ void bpf_task_storage_free(struct task_s
+ 			local_storage, selem, false);
+ 	}
+ 	raw_spin_unlock_irqrestore(&local_storage->lock, flags);
++	bpf_task_storage_unlock();
+ 	rcu_read_unlock();
+ 
+ 	/* free_task_storage should always be true as long as
+@@ -109,7 +136,9 @@ static void *bpf_pid_task_storage_lookup
+ 		goto out;
+ 	}
+ 
++	bpf_task_storage_lock();
+ 	sdata = task_storage_lookup(task, map, true);
++	bpf_task_storage_unlock();
+ 	put_pid(pid);
+ 	return sdata ? sdata->data : NULL;
+ out:
+@@ -141,8 +170,10 @@ static int bpf_pid_task_storage_update_e
+ 		goto out;
+ 	}
+ 
++	bpf_task_storage_lock();
+ 	sdata = bpf_local_storage_update(
+ 		task, (struct bpf_local_storage_map *)map, value, map_flags);
++	bpf_task_storage_unlock();
+ 
+ 	err = PTR_ERR_OR_ZERO(sdata);
+ out:
+@@ -185,7 +216,9 @@ static int bpf_pid_task_storage_delete_e
+ 		goto out;
+ 	}
+ 
++	bpf_task_storage_lock();
+ 	err = task_storage_delete(task, map);
++	bpf_task_storage_unlock();
+ out:
+ 	put_pid(pid);
+ 	return err;
+@@ -202,34 +235,44 @@ BPF_CALL_4(bpf_task_storage_get, struct
+ 	if (!task)
+ 		return (unsigned long)NULL;
+ 
++	if (!bpf_task_storage_trylock())
++		return (unsigned long)NULL;
++
+ 	sdata = task_storage_lookup(task, map, true);
+ 	if (sdata)
+-		return (unsigned long)sdata->data;
++		goto unlock;
+ 
+ 	/* only allocate new storage, when the task is refcounted */
+ 	if (refcount_read(&task->usage) &&
+-	    (flags & BPF_LOCAL_STORAGE_GET_F_CREATE)) {
++	    (flags & BPF_LOCAL_STORAGE_GET_F_CREATE))
+ 		sdata = bpf_local_storage_update(
+ 			task, (struct bpf_local_storage_map *)map, value,
+ 			BPF_NOEXIST);
+-		return IS_ERR(sdata) ? (unsigned long)NULL :
+-					     (unsigned long)sdata->data;
+-	}
+ 
+-	return (unsigned long)NULL;
++unlock:
++	bpf_task_storage_unlock();
++	return IS_ERR_OR_NULL(sdata) ? (unsigned long)NULL :
++		(unsigned long)sdata->data;
+ }
+ 
+ BPF_CALL_2(bpf_task_storage_delete, struct bpf_map *, map, struct task_struct *,
+ 	   task)
+ {
++	int ret;
++
+ 	if (!task)
+ 		return -EINVAL;
+ 
++	if (!bpf_task_storage_trylock())
++		return -EBUSY;
++
+ 	/* This helper must only be called from places where the lifetime of the task
+ 	 * is guaranteed. Either by being refcounted or by being protected
+ 	 * by an RCU read-side critical section.
+ 	 */
+-	return task_storage_delete(task, map);
++	ret = task_storage_delete(task, map);
++	bpf_task_storage_unlock();
++	return ret;
+ }
+ 
+ static int notsupp_get_next_key(struct bpf_map *map, void *key, void *next_key)
+@@ -255,7 +298,7 @@ static void task_storage_map_free(struct
+ 
+ 	smap = (struct bpf_local_storage_map *)map;
+ 	bpf_local_storage_cache_idx_free(&task_cache, smap->cache_idx);
+-	bpf_local_storage_map_free(smap);
++	bpf_local_storage_map_free(smap, &bpf_task_storage_busy);
+ }
+ 
+ static int task_storage_map_btf_id;
+--- a/net/core/bpf_sk_storage.c
++++ b/net/core/bpf_sk_storage.c
+@@ -100,7 +100,7 @@ static void sk_storage_map_free(struct b
+ 
+ 	smap = (struct bpf_local_storage_map *)map;
+ 	bpf_local_storage_cache_idx_free(&sk_cache, smap->cache_idx);
+-	bpf_local_storage_map_free(smap);
++	bpf_local_storage_map_free(smap, NULL);
+ }
+ 
+ static struct bpf_map *sk_storage_map_alloc(union bpf_attr *attr)

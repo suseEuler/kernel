@@ -1,0 +1,152 @@
+From 16137b09a66f2b75090f1e56a9ba0e27ef845ebc Mon Sep 17 00:00:00 2001
+Message-Id: <16137b09a66f2b75090f1e56a9ba0e27ef845ebc.1648735779.git.geliang.tang@suse.com>
+From: Cong Wang <cong.wang@bytedance.com>
+Date: Tue, 23 Feb 2021 10:49:28 -0800
+Subject: [PATCH] bpf: Compute data_end dynamically with JIT code
+Git-commit: 16137b09a66f2b75090f1e56a9ba0e27ef845ebc
+Patch-mainline: v5.13-rc1
+References: bsn#127
+Modified-by-SEL: Yes, refreshed due to context changes
+
+
+Currently, we compute ->data_end with a compile-time constant
+offset of skb. But as Jakub pointed out, we can actually compute
+it in eBPF JIT code at run-time, so that we can competely get
+rid of ->data_end. This is similar to skb_shinfo(skb) computation
+in bpf_convert_shinfo_access().
+
+Suggested-by: Jakub Sitnicki <jakub@cloudflare.com>
+Signed-off-by: Cong Wang <cong.wang@bytedance.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: John Fastabend <john.fastabend@gmail.com>
+Acked-by: Jakub Sitnicki <jakub@cloudflare.com>
+Link: https://lore.kernel.org/bpf/20210223184934.6054-4-xiyou.wangcong@gmail.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ include/net/tcp.h |    6 ------
+ net/core/filter.c |   48 ++++++++++++++++++++++++++++--------------------
+ net/core/skmsg.c  |    1 -
+ 3 files changed, 28 insertions(+), 27 deletions(-)
+
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -879,18 +879,12 @@ struct tcp_skb_cb {
+ 		struct {
+ 			__u32 flags;
+ 			struct sock *sk_redir;
+-			void *data_end;
+ 		} bpf;
+ 	};
+ };
+ 
+ #define TCP_SKB_CB(__skb)	((struct tcp_skb_cb *)&((__skb)->cb[0]))
+ 
+-static inline void bpf_compute_data_end_sk_skb(struct sk_buff *skb)
+-{
+-	TCP_SKB_CB(skb)->bpf.data_end = skb->data + skb_headlen(skb);
+-}
+-
+ static inline bool tcp_skb_bpf_ingress(const struct sk_buff *skb)
+ {
+ 	return TCP_SKB_CB(skb)->bpf.flags & BPF_F_INGRESS;
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -1863,10 +1863,7 @@ static const struct bpf_func_proto bpf_s
+ static inline int sk_skb_try_make_writable(struct sk_buff *skb,
+ 					   unsigned int write_len)
+ {
+-	int err = __bpf_try_make_writable(skb, write_len);
+-
+-	bpf_compute_data_end_sk_skb(skb);
+-	return err;
++	return __bpf_try_make_writable(skb, write_len);
+ }
+ 
+ BPF_CALL_2(sk_skb_pull_data, struct sk_buff *, skb, u32, len)
+@@ -3576,7 +3573,6 @@ BPF_CALL_4(sk_skb_adjust_room, struct sk
+ 			return -ENOMEM;
+ 		__skb_pull(skb, len_diff_abs);
+ 	}
+-	bpf_compute_data_end_sk_skb(skb);
+ 	if (tls_sw_has_ctx_rx(skb->sk)) {
+ 		struct strp_msg *rxm = strp_msg(skb);
+ 
+@@ -3741,10 +3737,7 @@ static const struct bpf_func_proto bpf_s
+ BPF_CALL_3(sk_skb_change_tail, struct sk_buff *, skb, u32, new_len,
+ 	   u64, flags)
+ {
+-	int ret = __bpf_skb_change_tail(skb, new_len, flags);
+-
+-	bpf_compute_data_end_sk_skb(skb);
+-	return ret;
++	return __bpf_skb_change_tail(skb, new_len, flags);
+ }
+ 
+ static const struct bpf_func_proto sk_skb_change_tail_proto = {
+@@ -3808,10 +3801,7 @@ static const struct bpf_func_proto bpf_s
+ BPF_CALL_3(sk_skb_change_head, struct sk_buff *, skb, u32, head_room,
+ 	   u64, flags)
+ {
+-	int ret = __bpf_skb_change_head(skb, head_room, flags);
+-
+-	bpf_compute_data_end_sk_skb(skb);
+-	return ret;
++	return __bpf_skb_change_head(skb, head_room, flags);
+ }
+ 
+ static const struct bpf_func_proto sk_skb_change_head_proto = {
+@@ -9661,6 +9651,30 @@ static u32 sock_ops_convert_ctx_access(e
+ 	return insn - insn_buf;
+ }
+ 
++/* data_end = skb->data + skb_headlen() */
++static struct bpf_insn *bpf_convert_data_end_access(const struct bpf_insn *si,
++						    struct bpf_insn *insn)
++{
++	/* si->dst_reg = skb->data */
++	*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct sk_buff, data),
++			      si->dst_reg, si->src_reg,
++			      offsetof(struct sk_buff, data));
++	/* AX = skb->len */
++	*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct sk_buff, len),
++			      BPF_REG_AX, si->src_reg,
++			      offsetof(struct sk_buff, len));
++	/* si->dst_reg = skb->data + skb->len */
++	*insn++ = BPF_ALU64_REG(BPF_ADD, si->dst_reg, BPF_REG_AX);
++	/* AX = skb->data_len */
++	*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct sk_buff, data_len),
++			      BPF_REG_AX, si->src_reg,
++			      offsetof(struct sk_buff, data_len));
++	/* si->dst_reg = skb->data + skb->len - skb->data_len */
++	*insn++ = BPF_ALU64_REG(BPF_SUB, si->dst_reg, BPF_REG_AX);
++
++	return insn;
++}
++
+ static u32 sk_skb_convert_ctx_access(enum bpf_access_type type,
+ 				     const struct bpf_insn *si,
+ 				     struct bpf_insn *insn_buf,
+@@ -9671,12 +9685,7 @@ static u32 sk_skb_convert_ctx_access(enu
+ 
+ 	switch (si->off) {
+ 	case offsetof(struct __sk_buff, data_end):
+-		off  = si->off;
+-		off -= offsetof(struct __sk_buff, data_end);
+-		off += offsetof(struct sk_buff, cb);
+-		off += offsetof(struct tcp_skb_cb, bpf.data_end);
+-		*insn++ = BPF_LDX_MEM(BPF_SIZEOF(void *), si->dst_reg,
+-				      si->src_reg, off);
++		insn = bpf_convert_data_end_access(si, insn);
+ 		break;
+ 	case offsetof(struct __sk_buff, cb[0]) ...
+ 	     offsetofend(struct __sk_buff, cb[4]) - 1:
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -753,7 +753,6 @@ EXPORT_SYMBOL_GPL(sk_psock_msg_verdict);
+ static int sk_psock_bpf_run(struct sk_psock *psock, struct bpf_prog *prog,
+ 			    struct sk_buff *skb)
+ {
+-	bpf_compute_data_end_sk_skb(skb);
+ 	return bpf_prog_run_pin_on_cpu(prog, skb);
+ }
+ 

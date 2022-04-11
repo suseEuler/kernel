@@ -1,0 +1,288 @@
+From 7bd1590d4eba1583f6ee85e8cfe556505f761e19 Mon Sep 17 00:00:00 2001
+Message-Id: <7bd1590d4eba1583f6ee85e8cfe556505f761e19.1648734725.git.geliang.tang@suse.com>
+From: Martin KaFai Lau <kafai@fb.com>
+Date: Wed, 24 Mar 2021 18:52:52 -0700
+Subject: [PATCH] bpf: selftests: Add kfunc_call test
+Git-commit: 7bd1590d4eba1583f6ee85e8cfe556505f761e19
+Patch-mainline: v5.13-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+This patch adds a few kernel function bpf_kfunc_call_test*() for the
+selftest's test_run purpose.  They will be allowed for tc_cls prog.
+
+The selftest calling the kernel function bpf_kfunc_call_test*()
+is also added in this patch.
+
+Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20210325015252.1551395-1-kafai@fb.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ include/linux/bpf.h                           |  6 ++
+ net/bpf/test_run.c                            | 28 +++++++++
+ net/core/filter.c                             |  1 +
+ .../selftests/bpf/prog_tests/kfunc_call.c     | 59 +++++++++++++++++++
+ .../selftests/bpf/progs/kfunc_call_test.c     | 47 +++++++++++++++
+ .../bpf/progs/kfunc_call_test_subprog.c       | 42 +++++++++++++
+ 6 files changed, 183 insertions(+)
+ create mode 100644 tools/testing/selftests/bpf/prog_tests/kfunc_call.c
+ create mode 100644 tools/testing/selftests/bpf/progs/kfunc_call_test.c
+ create mode 100644 tools/testing/selftests/bpf/progs/kfunc_call_test_subprog.c
+
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index b5b7967e3ff3..9fdd839b418c 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1532,6 +1532,7 @@ int bpf_prog_test_run_raw_tp(struct bpf_prog *prog,
+ int bpf_prog_test_run_sk_lookup(struct bpf_prog *prog,
+ 				const union bpf_attr *kattr,
+ 				union bpf_attr __user *uattr);
++bool bpf_prog_test_check_kfunc_call(u32 kfunc_id);
+ bool btf_ctx_access(int off, int size, enum bpf_access_type type,
+ 		    const struct bpf_prog *prog,
+ 		    struct bpf_insn_access_aux *info);
+@@ -1731,6 +1732,11 @@ static inline int bpf_prog_test_run_sk_lookup(struct bpf_prog *prog,
+ 	return -ENOTSUPP;
+ }
+ 
++static inline bool bpf_prog_test_check_kfunc_call(u32 kfunc_id)
++{
++	return false;
++}
++
+ static inline void bpf_map_put(struct bpf_map *map)
+ {
+ }
+diff --git a/net/bpf/test_run.c b/net/bpf/test_run.c
+index 4aabf71cd95d..a5d72c48fb66 100644
+--- a/net/bpf/test_run.c
++++ b/net/bpf/test_run.c
+@@ -2,6 +2,7 @@
+ /* Copyright (c) 2017 Facebook
+  */
+ #include <linux/bpf.h>
++#include <linux/btf_ids.h>
+ #include <linux/slab.h>
+ #include <linux/vmalloc.h>
+ #include <linux/etherdevice.h>
+@@ -213,10 +214,37 @@ int noinline bpf_modify_return_test(int a, int *b)
+ 	*b += 1;
+ 	return a + *b;
+ }
++
++u64 noinline bpf_kfunc_call_test1(struct sock *sk, u32 a, u64 b, u32 c, u64 d)
++{
++	return a + b + c + d;
++}
++
++int noinline bpf_kfunc_call_test2(struct sock *sk, u32 a, u32 b)
++{
++	return a + b;
++}
++
++struct sock * noinline bpf_kfunc_call_test3(struct sock *sk)
++{
++	return sk;
++}
++
+ __diag_pop();
+ 
+ ALLOW_ERROR_INJECTION(bpf_modify_return_test, ERRNO);
+ 
++BTF_SET_START(test_sk_kfunc_ids)
++BTF_ID(func, bpf_kfunc_call_test1)
++BTF_ID(func, bpf_kfunc_call_test2)
++BTF_ID(func, bpf_kfunc_call_test3)
++BTF_SET_END(test_sk_kfunc_ids)
++
++bool bpf_prog_test_check_kfunc_call(u32 kfunc_id)
++{
++	return btf_id_set_contains(&test_sk_kfunc_ids, kfunc_id);
++}
++
+ static void *bpf_test_init(const union bpf_attr *kattr, u32 size,
+ 			   u32 headroom, u32 tailroom)
+ {
+diff --git a/net/core/filter.c b/net/core/filter.c
+index 17dc159ec40c..cae56d08a670 100644
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -9813,6 +9813,7 @@ const struct bpf_verifier_ops tc_cls_act_verifier_ops = {
+ 	.convert_ctx_access	= tc_cls_act_convert_ctx_access,
+ 	.gen_prologue		= tc_cls_act_prologue,
+ 	.gen_ld_abs		= bpf_gen_ld_abs,
++	.check_kfunc_call	= bpf_prog_test_check_kfunc_call,
+ };
+ 
+ const struct bpf_prog_ops tc_cls_act_prog_ops = {
+diff --git a/tools/testing/selftests/bpf/prog_tests/kfunc_call.c b/tools/testing/selftests/bpf/prog_tests/kfunc_call.c
+new file mode 100644
+index 000000000000..7fc0951ee75f
+--- /dev/null
++++ b/tools/testing/selftests/bpf/prog_tests/kfunc_call.c
+@@ -0,0 +1,59 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2021 Facebook */
++#include <test_progs.h>
++#include <network_helpers.h>
++#include "kfunc_call_test.skel.h"
++#include "kfunc_call_test_subprog.skel.h"
++
++static void test_main(void)
++{
++	struct kfunc_call_test *skel;
++	int prog_fd, retval, err;
++
++	skel = kfunc_call_test__open_and_load();
++	if (!ASSERT_OK_PTR(skel, "skel"))
++		return;
++
++	prog_fd = bpf_program__fd(skel->progs.kfunc_call_test1);
++	err = bpf_prog_test_run(prog_fd, 1, &pkt_v4, sizeof(pkt_v4),
++				NULL, NULL, (__u32 *)&retval, NULL);
++	ASSERT_OK(err, "bpf_prog_test_run(test1)");
++	ASSERT_EQ(retval, 12, "test1-retval");
++
++	prog_fd = bpf_program__fd(skel->progs.kfunc_call_test2);
++	err = bpf_prog_test_run(prog_fd, 1, &pkt_v4, sizeof(pkt_v4),
++				NULL, NULL, (__u32 *)&retval, NULL);
++	ASSERT_OK(err, "bpf_prog_test_run(test2)");
++	ASSERT_EQ(retval, 3, "test2-retval");
++
++	kfunc_call_test__destroy(skel);
++}
++
++static void test_subprog(void)
++{
++	struct kfunc_call_test_subprog *skel;
++	int prog_fd, retval, err;
++
++	skel = kfunc_call_test_subprog__open_and_load();
++	if (!ASSERT_OK_PTR(skel, "skel"))
++		return;
++
++	prog_fd = bpf_program__fd(skel->progs.kfunc_call_test1);
++	err = bpf_prog_test_run(prog_fd, 1, &pkt_v4, sizeof(pkt_v4),
++				NULL, NULL, (__u32 *)&retval, NULL);
++	ASSERT_OK(err, "bpf_prog_test_run(test1)");
++	ASSERT_EQ(retval, 10, "test1-retval");
++	ASSERT_NEQ(skel->data->active_res, -1, "active_res");
++	ASSERT_EQ(skel->data->sk_state, BPF_TCP_CLOSE, "sk_state");
++
++	kfunc_call_test_subprog__destroy(skel);
++}
++
++void test_kfunc_call(void)
++{
++	if (test__start_subtest("main"))
++		test_main();
++
++	if (test__start_subtest("subprog"))
++		test_subprog();
++}
+diff --git a/tools/testing/selftests/bpf/progs/kfunc_call_test.c b/tools/testing/selftests/bpf/progs/kfunc_call_test.c
+new file mode 100644
+index 000000000000..470f8723e463
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/kfunc_call_test.c
+@@ -0,0 +1,47 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2021 Facebook */
++#include <linux/bpf.h>
++#include <bpf/bpf_helpers.h>
++#include "bpf_tcp_helpers.h"
++
++extern int bpf_kfunc_call_test2(struct sock *sk, __u32 a, __u32 b) __ksym;
++extern __u64 bpf_kfunc_call_test1(struct sock *sk, __u32 a, __u64 b,
++				  __u32 c, __u64 d) __ksym;
++
++SEC("classifier")
++int kfunc_call_test2(struct __sk_buff *skb)
++{
++	struct bpf_sock *sk = skb->sk;
++
++	if (!sk)
++		return -1;
++
++	sk = bpf_sk_fullsock(sk);
++	if (!sk)
++		return -1;
++
++	return bpf_kfunc_call_test2((struct sock *)sk, 1, 2);
++}
++
++SEC("classifier")
++int kfunc_call_test1(struct __sk_buff *skb)
++{
++	struct bpf_sock *sk = skb->sk;
++	__u64 a = 1ULL << 32;
++	__u32 ret;
++
++	if (!sk)
++		return -1;
++
++	sk = bpf_sk_fullsock(sk);
++	if (!sk)
++		return -1;
++
++	a = bpf_kfunc_call_test1((struct sock *)sk, 1, a | 2, 3, a | 4);
++	ret = a >> 32;   /* ret should be 2 */
++	ret += (__u32)a; /* ret should be 12 */
++
++	return ret;
++}
++
++char _license[] SEC("license") = "GPL";
+diff --git a/tools/testing/selftests/bpf/progs/kfunc_call_test_subprog.c b/tools/testing/selftests/bpf/progs/kfunc_call_test_subprog.c
+new file mode 100644
+index 000000000000..b2dcb7d9cb03
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/kfunc_call_test_subprog.c
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2021 Facebook */
++#include <linux/bpf.h>
++#include <bpf/bpf_helpers.h>
++#include "bpf_tcp_helpers.h"
++
++extern const int bpf_prog_active __ksym;
++extern __u64 bpf_kfunc_call_test1(struct sock *sk, __u32 a, __u64 b,
++				  __u32 c, __u64 d) __ksym;
++extern struct sock *bpf_kfunc_call_test3(struct sock *sk) __ksym;
++int active_res = -1;
++int sk_state = -1;
++
++int __noinline f1(struct __sk_buff *skb)
++{
++	struct bpf_sock *sk = skb->sk;
++	int *active;
++
++	if (!sk)
++		return -1;
++
++	sk = bpf_sk_fullsock(sk);
++	if (!sk)
++		return -1;
++
++	active = (int *)bpf_per_cpu_ptr(&bpf_prog_active,
++					bpf_get_smp_processor_id());
++	if (active)
++		active_res = *active;
++
++	sk_state = bpf_kfunc_call_test3((struct sock *)sk)->__sk_common.skc_state;
++
++	return (__u32)bpf_kfunc_call_test1((struct sock *)sk, 1, 2, 3, 4);
++}
++
++SEC("classifier")
++int kfunc_call_test1(struct __sk_buff *skb)
++{
++	return f1(skb);
++}
++
++char _license[] SEC("license") = "GPL";
+-- 
+2.34.1
+

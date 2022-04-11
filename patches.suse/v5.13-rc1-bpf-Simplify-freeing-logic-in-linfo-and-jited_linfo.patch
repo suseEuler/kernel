@@ -1,0 +1,149 @@
+From e16301fbe1837c9594f9c1957c28fd1bb18fbd15 Mon Sep 17 00:00:00 2001
+Message-Id: <e16301fbe1837c9594f9c1957c28fd1bb18fbd15.1648734757.git.geliang.tang@suse.com>
+From: Martin KaFai Lau <kafai@fb.com>
+Date: Wed, 24 Mar 2021 18:51:30 -0700
+Subject: [PATCH] bpf: Simplify freeing logic in linfo and jited_linfo
+Git-commit: e16301fbe1837c9594f9c1957c28fd1bb18fbd15
+Patch-mainline: v5.13-rc1
+References: bsn#127
+Modified-by-SEL: Yes, refreshed due to context changes
+
+
+This patch simplifies the linfo freeing logic by combining
+"bpf_prog_free_jited_linfo()" and "bpf_prog_free_unused_jited_linfo()"
+into the new "bpf_prog_jit_attempt_done()".
+It is a prep work for the kernel function call support.  In a later
+patch, freeing the kernel function call descriptors will also
+be done in the "bpf_prog_jit_attempt_done()".
+
+"bpf_prog_free_linfo()" is removed since it is only called by
+"__bpf_prog_put_noref()".  The kvfree() are directly called
+instead.
+
+It also takes this chance to s/kcalloc/kvcalloc/ for the jited_linfo
+allocation.
+
+Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20210325015130.1544323-1-kafai@fb.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ include/linux/filter.h |    3 +--
+ kernel/bpf/core.c      |   35 ++++++++++++-----------------------
+ kernel/bpf/syscall.c   |    3 ++-
+ kernel/bpf/verifier.c  |    4 ++--
+ 4 files changed, 17 insertions(+), 28 deletions(-)
+
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -891,8 +891,7 @@ void bpf_prog_free_linfo(struct bpf_prog
+ void bpf_prog_fill_jited_linfo(struct bpf_prog *prog,
+ 			       const u32 *insn_to_jit_off);
+ int bpf_prog_alloc_jited_linfo(struct bpf_prog *prog);
+-void bpf_prog_free_jited_linfo(struct bpf_prog *prog);
+-void bpf_prog_free_unused_jited_linfo(struct bpf_prog *prog);
++void bpf_prog_jit_attempt_done(struct bpf_prog *prog);
+ 
+ struct bpf_prog *bpf_prog_alloc(unsigned int size, gfp_t gfp_extra_flags);
+ struct bpf_prog *bpf_prog_alloc_no_stats(unsigned int size, gfp_t gfp_extra_flags);
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -145,25 +145,22 @@ int bpf_prog_alloc_jited_linfo(struct bp
+ 	if (!prog->aux->nr_linfo || !prog->jit_requested)
+ 		return 0;
+ 
+-	prog->aux->jited_linfo = kcalloc(prog->aux->nr_linfo,
+-					 sizeof(*prog->aux->jited_linfo),
+-					 GFP_KERNEL_ACCOUNT | __GFP_NOWARN);
++	prog->aux->jited_linfo = kvcalloc(prog->aux->nr_linfo,
++					  sizeof(*prog->aux->jited_linfo),
++					  GFP_KERNEL_ACCOUNT | __GFP_NOWARN);
+ 	if (!prog->aux->jited_linfo)
+ 		return -ENOMEM;
+ 
+ 	return 0;
+ }
+ 
+-void bpf_prog_free_jited_linfo(struct bpf_prog *prog)
++void bpf_prog_jit_attempt_done(struct bpf_prog *prog)
+ {
+-	kfree(prog->aux->jited_linfo);
+-	prog->aux->jited_linfo = NULL;
+-}
+-
+-void bpf_prog_free_unused_jited_linfo(struct bpf_prog *prog)
+-{
+-	if (prog->aux->jited_linfo && !prog->aux->jited_linfo[0])
+-		bpf_prog_free_jited_linfo(prog);
++	if (prog->aux->jited_linfo &&
++	    (!prog->jited || !prog->aux->jited_linfo[0])) {
++		kvfree(prog->aux->jited_linfo);
++		prog->aux->jited_linfo = NULL;
++	}
+ }
+ 
+ /* The jit engine is responsible to provide an array
+@@ -219,12 +216,6 @@ void bpf_prog_fill_jited_linfo(struct bp
+ 			insn_to_jit_off[linfo[i].insn_off - insn_start - 1];
+ }
+ 
+-void bpf_prog_free_linfo(struct bpf_prog *prog)
+-{
+-	bpf_prog_free_jited_linfo(prog);
+-	kvfree(prog->aux->linfo);
+-}
+-
+ struct bpf_prog *bpf_prog_realloc(struct bpf_prog *fp_old, unsigned int size,
+ 				  gfp_t gfp_extra_flags)
+ {
+@@ -1916,15 +1907,13 @@ struct bpf_prog *bpf_prog_select_runtime
+ 			return fp;
+ 
+ 		fp = bpf_int_jit_compile(fp);
+-		if (!fp->jited) {
+-			bpf_prog_free_jited_linfo(fp);
++		bpf_prog_jit_attempt_done(fp);
+ #ifdef CONFIG_BPF_JIT_ALWAYS_ON
++		if (!fp->jited) {
+ 			*err = -ENOTSUPP;
+ 			return fp;
+-#endif
+-		} else {
+-			bpf_prog_free_unused_jited_linfo(fp);
+ 		}
++#endif
+ 	} else {
+ 		*err = bpf_prog_offload_compile(fp);
+ 		if (*err)
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -1715,7 +1715,8 @@ static void __bpf_prog_put_noref(struct
+ {
+ 	bpf_prog_kallsyms_del_all(prog);
+ 	btf_put(prog->aux->btf);
+-	bpf_prog_free_linfo(prog);
++	kvfree(prog->aux->jited_linfo);
++	kvfree(prog->aux->linfo);
+ 	if (prog->aux->attach_btf)
+ 		btf_put(prog->aux->attach_btf);
+ 
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -11666,7 +11666,7 @@ static int jit_subprogs(struct bpf_verif
+ 	prog->bpf_func = func[0]->bpf_func;
+ 	prog->aux->func = func;
+ 	prog->aux->func_cnt = env->subprog_cnt;
+-	bpf_prog_free_unused_jited_linfo(prog);
++	bpf_prog_jit_attempt_done(prog);
+ 	return 0;
+ out_free:
+ 	/* We failed JIT'ing, so at this point we need to unregister poke
+@@ -11697,7 +11697,7 @@ out_undo_insn:
+ 		insn->off = 0;
+ 		insn->imm = env->insn_aux_data[i].call_imm;
+ 	}
+-	bpf_prog_free_jited_linfo(prog);
++	bpf_prog_jit_attempt_done(prog);
+ 	return err;
+ }
+ 

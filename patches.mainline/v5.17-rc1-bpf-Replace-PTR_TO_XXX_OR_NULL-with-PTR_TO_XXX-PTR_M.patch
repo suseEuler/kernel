@@ -1,13 +1,12 @@
-From 9dfcfd4d9e61d48c86b19b4feb318a5924679877 Mon Sep 17 00:00:00 2001
+From c25b2ae136039ffa820c26138ed4a5e5f3ab3841 Mon Sep 17 00:00:00 2001
 From: Hao Luo <haoluo@google.com>
-Date: Tue, 8 Mar 2022 22:06:19 +0800
+Date: Thu, 16 Dec 2021 16:31:47 -0800
 Subject: [PATCH] bpf: Replace PTR_TO_XXX_OR_NULL with PTR_TO_XXX |
  PTR_MAYBE_NULL
 Git-commit: c25b2ae136039ffa820c26138ed4a5e5f3ab3841
 Patch-mainline: v5.17-rc1
 References: bsn#12
-Modified-by-SEL: Yes, modified per openEuler commit 9dfcfd4d9e61d48c86b19b4feb318a5924679877
-		 and also refreshed
+Modified-by-SEL: Yes, refreshed due to context changes
 
 
 We have introduced a new type to make bpf_reg composable, by
@@ -31,36 +30,23 @@ Signed-off-by: Alexei Starovoitov <ast@kernel.org>
 Link: https://lore.kernel.org/r/20211217003152.48334-5-haoluo@google.com
 Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
 ---
- drivers/net/ethernet/netronome/nfp/bpf/fw.h |    4 
- include/linux/bpf.h                         |   16 -
- include/linux/bpf_verifier.h                |    4 
- kernel/bpf/btf.c                            |    7 
- kernel/bpf/map_iter.c                       |    4 
- kernel/bpf/verifier.c                       |  273 ++++++++++++----------------
- net/core/bpf_sk_storage.c                   |    2 
- net/core/sock_map.c                         |    2 
- 8 files changed, 144 insertions(+), 168 deletions(-)
+ include/linux/bpf.h          |  18 +--
+ include/linux/bpf_verifier.h |   4 +
+ kernel/bpf/btf.c             |   7 +-
+ kernel/bpf/map_iter.c        |   4 +-
+ kernel/bpf/verifier.c        | 298 +++++++++++++++--------------------
+ net/core/bpf_sk_storage.c    |   2 +-
+ net/core/sock_map.c          |   2 +-
+ 7 files changed, 147 insertions(+), 188 deletions(-)
 
---- a/drivers/net/ethernet/netronome/nfp/bpf/fw.h
-+++ b/drivers/net/ethernet/netronome/nfp/bpf/fw.h
-@@ -13,8 +13,8 @@
-  */
- #define NFP_BPF_SCALAR_VALUE		1
- #define NFP_BPF_MAP_VALUE		4
--#define NFP_BPF_STACK			6
--#define NFP_BPF_PACKET_DATA		8
-+#define NFP_BPF_STACK			5
-+#define NFP_BPF_PACKET_DATA		7
- 
- enum bpf_cap_tlv_type {
- 	NFP_BPF_CAP_TYPE_FUNC		= 1,
 --- a/include/linux/bpf.h
 +++ b/include/linux/bpf.h
-@@ -419,18 +419,14 @@ enum bpf_reg_type {
+@@ -433,18 +433,15 @@ enum bpf_reg_type {
  	PTR_TO_CTX,		 /* reg points to bpf_context */
  	CONST_PTR_TO_MAP,	 /* reg points to struct bpf_map */
  	PTR_TO_MAP_VALUE,	 /* reg points to map element value */
 -	PTR_TO_MAP_VALUE_OR_NULL,/* points to map elem value or NULL */
++	PTR_TO_MAP_KEY,		 /* reg points to a map element key */
  	PTR_TO_STACK,		 /* reg == frame_pointer + offset */
  	PTR_TO_PACKET_META,	 /* skb->data - meta_len */
  	PTR_TO_PACKET,		 /* reg points to skb->data */
@@ -75,7 +61,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  	PTR_TO_TP_BUFFER,	 /* reg points to a writable raw tp's buffer */
  	PTR_TO_XDP_SOCK,	 /* reg points to struct xdp_sock */
  	/* PTR_TO_BTF_ID points to a kernel struct that does not need
-@@ -448,16 +444,20 @@ enum bpf_reg_type {
+@@ -462,18 +459,21 @@ enum bpf_reg_type {
  	 * been checked for null. Used primarily to inform the verifier
  	 * an explicit null check is required for this struct.
  	 */
@@ -87,6 +73,8 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  	PTR_TO_RDWR_BUF,	 /* reg points to a read/write buffer */
 -	PTR_TO_RDWR_BUF_OR_NULL, /* reg points to a read/write buffer or NULL */
  	PTR_TO_PERCPU_BTF_ID,	 /* reg points to a percpu kernel variable */
+ 	PTR_TO_FUNC,		 /* reg points to a bpf program function */
+-	PTR_TO_MAP_KEY,		 /* reg points to a map element key */
  	__BPF_REG_TYPE_MAX,
  
 +	/* Extended reg_types. */
@@ -111,7 +99,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  
  /* Liveness marks, used for registers and spilled-regs (in stack slots).
   * Read marks propagate upwards until they find a write mark; they record that
-@@ -455,6 +457,8 @@ struct bpf_verifier_env {
+@@ -458,6 +460,8 @@ struct bpf_verifier_env {
  	u32 peak_states;
  	/* longest register parentage chain walked for liveness marking */
  	u32 longest_mark_read_walk;
@@ -122,7 +110,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  __printf(2, 0) void bpf_verifier_vlog(struct bpf_verifier_log *log,
 --- a/kernel/bpf/btf.c
 +++ b/kernel/bpf/btf.c
-@@ -4671,10 +4671,13 @@ bool btf_ctx_access(int off, int size, e
+@@ -4751,10 +4751,13 @@ bool btf_ctx_access(int off, int size, e
  	/* check for PTR_TO_RDONLY_BUF_OR_NULL or PTR_TO_RDWR_BUF_OR_NULL */
  	for (i = 0; i < prog->aux->ctx_arg_info_size; i++) {
  		const struct bpf_ctx_arg_aux *ctx_arg_info = &prog->aux->ctx_arg_info[i];
@@ -154,7 +142,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  
 --- a/kernel/bpf/verifier.c
 +++ b/kernel/bpf/verifier.c
-@@ -412,18 +412,6 @@ static bool reg_type_not_null(enum bpf_r
+@@ -444,18 +444,6 @@ static bool reg_type_not_null(enum bpf_r
  		type == PTR_TO_SOCK_COMMON;
  }
  
@@ -173,7 +161,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  static bool reg_may_point_to_spin_lock(const struct bpf_reg_state *reg)
  {
  	return reg->type == PTR_TO_MAP_VALUE &&
-@@ -432,12 +420,9 @@ static bool reg_may_point_to_spin_lock(c
+@@ -464,12 +452,9 @@ static bool reg_may_point_to_spin_lock(c
  
  static bool reg_type_may_be_refcounted_or_null(enum bpf_reg_type type)
  {
@@ -184,12 +172,12 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
 -		type == PTR_TO_MEM ||
 -		type == PTR_TO_MEM_OR_NULL;
 +	return base_type(type) == PTR_TO_SOCKET ||
-+	       base_type(type) == PTR_TO_TCP_SOCK ||
-+	       base_type(type) == PTR_TO_MEM;
++		base_type(type) == PTR_TO_TCP_SOCK ||
++		base_type(type) == PTR_TO_MEM;
  }
  
  static bool arg_type_may_be_refcounted(enum bpf_arg_type type)
-@@ -500,37 +485,50 @@ static bool is_ptr_cast_function(enum bp
+@@ -532,39 +517,52 @@ static bool is_ptr_cast_function(enum bp
  		func_id == BPF_FUNC_skc_to_tcp_request_sock;
  }
  
@@ -223,6 +211,8 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
 -	[PTR_TO_RDONLY_BUF_OR_NULL] = "rdonly_buf_or_null",
 -	[PTR_TO_RDWR_BUF]	= "rdwr_buf",
 -	[PTR_TO_RDWR_BUF_OR_NULL] = "rdwr_buf_or_null",
+-	[PTR_TO_FUNC]		= "func",
+-	[PTR_TO_MAP_KEY]	= "map_key",
 -};
 +/* string representation of 'enum bpf_reg_type'
 + *
@@ -230,7 +220,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
 + * statement.
 + */
 +static const char *reg_type_str(struct bpf_verifier_env *env,
-+		enum bpf_reg_type type)
++				enum bpf_reg_type type)
 +{
 +	char postfix[16] = {0};
 +	static const char * const str[] = {
@@ -254,6 +244,8 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
 +		[PTR_TO_MEM]		= "mem",
 +		[PTR_TO_RDONLY_BUF]	= "rdonly_buf",
 +		[PTR_TO_RDWR_BUF]	= "rdwr_buf",
++		[PTR_TO_FUNC]		= "func",
++		[PTR_TO_MAP_KEY]	= "map_key",
 +	};
 +
 +	if (type & PTR_MAYBE_NULL) {
@@ -271,7 +263,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  
  static char slot_type_char[] = {
  	[STACK_INVALID]	= '?',
-@@ -581,7 +579,7 @@ static void print_verifier_state(struct
+@@ -615,7 +613,7 @@ static void print_verifier_state(struct
  			continue;
  		verbose(env, " R%d", i);
  		print_liveness(env, reg->live);
@@ -280,7 +272,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  		if (t == SCALAR_VALUE && reg->precise)
  			verbose(env, "P");
  		if ((t == SCALAR_VALUE || t == PTR_TO_STACK) &&
-@@ -589,9 +587,8 @@ static void print_verifier_state(struct
+@@ -623,9 +621,8 @@ static void print_verifier_state(struct
  			/* reg->off should be 0 for SCALAR_VALUE */
  			verbose(env, "%lld", reg->var_off.value + reg->off);
  		} else {
@@ -292,19 +284,21 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  				verbose(env, "%s", kernel_type_name(reg->btf, reg->btf_id));
  			verbose(env, "(id=%d", reg->id);
  			if (reg_type_may_be_refcounted_or_null(t))
-@@ -600,9 +597,8 @@ static void print_verifier_state(struct
+@@ -634,10 +631,9 @@ static void print_verifier_state(struct
  				verbose(env, ",off=%d", reg->off);
  			if (type_is_pkt_pointer(t))
  				verbose(env, ",r=%d", reg->range);
 -			else if (t == CONST_PTR_TO_MAP ||
+-				 t == PTR_TO_MAP_KEY ||
 -				 t == PTR_TO_MAP_VALUE ||
 -				 t == PTR_TO_MAP_VALUE_OR_NULL)
 +			else if (base_type(t) == CONST_PTR_TO_MAP ||
++				 base_type(t) == PTR_TO_MAP_KEY ||
 +				 base_type(t) == PTR_TO_MAP_VALUE)
  				verbose(env, ",ks=%d,vs=%d",
  					reg->map_ptr->key_size,
  					reg->map_ptr->value_size);
-@@ -672,7 +668,7 @@ static void print_verifier_state(struct
+@@ -707,7 +703,7 @@ static void print_verifier_state(struct
  		if (state->stack[i].slot_type[0] == STACK_SPILL) {
  			reg = &state->stack[i].spilled_ptr;
  			t = reg->type;
@@ -313,7 +307,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  			if (t == SCALAR_VALUE && reg->precise)
  				verbose(env, "P");
  			if (t == SCALAR_VALUE && tnum_is_const(reg->var_off))
-@@ -1077,8 +1073,7 @@ static void mark_reg_known_zero(struct b
+@@ -1112,8 +1108,7 @@ static void mark_reg_known_zero(struct b
  
  static void mark_ptr_not_null_reg(struct bpf_reg_state *reg)
  {
@@ -323,7 +317,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  		const struct bpf_map *map = reg->map_ptr;
  
  		if (map->inner_map_meta) {
-@@ -1092,32 +1087,10 @@ static void mark_ptr_not_null_reg(struct
+@@ -1127,32 +1122,10 @@ static void mark_ptr_not_null_reg(struct
  		} else {
  			reg->type = PTR_TO_MAP_VALUE;
  		}
@@ -359,7 +353,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  }
  
  static bool reg_is_pkt_pointer(const struct bpf_reg_state *reg)
-@@ -1616,7 +1589,7 @@ static int mark_reg_read(struct bpf_veri
+@@ -1832,7 +1805,7 @@ static int mark_reg_read(struct bpf_veri
  			break;
  		if (parent->live & REG_LIVE_DONE) {
  			verbose(env, "verifier BUG type %s var_off %lld off %d\n",
@@ -368,7 +362,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  				parent->var_off.value, parent->off);
  			return -EFAULT;
  		}
-@@ -2262,9 +2235,8 @@ static int mark_chain_precision_stack(st
+@@ -2490,9 +2463,8 @@ static int mark_chain_precision_stack(st
  
  static bool is_spillable_regtype(enum bpf_reg_type type)
  {
@@ -379,7 +373,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  	case PTR_TO_STACK:
  	case PTR_TO_CTX:
  	case PTR_TO_PACKET:
-@@ -2273,21 +2245,14 @@ static bool is_spillable_regtype(enum bp
+@@ -2501,21 +2473,14 @@ static bool is_spillable_regtype(enum bp
  	case PTR_TO_FLOW_KEYS:
  	case CONST_PTR_TO_MAP:
  	case PTR_TO_SOCKET:
@@ -398,10 +392,10 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  	case PTR_TO_PERCPU_BTF_ID:
  	case PTR_TO_MEM:
 -	case PTR_TO_MEM_OR_NULL:
+ 	case PTR_TO_FUNC:
+ 	case PTR_TO_MAP_KEY:
  		return true;
- 	default:
- 		return false;
-@@ -3090,7 +3055,7 @@ static int check_ctx_access(struct bpf_v
+@@ -3324,7 +3289,7 @@ static int check_ctx_access(struct bpf_v
  		 */
  		*reg_type = info.reg_type;
  
@@ -410,7 +404,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  			*btf = info.btf;
  			*btf_id = info.btf_id;
  		} else {
-@@ -3158,7 +3123,7 @@ static int check_sock_access(struct bpf_
+@@ -3392,7 +3357,7 @@ static int check_sock_access(struct bpf_
  	}
  
  	verbose(env, "R%d invalid %s access off=%d size=%d\n",
@@ -419,7 +413,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  
  	return -EACCES;
  }
-@@ -3897,7 +3862,7 @@ static int check_mem_access(struct bpf_v
+@@ -4146,7 +4111,7 @@ static int check_mem_access(struct bpf_v
  			} else {
  				mark_reg_known_zero(env, regs,
  						    value_regno);
@@ -428,7 +422,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  					regs[value_regno].id = ++env->id_gen;
  				/* A load of ctx field could have different
  				 * actual load size with the one encoded in the
-@@ -3905,8 +3870,7 @@ static int check_mem_access(struct bpf_v
+@@ -4154,8 +4119,7 @@ static int check_mem_access(struct bpf_v
  				 * a sub-register.
  				 */
  				regs[value_regno].subreg_def = DEF_NOT_SUBREG;
@@ -438,7 +432,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  					regs[value_regno].btf = btf;
  					regs[value_regno].btf_id = btf_id;
  				}
-@@ -3959,7 +3923,7 @@ static int check_mem_access(struct bpf_v
+@@ -4208,7 +4172,7 @@ static int check_mem_access(struct bpf_v
  	} else if (type_is_sk_pointer(reg->type)) {
  		if (t == BPF_WRITE) {
  			verbose(env, "R%d cannot write into %s\n",
@@ -447,7 +441,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  			return -EACCES;
  		}
  		err = check_sock_access(env, insn_idx, regno, off, size, t);
-@@ -3978,7 +3942,7 @@ static int check_mem_access(struct bpf_v
+@@ -4227,7 +4191,7 @@ static int check_mem_access(struct bpf_v
  	} else if (reg->type == PTR_TO_RDONLY_BUF) {
  		if (t == BPF_WRITE) {
  			verbose(env, "R%d cannot write into %s\n",
@@ -456,7 +450,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  			return -EACCES;
  		}
  		err = check_buffer_access(env, reg, regno, off, size, false,
-@@ -3994,7 +3958,7 @@ static int check_mem_access(struct bpf_v
+@@ -4243,7 +4207,7 @@ static int check_mem_access(struct bpf_v
  			mark_reg_unknown(env, regs, value_regno);
  	} else {
  		verbose(env, "R%d invalid mem access '%s'\n", regno,
@@ -465,7 +459,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  		return -EACCES;
  	}
  
-@@ -4061,7 +4025,7 @@ static int check_atomic(struct bpf_verif
+@@ -4310,7 +4274,7 @@ static int check_atomic(struct bpf_verif
  	    is_sk_reg(env, insn->dst_reg)) {
  		verbose(env, "BPF_ATOMIC stores into R%d %s is not allowed\n",
  			insn->dst_reg,
@@ -474,7 +468,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  		return -EACCES;
  	}
  
-@@ -4278,9 +4242,9 @@ static int check_helper_mem_access(struc
+@@ -4530,9 +4494,9 @@ static int check_helper_mem_access(struc
  		    register_is_null(reg))
  			return 0;
  
@@ -487,7 +481,16 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  		return -EACCES;
  	}
  }
-@@ -4563,10 +4527,10 @@ static int check_reg_type(struct bpf_ver
+@@ -4543,7 +4507,7 @@ int check_mem_reg(struct bpf_verifier_en
+ 	if (register_is_null(reg))
+ 		return 0;
+ 
+-	if (reg_type_may_be_null(reg->type)) {
++	if (type_may_be_null(reg->type)) {
+ 		/* Assuming that the register contains a value check if the memory
+ 		 * access is safe. Temporarily save and restore the register's state as
+ 		 * the conversion shouldn't be visible to a caller.
+@@ -4823,10 +4787,10 @@ static int check_reg_type(struct bpf_ver
  			goto found;
  	}
  
@@ -501,15 +504,15 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  	return -EACCES;
  
  found:
-@@ -5505,6 +5469,7 @@ static int check_helper_call(struct bpf_
+@@ -5942,6 +5906,7 @@ static int check_helper_call(struct bpf_
  {
  	const struct bpf_func_proto *fn = NULL;
  	enum bpf_return_type ret_type;
 +	enum bpf_type_flag ret_flag;
  	struct bpf_reg_state *regs;
  	struct bpf_call_arg_meta meta;
- 	bool changes_data;
-@@ -5617,6 +5582,7 @@ static int check_helper_call(struct bpf_
+ 	int insn_idx = *insn_idx_p;
+@@ -6069,6 +6034,7 @@ static int check_helper_call(struct bpf_
  
  	/* update return register (already marked as written above) */
  	ret_type = fn->ret_type;
@@ -517,7 +520,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  	if (ret_type == RET_INTEGER) {
  		/* sets type to SCALAR_VALUE */
  		mark_reg_unknown(env, regs, BPF_REG_0);
-@@ -5635,25 +5601,23 @@ static int check_helper_call(struct bpf_
+@@ -6087,25 +6053,23 @@ static int check_helper_call(struct bpf_
  			return -EINVAL;
  		}
  		regs[BPF_REG_0].map_ptr = meta.map_ptr;
@@ -551,7 +554,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  		regs[BPF_REG_0].mem_size = meta.mem_size;
  	} else if (base_type(ret_type) == RET_PTR_TO_MEM_OR_BTF_ID) {
  		const struct btf_type *t;
-@@ -5673,14 +5637,10 @@ static int check_helper_call(struct bpf_
+@@ -6125,14 +6089,10 @@ static int check_helper_call(struct bpf_
  					tname, PTR_ERR(ret));
  				return -EINVAL;
  			}
@@ -568,7 +571,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  			regs[BPF_REG_0].btf = meta.ret_btf;
  			regs[BPF_REG_0].btf_id = meta.ret_btf_id;
  		}
-@@ -5688,9 +5648,7 @@ static int check_helper_call(struct bpf_
+@@ -6140,9 +6100,7 @@ static int check_helper_call(struct bpf_
  		int ret_btf_id;
  
  		mark_reg_known_zero(env, regs, BPF_REG_0);
@@ -579,7 +582,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  		ret_btf_id = *fn->ret_btf_id;
  		if (ret_btf_id == 0) {
  			verbose(env, "invalid return type %u of func %s#%d\n",
-@@ -5709,7 +5667,7 @@ static int check_helper_call(struct bpf_
+@@ -6161,7 +6119,7 @@ static int check_helper_call(struct bpf_
  		return -EINVAL;
  	}
  
@@ -588,7 +591,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  		regs[BPF_REG_0].id = ++env->id_gen;
  
  	if (is_ptr_cast_function(func_id)) {
-@@ -5810,25 +5768,25 @@ static bool check_reg_sane_offset(struct
+@@ -6354,25 +6312,25 @@ static bool check_reg_sane_offset(struct
  
  	if (known && (val >= BPF_MAX_VAR_OFF || val <= -BPF_MAX_VAR_OFF)) {
  		verbose(env, "math between %s pointer and %lld is not allowed\n",
@@ -618,7 +621,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  		return false;
  	}
  
-@@ -6205,11 +6163,13 @@ static int adjust_ptr_min_max_vals(struc
+@@ -6749,11 +6707,13 @@ static int adjust_ptr_min_max_vals(struc
  		return -EACCES;
  	}
  
@@ -635,7 +638,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  	case CONST_PTR_TO_MAP:
  		/* smin_val represents the known value */
  		if (known && smin_val == 0 && opcode == BPF_ADD)
-@@ -6222,10 +6182,10 @@ static int adjust_ptr_min_max_vals(struc
+@@ -6766,10 +6726,10 @@ static int adjust_ptr_min_max_vals(struc
  	case PTR_TO_XDP_SOCK:
  reject:
  		verbose(env, "R%d pointer arithmetic on %s prohibited\n",
@@ -648,7 +651,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  			goto reject;
  		break;
  	}
-@@ -7947,7 +7907,7 @@ static void mark_ptr_or_null_reg(struct
+@@ -8491,7 +8451,7 @@ static void mark_ptr_or_null_reg(struct
  				 struct bpf_reg_state *reg, u32 id,
  				 bool is_null)
  {
@@ -657,7 +660,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  	    !WARN_ON_ONCE(!reg->id)) {
  		if (WARN_ON_ONCE(reg->smin_value || reg->smax_value ||
  				 !tnum_equals_const(reg->var_off, 0) ||
-@@ -8325,7 +8285,7 @@ static int check_cond_jmp_op(struct bpf_
+@@ -8869,7 +8829,7 @@ static int check_cond_jmp_op(struct bpf_
  	 */
  	if (!is_jmp32 && BPF_SRC(insn->code) == BPF_K &&
  	    insn->imm == 0 && (opcode == BPF_JEQ || opcode == BPF_JNE) &&
@@ -666,7 +669,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  		/* Mark all identical registers in each branch as either
  		 * safe or unknown depending R == 0 or R != 0 conditional.
  		 */
-@@ -8555,7 +8515,7 @@ static int check_return_code(struct bpf_
+@@ -9117,7 +9077,7 @@ static int check_return_code(struct bpf_
  	if (is_subprog) {
  		if (reg->type != SCALAR_VALUE) {
  			verbose(env, "At subprogram exit the register R0 is not a scalar value (%s)\n",
@@ -675,7 +678,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  			return -EINVAL;
  		}
  		return 0;
-@@ -8619,7 +8579,7 @@ static int check_return_code(struct bpf_
+@@ -9181,7 +9141,7 @@ static int check_return_code(struct bpf_
  
  	if (reg->type != SCALAR_VALUE) {
  		verbose(env, "At program exit the register R0 is not a known value (%s)\n",
@@ -684,7 +687,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  		return -EINVAL;
  	}
  
-@@ -9382,7 +9342,7 @@ static bool regsafe(struct bpf_verifier_
+@@ -9948,7 +9908,7 @@ static bool regsafe(struct bpf_verifier_
  		return true;
  	if (rcur->type == NOT_INIT)
  		return false;
@@ -693,9 +696,9 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  	case SCALAR_VALUE:
  		if (env->explore_alu_limits)
  			return false;
-@@ -9403,6 +9363,22 @@ static bool regsafe(struct bpf_verifier_
- 			return false;
+@@ -9970,6 +9930,22 @@ static bool regsafe(struct bpf_verifier_
  		}
+ 	case PTR_TO_MAP_KEY:
  	case PTR_TO_MAP_VALUE:
 +		/* a PTR_TO_MAP_VALUE could be safe to use as a
 +		 * PTR_TO_MAP_VALUE_OR_NULL into the same map.
@@ -716,7 +719,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  		/* If the new min/max/var_off satisfy the old ones and
  		 * everything else matches, we are OK.
  		 * 'id' is not compared, since it's only used for maps with
-@@ -9414,20 +9390,6 @@ static bool regsafe(struct bpf_verifier_
+@@ -9981,20 +9957,6 @@ static bool regsafe(struct bpf_verifier_
  		return memcmp(rold, rcur, offsetof(struct bpf_reg_state, id)) == 0 &&
  		       range_within(rold, rcur) &&
  		       tnum_in(rold->var_off, rcur->var_off);
@@ -737,7 +740,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  	case PTR_TO_PACKET_META:
  	case PTR_TO_PACKET:
  		if (rcur->type != rold->type)
-@@ -9456,11 +9418,8 @@ static bool regsafe(struct bpf_verifier_
+@@ -10023,11 +9985,8 @@ static bool regsafe(struct bpf_verifier_
  	case PTR_TO_PACKET_END:
  	case PTR_TO_FLOW_KEYS:
  	case PTR_TO_SOCKET:
@@ -749,7 +752,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  	case PTR_TO_XDP_SOCK:
  		/* Only valid matches are exact, which memcmp() above
  		 * would have accepted
-@@ -9970,17 +9929,13 @@ next:
+@@ -10537,17 +10496,13 @@ next:
  /* Return true if it's OK to have the same insn return a different type. */
  static bool reg_type_mismatch_ok(enum bpf_reg_type type)
  {
@@ -768,7 +771,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  		return false;
  	default:
  		return true;
-@@ -10203,7 +10158,7 @@ static int do_check(struct bpf_verifier_
+@@ -10771,7 +10726,7 @@ static int do_check(struct bpf_verifier_
  			if (is_ctx_reg(env, insn->dst_reg)) {
  				verbose(env, "BPF_ST stores into R%d %s is not allowed\n",
  					insn->dst_reg,
@@ -790,7 +793,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  };
 --- a/net/core/sock_map.c
 +++ b/net/core/sock_map.c
-@@ -1576,7 +1576,7 @@ static struct bpf_iter_reg sock_map_iter
+@@ -1581,7 +1581,7 @@ static struct bpf_iter_reg sock_map_iter
  	.ctx_arg_info_size	= 2,
  	.ctx_arg_info		= {
  		{ offsetof(struct bpf_iter__sockmap, key),

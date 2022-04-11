@@ -1,0 +1,88 @@
+From e2d5b2bb769fa5f500760caba76436ba3a10a895 Mon Sep 17 00:00:00 2001
+Message-Id: <e2d5b2bb769fa5f500760caba76436ba3a10a895.1648734234.git.geliang.tang@suse.com>
+From: Florent Revest <revest@chromium.org>
+Date: Tue, 11 May 2021 10:10:54 +0200
+Subject: [PATCH] bpf: Fix nested bpf_bprintf_prepare with more per-cpu buffers
+Git-commit: e2d5b2bb769fa5f500760caba76436ba3a10a895
+Patch-mainline: v5.13-rc4
+References: bsn#127
+Modified-by-SEL: Yes, refreshed due to context changes
+
+
+The bpf_seq_printf, bpf_trace_printk and bpf_snprintf helpers share one
+per-cpu buffer that they use to store temporary data (arguments to
+bprintf). They "get" that buffer with try_get_fmt_tmp_buf and "put" it
+by the end of their scope with bpf_bprintf_cleanup.
+
+If one of these helpers gets called within the scope of one of these
+helpers, for example: a first bpf program gets called, uses
+bpf_trace_printk which calls raw_spin_lock_irqsave which is traced by
+another bpf program that calls bpf_snprintf, then the second "get"
+fails. Essentially, these helpers are not re-entrant. They would return
+-EBUSY and print a warning message once.
+
+This patch triples the number of bprintf buffers to allow three levels
+of nesting. This is very similar to what was done for tracepoints in
+"9594dc3c7e7 bpf: fix nested bpf tracepoints with per-cpu data"
+
+Fixes: d9c9e4db186a ("bpf: Factorize bpf_trace_printk and bpf_seq_printf")
+Reported-by: syzbot+63122d0bc347f18c1884@syzkaller.appspotmail.com
+Signed-off-by: Florent Revest <revest@chromium.org>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20210511081054.2125874-1-revest@chromium.org
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ kernel/bpf/helpers.c | 27 ++++++++++++++-------------
+ 1 file changed, 14 insertions(+), 13 deletions(-)
+
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -697,34 +697,35 @@ static int bpf_trace_copy_string(char *b
+  */
+ #define MAX_PRINTF_BUF_LEN	512
+ 
+-struct bpf_printf_buf {
+-	char tmp_buf[MAX_PRINTF_BUF_LEN];
++/* Support executing three nested bprintf helper calls on a given CPU */
++struct bpf_bprintf_buffers {
++	char tmp_bufs[3][MAX_PRINTF_BUF_LEN];
+ };
+-static DEFINE_PER_CPU(struct bpf_printf_buf, bpf_printf_buf);
+-static DEFINE_PER_CPU(int, bpf_printf_buf_used);
++static DEFINE_PER_CPU(struct bpf_bprintf_buffers, bpf_bprintf_bufs);
++static DEFINE_PER_CPU(int, bpf_bprintf_nest_level);
+ 
+ static int try_get_fmt_tmp_buf(char **tmp_buf)
+ {
+-	struct bpf_printf_buf *bufs;
+-	int used;
++	struct bpf_bprintf_buffers *bufs;
++	int nest_level;
+ 
+ 	preempt_disable();
+-	used = this_cpu_inc_return(bpf_printf_buf_used);
+-	if (WARN_ON_ONCE(used > 1)) {
+-		this_cpu_dec(bpf_printf_buf_used);
++	nest_level = this_cpu_inc_return(bpf_bprintf_nest_level);
++	if (WARN_ON_ONCE(nest_level > ARRAY_SIZE(bufs->tmp_bufs))) {
++		this_cpu_dec(bpf_bprintf_nest_level);
+ 		preempt_enable();
+ 		return -EBUSY;
+ 	}
+-	bufs = this_cpu_ptr(&bpf_printf_buf);
+-	*tmp_buf = bufs->tmp_buf;
++	bufs = this_cpu_ptr(&bpf_bprintf_bufs);
++	*tmp_buf = bufs->tmp_bufs[nest_level - 1];
+ 
+ 	return 0;
+ }
+ 
+ void bpf_bprintf_cleanup(void)
+ {
+-	if (this_cpu_read(bpf_printf_buf_used)) {
+-		this_cpu_dec(bpf_printf_buf_used);
++	if (this_cpu_read(bpf_bprintf_nest_level)) {
++		this_cpu_dec(bpf_bprintf_nest_level);
+ 		preempt_enable();
+ 	}
+ }

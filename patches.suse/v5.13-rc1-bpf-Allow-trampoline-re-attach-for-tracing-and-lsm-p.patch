@@ -1,0 +1,99 @@
+From f3a95075549e0e5c36db922caf86847db7a35403 Mon Sep 17 00:00:00 2001
+Message-Id: <f3a95075549e0e5c36db922caf86847db7a35403.1648734416.git.geliang.tang@suse.com>
+From: Jiri Olsa <jolsa@kernel.org>
+Date: Wed, 14 Apr 2021 21:51:41 +0200
+Subject: [PATCH] bpf: Allow trampoline re-attach for tracing and lsm programs
+MIME-Version: 1.0
+Git-commit: f3a95075549e0e5c36db922caf86847db7a35403
+Patch-mainline: v5.13-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Currently we don't allow re-attaching of trampolines. Once
+it's detached, it can't be re-attach even when the program
+is still loaded.
+
+Adding the possibility to re-attach the loaded tracing and
+lsm programs.
+
+Fixing missing unlock with proper cleanup goto jump reported
+by Julia.
+
+Reported-by: kernel test robot <lkp@intel.com>
+Reported-by: Julia Lawall <julia.lawall@lip6.fr>
+Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Toke Høiland-Jørgensen <toke@redhat.com>
+Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Acked-by: KP Singh <kpsingh@kernel.org>
+Link: https://lore.kernel.org/bpf/20210414195147.1624932-2-jolsa@kernel.org
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ kernel/bpf/syscall.c    | 23 +++++++++++++++++------
+ kernel/bpf/trampoline.c |  4 ++--
+ 2 files changed, 19 insertions(+), 8 deletions(-)
+
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index fd495190115e..941ca06d9dfa 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -2648,14 +2648,25 @@ static int bpf_tracing_prog_attach(struct bpf_prog *prog,
+ 	 *   target_btf_id using the link_create API.
+ 	 *
+ 	 * - if tgt_prog == NULL when this function was called using the old
+-         *   raw_tracepoint_open API, and we need a target from prog->aux
+-         *
+-         * The combination of no saved target in prog->aux, and no target
+-         * specified on load is illegal, and we reject that here.
++	 *   raw_tracepoint_open API, and we need a target from prog->aux
++	 *
++	 * - if prog->aux->dst_trampoline and tgt_prog is NULL, the program
++	 *   was detached and is going for re-attachment.
+ 	 */
+ 	if (!prog->aux->dst_trampoline && !tgt_prog) {
+-		err = -ENOENT;
+-		goto out_unlock;
++		/*
++		 * Allow re-attach for TRACING and LSM programs. If it's
++		 * currently linked, bpf_trampoline_link_prog will fail.
++		 * EXT programs need to specify tgt_prog_fd, so they
++		 * re-attach in separate code path.
++		 */
++		if (prog->type != BPF_PROG_TYPE_TRACING &&
++		    prog->type != BPF_PROG_TYPE_LSM) {
++			err = -EINVAL;
++			goto out_unlock;
++		}
++		btf_id = prog->aux->attach_btf_id;
++		key = bpf_trampoline_compute_key(NULL, prog->aux->attach_btf, btf_id);
+ 	}
+ 
+ 	if (!prog->aux->dst_trampoline ||
+diff --git a/kernel/bpf/trampoline.c b/kernel/bpf/trampoline.c
+index 4aa8b52adf25..2d44b5aa0057 100644
+--- a/kernel/bpf/trampoline.c
++++ b/kernel/bpf/trampoline.c
+@@ -444,7 +444,7 @@ int bpf_trampoline_link_prog(struct bpf_prog *prog, struct bpf_trampoline *tr)
+ 	tr->progs_cnt[kind]++;
+ 	err = bpf_trampoline_update(tr);
+ 	if (err) {
+-		hlist_del(&prog->aux->tramp_hlist);
++		hlist_del_init(&prog->aux->tramp_hlist);
+ 		tr->progs_cnt[kind]--;
+ 	}
+ out:
+@@ -467,7 +467,7 @@ int bpf_trampoline_unlink_prog(struct bpf_prog *prog, struct bpf_trampoline *tr)
+ 		tr->extension_prog = NULL;
+ 		goto out;
+ 	}
+-	hlist_del(&prog->aux->tramp_hlist);
++	hlist_del_init(&prog->aux->tramp_hlist);
+ 	tr->progs_cnt[kind]--;
+ 	err = bpf_trampoline_update(tr);
+ out:
+-- 
+2.34.1
+

@@ -1,0 +1,116 @@
+From d01b59c9ae94560fbcceaafeef39784d72765033 Mon Sep 17 00:00:00 2001
+Message-Id: <d01b59c9ae94560fbcceaafeef39784d72765033.1648735058.git.geliang.tang@suse.com>
+From: Xuesen Huang <huangxuesen@kuaishou.com>
+Date: Thu, 4 Mar 2021 14:40:46 +0800
+Subject: [PATCH] bpf: Add bpf_skb_adjust_room flag BPF_F_ADJ_ROOM_ENCAP_L2_ETH
+Git-commit: d01b59c9ae94560fbcceaafeef39784d72765033
+Patch-mainline: v5.13-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+bpf_skb_adjust_room sets the inner_protocol as skb->protocol for packets
+encapsulation. But that is not appropriate when pushing Ethernet header.
+
+Add an option to further specify encap L2 type and set the inner_protocol
+as ETH_P_TEB.
+
+Suggested-by: Willem de Bruijn <willemb@google.com>
+Signed-off-by: Xuesen Huang <huangxuesen@kuaishou.com>
+Signed-off-by: Zhiyong Cheng <chengzhiyong@kuaishou.com>
+Signed-off-by: Li Wang <wangli09@kuaishou.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Willem de Bruijn <willemb@google.com>
+Link: https://lore.kernel.org/bpf/20210304064046.6232-1-hxseverything@gmail.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ include/uapi/linux/bpf.h       |  5 +++++
+ net/core/filter.c              | 11 ++++++++++-
+ tools/include/uapi/linux/bpf.h |  5 +++++
+ 3 files changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index 7f530e349aff..2d3036e292a9 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -2484,6 +2484,10 @@ union bpf_attr {
+  *		  Use with ENCAP_L3/L4 flags to further specify the tunnel
+  *		  type; *len* is the length of the inner MAC header.
+  *
++ *		* **BPF_F_ADJ_ROOM_ENCAP_L2_ETH**:
++ *		  Use with BPF_F_ADJ_ROOM_ENCAP_L2 flag to further specify the
++ *		  L2 type as Ethernet.
++ *
+  * 		A call to this helper is susceptible to change the underlying
+  * 		packet buffer. Therefore, at load time, all checks on pointers
+  * 		previously done by the verifier are invalidated and must be
+@@ -4916,6 +4920,7 @@ enum {
+ 	BPF_F_ADJ_ROOM_ENCAP_L4_GRE	= (1ULL << 3),
+ 	BPF_F_ADJ_ROOM_ENCAP_L4_UDP	= (1ULL << 4),
+ 	BPF_F_ADJ_ROOM_NO_CSUM_RESET	= (1ULL << 5),
++	BPF_F_ADJ_ROOM_ENCAP_L2_ETH	= (1ULL << 6),
+ };
+ 
+ enum {
+diff --git a/net/core/filter.c b/net/core/filter.c
+index a526db494c62..588b19ba0da8 100644
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -3409,6 +3409,7 @@ static u32 bpf_skb_net_base_len(const struct sk_buff *skb)
+ 					 BPF_F_ADJ_ROOM_ENCAP_L3_MASK | \
+ 					 BPF_F_ADJ_ROOM_ENCAP_L4_GRE | \
+ 					 BPF_F_ADJ_ROOM_ENCAP_L4_UDP | \
++					 BPF_F_ADJ_ROOM_ENCAP_L2_ETH | \
+ 					 BPF_F_ADJ_ROOM_ENCAP_L2( \
+ 					  BPF_ADJ_ROOM_ENCAP_L2_MASK))
+ 
+@@ -3445,6 +3446,10 @@ static int bpf_skb_net_grow(struct sk_buff *skb, u32 off, u32 len_diff,
+ 		    flags & BPF_F_ADJ_ROOM_ENCAP_L4_UDP)
+ 			return -EINVAL;
+ 
++		if (flags & BPF_F_ADJ_ROOM_ENCAP_L2_ETH &&
++		    inner_mac_len < ETH_HLEN)
++			return -EINVAL;
++
+ 		if (skb->encapsulation)
+ 			return -EALREADY;
+ 
+@@ -3463,7 +3468,11 @@ static int bpf_skb_net_grow(struct sk_buff *skb, u32 off, u32 len_diff,
+ 		skb->inner_mac_header = inner_net - inner_mac_len;
+ 		skb->inner_network_header = inner_net;
+ 		skb->inner_transport_header = inner_trans;
+-		skb_set_inner_protocol(skb, skb->protocol);
++
++		if (flags & BPF_F_ADJ_ROOM_ENCAP_L2_ETH)
++			skb_set_inner_protocol(skb, htons(ETH_P_TEB));
++		else
++			skb_set_inner_protocol(skb, skb->protocol);
+ 
+ 		skb->encapsulation = 1;
+ 		skb_set_network_header(skb, mac_len);
+diff --git a/tools/include/uapi/linux/bpf.h b/tools/include/uapi/linux/bpf.h
+index 7f530e349aff..2d3036e292a9 100644
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -2484,6 +2484,10 @@ union bpf_attr {
+  *		  Use with ENCAP_L3/L4 flags to further specify the tunnel
+  *		  type; *len* is the length of the inner MAC header.
+  *
++ *		* **BPF_F_ADJ_ROOM_ENCAP_L2_ETH**:
++ *		  Use with BPF_F_ADJ_ROOM_ENCAP_L2 flag to further specify the
++ *		  L2 type as Ethernet.
++ *
+  * 		A call to this helper is susceptible to change the underlying
+  * 		packet buffer. Therefore, at load time, all checks on pointers
+  * 		previously done by the verifier are invalidated and must be
+@@ -4916,6 +4920,7 @@ enum {
+ 	BPF_F_ADJ_ROOM_ENCAP_L4_GRE	= (1ULL << 3),
+ 	BPF_F_ADJ_ROOM_ENCAP_L4_UDP	= (1ULL << 4),
+ 	BPF_F_ADJ_ROOM_NO_CSUM_RESET	= (1ULL << 5),
++	BPF_F_ADJ_ROOM_ENCAP_L2_ETH	= (1ULL << 6),
+ };
+ 
+ enum {
+-- 
+2.34.1
+

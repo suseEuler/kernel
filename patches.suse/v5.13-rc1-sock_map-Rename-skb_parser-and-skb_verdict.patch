@@ -1,0 +1,279 @@
+From ae8b8332fbb512f53bf50ff6a7586dd0f90ed18a Mon Sep 17 00:00:00 2001
+Message-Id: <ae8b8332fbb512f53bf50ff6a7586dd0f90ed18a.1649640008.git.geliang.tang@suse.com>
+From: Cong Wang <cong.wang@bytedance.com>
+Date: Tue, 23 Feb 2021 10:49:30 -0800
+Subject: [PATCH] sock_map: Rename skb_parser and skb_verdict
+Git-commit: ae8b8332fbb512f53bf50ff6a7586dd0f90ed18a
+Patch-mainline: v5.12-rc2
+References: bsn#127
+Modified-by-SEL: Yes, refreshed due to context changes
+
+These two eBPF programs are tied to BPF_SK_SKB_STREAM_PARSER
+and BPF_SK_SKB_STREAM_VERDICT, rename them to reflect the fact
+they are only used for TCP. And save the name 'skb_verdict' for
+general use later.
+
+Signed-off-by: Cong Wang <cong.wang@bytedance.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Reviewed-by: Lorenz Bauer <lmb@cloudflare.com>
+Acked-by: John Fastabend <john.fastabend@gmail.com>
+Acked-by: Jakub Sitnicki <jakub@cloudflare.com>
+Link: https://lore.kernel.org/bpf/20210223184934.6054-6-xiyou.wangcong@gmail.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ include/linux/skmsg.h                         |  8 +--
+ net/core/skmsg.c                              | 14 ++---
+ net/core/sock_map.c                           | 60 +++++++++----------
+ .../selftests/bpf/prog_tests/sockmap_listen.c |  8 +--
+ .../selftests/bpf/progs/test_sockmap_listen.c |  4 +-
+ 5 files changed, 47 insertions(+), 47 deletions(-)
+
+--- a/include/linux/skmsg.h
++++ b/include/linux/skmsg.h
+@@ -56,8 +56,8 @@ struct sk_msg {
+ 
+ struct sk_psock_progs {
+ 	struct bpf_prog			*msg_parser;
+-	struct bpf_prog			*skb_parser;
+-	struct bpf_prog			*skb_verdict;
++	struct bpf_prog			*stream_parser;
++	struct bpf_prog			*stream_verdict;
+ };
+ 
+ enum sk_psock_state_bits {
+@@ -448,8 +448,8 @@ static inline int psock_replace_prog(str
+ static inline void psock_progs_drop(struct sk_psock_progs *progs)
+ {
+ 	psock_set_prog(&progs->msg_parser, NULL);
+-	psock_set_prog(&progs->skb_parser, NULL);
+-	psock_set_prog(&progs->skb_verdict, NULL);
++	psock_set_prog(&progs->stream_parser, NULL);
++	psock_set_prog(&progs->stream_verdict, NULL);
+ }
+ 
+ int sk_psock_tls_strp_read(struct sk_psock *psock, struct sk_buff *skb);
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -692,9 +692,9 @@ void sk_psock_drop(struct sock *sk, stru
+ 	write_lock_bh(&sk->sk_callback_lock);
+ 	sk_psock_restore_proto(sk, psock);
+ 	rcu_assign_sk_user_data(sk, NULL);
+-	if (psock->progs.skb_parser)
++	if (psock->progs.stream_parser)
+ 		sk_psock_stop_strp(sk, psock);
+-	else if (psock->progs.skb_verdict)
++	else if (psock->progs.stream_verdict)
+ 		sk_psock_stop_verdict(sk, psock);
+ 	write_unlock_bh(&sk->sk_callback_lock);
+ 	sk_psock_clear_state(psock, SK_PSOCK_TX_ENABLED);
+@@ -803,7 +803,7 @@ int sk_psock_tls_strp_read(struct sk_pso
+ 	int ret = __SK_PASS;
+ 
+ 	rcu_read_lock();
+-	prog = READ_ONCE(psock->progs.skb_verdict);
++	prog = READ_ONCE(psock->progs.stream_verdict);
+ 	if (likely(prog)) {
+ 		skb->sk = psock->sk;
+ 		tcp_skb_bpf_redirect_clear(skb);
+@@ -891,7 +891,7 @@ static void sk_psock_strp_read(struct st
+ 		kfree_skb(skb);
+ 		goto out;
+ 	}
+-	prog = READ_ONCE(psock->progs.skb_verdict);
++	prog = READ_ONCE(psock->progs.stream_verdict);
+ 	if (likely(prog)) {
+ 		skb->sk = sk;
+ 		tcp_skb_bpf_redirect_clear(skb);
+@@ -916,7 +916,7 @@ static int sk_psock_strp_parse(struct st
+ 	int ret = skb->len;
+ 
+ 	rcu_read_lock();
+-	prog = READ_ONCE(psock->progs.skb_parser);
++	prog = READ_ONCE(psock->progs.stream_parser);
+ 	if (likely(prog)) {
+ 		skb->sk = psock->sk;
+ 		ret = sk_psock_bpf_run(psock, prog, skb);
+@@ -979,7 +979,7 @@ void sk_psock_stop_strp(struct sock *sk,
+ static void sk_psock_done_strp(struct sk_psock *psock)
+ {
+ 	/* Parser has been stopped */
+-	if (psock->progs.skb_parser)
++	if (psock->progs.stream_parser)
+ 		strp_done(&psock->strp);
+ }
+ #else
+@@ -1011,7 +1011,7 @@ static int sk_psock_verdict_recv(read_de
+ 		kfree_skb(skb);
+ 		goto out;
+ 	}
+-	prog = READ_ONCE(psock->progs.skb_verdict);
++	prog = READ_ONCE(psock->progs.stream_verdict);
+ 	if (likely(prog)) {
+ 		skb->sk = sk;
+ 		tcp_skb_bpf_redirect_clear(skb);
+--- a/net/core/sock_map.c
++++ b/net/core/sock_map.c
+@@ -148,9 +148,9 @@ static void sock_map_del_link(struct soc
+ 			struct bpf_map *map = link->map;
+ 			struct bpf_stab *stab = container_of(map, struct bpf_stab,
+ 							     map);
+-			if (psock->saved_data_ready && stab->progs.skb_parser)
++			if (psock->saved_data_ready && stab->progs.stream_parser)
+ 				strp_stop = true;
+-			if (psock->saved_data_ready && stab->progs.skb_verdict)
++			if (psock->saved_data_ready && stab->progs.stream_verdict)
+ 				verdict_stop = true;
+ 			list_del(&link->list);
+ 			sk_psock_free_link(link);
+@@ -224,23 +224,23 @@ out:
+ static int sock_map_link(struct bpf_map *map, struct sk_psock_progs *progs,
+ 			 struct sock *sk)
+ {
+-	struct bpf_prog *msg_parser, *skb_parser, *skb_verdict;
++	struct bpf_prog *msg_parser, *stream_parser, *stream_verdict;
+ 	struct sk_psock *psock;
+ 	int ret;
+ 
+-	skb_verdict = READ_ONCE(progs->skb_verdict);
+-	if (skb_verdict) {
+-		skb_verdict = bpf_prog_inc_not_zero(skb_verdict);
+-		if (IS_ERR(skb_verdict))
+-			return PTR_ERR(skb_verdict);
++	stream_verdict = READ_ONCE(progs->stream_verdict);
++	if (stream_verdict) {
++		stream_verdict = bpf_prog_inc_not_zero(stream_verdict);
++		if (IS_ERR(stream_verdict))
++			return PTR_ERR(stream_verdict);
+ 	}
+ 
+-	skb_parser = READ_ONCE(progs->skb_parser);
+-	if (skb_parser) {
+-		skb_parser = bpf_prog_inc_not_zero(skb_parser);
+-		if (IS_ERR(skb_parser)) {
+-			ret = PTR_ERR(skb_parser);
+-			goto out_put_skb_verdict;
++	stream_parser = READ_ONCE(progs->stream_parser);
++	if (stream_parser) {
++		stream_parser = bpf_prog_inc_not_zero(stream_parser);
++		if (IS_ERR(stream_parser)) {
++			ret = PTR_ERR(stream_parser);
++			goto out_put_stream_verdict;
+ 		}
+ 	}
+ 
+@@ -249,7 +249,7 @@ static int sock_map_link(struct bpf_map
+ 		msg_parser = bpf_prog_inc_not_zero(msg_parser);
+ 		if (IS_ERR(msg_parser)) {
+ 			ret = PTR_ERR(msg_parser);
+-			goto out_put_skb_parser;
++			goto out_put_stream_parser;
+ 		}
+ 	}
+ 
+@@ -261,8 +261,8 @@ static int sock_map_link(struct bpf_map
+ 
+ 	if (psock) {
+ 		if ((msg_parser && READ_ONCE(psock->progs.msg_parser)) ||
+-		    (skb_parser  && READ_ONCE(psock->progs.skb_parser)) ||
+-		    (skb_verdict && READ_ONCE(psock->progs.skb_verdict))) {
++		    (stream_parser  && READ_ONCE(psock->progs.stream_parser)) ||
++		    (stream_verdict && READ_ONCE(psock->progs.stream_verdict))) {
+ 			sk_psock_put(sk, psock);
+ 			ret = -EBUSY;
+ 			goto out_progs;
+@@ -283,15 +283,15 @@ static int sock_map_link(struct bpf_map
+ 		goto out_drop;
+ 
+ 	write_lock_bh(&sk->sk_callback_lock);
+-	if (skb_parser && skb_verdict && !psock->saved_data_ready) {
++	if (stream_parser && stream_verdict && !psock->saved_data_ready) {
+ 		ret = sk_psock_init_strp(sk, psock);
+ 		if (ret)
+ 			goto out_unlock_drop;
+-		psock_set_prog(&psock->progs.skb_verdict, skb_verdict);
+-		psock_set_prog(&psock->progs.skb_parser, skb_parser);
++		psock_set_prog(&psock->progs.stream_verdict, stream_verdict);
++		psock_set_prog(&psock->progs.stream_parser, stream_parser);
+ 		sk_psock_start_strp(sk, psock);
+-	} else if (!skb_parser && skb_verdict && !psock->saved_data_ready) {
+-		psock_set_prog(&psock->progs.skb_verdict, skb_verdict);
++	} else if (!stream_parser && stream_verdict && !psock->saved_data_ready) {
++		psock_set_prog(&psock->progs.stream_verdict, stream_verdict);
+ 		sk_psock_start_verdict(sk,psock);
+ 	}
+ 	write_unlock_bh(&sk->sk_callback_lock);
+@@ -303,12 +303,12 @@ out_drop:
+ out_progs:
+ 	if (msg_parser)
+ 		bpf_prog_put(msg_parser);
+-out_put_skb_parser:
+-	if (skb_parser)
+-		bpf_prog_put(skb_parser);
+-out_put_skb_verdict:
+-	if (skb_verdict)
+-		bpf_prog_put(skb_verdict);
++out_put_stream_parser:
++	if (stream_parser)
++		bpf_prog_put(stream_parser);
++out_put_stream_verdict:
++	if (stream_verdict)
++		bpf_prog_put(stream_verdict);
+ 	return ret;
+ }
+ 
+@@ -1463,11 +1463,11 @@ int sock_map_prog_update(struct bpf_map
+ 		break;
+ #if IS_ENABLED(CONFIG_BPF_STREAM_PARSER)
+ 	case BPF_SK_SKB_STREAM_PARSER:
+-		pprog = &progs->skb_parser;
++		pprog = &progs->stream_parser;
+ 		break;
+ #endif
+ 	case BPF_SK_SKB_STREAM_VERDICT:
+-		pprog = &progs->skb_verdict;
++		pprog = &progs->stream_verdict;
+ 		break;
+ 	default:
+ 		return -EOPNOTSUPP;
+--- a/tools/testing/selftests/bpf/prog_tests/sockmap_listen.c
++++ b/tools/testing/selftests/bpf/prog_tests/sockmap_listen.c
+@@ -1014,8 +1014,8 @@ static void test_skb_redir_to_connected(
+ 					struct bpf_map *inner_map, int family,
+ 					int sotype)
+ {
+-	int verdict = bpf_program__fd(skel->progs.prog_skb_verdict);
+-	int parser = bpf_program__fd(skel->progs.prog_skb_parser);
++	int verdict = bpf_program__fd(skel->progs.prog_stream_verdict);
++	int parser = bpf_program__fd(skel->progs.prog_stream_parser);
+ 	int verdict_map = bpf_map__fd(skel->maps.verdict_map);
+ 	int sock_map = bpf_map__fd(inner_map);
+ 	int err;
+@@ -1125,8 +1125,8 @@ static void test_skb_redir_to_listening(
+ 					struct bpf_map *inner_map, int family,
+ 					int sotype)
+ {
+-	int verdict = bpf_program__fd(skel->progs.prog_skb_verdict);
+-	int parser = bpf_program__fd(skel->progs.prog_skb_parser);
++	int verdict = bpf_program__fd(skel->progs.prog_stream_verdict);
++	int parser = bpf_program__fd(skel->progs.prog_stream_parser);
+ 	int verdict_map = bpf_map__fd(skel->maps.verdict_map);
+ 	int sock_map = bpf_map__fd(inner_map);
+ 	int err;
+--- a/tools/testing/selftests/bpf/progs/test_sockmap_listen.c
++++ b/tools/testing/selftests/bpf/progs/test_sockmap_listen.c
+@@ -31,13 +31,13 @@ struct {
+ static volatile bool test_sockmap; /* toggled by user-space */
+ 
+ SEC("sk_skb/stream_parser")
+-int prog_skb_parser(struct __sk_buff *skb)
++int prog_stream_parser(struct __sk_buff *skb)
+ {
+ 	return skb->len;
+ }
+ 
+ SEC("sk_skb/stream_verdict")
+-int prog_skb_verdict(struct __sk_buff *skb)
++int prog_stream_verdict(struct __sk_buff *skb)
+ {
+ 	unsigned int *count;
+ 	__u32 zero = 0;
