@@ -1,0 +1,87 @@
+From ae29fc82d83dba791cb7a26da57949d6362e69e6 Mon Sep 17 00:00:00 2001
+From: Guo Mengqi <guomengqi3@huawei.com>
+Date: Thu, 7 Apr 2022 16:12:35 +0800
+Subject: [PATCH] mm: share_pool: adjust sp_alloc behavior when coredump
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: ae29fc82d83dba791cb7a26da57949d6362e69e6
+Modified-by-SEL: No
+
+
+ascend inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4MUV2
+CVE: NA
+
+when sp_alloc is being executed ont the whole sharepool group,
+and one process coredumps, allocation will skip the coredumped process and
+continue on the rest processes in the group.
+
+Signed-off-by: Guo Mengqi <guomengqi3@huawei.com>
+Reviewed-by: Weilong Chen <chenweilong@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Reviewed-by: Weilong Chen <chenweilong@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/share_pool.c | 23 +++++++++++++++++------
+ 1 file changed, 17 insertions(+), 6 deletions(-)
+
+diff --git a/mm/share_pool.c b/mm/share_pool.c
+index f18bcd188027..b209e216b33a 100644
+--- a/mm/share_pool.c
++++ b/mm/share_pool.c
+@@ -2144,6 +2144,7 @@ static unsigned long sp_mmap(struct mm_struct *mm, struct file *file,
+ #define ALLOC_NORMAL	1
+ #define ALLOC_RETRY	2
+ #define ALLOC_NOMEM	3
++#define ALLOC_COREDUMP	4
+ 
+ struct sp_alloc_context {
+ 	struct sp_group *spg;
+@@ -2321,8 +2322,7 @@ static int sp_alloc_mmap(struct mm_struct *mm, struct sp_area *spa,
+ 	down_write(&mm->mmap_lock);
+ 	if (unlikely(mm->core_state)) {
+ 		up_write(&mm->mmap_lock);
+-		sp_alloc_unmap(mm, spa, spg_node);
+-		ac->state = ALLOC_NOMEM;
++		ac->state = ALLOC_COREDUMP;
+ 		pr_info("allocation encountered coredump\n");
+ 		return -EFAULT;
+ 	}
+@@ -2464,7 +2464,8 @@ static int __sp_alloc_mmap_populate(struct mm_struct *mm, struct sp_area *spa,
+ static int sp_alloc_mmap_populate(struct sp_area *spa,
+ 				  struct sp_alloc_context *ac)
+ {
+-	int ret;
++	int ret = -EINVAL;
++	int mmap_ret = 0;
+ 	struct mm_struct *mm;
+ 	struct sp_group_node *spg_node;
+ 
+@@ -2474,9 +2475,19 @@ static int sp_alloc_mmap_populate(struct sp_area *spa,
+ 		/* create mapping for each process in the group */
+ 		list_for_each_entry(spg_node, &spa->spg->procs, proc_node) {
+ 			mm = spg_node->master->mm;
+-			ret = __sp_alloc_mmap_populate(mm, spa, spg_node, ac);
+-			if (ret)
+-				return ret;
++			mmap_ret = __sp_alloc_mmap_populate(mm, spa, spg_node, ac);
++			if (mmap_ret) {
++				if (ac->state != ALLOC_COREDUMP)
++					return mmap_ret;
++				if (ac->spg == spg_none) {
++					sp_alloc_unmap(mm, spa, spg_node);
++					pr_err("dvpp allocation failed due to coredump");
++					return mmap_ret;
++				}
++				ac->state = ALLOC_NORMAL;
++				continue;
++			}
++			ret = mmap_ret;
+ 		}
+ 	}
+ 	return ret;
+-- 
+2.26.2
+

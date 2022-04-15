@@ -1,0 +1,240 @@
+From b5b0d15af7d7ab4b50848142db3a4807f9dc92cc Mon Sep 17 00:00:00 2001
+From: Kefeng Wang <wangkefeng.wang@huawei.com>
+Date: Thu, 7 Apr 2022 16:12:41 +0800
+Subject: [PATCH] arm64: quick_kexec: Move to stand-alone file
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: b5b0d15af7d7ab4b50848142db3a4807f9dc92cc
+Modified-by-SEL: Yes, refreshed due to different context
+
+
+hulk inclusion
+category: feature
+bugzilla: 48159, https://gitee.com/openeuler/kernel/issues/I51Z7R
+CVE: N/A
+
+------------------------------
+
+It's better to make the non-upstreamed feature into stand-alone file,
+which make us easy to backport mainline patches.
+
+No functional changes.
+
+Cc: Sang Yan <sangyan@huawei.com>
+Signed-off-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Reviewed-by: Sang Yan <sangyan@huawei.com>
+Reviewed-by: Liu Shixin <liushixin2@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/kernel/setup.c    |   10 +-------
+ arch/arm64/mm/Makefile       |    1 
+ arch/arm64/mm/init.c         |   43 ----------------------------------
+ arch/arm64/mm/internal.h     |   25 ++++++++++++++++++++
+ arch/arm64/mm/pmem_reserve.h |   13 ----------
+ arch/arm64/mm/quick_kexec.c  |   53 +++++++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 82 insertions(+), 63 deletions(-)
+ create mode 100644 arch/arm64/mm/internal.h
+ delete mode 100644 arch/arm64/mm/pmem_reserve.h
+ create mode 100644 arch/arm64/mm/quick_kexec.c
+
+--- a/arch/arm64/kernel/setup.c
++++ b/arch/arm64/kernel/setup.c
+@@ -52,7 +52,7 @@
+ #include <asm/xen/hypervisor.h>
+ #include <asm/mmu_context.h>
+ 
+-#include "../mm/pmem_reserve.h"
++#include "../mm/internal.h"
+ 
+ static int num_standard_resources;
+ static struct resource *standard_resources;
+@@ -290,13 +290,7 @@ static void __init request_standard_reso
+ 			request_resource(res, &crashk_res);
+ #endif
+ 
+-#ifdef CONFIG_QUICK_KEXEC
+-		if (quick_kexec_res.end &&
+-		    quick_kexec_res.start >= res->start &&
+-		    quick_kexec_res.end <= res->end)
+-			request_resource(res, &quick_kexec_res);
+-#endif
+-
++		request_quick_kexec_res(res);
+ 		request_pin_mem_res(res);
+ 	}
+ 
+--- a/arch/arm64/mm/Makefile
++++ b/arch/arm64/mm/Makefile
+@@ -17,3 +17,4 @@ obj-$(CONFIG_KASAN)		+= kasan_init.o
+ KASAN_SANITIZE_kasan_init.o	:= n
+ 
+ obj-$(CONFIG_ARM64_PMEM_RESERVE)	+= pmem_reserve.o
++obj-$(CONFIG_QUICK_KEXEC)	+= quick_kexec.o
+--- a/arch/arm64/mm/init.c
++++ b/arch/arm64/mm/init.c
+@@ -45,7 +45,7 @@
+ #include <asm/tlb.h>
+ #include <asm/alternative.h>
+ 
+-#include "pmem_reserve.h"
++#include "internal.h"
+ 
+ /*
+  * We need to be able to catch inadvertent references to memstart_addr
+@@ -157,45 +157,6 @@ static void __init reserve_elfcorehdr(vo
+ }
+ #endif /* CONFIG_CRASH_DUMP */
+ 
+-#ifdef CONFIG_QUICK_KEXEC
+-static int __init parse_quick_kexec(char *p)
+-{
+-	if (!p)
+-		return 0;
+-
+-	quick_kexec_res.end = PAGE_ALIGN(memparse(p, NULL));
+-
+-	return 0;
+-}
+-early_param("quickkexec", parse_quick_kexec);
+-
+-static void __init reserve_quick_kexec(void)
+-{
+-	unsigned long long mem_start, mem_len;
+-
+-	mem_len = quick_kexec_res.end;
+-	if (mem_len == 0)
+-		return;
+-
+-	/* Current arm64 boot protocol requires 2MB alignment */
+-	mem_start = memblock_find_in_range(0, arm64_dma_phys_limit,
+-			mem_len, SZ_2M);
+-	if (mem_start == 0) {
+-		pr_warn("cannot allocate quick kexec mem (size:0x%llx)\n",
+-			mem_len);
+-		quick_kexec_res.end = 0;
+-		return;
+-	}
+-
+-	memblock_reserve(mem_start, mem_len);
+-	pr_info("quick kexec mem reserved: 0x%016llx - 0x%016llx (%lld MB)\n",
+-		mem_start, mem_start + mem_len,	mem_len >> 20);
+-
+-	quick_kexec_res.start = mem_start;
+-	quick_kexec_res.end = mem_start + mem_len - 1;
+-}
+-#endif
+-
+ /*
+  * Return the maximum physical address for a zone accessible by the given bits
+  * limit. If DRAM starts above 32-bit, expand the zone to the maximum
+@@ -619,9 +580,7 @@ void __init bootmem_init(void)
+ 	if (IS_ENABLED(CONFIG_ZONE_DMA) || IS_ENABLED(CONFIG_ZONE_DMA32))
+ 		reserve_crashkernel();
+ 
+-#ifdef CONFIG_QUICK_KEXEC
+ 	reserve_quick_kexec();
+-#endif
+ 
+ 	reserve_pmem();
+ 
+--- /dev/null
++++ b/arch/arm64/mm/internal.h
+@@ -0,0 +1,25 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++#ifndef __ARM64_MM_INTERNAL_H
++#define __ARM64_MM_INTERNAL_H
++
++#include <linux/types.h>
++
++#ifdef CONFIG_ARM64_PMEM_RESERVE
++void __init setup_reserve_pmem(u64 start, u64 size);
++void __init reserve_pmem(void);
++void __init request_pmem_res_resource(void);
++#else
++static inline void __init setup_reserve_pmem(u64 start, u64 size) {}
++static inline void __init reserve_pmem(void) {}
++static inline void __init request_pmem_res_resource(void) {}
++#endif
++#ifdef CONFIG_ARM64_PMEM_RESERVE
++void __init reserve_quick_kexec(void);
++void __init request_quick_kexec_res(struct resource *res);
++#else
++static inline void __init reserve_quick_kexec(void) {}
++static inline void __init request_quick_kexec_res(struct resource *res) {}
++#endif
++
++#endif /* ifndef _ARM64_MM_INTERNAL_H */
+--- a/arch/arm64/mm/pmem_reserve.h
++++ /dev/null
+@@ -1,13 +0,0 @@
+-/* SPDX-License-Identifier: GPL-2.0 */
+-
+-#include <linux/types.h>
+-
+-#ifdef CONFIG_ARM64_PMEM_RESERVE
+-void __init setup_reserve_pmem(u64 start, u64 size);
+-void __init reserve_pmem(void);
+-void __init request_pmem_res_resource(void);
+-#else
+-static inline void __init setup_reserve_pmem(u64 start, u64 size) {}
+-static inline void __init reserve_pmem(void) {}
+-static inline void __init request_pmem_res_resource(void) {}
+-#endif
+--- /dev/null
++++ b/arch/arm64/mm/quick_kexec.c
+@@ -0,0 +1,53 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#define pr_fmt(fmt) "quick_kexec: " fmt
++
++#include <linux/memblock.h>
++#include <linux/ioport.h>
++#include <linux/types.h>
++#include <linux/kexec.h>
++
++static int __init parse_quick_kexec(char *p)
++{
++	if (!p)
++		return 0;
++
++	quick_kexec_res.end = PAGE_ALIGN(memparse(p, NULL));
++
++	return 0;
++}
++early_param("quickkexec", parse_quick_kexec);
++
++void __init reserve_quick_kexec(void)
++{
++	unsigned long long mem_start, mem_len;
++
++	mem_len = quick_kexec_res.end;
++	if (mem_len == 0)
++		return;
++
++	/* Current arm64 boot protocol requires 2MB alignment */
++	mem_start = memblock_find_in_range(0, arm64_dma_phys_limit,
++			mem_len, SZ_2M);
++	if (mem_start == 0) {
++		pr_warn("cannot allocate quick kexec mem (size:0x%llx)\n",
++			mem_len);
++		quick_kexec_res.end = 0;
++		return;
++	}
++
++	memblock_reserve(mem_start, mem_len);
++	pr_info("quick kexec mem reserved: 0x%016llx - 0x%016llx (%lld MB)\n",
++		mem_start, mem_start + mem_len,	mem_len >> 20);
++
++	quick_kexec_res.start = mem_start;
++	quick_kexec_res.end = mem_start + mem_len - 1;
++}
++
++void __init request_quick_kexec_res(struct resource *res)
++{
++	if (quick_kexec_res.end &&
++	    quick_kexec_res.start >= res->start &&
++	    quick_kexec_res.end <= res->end)
++		request_resource(res, &quick_kexec_res);
++}

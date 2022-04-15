@@ -1,0 +1,100 @@
+From 01c6cfa8be10b6c5fe1815469f8c8afc533d9214 Mon Sep 17 00:00:00 2001
+From: Zhang Qiao <zhangqiao22@huawei.com>
+Date: Thu, 7 Apr 2022 16:13:01 +0800
+Subject: [PATCH] sched/fair: Add qos_throttle_list node in struct cfs_rq
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 01c6cfa8be10b6c5fe1815469f8c8afc533d9214
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I50PPU
+CVE: NA
+
+-----------------------------------------------------------------
+
+when unthrottle a cfs_rq at distribute_cfs_runtime(), another cpu
+may re-throttle this cfs_rq at qos_throttle_cfs_rq() before access
+the cfs_rq->throttle_list.next, but meanwhile, qos throttle will
+attach the cfs_rq throttle_list node to percpu qos_throttled_cfs_rq,
+it will change cfs_rq->throttle_list.next and cause panic or hardlockup
+at distribute_cfs_runtime().
+
+Fix it by adding a qos_throttle_list node in struct cfs_rq, and qos
+throttle disuse the cfs_rq->throttle_list.
+
+Signed-off-by: Zhang Qiao <zhangqiao22@huawei.com>
+Reviewed-by: zheng zucheng <zhengzucheng@huawei.com>
+Reviewed-by: Chen Hui <judy.chenhui@huawei.com>
+Reviewed-by: Wang Weiyang <wangweiyang2@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/sched/fair.c  | 10 +++++++---
+ kernel/sched/sched.h |  4 ++++
+ 2 files changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 583b5dcbf61f..26ea78ae3cca 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -5385,6 +5385,9 @@ static void init_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+ {
+ 	cfs_rq->runtime_enabled = 0;
+ 	INIT_LIST_HEAD(&cfs_rq->throttled_list);
++#ifdef CONFIG_QOS_SCHED
++	INIT_LIST_HEAD(&cfs_rq->qos_throttled_list);
++#endif
+ }
+ 
+ void start_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
+@@ -7204,7 +7207,8 @@ static void throttle_qos_cfs_rq(struct cfs_rq *cfs_rq)
+ 	cfs_rq->throttled = 1;
+ 	cfs_rq->throttled_clock = rq_clock(rq);
+ 
+-	list_add(&cfs_rq->throttled_list, &per_cpu(qos_throttled_cfs_rq, cpu_of(rq)));
++	list_add(&cfs_rq->qos_throttled_list,
++		 &per_cpu(qos_throttled_cfs_rq, cpu_of(rq)));
+ }
+ 
+ static void unthrottle_qos_cfs_rq(struct cfs_rq *cfs_rq)
+@@ -7223,7 +7227,7 @@ static void unthrottle_qos_cfs_rq(struct cfs_rq *cfs_rq)
+ 	update_rq_clock(rq);
+ 
+ 	cfs_b->throttled_time += rq_clock(rq) - cfs_rq->throttled_clock;
+-	list_del_init(&cfs_rq->throttled_list);
++	list_del_init(&cfs_rq->qos_throttled_list);
+ 
+ 	/* update hierarchical throttle state */
+ 	walk_tg_tree_from(cfs_rq->tg, tg_nop, tg_unthrottle_up, (void *)rq);
+@@ -7266,7 +7270,7 @@ static int __unthrottle_qos_cfs_rqs(int cpu)
+ 	int res = 0;
+ 
+ 	list_for_each_entry_safe(cfs_rq, tmp_rq, &per_cpu(qos_throttled_cfs_rq, cpu),
+-				throttled_list) {
++				 qos_throttled_list) {
+ 		if (cfs_rq_throttled(cfs_rq)) {
+ 			unthrottle_qos_cfs_rq(cfs_rq);
+ 			res++;
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index d122f1b8e3e6..fadd38187c2a 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -626,8 +626,12 @@ struct cfs_rq {
+ #endif /* CONFIG_CFS_BANDWIDTH */
+ #endif /* CONFIG_FAIR_GROUP_SCHED */
+ 
++#if !defined(__GENKSYMS__) && defined(CONFIG_QOS_SCHED)
++	struct list_head	qos_throttled_list;
++#else
+ 	KABI_RESERVE(1)
+ 	KABI_RESERVE(2)
++#endif
+ 	KABI_RESERVE(3)
+ 	KABI_RESERVE(4)
+ };
+-- 
+2.26.2
+
