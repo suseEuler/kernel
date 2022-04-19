@@ -1,0 +1,98 @@
+From e061047684af63f2d4f1338ec73140f6e29eb59f Mon Sep 17 00:00:00 2001
+Message-Id: <e061047684af63f2d4f1338ec73140f6e29eb59f.1648733841.git.geliang.tang@suse.com>
+From: Kuniyuki Iwashima <kuniyu@amazon.co.jp>
+Date: Sat, 12 Jun 2021 21:32:21 +0900
+Subject: [PATCH] bpf: Support BPF_FUNC_get_socket_cookie() for
+ BPF_PROG_TYPE_SK_REUSEPORT.
+Git-commit: e061047684af63f2d4f1338ec73140f6e29eb59f
+Patch-mainline: v5.14-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+We will call sock_reuseport.prog for socket migration in the next commit,
+so the eBPF program has to know which listener is closing to select a new
+listener.
+
+We can currently get a unique ID of each listener in the userspace by
+calling bpf_map_lookup_elem() for BPF_MAP_TYPE_REUSEPORT_SOCKARRAY map.
+
+This patch makes the pointer of sk available in sk_reuseport_md so that we
+can get the ID by BPF_FUNC_get_socket_cookie() in the eBPF program.
+
+Suggested-by: Martin KaFai Lau <kafai@fb.com>
+Signed-off-by: Kuniyuki Iwashima <kuniyu@amazon.co.jp>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Reviewed-by: Eric Dumazet <edumazet@google.com>
+Acked-by: Martin KaFai Lau <kafai@fb.com>
+Link: https://lore.kernel.org/netdev/20201119001154.kapwihc2plp4f7zc@kafai-mbp.dhcp.thefacebook.com/
+Link: https://lore.kernel.org/bpf/20210612123224.12525-9-kuniyu@amazon.co.jp
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ include/uapi/linux/bpf.h       |  1 +
+ net/core/filter.c              | 10 ++++++++++
+ tools/include/uapi/linux/bpf.h |  1 +
+ 3 files changed, 12 insertions(+)
+
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index 2c1ba70abbf1..f3b72588442b 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -5416,6 +5416,7 @@ struct sk_reuseport_md {
+ 	__u32 ip_protocol;	/* IP protocol. e.g. IPPROTO_TCP, IPPROTO_UDP */
+ 	__u32 bind_inany;	/* Is sock bound to an INANY address? */
+ 	__u32 hash;		/* A hash of the packet 4 tuples */
++	__bpf_md_ptr(struct bpf_sock *, sk);
+ };
+ 
+ #define BPF_TAG_SIZE	8
+diff --git a/net/core/filter.c b/net/core/filter.c
+index caa88955562e..f753ab550525 100644
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -10172,6 +10172,8 @@ sk_reuseport_func_proto(enum bpf_func_id func_id,
+ 		return &sk_reuseport_load_bytes_proto;
+ 	case BPF_FUNC_skb_load_bytes_relative:
+ 		return &sk_reuseport_load_bytes_relative_proto;
++	case BPF_FUNC_get_socket_cookie:
++		return &bpf_get_socket_ptr_cookie_proto;
+ 	default:
+ 		return bpf_base_func_proto(func_id);
+ 	}
+@@ -10201,6 +10203,10 @@ sk_reuseport_is_valid_access(int off, int size,
+ 	case offsetof(struct sk_reuseport_md, hash):
+ 		return size == size_default;
+ 
++	case offsetof(struct sk_reuseport_md, sk):
++		info->reg_type = PTR_TO_SOCKET;
++		return size == sizeof(__u64);
++
+ 	/* Fields that allow narrowing */
+ 	case bpf_ctx_range(struct sk_reuseport_md, eth_protocol):
+ 		if (size < sizeof_field(struct sk_buff, protocol))
+@@ -10273,6 +10279,10 @@ static u32 sk_reuseport_convert_ctx_access(enum bpf_access_type type,
+ 	case offsetof(struct sk_reuseport_md, bind_inany):
+ 		SK_REUSEPORT_LOAD_FIELD(bind_inany);
+ 		break;
++
++	case offsetof(struct sk_reuseport_md, sk):
++		SK_REUSEPORT_LOAD_FIELD(sk);
++		break;
+ 	}
+ 
+ 	return insn - insn_buf;
+diff --git a/tools/include/uapi/linux/bpf.h b/tools/include/uapi/linux/bpf.h
+index 2c1ba70abbf1..f3b72588442b 100644
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -5416,6 +5416,7 @@ struct sk_reuseport_md {
+ 	__u32 ip_protocol;	/* IP protocol. e.g. IPPROTO_TCP, IPPROTO_UDP */
+ 	__u32 bind_inany;	/* Is sock bound to an INANY address? */
+ 	__u32 hash;		/* A hash of the packet 4 tuples */
++	__bpf_md_ptr(struct bpf_sock *, sk);
+ };
+ 
+ #define BPF_TAG_SIZE	8
+-- 
+2.34.1
+

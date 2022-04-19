@@ -1,0 +1,156 @@
+From 1cd62c21572c1df6e7090ea4cabf4cf509616dbb Mon Sep 17 00:00:00 2001
+Message-Id: <1cd62c21572c1df6e7090ea4cabf4cf509616dbb.1650355515.git.geliang.tang@suse.com>
+From: Kuniyuki Iwashima <kuniyu@amazon.co.jp>
+Date: Sat, 12 Jun 2021 21:32:17 +0900
+Subject: [PATCH] tcp: Add reuseport_migrate_sock() to select a new listener.
+Git-commit: 1cd62c21572c1df6e7090ea4cabf4cf509616dbb
+Patch-mainline: v5.14-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+reuseport_migrate_sock() does the same check done in
+reuseport_listen_stop_sock(). If the reuseport group is capable of
+migration, reuseport_migrate_sock() selects a new listener by the child
+socket hash and increments the listener's sk_refcnt beforehand. Thus, if we
+fail in the migration, we have to decrement it later.
+
+We will support migration by eBPF in the later commits.
+
+Signed-off-by: Kuniyuki Iwashima <kuniyu@amazon.co.jp>
+Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Reviewed-by: Eric Dumazet <edumazet@google.com>
+Link: https://lore.kernel.org/bpf/20210612123224.12525-5-kuniyu@amazon.co.jp
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ include/net/sock_reuseport.h |  3 ++
+ net/core/sock_reuseport.c    | 78 +++++++++++++++++++++++++++++-------
+ 2 files changed, 67 insertions(+), 14 deletions(-)
+
+diff --git a/include/net/sock_reuseport.h b/include/net/sock_reuseport.h
+index 1333d0cddfbc..473b0b0fa4ab 100644
+--- a/include/net/sock_reuseport.h
++++ b/include/net/sock_reuseport.h
+@@ -37,6 +37,9 @@ extern struct sock *reuseport_select_sock(struct sock *sk,
+ 					  u32 hash,
+ 					  struct sk_buff *skb,
+ 					  int hdr_len);
++struct sock *reuseport_migrate_sock(struct sock *sk,
++				    struct sock *migrating_sk,
++				    struct sk_buff *skb);
+ extern int reuseport_attach_prog(struct sock *sk, struct bpf_prog *prog);
+ extern int reuseport_detach_prog(struct sock *sk);
+ 
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+index 41fcd55ab5ae..b239f8cd9d39 100644
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -44,7 +44,7 @@ static void __reuseport_add_sock(struct sock *sk,
+ 				 struct sock_reuseport *reuse)
+ {
+ 	reuse->socks[reuse->num_socks] = sk;
+-	/* paired with smp_rmb() in reuseport_select_sock() */
++	/* paired with smp_rmb() in reuseport_(select|migrate)_sock() */
+ 	smp_wmb();
+ 	reuse->num_socks++;
+ }
+@@ -434,6 +434,23 @@ static struct sock *run_bpf_filter(struct sock_reuseport *reuse, u16 socks,
+ 	return reuse->socks[index];
+ }
+ 
++static struct sock *reuseport_select_sock_by_hash(struct sock_reuseport *reuse,
++						  u32 hash, u16 num_socks)
++{
++	int i, j;
++
++	i = j = reciprocal_scale(hash, num_socks);
++	while (reuse->socks[i]->sk_state == TCP_ESTABLISHED) {
++		i++;
++		if (i >= num_socks)
++			i = 0;
++		if (i == j)
++			return NULL;
++	}
++
++	return reuse->socks[i];
++}
++
+ /**
+  *  reuseport_select_sock - Select a socket from an SO_REUSEPORT group.
+  *  @sk: First socket in the group.
+@@ -477,19 +494,8 @@ struct sock *reuseport_select_sock(struct sock *sk,
+ 
+ select_by_hash:
+ 		/* no bpf or invalid bpf result: fall back to hash usage */
+-		if (!sk2) {
+-			int i, j;
+-
+-			i = j = reciprocal_scale(hash, socks);
+-			while (reuse->socks[i]->sk_state == TCP_ESTABLISHED) {
+-				i++;
+-				if (i >= socks)
+-					i = 0;
+-				if (i == j)
+-					goto out;
+-			}
+-			sk2 = reuse->socks[i];
+-		}
++		if (!sk2)
++			sk2 = reuseport_select_sock_by_hash(reuse, hash, socks);
+ 	}
+ 
+ out:
+@@ -498,6 +504,50 @@ struct sock *reuseport_select_sock(struct sock *sk,
+ }
+ EXPORT_SYMBOL(reuseport_select_sock);
+ 
++/**
++ *  reuseport_migrate_sock - Select a socket from an SO_REUSEPORT group.
++ *  @sk: close()ed or shutdown()ed socket in the group.
++ *  @migrating_sk: ESTABLISHED/SYN_RECV full socket in the accept queue or
++ *    NEW_SYN_RECV request socket during 3WHS.
++ *  @skb: skb to run through BPF filter.
++ *  Returns a socket (with sk_refcnt +1) that should accept the child socket
++ *  (or NULL on error).
++ */
++struct sock *reuseport_migrate_sock(struct sock *sk,
++				    struct sock *migrating_sk,
++				    struct sk_buff *skb)
++{
++	struct sock_reuseport *reuse;
++	struct sock *nsk = NULL;
++	u16 socks;
++	u32 hash;
++
++	rcu_read_lock();
++
++	reuse = rcu_dereference(sk->sk_reuseport_cb);
++	if (!reuse)
++		goto out;
++
++	socks = READ_ONCE(reuse->num_socks);
++	if (unlikely(!socks))
++		goto out;
++
++	/* paired with smp_wmb() in __reuseport_add_sock() */
++	smp_rmb();
++
++	hash = migrating_sk->sk_hash;
++	if (sock_net(sk)->ipv4.sysctl_tcp_migrate_req)
++		nsk = reuseport_select_sock_by_hash(reuse, hash, socks);
++
++	if (nsk && unlikely(!refcount_inc_not_zero(&nsk->sk_refcnt)))
++		nsk = NULL;
++
++out:
++	rcu_read_unlock();
++	return nsk;
++}
++EXPORT_SYMBOL(reuseport_migrate_sock);
++
+ int reuseport_attach_prog(struct sock *sk, struct bpf_prog *prog)
+ {
+ 	struct sock_reuseport *reuse;
+-- 
+2.34.1
+
