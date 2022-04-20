@@ -1,0 +1,101 @@
+From e78aea8b2170be1b88c96a4d138422986a737336 Mon Sep 17 00:00:00 2001
+Message-Id: <e78aea8b2170be1b88c96a4d138422986a737336.1650458621.git.geliang.tang@suse.com>
+From: Martin KaFai Lau <kafai@fb.com>
+Date: Wed, 24 Mar 2021 18:52:01 -0700
+Subject: [PATCH] bpf: tcp: Put some tcp cong functions in allowlist for
+ bpf-tcp-cc
+Git-commit: e78aea8b2170be1b88c96a4d138422986a737336
+Patch-mainline: v5.13-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+This patch puts some tcp cong helper functions, tcp_slow_start()
+and tcp_cong_avoid_ai(), into the allowlist for the bpf-tcp-cc
+program.
+
+A few tcp cc implementation functions are also put into the
+allowlist.  A potential use case is the bpf-tcp-cc implementation
+may only want to override a subset of a tcp_congestion_ops.  For others,
+the bpf-tcp-cc can directly call the kernel counter parts instead of
+re-implementing (or copy-and-pasting) them to the bpf program.
+
+They will only be available to the bpf-tcp-cc typed program.
+The allowlist functions are not bounded to a fixed ABI contract.
+When any of them has changed, the bpf-tcp-cc program has to be changed
+like any in-tree/out-of-tree kernel tcp-cc implementations do also.
+
+Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20210325015201.1546345-1-kafai@fb.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ net/ipv4/bpf_tcp_ca.c | 41 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/net/ipv4/bpf_tcp_ca.c b/net/ipv4/bpf_tcp_ca.c
+index d520e61649c8..40520b77a307 100644
+--- a/net/ipv4/bpf_tcp_ca.c
++++ b/net/ipv4/bpf_tcp_ca.c
+@@ -5,6 +5,7 @@
+ #include <linux/bpf_verifier.h>
+ #include <linux/bpf.h>
+ #include <linux/btf.h>
++#include <linux/btf_ids.h>
+ #include <linux/filter.h>
+ #include <net/tcp.h>
+ #include <net/bpf_sk_storage.h>
+@@ -178,10 +179,50 @@ bpf_tcp_ca_get_func_proto(enum bpf_func_id func_id,
+ 	}
+ }
+ 
++BTF_SET_START(bpf_tcp_ca_kfunc_ids)
++BTF_ID(func, tcp_reno_ssthresh)
++BTF_ID(func, tcp_reno_cong_avoid)
++BTF_ID(func, tcp_reno_undo_cwnd)
++BTF_ID(func, tcp_slow_start)
++BTF_ID(func, tcp_cong_avoid_ai)
++#if IS_BUILTIN(CONFIG_TCP_CONG_CUBIC)
++BTF_ID(func, cubictcp_init)
++BTF_ID(func, cubictcp_recalc_ssthresh)
++BTF_ID(func, cubictcp_cong_avoid)
++BTF_ID(func, cubictcp_state)
++BTF_ID(func, cubictcp_cwnd_event)
++BTF_ID(func, cubictcp_acked)
++#endif
++#if IS_BUILTIN(CONFIG_TCP_CONG_DCTCP)
++BTF_ID(func, dctcp_init)
++BTF_ID(func, dctcp_update_alpha)
++BTF_ID(func, dctcp_cwnd_event)
++BTF_ID(func, dctcp_ssthresh)
++BTF_ID(func, dctcp_cwnd_undo)
++BTF_ID(func, dctcp_state)
++#endif
++#if IS_BUILTIN(CONFIG_TCP_CONG_BBR)
++BTF_ID(func, bbr_init)
++BTF_ID(func, bbr_main)
++BTF_ID(func, bbr_sndbuf_expand)
++BTF_ID(func, bbr_undo_cwnd)
++BTF_ID(func, bbr_cwnd_even),
++BTF_ID(func, bbr_ssthresh)
++BTF_ID(func, bbr_min_tso_segs)
++BTF_ID(func, bbr_set_state)
++#endif
++BTF_SET_END(bpf_tcp_ca_kfunc_ids)
++
++static bool bpf_tcp_ca_check_kfunc_call(u32 kfunc_btf_id)
++{
++	return btf_id_set_contains(&bpf_tcp_ca_kfunc_ids, kfunc_btf_id);
++}
++
+ static const struct bpf_verifier_ops bpf_tcp_ca_verifier_ops = {
+ 	.get_func_proto		= bpf_tcp_ca_get_func_proto,
+ 	.is_valid_access	= bpf_tcp_ca_is_valid_access,
+ 	.btf_struct_access	= bpf_tcp_ca_btf_struct_access,
++	.check_kfunc_call	= bpf_tcp_ca_check_kfunc_call,
+ };
+ 
+ static int bpf_tcp_ca_init_member(const struct btf_type *t,
+-- 
+2.34.1
+
