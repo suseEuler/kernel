@@ -1,0 +1,191 @@
+From 44779a4b85abd1d1dab9e5b90bd5e6adcfc8143a Mon Sep 17 00:00:00 2001
+Message-Id: <44779a4b85abd1d1dab9e5b90bd5e6adcfc8143a.1648732963.git.geliang.tang@suse.com>
+From: Stanislav Fomichev <sdf@google.com>
+Date: Wed, 18 Aug 2021 16:52:16 -0700
+Subject: [PATCH] bpf: Use kvmalloc for map keys in syscalls
+Git-commit: 44779a4b85abd1d1dab9e5b90bd5e6adcfc8143a
+Patch-mainline: v5.15-rc1
+References: bsn#127
+Modified-by-SEL: Yes, refreshed due to context changes
+
+
+Same as previous patch but for the keys. memdup_bpfptr is renamed
+to kvmemdup_bpfptr (and converted to kvmalloc).
+
+Signed-off-by: Stanislav Fomichev <sdf@google.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Song Liu <songliubraving@fb.com>
+Link: https://lore.kernel.org/bpf/20210818235216.1159202-2-sdf@google.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ include/linux/bpfptr.h | 12 ++++++++++--
+ kernel/bpf/syscall.c   | 34 +++++++++++++++++-----------------
+ 2 files changed, 27 insertions(+), 19 deletions(-)
+
+--- a/include/linux/bpfptr.h
++++ b/include/linux/bpfptr.h
+@@ -62,9 +62,17 @@ static inline int copy_to_bpfptr_offset(
+ 	return copy_to_sockptr_offset((sockptr_t) dst, offset, src, size);
+ }
+ 
+-static inline void *memdup_bpfptr(bpfptr_t src, size_t len)
++static inline void *kvmemdup_bpfptr(bpfptr_t src, size_t len)
+ {
+-	return memdup_sockptr((sockptr_t) src, len);
++	void *p = kvmalloc(len, GFP_USER | __GFP_NOWARN);
++
++	if (!p)
++		return ERR_PTR(-ENOMEM);
++	if (copy_from_bpfptr(p, src, len)) {
++		kvfree(p);
++		return ERR_PTR(-EFAULT);
++	}
++	return p;
+ }
+ 
+ static inline long strncpy_from_bpfptr(char *dst, bpfptr_t src, size_t count)
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -1024,7 +1024,7 @@ int __weak bpf_stackmap_copy(struct bpf_
+ static void *__bpf_copy_key(void __user *ukey, u64 key_size)
+ {
+ 	if (key_size)
+-		return memdup_user(ukey, key_size);
++		return vmemdup_user(ukey, key_size);
+ 
+ 	if (ukey)
+ 		return ERR_PTR(-EINVAL);
+@@ -1035,7 +1035,7 @@ static void *__bpf_copy_key(void __user
+ static void *___bpf_copy_key(bpfptr_t ukey, u64 key_size)
+ {
+ 	if (key_size)
+-		return memdup_bpfptr(ukey, key_size);
++		return kvmemdup_bpfptr(ukey, key_size);
+ 
+ 	if (!bpfptr_is_null(ukey))
+ 		return ERR_PTR(-EINVAL);
+@@ -1104,7 +1104,7 @@ static int map_lookup_elem(union bpf_att
+ free_value:
+ 	kvfree(value);
+ free_key:
+-	kfree(key);
++	kvfree(key);
+ err_put:
+ 	fdput(f);
+ 	return err;
+@@ -1165,7 +1165,7 @@ static int map_update_elem(union bpf_att
+ free_value:
+ 	kvfree(value);
+ free_key:
+-	kfree(key);
++	kvfree(key);
+ err_put:
+ 	bpf_map_write_active_dec(map);
+ 	fdput(f);
+@@ -1219,7 +1219,7 @@ static int map_delete_elem(union bpf_att
+ 	bpf_enable_instrumentation();
+ 	maybe_wait_bpf_programs(map);
+ out:
+-	kfree(key);
++	kvfree(key);
+ err_put:
+ 	bpf_map_write_active_dec(map);
+ 	fdput(f);
+@@ -1262,7 +1262,7 @@ static int map_get_next_key(union bpf_at
+ 	}
+ 
+ 	err = -ENOMEM;
+-	next_key = kmalloc(map->key_size, GFP_USER);
++	next_key = kvmalloc(map->key_size, GFP_USER);
+ 	if (!next_key)
+ 		goto free_key;
+ 
+@@ -1285,9 +1285,9 @@ out:
+ 	err = 0;
+ 
+ free_next_key:
+-	kfree(next_key);
++	kvfree(next_key);
+ free_key:
+-	kfree(key);
++	kvfree(key);
+ err_put:
+ 	fdput(f);
+ 	return err;
+@@ -1314,7 +1314,7 @@ int generic_map_delete_batch(struct bpf_
+ 	if (!max_count)
+ 		return 0;
+ 
+-	key = kmalloc(map->key_size, GFP_USER | __GFP_NOWARN);
++	key = kvmalloc(map->key_size, GFP_USER | __GFP_NOWARN);
+ 	if (!key)
+ 		return -ENOMEM;
+ 
+@@ -1342,7 +1342,7 @@ int generic_map_delete_batch(struct bpf_
+ 	if (copy_to_user(&uattr->batch.count, &cp, sizeof(cp)))
+ 		err = -EFAULT;
+ 
+-	kfree(key);
++	kvfree(key);
+ 	return err;
+ }
+ 
+@@ -1372,13 +1372,13 @@ int generic_map_update_batch(struct bpf_
+ 	if (!max_count)
+ 		return 0;
+ 
+-	key = kmalloc(map->key_size, GFP_USER | __GFP_NOWARN);
++	key = kvmalloc(map->key_size, GFP_USER | __GFP_NOWARN);
+ 	if (!key)
+ 		return -ENOMEM;
+ 
+ 	value = kvmalloc(value_size, GFP_USER | __GFP_NOWARN);
+ 	if (!value) {
+-		kfree(key);
++		kvfree(key);
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -1402,7 +1402,7 @@ int generic_map_update_batch(struct bpf_
+ 		err = -EFAULT;
+ 
+ 	kvfree(value);
+-	kfree(key);
++	kvfree(key);
+ 	fdput(f);
+ 	return err;
+ }
+@@ -1437,13 +1437,13 @@ int generic_map_lookup_batch(struct bpf_
+ 	if (put_user(0, &uattr->batch.count))
+ 		return -EFAULT;
+ 
+-	buf_prevkey = kmalloc(map->key_size, GFP_USER | __GFP_NOWARN);
++	buf_prevkey = kvmalloc(map->key_size, GFP_USER | __GFP_NOWARN);
+ 	if (!buf_prevkey)
+ 		return -ENOMEM;
+ 
+ 	buf = kvmalloc(map->key_size + value_size, GFP_USER | __GFP_NOWARN);
+ 	if (!buf) {
+-		kfree(buf_prevkey);
++		kvfree(buf_prevkey);
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -1504,7 +1504,7 @@ int generic_map_lookup_batch(struct bpf_
+ 		err = -EFAULT;
+ 
+ free_buf:
+-	kfree(buf_prevkey);
++	kvfree(buf_prevkey);
+ 	kvfree(buf);
+ 	return err;
+ }
+@@ -1595,7 +1595,7 @@ static int map_lookup_and_delete_elem(un
+ free_value:
+ 	kvfree(value);
+ free_key:
+-	kfree(key);
++	kvfree(key);
+ err_put:
+ 	bpf_map_write_active_dec(map);
+ 	fdput(f);
