@@ -1,0 +1,64 @@
+From 9317d0fffeb4c3929069cfc7377cfa2a7cd36d1d Mon Sep 17 00:00:00 2001
+From: Johannes Weiner <hannes@cmpxchg.org>
+Date: Thu, 29 Apr 2021 22:57:04 -0700
+Subject: [PATCH] mm: page_counter: mitigate consequences of a page_counter
+ underflow
+Git-commit: 9317d0fffeb4c3929069cfc7377cfa2a7cd36d1d
+Patch-mainline: v5.13-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+When the unsigned page_counter underflows, even just by a few pages, a
+cgroup will not be able to run anything afterwards and trigger the OOM
+killer in a loop.
+
+Underflows shouldn't happen, but when they do in practice, we may just be
+off by a small amount that doesn't interfere with the normal operation -
+consequences don't need to be that dire.
+
+Reset the page_counter to 0 upon underflow.  We'll issue a warning that
+the accounting will be off and then try to keep limping along.
+
+[ We used to do this with the original res_counter, where it was a
+  more straight-forward correction inside the spinlock section. I
+  didn't carry it forward into the lockless page counters for
+  simplicity, but it turns out this is quite useful in practice. ]
+
+Link: https://lkml.kernel.org/r/20210408143155.2679744-1-hannes@cmpxchg.org
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Acked-by: Chris Down <chris@chrisdown.name>
+Reviewed-by: Shakeel Butt <shakeelb@google.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Roman Gushchin <guro@fb.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/page_counter.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/mm/page_counter.c b/mm/page_counter.c
+index c6860f51b6c6..7d83641eb86b 100644
+--- a/mm/page_counter.c
++++ b/mm/page_counter.c
+@@ -52,9 +52,13 @@ void page_counter_cancel(struct page_counter *counter, unsigned long nr_pages)
+ 	long new;
+ 
+ 	new = atomic_long_sub_return(nr_pages, &counter->usage);
+-	propagate_protected_usage(counter, new);
+ 	/* More uncharges than charges? */
+-	WARN_ON_ONCE(new < 0);
++	if (WARN_ONCE(new < 0, "page_counter underflow: %ld nr_pages=%lu\n",
++		      new, nr_pages)) {
++		new = 0;
++		atomic_long_set(&counter->usage, new);
++	}
++	propagate_protected_usage(counter, new);
+ }
+ 
+ /**
+-- 
+2.26.2
+
