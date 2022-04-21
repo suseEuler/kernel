@@ -1,5 +1,5 @@
 From 7d08c2c9117113fee118487425ed55efa50cbfa9 Mon Sep 17 00:00:00 2001
-Message-Id: <7d08c2c9117113fee118487425ed55efa50cbfa9.1648733062.git.geliang.tang@suse.com>
+Message-Id: <7d08c2c9117113fee118487425ed55efa50cbfa9.1650785492.git.geliang.tang@suse.com>
 From: Andrii Nakryiko <andrii@kernel.org>
 Date: Sun, 15 Aug 2021 00:05:55 -0700
 Subject: [PATCH] bpf: Refactor BPF_PROG_RUN_ARRAY family of macros into
@@ -44,7 +44,34 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 
 --- a/include/linux/bpf.h
 +++ b/include/linux/bpf.h
-@@ -1153,66 +1153,115 @@ int bpf_prog_array_copy(struct bpf_prog_
+@@ -1151,67 +1151,116 @@ struct bpf_run_ctx {};
+ 
+ struct bpf_cg_run_ctx {
+ 	struct bpf_run_ctx run_ctx;
+-	struct bpf_prog_array_item *prog_item;
++	const struct bpf_prog_array_item *prog_item;
+ };
+ 
++static inline struct bpf_run_ctx *bpf_set_run_ctx(struct bpf_run_ctx *new_ctx)
++{
++	struct bpf_run_ctx *old_ctx = NULL;
++
++#ifdef CONFIG_BPF_SYSCALL
++	old_ctx = current->bpf_ctx;
++	current->bpf_ctx = new_ctx;
++#endif
++	return old_ctx;
++}
++
++static inline void bpf_reset_run_ctx(struct bpf_run_ctx *old_ctx)
++{
++#ifdef CONFIG_BPF_SYSCALL
++	current->bpf_ctx = old_ctx;
++#endif
++}
++
+ /* BPF program asks to bypass CAP_NET_BIND_SERVICE in bind. */
+ #define BPF_RET_BIND_NO_CAP_NET_BIND_SERVICE			(1 << 0)
  /* BPF program asks to set CN on the packet. */
  #define BPF_RET_SET_CN						(1 << 0)
  
@@ -74,14 +101,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 -		migrate_enable();					\
 -		_ret;							\
 -	 })
--
- struct bpf_run_ctx {};
- 
- struct bpf_cg_run_ctx {
- 	struct bpf_run_ctx run_ctx;
--	struct bpf_prog_array_item *prog_item;
-+	const struct bpf_prog_array_item *prog_item;
- };
++typedef u32 (*bpf_prog_run_fn)(const struct bpf_prog *prog, const void *ctx);
  
 -#define __BPF_PROG_RUN_ARRAY(array, ctx, func, check_non_null, set_cg_storage) \
 -	({						\
@@ -109,26 +129,6 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 -		migrate_enable();			\
 -		_ret;					\
 -	 })
-+static inline struct bpf_run_ctx *bpf_set_run_ctx(struct bpf_run_ctx *new_ctx)
-+{
-+	struct bpf_run_ctx *old_ctx = NULL;
-+
-+#ifdef CONFIG_BPF_SYSCALL
-+	old_ctx = current->bpf_ctx;
-+	current->bpf_ctx = new_ctx;
-+#endif
-+	return old_ctx;
-+}
-+
-+static inline void bpf_reset_run_ctx(struct bpf_run_ctx *old_ctx)
-+{
-+#ifdef CONFIG_BPF_SYSCALL
-+	current->bpf_ctx = old_ctx;
-+#endif
-+}
-+
-+typedef u32 (*bpf_prog_run_fn)(const struct bpf_prog *prog, const void *ctx);
-+
 +static __always_inline u32
 +BPF_PROG_RUN_ARRAY_CG_FLAGS(const struct bpf_prog_array __rcu *array_rcu,
 +			    const void *ctx, bpf_prog_run_fn run_prog,
@@ -214,16 +214,16 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  
  /* To be used by __cgroup_bpf_run_filter_skb for EGRESS BPF progs
   * so BPF programs can request cwr for TCP packets.
-@@ -1241,7 +1290,7 @@ _out:							\
- 	 	u32 _flags = 0;				\
- 	 	bool _cn;				\
- 	 	u32 _ret;				\
--	 	_ret = BPF_PROG_RUN_ARRAY_FLAGS(array, ctx, func, &_flags); \
+@@ -1240,7 +1289,7 @@ _out:							\
+ 		u32 _flags = 0;				\
+ 		bool _cn;				\
+ 		u32 _ret;				\
+-		_ret = BPF_PROG_RUN_ARRAY_FLAGS(array, ctx, func, &_flags); \
 +		_ret = BPF_PROG_RUN_ARRAY_CG_FLAGS(array, ctx, func, &_flags); \
- 	 	_cn = _flags & BPF_RET_SET_CN;		\
+ 		_cn = _flags & BPF_RET_SET_CN;		\
  		if (_ret)				\
  			_ret = (_cn ? NET_XMIT_CN : NET_XMIT_SUCCESS);	\
-@@ -1250,12 +1299,6 @@ _out:							\
+@@ -1249,12 +1298,6 @@ _out:							\
  		_ret;					\
  	})
  
@@ -236,7 +236,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  #ifdef CONFIG_BPF_SYSCALL
  DECLARE_PER_CPU(int, bpf_prog_active);
  extern struct mutex bpf_stats_enabled_mutex;
-@@ -1290,20 +1333,6 @@ static inline void bpf_enable_instrument
+@@ -1289,20 +1332,6 @@ static inline void bpf_enable_instrument
  	migrate_enable();
  }
  
