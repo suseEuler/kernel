@@ -1,0 +1,138 @@
+From e2a073dde9218cdef3c5431bddabf4549dd65fea Mon Sep 17 00:00:00 2001
+From: Ard Biesheuvel <ardb@kernel.org>
+Date: Tue, 17 Nov 2020 13:47:27 +0100
+Subject: [PATCH] arm64: omit [_text, _stext) from permanent kernel mapping
+Git-commit: e2a073dde9218cdef3c5431bddabf4549dd65fea
+Patch-mainline: v5.11-rc1
+References: bsn#123
+Modified-by-SEL: Yes, refreshed due to context change
+
+
+In a previous patch, we increased the size of the EFI PE/COFF header
+to 64 KB, which resulted in the _stext symbol to appear at a fixed
+offset of 64 KB into the image.
+
+Since 64 KB is also the largest page size we support, this completely
+removes the need to map the first 64 KB of the kernel image, given that
+it only contains the arm64 Image header and the EFI header, neither of
+which we ever access again after booting the kernel. More importantly,
+we should avoid an executable mapping of non-executable and not entirely
+predictable data, to deal with the unlikely event that we inadvertently
+emitted something that looks like an opcode that could be used as a
+gadget for speculative execution.
+
+So let's limit the kernel mapping of .text to the [_stext, _etext)
+region, which matches the view of generic code (such as kallsyms) when
+it reasons about the boundaries of the kernel's .text section.
+
+Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+Acked-by: Will Deacon <will@kernel.org>
+Link: https://lore.kernel.org/r/20201117124729.12642-2-ardb@kernel.org
+Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ arch/arm64/kernel/efi-header.S  |    7 -------
+ arch/arm64/kernel/setup.c       |    4 ++--
+ arch/arm64/kernel/vmlinux.lds.S |    2 +-
+ arch/arm64/mm/init.c            |    2 +-
+ arch/arm64/mm/mmu.c             |   10 +++++-----
+ 5 files changed, 9 insertions(+), 16 deletions(-)
+
+--- a/arch/arm64/kernel/efi-header.S
++++ b/arch/arm64/kernel/efi-header.S
+@@ -140,13 +140,6 @@ efi_debug_entry:
+ 	.set	efi_debug_entry_size, . - efi_debug_entry
+ #endif
+ 
+-	/*
+-	 * EFI will load .text onwards at the 4k section alignment
+-	 * described in the PE/COFF header. To ensure that instruction
+-	 * sequences using an adrp and a :lo12: immediate will function
+-	 * correctly at this alignment, we must ensure that .text is
+-	 * placed at a 4k boundary in the Image to begin with.
+-	 */
+ 	.balign	SEGMENT_ALIGN
+ efi_header_end:
+ 	.endm
+--- a/arch/arm64/kernel/setup.c
++++ b/arch/arm64/kernel/setup.c
+@@ -206,7 +206,7 @@ static void __init request_standard_reso
+ 	unsigned long i = 0;
+ 	size_t res_size;
+ 
+-	kernel_code.start   = __pa_symbol(_text);
++	kernel_code.start   = __pa_symbol(_stext);
+ 	kernel_code.end     = __pa_symbol(__init_begin - 1);
+ 	kernel_data.start   = __pa_symbol(_sdata);
+ 	kernel_data.end     = __pa_symbol(_end - 1);
+@@ -283,7 +283,7 @@ u64 cpu_logical_map(int cpu)
+ 
+ void __init __no_sanitize_address setup_arch(char **cmdline_p)
+ {
+-	init_mm.start_code = (unsigned long) _text;
++	init_mm.start_code = (unsigned long) _stext;
+ 	init_mm.end_code   = (unsigned long) _etext;
+ 	init_mm.end_data   = (unsigned long) _edata;
+ 	init_mm.brk	   = (unsigned long) _end;
+--- a/arch/arm64/kernel/vmlinux.lds.S
++++ b/arch/arm64/kernel/vmlinux.lds.S
+@@ -121,7 +121,7 @@ SECTIONS
+ 		_text = .;
+ 		HEAD_TEXT
+ 	}
+-	.text : {			/* Real text segment		*/
++	.text : ALIGN(SEGMENT_ALIGN) {	/* Real text segment		*/
+ 		_stext = .;		/* Text and read-only data	*/
+ 			IRQENTRY_TEXT
+ 			SOFTIRQENTRY_TEXT
+--- a/arch/arm64/mm/init.c
++++ b/arch/arm64/mm/init.c
+@@ -420,7 +420,7 @@ void __init arm64_memblock_init(void)
+ 	 * Register the kernel text, kernel data, initrd, and initial
+ 	 * pagetables with memblock.
+ 	 */
+-	memblock_reserve(__pa_symbol(_text), _end - _text);
++	memblock_reserve(__pa_symbol(_stext), _end - _stext);
+ 	if (IS_ENABLED(CONFIG_BLK_DEV_INITRD) && phys_initrd_size) {
+ 		/* the generic initrd code expects virtual addresses */
+ 		initrd_start = __phys_to_virt(phys_initrd_start);
+--- a/arch/arm64/mm/mmu.c
++++ b/arch/arm64/mm/mmu.c
+@@ -473,8 +473,8 @@ void __init mark_linear_text_alias_ro(vo
+ 	/*
+ 	 * Remove the write permissions from the linear alias of .text/.rodata
+ 	 */
+-	update_mapping_prot(__pa_symbol(_text), (unsigned long)lm_alias(_text),
+-			    (unsigned long)__init_begin - (unsigned long)_text,
++	update_mapping_prot(__pa_symbol(_stext), (unsigned long)lm_alias(_stext),
++			    (unsigned long)__init_begin - (unsigned long)_stext,
+ 			    PAGE_KERNEL_RO);
+ }
+ 
+@@ -495,7 +495,7 @@ early_param("crashkernel", enable_crash_
+ 
+ static void __init map_mem(pgd_t *pgdp)
+ {
+-	phys_addr_t kernel_start = __pa_symbol(_text);
++	phys_addr_t kernel_start = __pa_symbol(_stext);
+ 	phys_addr_t kernel_end = __pa_symbol(__init_begin);
+ 	phys_addr_t start, end;
+ 	int flags = 0;
+@@ -537,7 +537,7 @@ static void __init map_mem(pgd_t *pgdp)
+ 	}
+ 
+ 	/*
+-	 * Map the linear alias of the [_text, __init_begin) interval
++	 * Map the linear alias of the [_stext, __init_begin) interval
+ 	 * as non-executable now, and remove the write permission in
+ 	 * mark_linear_text_alias_ro() below (which will be called after
+ 	 * alternative patching has completed). This makes the contents
+@@ -706,7 +706,7 @@ static void __init map_kernel(pgd_t *pgd
+ 	 * Only rodata will be remapped with different permissions later on,
+ 	 * all other segments are allowed to use contiguous mappings.
+ 	 */
+-	map_kernel_segment(pgdp, _text, _etext, text_prot, &vmlinux_text, 0,
++	map_kernel_segment(pgdp, _stext, _etext, text_prot, &vmlinux_text, 0,
+ 			   VM_NO_GUARD);
+ 	map_kernel_segment(pgdp, __start_rodata, __inittext_begin, PAGE_KERNEL,
+ 			   &vmlinux_rodata, NO_CONT_MAPPINGS, VM_NO_GUARD);
