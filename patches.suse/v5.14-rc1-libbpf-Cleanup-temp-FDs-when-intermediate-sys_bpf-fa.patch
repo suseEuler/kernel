@@ -1,0 +1,109 @@
+From 30f51aedabda92b74927979b2b3b50169e285f6b Mon Sep 17 00:00:00 2001
+Message-Id: <30f51aedabda92b74927979b2b3b50169e285f6b.1650804036.git.geliang.tang@suse.com>
+From: Alexei Starovoitov <ast@kernel.org>
+Date: Thu, 13 May 2021 17:36:17 -0700
+Subject: [PATCH] libbpf: Cleanup temp FDs when intermediate sys_bpf fails.
+Git-commit: 30f51aedabda92b74927979b2b3b50169e285f6b
+Patch-mainline: v5.14-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+Fix loader program to close temporary FDs when intermediate
+sys_bpf command fails.
+
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20210514003623.28033-16-alexei.starovoitov@gmail.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/lib/bpf/bpf_gen_internal.h |  1 +
+ tools/lib/bpf/gen_loader.c       | 48 +++++++++++++++++++++++++++++---
+ 2 files changed, 45 insertions(+), 4 deletions(-)
+
+diff --git a/tools/lib/bpf/bpf_gen_internal.h b/tools/lib/bpf/bpf_gen_internal.h
+index f42a55efd559..615400391e57 100644
+--- a/tools/lib/bpf/bpf_gen_internal.h
++++ b/tools/lib/bpf/bpf_gen_internal.h
+@@ -15,6 +15,7 @@ struct bpf_gen {
+ 	void *data_cur;
+ 	void *insn_start;
+ 	void *insn_cur;
++	ssize_t cleanup_label;
+ 	__u32 nr_progs;
+ 	__u32 nr_maps;
+ 	int log_level;
+diff --git a/tools/lib/bpf/gen_loader.c b/tools/lib/bpf/gen_loader.c
+index 0fc54b1ca311..8df718a6b142 100644
+--- a/tools/lib/bpf/gen_loader.c
++++ b/tools/lib/bpf/gen_loader.c
+@@ -101,8 +101,36 @@ static void emit2(struct bpf_gen *gen, struct bpf_insn insn1, struct bpf_insn in
+ 
+ void bpf_gen__init(struct bpf_gen *gen, int log_level)
+ {
++	size_t stack_sz = sizeof(struct loader_stack);
++	int i;
++
+ 	gen->log_level = log_level;
++	/* save ctx pointer into R6 */
+ 	emit(gen, BPF_MOV64_REG(BPF_REG_6, BPF_REG_1));
++
++	/* bzero stack */
++	emit(gen, BPF_MOV64_REG(BPF_REG_1, BPF_REG_10));
++	emit(gen, BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, -stack_sz));
++	emit(gen, BPF_MOV64_IMM(BPF_REG_2, stack_sz));
++	emit(gen, BPF_MOV64_IMM(BPF_REG_3, 0));
++	emit(gen, BPF_EMIT_CALL(BPF_FUNC_probe_read_kernel));
++
++	/* jump over cleanup code */
++	emit(gen, BPF_JMP_IMM(BPF_JA, 0, 0,
++			      /* size of cleanup code below */
++			      (stack_sz / 4) * 3 + 2));
++
++	/* remember the label where all error branches will jump to */
++	gen->cleanup_label = gen->insn_cur - gen->insn_start;
++	/* emit cleanup code: close all temp FDs */
++	for (i = 0; i < stack_sz; i += 4) {
++		emit(gen, BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_10, -stack_sz + i));
++		emit(gen, BPF_JMP_IMM(BPF_JSLE, BPF_REG_1, 0, 1));
++		emit(gen, BPF_EMIT_CALL(BPF_FUNC_sys_close));
++	}
++	/* R7 contains the error code from sys_bpf. Copy it into R0 and exit. */
++	emit(gen, BPF_MOV64_REG(BPF_REG_0, BPF_REG_7));
++	emit(gen, BPF_EXIT_INSN());
+ }
+ 
+ static int add_data(struct bpf_gen *gen, const void *data, __u32 size)
+@@ -187,12 +215,24 @@ static void emit_sys_bpf(struct bpf_gen *gen, int cmd, int attr, int attr_size)
+ 	emit(gen, BPF_MOV64_REG(BPF_REG_7, BPF_REG_0));
+ }
+ 
++static bool is_simm16(__s64 value)
++{
++	return value == (__s64)(__s16)value;
++}
++
+ static void emit_check_err(struct bpf_gen *gen)
+ {
+-	emit(gen, BPF_JMP_IMM(BPF_JSGE, BPF_REG_7, 0, 2));
+-	emit(gen, BPF_MOV64_REG(BPF_REG_0, BPF_REG_7));
+-	/* TODO: close intermediate FDs in case of error */
+-	emit(gen, BPF_EXIT_INSN());
++	__s64 off = -(gen->insn_cur - gen->insn_start - gen->cleanup_label) / 8 - 1;
++
++	/* R7 contains result of last sys_bpf command.
++	 * if (R7 < 0) goto cleanup;
++	 */
++	if (is_simm16(off)) {
++		emit(gen, BPF_JMP_IMM(BPF_JSLT, BPF_REG_7, 0, off));
++	} else {
++		gen->error = -ERANGE;
++		emit(gen, BPF_JMP_IMM(BPF_JA, 0, 0, -1));
++	}
+ }
+ 
+ /* reg1 and reg2 should not be R1 - R5. They can be R0, R6 - R10 */
+-- 
+2.26.2
+

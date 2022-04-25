@@ -1,0 +1,110 @@
+From 9c6c0449deb41dbe3a66ab9adfd08020bba6c43d Mon Sep 17 00:00:00 2001
+Message-Id: <9c6c0449deb41dbe3a66ab9adfd08020bba6c43d.1650803781.git.geliang.tang@suse.com>
+From: Andrii Nakryiko <andrii@kernel.org>
+Date: Mon, 24 May 2021 20:59:35 -0700
+Subject: [PATCH] bpftool: Set errno on skeleton failures and propagate errors
+MIME-Version: 1.0
+Git-commit: 9c6c0449deb41dbe3a66ab9adfd08020bba6c43d
+Patch-mainline: v5.14-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Follow libbpf's error handling conventions and pass through errors and errno
+properly. Skeleton code always returned NULL on errors (not ERR_PTR(err)), so
+there are no backwards compatibility concerns. But now we also set errno
+properly, so it's possible to distinguish different reasons for failure, if
+necessary.
+
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: John Fastabend <john.fastabend@gmail.com>
+Acked-by: Toke Høiland-Jørgensen <toke@redhat.com>
+Link: https://lore.kernel.org/bpf/20210525035935.1461796-6-andrii@kernel.org
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/bpf/bpftool/gen.c | 27 ++++++++++++++++++---------
+ 1 file changed, 18 insertions(+), 9 deletions(-)
+
+diff --git a/tools/bpf/bpftool/gen.c b/tools/bpf/bpftool/gen.c
+index 13b0aa789178..1d71ff8c52fa 100644
+--- a/tools/bpf/bpftool/gen.c
++++ b/tools/bpf/bpftool/gen.c
+@@ -713,6 +713,7 @@ static int do_skeleton(int argc, char **argv)
+ 		#ifndef %2$s						    \n\
+ 		#define %2$s						    \n\
+ 									    \n\
++		#include <errno.h>					    \n\
+ 		#include <stdlib.h>					    \n\
+ 		#include <bpf/libbpf.h>					    \n\
+ 									    \n\
+@@ -793,18 +794,23 @@ static int do_skeleton(int argc, char **argv)
+ 		%1$s__open_opts(const struct bpf_object_open_opts *opts)    \n\
+ 		{							    \n\
+ 			struct %1$s *obj;				    \n\
++			int err;					    \n\
+ 									    \n\
+ 			obj = (struct %1$s *)calloc(1, sizeof(*obj));	    \n\
+-			if (!obj)					    \n\
++			if (!obj) {					    \n\
++				errno = ENOMEM;				    \n\
+ 				return NULL;				    \n\
+-			if (%1$s__create_skeleton(obj))			    \n\
+-				goto err;				    \n\
+-			if (bpf_object__open_skeleton(obj->skeleton, opts)) \n\
+-				goto err;				    \n\
++			}						    \n\
++									    \n\
++			err = %1$s__create_skeleton(obj);		    \n\
++			err = err ?: bpf_object__open_skeleton(obj->skeleton, opts);\n\
++			if (err)					    \n\
++				goto err_out;				    \n\
+ 									    \n\
+ 			return obj;					    \n\
+-		err:							    \n\
++		err_out:						    \n\
+ 			%1$s__destroy(obj);				    \n\
++			errno = -err;					    \n\
+ 			return NULL;					    \n\
+ 		}							    \n\
+ 									    \n\
+@@ -824,12 +830,15 @@ static int do_skeleton(int argc, char **argv)
+ 		%1$s__open_and_load(void)				    \n\
+ 		{							    \n\
+ 			struct %1$s *obj;				    \n\
++			int err;					    \n\
+ 									    \n\
+ 			obj = %1$s__open();				    \n\
+ 			if (!obj)					    \n\
+ 				return NULL;				    \n\
+-			if (%1$s__load(obj)) {				    \n\
++			err = %1$s__load(obj);				    \n\
++			if (err) {					    \n\
+ 				%1$s__destroy(obj);			    \n\
++				errno = -err;				    \n\
+ 				return NULL;				    \n\
+ 			}						    \n\
+ 			return obj;					    \n\
+@@ -860,7 +869,7 @@ static int do_skeleton(int argc, char **argv)
+ 									    \n\
+ 			s = (struct bpf_object_skeleton *)calloc(1, sizeof(*s));\n\
+ 			if (!s)						    \n\
+-				return -1;				    \n\
++				goto err;				    \n\
+ 			obj->skeleton = s;				    \n\
+ 									    \n\
+ 			s->sz = sizeof(*s);				    \n\
+@@ -949,7 +958,7 @@ static int do_skeleton(int argc, char **argv)
+ 			return 0;					    \n\
+ 		err:							    \n\
+ 			bpf_object__destroy_skeleton(s);		    \n\
+-			return -1;					    \n\
++			return -ENOMEM;					    \n\
+ 		}							    \n\
+ 									    \n\
+ 		#endif /* %s */						    \n\
+-- 
+2.26.2
+

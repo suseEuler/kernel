@@ -1,0 +1,87 @@
+From 632f96d2652e0d4188de837f88a977eedb55aee1 Mon Sep 17 00:00:00 2001
+Message-Id: <632f96d2652e0d4188de837f88a977eedb55aee1.1650799243.git.geliang.tang@suse.com>
+From: Ilya Leoshkevich <iii@linux.ibm.com>
+Date: Thu, 21 Oct 2021 12:46:58 +0200
+Subject: [PATCH] libbpf: Fix ptr_is_aligned() usages
+Git-commit: 632f96d2652e0d4188de837f88a977eedb55aee1
+Patch-mainline: v5.16-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+Currently ptr_is_aligned() takes size, and not alignment, as a
+parameter, which may be overly pessimistic e.g. for __i128 on s390,
+which must be only 8-byte aligned. Fix by using btf__align_of().
+
+Signed-off-by: Ilya Leoshkevich <iii@linux.ibm.com>
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20211021104658.624944-2-iii@linux.ibm.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/lib/bpf/btf_dump.c | 20 ++++++++++++--------
+ 1 file changed, 12 insertions(+), 8 deletions(-)
+
+diff --git a/tools/lib/bpf/btf_dump.c b/tools/lib/bpf/btf_dump.c
+index e98c201f29b5..e9e5801ece4c 100644
+--- a/tools/lib/bpf/btf_dump.c
++++ b/tools/lib/bpf/btf_dump.c
+@@ -1657,9 +1657,15 @@ static int btf_dump_base_type_check_zero(struct btf_dump *d,
+ 	return 0;
+ }
+ 
+-static bool ptr_is_aligned(const void *data, int data_sz)
++static bool ptr_is_aligned(const struct btf *btf, __u32 type_id,
++			   const void *data)
+ {
+-	return ((uintptr_t)data) % data_sz == 0;
++	int alignment = btf__align_of(btf, type_id);
++
++	if (alignment == 0)
++		return false;
++
++	return ((uintptr_t)data) % alignment == 0;
+ }
+ 
+ static int btf_dump_int_data(struct btf_dump *d,
+@@ -1681,7 +1687,7 @@ static int btf_dump_int_data(struct btf_dump *d,
+ 	/* handle packed int data - accesses of integers not aligned on
+ 	 * int boundaries can cause problems on some platforms.
+ 	 */
+-	if (!ptr_is_aligned(data, sz)) {
++	if (!ptr_is_aligned(d->btf, type_id, data)) {
+ 		memcpy(buf, data, sz);
+ 		data = buf;
+ 	}
+@@ -1770,7 +1776,7 @@ static int btf_dump_float_data(struct btf_dump *d,
+ 	int sz = t->size;
+ 
+ 	/* handle unaligned data; copy to local union */
+-	if (!ptr_is_aligned(data, sz)) {
++	if (!ptr_is_aligned(d->btf, type_id, data)) {
+ 		memcpy(&fl, data, sz);
+ 		flp = &fl;
+ 	}
+@@ -1933,7 +1939,7 @@ static int btf_dump_ptr_data(struct btf_dump *d,
+ 			      __u32 id,
+ 			      const void *data)
+ {
+-	if (ptr_is_aligned(data, d->ptr_sz) && d->ptr_sz == sizeof(void *)) {
++	if (ptr_is_aligned(d->btf, id, data) && d->ptr_sz == sizeof(void *)) {
+ 		btf_dump_type_values(d, "%p", *(void **)data);
+ 	} else {
+ 		union ptr_data pt;
+@@ -1953,10 +1959,8 @@ static int btf_dump_get_enum_value(struct btf_dump *d,
+ 				   __u32 id,
+ 				   __s64 *value)
+ {
+-	int sz = t->size;
+-
+ 	/* handle unaligned enum value */
+-	if (!ptr_is_aligned(data, sz)) {
++	if (!ptr_is_aligned(d->btf, id, data)) {
+ 		__u64 val;
+ 		int err;
+ 
+-- 
+2.26.2
+

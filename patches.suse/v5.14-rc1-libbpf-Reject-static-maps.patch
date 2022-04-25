@@ -1,0 +1,85 @@
+From c1cccec9c63637c4c5ee0aa2da2850d983c19e88 Mon Sep 17 00:00:00 2001
+Message-Id: <c1cccec9c63637c4c5ee0aa2da2850d983c19e88.1650804182.git.geliang.tang@suse.com>
+From: Andrii Nakryiko <andrii@kernel.org>
+Date: Thu, 13 May 2021 16:36:43 -0700
+Subject: [PATCH] libbpf: Reject static maps
+Git-commit: c1cccec9c63637c4c5ee0aa2da2850d983c19e88
+Patch-mainline: v5.14-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+Static maps never really worked with libbpf, because all such maps were always
+silently resolved to the very first map. Detect static maps (both legacy and
+BTF-defined) and report user-friendly error.
+
+Tested locally by switching few maps (legacy and BTF-defined) in selftests to
+static ones and verifying that now libbpf rejects them loudly.
+
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20210513233643.194711-2-andrii@kernel.org
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/lib/bpf/libbpf.c | 24 +++++++++++++++++++-----
+ 1 file changed, 19 insertions(+), 5 deletions(-)
+
+diff --git a/tools/lib/bpf/libbpf.c b/tools/lib/bpf/libbpf.c
+index b8cf93fa1b4d..182bd3d3f728 100644
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@ -1795,7 +1795,6 @@ static int bpf_object__init_user_maps(struct bpf_object *obj, bool strict)
+ 	if (!symbols)
+ 		return -EINVAL;
+ 
+-
+ 	scn = elf_sec_by_idx(obj, obj->efile.maps_shndx);
+ 	data = elf_sec_data(obj, scn);
+ 	if (!scn || !data) {
+@@ -1855,6 +1854,12 @@ static int bpf_object__init_user_maps(struct bpf_object *obj, bool strict)
+ 			return -LIBBPF_ERRNO__FORMAT;
+ 		}
+ 
++		if (GELF_ST_TYPE(sym.st_info) == STT_SECTION
++		    || GELF_ST_BIND(sym.st_info) == STB_LOCAL) {
++			pr_warn("map '%s' (legacy): static maps are not supported\n", map_name);
++			return -ENOTSUP;
++		}
++
+ 		map->libbpf_type = LIBBPF_MAP_UNSPEC;
+ 		map->sec_idx = sym.st_shndx;
+ 		map->sec_offset = sym.st_value;
+@@ -2262,6 +2267,16 @@ static void fill_map_from_def(struct bpf_map *map, const struct btf_map_def *def
+ 		pr_debug("map '%s': found inner map definition.\n", map->name);
+ }
+ 
++static const char *btf_var_linkage_str(__u32 linkage)
++{
++	switch (linkage) {
++	case BTF_VAR_STATIC: return "static";
++	case BTF_VAR_GLOBAL_ALLOCATED: return "global";
++	case BTF_VAR_GLOBAL_EXTERN: return "extern";
++	default: return "unknown";
++	}
++}
++
+ static int bpf_object__init_user_btf_map(struct bpf_object *obj,
+ 					 const struct btf_type *sec,
+ 					 int var_idx, int sec_idx,
+@@ -2294,10 +2309,9 @@ static int bpf_object__init_user_btf_map(struct bpf_object *obj,
+ 			map_name, btf_kind_str(var));
+ 		return -EINVAL;
+ 	}
+-	if (var_extra->linkage != BTF_VAR_GLOBAL_ALLOCATED &&
+-	    var_extra->linkage != BTF_VAR_STATIC) {
+-		pr_warn("map '%s': unsupported var linkage %u.\n",
+-			map_name, var_extra->linkage);
++	if (var_extra->linkage != BTF_VAR_GLOBAL_ALLOCATED) {
++		pr_warn("map '%s': unsupported map linkage %s.\n",
++			map_name, btf_var_linkage_str(var_extra->linkage));
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+-- 
+2.26.2
+

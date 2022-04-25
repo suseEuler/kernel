@@ -6,7 +6,7 @@ Subject: [PATCH] libbpf: Split CO-RE logic into relo_core.c.
 Git-commit: b0588390dbcedcd74fab6ffb8afe8d52380fd8b6
 Patch-mainline: v5.15-rc1
 References: bsn#127
-Modified-by-SEL: Yes, refreshed due to context changes
+Modified-by-SEL: No
 
 
 Move CO-RE logic into separate file.
@@ -26,16 +26,20 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  5 files changed, 1319 insertions(+), 1297 deletions(-)
  create mode 100644 tools/lib/bpf/relo_core.c
 
+diff --git a/tools/lib/bpf/Build b/tools/lib/bpf/Build
+index 430f6874fa41..94f0a146bb7b 100644
 --- a/tools/lib/bpf/Build
 +++ b/tools/lib/bpf/Build
 @@ -1,3 +1,3 @@
  libbpf-y := libbpf.o bpf.o nlattr.o btf.o libbpf_errno.o str_error.o \
  	    netlink.o bpf_prog_linfo.o libbpf_probes.o xsk.o hashmap.o \
--	    btf_dump.o ringbuf.o strset.o linker.o
-+	    btf_dump.o ringbuf.o strset.o linker.o relo_core.o
+-	    btf_dump.o ringbuf.o strset.o linker.o gen_loader.o
++	    btf_dump.o ringbuf.o strset.o linker.o gen_loader.o relo_core.o
+diff --git a/tools/lib/bpf/libbpf.c b/tools/lib/bpf/libbpf.c
+index 5dcb048da8df..27b9a6bec9fb 100644
 --- a/tools/lib/bpf/libbpf.c
 +++ b/tools/lib/bpf/libbpf.c
-@@ -571,11 +571,6 @@ static bool insn_is_subprog_call(const s
+@@ -595,11 +595,6 @@ static bool insn_is_subprog_call(const struct bpf_insn *insn)
  	       insn->off == 0;
  }
  
@@ -47,7 +51,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  static bool is_call_insn(const struct bpf_insn *insn)
  {
  	return insn->code == (BPF_JMP | BPF_CALL);
-@@ -4646,279 +4641,6 @@ err_out:
+@@ -4725,279 +4720,6 @@ bpf_object__create_maps(struct bpf_object *obj)
  	return err;
  }
  
@@ -327,7 +331,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  static bool bpf_core_is_flavor_sep(const char *s)
  {
  	/* check X___Y name pattern, where X and Y are not underscores */
-@@ -4931,7 +4653,7 @@ static bool bpf_core_is_flavor_sep(const
+@@ -5010,7 +4732,7 @@ static bool bpf_core_is_flavor_sep(const char *s)
   * before last triple underscore. Struct name part after last triple
   * underscore is ignored by BPF CO-RE relocation during relocation matching.
   */
@@ -336,7 +340,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  {
  	size_t n = strlen(name);
  	int i;
-@@ -5147,165 +4869,6 @@ err_out:
+@@ -5229,165 +4951,6 @@ bpf_core_find_cands(struct bpf_object *obj, const struct btf *local_btf, __u32 l
  	return ERR_PTR(err);
  }
  
@@ -502,7 +506,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  /* Check local and target types for compatibility. This check is used for
   * type-based CO-RE relocations and follow slightly different rules than
   * field-based relocations. This function assumes that root types were already
-@@ -5325,8 +4888,8 @@ static int bpf_core_match_member(const s
+@@ -5407,8 +4970,8 @@ static int bpf_core_match_member(const struct btf *local_btf,
   * These rules are not set in stone and probably will be adjusted as we get
   * more experience with using BPF CO-RE relocations.
   */
@@ -513,7 +517,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  {
  	const struct btf_type *local_type, *targ_type;
  	int depth = 32; /* max recursion depth */
-@@ -5400,658 +4963,6 @@ recur:
+@@ -5482,658 +5045,6 @@ static int bpf_core_types_are_compat(const struct btf *local_btf, __u32 local_id
  	}
  }
  
@@ -1172,7 +1176,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  static size_t bpf_core_hash_fn(const void *key, void *ctx)
  {
  	return (size_t)key;
-@@ -6067,208 +4978,6 @@ static void *u32_as_hash_key(__u32 x)
+@@ -6149,208 +5060,6 @@ static void *u32_as_hash_key(__u32 x)
  	return (void *)(uintptr_t)x;
  }
  
@@ -1381,11 +1385,13 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  static int bpf_core_apply_relo(struct bpf_program *prog,
  			       const struct bpf_core_relo *relo,
  			       int relo_idx,
+diff --git a/tools/lib/bpf/libbpf_internal.h b/tools/lib/bpf/libbpf_internal.h
+index 3178d5685dce..f7b691d5f9eb 100644
 --- a/tools/lib/bpf/libbpf_internal.h
 +++ b/tools/lib/bpf/libbpf_internal.h
-@@ -364,4 +364,14 @@ int btf_type_visit_str_offs(struct btf_t
- int btf_ext_visit_type_ids(struct btf_ext *btf_ext, type_id_visit_fn visit, void *ctx);
- int btf_ext_visit_str_offs(struct btf_ext *btf_ext, str_off_visit_fn visit, void *ctx);
+@@ -425,4 +425,14 @@ static inline void *libbpf_ptr(void *ret)
+ 	return ret;
+ }
  
 +static inline bool str_is_empty(const char *s)
 +{
@@ -1398,6 +1404,9 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 +}
 +
  #endif /* __LIBBPF_LIBBPF_INTERNAL_H */
+diff --git a/tools/lib/bpf/relo_core.c b/tools/lib/bpf/relo_core.c
+new file mode 100644
+index 000000000000..4016ed492d0c
 --- /dev/null
 +++ b/tools/lib/bpf/relo_core.c
 @@ -0,0 +1,1295 @@
@@ -2696,6 +2705,8 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 +
 +	return 0;
 +}
+diff --git a/tools/lib/bpf/relo_core.h b/tools/lib/bpf/relo_core.h
+index ddf20151fe41..3b9f8f18346c 100644
 --- a/tools/lib/bpf/relo_core.h
 +++ b/tools/lib/bpf/relo_core.h
 @@ -75,8 +75,7 @@ struct bpf_core_relo {
@@ -2722,3 +2733,6 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 +
 +size_t bpf_core_essential_name_len(const char *name);
  #endif
+-- 
+2.34.1
+

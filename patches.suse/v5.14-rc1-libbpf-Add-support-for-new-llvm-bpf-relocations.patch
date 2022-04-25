@@ -1,0 +1,93 @@
+From 9f0c317f6aa12b160103ee3946d79276c14b95e2 Mon Sep 17 00:00:00 2001
+Message-Id: <9f0c317f6aa12b160103ee3946d79276c14b95e2.1650803878.git.geliang.tang@suse.com>
+From: Yonghong Song <yhs@fb.com>
+Date: Sat, 22 May 2021 09:23:41 -0700
+Subject: [PATCH] libbpf: Add support for new llvm bpf relocations
+Git-commit: 9f0c317f6aa12b160103ee3946d79276c14b95e2
+Patch-mainline: v5.14-rc1
+References: bsn#127
+Modified-by-SEL: No
+
+
+LLVM patch https://reviews.llvm.org/D102712
+narrowed the scope of existing R_BPF_64_64
+and R_BPF_64_32 relocations, and added three
+new relocations, R_BPF_64_ABS64, R_BPF_64_ABS32
+and R_BPF_64_NODYLD32. The main motivation is
+to make relocations linker friendly.
+
+This change, unfortunately, breaks libbpf build,
+and we will see errors like below:
+  libbpf: ELF relo #0 in section #6 has unexpected type 2 in
+     /home/yhs/work/bpf-next/tools/testing/selftests/bpf/bpf_tcp_nogpl.o
+  Error: failed to link
+     '/home/yhs/work/bpf-next/tools/testing/selftests/bpf/bpf_tcp_nogpl.o':
+     Unknown error -22 (-22)
+The new relocation R_BPF_64_ABS64 is generated
+and libbpf linker sanity check doesn't understand it.
+Relocation section '.rel.struct_ops' at offset 0x1410 contains 1 entries:
+    Offset             Info             Type               Symbol's Value  Symbol's Name
+0000000000000018  0000000700000002 R_BPF_64_ABS64         0000000000000000 nogpltcp_init
+
+Look at the selftests/bpf/bpf_tcp_nogpl.c,
+  void BPF_STRUCT_OPS(nogpltcp_init, struct sock *sk)
+  {
+  }
+
+  SEC(".struct_ops")
+  struct tcp_congestion_ops bpf_nogpltcp = {
+          .init           = (void *)nogpltcp_init,
+          .name           = "bpf_nogpltcp",
+  };
+The new llvm relocation scheme categorizes 'nogpltcp_init' reference
+as R_BPF_64_ABS64 instead of R_BPF_64_64 which is used to specify
+ld_imm64 relocation in the new scheme.
+
+Let us fix the linker sanity checking by including
+R_BPF_64_ABS64 and R_BPF_64_ABS32. There is no need to
+check R_BPF_64_NODYLD32 which is used for .BTF and .BTF.ext.
+
+Signed-off-by: Yonghong Song <yhs@fb.com>
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Acked-by: John Fastabend <john.fastabend@gmail.com>
+Link: https://lore.kernel.org/bpf/20210522162341.3687617-1-yhs@fb.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/lib/bpf/libbpf_internal.h | 6 ++++++
+ tools/lib/bpf/linker.c          | 3 ++-
+ 2 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/tools/lib/bpf/libbpf_internal.h b/tools/lib/bpf/libbpf_internal.h
+index 55d9b4dca64f..e2db08573bf0 100644
+--- a/tools/lib/bpf/libbpf_internal.h
++++ b/tools/lib/bpf/libbpf_internal.h
+@@ -28,6 +28,12 @@
+ #ifndef R_BPF_64_64
+ #define R_BPF_64_64 1
+ #endif
++#ifndef R_BPF_64_ABS64
++#define R_BPF_64_ABS64 2
++#endif
++#ifndef R_BPF_64_ABS32
++#define R_BPF_64_ABS32 3
++#endif
+ #ifndef R_BPF_64_32
+ #define R_BPF_64_32 10
+ #endif
+diff --git a/tools/lib/bpf/linker.c b/tools/lib/bpf/linker.c
+index b594a88620ce..1dca41a24f75 100644
+--- a/tools/lib/bpf/linker.c
++++ b/tools/lib/bpf/linker.c
+@@ -892,7 +892,8 @@ static int linker_sanity_check_elf_relos(struct src_obj *obj, struct src_sec *se
+ 		size_t sym_idx = ELF64_R_SYM(relo->r_info);
+ 		size_t sym_type = ELF64_R_TYPE(relo->r_info);
+ 
+-		if (sym_type != R_BPF_64_64 && sym_type != R_BPF_64_32) {
++		if (sym_type != R_BPF_64_64 && sym_type != R_BPF_64_32 &&
++		    sym_type != R_BPF_64_ABS64 && sym_type != R_BPF_64_ABS32) {
+ 			pr_warn("ELF relo #%d in section #%zu has unexpected type %zu in %s\n",
+ 				i, sec->sec_idx, sym_type, obj->filename);
+ 			return -EINVAL;
+-- 
+2.26.2
+
