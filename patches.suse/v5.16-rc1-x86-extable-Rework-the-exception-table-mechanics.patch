@@ -4,8 +4,8 @@ Date: Wed, 8 Sep 2021 15:29:18 +0200
 Subject: [PATCH] x86/extable: Rework the exception table mechanics
 Git-commit: 46d28947d9876fc0f8f93d3c69813ef6e9852595
 Patch-mainline: v5.16-rc1
-References: bsn#178
-Modified-by-SEL: Yes, refreshed due to different context
+References: bsn#127
+Modified-by-SEL: No
 
 
 The exception table entries contain the instruction address, the fixup
@@ -44,25 +44,28 @@ Acked-by: Alexei Starovoitov <ast@kernel.org>
 Link: https://lkml.kernel.org/r/20210908132525.211958725@linutronix.de
 Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
 Signed-off-by: Kai Liu <kai.liu@suse.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 ---
- arch/x86/include/asm/asm.h                 |   22 ++---
- arch/x86/include/asm/extable.h             |   44 ++++++----
- arch/x86/include/asm/extable_fixup_types.h |   19 ++++
- arch/x86/include/asm/fpu/internal.h        |    4 
- arch/x86/include/asm/msr.h                 |    4 
- arch/x86/include/asm/segment.h             |    2 
- arch/x86/kernel/cpu/mce/core.c             |   24 -----
- arch/x86/kernel/cpu/mce/internal.h         |   10 --
- arch/x86/kernel/cpu/mce/severity.c         |   21 ++--
- arch/x86/mm/extable.c                      |  123 ++++++++++++-----------------
- arch/x86/net/bpf_jit_comp.c                |   11 --
- scripts/sorttable.c                        |    4 
+ arch/x86/include/asm/asm.h                 |  22 ++--
+ arch/x86/include/asm/extable.h             |  44 +++++---
+ arch/x86/include/asm/extable_fixup_types.h |  19 ++++
+ arch/x86/include/asm/fpu/internal.h        |   4 +-
+ arch/x86/include/asm/msr.h                 |   4 +-
+ arch/x86/include/asm/segment.h             |   2 +-
+ arch/x86/kernel/cpu/mce/core.c             |  24 +---
+ arch/x86/kernel/cpu/mce/internal.h         |  10 --
+ arch/x86/kernel/cpu/mce/severity.c         |  21 ++--
+ arch/x86/mm/extable.c                      | 123 +++++++++------------
+ arch/x86/net/bpf_jit_comp.c                |  11 +-
+ scripts/sorttable.c                        |   4 +-
  12 files changed, 133 insertions(+), 155 deletions(-)
  create mode 100644 arch/x86/include/asm/extable_fixup_types.h
 
+diff --git a/arch/x86/include/asm/asm.h b/arch/x86/include/asm/asm.h
+index 719955e658a2..6aadb9a620ee 100644
 --- a/arch/x86/include/asm/asm.h
 +++ b/arch/x86/include/asm/asm.h
-@@ -121,14 +121,17 @@
+@@ -122,14 +122,17 @@
  
  #ifdef __KERNEL__
  
@@ -82,7 +85,7 @@ Signed-off-by: Kai Liu <kai.liu@suse.com>
  	.popsection
  
  # ifdef CONFIG_KPROBES
-@@ -142,13 +145,13 @@
+@@ -143,13 +146,13 @@
  # endif
  
  #else /* ! __ASSEMBLY__ */
@@ -99,7 +102,7 @@ Signed-off-by: Kai Liu <kai.liu@suse.com>
  	" .popsection\n"
  
  /* For C file, we already have NOKPROBE_SYMBOL macro */
-@@ -164,17 +167,16 @@ register unsigned long current_stack_poi
+@@ -165,17 +168,16 @@ register unsigned long current_stack_pointer asm(_ASM_SP);
  #endif /* __ASSEMBLY__ */
  
  #define _ASM_EXTABLE(from, to)					\
@@ -121,6 +124,8 @@ Signed-off-by: Kai Liu <kai.liu@suse.com>
  #endif /* __KERNEL__ */
 -
  #endif /* _ASM_X86_ASM_H */
+diff --git a/arch/x86/include/asm/extable.h b/arch/x86/include/asm/extable.h
+index 1f0cbc52937c..93f400eb728f 100644
 --- a/arch/x86/include/asm/extable.h
 +++ b/arch/x86/include/asm/extable.h
 @@ -1,12 +1,18 @@
@@ -194,6 +199,9 @@ Signed-off-by: Kai Liu <kai.liu@suse.com>
 +#endif
 +
  #endif
+diff --git a/arch/x86/include/asm/extable_fixup_types.h b/arch/x86/include/asm/extable_fixup_types.h
+new file mode 100644
+index 000000000000..0adc117618e6
 --- /dev/null
 +++ b/arch/x86/include/asm/extable_fixup_types.h
 @@ -0,0 +1,19 @@
@@ -216,9 +224,11 @@ Signed-off-by: Kai Liu <kai.liu@suse.com>
 +#define	EX_TYPE_RDMSR_IN_MCE		11
 +
 +#endif
+diff --git a/arch/x86/include/asm/fpu/internal.h b/arch/x86/include/asm/fpu/internal.h
+index 5a18694a89b2..ce6fc4f8d1d1 100644
 --- a/arch/x86/include/asm/fpu/internal.h
 +++ b/arch/x86/include/asm/fpu/internal.h
-@@ -126,7 +126,7 @@ extern void save_fpregs_to_fpstate(struc
+@@ -126,7 +126,7 @@ extern void save_fpregs_to_fpstate(struct fpu *fpu);
  #define kernel_insn(insn, output, input...)				\
  	asm volatile("1:" #insn "\n\t"					\
  		     "2:\n"						\
@@ -227,7 +237,7 @@ Signed-off-by: Kai Liu <kai.liu@suse.com>
  		     : output : input)
  
  static inline int fnsave_to_user_sigframe(struct fregs_state __user *fx)
-@@ -253,7 +253,7 @@ static inline void fxsave(struct fxregs_
+@@ -253,7 +253,7 @@ static inline void fxsave(struct fxregs_state *fx)
  				 XRSTORS, X86_FEATURE_XSAVES)		\
  		     "\n"						\
  		     "3:\n"						\
@@ -236,9 +246,11 @@ Signed-off-by: Kai Liu <kai.liu@suse.com>
  		     :							\
  		     : "D" (st), "m" (*st), "a" (lmask), "d" (hmask)	\
  		     : "memory")
+diff --git a/arch/x86/include/asm/msr.h b/arch/x86/include/asm/msr.h
+index a3f87f1015d3..6b52182e178a 100644
 --- a/arch/x86/include/asm/msr.h
 +++ b/arch/x86/include/asm/msr.h
-@@ -92,7 +92,7 @@ static __always_inline unsigned long lon
+@@ -92,7 +92,7 @@ static __always_inline unsigned long long __rdmsr(unsigned int msr)
  
  	asm volatile("1: rdmsr\n"
  		     "2:\n"
@@ -247,7 +259,7 @@ Signed-off-by: Kai Liu <kai.liu@suse.com>
  		     : EAX_EDX_RET(val, low, high) : "c" (msr));
  
  	return EAX_EDX_VAL(val, low, high);
-@@ -102,7 +102,7 @@ static __always_inline void __wrmsr(unsi
+@@ -102,7 +102,7 @@ static __always_inline void __wrmsr(unsigned int msr, u32 low, u32 high)
  {
  	asm volatile("1: wrmsr\n"
  		     "2:\n"
@@ -256,9 +268,11 @@ Signed-off-by: Kai Liu <kai.liu@suse.com>
  		     : : "c" (msr), "a"(low), "d" (high) : "memory");
  }
  
+diff --git a/arch/x86/include/asm/segment.h b/arch/x86/include/asm/segment.h
+index 72044026eb3c..8dd8e8ec9fa5 100644
 --- a/arch/x86/include/asm/segment.h
 +++ b/arch/x86/include/asm/segment.h
-@@ -346,7 +346,7 @@ static inline void __loadsegment_fs(unsi
+@@ -339,7 +339,7 @@ static inline void __loadsegment_fs(unsigned short value)
  		     "1:	movw %0, %%fs			\n"
  		     "2:					\n"
  
@@ -267,9 +281,11 @@ Signed-off-by: Kai Liu <kai.liu@suse.com>
  
  		     : : "rm" (value) : "memory");
  }
+diff --git a/arch/x86/kernel/cpu/mce/core.c b/arch/x86/kernel/cpu/mce/core.c
+index 428eed98742b..cd919fce3ca3 100644
 --- a/arch/x86/kernel/cpu/mce/core.c
 +++ b/arch/x86/kernel/cpu/mce/core.c
-@@ -382,7 +382,7 @@ static int msr_to_offset(u32 msr)
+@@ -373,7 +373,7 @@ static int msr_to_offset(u32 msr)
  	return -1;
  }
  
@@ -278,7 +294,7 @@ Signed-off-by: Kai Liu <kai.liu@suse.com>
  {
  	if (wrmsr) {
  		pr_emerg("MSR access error: WRMSR to 0x%x (tried to write 0x%08x%08x) at rIP: 0x%lx (%pS)\n",
-@@ -401,15 +401,6 @@ static void ex_handler_msr_mce(struct pt
+@@ -392,15 +392,6 @@ static void ex_handler_msr_mce(struct pt_regs *regs, bool wrmsr)
  		cpu_relax();
  }
  
@@ -294,7 +310,7 @@ Signed-off-by: Kai Liu <kai.liu@suse.com>
  /* MSR access wrappers used for error injection */
  static noinstr u64 mce_rdmsrl(u32 msr)
  {
-@@ -439,22 +430,13 @@ static noinstr u64 mce_rdmsrl(u32 msr)
+@@ -430,22 +421,13 @@ static noinstr u64 mce_rdmsrl(u32 msr)
  	 */
  	asm volatile("1: rdmsr\n"
  		     "2:\n"
@@ -318,7 +334,7 @@ Signed-off-by: Kai Liu <kai.liu@suse.com>
  static noinstr void mce_wrmsrl(u32 msr, u64 v)
  {
  	u32 low, high;
-@@ -479,7 +461,7 @@ static noinstr void mce_wrmsrl(u32 msr,
+@@ -470,7 +452,7 @@ static noinstr void mce_wrmsrl(u32 msr, u64 v)
  	/* See comment in mce_rdmsrl() */
  	asm volatile("1: wrmsr\n"
  		     "2:\n"
@@ -327,9 +343,11 @@ Signed-off-by: Kai Liu <kai.liu@suse.com>
  		     : : "c" (msr), "a"(low), "d" (high) : "memory");
  }
  
+diff --git a/arch/x86/kernel/cpu/mce/internal.h b/arch/x86/kernel/cpu/mce/internal.h
+index 95099225defc..3463f8cedb32 100644
 --- a/arch/x86/kernel/cpu/mce/internal.h
 +++ b/arch/x86/kernel/cpu/mce/internal.h
-@@ -186,14 +186,4 @@ extern bool amd_filter_mce(struct mce *m
+@@ -186,14 +186,4 @@ extern bool amd_filter_mce(struct mce *m);
  static inline bool amd_filter_mce(struct mce *m) { return false; }
  #endif
  
@@ -344,9 +362,11 @@ Signed-off-by: Kai Liu <kai.liu@suse.com>
 -				      unsigned long fault_addr);
 -
  #endif /* __X86_MCE_INTERNAL_H__ */
+diff --git a/arch/x86/kernel/cpu/mce/severity.c b/arch/x86/kernel/cpu/mce/severity.c
+index 17e631443116..74fe763bffda 100644
 --- a/arch/x86/kernel/cpu/mce/severity.c
 +++ b/arch/x86/kernel/cpu/mce/severity.c
-@@ -269,25 +269,24 @@ static bool is_copy_from_user(struct pt_
+@@ -265,25 +265,24 @@ static bool is_copy_from_user(struct pt_regs *regs)
   */
  static int error_context(struct mce *m, struct pt_regs *regs)
  {
@@ -382,6 +402,8 @@ Signed-off-by: Kai Liu <kai.liu@suse.com>
  }
  
  static int mce_severity_amd_smca(struct mce *m, enum context err_ctx)
+diff --git a/arch/x86/mm/extable.c b/arch/x86/mm/extable.c
+index d9a1046f3a98..5db46df409b5 100644
 --- a/arch/x86/mm/extable.c
 +++ b/arch/x86/mm/extable.c
 @@ -9,40 +9,25 @@
@@ -443,7 +465,7 @@ Signed-off-by: Kai Liu <kai.liu@suse.com>
  {
  	regs->ip = ex_fixup_addr(fixup);
  
-@@ -67,32 +50,23 @@ __visible bool ex_handler_fprestore(cons
+@@ -67,32 +50,23 @@ __visible bool ex_handler_fprestore(const struct exception_table_entry *fixup,
  	__restore_fpregs_from_fpstate(&init_fpstate, xfeatures_mask_fpstate());
  	return true;
  }
@@ -484,7 +506,7 @@ Signed-off-by: Kai Liu <kai.liu@suse.com>
  {
  	if (pr_warn_once("unchecked MSR access error: RDMSR from 0x%x at rIP: 0x%lx (%pS)\n",
  			 (unsigned int)regs->cx, regs->ip, (void *)regs->ip))
-@@ -101,14 +75,11 @@ __visible bool ex_handler_rdmsr_unsafe(c
+@@ -101,14 +75,11 @@ __visible bool ex_handler_rdmsr_unsafe(const struct exception_table_entry *fixup
  	/* Pretend that the read succeeded and returned 0. */
  	regs->ax = 0;
  	regs->dx = 0;
@@ -502,7 +524,7 @@ Signed-off-by: Kai Liu <kai.liu@suse.com>
  {
  	if (pr_warn_once("unchecked MSR access error: WRMSR to 0x%x (tried to write 0x%08x%08x) at rIP: 0x%lx (%pS)\n",
  			 (unsigned int)regs->cx, (unsigned int)regs->dx,
-@@ -116,44 +87,29 @@ __visible bool ex_handler_wrmsr_unsafe(c
+@@ -116,44 +87,29 @@ __visible bool ex_handler_wrmsr_unsafe(const struct exception_table_entry *fixup
  		show_stack_regs(regs);
  
  	/* Pretend that the write succeeded. */
@@ -554,7 +576,7 @@ Signed-off-by: Kai Liu <kai.liu@suse.com>
  
  #ifdef CONFIG_PNPBIOS
  	if (unlikely(SEGMENT_IS_PNP_CODE(regs->cs))) {
-@@ -173,8 +129,33 @@ int fixup_exception(struct pt_regs *regs
+@@ -173,8 +129,33 @@ int fixup_exception(struct pt_regs *regs, int trapnr, unsigned long error_code,
  	if (!e)
  		return 0;
  
@@ -590,9 +612,11 @@ Signed-off-by: Kai Liu <kai.liu@suse.com>
  }
  
  extern unsigned int early_recursion_flag;
+diff --git a/arch/x86/net/bpf_jit_comp.c b/arch/x86/net/bpf_jit_comp.c
+index 0fe6aacef3db..703dc6eaf4c7 100644
 --- a/arch/x86/net/bpf_jit_comp.c
 +++ b/arch/x86/net/bpf_jit_comp.c
-@@ -843,9 +843,7 @@ static int emit_atomic(u8 **pprog, u8 at
+@@ -827,9 +827,7 @@ static int emit_atomic(u8 **pprog, u8 atomic_op,
  	return 0;
  }
  
@@ -603,7 +627,7 @@ Signed-off-by: Kai Liu <kai.liu@suse.com>
  {
  	u32 reg = x->fixup >> 8;
  
-@@ -1283,12 +1281,7 @@ st:			if (is_imm8(insn->off))
+@@ -1313,12 +1311,7 @@ st:			if (is_imm8(insn->off))
  				}
  				ex->insn = delta;
  
@@ -617,9 +641,11 @@ Signed-off-by: Kai Liu <kai.liu@suse.com>
  
  				if (dst_reg > BPF_REG_9) {
  					pr_err("verifier error\n");
+diff --git a/scripts/sorttable.c b/scripts/sorttable.c
+index f355869c65cd..a9b3324cacf9 100644
 --- a/scripts/sorttable.c
 +++ b/scripts/sorttable.c
-@@ -236,7 +236,7 @@ static void x86_sort_relative_table(char
+@@ -236,7 +236,7 @@ static void x86_sort_relative_table(char *extab_image, int image_size)
  
  		w(r(loc) + i, loc);
  		w(r(loc + 1) + i + 4, loc + 1);
@@ -628,7 +654,7 @@ Signed-off-by: Kai Liu <kai.liu@suse.com>
  
  		i += sizeof(uint32_t) * 3;
  	}
-@@ -249,7 +249,7 @@ static void x86_sort_relative_table(char
+@@ -249,7 +249,7 @@ static void x86_sort_relative_table(char *extab_image, int image_size)
  
  		w(r(loc) - i, loc);
  		w(r(loc + 1) - (i + 4), loc + 1);
@@ -637,3 +663,6 @@ Signed-off-by: Kai Liu <kai.liu@suse.com>
  
  		i += sizeof(uint32_t) * 3;
  	}
+-- 
+2.34.1
+
