@@ -1,0 +1,181 @@
+From 81d82781a8e97185d3542e4e1003aeefea424500 Mon Sep 17 00:00:00 2001
+From: Zheng Zengkai <zhengzengkai@huawei.com>
+Date: Thu, 28 Apr 2022 15:52:39 +0800
+Subject: [PATCH] Revert "clocksource: Reduce clocksource-skew threshold"
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 81d82781a8e97185d3542e4e1003aeefea424500
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I531X9
+
+Reference: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=cacc6c30e3eb7c452132ee5b273e248d2f263323
+
+--------------------------------
+
+This reverts commit 270507d879d1c4c343603cb299423576e1fb96a1.
+
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Acked-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/kernel/tsc.c       |  1 -
+ include/linux/clocksource.h |  3 ---
+ kernel/time/clocksource.c   | 48 ++++++++-----------------------------
+ kernel/time/jiffies.c       | 15 ++++++------
+ 4 files changed, 17 insertions(+), 50 deletions(-)
+
+diff --git a/arch/x86/kernel/tsc.c b/arch/x86/kernel/tsc.c
+index 13d1a0ac8916..f9f1b45e5ddc 100644
+--- a/arch/x86/kernel/tsc.c
++++ b/arch/x86/kernel/tsc.c
+@@ -1127,7 +1127,6 @@ static int tsc_cs_enable(struct clocksource *cs)
+ static struct clocksource clocksource_tsc_early = {
+ 	.name			= "tsc-early",
+ 	.rating			= 299,
+-	.uncertainty_margin	= 32 * NSEC_PER_MSEC,
+ 	.read			= read_tsc,
+ 	.mask			= CLOCKSOURCE_MASK(64),
+ 	.flags			= CLOCK_SOURCE_IS_CONTINUOUS |
+diff --git a/include/linux/clocksource.h b/include/linux/clocksource.h
+index 5eed1e196900..4c3ecccc44ed 100644
+--- a/include/linux/clocksource.h
++++ b/include/linux/clocksource.h
+@@ -42,8 +42,6 @@ struct module;
+  * @shift:		Cycle to nanosecond divisor (power of two)
+  * @max_idle_ns:	Maximum idle time permitted by the clocksource (nsecs)
+  * @maxadj:		Maximum adjustment value to mult (~11%)
+- * @uncertainty_margin:	Maximum uncertainty in nanoseconds per half second.
+- *			Zero says to use default WATCHDOG_THRESHOLD.
+  * @archdata:		Optional arch-specific data
+  * @max_cycles:		Maximum safe cycle value which won't overflow on
+  *			multiplication
+@@ -95,7 +93,6 @@ struct clocksource {
+ 	u32			shift;
+ 	u64			max_idle_ns;
+ 	u32			maxadj;
+-	u32			uncertainty_margin;
+ #ifdef CONFIG_ARCH_CLOCKSOURCE_DATA
+ 	struct arch_clocksource_data archdata;
+ #endif
+diff --git a/kernel/time/clocksource.c b/kernel/time/clocksource.c
+index d0803a69a200..74492f08660c 100644
+--- a/kernel/time/clocksource.c
++++ b/kernel/time/clocksource.c
+@@ -93,20 +93,6 @@ static char override_name[CS_NAME_LEN];
+ static int finished_booting;
+ static u64 suspend_start;
+ 
+-/*
+- * Threshold: 0.0312s, when doubled: 0.0625s.
+- * Also a default for cs->uncertainty_margin when registering clocks.
+- */
+-#define WATCHDOG_THRESHOLD (NSEC_PER_SEC >> 5)
+-
+-/*
+- * Maximum permissible delay between two readouts of the watchdog
+- * clocksource surrounding a read of the clocksource being validated.
+- * This delay could be due to SMIs, NMIs, or to VCPU preemptions.  Used as
+- * a lower bound for cs->uncertainty_margin values when registering clocks.
+- */
+-#define WATCHDOG_MAX_SKEW (50 * NSEC_PER_USEC)
+-
+ #ifdef CONFIG_CLOCKSOURCE_WATCHDOG
+ static void clocksource_watchdog_work(struct work_struct *work);
+ static void clocksource_select(void);
+@@ -133,9 +119,17 @@ static int clocksource_watchdog_kthread(void *data);
+ static void __clocksource_change_rating(struct clocksource *cs, int rating);
+ 
+ /*
+- * Interval: 0.5sec.
++ * Interval: 0.5sec Threshold: 0.0625s
+  */
+ #define WATCHDOG_INTERVAL (HZ >> 1)
++#define WATCHDOG_THRESHOLD (NSEC_PER_SEC >> 4)
++
++/*
++ * Maximum permissible delay between two readouts of the watchdog
++ * clocksource surrounding a read of the clocksource being validated.
++ * This delay could be due to SMIs, NMIs, or to VCPU preemptions.
++ */
++#define WATCHDOG_MAX_SKEW (100 * NSEC_PER_USEC)
+ 
+ static void clocksource_watchdog_work(struct work_struct *work)
+ {
+@@ -290,7 +284,6 @@ static void clocksource_watchdog(struct timer_list *unused)
+ 	int next_cpu, reset_pending;
+ 	int64_t wd_nsec, cs_nsec;
+ 	struct clocksource *cs;
+-	u32 md;
+ 
+ 	spin_lock(&watchdog_lock);
+ 	if (!watchdog_running)
+@@ -337,8 +330,7 @@ static void clocksource_watchdog(struct timer_list *unused)
+ 			continue;
+ 
+ 		/* Check the deviation from the watchdog clocksource. */
+-		md = cs->uncertainty_margin + watchdog->uncertainty_margin;
+-		if (abs(cs_nsec - wd_nsec) > md) {
++		if (abs(cs_nsec - wd_nsec) > WATCHDOG_THRESHOLD) {
+ 			pr_warn("timekeeping watchdog on CPU%d: Marking clocksource '%s' as unstable because the skew is too large:\n",
+ 				smp_processor_id(), cs->name);
+ 			pr_warn("                      '%s' wd_now: %llx wd_last: %llx mask: %llx\n",
+@@ -993,26 +985,6 @@ void __clocksource_update_freq_scale(struct clocksource *cs, u32 scale, u32 freq
+ 		clocks_calc_mult_shift(&cs->mult, &cs->shift, freq,
+ 				       NSEC_PER_SEC / scale, sec * scale);
+ 	}
+-
+-	/*
+-	 * If the uncertainty margin is not specified, calculate it.
+-	 * If both scale and freq are non-zero, calculate the clock
+-	 * period, but bound below at 2*WATCHDOG_MAX_SKEW.  However,
+-	 * if either of scale or freq is zero, be very conservative and
+-	 * take the tens-of-milliseconds WATCHDOG_THRESHOLD value for the
+-	 * uncertainty margin.  Allow stupidly small uncertainty margins
+-	 * to be specified by the caller for testing purposes, but warn
+-	 * to discourage production use of this capability.
+-	 */
+-	if (scale && freq && !cs->uncertainty_margin) {
+-		cs->uncertainty_margin = NSEC_PER_SEC / (scale * freq);
+-		if (cs->uncertainty_margin < 2 * WATCHDOG_MAX_SKEW)
+-			cs->uncertainty_margin = 2 * WATCHDOG_MAX_SKEW;
+-	} else if (!cs->uncertainty_margin) {
+-		cs->uncertainty_margin = WATCHDOG_THRESHOLD;
+-	}
+-	WARN_ON_ONCE(cs->uncertainty_margin < 2 * WATCHDOG_MAX_SKEW);
+-
+ 	/*
+ 	 * Ensure clocksources that have large 'mult' values don't overflow
+ 	 * when adjusted.
+diff --git a/kernel/time/jiffies.c b/kernel/time/jiffies.c
+index 65409abcca8e..eddcf4970444 100644
+--- a/kernel/time/jiffies.c
++++ b/kernel/time/jiffies.c
+@@ -49,14 +49,13 @@ static u64 jiffies_read(struct clocksource *cs)
+  * for "tick-less" systems.
+  */
+ static struct clocksource clocksource_jiffies = {
+-	.name			= "jiffies",
+-	.rating			= 1, /* lowest valid rating*/
+-	.uncertainty_margin	= 32 * NSEC_PER_MSEC,
+-	.read			= jiffies_read,
+-	.mask			= CLOCKSOURCE_MASK(32),
+-	.mult			= TICK_NSEC << JIFFIES_SHIFT, /* details above */
+-	.shift			= JIFFIES_SHIFT,
+-	.max_cycles		= 10,
++	.name		= "jiffies",
++	.rating		= 1, /* lowest valid rating*/
++	.read		= jiffies_read,
++	.mask		= CLOCKSOURCE_MASK(32),
++	.mult		= TICK_NSEC << JIFFIES_SHIFT, /* details above */
++	.shift		= JIFFIES_SHIFT,
++	.max_cycles	= 10,
+ };
+ 
+ __cacheline_aligned_in_smp DEFINE_RAW_SPINLOCK(jiffies_lock);
+-- 
+2.34.1
+

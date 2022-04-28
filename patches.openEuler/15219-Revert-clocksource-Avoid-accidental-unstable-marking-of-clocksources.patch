@@ -1,0 +1,133 @@
+From b065b5a0ad322a74fc5367beeaa38e8b216e1be9 Mon Sep 17 00:00:00 2001
+From: Zheng Zengkai <zhengzengkai@huawei.com>
+Date: Thu, 28 Apr 2022 15:52:38 +0800
+Subject: [PATCH] Revert "clocksource: Avoid accidental unstable marking of
+ clocksources"
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: b065b5a0ad322a74fc5367beeaa38e8b216e1be9
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I531X9
+
+Reference: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=fd99aeb978451eee9e623be496cd6f9bbbc95e37
+
+--------------------------------
+
+This reverts commit d99e6e1c12d838dfcfc67421c293e972214b9eed.
+
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Acked-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/time/clocksource.c | 50 +++++++--------------------------------
+ 1 file changed, 9 insertions(+), 41 deletions(-)
+
+diff --git a/kernel/time/clocksource.c b/kernel/time/clocksource.c
+index e34ceb91f4c5..d0803a69a200 100644
+--- a/kernel/time/clocksource.c
++++ b/kernel/time/clocksource.c
+@@ -105,7 +105,7 @@ static u64 suspend_start;
+  * This delay could be due to SMIs, NMIs, or to VCPU preemptions.  Used as
+  * a lower bound for cs->uncertainty_margin values when registering clocks.
+  */
+-#define WATCHDOG_MAX_SKEW (100 * NSEC_PER_USEC)
++#define WATCHDOG_MAX_SKEW (50 * NSEC_PER_USEC)
+ 
+ #ifdef CONFIG_CLOCKSOURCE_WATCHDOG
+ static void clocksource_watchdog_work(struct work_struct *work);
+@@ -200,24 +200,17 @@ void clocksource_mark_unstable(struct clocksource *cs)
+ static ulong max_cswd_read_retries = 3;
+ module_param(max_cswd_read_retries, ulong, 0644);
+ 
+-enum wd_read_status {
+-	WD_READ_SUCCESS,
+-	WD_READ_UNSTABLE,
+-	WD_READ_SKIP
+-};
+-
+-static enum wd_read_status cs_watchdog_read(struct clocksource *cs, u64 *csnow, u64 *wdnow)
++static bool cs_watchdog_read(struct clocksource *cs, u64 *csnow, u64 *wdnow)
+ {
+ 	unsigned int nretries;
+-	u64 wd_end, wd_end2, wd_delta;
+-	int64_t wd_delay, wd_seq_delay;
++	u64 wd_end, wd_delta;
++	int64_t wd_delay;
+ 
+ 	for (nretries = 0; nretries <= max_cswd_read_retries; nretries++) {
+ 		local_irq_disable();
+ 		*wdnow = watchdog->read(watchdog);
+ 		*csnow = cs->read(cs);
+ 		wd_end = watchdog->read(watchdog);
+-		wd_end2 = watchdog->read(watchdog);
+ 		local_irq_enable();
+ 
+ 		wd_delta = clocksource_delta(wd_end, *wdnow, watchdog->mask);
+@@ -228,34 +221,13 @@ static enum wd_read_status cs_watchdog_read(struct clocksource *cs, u64 *csnow,
+ 				pr_warn("timekeeping watchdog on CPU%d: %s retried %d times before success\n",
+ 					smp_processor_id(), watchdog->name, nretries);
+ 			}
+-			return WD_READ_SUCCESS;
++			return true;
+ 		}
+-
+-		/*
+-		 * Now compute delay in consecutive watchdog read to see if
+-		 * there is too much external interferences that cause
+-		 * significant delay in reading both clocksource and watchdog.
+-		 *
+-		 * If consecutive WD read-back delay > WATCHDOG_MAX_SKEW/2,
+-		 * report system busy, reinit the watchdog and skip the current
+-		 * watchdog test.
+-		 */
+-		wd_delta = clocksource_delta(wd_end2, wd_end, watchdog->mask);
+-		wd_seq_delay = clocksource_cyc2ns(wd_delta, watchdog->mult, watchdog->shift);
+-		if (wd_seq_delay > WATCHDOG_MAX_SKEW/2)
+-			goto skip_test;
+ 	}
+ 
+ 	pr_warn("timekeeping watchdog on CPU%d: %s read-back delay of %lldns, attempt %d, marking unstable\n",
+ 		smp_processor_id(), watchdog->name, wd_delay, nretries);
+-	return WD_READ_UNSTABLE;
+-
+-skip_test:
+-	pr_info("timekeeping watchdog on CPU%d: %s wd-wd read-back delay of %lldns\n",
+-		smp_processor_id(), watchdog->name, wd_seq_delay);
+-	pr_info("wd-%s-wd read-back delay of %lldns, clock-skew test skipped!\n",
+-		cs->name, wd_delay);
+-	return WD_READ_SKIP;
++	return false;
+ }
+ 
+ static u64 csnow_mid;
+@@ -318,7 +290,6 @@ static void clocksource_watchdog(struct timer_list *unused)
+ 	int next_cpu, reset_pending;
+ 	int64_t wd_nsec, cs_nsec;
+ 	struct clocksource *cs;
+-	enum wd_read_status read_ret;
+ 	u32 md;
+ 
+ 	spin_lock(&watchdog_lock);
+@@ -336,12 +307,9 @@ static void clocksource_watchdog(struct timer_list *unused)
+ 			continue;
+ 		}
+ 
+-		read_ret = cs_watchdog_read(cs, &csnow, &wdnow);
+-
+-		if (read_ret != WD_READ_SUCCESS) {
+-			if (read_ret == WD_READ_UNSTABLE)
+-				/* Clock readout unreliable, so give it up. */
+-				__clocksource_unstable(cs);
++		if (!cs_watchdog_read(cs, &csnow, &wdnow)) {
++			/* Clock readout unreliable, so give it up. */
++			__clocksource_unstable(cs);
+ 			continue;
+ 		}
+ 
+-- 
+2.34.1
+

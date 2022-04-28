@@ -1,0 +1,233 @@
+From fa1b30195027e743d73ae968d78c25e8d83ec481 Mon Sep 17 00:00:00 2001
+From: Zhen Lei <thunder.leizhen@huawei.com>
+Date: Wed, 27 Apr 2022 18:48:35 +0800
+Subject: [PATCH] arm64: kdump: Use page-level mapping for the high memory of
+ crashkernel
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: fa1b30195027e743d73ae968d78c25e8d83ec481
+Modified-by-SEL: Yes, because of the stable one v5.10.110-0596...patch
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I545H8
+CVE: NA
+
+-------------------------------------------------------------------------
+
+If the crashkernel has both high memory above 4G and low memory under 4G,
+kexec always loads the content such as Imge and dtb to the high memory
+instead of the low memory. This means that only high memory requires write
+protection based on page-level mapping. The allocation of high memory does
+not depend on the DMA boundary. So we can reserve the high memory first
+even if the crashkernel reservation is deferred.
+
+Signed-off-by: Zhen Lei <thunder.leizhen@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/kexec.h |    1 
+ arch/arm64/mm/init.c           |    2 
+ arch/arm64/mm/mmu.c            |   21 ++++-----
+ kernel/crash_core.c            |   92 +++++++++++++++++++++++++++++++++++++++--
+ 4 files changed, 102 insertions(+), 14 deletions(-)
+
+--- a/arch/arm64/include/asm/kexec.h
++++ b/arch/arm64/include/asm/kexec.h
+@@ -104,6 +104,7 @@ void machine_kexec_mask_interrupts(void)
+ 
+ #ifdef CONFIG_KEXEC_CORE
+ extern void __init reserve_crashkernel(void);
++extern void __init reserve_crashkernel_high(void);
+ #endif
+ 
+ #ifdef CONFIG_KEXEC_FILE
+--- a/arch/arm64/mm/init.c
++++ b/arch/arm64/mm/init.c
+@@ -465,6 +465,8 @@ void __init arm64_memblock_init(void)
+ 
+ 	early_init_fdt_scan_reserved_mem();
+ 
++	reserve_crashkernel_high();
++
+ 	reserve_elfcorehdr();
+ 
+ 	if (!IS_ENABLED(CONFIG_ZONE_DMA) && !IS_ENABLED(CONFIG_ZONE_DMA32))
+--- a/arch/arm64/mm/mmu.c
++++ b/arch/arm64/mm/mmu.c
+@@ -526,6 +526,10 @@ static void __init map_mem(pgd_t *pgdp)
+ #ifdef CONFIG_KEXEC_CORE
+ 	if (crash_mem_map)
+ 		eflags = NO_BLOCK_MAPPINGS | NO_CONT_MAPPINGS;
++
++	if (crashk_res.end)
++		memblock_mark_nomap(crashk_res.start,
++				    resource_size(&crashk_res));
+ #endif
+ 
+ 	/* map all the memory banks */
+@@ -579,16 +583,13 @@ static void __init map_mem(pgd_t *pgdp)
+ 	 * through /sys/kernel/kexec_crash_size interface.
+ 	 */
+ #ifdef CONFIG_KEXEC_CORE
+-	if (crash_mem_map &&
+-	    !IS_ENABLED(CONFIG_ZONE_DMA) && !IS_ENABLED(CONFIG_ZONE_DMA32)) {
+-		if (crashk_res.end) {
+-			__map_memblock(pgdp, crashk_res.start,
+-				       crashk_res.end + 1,
+-				       PAGE_KERNEL,
+-				       NO_BLOCK_MAPPINGS | NO_CONT_MAPPINGS);
+-			memblock_clear_nomap(crashk_res.start,
+-					     resource_size(&crashk_res));
+-		}
++	if (crashk_res.end) {
++		__map_memblock(pgdp, crashk_res.start,
++			       crashk_res.end + 1,
++			       PAGE_KERNEL,
++			       NO_BLOCK_MAPPINGS | NO_CONT_MAPPINGS);
++		memblock_clear_nomap(crashk_res.start,
++				     resource_size(&crashk_res));
+ 	}
+ #endif
+ }
+--- a/kernel/crash_core.c
++++ b/kernel/crash_core.c
+@@ -321,6 +321,9 @@ int __init parse_crashkernel_low(char *c
+  */
+ 
+ #ifdef CONFIG_ARCH_WANT_RESERVE_CRASH_KERNEL
++static bool crash_high_mem_reserved __initdata;
++static struct resource crashk_res_high;
++
+ static int __init reserve_crashkernel_low(void)
+ {
+ #ifdef CONFIG_64BIT
+@@ -374,6 +377,66 @@ static int __init reserve_crashkernel_lo
+ 	return 0;
+ }
+ 
++void __init reserve_crashkernel_high(void)
++{
++	unsigned long long crash_base, crash_size;
++	char *cmdline = boot_command_line;
++	int ret;
++
++	if (!IS_ENABLED(CONFIG_KEXEC_CORE))
++		return;
++
++	/* crashkernel=X[@offset] */
++	ret = parse_crashkernel(cmdline, memblock_phys_mem_size(),
++				&crash_size, &crash_base);
++	if (ret || !crash_size) {
++		ret = parse_crashkernel_high(cmdline, 0, &crash_size, &crash_base);
++		if (ret || !crash_size)
++			return;
++	}
++
++	crash_size = PAGE_ALIGN(crash_size);
++
++	/*
++	 * For the case crashkernel=X, may fall back to reserve memory above
++	 * 4G, make reservations here in advance. It will be released later if
++	 * the region is successfully reserved under 4G.
++	 */
++	if (!crash_base) {
++		crash_base = memblock_phys_alloc_range(crash_size, CRASH_ALIGN,
++						       crash_base, CRASH_ADDR_HIGH_MAX);
++		if (!crash_base)
++			return;
++
++		crash_high_mem_reserved = true;
++	}
++
++	/* Mark the memory range that requires page-level mappings */
++	crashk_res.start = crash_base;
++	crashk_res.end   = crash_base + crash_size - 1;
++}
++
++static void __init hand_over_reserved_high_mem(void)
++{
++	crashk_res_high.start = crashk_res.start;
++	crashk_res_high.end   = crashk_res.end;
++
++	crashk_res.start = 0;
++	crashk_res.end   = 0;
++}
++
++static void __init take_reserved_high_mem(unsigned long long *crash_base,
++					  unsigned long long *crash_size)
++{
++	*crash_base = crashk_res_high.start;
++	*crash_size = resource_size(&crashk_res_high);
++}
++
++static void __init free_reserved_high_mem(void)
++{
++	memblock_free(crashk_res_high.start, resource_size(&crashk_res_high));
++}
++
+ /*
+  * reserve_crashkernel() - reserves memory for crash kernel
+  *
+@@ -389,6 +452,8 @@ void __init reserve_crashkernel(void)
+ 
+ 	total_mem = memblock_phys_mem_size();
+ 
++	hand_over_reserved_high_mem();
++
+ 	/* crashkernel=XM */
+ 	ret = parse_crashkernel(boot_command_line, total_mem, &crash_size, &crash_base);
+ 	if (ret != 0 || crash_size <= 0) {
+@@ -398,6 +463,11 @@ void __init reserve_crashkernel(void)
+ 		if (ret != 0 || crash_size <= 0)
+ 			return;
+ 		high = true;
++
++		if (crash_high_mem_reserved) {
++			take_reserved_high_mem(&crash_base, &crash_size);
++			goto reserve_low;
++		}
+ 	}
+ 
+ 	/* 0 means: find the address automatically */
+@@ -411,10 +481,15 @@ void __init reserve_crashkernel(void)
+ 		 * So try low memory first and fall back to high memory
+ 		 * unless "crashkernel=size[KMG],high" is specified.
+ 		 */
+-		if (!high)
++		if (!high) {
+ 			crash_base = memblock_find_in_range(CRASH_ALIGN,
+ 					CRASH_ADDR_LOW_MAX, crash_size,
+ 					CRASH_ALIGN);
++			if (!crash_base && crash_high_mem_reserved) {
++				take_reserved_high_mem(&crash_base, &crash_size);
++				goto reserve_low;
++			}
++		}
+ 		if (!crash_base)
+ 			crash_base = memblock_find_in_range(CRASH_ALIGN,
+ 					CRASH_ADDR_HIGH_MAX, crash_size,
+@@ -447,9 +522,18 @@ void __init reserve_crashkernel(void)
+ 		return;
+ 	}
+ 
+-	if (crash_base >= CRASH_ADDR_LOW_MAX && reserve_crashkernel_low()) {
+-		memblock_free(crash_base, crash_size);
+-		return;
++	if ((crash_base >= CRASH_ADDR_LOW_MAX) || high) {
++reserve_low:
++		if (reserve_crashkernel_low()) {
++			memblock_free(crash_base, crash_size);
++			return;
++		}
++	} else if (crash_high_mem_reserved) {
++		/*
++		 * The crash memory is successfully allocated under 4G, and the
++		 * previously reserved high memory is no longer required.
++		 */
++		free_reserved_high_mem();
+ 	}
+ 
+ 	pr_info("Reserving %ldMB of memory at %ldMB for crashkernel (System RAM: %ldMB)\n",

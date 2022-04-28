@@ -1,0 +1,135 @@
+From 1e891e10805caba6bb6c4e882d1f1782c744605d Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Mon, 1 Mar 2021 11:13:34 +0100
+Subject: [PATCH] locking/csd_lock: Add boot parameter for controlling CSD lock
+ debugging
+Git-commit: 8d0968cc6b8ffd8496c2ebffdfdc801f949a85e5
+Patch-mainline: v5.13-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified per openEuler commit 8d0968cc6
+
+
+Currently CSD lock debugging can be switched on and off via a kernel
+config option only. Unfortunately there is at least one problem with
+CSD lock handling pending for about 2 years now, which has been seen
+in different environments (mostly when running virtualized under KVM
+or Xen, at least once on bare metal). Multiple attempts to catch this
+issue have finally led to introduction of CSD lock debug code, but
+this code is not in use in most distros as it has some impact on
+performance.
+
+In order to be able to ship kernels with CONFIG_CSD_LOCK_WAIT_DEBUG
+enabled even for production use, add a boot parameter for switching
+the debug functionality on. This will reduce any performance impact
+of the debug coding to a bare minimum when not being used.
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+[ Minor edits. ]
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Link: https://lore.kernel.org/r/20210301101336.7797-2-jgross@suse.com
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ .../admin-guide/kernel-parameters.txt         |  6 ++++
+ kernel/smp.c                                  | 34 +++++++++++++++++--
+ 2 files changed, 38 insertions(+), 2 deletions(-)
+
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index b5524464f1cb..74c25228aec4 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -800,6 +800,12 @@
+ 	cs89x0_media=	[HW,NET]
+ 			Format: { rj45 | aui | bnc }
+ 
++	csdlock_debug=	[KNL] Enable debug add-ons of cross-CPU function call
++			handling. When switched on, additional debug data is
++			printed to the console in case a hanging CPU is
++			detected, and that CPU is pinged again in order to try
++			to resolve the hang situation.
++
+ 	dasd=		[HW,NET]
+ 			See header of drivers/s390/block/dasd_devmap.c.
+ 
+diff --git a/kernel/smp.c b/kernel/smp.c
+index a5a87a51e726..b04ab01eb9e0 100644
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@ -24,6 +24,7 @@
+ #include <linux/sched/clock.h>
+ #include <linux/nmi.h>
+ #include <linux/sched/debug.h>
++#include <linux/jump_label.h>
+ 
+ #include "smpboot.h"
+ #include "sched/smp.h"
+@@ -102,6 +103,20 @@ void __init call_function_init(void)
+ 
+ #ifdef CONFIG_CSD_LOCK_WAIT_DEBUG
+ 
++static DEFINE_STATIC_KEY_FALSE(csdlock_debug_enabled);
++
++static int __init csdlock_debug(char *str)
++{
++	unsigned int val = 0;
++
++	get_option(&str, &val);
++	if (val)
++		static_branch_enable(&csdlock_debug_enabled);
++
++	return 0;
++}
++early_param("csdlock_debug", csdlock_debug);
++
+ static DEFINE_PER_CPU(call_single_data_t *, cur_csd);
+ static DEFINE_PER_CPU(smp_call_func_t, cur_csd_func);
+ static DEFINE_PER_CPU(void *, cur_csd_info);
+@@ -110,7 +125,7 @@ static DEFINE_PER_CPU(void *, cur_csd_info);
+ static atomic_t csd_bug_count = ATOMIC_INIT(0);
+ 
+ /* Record current CSD work for current CPU, NULL to erase. */
+-static void csd_lock_record(struct __call_single_data *csd)
++static void __csd_lock_record(struct __call_single_data *csd)
+ {
+ 	if (!csd) {
+ 		smp_mb(); /* NULL cur_csd after unlock. */
+@@ -125,6 +140,12 @@ static void csd_lock_record(struct __call_single_data *csd)
+ 		  /* Or before unlock, as the case may be. */
+ }
+ 
++static __always_inline void csd_lock_record(struct __call_single_data *csd)
++{
++	if (static_branch_unlikely(&csdlock_debug_enabled))
++		__csd_lock_record(csd);
++}
++
+ static __always_inline int csd_lock_wait_getcpu(struct __call_single_data *csd)
+ {
+ 	unsigned int csd_type;
+@@ -204,7 +225,7 @@ static __always_inline bool csd_lock_wait_toolong(struct __call_single_data *csd
+  * previous function call. For multi-cpu calls its even more interesting
+  * as we'll have to ensure no other cpu is observing our csd.
+  */
+-static __always_inline void csd_lock_wait(struct __call_single_data *csd)
++static void __csd_lock_wait(struct __call_single_data *csd)
+ {
+ 	int bug_id = 0;
+ 	u64 ts0, ts1;
+@@ -218,6 +239,15 @@ static __always_inline void csd_lock_wait(struct __call_single_data *csd)
+ 	smp_acquire__after_ctrl_dep();
+ }
+ 
++static __always_inline void csd_lock_wait(struct __call_single_data *csd)
++{
++	if (static_branch_unlikely(&csdlock_debug_enabled)) {
++		__csd_lock_wait(csd);
++		return;
++	}
++
++	smp_cond_load_acquire(&csd->node.u_flags, !(VAL & CSD_FLAG_LOCK));
++}
+ #else
+ static void csd_lock_record(struct __call_single_data *csd)
+ {
+-- 
+2.34.1
+

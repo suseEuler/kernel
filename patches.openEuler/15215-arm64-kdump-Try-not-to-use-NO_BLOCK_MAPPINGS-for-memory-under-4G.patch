@@ -1,0 +1,111 @@
+From ebe315a09d0071e361031a207466bba147bbb105 Mon Sep 17 00:00:00 2001
+From: Zhen Lei <thunder.leizhen@huawei.com>
+Date: Wed, 27 Apr 2022 18:48:36 +0800
+Subject: [PATCH] arm64: kdump: Try not to use NO_BLOCK_MAPPINGS for memory
+ under 4G
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: ebe315a09d0071e361031a207466bba147bbb105
+Modified-by-SEL: Yes, refreshed due to different context, also refer to
+                 openEuler commit 255cd474
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I545H8
+CVE: NA
+
+-------------------------------------------------------------------------
+
+For the case crashkernel=X@offset and crashkernel=X,high, we've explicitly
+used 'crashk_res' to mark the scope of the page-level mapping required, so
+NO_BLOCK_MAPPINGS should not be required for other areas. Otherwise,
+system performance will be affected. In fact, only the case crashkernel=X
+requires page-level mapping for all low memory under 4G because it
+attempts high memory after it fails to request low memory first, and we
+cannot predict its final location.
+
+Signed-off-by: Zhen Lei <thunder.leizhen@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/kexec.h |    2 ++
+ arch/arm64/mm/mmu.c            |   28 +---------------------------
+ kernel/crash_core.c            |    3 +++
+ 3 files changed, 6 insertions(+), 27 deletions(-)
+
+--- a/arch/arm64/include/asm/kexec.h
++++ b/arch/arm64/include/asm/kexec.h
+@@ -102,6 +102,8 @@ static inline void crash_post_resume(voi
+ #endif
+ void machine_kexec_mask_interrupts(void);
+ 
++extern bool crash_low_mem_page_map;
++
+ #ifdef CONFIG_KEXEC_CORE
+ extern void __init reserve_crashkernel(void);
+ extern void __init reserve_crashkernel_high(void);
+--- a/arch/arm64/mm/mmu.c
++++ b/arch/arm64/mm/mmu.c
+@@ -478,21 +478,6 @@ void __init mark_linear_text_alias_ro(vo
+ 			    PAGE_KERNEL_RO);
+ }
+ 
+-static bool crash_mem_map __initdata;
+-
+-static int __init enable_crash_mem_map(char *arg)
+-{
+-	/*
+-	 * Proper parameter parsing is done by reserve_crashkernel(). We only
+-	 * need to know if the linear map has to avoid block mappings so that
+-	 * the crashkernel reservations can be unmapped later.
+-	 */
+-	crash_mem_map = true;
+-
+-	return 0;
+-}
+-early_param("crashkernel", enable_crash_mem_map);
+-
+ static void __init map_mem(pgd_t *pgdp)
+ {
+ 	phys_addr_t kernel_start = __pa_symbol(_stext);
+@@ -513,18 +498,7 @@ static void __init map_mem(pgd_t *pgdp)
+ 	memblock_mark_nomap(kernel_start, kernel_end - kernel_start);
+ 
+ #ifdef CONFIG_KEXEC_CORE
+-	if (crash_mem_map) {
+-		if (IS_ENABLED(CONFIG_ZONE_DMA) ||
+-		    IS_ENABLED(CONFIG_ZONE_DMA32))
+-			flags |= NO_BLOCK_MAPPINGS | NO_CONT_MAPPINGS;
+-		else if (crashk_res.end)
+-			memblock_mark_nomap(crashk_res.start,
+-					    resource_size(&crashk_res));
+-	}
+-#endif
+-
+-#ifdef CONFIG_KEXEC_CORE
+-	if (crash_mem_map)
++	if (crash_low_mem_page_map)
+ 		eflags = NO_BLOCK_MAPPINGS | NO_CONT_MAPPINGS;
+ 
+ 	if (crashk_res.end)
+--- a/kernel/crash_core.c
++++ b/kernel/crash_core.c
+@@ -321,6 +321,7 @@ int __init parse_crashkernel_low(char *c
+  */
+ 
+ #ifdef CONFIG_ARCH_WANT_RESERVE_CRASH_KERNEL
++bool crash_low_mem_page_map __initdata;
+ static bool crash_high_mem_reserved __initdata;
+ static struct resource crashk_res_high;
+ 
+@@ -393,6 +394,8 @@ void __init reserve_crashkernel_high(voi
+ 		ret = parse_crashkernel_high(cmdline, 0, &crash_size, &crash_base);
+ 		if (ret || !crash_size)
+ 			return;
++	} else if (!crash_base) {
++		crash_low_mem_page_map = true;
+ 	}
+ 
+ 	crash_size = PAGE_ALIGN(crash_size);
