@@ -1,0 +1,53 @@
+From 9d7eceede769f90b66cfa06ad5b357140d5141ed Mon Sep 17 00:00:00 2001
+Message-Id: <9d7eceede769f90b66cfa06ad5b357140d5141ed.1651205793.git.geliang.tang@suse.com>
+From: Daniel Borkmann <daniel@iogearbox.net>
+Date: Thu, 3 Jan 2019 00:58:32 +0100
+Subject: [PATCH] bpf: restrict unknown scalars of mixed signed bounds for
+ unprivileged
+Git-commit: 9d7eceede769f90b66cfa06ad5b357140d5141ed
+Patch-mainline: v5.11-rc1
+References: bsn#210
+Modified-by-SEL: Yes, refreshed due to context changes
+
+For unknown scalars of mixed signed bounds, meaning their smin_value is
+negative and their smax_value is positive, we need to reject arithmetic
+with pointer to map value. For unprivileged the goal is to mask every
+map pointer arithmetic and this cannot reliably be done when it is
+unknown at verification time whether the scalar value is negative or
+positive. Given this is a corner case, the likelihood of breaking should
+be very small.
+
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ kernel/bpf/verifier.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -5997,8 +5997,8 @@ static int adjust_ptr_min_max_vals(struc
+ 	u64 umin_val = off_reg->umin_value, umax_val = off_reg->umax_value,
+ 	    umin_ptr = ptr_reg->umin_value, umax_ptr = ptr_reg->umax_value;
+ 	struct bpf_sanitize_info info = {};
++	u32 dst = insn->dst_reg, src = insn->src_reg;
+ 	u8 opcode = BPF_OP(insn->code);
+-	u32 dst = insn->dst_reg;
+ 	int ret;
+ 
+ 	dst_reg = &regs[dst];
+@@ -6044,6 +6044,13 @@ reject:
+ 		verbose(env, "R%d pointer arithmetic on %s prohibited\n",
+ 			dst, reg_type_str[ptr_reg->type]);
+ 		return -EACCES;
++	case PTR_TO_MAP_VALUE:
++		if (!env->allow_ptr_leaks && !known && (smin_val < 0) != (smax_val < 0)) {
++			verbose(env, "R%d has unknown scalar with mixed signed bounds, pointer arithmetic with it prohibited for !root\n",
++				off_reg == dst_reg ? dst : src);
++			return -EACCES;
++		}
++		/* fall-through */
+ 	default:
+ 		if (reg_type_may_be_null(ptr_reg->type))
+ 			goto reject;

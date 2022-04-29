@@ -1,0 +1,57 @@
+From 07c2c7a3b622e109ba4d2efd916da0477617ce81 Mon Sep 17 00:00:00 2001
+Message-Id: <07c2c7a3b622e109ba4d2efd916da0477617ce81.1651196606.git.geliang.tang@suse.com>
+From: Paolo Abeni <pabeni@redhat.com>
+Date: Thu, 24 Feb 2022 16:52:57 -0800
+Subject: [PATCH] mptcp: accurate SIOCOUTQ for fallback socket
+Git-commit: 07c2c7a3b622e109ba4d2efd916da0477617ce81
+Patch-mainline: v5.17-rc6
+References: bsn#210
+Modified-by-SEL: No
+
+The MPTCP SIOCOUTQ implementation is not very accurate in
+case of fallback: it only measures the data in the MPTCP-level
+write queue, but it does not take in account the subflow
+write queue utilization. In case of fallback the first can be
+empty, while the latter is not.
+
+The above produces sporadic self-tests issues and can foul
+legit user-space application.
+
+Fix the issue additionally querying the subflow in case of fallback.
+
+Fixes: 644807e3e462 ("mptcp: add SIOCINQ, OUTQ and OUTQNSD ioctls")
+Closes: https://github.com/multipath-tcp/mptcp_net-next/issues/260
+Reported-by: Matthieu Baerts <matthieu.baerts@tessares.net>
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ net/mptcp/protocol.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index f60f01b14fac..12bb28c5007e 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -3294,6 +3294,17 @@ static int mptcp_ioctl_outq(const struct mptcp_sock *msk, u64 v)
+ 		return 0;
+ 
+ 	delta = msk->write_seq - v;
++	if (__mptcp_check_fallback(msk) && msk->first) {
++		struct tcp_sock *tp = tcp_sk(msk->first);
++
++		/* the first subflow is disconnected after close - see
++		 * __mptcp_close_ssk(). tcp_disconnect() moves the write_seq
++		 * so ignore that status, too.
++		 */
++		if (!((1 << msk->first->sk_state) &
++		      (TCPF_SYN_SENT | TCPF_SYN_RECV | TCPF_CLOSE)))
++			delta += READ_ONCE(tp->write_seq) - tp->snd_una;
++	}
+ 	if (delta > INT_MAX)
+ 		delta = INT_MAX;
+ 
+-- 
+2.34.1
+

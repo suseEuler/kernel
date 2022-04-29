@@ -1,0 +1,72 @@
+From 80847a71b270b172814dc7562f3eb59507fca61e Mon Sep 17 00:00:00 2001
+Message-Id: <80847a71b270b172814dc7562f3eb59507fca61e.1651196605.git.geliang.tang@suse.com>
+From: Daniel Borkmann <daniel@iogearbox.net>
+Date: Fri, 26 Mar 2021 00:41:34 +0100
+Subject: [PATCH] bpf: Undo ptr_to_map_key alu sanitation for now
+Git-commit: 80847a71b270b172814dc7562f3eb59507fca61e
+Patch-mainline: v5.13-rc1
+References: bsn#210
+Modified-by-SEL: Yes, refreshed due to context changes
+
+Remove PTR_TO_MAP_KEY for the time being from being sanitized on pointer ALU
+through sanitize_ptr_alu() mainly for 3 reasons:
+
+  1) It's currently unused and not available from unprivileged. However that by
+     itself is not yet a strong reason to drop the code.
+
+  2) Commit 69c087ba6225 ("bpf: Add bpf_for_each_map_elem() helper") implemented
+     the sanitation not fully correct in that unlike stack or map_value pointer
+     it doesn't probe whether the access to the map key /after/ the simulated ALU
+     operation is still in bounds. This means that the generated mask can truncate
+     the offset in the non-speculative domain whereas it should only truncate in
+     the speculative domain. The verifier should instead reject such program as
+     we do for other types.
+
+  3) Given the recent fixes from f232326f6966 ("bpf: Prohibit alu ops for pointer
+     types not defining ptr_limit"), 10d2bb2e6b1d ("bpf: Fix off-by-one for area
+     size in creating mask to left"), b5871dca250c ("bpf: Simplify alu_limit masking
+     for pointer arithmetic") as well as 1b1597e64e1a ("bpf: Add sanity check for
+     upper ptr_limit") the code changed quite a bit and the merge in efd13b71a3fa
+     broke the PTR_TO_MAP_KEY case due to an incorrect merge conflict.
+
+Remove the relevant pieces for the time being and we can rework the PTR_TO_MAP_KEY
+case once everything settles.
+
+Fixes: efd13b71a3fa ("Merge git://git.kernel.org/pub/scm/linux/kernel/git/netdev/net")
+Fixes: 69c087ba6225 ("bpf: Add bpf_for_each_map_elem() helper")
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ kernel/bpf/verifier.c | 14 --------------
+ 1 file changed, 14 deletions(-)
+
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -6063,19 +6063,6 @@ static int retrieve_ptr_limit(const stru
+ 		max = MAX_BPF_STACK + mask_to_left;
+ 		ptr_limit = -(ptr_reg->var_off.value + ptr_reg->off);
+ 		break;
+-	case PTR_TO_MAP_KEY:
+-		/* Currently, this code is not exercised as the only use
+-		 * is bpf_for_each_map_elem() helper which requires
+-		 * bpf_capble. The code has been tested manually for
+-		 * future use.
+-		 */
+-		if (mask_to_left) {
+-			*ptr_limit = ptr_reg->umax_value + ptr_reg->off;
+-		} else {
+-			off = ptr_reg->smin_value + ptr_reg->off;
+-			*ptr_limit = ptr_reg->map_ptr->key_size - off;
+-		}
+-		return 0;
+ 	case PTR_TO_MAP_VALUE:
+ 		max = ptr_reg->map_ptr->value_size;
+ 		ptr_limit = (mask_to_left ?
+@@ -6437,7 +6424,6 @@ reject:
+ 		verbose(env, "R%d pointer arithmetic on %s prohibited\n",
+ 			dst, reg_type_str[ptr_reg->type]);
+ 		return -EACCES;
+-	case PTR_TO_MAP_KEY:
+ 	case PTR_TO_MAP_VALUE:
+ 		if (!env->allow_ptr_leaks && !known && (smin_val < 0) != (smax_val < 0)) {
+ 			verbose(env, "R%d has unknown scalar with mixed signed bounds, pointer arithmetic with it prohibited for !root\n",
