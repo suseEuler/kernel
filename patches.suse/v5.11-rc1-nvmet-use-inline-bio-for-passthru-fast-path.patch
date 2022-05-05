@@ -1,0 +1,82 @@
+From dab3902b19a0dd1668d0cc3e8e4b976b1ee8638c Mon Sep 17 00:00:00 2001
+From: Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+Date: Mon, 9 Nov 2020 18:24:05 -0800
+Subject: [PATCH] nvmet: use inline bio for passthru fast path
+Git-commit: dab3902b19a0dd1668d0cc3e8e4b976b1ee8638c
+Patch-mainline: v5.11-rc1
+References: bsn#210
+Modified-by-SEL: No
+
+
+In nvmet_passthru_execute_cmd() which is a high frequency function
+it uses bio_alloc() which leads to memory allocation from the fs pool
+for each I/O.
+
+For NVMeoF nvmet_req we already have inline_bvec allocated as a part of
+request allocation that can be used with preallocated bio when we
+already know the size of request before bio allocation with bio_alloc(),
+which we already do.
+
+Introduce a bio member for the nvmet_req passthru anon union. In the
+fast path, check if we can get away with inline bvec and bio from
+nvmet_req with bio_init() call before actually allocating from the
+bio_alloc().
+
+This will be useful to avoid any new memory allocation under high
+memory pressure situation and get rid of any extra work of
+allocation (bio_alloc()) vs initialization (bio_init()) when
+transfer len is < NVMET_MAX_INLINE_DATA_LEN that user can configure at
+compile time.
+
+Signed-off-by: Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+Reviewed-by: Logan Gunthorpe <logang@deltatee.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ drivers/nvme/target/nvmet.h    |  1 +
+ drivers/nvme/target/passthru.c | 12 +++++++++---
+ 2 files changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/nvme/target/nvmet.h b/drivers/nvme/target/nvmet.h
+index 2f9635273629..e89ec280e91a 100644
+--- a/drivers/nvme/target/nvmet.h
++++ b/drivers/nvme/target/nvmet.h
+@@ -332,6 +332,7 @@ struct nvmet_req {
+ 			struct work_struct      work;
+ 		} f;
+ 		struct {
++			struct bio		inline_bio;
+ 			struct request		*rq;
+ 			struct work_struct      work;
+ 			bool			use_workqueue;
+diff --git a/drivers/nvme/target/passthru.c b/drivers/nvme/target/passthru.c
+index 2b24205ee79d..b9776fc8f08f 100644
+--- a/drivers/nvme/target/passthru.c
++++ b/drivers/nvme/target/passthru.c
+@@ -194,14 +194,20 @@ static int nvmet_passthru_map_sg(struct nvmet_req *req, struct request *rq)
+ 	if (req->sg_cnt > BIO_MAX_PAGES)
+ 		return -EINVAL;
+ 
+-	bio = bio_alloc(GFP_KERNEL, req->sg_cnt);
+-	bio->bi_end_io = bio_put;
++	if (req->transfer_len <= NVMET_MAX_INLINE_DATA_LEN) {
++		bio = &req->p.inline_bio;
++		bio_init(bio, req->inline_bvec, ARRAY_SIZE(req->inline_bvec));
++	} else {
++		bio = bio_alloc(GFP_KERNEL, min(req->sg_cnt, BIO_MAX_PAGES));
++		bio->bi_end_io = bio_put;
++	}
+ 	bio->bi_opf = req_op(rq);
+ 
+ 	for_each_sg(req->sg, sg, req->sg_cnt, i) {
+ 		if (bio_add_pc_page(rq->q, bio, sg_page(sg), sg->length,
+ 				    sg->offset) < sg->length) {
+-			bio_put(bio);
++			if (bio != &req->p.inline_bio)
++				bio_put(bio);
+ 			return -EINVAL;
+ 		}
+ 	}
+-- 
+2.34.1
+
