@@ -1,0 +1,103 @@
+From 33397b83eee6417ab144966743024cd7c0e55a9a Mon Sep 17 00:00:00 2001
+Message-Id: <33397b83eee6417ab144966743024cd7c0e55a9a.1651808132.git.geliang.tang@suse.com>
+From: Geliang Tang <geliang.tang@suse.com>
+Date: Fri, 4 Feb 2022 16:03:31 -0800
+Subject: [PATCH] selftests: mptcp: add backup with port testcase
+Git-commit: 33397b83eee6417ab144966743024cd7c0e55a9a
+Patch-mainline: v5.18-rc1
+References: bsn#2
+Modified-by-SEL: No
+
+
+This patch added the backup testcase using an address with a port number.
+
+The original backup tests only work for the output of 'pm_nl_ctl dump'
+without the port number. It chooses the last item in the dump to parse
+the address in it, and in this case, the address is showed at the end
+of the item.
+
+But it doesn't work for the dump with the port number, in this case, the
+port number is showed at the end of the item, not the address.
+
+So implemented a more flexible approach to get the address and the port
+number from the dump to fit for the port number case.
+
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+---
+ .../testing/selftests/net/mptcp/mptcp_join.sh | 44 ++++++++++++++++---
+ 1 file changed, 39 insertions(+), 5 deletions(-)
+
+diff --git a/tools/testing/selftests/net/mptcp/mptcp_join.sh b/tools/testing/selftests/net/mptcp/mptcp_join.sh
+index bd106c7ec232..eb945cebbd6d 100755
+--- a/tools/testing/selftests/net/mptcp/mptcp_join.sh
++++ b/tools/testing/selftests/net/mptcp/mptcp_join.sh
+@@ -239,6 +239,16 @@ is_v6()
+ 	[ -z "${1##*:*}" ]
+ }
+ 
++is_addr()
++{
++	[ -z "${1##*[.:]*}" ]
++}
++
++is_number()
++{
++	[[ $1 == ?(-)+([0-9]) ]]
++}
++
+ # $1: ns, $2: port
+ wait_local_port_listen()
+ {
+@@ -464,11 +474,25 @@ do_transfer()
+ 	if [ ! -z $sflags ]; then
+ 		sleep 1
+ 		for netns in "$ns1" "$ns2"; do
+-			dump=(`ip netns exec $netns ./pm_nl_ctl dump`)
+-			if [ ${#dump[@]} -gt 0 ]; then
+-				addr=${dump[${#dump[@]} - 1]}
+-				ip netns exec $netns ./pm_nl_ctl set $addr flags $sflags
+-			fi
++			ip netns exec $netns ./pm_nl_ctl dump | while read line; do
++				local arr=($line)
++				local addr
++				local port=0
++				local _port=""
++
++				for i in ${arr[@]}; do
++					if is_addr $i; then
++						addr=$i
++					elif is_number $i; then
++						# The minimum expected port number is 10000
++						if [ $i -gt 10000 ]; then
++							port=$i
++						fi
++					fi
++				done
++				if [ $port -ne 0 ]; then _port="port $port"; fi
++				ip netns exec $netns ./pm_nl_ctl set $addr flags $sflags $_port
++			done
+ 		done
+ 	fi
+ 
+@@ -1616,6 +1640,16 @@ backup_tests()
+ 	chk_join_nr "single address, backup" 1 1 1
+ 	chk_add_nr 1 1
+ 	chk_prio_nr 1 0
++
++	# single address with port, backup
++	reset
++	ip netns exec $ns1 ./pm_nl_ctl limits 0 1
++	ip netns exec $ns1 ./pm_nl_ctl add 10.0.2.1 flags signal port 10100
++	ip netns exec $ns2 ./pm_nl_ctl limits 1 1
++	run_tests $ns1 $ns2 10.0.1.1 0 0 0 slow backup
++	chk_join_nr "single address with port, backup" 1 1 1
++	chk_add_nr 1 1
++	chk_prio_nr 1 0
+ }
+ 
+ add_addr_ports_tests()
+-- 
+2.34.1
+
