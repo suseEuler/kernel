@@ -1,0 +1,62 @@
+From a7766ef18b33674fa164e2e2916cef16d4e17f43 Mon Sep 17 00:00:00 2001
+From: "Michael S. Tsirkin" <mst@redhat.com>
+Date: Tue, 13 Apr 2021 01:30:45 -0400
+Subject: [PATCH] virtio_net: disable cb aggressively
+Git-commit: a7766ef18b33674fa164e2e2916cef16d4e17f43
+Patch-mainline: v5.14-rc1
+References: bsn#198
+Modified-by-SEL: No
+
+
+There are currently two cases where we poll TX vq not in response to a
+callback: start xmit and rx napi.  We currently do this with callbacks
+enabled which can cause extra interrupts from the card.  Used not to be
+a big issue as we run with interrupts disabled but that is no longer the
+case, and in some cases the rate of spurious interrupts is so high
+linux detects this and actually kills the interrupt.
+
+Fix up by disabling the callbacks before polling the tx vq.
+
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/net/virtio_net.c | 15 +++++++++++----
+ 1 file changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/virtio_net.c b/drivers/net/virtio_net.c
+index 613aef630cdd..8a58a2f013af 100644
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@ -1516,7 +1516,10 @@ static void virtnet_poll_cleantx(struct receive_queue *rq)
+ 		return;
+ 
+ 	if (__netif_tx_trylock(txq)) {
+-		free_old_xmit_skbs(sq, true);
++		do {
++			virtqueue_disable_cb(sq->vq);
++			free_old_xmit_skbs(sq, true);
++		} while (unlikely(!virtqueue_enable_cb_delayed(sq->vq)));
+ 
+ 		if (sq->vq->num_free >= 2 + MAX_SKB_FRAGS)
+ 			netif_tx_wake_queue(txq);
+@@ -1691,10 +1694,14 @@ static netdev_tx_t start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	bool use_napi = sq->napi.weight;
+ 
+ 	/* Free up any pending old buffers before queueing new ones. */
+-	free_old_xmit_skbs(sq, false);
++	do {
++		if (use_napi)
++			virtqueue_disable_cb(sq->vq);
++
++		free_old_xmit_skbs(sq, false);
+ 
+-	if (use_napi && kick)
+-		virtqueue_enable_cb_delayed(sq->vq);
++	} while (use_napi && kick &&
++	       unlikely(!virtqueue_enable_cb_delayed(sq->vq)));
+ 
+ 	/* timestamp packet in software */
+ 	skb_tx_timestamp(skb);
+-- 
+2.34.1
+

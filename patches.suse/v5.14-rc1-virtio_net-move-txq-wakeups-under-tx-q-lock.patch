@@ -1,0 +1,67 @@
+From 22bc63c58e876cc359d0b1566dee3db8ecc16722 Mon Sep 17 00:00:00 2001
+From: "Michael S. Tsirkin" <mst@redhat.com>
+Date: Tue, 13 Apr 2021 01:38:08 -0400
+Subject: [PATCH] virtio_net: move txq wakeups under tx q lock
+Git-commit: 22bc63c58e876cc359d0b1566dee3db8ecc16722
+Patch-mainline: v5.14-rc1
+References: bsn#198
+Modified-by-SEL: No
+
+
+We currently check num_free outside tx q lock
+which is unsafe: new packets can arrive meanwhile
+and there won't be space in the queue.
+Thus a spurious queue wakeup causing overhead
+and even packet drops.
+
+Move the check under the lock to fix that.
+
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/net/virtio_net.c | 13 +++++++------
+ 1 file changed, 7 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/net/virtio_net.c b/drivers/net/virtio_net.c
+index 9573f7622ef6..613aef630cdd 100644
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@ -1517,11 +1517,12 @@ static void virtnet_poll_cleantx(struct receive_queue *rq)
+ 
+ 	if (__netif_tx_trylock(txq)) {
+ 		free_old_xmit_skbs(sq, true);
++
++		if (sq->vq->num_free >= 2 + MAX_SKB_FRAGS)
++			netif_tx_wake_queue(txq);
++
+ 		__netif_tx_unlock(txq);
+ 	}
+-
+-	if (sq->vq->num_free >= 2 + MAX_SKB_FRAGS)
+-		netif_tx_wake_queue(txq);
+ }
+ 
+ static int virtnet_poll(struct napi_struct *napi, int budget)
+@@ -1606,6 +1607,9 @@ static int virtnet_poll_tx(struct napi_struct *napi, int budget)
+ 	virtqueue_disable_cb(sq->vq);
+ 	free_old_xmit_skbs(sq, true);
+ 
++	if (sq->vq->num_free >= 2 + MAX_SKB_FRAGS)
++		netif_tx_wake_queue(txq);
++
+ 	opaque = virtqueue_enable_cb_prepare(sq->vq);
+ 
+ 	done = napi_complete_done(napi, 0);
+@@ -1626,9 +1630,6 @@ static int virtnet_poll_tx(struct napi_struct *napi, int budget)
+ 		}
+ 	}
+ 
+-	if (sq->vq->num_free >= 2 + MAX_SKB_FRAGS)
+-		netif_tx_wake_queue(txq);
+-
+ 	return 0;
+ }
+ 
+-- 
+2.34.1
+
