@@ -1,0 +1,167 @@
+From fae21608c31ca987d9dfc0422ac9b5bd21c213a6 Mon Sep 17 00:00:00 2001
+From: Sreekanth Reddy <sreekanth.reddy@broadcom.com>
+Date: Mon, 5 Jul 2021 20:29:50 +0530
+Subject: [PATCH] scsi: mpt3sas: Transition IOC to Ready state during shutdown
+Git-commit: fae21608c31ca987d9dfc0422ac9b5bd21c213a6
+Patch-mainline: v5.14-rc3
+References: bsn#59
+Modified-by-SEL: No
+
+
+The IOC firmware assumes that the host driver is still alive after shutdown
+and continues to post events to host memory (due to faulty expander phy
+links, etc). This leads to 0x2666 (a bus fault occurred during a host-IOC
+memory access).
+
+Perform an IOC soft reset as part of shutdown to disable event posting.
+
+Link: https://lore.kernel.org/r/20210705145951.32258-1-sreekanth.reddy@broadcom.com
+Signed-off-by: Sreekanth Reddy <sreekanth.reddy@broadcom.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/scsi/mpt3sas/mpt3sas_base.c  | 32 ++++++++++++++--------------
+ drivers/scsi/mpt3sas/mpt3sas_base.h  |  4 ++++
+ drivers/scsi/mpt3sas/mpt3sas_scsih.c |  7 +++++-
+ 3 files changed, 26 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_base.c b/drivers/scsi/mpt3sas/mpt3sas_base.c
+index c39955239d1c..19b1c0cf5f2a 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_base.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_base.c
+@@ -2983,13 +2983,13 @@ _base_check_enable_msix(struct MPT3SAS_ADAPTER *ioc)
+ }
+ 
+ /**
+- * _base_free_irq - free irq
++ * mpt3sas_base_free_irq - free irq
+  * @ioc: per adapter object
+  *
+  * Freeing respective reply_queue from the list.
+  */
+-static void
+-_base_free_irq(struct MPT3SAS_ADAPTER *ioc)
++void
++mpt3sas_base_free_irq(struct MPT3SAS_ADAPTER *ioc)
+ {
+ 	struct adapter_reply_queue *reply_q, *next;
+ 
+@@ -3191,12 +3191,12 @@ _base_check_and_enable_high_iops_queues(struct MPT3SAS_ADAPTER *ioc,
+ }
+ 
+ /**
+- * _base_disable_msix - disables msix
++ * mpt3sas_base_disable_msix - disables msix
+  * @ioc: per adapter object
+  *
+  */
+-static void
+-_base_disable_msix(struct MPT3SAS_ADAPTER *ioc)
++void
++mpt3sas_base_disable_msix(struct MPT3SAS_ADAPTER *ioc)
+ {
+ 	if (!ioc->msix_enable)
+ 		return;
+@@ -3304,8 +3304,8 @@ _base_enable_msix(struct MPT3SAS_ADAPTER *ioc)
+ 	for (i = 0; i < ioc->reply_queue_count; i++) {
+ 		r = _base_request_irq(ioc, i);
+ 		if (r) {
+-			_base_free_irq(ioc);
+-			_base_disable_msix(ioc);
++			mpt3sas_base_free_irq(ioc);
++			mpt3sas_base_disable_msix(ioc);
+ 			goto try_ioapic;
+ 		}
+ 	}
+@@ -3342,8 +3342,8 @@ mpt3sas_base_unmap_resources(struct MPT3SAS_ADAPTER *ioc)
+ 
+ 	dexitprintk(ioc, ioc_info(ioc, "%s\n", __func__));
+ 
+-	_base_free_irq(ioc);
+-	_base_disable_msix(ioc);
++	mpt3sas_base_free_irq(ioc);
++	mpt3sas_base_disable_msix(ioc);
+ 
+ 	kfree(ioc->replyPostRegisterIndex);
+ 	ioc->replyPostRegisterIndex = NULL;
+@@ -7613,14 +7613,14 @@ _base_diag_reset(struct MPT3SAS_ADAPTER *ioc)
+ }
+ 
+ /**
+- * _base_make_ioc_ready - put controller in READY state
++ * mpt3sas_base_make_ioc_ready - put controller in READY state
+  * @ioc: per adapter object
+  * @type: FORCE_BIG_HAMMER or SOFT_RESET
+  *
+  * Return: 0 for success, non-zero for failure.
+  */
+-static int
+-_base_make_ioc_ready(struct MPT3SAS_ADAPTER *ioc, enum reset_type type)
++int
++mpt3sas_base_make_ioc_ready(struct MPT3SAS_ADAPTER *ioc, enum reset_type type)
+ {
+ 	u32 ioc_state;
+ 	int rc;
+@@ -7897,7 +7897,7 @@ mpt3sas_base_free_resources(struct MPT3SAS_ADAPTER *ioc)
+ 	if (ioc->chip_phys && ioc->chip) {
+ 		mpt3sas_base_mask_interrupts(ioc);
+ 		ioc->shost_recovery = 1;
+-		_base_make_ioc_ready(ioc, SOFT_RESET);
++		mpt3sas_base_make_ioc_ready(ioc, SOFT_RESET);
+ 		ioc->shost_recovery = 0;
+ 	}
+ 
+@@ -8017,7 +8017,7 @@ mpt3sas_base_attach(struct MPT3SAS_ADAPTER *ioc)
+ 	ioc->build_sg_mpi = &_base_build_sg;
+ 	ioc->build_zero_len_sge_mpi = &_base_build_zero_len_sge;
+ 
+-	r = _base_make_ioc_ready(ioc, SOFT_RESET);
++	r = mpt3sas_base_make_ioc_ready(ioc, SOFT_RESET);
+ 	if (r)
+ 		goto out_free_resources;
+ 
+@@ -8471,7 +8471,7 @@ mpt3sas_base_hard_reset_handler(struct MPT3SAS_ADAPTER *ioc,
+ 	_base_pre_reset_handler(ioc);
+ 	mpt3sas_wait_for_commands_to_complete(ioc);
+ 	mpt3sas_base_mask_interrupts(ioc);
+-	r = _base_make_ioc_ready(ioc, type);
++	r = mpt3sas_base_make_ioc_ready(ioc, type);
+ 	if (r)
+ 		goto out;
+ 	_base_clear_outstanding_commands(ioc);
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_base.h b/drivers/scsi/mpt3sas/mpt3sas_base.h
+index d4834c8ee9c0..0c6c3df0038d 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_base.h
++++ b/drivers/scsi/mpt3sas/mpt3sas_base.h
+@@ -1730,6 +1730,10 @@ do {	ioc_err(ioc, "In func: %s\n", __func__); \
+ 	status, mpi_request, sz); } while (0)
+ 
+ int mpt3sas_wait_for_ioc(struct MPT3SAS_ADAPTER *ioc, int wait_count);
++int
++mpt3sas_base_make_ioc_ready(struct MPT3SAS_ADAPTER *ioc, enum reset_type type);
++void mpt3sas_base_free_irq(struct MPT3SAS_ADAPTER *ioc);
++void mpt3sas_base_disable_msix(struct MPT3SAS_ADAPTER *ioc);
+ 
+ /* scsih shared API */
+ struct scsi_cmnd *mpt3sas_scsih_scsi_lookup_get(struct MPT3SAS_ADAPTER *ioc,
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_scsih.c b/drivers/scsi/mpt3sas/mpt3sas_scsih.c
+index 866d118f7931..8e64a6f14542 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_scsih.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_scsih.c
+@@ -11295,7 +11295,12 @@ scsih_shutdown(struct pci_dev *pdev)
+ 
+ 	_scsih_ir_shutdown(ioc);
+ 	_scsih_nvme_shutdown(ioc);
+-	mpt3sas_base_detach(ioc);
++	mpt3sas_base_mask_interrupts(ioc);
++	ioc->shost_recovery = 1;
++	mpt3sas_base_make_ioc_ready(ioc, SOFT_RESET);
++	ioc->shost_recovery = 0;
++	mpt3sas_base_free_irq(ioc);
++	mpt3sas_base_disable_msix(ioc);
+ }
+ 
+ 
+-- 
+2.34.1
+

@@ -1,0 +1,335 @@
+From 2a5c3a35c156efc9991dd3b9e46b1cc2653baa63 Mon Sep 17 00:00:00 2001
+From: Suganath Prabu S <suganath-prabu.subramani@broadcom.com>
+Date: Thu, 26 Nov 2020 15:13:08 +0530
+Subject: [PATCH] scsi: mpt3sas: Add persistent SCSI sense trigger page
+Git-commit: 2a5c3a35c156efc9991dd3b9e46b1cc2653baa63
+Patch-mainline: v5.11-rc1
+References: bsn#59
+Modified-by-SEL: No
+
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Trigger Page3 is used to store information about SCSI Sense triggers:
+
+ Persistent Trigger Page-3
+ ------------------------------------------------------------------
+ | 31         24 23            16 15              8 7            0|    Byte
+ ------------------------------------------------------------------
+ | PageType      | PageNumber     | Reserved       | PageVersion  |    0x00
+ ------------------------------------------------------------------
+ | Reserved      | ExtPageType    |          ExtPageLen           |    0x04
+ ------------------------------------------------------------------
+ | Reserved      | NumScsiSense   |         TriggerEntries        |    0x08
+ ------------------------------------------------------------------
+ |               ScsiSenseTriggerEntry[0]                         |    0x0C
+ ------------------------------------------------------------------
+ |                    …        …                                  |
+ ------------------------------------------------------------------
+ |               ScsiSenseTriggerEntry[19]                        |    0x58
+ ------------------------------------------------------------------
+
+NumScsiSenseTriggerEntries:
+
+This field indicates number of SCSI Sense trigger entries stored in this
+page. Currently driver is supporting a maximum of 20-SCSI Sense trigger
+entries.
+
+ScsiSenseTriggerEntry:
+
+ -----------------------------------------------
+ | 31      24 23       16 15       8 7       0 |
+ -----------------------------------------------
+ | Reserved   | SenseKey  |    ASC   |   ASCQ  |
+ -----------------------------------------------
+
+ ASCQ     => Additional Sense Code Qualifier
+ ASC      => Additional Sense Code
+ SenseKey => Sense Key values
+
+ ASCQ     => Additional Sense Code Qualifier
+ ASC      => Additional Sense Code
+ SenseKey => Sense Key values
+
+Link: https://lore.kernel.org/r/20201126094311.8686-6-suganath-prabu.subramani@broadcom.com
+Reported-by: kernel test robot <lkp@intel.com>
+Signed-off-by: Suganath Prabu S <suganath-prabu.subramani@broadcom.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/scsi/mpt3sas/mpt3sas_base.c   |  59 ++++++++++
+ drivers/scsi/mpt3sas/mpt3sas_base.h   |   6 +
+ drivers/scsi/mpt3sas/mpt3sas_config.c | 157 ++++++++++++++++++++++++++
+ 3 files changed, 222 insertions(+)
+
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_base.c b/drivers/scsi/mpt3sas/mpt3sas_base.c
+index 1fd77aa34eed..8c2ef565e8d7 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_base.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_base.c
+@@ -4848,6 +4848,57 @@ _base_get_event_diag_triggers(struct MPT3SAS_ADAPTER *ioc)
+ 	}
+ }
+ 
++/**
++ * _base_get_scsi_diag_triggers - get scsi diag trigger values from
++ *				persistent pages
++ * @ioc : per adapter object
++ *
++ * Return nothing.
++ */
++static void
++_base_get_scsi_diag_triggers(struct MPT3SAS_ADAPTER *ioc)
++{
++	Mpi26DriverTriggerPage3_t trigger_pg3;
++	struct SL_WH_SCSI_TRIGGER_T *scsi_tg;
++	MPI26_DRIVER_SCSI_SENSE_TIGGER_ENTRY *mpi_scsi_tg;
++	Mpi2ConfigReply_t mpi_reply;
++	int r = 0, i = 0;
++	u16 count = 0;
++	u16 ioc_status;
++
++	r = mpt3sas_config_get_driver_trigger_pg3(ioc, &mpi_reply,
++	    &trigger_pg3);
++	if (r)
++		return;
++
++	ioc_status = le16_to_cpu(mpi_reply.IOCStatus) &
++	    MPI2_IOCSTATUS_MASK;
++	if (ioc_status != MPI2_IOCSTATUS_SUCCESS) {
++		dinitprintk(ioc,
++		    ioc_err(ioc,
++		    "%s: Failed to get trigger pg3, ioc_status(0x%04x)\n",
++		    __func__, ioc_status));
++		return;
++	}
++
++	if (le16_to_cpu(trigger_pg3.NumSCSISenseTrigger)) {
++		count = le16_to_cpu(trigger_pg3.NumSCSISenseTrigger);
++		count = min_t(u16, NUM_VALID_ENTRIES, count);
++		ioc->diag_trigger_scsi.ValidEntries = count;
++
++		scsi_tg = &ioc->diag_trigger_scsi.SCSITriggerEntry[0];
++		mpi_scsi_tg = &trigger_pg3.SCSISenseTriggers[0];
++		for (i = 0; i < count; i++) {
++			scsi_tg->ASCQ = mpi_scsi_tg->ASCQ;
++			scsi_tg->ASC = mpi_scsi_tg->ASC;
++			scsi_tg->SenseKey = mpi_scsi_tg->SenseKey;
++
++			scsi_tg++;
++			mpi_scsi_tg++;
++		}
++	}
++}
++
+ /**
+  * _base_get_master_diag_triggers - get master diag trigger values from
+  *				persistent pages
+@@ -4953,6 +5004,14 @@ _base_get_diag_triggers(struct MPT3SAS_ADAPTER *ioc)
+ 	    MPI26_DRIVER_TRIGGER0_FLAG_MPI_EVENT_TRIGGER_VALID)
+ 		_base_get_event_diag_triggers(ioc);
+ 
++	/*
++	 * Retrieve scsi diag trigger values from driver trigger pg3
++	 * if scsi trigger bit enabled in TriggerFlags.
++	 */
++	if ((u16)trigger_flags &
++	    MPI26_DRIVER_TRIGGER0_FLAG_SCSI_SENSE_TRIGGER_VALID)
++		_base_get_scsi_diag_triggers(ioc);
++
+ }
+ 
+ /**
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_base.h b/drivers/scsi/mpt3sas/mpt3sas_base.h
+index 1d381d7494e4..ffc04e6c9b26 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_base.h
++++ b/drivers/scsi/mpt3sas/mpt3sas_base.h
+@@ -1829,11 +1829,17 @@ int
+ mpt3sas_config_get_driver_trigger_pg2(struct MPT3SAS_ADAPTER *ioc,
+ 	Mpi2ConfigReply_t *mpi_reply, Mpi26DriverTriggerPage2_t *config_page);
+ int
++mpt3sas_config_get_driver_trigger_pg3(struct MPT3SAS_ADAPTER *ioc,
++	Mpi2ConfigReply_t *mpi_reply, Mpi26DriverTriggerPage3_t *config_page);
++int
+ mpt3sas_config_update_driver_trigger_pg1(struct MPT3SAS_ADAPTER *ioc,
+ 	struct SL_WH_MASTER_TRIGGER_T *master_tg, bool set);
+ int
+ mpt3sas_config_update_driver_trigger_pg2(struct MPT3SAS_ADAPTER *ioc,
+ 	struct SL_WH_EVENT_TRIGGERS_T *event_tg, bool set);
++int
++mpt3sas_config_update_driver_trigger_pg3(struct MPT3SAS_ADAPTER *ioc,
++	struct SL_WH_SCSI_TRIGGERS_T *scsi_tg, bool set);
+ 
+ /* ctl shared API */
+ extern struct device_attribute *mpt3sas_host_attrs[];
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_config.c b/drivers/scsi/mpt3sas/mpt3sas_config.c
+index 9bad6a8a8893..ae1caba662f3 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_config.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_config.c
+@@ -2187,6 +2187,163 @@ mpt3sas_config_update_driver_trigger_pg2(struct MPT3SAS_ADAPTER *ioc,
+ 	return rc;
+ }
+ 
++/**
++ * mpt3sas_config_get_driver_trigger_pg3 - obtain driver trigger page 3
++ * @ioc: per adapter object
++ * @mpi_reply: reply mf payload returned from firmware
++ * @config_page: contents of the config page
++ * Context: sleep.
++ *
++ * Returns 0 for success, non-zero for failure.
++ */
++int
++mpt3sas_config_get_driver_trigger_pg3(struct MPT3SAS_ADAPTER *ioc,
++	Mpi2ConfigReply_t *mpi_reply, Mpi26DriverTriggerPage3_t *config_page)
++{
++	Mpi2ConfigRequest_t mpi_request;
++	int r;
++
++	memset(&mpi_request, 0, sizeof(Mpi2ConfigRequest_t));
++	mpi_request.Function = MPI2_FUNCTION_CONFIG;
++	mpi_request.Action = MPI2_CONFIG_ACTION_PAGE_HEADER;
++	mpi_request.Header.PageType = MPI2_CONFIG_PAGETYPE_EXTENDED;
++	mpi_request.ExtPageType =
++	    MPI2_CONFIG_EXTPAGETYPE_DRIVER_PERSISTENT_TRIGGER;
++	mpi_request.Header.PageNumber = 3;
++	mpi_request.Header.PageVersion = MPI26_DRIVER_TRIGGER_PAGE3_PAGEVERSION;
++	ioc->build_zero_len_sge_mpi(ioc, &mpi_request.PageBufferSGE);
++	r = _config_request(ioc, &mpi_request, mpi_reply,
++	    MPT3_CONFIG_PAGE_DEFAULT_TIMEOUT, NULL, 0);
++	if (r)
++		goto out;
++
++	mpi_request.Action = MPI2_CONFIG_ACTION_PAGE_READ_CURRENT;
++	r = _config_request(ioc, &mpi_request, mpi_reply,
++	    MPT3_CONFIG_PAGE_DEFAULT_TIMEOUT, config_page,
++	    sizeof(*config_page));
++ out:
++	return r;
++}
++
++/**
++ * mpt3sas_config_set_driver_trigger_pg3 - write driver trigger page 3
++ * @ioc: per adapter object
++ * @mpi_reply: reply mf payload returned from firmware
++ * @config_page: contents of the config page
++ * Context: sleep.
++ *
++ * Returns 0 for success, non-zero for failure.
++ */
++static int
++_config_set_driver_trigger_pg3(struct MPT3SAS_ADAPTER *ioc,
++	Mpi2ConfigReply_t *mpi_reply, Mpi26DriverTriggerPage3_t *config_page)
++{
++	Mpi2ConfigRequest_t mpi_request;
++	int r;
++
++	memset(&mpi_request, 0, sizeof(Mpi2ConfigRequest_t));
++	mpi_request.Function = MPI2_FUNCTION_CONFIG;
++	mpi_request.Action = MPI2_CONFIG_ACTION_PAGE_HEADER;
++	mpi_request.Header.PageType = MPI2_CONFIG_PAGETYPE_EXTENDED;
++	mpi_request.ExtPageType =
++	    MPI2_CONFIG_EXTPAGETYPE_DRIVER_PERSISTENT_TRIGGER;
++	mpi_request.Header.PageNumber = 3;
++	mpi_request.Header.PageVersion = MPI26_DRIVER_TRIGGER_PAGE3_PAGEVERSION;
++	ioc->build_zero_len_sge_mpi(ioc, &mpi_request.PageBufferSGE);
++	r = _config_request(ioc, &mpi_request, mpi_reply,
++	    MPT3_CONFIG_PAGE_DEFAULT_TIMEOUT, NULL, 0);
++	if (r)
++		goto out;
++
++	mpi_request.Action = MPI2_CONFIG_ACTION_PAGE_WRITE_CURRENT;
++	_config_request(ioc, &mpi_request, mpi_reply,
++	    MPT3_CONFIG_PAGE_DEFAULT_TIMEOUT, config_page,
++	    sizeof(*config_page));
++	mpi_request.Action = MPI2_CONFIG_ACTION_PAGE_WRITE_NVRAM;
++	r = _config_request(ioc, &mpi_request, mpi_reply,
++	    MPT3_CONFIG_PAGE_DEFAULT_TIMEOUT, config_page,
++	    sizeof(*config_page));
++ out:
++	return r;
++}
++
++/**
++ * mpt3sas_config_update_driver_trigger_pg3 - update driver trigger page 3
++ * @ioc: per adapter object
++ * @scsi_tg: scsi trigger list
++ * @set: set ot clear trigger values
++ * Context: sleep.
++ *
++ * Returns 0 for success, non-zero for failure.
++ */
++int
++mpt3sas_config_update_driver_trigger_pg3(struct MPT3SAS_ADAPTER *ioc,
++	struct SL_WH_SCSI_TRIGGERS_T *scsi_tg, bool set)
++{
++	Mpi26DriverTriggerPage3_t tg_pg3;
++	Mpi2ConfigReply_t mpi_reply;
++	int rc, i, count;
++	u16 ioc_status;
++
++	rc = mpt3sas_config_update_driver_trigger_pg0(ioc,
++	    MPI26_DRIVER_TRIGGER0_FLAG_SCSI_SENSE_TRIGGER_VALID, set);
++	if (rc)
++		return rc;
++
++	rc = mpt3sas_config_get_driver_trigger_pg3(ioc, &mpi_reply, &tg_pg3);
++	if (rc)
++		goto out;
++
++	ioc_status = le16_to_cpu(mpi_reply.IOCStatus) &
++	    MPI2_IOCSTATUS_MASK;
++	if (ioc_status != MPI2_IOCSTATUS_SUCCESS) {
++		dcprintk(ioc,
++		    ioc_err(ioc,
++		    "%s: Failed to get trigger pg3, ioc_status(0x%04x)\n",
++		    __func__, ioc_status));
++		return -EFAULT;
++	}
++
++	if (set) {
++		count = scsi_tg->ValidEntries;
++		tg_pg3.NumSCSISenseTrigger = cpu_to_le16(count);
++		for (i = 0; i < count; i++) {
++			tg_pg3.SCSISenseTriggers[i].ASCQ =
++			    scsi_tg->SCSITriggerEntry[i].ASCQ;
++			tg_pg3.SCSISenseTriggers[i].ASC =
++			    scsi_tg->SCSITriggerEntry[i].ASC;
++			tg_pg3.SCSISenseTriggers[i].SenseKey =
++			    scsi_tg->SCSITriggerEntry[i].SenseKey;
++		}
++	} else {
++		tg_pg3.NumSCSISenseTrigger = 0;
++		memset(&tg_pg3.SCSISenseTriggers[0], 0,
++		    NUM_VALID_ENTRIES * sizeof(
++		    MPI26_DRIVER_SCSI_SENSE_TIGGER_ENTRY));
++	}
++
++	rc = _config_set_driver_trigger_pg3(ioc, &mpi_reply, &tg_pg3);
++	if (rc)
++		goto out;
++
++	ioc_status = le16_to_cpu(mpi_reply.IOCStatus) &
++	    MPI2_IOCSTATUS_MASK;
++	if (ioc_status != MPI2_IOCSTATUS_SUCCESS) {
++		dcprintk(ioc,
++		    ioc_err(ioc,
++		    "%s: Failed to get trigger pg3, ioc_status(0x%04x)\n",
++		     __func__, ioc_status));
++		return -EFAULT;
++	}
++
++	return 0;
++out:
++	mpt3sas_config_update_driver_trigger_pg0(ioc,
++	    MPI26_DRIVER_TRIGGER0_FLAG_SCSI_SENSE_TRIGGER_VALID, !set);
++
++	return rc;
++}
++
+ /**
+  * mpt3sas_config_get_volume_handle - returns volume handle for give hidden
+  * raid components
+-- 
+2.34.1
+

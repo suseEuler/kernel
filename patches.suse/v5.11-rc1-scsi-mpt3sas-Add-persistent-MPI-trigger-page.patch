@@ -1,0 +1,338 @@
+From 0e17a87c5950b91aa5ed11ba569b46dea13b1e0d Mon Sep 17 00:00:00 2001
+From: Suganath Prabu S <suganath-prabu.subramani@broadcom.com>
+Date: Thu, 26 Nov 2020 15:13:09 +0530
+Subject: [PATCH] scsi: mpt3sas: Add persistent MPI trigger page
+Git-commit: 0e17a87c5950b91aa5ed11ba569b46dea13b1e0d
+Patch-mainline: v5.11-rc1
+References: bsn#59
+Modified-by-SEL: No
+
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This page is used to store information about MPI (IOC Status & LogInfo)
+triggers.
+
+ Driver Persistent Trigger Page-4 format:
+ -------------------------------------------------------
+ | 31       24 23           16 15         8 7          0|  Byte
+ -------------------------------------------------------
+ | PageType   | PageNumber    | Reserved  | PageVersion |  0x00
+ --------------------------------------------------------
+ | Reserved   | ExtPageType   |      ExtPageLength      |  0x04
+ --------------------------------------------------------
+ |          Reserved          | NumMpiTriggerEntries    |  0x08
+ --------------------------------------------------------
+ |             MPITriggerEntry[0]                       |  0x0C
+ --------------------------------------------------------
+ |               …                                      |
+ --------------------------------------------------------
+ |            MPITriggerEntry[19]                       |  0xA4
+ --------------------------------------------------------
+
+NumMpiTriggerEntries:
+
+This field indicates number of MPI (IOC Status & LogInfo) trigger entries
+stored in this page. Currently driver is supporting a maximum of 20-MPI
+trigger entries.
+
+MPITriggerEntry:
+
+ -----------------------------------------------------
+ | 31                    16 15                     0 |
+ -----------------------------------------------------
+ |        Reserved         |      IOCStatus          |
+ -----------------------------------------------------
+ |                   IOCLogInfo                      |
+ -----------------------------------------------------
+
+IOCStatus  => Status value from the IOC
+IOCLogInfo => Specific value that supplements the IOCStatus.
+
+Link: https://lore.kernel.org/r/20201126094311.8686-7-suganath-prabu.subramani@broadcom.com
+Reported-by: kernel test robot <lkp@intel.com>
+Signed-off-by: Suganath Prabu S <suganath-prabu.subramani@broadcom.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/scsi/mpt3sas/mpt3sas_base.c   |  61 +++++++++-
+ drivers/scsi/mpt3sas/mpt3sas_base.h   |   6 +
+ drivers/scsi/mpt3sas/mpt3sas_config.c | 158 ++++++++++++++++++++++++++
+ 3 files changed, 224 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_base.c b/drivers/scsi/mpt3sas/mpt3sas_base.c
+index 8c2ef565e8d7..ce3ef9e2d6d1 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_base.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_base.c
+@@ -4899,6 +4899,59 @@ _base_get_scsi_diag_triggers(struct MPT3SAS_ADAPTER *ioc)
+ 	}
+ }
+ 
++/**
++ * _base_get_mpi_diag_triggers - get mpi diag trigger values from
++ *				persistent pages
++ * @ioc : per adapter object
++ *
++ * Return nothing.
++ */
++static void
++_base_get_mpi_diag_triggers(struct MPT3SAS_ADAPTER *ioc)
++{
++	Mpi26DriverTriggerPage4_t trigger_pg4;
++	struct SL_WH_MPI_TRIGGER_T *status_tg;
++	MPI26_DRIVER_IOCSTATUS_LOGINFO_TIGGER_ENTRY *mpi_status_tg;
++	Mpi2ConfigReply_t mpi_reply;
++	int r = 0, i = 0;
++	u16 count = 0;
++	u16 ioc_status;
++
++	r = mpt3sas_config_get_driver_trigger_pg4(ioc, &mpi_reply,
++	    &trigger_pg4);
++	if (r)
++		return;
++
++	ioc_status = le16_to_cpu(mpi_reply.IOCStatus) &
++	    MPI2_IOCSTATUS_MASK;
++	if (ioc_status != MPI2_IOCSTATUS_SUCCESS) {
++		dinitprintk(ioc,
++		    ioc_err(ioc,
++		    "%s: Failed to get trigger pg4, ioc_status(0x%04x)\n",
++		    __func__, ioc_status));
++		return;
++	}
++
++	if (le16_to_cpu(trigger_pg4.NumIOCStatusLogInfoTrigger)) {
++		count = le16_to_cpu(trigger_pg4.NumIOCStatusLogInfoTrigger);
++		count = min_t(u16, NUM_VALID_ENTRIES, count);
++		ioc->diag_trigger_mpi.ValidEntries = count;
++
++		status_tg = &ioc->diag_trigger_mpi.MPITriggerEntry[0];
++		mpi_status_tg = &trigger_pg4.IOCStatusLoginfoTriggers[0];
++
++		for (i = 0; i < count; i++) {
++			status_tg->IOCStatus = le16_to_cpu(
++			    mpi_status_tg->IOCStatus);
++			status_tg->IocLogInfo = le32_to_cpu(
++			    mpi_status_tg->LogInfo);
++
++			status_tg++;
++			mpi_status_tg++;
++		}
++	}
++}
++
+ /**
+  * _base_get_master_diag_triggers - get master diag trigger values from
+  *				persistent pages
+@@ -5011,7 +5064,13 @@ _base_get_diag_triggers(struct MPT3SAS_ADAPTER *ioc)
+ 	if ((u16)trigger_flags &
+ 	    MPI26_DRIVER_TRIGGER0_FLAG_SCSI_SENSE_TRIGGER_VALID)
+ 		_base_get_scsi_diag_triggers(ioc);
+-
++	/*
++	 * Retrieve mpi error diag trigger values from driver trigger pg4
++	 * if loginfo trigger bit enabled in TriggerFlags.
++	 */
++	if ((u16)trigger_flags &
++	    MPI26_DRIVER_TRIGGER0_FLAG_LOGINFO_TRIGGER_VALID)
++		_base_get_mpi_diag_triggers(ioc);
+ }
+ 
+ /**
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_base.h b/drivers/scsi/mpt3sas/mpt3sas_base.h
+index ffc04e6c9b26..352e6cd21388 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_base.h
++++ b/drivers/scsi/mpt3sas/mpt3sas_base.h
+@@ -1832,6 +1832,9 @@ int
+ mpt3sas_config_get_driver_trigger_pg3(struct MPT3SAS_ADAPTER *ioc,
+ 	Mpi2ConfigReply_t *mpi_reply, Mpi26DriverTriggerPage3_t *config_page);
+ int
++mpt3sas_config_get_driver_trigger_pg4(struct MPT3SAS_ADAPTER *ioc,
++	Mpi2ConfigReply_t *mpi_reply, Mpi26DriverTriggerPage4_t *config_page);
++int
+ mpt3sas_config_update_driver_trigger_pg1(struct MPT3SAS_ADAPTER *ioc,
+ 	struct SL_WH_MASTER_TRIGGER_T *master_tg, bool set);
+ int
+@@ -1840,6 +1843,9 @@ mpt3sas_config_update_driver_trigger_pg2(struct MPT3SAS_ADAPTER *ioc,
+ int
+ mpt3sas_config_update_driver_trigger_pg3(struct MPT3SAS_ADAPTER *ioc,
+ 	struct SL_WH_SCSI_TRIGGERS_T *scsi_tg, bool set);
++int
++mpt3sas_config_update_driver_trigger_pg4(struct MPT3SAS_ADAPTER *ioc,
++	struct SL_WH_MPI_TRIGGERS_T *mpi_tg, bool set);
+ 
+ /* ctl shared API */
+ extern struct device_attribute *mpt3sas_host_attrs[];
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_config.c b/drivers/scsi/mpt3sas/mpt3sas_config.c
+index ae1caba662f3..8238843523b5 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_config.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_config.c
+@@ -2344,6 +2344,164 @@ mpt3sas_config_update_driver_trigger_pg3(struct MPT3SAS_ADAPTER *ioc,
+ 	return rc;
+ }
+ 
++/**
++ * mpt3sas_config_get_driver_trigger_pg4 - obtain driver trigger page 4
++ * @ioc: per adapter object
++ * @mpi_reply: reply mf payload returned from firmware
++ * @config_page: contents of the config page
++ * Context: sleep.
++ *
++ * Returns 0 for success, non-zero for failure.
++ */
++int
++mpt3sas_config_get_driver_trigger_pg4(struct MPT3SAS_ADAPTER *ioc,
++	Mpi2ConfigReply_t *mpi_reply, Mpi26DriverTriggerPage4_t *config_page)
++{
++	Mpi2ConfigRequest_t mpi_request;
++	int r;
++
++	memset(&mpi_request, 0, sizeof(Mpi2ConfigRequest_t));
++	mpi_request.Function = MPI2_FUNCTION_CONFIG;
++	mpi_request.Action = MPI2_CONFIG_ACTION_PAGE_HEADER;
++	mpi_request.Header.PageType = MPI2_CONFIG_PAGETYPE_EXTENDED;
++	mpi_request.ExtPageType =
++	    MPI2_CONFIG_EXTPAGETYPE_DRIVER_PERSISTENT_TRIGGER;
++	mpi_request.Header.PageNumber = 4;
++	mpi_request.Header.PageVersion = MPI26_DRIVER_TRIGGER_PAGE4_PAGEVERSION;
++	ioc->build_zero_len_sge_mpi(ioc, &mpi_request.PageBufferSGE);
++	r = _config_request(ioc, &mpi_request, mpi_reply,
++	    MPT3_CONFIG_PAGE_DEFAULT_TIMEOUT, NULL, 0);
++	if (r)
++		goto out;
++
++	mpi_request.Action = MPI2_CONFIG_ACTION_PAGE_READ_CURRENT;
++	r = _config_request(ioc, &mpi_request, mpi_reply,
++	    MPT3_CONFIG_PAGE_DEFAULT_TIMEOUT, config_page,
++	    sizeof(*config_page));
++ out:
++	return r;
++}
++
++/**
++ * mpt3sas_config_set_driver_trigger_pg4 - write driver trigger page 4
++ * @ioc: per adapter object
++ * @mpi_reply: reply mf payload returned from firmware
++ * @config_page: contents of the config page
++ * Context: sleep.
++ *
++ * Returns 0 for success, non-zero for failure.
++ */
++static int
++_config_set_driver_trigger_pg4(struct MPT3SAS_ADAPTER *ioc,
++	Mpi2ConfigReply_t *mpi_reply, Mpi26DriverTriggerPage4_t *config_page)
++{
++	Mpi2ConfigRequest_t mpi_request;
++	int r;
++
++	memset(&mpi_request, 0, sizeof(Mpi2ConfigRequest_t));
++	mpi_request.Function = MPI2_FUNCTION_CONFIG;
++	mpi_request.Action = MPI2_CONFIG_ACTION_PAGE_HEADER;
++	mpi_request.Header.PageType = MPI2_CONFIG_PAGETYPE_EXTENDED;
++	mpi_request.ExtPageType =
++	    MPI2_CONFIG_EXTPAGETYPE_DRIVER_PERSISTENT_TRIGGER;
++	mpi_request.Header.PageNumber = 4;
++	mpi_request.Header.PageVersion = MPI26_DRIVER_TRIGGER_PAGE4_PAGEVERSION;
++	ioc->build_zero_len_sge_mpi(ioc, &mpi_request.PageBufferSGE);
++	r = _config_request(ioc, &mpi_request, mpi_reply,
++	    MPT3_CONFIG_PAGE_DEFAULT_TIMEOUT, NULL, 0);
++	if (r)
++		goto out;
++
++	mpi_request.Action = MPI2_CONFIG_ACTION_PAGE_WRITE_CURRENT;
++	_config_request(ioc, &mpi_request, mpi_reply,
++	    MPT3_CONFIG_PAGE_DEFAULT_TIMEOUT, config_page,
++	    sizeof(*config_page));
++	mpi_request.Action = MPI2_CONFIG_ACTION_PAGE_WRITE_NVRAM;
++	r = _config_request(ioc, &mpi_request, mpi_reply,
++	    MPT3_CONFIG_PAGE_DEFAULT_TIMEOUT, config_page,
++	    sizeof(*config_page));
++ out:
++	return r;
++}
++
++/**
++ * mpt3sas_config_update_driver_trigger_pg4 - update driver trigger page 4
++ * @ioc: per adapter object
++ * @mpi_tg: mpi trigger list
++ * @set: set ot clear trigger values
++ * Context: sleep.
++ *
++ * Returns 0 for success, non-zero for failure.
++ */
++int
++mpt3sas_config_update_driver_trigger_pg4(struct MPT3SAS_ADAPTER *ioc,
++	struct SL_WH_MPI_TRIGGERS_T *mpi_tg, bool set)
++{
++	Mpi26DriverTriggerPage4_t tg_pg4;
++	Mpi2ConfigReply_t mpi_reply;
++	int rc, i, count;
++	u16 ioc_status;
++
++	rc = mpt3sas_config_update_driver_trigger_pg0(ioc,
++	    MPI26_DRIVER_TRIGGER0_FLAG_LOGINFO_TRIGGER_VALID, set);
++	if (rc)
++		return rc;
++
++	rc = mpt3sas_config_get_driver_trigger_pg4(ioc, &mpi_reply, &tg_pg4);
++	if (rc)
++		goto out;
++
++	ioc_status = le16_to_cpu(mpi_reply.IOCStatus) &
++	    MPI2_IOCSTATUS_MASK;
++	if (ioc_status != MPI2_IOCSTATUS_SUCCESS) {
++		dcprintk(ioc,
++		    ioc_err(ioc,
++		    "%s: Failed to get trigger pg4, ioc_status(0x%04x)\n",
++		    __func__, ioc_status));
++		rc = -EFAULT;
++		goto out;
++	}
++
++	if (set) {
++		count = mpi_tg->ValidEntries;
++		tg_pg4.NumIOCStatusLogInfoTrigger = cpu_to_le16(count);
++		for (i = 0; i < count; i++) {
++			tg_pg4.IOCStatusLoginfoTriggers[i].IOCStatus =
++			    cpu_to_le16(mpi_tg->MPITriggerEntry[i].IOCStatus);
++			tg_pg4.IOCStatusLoginfoTriggers[i].LogInfo =
++			    cpu_to_le32(mpi_tg->MPITriggerEntry[i].IocLogInfo);
++		}
++	} else {
++		tg_pg4.NumIOCStatusLogInfoTrigger = 0;
++		memset(&tg_pg4.IOCStatusLoginfoTriggers[0], 0,
++		    NUM_VALID_ENTRIES * sizeof(
++		    MPI26_DRIVER_IOCSTATUS_LOGINFO_TIGGER_ENTRY));
++	}
++
++	rc = _config_set_driver_trigger_pg4(ioc, &mpi_reply, &tg_pg4);
++	if (rc)
++		goto out;
++
++	ioc_status = le16_to_cpu(mpi_reply.IOCStatus) &
++	    MPI2_IOCSTATUS_MASK;
++	if (ioc_status != MPI2_IOCSTATUS_SUCCESS) {
++		dcprintk(ioc,
++		    ioc_err(ioc,
++		    "%s: Failed to get trigger pg4, ioc_status(0x%04x)\n",
++		    __func__, ioc_status));
++		rc = -EFAULT;
++		goto out;
++	}
++
++	return 0;
++
++out:
++	mpt3sas_config_update_driver_trigger_pg0(ioc,
++	    MPI26_DRIVER_TRIGGER0_FLAG_LOGINFO_TRIGGER_VALID, !set);
++
++	return rc;
++}
++
+ /**
+  * mpt3sas_config_get_volume_handle - returns volume handle for give hidden
+  * raid components
+-- 
+2.34.1
+

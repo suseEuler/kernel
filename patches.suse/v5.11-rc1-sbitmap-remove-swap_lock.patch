@@ -1,0 +1,85 @@
+From 661d4f55a79483aee4970a76e3bd9d4cdc74ac79 Mon Sep 17 00:00:00 2001
+From: Pavel Begunkov <asml.silence@gmail.com>
+Date: Sun, 22 Nov 2020 15:35:46 +0000
+Subject: [PATCH] sbitmap: remove swap_lock
+Git-commit: 661d4f55a79483aee4970a76e3bd9d4cdc74ac79
+Patch-mainline: v5.11-rc1
+References: bsn#59
+Modified-by-SEL: No
+
+
+map->swap_lock protects map->cleared from concurrent modification,
+however sbitmap_deferred_clear() is already atomically drains it, so
+it's guaranteed to not loose bits on concurrent
+sbitmap_deferred_clear().
+
+A one threaded tag heavy test on top of nullbk showed ~1.5% t-put
+increase, and 3% -> 1% cycle reduction of sbitmap_get() according to perf.
+
+Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/sbitmap.h |  5 -----
+ lib/sbitmap.c           | 14 +++-----------
+ 2 files changed, 3 insertions(+), 16 deletions(-)
+
+diff --git a/include/linux/sbitmap.h b/include/linux/sbitmap.h
+index e40d019c3d9d..74cc6384715e 100644
+--- a/include/linux/sbitmap.h
++++ b/include/linux/sbitmap.h
+@@ -32,11 +32,6 @@ struct sbitmap_word {
+ 	 * @cleared: word holding cleared bits
+ 	 */
+ 	unsigned long cleared ____cacheline_aligned_in_smp;
+-
+-	/**
+-	 * @swap_lock: Held while swapping word <-> cleared
+-	 */
+-	spinlock_t swap_lock;
+ } ____cacheline_aligned_in_smp;
+ 
+ /**
+diff --git a/lib/sbitmap.c b/lib/sbitmap.c
+index c1c8a4e69325..4fd877048ba8 100644
+--- a/lib/sbitmap.c
++++ b/lib/sbitmap.c
+@@ -15,13 +15,9 @@
+ static inline bool sbitmap_deferred_clear(struct sbitmap_word *map)
+ {
+ 	unsigned long mask, val;
+-	bool ret = false;
+-	unsigned long flags;
+ 
+-	spin_lock_irqsave(&map->swap_lock, flags);
+-
+-	if (!map->cleared)
+-		goto out_unlock;
++	if (!READ_ONCE(map->cleared))
++		return false;
+ 
+ 	/*
+ 	 * First get a stable cleared mask, setting the old mask to 0.
+@@ -35,10 +31,7 @@ static inline bool sbitmap_deferred_clear(struct sbitmap_word *map)
+ 		val = map->word;
+ 	} while (cmpxchg(&map->word, val, val & ~mask) != val);
+ 
+-	ret = true;
+-out_unlock:
+-	spin_unlock_irqrestore(&map->swap_lock, flags);
+-	return ret;
++	return true;
+ }
+ 
+ int sbitmap_init_node(struct sbitmap *sb, unsigned int depth, int shift,
+@@ -80,7 +73,6 @@ int sbitmap_init_node(struct sbitmap *sb, unsigned int depth, int shift,
+ 	for (i = 0; i < sb->map_nr; i++) {
+ 		sb->map[i].depth = min(depth, bits_per_word);
+ 		depth -= sb->map[i].depth;
+-		spin_lock_init(&sb->map[i].swap_lock);
+ 	}
+ 	return 0;
+ }
+-- 
+2.34.1
+

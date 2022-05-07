@@ -1,0 +1,125 @@
+From 8278807abd338f2246b6ae8057f2ec61a80a5614 Mon Sep 17 00:00:00 2001
+From: Ming Lei <ming.lei@redhat.com>
+Date: Fri, 22 Jan 2021 10:33:15 +0800
+Subject: [PATCH] scsi: core: Add scsi_device_busy() wrapper
+Git-commit: 8278807abd338f2246b6ae8057f2ec61a80a5614
+Patch-mainline: v5.13-rc1
+References: bsn#59
+Modified-by-SEL: No
+
+
+Add scsi_device_busy() helper to prepare drivers for tracking device queue
+depth via sbitmap_queue.
+
+Link: https://lore.kernel.org/r/20210122023317.687987-12-ming.lei@redhat.com
+Cc: Omar Sandoval <osandov@fb.com>
+Cc: Kashyap Desai <kashyap.desai@broadcom.com>
+Cc: Sumanesh Samanta <sumanesh.samanta@broadcom.com>
+Cc: Ewan D. Milne <emilne@redhat.com>
+Tested-by: Sumanesh Samanta <sumanesh.samanta@broadcom.com>
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Signed-off-by: Ming Lei <ming.lei@redhat.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/message/fusion/mptsas.c      | 2 +-
+ drivers/scsi/mpt3sas/mpt3sas_scsih.c | 2 +-
+ drivers/scsi/scsi_lib.c              | 4 ++--
+ drivers/scsi/scsi_sysfs.c            | 2 +-
+ drivers/scsi/sg.c                    | 2 +-
+ include/scsi/scsi_device.h           | 5 +++++
+ 6 files changed, 11 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/message/fusion/mptsas.c b/drivers/message/fusion/mptsas.c
+index 5eb0b3361e4e..85aa5788826b 100644
+--- a/drivers/message/fusion/mptsas.c
++++ b/drivers/message/fusion/mptsas.c
+@@ -3781,7 +3781,7 @@ mptsas_send_link_status_event(struct fw_event_work *fw_event)
+ 						printk(MYIOC_s_DEBUG_FMT
+ 						"SDEV OUTSTANDING CMDS"
+ 						"%d\n", ioc->name,
+-						atomic_read(&sdev->device_busy)));
++						scsi_device_busy(sdev)));
+ 				}
+ 
+ 			}
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_scsih.c b/drivers/scsi/mpt3sas/mpt3sas_scsih.c
+index ffca03064797..7bd0a57e5b92 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_scsih.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_scsih.c
+@@ -3423,7 +3423,7 @@ scsih_dev_reset(struct scsi_cmnd *scmd)
+ 		MPI2_SCSITASKMGMT_TASKTYPE_LOGICAL_UNIT_RESET, 0, 0,
+ 		tr_timeout, tr_method);
+ 	/* Check for busy commands after reset */
+-	if (r == SUCCESS && atomic_read(&scmd->device->device_busy))
++	if (r == SUCCESS && scsi_device_busy(scmd->device))
+ 		r = FAILED;
+  out:
+ 	sdev_printk(KERN_INFO, scmd->device, "device reset: %s scmd(0x%p)\n",
+diff --git a/drivers/scsi/scsi_lib.c b/drivers/scsi/scsi_lib.c
+index dae9f66caffd..2f8578fb89ff 100644
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@ -385,7 +385,7 @@ static void scsi_single_lun_run(struct scsi_device *current_sdev)
+ 
+ static inline bool scsi_device_is_busy(struct scsi_device *sdev)
+ {
+-	if (atomic_read(&sdev->device_busy) >= sdev->queue_depth)
++	if (scsi_device_busy(sdev) >= sdev->queue_depth)
+ 		return true;
+ 	if (atomic_read(&sdev->device_blocked) > 0)
+ 		return true;
+@@ -1639,7 +1639,7 @@ static int scsi_mq_get_budget(struct request_queue *q)
+ 	 * the .restarts flag, and the request queue will be run for handling
+ 	 * this request, see scsi_end_request().
+ 	 */
+-	if (unlikely(atomic_read(&sdev->device_busy) == 0 &&
++	if (unlikely(scsi_device_busy(sdev) == 0 &&
+ 				!scsi_device_blocked(sdev)))
+ 		blk_mq_delay_run_hw_queues(sdev->request_queue, SCSI_QUEUE_DELAY);
+ 	return -1;
+diff --git a/drivers/scsi/scsi_sysfs.c b/drivers/scsi/scsi_sysfs.c
+index b6378c8ca783..0840e44140de 100644
+--- a/drivers/scsi/scsi_sysfs.c
++++ b/drivers/scsi/scsi_sysfs.c
+@@ -670,7 +670,7 @@ sdev_show_device_busy(struct device *dev, struct device_attribute *attr,
+ 		char *buf)
+ {
+ 	struct scsi_device *sdev = to_scsi_device(dev);
+-	return snprintf(buf, 20, "%d\n", atomic_read(&sdev->device_busy));
++	return snprintf(buf, 20, "%d\n", scsi_device_busy(sdev));
+ }
+ static DEVICE_ATTR(device_busy, S_IRUGO, sdev_show_device_busy, NULL);
+ 
+diff --git a/drivers/scsi/sg.c b/drivers/scsi/sg.c
+index 4383d93110f8..737cea9d908e 100644
+--- a/drivers/scsi/sg.c
++++ b/drivers/scsi/sg.c
+@@ -2503,7 +2503,7 @@ static int sg_proc_seq_show_dev(struct seq_file *s, void *v)
+ 			      scsidp->id, scsidp->lun, (int) scsidp->type,
+ 			      1,
+ 			      (int) scsidp->queue_depth,
+-			      (int) atomic_read(&scsidp->device_busy),
++			      (int) scsi_device_busy(scsidp),
+ 			      (int) scsi_device_online(scsidp));
+ 	}
+ 	read_unlock_irqrestore(&sg_index_lock, iflags);
+diff --git a/include/scsi/scsi_device.h b/include/scsi/scsi_device.h
+index 1a5c9a3df6d6..dd0b9f690a26 100644
+--- a/include/scsi/scsi_device.h
++++ b/include/scsi/scsi_device.h
+@@ -590,6 +590,11 @@ static inline int scsi_device_supports_vpd(struct scsi_device *sdev)
+ 	return 0;
+ }
+ 
++static inline int scsi_device_busy(struct scsi_device *sdev)
++{
++	return atomic_read(&sdev->device_busy);
++}
++
+ #define MODULE_ALIAS_SCSI_DEVICE(type) \
+ 	MODULE_ALIAS("scsi:t-" __stringify(type) "*")
+ #define SCSI_DEVICE_MODALIAS_FMT "scsi:t-0x%02x"
+-- 
+2.34.1
+

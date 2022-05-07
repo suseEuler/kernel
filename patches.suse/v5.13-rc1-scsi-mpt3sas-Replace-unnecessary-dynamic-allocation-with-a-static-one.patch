@@ -1,0 +1,116 @@
+From a1c4d7741323eff1d9c5baca8337ac3ac4630649 Mon Sep 17 00:00:00 2001
+From: "Gustavo A. R. Silva" <gustavoars@kernel.org>
+Date: Wed, 10 Mar 2021 17:59:51 -0600
+Subject: [PATCH] scsi: mpt3sas: Replace unnecessary dynamic allocation with a
+ static one
+Git-commit: a1c4d7741323eff1d9c5baca8337ac3ac4630649
+Patch-mainline: v5.13-rc1
+References: bsn#59
+Modified-by-SEL: No
+
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Dynamic memory allocation isn't actually needed and it can be replaced by
+statically allocating memory for struct object io_unit_pg3 with 36
+hardcoded entries for its GPIOVal array.
+
+Also, this helps the with ongoing efforts to enable -Warray-bounds by
+fixing the following warning:
+
+drivers/scsi/mpt3sas/mpt3sas_ctl.c: In function ‘BRM_status_show’:
+drivers/scsi/mpt3sas/mpt3sas_ctl.c:3257:63: warning: array subscript 24 is above array bounds of ‘U16[1]’ {aka ‘short unsigned int[1]’} [-Warray-bounds]
+ 3257 |  backup_rail_monitor_status = le16_to_cpu(io_unit_pg3->GPIOVal[24]);
+./include/uapi/linux/byteorder/little_endian.h:36:51: note: in definition of macro ‘__le16_to_cpu’
+   36 | #define __le16_to_cpu(x) ((__force __u16)(__le16)(x))
+      |                                                   ^
+drivers/scsi/mpt3sas/mpt3sas_ctl.c:3257:31: note: in expansion of macro ‘le16_to_cpu’
+ 3257 |  backup_rail_monitor_status = le16_to_cpu(io_unit_pg3->GPIOVal[24]);
+
+Link: https://github.com/KSPP/linux/issues/109
+Link: https://lore.kernel.org/lkml/202103101058.16ED27BE3@keescook/
+Link: https://lore.kernel.org/r/20210310235951.GA108661@embeddedor
+Reviewed-by: Kees Cook <keescook@chromium.org>
+Signed-off-by: Gustavo A. R. Silva <gustavoars@kernel.org>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/scsi/mpt3sas/mpi/mpi2_cnfg.h |  2 +-
+ drivers/scsi/mpt3sas/mpt3sas_ctl.c   | 24 ++++++++----------------
+ 2 files changed, 9 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/scsi/mpt3sas/mpi/mpi2_cnfg.h b/drivers/scsi/mpt3sas/mpi/mpi2_cnfg.h
+index 43a3bf8ff428..d00431f553e1 100644
+--- a/drivers/scsi/mpt3sas/mpi/mpi2_cnfg.h
++++ b/drivers/scsi/mpt3sas/mpi/mpi2_cnfg.h
+@@ -992,7 +992,7 @@ typedef struct _MPI2_CONFIG_PAGE_IO_UNIT_1 {
+  *one and check the value returned for GPIOCount at runtime.
+  */
+ #ifndef MPI2_IO_UNIT_PAGE_3_GPIO_VAL_MAX
+-#define MPI2_IO_UNIT_PAGE_3_GPIO_VAL_MAX    (1)
++#define MPI2_IO_UNIT_PAGE_3_GPIO_VAL_MAX    (36)
+ #endif
+ 
+ typedef struct _MPI2_CONFIG_PAGE_IO_UNIT_3 {
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_ctl.c b/drivers/scsi/mpt3sas/mpt3sas_ctl.c
+index 8717412b8079..e7582fb8a93f 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_ctl.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_ctl.c
+@@ -3203,7 +3203,7 @@ BRM_status_show(struct device *cdev, struct device_attribute *attr,
+ {
+ 	struct Scsi_Host *shost = class_to_shost(cdev);
+ 	struct MPT3SAS_ADAPTER *ioc = shost_priv(shost);
+-	Mpi2IOUnitPage3_t *io_unit_pg3 = NULL;
++	Mpi2IOUnitPage3_t io_unit_pg3;
+ 	Mpi2ConfigReply_t mpi_reply;
+ 	u16 backup_rail_monitor_status = 0;
+ 	u16 ioc_status;
+@@ -3220,17 +3220,10 @@ BRM_status_show(struct device *cdev, struct device_attribute *attr,
+ 	if (ioc->pci_error_recovery || ioc->remove_host)
+ 		goto out;
+ 
+-	/* allocate upto GPIOVal 36 entries */
+-	sz = offsetof(Mpi2IOUnitPage3_t, GPIOVal) + (sizeof(u16) * 36);
+-	io_unit_pg3 = kzalloc(sz, GFP_KERNEL);
+-	if (!io_unit_pg3) {
+-		rc = -ENOMEM;
+-		ioc_err(ioc, "%s: failed allocating memory for iounit_pg3: (%d) bytes\n",
+-			__func__, sz);
+-		goto out;
+-	}
++	sz = sizeof(io_unit_pg3);
++	memset(&io_unit_pg3, 0, sz);
+ 
+-	if (mpt3sas_config_get_iounit_pg3(ioc, &mpi_reply, io_unit_pg3, sz) !=
++	if (mpt3sas_config_get_iounit_pg3(ioc, &mpi_reply, &io_unit_pg3, sz) !=
+ 	    0) {
+ 		ioc_err(ioc, "%s: failed reading iounit_pg3\n",
+ 			__func__);
+@@ -3246,19 +3239,18 @@ BRM_status_show(struct device *cdev, struct device_attribute *attr,
+ 		goto out;
+ 	}
+ 
+-	if (io_unit_pg3->GPIOCount < 25) {
+-		ioc_err(ioc, "%s: iounit_pg3->GPIOCount less than 25 entries, detected (%d) entries\n",
+-			__func__, io_unit_pg3->GPIOCount);
++	if (io_unit_pg3.GPIOCount < 25) {
++		ioc_err(ioc, "%s: iounit_pg3.GPIOCount less than 25 entries, detected (%d) entries\n",
++			__func__, io_unit_pg3.GPIOCount);
+ 		rc = -EINVAL;
+ 		goto out;
+ 	}
+ 
+ 	/* BRM status is in bit zero of GPIOVal[24] */
+-	backup_rail_monitor_status = le16_to_cpu(io_unit_pg3->GPIOVal[24]);
++	backup_rail_monitor_status = le16_to_cpu(io_unit_pg3.GPIOVal[24]);
+ 	rc = snprintf(buf, PAGE_SIZE, "%d\n", (backup_rail_monitor_status & 1));
+ 
+  out:
+-	kfree(io_unit_pg3);
+ 	mutex_unlock(&ioc->pci_access_mutex);
+ 	return rc;
+ }
+-- 
+2.34.1
+

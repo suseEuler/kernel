@@ -1,0 +1,103 @@
+From 9b271c69128b46e2735df732819c5a5b1f4252af Mon Sep 17 00:00:00 2001
+From: Suganath Prabu S <suganath-prabu.subramani@broadcom.com>
+Date: Thu, 26 Nov 2020 15:13:10 +0530
+Subject: [PATCH] scsi: mpt3sas: Handle trigger page after firmware update
+Git-commit: 9b271c69128b46e2735df732819c5a5b1f4252af
+Patch-mainline: v5.11-rc1
+References: bsn#59
+Modified-by-SEL: No
+
+
+If a firmware update adds support for the trigger pages, then the driver
+should handle this by writing the existing trigger data from the driver's
+internal data structure to the corresponding trigger pages in NVRAM.
+
+Also handle the case where the trigger page capability is no longer present
+after a firmware downgrade.
+
+Link: https://lore.kernel.org/r/20201126094311.8686-8-suganath-prabu.subramani@broadcom.com
+Signed-off-by: Suganath Prabu S <suganath-prabu.subramani@broadcom.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/scsi/mpt3sas/mpt3sas_base.c | 50 ++++++++++++++++++++++++++++-
+ 1 file changed, 49 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_base.c b/drivers/scsi/mpt3sas/mpt3sas_base.c
+index ce3ef9e2d6d1..b129f3734ed0 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_base.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_base.c
+@@ -5073,6 +5073,35 @@ _base_get_diag_triggers(struct MPT3SAS_ADAPTER *ioc)
+ 		_base_get_mpi_diag_triggers(ioc);
+ }
+ 
++/**
++ * _base_update_diag_trigger_pages - Update the driver trigger pages after
++ *			online FW update, incase updated FW supports driver
++ *			trigger pages.
++ * @ioc : per adapter object
++ *
++ * Return nothing.
++ */
++static void
++_base_update_diag_trigger_pages(struct MPT3SAS_ADAPTER *ioc)
++{
++
++	if (ioc->diag_trigger_master.MasterData)
++		mpt3sas_config_update_driver_trigger_pg1(ioc,
++		    &ioc->diag_trigger_master, 1);
++
++	if (ioc->diag_trigger_event.ValidEntries)
++		mpt3sas_config_update_driver_trigger_pg2(ioc,
++		    &ioc->diag_trigger_event, 1);
++
++	if (ioc->diag_trigger_scsi.ValidEntries)
++		mpt3sas_config_update_driver_trigger_pg3(ioc,
++		    &ioc->diag_trigger_scsi, 1);
++
++	if (ioc->diag_trigger_mpi.ValidEntries)
++		mpt3sas_config_update_driver_trigger_pg4(ioc,
++		    &ioc->diag_trigger_mpi, 1);
++}
++
+ /**
+  * _base_static_config_pages - static start of day config pages
+  * @ioc: per adapter object
+@@ -5082,7 +5111,7 @@ _base_static_config_pages(struct MPT3SAS_ADAPTER *ioc)
+ {
+ 	Mpi2ConfigReply_t mpi_reply;
+ 	u32 iounit_pg1_flags;
+-
++	int tg_flags = 0;
+ 	ioc->nvme_abort_timeout = 30;
+ 	mpt3sas_config_get_manufacturing_pg0(ioc, &mpi_reply, &ioc->manu_pg0);
+ 	if (ioc->ir_firmware)
+@@ -5162,6 +5191,25 @@ _base_static_config_pages(struct MPT3SAS_ADAPTER *ioc)
+ 	if (ioc->is_gen35_ioc) {
+ 		if (ioc->is_driver_loading)
+ 			_base_get_diag_triggers(ioc);
++		else {
++			/*
++			 * In case of online HBA FW update operation,
++			 * check whether updated FW supports the driver trigger
++			 * pages or not.
++			 * - If previous FW has not supported driver trigger
++			 *   pages and newer FW supports them then update these
++			 *   pages with current diag trigger values.
++			 * - If previous FW has supported driver trigger pages
++			 *   and new FW doesn't support them then disable
++			 *   support_trigger_pages flag.
++			 */
++			tg_flags = _base_check_for_trigger_pages_support(ioc);
++			if (!ioc->supports_trigger_pages && tg_flags != -EFAULT)
++				_base_update_diag_trigger_pages(ioc);
++			else if (ioc->supports_trigger_pages &&
++			    tg_flags == -EFAULT)
++				ioc->supports_trigger_pages = 0;
++		}
+ 	}
+ }
+ 
+-- 
+2.34.1
+

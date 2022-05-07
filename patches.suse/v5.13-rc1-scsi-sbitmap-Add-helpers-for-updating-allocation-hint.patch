@@ -1,0 +1,166 @@
+From bf2c4282a10a92810ba83e85677a5273d6ca0df5 Mon Sep 17 00:00:00 2001
+From: Ming Lei <ming.lei@redhat.com>
+Date: Fri, 22 Jan 2021 10:33:07 +0800
+Subject: [PATCH] scsi: sbitmap: Add helpers for updating allocation hint
+Git-commit: bf2c4282a10a92810ba83e85677a5273d6ca0df5
+Patch-mainline: v5.13-rc1
+References: bsn#59
+Modified-by-SEL: No
+
+
+Add helpers for updating allocation hint so that we can avoid duplicate
+code.
+
+Prepare for moving allocation hint into sbitmap.
+
+Link: https://lore.kernel.org/r/20210122023317.687987-4-ming.lei@redhat.com
+Cc: Omar Sandoval <osandov@fb.com>
+Cc: Kashyap Desai <kashyap.desai@broadcom.com>
+Cc: Sumanesh Samanta <sumanesh.samanta@broadcom.com>
+Cc: Ewan D. Milne <emilne@redhat.com>
+Cc: Hannes Reinecke <hare@suse.de>
+Tested-by: Sumanesh Samanta <sumanesh.samanta@broadcom.com>
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Signed-off-by: Ming Lei <ming.lei@redhat.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ lib/sbitmap.c | 93 ++++++++++++++++++++++++++++++---------------------
+ 1 file changed, 54 insertions(+), 39 deletions(-)
+
+diff --git a/lib/sbitmap.c b/lib/sbitmap.c
+index 7000636933b3..2b43a6aefec3 100644
+--- a/lib/sbitmap.c
++++ b/lib/sbitmap.c
+@@ -9,6 +9,55 @@
+ #include <linux/sbitmap.h>
+ #include <linux/seq_file.h>
+ 
++static int init_alloc_hint(struct sbitmap_queue *sbq, gfp_t flags)
++{
++	unsigned depth = sbq->sb.depth;
++
++	sbq->alloc_hint = alloc_percpu_gfp(unsigned int, flags);
++	if (!sbq->alloc_hint)
++		return -ENOMEM;
++
++	if (depth && !sbq->sb.round_robin) {
++		int i;
++
++		for_each_possible_cpu(i)
++			*per_cpu_ptr(sbq->alloc_hint, i) = prandom_u32() % depth;
++	}
++
++	return 0;
++}
++
++static inline unsigned update_alloc_hint_before_get(struct sbitmap_queue *sbq,
++						    unsigned int depth)
++{
++	unsigned hint;
++
++	hint = this_cpu_read(*sbq->alloc_hint);
++	if (unlikely(hint >= depth)) {
++		hint = depth ? prandom_u32() % depth : 0;
++		this_cpu_write(*sbq->alloc_hint, hint);
++	}
++
++	return hint;
++}
++
++static inline void update_alloc_hint_after_get(struct sbitmap_queue *sbq,
++					       unsigned int depth,
++					       unsigned int hint,
++					       unsigned int nr)
++{
++	if (nr == -1) {
++		/* If the map is full, a hint won't do us much good. */
++		this_cpu_write(*sbq->alloc_hint, 0);
++	} else if (nr == hint || unlikely(sbq->sb.round_robin)) {
++		/* Only update the hint if we used it. */
++		hint = nr + 1;
++		if (hint >= depth - 1)
++			hint = 0;
++		this_cpu_write(*sbq->alloc_hint, hint);
++	}
++}
++
+ /*
+  * See if we have deferred clears that we can batch move
+  */
+@@ -355,17 +404,11 @@ int sbitmap_queue_init_node(struct sbitmap_queue *sbq, unsigned int depth,
+ 	if (ret)
+ 		return ret;
+ 
+-	sbq->alloc_hint = alloc_percpu_gfp(unsigned int, flags);
+-	if (!sbq->alloc_hint) {
++	if (init_alloc_hint(sbq, flags) != 0) {
+ 		sbitmap_free(&sbq->sb);
+ 		return -ENOMEM;
+ 	}
+ 
+-	if (depth && !round_robin) {
+-		for_each_possible_cpu(i)
+-			*per_cpu_ptr(sbq->alloc_hint, i) = prandom_u32() % depth;
+-	}
+-
+ 	sbq->min_shallow_depth = UINT_MAX;
+ 	sbq->wake_batch = sbq_calc_wake_batch(sbq, depth);
+ 	atomic_set(&sbq->wake_index, 0);
+@@ -418,24 +461,10 @@ int __sbitmap_queue_get(struct sbitmap_queue *sbq)
+ 	unsigned int hint, depth;
+ 	int nr;
+ 
+-	hint = this_cpu_read(*sbq->alloc_hint);
+ 	depth = READ_ONCE(sbq->sb.depth);
+-	if (unlikely(hint >= depth)) {
+-		hint = depth ? prandom_u32() % depth : 0;
+-		this_cpu_write(*sbq->alloc_hint, hint);
+-	}
++	hint = update_alloc_hint_before_get(sbq, depth);
+ 	nr = sbitmap_get(&sbq->sb, hint);
+-
+-	if (nr == -1) {
+-		/* If the map is full, a hint won't do us much good. */
+-		this_cpu_write(*sbq->alloc_hint, 0);
+-	} else if (nr == hint || unlikely(sbq->sb.round_robin)) {
+-		/* Only update the hint if we used it. */
+-		hint = nr + 1;
+-		if (hint >= depth - 1)
+-			hint = 0;
+-		this_cpu_write(*sbq->alloc_hint, hint);
+-	}
++	update_alloc_hint_after_get(sbq, depth, hint, nr);
+ 
+ 	return nr;
+ }
+@@ -449,24 +478,10 @@ int __sbitmap_queue_get_shallow(struct sbitmap_queue *sbq,
+ 
+ 	WARN_ON_ONCE(shallow_depth < sbq->min_shallow_depth);
+ 
+-	hint = this_cpu_read(*sbq->alloc_hint);
+ 	depth = READ_ONCE(sbq->sb.depth);
+-	if (unlikely(hint >= depth)) {
+-		hint = depth ? prandom_u32() % depth : 0;
+-		this_cpu_write(*sbq->alloc_hint, hint);
+-	}
++	hint = update_alloc_hint_before_get(sbq, depth);
+ 	nr = sbitmap_get_shallow(&sbq->sb, hint, shallow_depth);
+-
+-	if (nr == -1) {
+-		/* If the map is full, a hint won't do us much good. */
+-		this_cpu_write(*sbq->alloc_hint, 0);
+-	} else if (nr == hint || unlikely(sbq->sb.round_robin)) {
+-		/* Only update the hint if we used it. */
+-		hint = nr + 1;
+-		if (hint >= depth - 1)
+-			hint = 0;
+-		this_cpu_write(*sbq->alloc_hint, hint);
+-	}
++	update_alloc_hint_after_get(sbq, depth, hint, nr);
+ 
+ 	return nr;
+ }
+-- 
+2.34.1
+
