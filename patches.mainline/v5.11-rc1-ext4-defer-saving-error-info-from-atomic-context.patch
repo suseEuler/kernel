@@ -5,6 +5,7 @@ Subject: [PATCH] ext4: defer saving error info from atomic context
 Git-commit: c92dc856848f32781e37b88c1b7f875e274f5efb
 Patch-mainline: v5.11-rc1
 References: bsn#12
+Modified-by-SEL: Yes, refreshed due to context change
 
 
 When filesystem inconsistency is detected with group locked, we
@@ -29,9 +30,9 @@ Reported-by: syzbot+9043030c040ce1849a60@syzkaller.appspotmail.com
 Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
 Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 ---
- fs/ext4/ext4.h  |  21 +++++++++
- fs/ext4/super.c | 118 +++++++++++++++++++++++++++++++++---------------
- 2 files changed, 103 insertions(+), 36 deletions(-)
+ fs/ext4/ext4.h  |   21 +++++++++
+ fs/ext4/super.c |  120 ++++++++++++++++++++++++++++++++++++++------------------
+ 2 files changed, 104 insertions(+), 37 deletions(-)
 
 --- a/fs/ext4/ext4.h
 +++ b/fs/ext4/ext4.h
@@ -191,15 +192,15 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  	ext4_handle_error(sb, false);
  	/*
  	 * We only get here in the ERRORS_RO case; relocking the group
-@@ -1124,6 +1122,7 @@ static void ext4_put_super(struct super_
+@@ -1136,6 +1134,7 @@ static void ext4_put_super(struct super_
  	ext4_unregister_li_request(sb);
  	ext4_quota_off_umount(sb);
  
 +	flush_work(&sbi->s_error_work);
  	destroy_workqueue(sbi->rsv_conversion_wq);
  
- 	/*
-@@ -4669,6 +4668,8 @@ static int ext4_fill_super(struct super_
+ 	if (sbi->s_journal) {
+@@ -4676,6 +4675,8 @@ static int ext4_fill_super(struct super_
  	}
  
  	timer_setup(&sbi->s_err_report, print_daily_error_info, 0);
@@ -208,7 +209,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  
  	/* Register extent status tree shrinker */
  	if (ext4_es_register_shrinker(sbi))
-@@ -5121,6 +5122,7 @@ failed_mount3a:
+@@ -5137,6 +5138,7 @@ failed_mount3a:
  	ext4_es_unregister_shrinker(sbi);
  failed_mount3:
  	del_timer_sync(&sbi->s_err_report);
@@ -216,7 +217,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  	ext4_stop_mmpd(sbi);
  failed_mount2:
  	rcu_read_lock();
-@@ -5447,6 +5449,7 @@ err_out:
+@@ -5463,6 +5465,7 @@ err_out:
  
  static int ext4_commit_super(struct super_block *sb, int sync)
  {
@@ -224,7 +225,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  	struct ext4_super_block *es = EXT4_SB(sb)->s_es;
  	struct buffer_head *sbh = EXT4_SB(sb)->s_sbh;
  	int error = 0;
-@@ -5485,6 +5488,46 @@ static int ext4_commit_super(struct supe
+@@ -5501,6 +5504,46 @@ static int ext4_commit_super(struct supe
  		es->s_free_inodes_count =
  			cpu_to_le32(percpu_counter_sum_positive(
  				&EXT4_SB(sb)->s_freeinodes_counter));
@@ -271,7 +272,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  	BUFFER_TRACE(sbh, "marking dirty");
  	ext4_superblock_csum_set(sb);
  	if (sync)
-@@ -5838,6 +5881,9 @@ static int ext4_remount(struct super_blo
+@@ -5854,6 +5897,9 @@ static int ext4_remount(struct super_blo
  		set_task_ioprio(sbi->s_journal->j_task, journal_ioprio);
  	}
  
