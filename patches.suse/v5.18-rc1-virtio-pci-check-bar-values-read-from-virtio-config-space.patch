@@ -1,0 +1,96 @@
+From 3f63a1d7f6f500b6891b1003cec3e23ea4996a2e Mon Sep 17 00:00:00 2001
+From: Keir Fraser <keirf@google.com>
+Date: Wed, 23 Mar 2022 14:07:27 +0000
+Subject: [PATCH] virtio: pci: check bar values read from virtio config space
+Git-commit: 3f63a1d7f6f500b6891b1003cec3e23ea4996a2e
+Patch-mainline: v5.18-rc1
+References: bsn#198
+Modified-by-SEL: No
+
+
+virtio pci config structures may in future have non-standard bar
+values in the bar field. We should anticipate this by skipping any
+structures containing such a reserved value.
+
+The bar value should never change: check for harmful modified values
+we re-read it from the config space in vp_modern_map_capability().
+
+Also clean up an existing check to consistently use PCI_STD_NUM_BARS.
+
+Signed-off-by: Keir Fraser <keirf@google.com>
+Link: https://lore.kernel.org/r/20220323140727.3499235-1-keirf@google.com
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/virtio/virtio_pci_modern.c     | 12 +++++++++---
+ drivers/virtio/virtio_pci_modern_dev.c |  9 ++++++++-
+ 2 files changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/virtio/virtio_pci_modern.c b/drivers/virtio/virtio_pci_modern.c
+index 30654d3a0b41..a2671a20ef77 100644
+--- a/drivers/virtio/virtio_pci_modern.c
++++ b/drivers/virtio/virtio_pci_modern.c
+@@ -293,7 +293,7 @@ static int virtio_pci_find_shm_cap(struct pci_dev *dev, u8 required_id,
+ 
+ 	for (pos = pci_find_capability(dev, PCI_CAP_ID_VNDR); pos > 0;
+ 	     pos = pci_find_next_capability(dev, pos, PCI_CAP_ID_VNDR)) {
+-		u8 type, cap_len, id;
++		u8 type, cap_len, id, res_bar;
+ 		u32 tmp32;
+ 		u64 res_offset, res_length;
+ 
+@@ -315,9 +315,14 @@ static int virtio_pci_find_shm_cap(struct pci_dev *dev, u8 required_id,
+ 		if (id != required_id)
+ 			continue;
+ 
+-		/* Type, and ID match, looks good */
+ 		pci_read_config_byte(dev, pos + offsetof(struct virtio_pci_cap,
+-							 bar), bar);
++							 bar), &res_bar);
++		if (res_bar >= PCI_STD_NUM_BARS)
++			continue;
++
++		/* Type and ID match, and the BAR value isn't reserved.
++		 * Looks good.
++		 */
+ 
+ 		/* Read the lower 32bit of length and offset */
+ 		pci_read_config_dword(dev, pos + offsetof(struct virtio_pci_cap,
+@@ -337,6 +342,7 @@ static int virtio_pci_find_shm_cap(struct pci_dev *dev, u8 required_id,
+ 						     length_hi), &tmp32);
+ 		res_length |= ((u64)tmp32) << 32;
+ 
++		*bar = res_bar;
+ 		*offset = res_offset;
+ 		*len = res_length;
+ 
+diff --git a/drivers/virtio/virtio_pci_modern_dev.c b/drivers/virtio/virtio_pci_modern_dev.c
+index e8b3ff2b9fbc..591738ad3d56 100644
+--- a/drivers/virtio/virtio_pci_modern_dev.c
++++ b/drivers/virtio/virtio_pci_modern_dev.c
+@@ -35,6 +35,13 @@ vp_modern_map_capability(struct virtio_pci_modern_device *mdev, int off,
+ 	pci_read_config_dword(dev, off + offsetof(struct virtio_pci_cap, length),
+ 			      &length);
+ 
++	/* Check if the BAR may have changed since we requested the region. */
++	if (bar >= PCI_STD_NUM_BARS || !(mdev->modern_bars & (1 << bar))) {
++		dev_err(&dev->dev,
++			"virtio_pci: bar unexpectedly changed to %u\n", bar);
++		return NULL;
++	}
++
+ 	if (length <= start) {
+ 		dev_err(&dev->dev,
+ 			"virtio_pci: bad capability len %u (>%u expected)\n",
+@@ -120,7 +127,7 @@ static inline int virtio_pci_find_capability(struct pci_dev *dev, u8 cfg_type,
+ 				     &bar);
+ 
+ 		/* Ignore structures with reserved BAR values */
+-		if (bar > 0x5)
++		if (bar >= PCI_STD_NUM_BARS)
+ 			continue;
+ 
+ 		if (type == cfg_type) {
+-- 
+2.34.1
+

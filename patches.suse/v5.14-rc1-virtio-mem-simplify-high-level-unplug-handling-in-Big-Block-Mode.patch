@@ -1,0 +1,160 @@
+From c6bc1422fa55033c1bd04c788203af8be2d5ce4c Mon Sep 17 00:00:00 2001
+From: David Hildenbrand <david@redhat.com>
+Date: Wed, 2 Jun 2021 20:57:19 +0200
+Subject: [PATCH] virtio-mem: simplify high-level unplug handling in Big Block
+ Mode
+Git-commit: c6bc1422fa55033c1bd04c788203af8be2d5ce4c
+Patch-mainline: v5.14-rc1
+References: bsn#198
+Modified-by-SEL: No
+
+
+Let's simplify high-level big block selection when unplugging in
+Big Block Mode.
+
+Combine handling of offline and online blocks. We can get rid of
+virtio_mem_bbm_bb_is_offline() and simply use
+virtio_mem_bbm_offline_remove_and_unplug_bb(), as that already tolerates
+offline parts.
+
+We can race with concurrent onlining/offlining either way, so we don;t
+have to be super correct by failing if an offline big block we'd like to
+unplug just got (partially) onlined.
+
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Link: https://lore.kernel.org/r/20210602185720.31821-7-david@redhat.com
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/virtio/virtio_mem.c | 96 ++++++++++---------------------------
+ 1 file changed, 24 insertions(+), 72 deletions(-)
+
+diff --git a/drivers/virtio/virtio_mem.c b/drivers/virtio/virtio_mem.c
+index 156a79ceb9fc..43199389c414 100644
+--- a/drivers/virtio/virtio_mem.c
++++ b/drivers/virtio/virtio_mem.c
+@@ -702,18 +702,6 @@ static int virtio_mem_sbm_remove_mb(struct virtio_mem *vm, unsigned long mb_id)
+ 	return virtio_mem_remove_memory(vm, addr, size);
+ }
+ 
+-/*
+- * See virtio_mem_remove_memory(): Try to remove all Linux memory blocks covered
+- * by the big block.
+- */
+-static int virtio_mem_bbm_remove_bb(struct virtio_mem *vm, unsigned long bb_id)
+-{
+-	const uint64_t addr = virtio_mem_bb_id_to_phys(vm, bb_id);
+-	const uint64_t size = vm->bbm.bb_size;
+-
+-	return virtio_mem_remove_memory(vm, addr, size);
+-}
+-
+ /*
+  * Try offlining and removing memory from Linux.
+  *
+@@ -2114,35 +2102,6 @@ static int virtio_mem_bbm_offline_remove_and_unplug_bb(struct virtio_mem *vm,
+ 	return rc;
+ }
+ 
+-/*
+- * Try to remove a big block from Linux and unplug it. Will fail with
+- * -EBUSY if some memory is online.
+- *
+- * Will modify the state of the memory block.
+- */
+-static int virtio_mem_bbm_remove_and_unplug_bb(struct virtio_mem *vm,
+-					       unsigned long bb_id)
+-{
+-	int rc;
+-
+-	if (WARN_ON_ONCE(virtio_mem_bbm_get_bb_state(vm, bb_id) !=
+-			 VIRTIO_MEM_BBM_BB_ADDED))
+-		return -EINVAL;
+-
+-	rc = virtio_mem_bbm_remove_bb(vm, bb_id);
+-	if (rc)
+-		return -EBUSY;
+-
+-	rc = virtio_mem_bbm_unplug_bb(vm, bb_id);
+-	if (rc)
+-		virtio_mem_bbm_set_bb_state(vm, bb_id,
+-					    VIRTIO_MEM_BBM_BB_PLUGGED);
+-	else
+-		virtio_mem_bbm_set_bb_state(vm, bb_id,
+-					    VIRTIO_MEM_BBM_BB_UNUSED);
+-	return rc;
+-}
+-
+ /*
+  * Test if a big block is completely offline.
+  */
+@@ -2166,42 +2125,35 @@ static int virtio_mem_bbm_unplug_request(struct virtio_mem *vm, uint64_t diff)
+ {
+ 	uint64_t nb_bb = diff / vm->bbm.bb_size;
+ 	uint64_t bb_id;
+-	int rc;
++	int rc, i;
+ 
+ 	if (!nb_bb)
+ 		return 0;
+ 
+-	/* Try to unplug completely offline big blocks first. */
+-	virtio_mem_bbm_for_each_bb_rev(vm, bb_id, VIRTIO_MEM_BBM_BB_ADDED) {
+-		cond_resched();
+-		/*
+-		 * As we're holding no locks, this check is racy as memory
+-		 * can get onlined in the meantime - but we'll fail gracefully.
+-		 */
+-		if (!virtio_mem_bbm_bb_is_offline(vm, bb_id))
+-			continue;
+-		rc = virtio_mem_bbm_remove_and_unplug_bb(vm, bb_id);
+-		if (rc == -EBUSY)
+-			continue;
+-		if (!rc)
+-			nb_bb--;
+-		if (rc || !nb_bb)
+-			return rc;
+-	}
+-
+-	if (!unplug_online)
+-		return 0;
++	/*
++	 * Try to unplug big blocks. Similar to SBM, start with offline
++	 * big blocks.
++	 */
++	for (i = 0; i < 2; i++) {
++		virtio_mem_bbm_for_each_bb_rev(vm, bb_id, VIRTIO_MEM_BBM_BB_ADDED) {
++			cond_resched();
+ 
+-	/* Try to unplug any big blocks. */
+-	virtio_mem_bbm_for_each_bb_rev(vm, bb_id, VIRTIO_MEM_BBM_BB_ADDED) {
+-		cond_resched();
+-		rc = virtio_mem_bbm_offline_remove_and_unplug_bb(vm, bb_id);
+-		if (rc == -EBUSY)
+-			continue;
+-		if (!rc)
+-			nb_bb--;
+-		if (rc || !nb_bb)
+-			return rc;
++			/*
++			 * As we're holding no locks, these checks are racy,
++			 * but we don't care.
++			 */
++			if (i == 0 && !virtio_mem_bbm_bb_is_offline(vm, bb_id))
++				continue;
++			rc = virtio_mem_bbm_offline_remove_and_unplug_bb(vm, bb_id);
++			if (rc == -EBUSY)
++				continue;
++			if (!rc)
++				nb_bb--;
++			if (rc || !nb_bb)
++				return rc;
++		}
++		if (i == 0 && !unplug_online)
++			return 0;
+ 	}
+ 
+ 	return nb_bb ? -EBUSY : 0;
+-- 
+2.34.1
+

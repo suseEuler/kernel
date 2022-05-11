@@ -1,0 +1,105 @@
+From 20b9150225c8e9599999b4e161192d8a8d56a4cb Mon Sep 17 00:00:00 2001
+From: David Hildenbrand <david@redhat.com>
+Date: Thu, 12 Nov 2020 14:37:49 +0100
+Subject: [PATCH] virtio-mem: simplify MAX_ORDER - 1 / pageblock_order handling
+Git-commit: 20b9150225c8e9599999b4e161192d8a8d56a4cb
+Patch-mainline: v5.11-rc1
+References: bsn#198
+Modified-by-SEL: No
+
+
+Let's use pageblock_nr_pages and MAX_ORDER_NR_PAGES instead where
+possible to simplify.
+
+Add a comment why we have that restriction for now.
+
+Reviewed-by: Wei Yang <richard.weiyang@linux.alibaba.com>
+Cc: "Michael S. Tsirkin" <mst@redhat.com>
+Cc: Jason Wang <jasowang@redhat.com>
+Cc: Pankaj Gupta <pankaj.gupta.linux@gmail.com>
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Link: https://lore.kernel.org/r/20201112133815.13332-4-david@redhat.com
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/virtio/virtio_mem.c | 35 +++++++++++++++++++----------------
+ 1 file changed, 19 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/virtio/virtio_mem.c b/drivers/virtio/virtio_mem.c
+index dee46865bae2..0f9d854e8e42 100644
+--- a/drivers/virtio/virtio_mem.c
++++ b/drivers/virtio/virtio_mem.c
+@@ -753,14 +753,15 @@ static void virtio_mem_clear_fake_offline(unsigned long pfn,
+  */
+ static void virtio_mem_fake_online(unsigned long pfn, unsigned int nr_pages)
+ {
+-	const int order = MAX_ORDER - 1;
++	const unsigned long max_nr_pages = MAX_ORDER_NR_PAGES;
+ 	int i;
+ 
+ 	/*
+-	 * We are always called with subblock granularity, which is at least
+-	 * aligned to MAX_ORDER - 1.
++	 * We are always called at least with MAX_ORDER_NR_PAGES
++	 * granularity/alignment (e.g., the way subblocks work). All pages
++	 * inside such a block are alike.
+ 	 */
+-	for (i = 0; i < nr_pages; i += 1 << order) {
++	for (i = 0; i < nr_pages; i += max_nr_pages) {
+ 		struct page *page = pfn_to_page(pfn + i);
+ 
+ 		/*
+@@ -770,14 +771,14 @@ static void virtio_mem_fake_online(unsigned long pfn, unsigned int nr_pages)
+ 		 * alike.
+ 		 */
+ 		if (PageDirty(page)) {
+-			virtio_mem_clear_fake_offline(pfn + i, 1 << order,
++			virtio_mem_clear_fake_offline(pfn + i, max_nr_pages,
+ 						      false);
+-			generic_online_page(page, order);
++			generic_online_page(page, MAX_ORDER - 1);
+ 		} else {
+-			virtio_mem_clear_fake_offline(pfn + i, 1 << order,
++			virtio_mem_clear_fake_offline(pfn + i, max_nr_pages,
+ 						      true);
+-			free_contig_range(pfn + i, 1 << order);
+-			adjust_managed_page_count(page, 1 << order);
++			free_contig_range(pfn + i, max_nr_pages);
++			adjust_managed_page_count(page, max_nr_pages);
+ 		}
+ 	}
+ }
+@@ -790,7 +791,7 @@ static void virtio_mem_online_page_cb(struct page *page, unsigned int order)
+ 	int sb_id;
+ 
+ 	/*
+-	 * We exploit here that subblocks have at least MAX_ORDER - 1
++	 * We exploit here that subblocks have at least MAX_ORDER_NR_PAGES.
+ 	 * size/alignment and that this callback is is called with such a
+ 	 * size/alignment. So we cannot cross subblocks and therefore
+ 	 * also not memory blocks.
+@@ -1673,13 +1674,15 @@ static int virtio_mem_init(struct virtio_mem *vm)
+ 			 "Some memory is not addressable. This can make some memory unusable.\n");
+ 
+ 	/*
+-	 * Calculate the subblock size:
+-	 * - At least MAX_ORDER - 1 / pageblock_order.
+-	 * - At least the device block size.
+-	 * In the worst case, a single subblock per memory block.
++	 * We want subblocks to span at least MAX_ORDER_NR_PAGES and
++	 * pageblock_nr_pages pages. This:
++	 * - Simplifies our page onlining code (virtio_mem_online_page_cb)
++	 *   and fake page onlining code (virtio_mem_fake_online).
++	 * - Is required for now for alloc_contig_range() to work reliably -
++	 *   it doesn't properly handle smaller granularity on ZONE_NORMAL.
+ 	 */
+-	vm->subblock_size = PAGE_SIZE * 1ul << max_t(uint32_t, MAX_ORDER - 1,
+-						     pageblock_order);
++	vm->subblock_size = max_t(uint64_t, MAX_ORDER_NR_PAGES,
++				  pageblock_nr_pages) * PAGE_SIZE;
+ 	vm->subblock_size = max_t(uint64_t, vm->device_block_size,
+ 				  vm->subblock_size);
+ 	vm->nb_sb_per_mb = memory_block_size_bytes() / vm->subblock_size;
+-- 
+2.34.1
+

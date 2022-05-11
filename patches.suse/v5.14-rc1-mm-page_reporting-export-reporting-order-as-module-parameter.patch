@@ -1,0 +1,122 @@
+From f58780a8e3851edae5bafb7d3af19425308a37f5 Mon Sep 17 00:00:00 2001
+From: Gavin Shan <gshan@redhat.com>
+Date: Mon, 28 Jun 2021 19:35:19 -0700
+Subject: [PATCH] mm/page_reporting: export reporting order as module parameter
+Git-commit: f58780a8e3851edae5bafb7d3af19425308a37f5
+Patch-mainline: v5.14-rc1
+References: bsn#198
+Modified-by-SEL: No
+
+
+The macro PAGE_REPORTING_MIN_ORDER is defined as the page reporting
+threshold.  It can't be adjusted at runtime.
+
+This introduces a variable (@page_reporting_order) to replace the marcro
+(PAGE_REPORTING_MIN_ORDER).  MAX_ORDER is assigned to it initially,
+meaning the page reporting is disabled.  It will be specified by driver if
+valid one is provided.  Otherwise, it will fall back to @pageblock_order.
+It's also exported so that the page reporting order can be adjusted at
+runtime.
+
+Link: https://lkml.kernel.org/r/20210625014710.42954-3-gshan@redhat.com
+Signed-off-by: Gavin Shan <gshan@redhat.com>
+Suggested-by: David Hildenbrand <david@redhat.com>
+Reviewed-by: Alexander Duyck <alexanderduyck@fb.com>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: "Michael S. Tsirkin" <mst@redhat.com>
+Cc: Will Deacon <will@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ Documentation/admin-guide/kernel-parameters.txt | 6 ++++++
+ mm/page_reporting.c                             | 9 +++++++--
+ mm/page_reporting.h                             | 5 ++---
+ 3 files changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index cb89dbdedc46..566c4b9af3cd 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -3566,6 +3566,12 @@
+ 			off: turn off poisoning (default)
+ 			on: turn on poisoning
+ 
++	page_reporting.page_reporting_order=
++			[KNL] Minimal page reporting order
++			Format: <integer>
++			Adjust the minimal page reporting order. The page
++			reporting is disabled when it exceeds (MAX_ORDER-1).
++
+ 	panic=		[KNL] Kernel behaviour on panic: delay <timeout>
+ 			timeout > 0: seconds before rebooting
+ 			timeout = 0: wait forever
+diff --git a/mm/page_reporting.c b/mm/page_reporting.c
+index df9c5054e1b4..34bf4d26c2c4 100644
+--- a/mm/page_reporting.c
++++ b/mm/page_reporting.c
+@@ -4,12 +4,17 @@
+ #include <linux/page_reporting.h>
+ #include <linux/gfp.h>
+ #include <linux/export.h>
++#include <linux/module.h>
+ #include <linux/delay.h>
+ #include <linux/scatterlist.h>
+ 
+ #include "page_reporting.h"
+ #include "internal.h"
+ 
++unsigned int page_reporting_order = MAX_ORDER;
++module_param(page_reporting_order, uint, 0644);
++MODULE_PARM_DESC(page_reporting_order, "Set page reporting order");
++
+ #define PAGE_REPORTING_DELAY	(2 * HZ)
+ static struct page_reporting_dev_info __rcu *pr_dev_info __read_mostly;
+ 
+@@ -229,7 +234,7 @@ page_reporting_process_zone(struct page_reporting_dev_info *prdev,
+ 
+ 	/* Generate minimum watermark to be able to guarantee progress */
+ 	watermark = low_wmark_pages(zone) +
+-		    (PAGE_REPORTING_CAPACITY << PAGE_REPORTING_MIN_ORDER);
++		    (PAGE_REPORTING_CAPACITY << page_reporting_order);
+ 
+ 	/*
+ 	 * Cancel request if insufficient free memory or if we failed
+@@ -239,7 +244,7 @@ page_reporting_process_zone(struct page_reporting_dev_info *prdev,
+ 		return err;
+ 
+ 	/* Process each free list starting from lowest order/mt */
+-	for (order = PAGE_REPORTING_MIN_ORDER; order < MAX_ORDER; order++) {
++	for (order = page_reporting_order; order < MAX_ORDER; order++) {
+ 		for (mt = 0; mt < MIGRATE_TYPES; mt++) {
+ 			/* We do not pull pages from the isolate free list */
+ 			if (is_migrate_isolate(mt))
+diff --git a/mm/page_reporting.h b/mm/page_reporting.h
+index 2c385dd4ddbd..c51dbc228b94 100644
+--- a/mm/page_reporting.h
++++ b/mm/page_reporting.h
+@@ -10,10 +10,9 @@
+ #include <linux/pgtable.h>
+ #include <linux/scatterlist.h>
+ 
+-#define PAGE_REPORTING_MIN_ORDER	pageblock_order
+-
+ #ifdef CONFIG_PAGE_REPORTING
+ DECLARE_STATIC_KEY_FALSE(page_reporting_enabled);
++extern unsigned int page_reporting_order;
+ void __page_reporting_notify(void);
+ 
+ static inline bool page_reported(struct page *page)
+@@ -38,7 +37,7 @@ static inline void page_reporting_notify_free(unsigned int order)
+ 		return;
+ 
+ 	/* Determine if we have crossed reporting threshold */
+-	if (order < PAGE_REPORTING_MIN_ORDER)
++	if (order < page_reporting_order)
+ 		return;
+ 
+ 	/* This will add a few cycles, but should be called infrequently */
+-- 
+2.34.1
+

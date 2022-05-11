@@ -1,0 +1,86 @@
+From 1225c216d9542ed4883027d3af50035c35a7a03c Mon Sep 17 00:00:00 2001
+From: Jason Wang <jasowang@redhat.com>
+Date: Wed, 2 Jun 2021 10:15:35 +0800
+Subject: [PATCH] vp_vdpa: allow set vq state to initial state after reset
+Git-commit: 1225c216d9542ed4883027d3af50035c35a7a03c
+Patch-mainline: v5.14-rc1
+References: bsn#198
+Modified-by-SEL: No
+
+
+We used to fail the set_vq_state() since it was not supported yet by
+the virtio spec. But if the bus tries to set the state which is equal
+to the device initial state after reset, we can let it go.
+
+This is a must for virtio_vdpa() to set vq state during probe which is
+required for some vDPA parents.
+
+Signed-off-by: Jason Wang <jasowang@redhat.com>
+Link: https://lore.kernel.org/r/20210602021536.39525-4-jasowang@redhat.com
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Reviewed-by: Eli Cohen <elic@nvidia.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/vdpa/virtio_pci/vp_vdpa.c | 42 ++++++++++++++++++++++++++++---
+ 1 file changed, 39 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/vdpa/virtio_pci/vp_vdpa.c b/drivers/vdpa/virtio_pci/vp_vdpa.c
+index 9145e0624565..7b4a6396c553 100644
+--- a/drivers/vdpa/virtio_pci/vp_vdpa.c
++++ b/drivers/vdpa/virtio_pci/vp_vdpa.c
+@@ -210,13 +210,49 @@ static int vp_vdpa_get_vq_state(struct vdpa_device *vdpa, u16 qid,
+ 	return -EOPNOTSUPP;
+ }
+ 
++static int vp_vdpa_set_vq_state_split(struct vdpa_device *vdpa,
++				      const struct vdpa_vq_state *state)
++{
++	const struct vdpa_vq_state_split *split = &state->split;
++
++	if (split->avail_index == 0)
++		return 0;
++
++	return -EOPNOTSUPP;
++}
++
++static int vp_vdpa_set_vq_state_packed(struct vdpa_device *vdpa,
++				       const struct vdpa_vq_state *state)
++{
++	const struct vdpa_vq_state_packed *packed = &state->packed;
++
++	if (packed->last_avail_counter == 1 &&
++	    packed->last_avail_idx == 0 &&
++	    packed->last_used_counter == 1 &&
++	    packed->last_used_idx == 0)
++		return 0;
++
++	return -EOPNOTSUPP;
++}
++
+ static int vp_vdpa_set_vq_state(struct vdpa_device *vdpa, u16 qid,
+ 				const struct vdpa_vq_state *state)
+ {
+-	/* Note that this is not supported by virtio specification, so
+-	 * we return -ENOPOTSUPP here. This means we can't support live
+-	 * migration, vhost device start/stop.
++	struct virtio_pci_modern_device *mdev = vdpa_to_mdev(vdpa);
++
++	/* Note that this is not supported by virtio specification.
++	 * But if the state is by chance equal to the device initial
++	 * state, we can let it go.
+ 	 */
++	if ((vp_modern_get_status(mdev) & VIRTIO_CONFIG_S_FEATURES_OK) &&
++	    !vp_modern_get_queue_enable(mdev, qid)) {
++		if (vp_modern_get_driver_features(mdev) &
++		    BIT_ULL(VIRTIO_F_RING_PACKED))
++			return vp_vdpa_set_vq_state_packed(vdpa, state);
++		else
++			return vp_vdpa_set_vq_state_split(vdpa,	state);
++	}
++
+ 	return -EOPNOTSUPP;
+ }
+ 
+-- 
+2.34.1
+

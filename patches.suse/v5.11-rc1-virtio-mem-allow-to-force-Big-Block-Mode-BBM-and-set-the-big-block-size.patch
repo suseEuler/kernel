@@ -1,0 +1,93 @@
+From faa45ff4ce885af93a3233a408c5a74b2943226b Mon Sep 17 00:00:00 2001
+From: David Hildenbrand <david@redhat.com>
+Date: Thu, 12 Nov 2020 14:38:12 +0100
+Subject: [PATCH] virtio-mem: allow to force Big Block Mode (BBM) and set the
+ big block size
+Git-commit: faa45ff4ce885af93a3233a408c5a74b2943226b
+Patch-mainline: v5.11-rc1
+References: bsn#198
+Modified-by-SEL: No
+
+
+Let's allow to force BBM, even if subblocks would be possible. Take care
+of properly calculating the first big block id, because the start
+address might no longer be aligned to the big block size.
+
+Also, allow to manually configure the size of Big Blocks.
+
+Reviewed-by: Wei Yang <richard.weiyang@linux.alibaba.com>
+Cc: "Michael S. Tsirkin" <mst@redhat.com>
+Cc: Jason Wang <jasowang@redhat.com>
+Cc: Pankaj Gupta <pankaj.gupta.linux@gmail.com>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Wei Yang <richard.weiyang@linux.alibaba.com>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Link: https://lore.kernel.org/r/20201112133815.13332-27-david@redhat.com
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/virtio/virtio_mem.c | 31 ++++++++++++++++++++++++++++---
+ 1 file changed, 28 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/virtio/virtio_mem.c b/drivers/virtio/virtio_mem.c
+index 8a4f735360ac..861149acafe5 100644
+--- a/drivers/virtio/virtio_mem.c
++++ b/drivers/virtio/virtio_mem.c
+@@ -27,6 +27,16 @@ static bool unplug_online = true;
+ module_param(unplug_online, bool, 0644);
+ MODULE_PARM_DESC(unplug_online, "Try to unplug online memory");
+ 
++static bool force_bbm;
++module_param(force_bbm, bool, 0444);
++MODULE_PARM_DESC(force_bbm,
++		"Force Big Block Mode. Default is 0 (auto-selection)");
++
++static unsigned long bbm_block_size;
++module_param(bbm_block_size, ulong, 0444);
++MODULE_PARM_DESC(bbm_block_size,
++		 "Big Block size in bytes. Default is 0 (auto-detection).");
++
+ /*
+  * virtio-mem currently supports the following modes of operation:
+  *
+@@ -2164,7 +2174,7 @@ static int virtio_mem_init(struct virtio_mem *vm)
+ 			pageblock_nr_pages) * PAGE_SIZE;
+ 	sb_size = max_t(uint64_t, vm->device_block_size, sb_size);
+ 
+-	if (sb_size < memory_block_size_bytes()) {
++	if (sb_size < memory_block_size_bytes() && !force_bbm) {
+ 		/* SBM: At least two subblocks per Linux memory block. */
+ 		vm->in_sbm = true;
+ 		vm->sbm.sb_size = sb_size;
+@@ -2177,9 +2187,24 @@ static int virtio_mem_init(struct virtio_mem *vm)
+ 		vm->sbm.next_mb_id = vm->sbm.first_mb_id;
+ 	} else {
+ 		/* BBM: At least one Linux memory block. */
+-		vm->bbm.bb_size = vm->device_block_size;
++		vm->bbm.bb_size = max_t(uint64_t, vm->device_block_size,
++					memory_block_size_bytes());
++
++		if (bbm_block_size) {
++			if (!is_power_of_2(bbm_block_size)) {
++				dev_warn(&vm->vdev->dev,
++					 "bbm_block_size is not a power of 2");
++			} else if (bbm_block_size < vm->bbm.bb_size) {
++				dev_warn(&vm->vdev->dev,
++					 "bbm_block_size is too small");
++			} else {
++				vm->bbm.bb_size = bbm_block_size;
++			}
++		}
+ 
+-		vm->bbm.first_bb_id = virtio_mem_phys_to_bb_id(vm, vm->addr);
++		/* Round up to the next aligned big block */
++		addr = vm->addr + vm->bbm.bb_size - 1;
++		vm->bbm.first_bb_id = virtio_mem_phys_to_bb_id(vm, addr);
+ 		vm->bbm.next_bb_id = vm->bbm.first_bb_id;
+ 	}
+ 
+-- 
+2.34.1
+

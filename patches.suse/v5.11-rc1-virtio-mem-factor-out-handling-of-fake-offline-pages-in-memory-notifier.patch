@@ -1,0 +1,147 @@
+From 7a34c77dab7e0c7ecb58da8bf600b7aadb4d878c Mon Sep 17 00:00:00 2001
+From: David Hildenbrand <david@redhat.com>
+Date: Thu, 12 Nov 2020 14:37:55 +0100
+Subject: [PATCH] virtio-mem: factor out handling of fake-offline pages in
+ memory notifier
+Git-commit: 7a34c77dab7e0c7ecb58da8bf600b7aadb4d878c
+Patch-mainline: v5.11-rc1
+References: bsn#198
+Modified-by-SEL: No
+
+
+Let's factor out the core pieces and place the implementation next to
+virtio_mem_fake_offline(). We'll reuse this functionality soon.
+
+Reviewed-by: Wei Yang <richard.weiyang@linux.alibaba.com>
+Cc: "Michael S. Tsirkin" <mst@redhat.com>
+Cc: Jason Wang <jasowang@redhat.com>
+Cc: Pankaj Gupta <pankaj.gupta.linux@gmail.com>
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Link: https://lore.kernel.org/r/20201112133815.13332-10-david@redhat.com
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/virtio/virtio_mem.c | 73 +++++++++++++++++++++++++------------
+ 1 file changed, 50 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/virtio/virtio_mem.c b/drivers/virtio/virtio_mem.c
+index fedfea27967e..c24055248f9d 100644
+--- a/drivers/virtio/virtio_mem.c
++++ b/drivers/virtio/virtio_mem.c
+@@ -160,6 +160,10 @@ static DEFINE_MUTEX(virtio_mem_mutex);
+ static LIST_HEAD(virtio_mem_devices);
+ 
+ static void virtio_mem_online_page_cb(struct page *page, unsigned int order);
++static void virtio_mem_fake_offline_going_offline(unsigned long pfn,
++						  unsigned long nr_pages);
++static void virtio_mem_fake_offline_cancel_offline(unsigned long pfn,
++						   unsigned long nr_pages);
+ 
+ /*
+  * Register a virtio-mem device so it will be considered for the online_page
+@@ -586,27 +590,15 @@ static void virtio_mem_notify_going_offline(struct virtio_mem *vm,
+ 					    unsigned long mb_id)
+ {
+ 	const unsigned long nr_pages = PFN_DOWN(vm->subblock_size);
+-	struct page *page;
+ 	unsigned long pfn;
+-	int sb_id, i;
++	int sb_id;
+ 
+ 	for (sb_id = 0; sb_id < vm->nb_sb_per_mb; sb_id++) {
+ 		if (virtio_mem_mb_test_sb_plugged(vm, mb_id, sb_id, 1))
+ 			continue;
+-		/*
+-		 * Drop our reference to the pages so the memory can get
+-		 * offlined and add the unplugged pages to the managed
+-		 * page counters (so offlining code can correctly subtract
+-		 * them again).
+-		 */
+ 		pfn = PFN_DOWN(virtio_mem_mb_id_to_phys(mb_id) +
+ 			       sb_id * vm->subblock_size);
+-		adjust_managed_page_count(pfn_to_page(pfn), nr_pages);
+-		for (i = 0; i < nr_pages; i++) {
+-			page = pfn_to_page(pfn + i);
+-			if (WARN_ON(!page_ref_dec_and_test(page)))
+-				dump_page(page, "unplugged page referenced");
+-		}
++		virtio_mem_fake_offline_going_offline(pfn, nr_pages);
+ 	}
+ }
+ 
+@@ -615,21 +607,14 @@ static void virtio_mem_notify_cancel_offline(struct virtio_mem *vm,
+ {
+ 	const unsigned long nr_pages = PFN_DOWN(vm->subblock_size);
+ 	unsigned long pfn;
+-	int sb_id, i;
++	int sb_id;
+ 
+ 	for (sb_id = 0; sb_id < vm->nb_sb_per_mb; sb_id++) {
+ 		if (virtio_mem_mb_test_sb_plugged(vm, mb_id, sb_id, 1))
+ 			continue;
+-		/*
+-		 * Get the reference we dropped when going offline and
+-		 * subtract the unplugged pages from the managed page
+-		 * counters.
+-		 */
+ 		pfn = PFN_DOWN(virtio_mem_mb_id_to_phys(mb_id) +
+ 			       sb_id * vm->subblock_size);
+-		adjust_managed_page_count(pfn_to_page(pfn), -nr_pages);
+-		for (i = 0; i < nr_pages; i++)
+-			page_ref_inc(pfn_to_page(pfn + i));
++		virtio_mem_fake_offline_cancel_offline(pfn, nr_pages);
+ 	}
+ }
+ 
+@@ -814,6 +799,48 @@ static int virtio_mem_fake_offline(unsigned long pfn, unsigned long nr_pages)
+ 	return 0;
+ }
+ 
++/*
++ * Handle fake-offline pages when memory is going offline - such that the
++ * pages can be skipped by mm-core when offlining.
++ */
++static void virtio_mem_fake_offline_going_offline(unsigned long pfn,
++						  unsigned long nr_pages)
++{
++	struct page *page;
++	unsigned long i;
++
++	/*
++	 * Drop our reference to the pages so the memory can get offlined
++	 * and add the unplugged pages to the managed page counters (so
++	 * offlining code can correctly subtract them again).
++	 */
++	adjust_managed_page_count(pfn_to_page(pfn), nr_pages);
++	/* Drop our reference to the pages so the memory can get offlined. */
++	for (i = 0; i < nr_pages; i++) {
++		page = pfn_to_page(pfn + i);
++		if (WARN_ON(!page_ref_dec_and_test(page)))
++			dump_page(page, "fake-offline page referenced");
++	}
++}
++
++/*
++ * Handle fake-offline pages when memory offlining is canceled - to undo
++ * what we did in virtio_mem_fake_offline_going_offline().
++ */
++static void virtio_mem_fake_offline_cancel_offline(unsigned long pfn,
++						   unsigned long nr_pages)
++{
++	unsigned long i;
++
++	/*
++	 * Get the reference we dropped when going offline and subtract the
++	 * unplugged pages from the managed page counters.
++	 */
++	adjust_managed_page_count(pfn_to_page(pfn), -nr_pages);
++	for (i = 0; i < nr_pages; i++)
++		page_ref_inc(pfn_to_page(pfn + i));
++}
++
+ static void virtio_mem_online_page_cb(struct page *page, unsigned int order)
+ {
+ 	const unsigned long addr = page_to_phys(page);
+-- 
+2.34.1
+

@@ -1,0 +1,83 @@
+From 89c486c47f2a450d7f064b4927b7f0ab911569a4 Mon Sep 17 00:00:00 2001
+From: David Hildenbrand <david@redhat.com>
+Date: Thu, 12 Nov 2020 14:37:54 +0100
+Subject: [PATCH] virtio-mem: factor out fake-offlining into
+ virtio_mem_fake_offline()
+Git-commit: 89c486c47f2a450d7f064b4927b7f0ab911569a4
+Patch-mainline: v5.11-rc1
+References: bsn#198
+Modified-by-SEL: No
+
+
+... which now matches virtio_mem_fake_online(). We'll reuse this
+functionality soon.
+
+Reviewed-by: Wei Yang <richard.weiyang@linux.alibaba.com>
+Reviewed-by: Pankaj Gupta <pankaj.gupta.linux@gmail.com>
+Cc: "Michael S. Tsirkin" <mst@redhat.com>
+Cc: Jason Wang <jasowang@redhat.com>
+Cc: Pankaj Gupta <pankaj.gupta.linux@gmail.com>
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Link: https://lore.kernel.org/r/20201112133815.13332-9-david@redhat.com
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/virtio/virtio_mem.c | 34 ++++++++++++++++++++++++----------
+ 1 file changed, 24 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/virtio/virtio_mem.c b/drivers/virtio/virtio_mem.c
+index 4742497feff0..fedfea27967e 100644
+--- a/drivers/virtio/virtio_mem.c
++++ b/drivers/virtio/virtio_mem.c
+@@ -793,6 +793,27 @@ static void virtio_mem_fake_online(unsigned long pfn, unsigned long nr_pages)
+ 	}
+ }
+ 
++/*
++ * Try to allocate a range, marking pages fake-offline, effectively
++ * fake-offlining them.
++ */
++static int virtio_mem_fake_offline(unsigned long pfn, unsigned long nr_pages)
++{
++	int rc;
++
++	rc = alloc_contig_range(pfn, pfn + nr_pages, MIGRATE_MOVABLE,
++				GFP_KERNEL);
++	if (rc == -ENOMEM)
++		/* whoops, out of memory */
++		return rc;
++	if (rc)
++		return -EBUSY;
++
++	virtio_mem_set_fake_offline(pfn, nr_pages, true);
++	adjust_managed_page_count(pfn_to_page(pfn), -nr_pages);
++	return 0;
++}
++
+ static void virtio_mem_online_page_cb(struct page *page, unsigned int order)
+ {
+ 	const unsigned long addr = page_to_phys(page);
+@@ -1328,17 +1349,10 @@ static int virtio_mem_mb_unplug_sb_online(struct virtio_mem *vm,
+ 
+ 	start_pfn = PFN_DOWN(virtio_mem_mb_id_to_phys(mb_id) +
+ 			     sb_id * vm->subblock_size);
+-	rc = alloc_contig_range(start_pfn, start_pfn + nr_pages,
+-				MIGRATE_MOVABLE, GFP_KERNEL);
+-	if (rc == -ENOMEM)
+-		/* whoops, out of memory */
+-		return rc;
+-	if (rc)
+-		return -EBUSY;
+ 
+-	/* Mark it as fake-offline before unplugging it */
+-	virtio_mem_set_fake_offline(start_pfn, nr_pages, true);
+-	adjust_managed_page_count(pfn_to_page(start_pfn), -nr_pages);
++	rc = virtio_mem_fake_offline(start_pfn, nr_pages);
++	if (rc)
++		return rc;
+ 
+ 	/* Try to unplug the allocated memory */
+ 	rc = virtio_mem_mb_unplug_sb(vm, mb_id, sb_id, count);
+-- 
+2.34.1
+
