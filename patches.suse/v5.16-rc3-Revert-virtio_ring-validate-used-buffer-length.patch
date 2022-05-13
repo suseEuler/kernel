@@ -1,0 +1,246 @@
+From f124034faa911ed534bf8c4881ad98dbbde2a966 Mon Sep 17 00:00:00 2001
+From: "Michael S. Tsirkin" <mst@redhat.com>
+Date: Wed, 24 Nov 2021 18:44:17 -0500
+Subject: [PATCH] Revert "virtio_ring: validate used buffer length"
+Git-commit: f124034faa911ed534bf8c4881ad98dbbde2a966
+Patch-mainline: v5.16-rc3
+References: git-fix
+Modified-by-SEL: No
+
+
+This reverts commit 939779f5152d161b34f612af29e7dc1ac4472fcf.
+
+Attempts to validate length in the core did not work out: there turn out
+to exist multiple broken devices, and in particular legacy devices are
+known to be broken in this respect.
+
+We have ideas for handling this better in the next version but for now
+let's revert to a known good state to make sure drivers work for people.
+
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/virtio/virtio_ring.c | 60 ------------------------------------
+ include/linux/virtio.h       |  2 --
+ 2 files changed, 62 deletions(-)
+
+diff --git a/drivers/virtio/virtio_ring.c b/drivers/virtio/virtio_ring.c
+index 00f64f2f8b72..6d2614e34470 100644
+--- a/drivers/virtio/virtio_ring.c
++++ b/drivers/virtio/virtio_ring.c
+@@ -14,9 +14,6 @@
+ #include <linux/spinlock.h>
+ #include <xen/xen.h>
+ 
+-static bool force_used_validation = false;
+-module_param(force_used_validation, bool, 0444);
+-
+ #ifdef DEBUG
+ /* For development, we want to crash whenever the ring is screwed. */
+ #define BAD_RING(_vq, fmt, args...)				\
+@@ -185,9 +182,6 @@ struct vring_virtqueue {
+ 		} packed;
+ 	};
+ 
+-	/* Per-descriptor in buffer length */
+-	u32 *buflen;
+-
+ 	/* How to notify other side. FIXME: commonalize hcalls! */
+ 	bool (*notify)(struct virtqueue *vq);
+ 
+@@ -496,7 +490,6 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
+ 	unsigned int i, n, avail, descs_used, prev, err_idx;
+ 	int head;
+ 	bool indirect;
+-	u32 buflen = 0;
+ 
+ 	START_USE(vq);
+ 
+@@ -578,7 +571,6 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
+ 						     VRING_DESC_F_NEXT |
+ 						     VRING_DESC_F_WRITE,
+ 						     indirect);
+-			buflen += sg->length;
+ 		}
+ 	}
+ 	/* Last one doesn't continue. */
+@@ -618,10 +610,6 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
+ 	else
+ 		vq->split.desc_state[head].indir_desc = ctx;
+ 
+-	/* Store in buffer length if necessary */
+-	if (vq->buflen)
+-		vq->buflen[head] = buflen;
+-
+ 	/* Put entry in available array (but don't update avail->idx until they
+ 	 * do sync). */
+ 	avail = vq->split.avail_idx_shadow & (vq->split.vring.num - 1);
+@@ -796,11 +784,6 @@ static void *virtqueue_get_buf_ctx_split(struct virtqueue *_vq,
+ 		BAD_RING(vq, "id %u is not a head!\n", i);
+ 		return NULL;
+ 	}
+-	if (vq->buflen && unlikely(*len > vq->buflen[i])) {
+-		BAD_RING(vq, "used len %d is larger than in buflen %u\n",
+-			*len, vq->buflen[i]);
+-		return NULL;
+-	}
+ 
+ 	/* detach_buf_split clears data, so grab it now. */
+ 	ret = vq->split.desc_state[i].data;
+@@ -1079,7 +1062,6 @@ static int virtqueue_add_indirect_packed(struct vring_virtqueue *vq,
+ 	unsigned int i, n, err_idx;
+ 	u16 head, id;
+ 	dma_addr_t addr;
+-	u32 buflen = 0;
+ 
+ 	head = vq->packed.next_avail_idx;
+ 	desc = alloc_indirect_packed(total_sg, gfp);
+@@ -1109,8 +1091,6 @@ static int virtqueue_add_indirect_packed(struct vring_virtqueue *vq,
+ 			desc[i].addr = cpu_to_le64(addr);
+ 			desc[i].len = cpu_to_le32(sg->length);
+ 			i++;
+-			if (n >= out_sgs)
+-				buflen += sg->length;
+ 		}
+ 	}
+ 
+@@ -1164,10 +1144,6 @@ static int virtqueue_add_indirect_packed(struct vring_virtqueue *vq,
+ 	vq->packed.desc_state[id].indir_desc = desc;
+ 	vq->packed.desc_state[id].last = id;
+ 
+-	/* Store in buffer length if necessary */
+-	if (vq->buflen)
+-		vq->buflen[id] = buflen;
+-
+ 	vq->num_added += 1;
+ 
+ 	pr_debug("Added buffer head %i to %p\n", head, vq);
+@@ -1203,7 +1179,6 @@ static inline int virtqueue_add_packed(struct virtqueue *_vq,
+ 	__le16 head_flags, flags;
+ 	u16 head, id, prev, curr, avail_used_flags;
+ 	int err;
+-	u32 buflen = 0;
+ 
+ 	START_USE(vq);
+ 
+@@ -1283,8 +1258,6 @@ static inline int virtqueue_add_packed(struct virtqueue *_vq,
+ 					1 << VRING_PACKED_DESC_F_AVAIL |
+ 					1 << VRING_PACKED_DESC_F_USED;
+ 			}
+-			if (n >= out_sgs)
+-				buflen += sg->length;
+ 		}
+ 	}
+ 
+@@ -1304,10 +1277,6 @@ static inline int virtqueue_add_packed(struct virtqueue *_vq,
+ 	vq->packed.desc_state[id].indir_desc = ctx;
+ 	vq->packed.desc_state[id].last = prev;
+ 
+-	/* Store in buffer length if necessary */
+-	if (vq->buflen)
+-		vq->buflen[id] = buflen;
+-
+ 	/*
+ 	 * A driver MUST NOT make the first descriptor in the list
+ 	 * available before all subsequent descriptors comprising
+@@ -1494,11 +1463,6 @@ static void *virtqueue_get_buf_ctx_packed(struct virtqueue *_vq,
+ 		BAD_RING(vq, "id %u is not a head!\n", id);
+ 		return NULL;
+ 	}
+-	if (vq->buflen && unlikely(*len > vq->buflen[id])) {
+-		BAD_RING(vq, "used len %d is larger than in buflen %u\n",
+-			*len, vq->buflen[id]);
+-		return NULL;
+-	}
+ 
+ 	/* detach_buf_packed clears data, so grab it now. */
+ 	ret = vq->packed.desc_state[id].data;
+@@ -1704,7 +1668,6 @@ static struct virtqueue *vring_create_virtqueue_packed(
+ 	struct vring_virtqueue *vq;
+ 	struct vring_packed_desc *ring;
+ 	struct vring_packed_desc_event *driver, *device;
+-	struct virtio_driver *drv = drv_to_virtio(vdev->dev.driver);
+ 	dma_addr_t ring_dma_addr, driver_event_dma_addr, device_event_dma_addr;
+ 	size_t ring_size_in_bytes, event_size_in_bytes;
+ 
+@@ -1794,15 +1757,6 @@ static struct virtqueue *vring_create_virtqueue_packed(
+ 	if (!vq->packed.desc_extra)
+ 		goto err_desc_extra;
+ 
+-	if (!drv->suppress_used_validation || force_used_validation) {
+-		vq->buflen = kmalloc_array(num, sizeof(*vq->buflen),
+-					   GFP_KERNEL);
+-		if (!vq->buflen)
+-			goto err_buflen;
+-	} else {
+-		vq->buflen = NULL;
+-	}
+-
+ 	/* No callback?  Tell other side not to bother us. */
+ 	if (!callback) {
+ 		vq->packed.event_flags_shadow = VRING_PACKED_EVENT_FLAG_DISABLE;
+@@ -1815,8 +1769,6 @@ static struct virtqueue *vring_create_virtqueue_packed(
+ 	spin_unlock(&vdev->vqs_list_lock);
+ 	return &vq->vq;
+ 
+-err_buflen:
+-	kfree(vq->packed.desc_extra);
+ err_desc_extra:
+ 	kfree(vq->packed.desc_state);
+ err_desc_state:
+@@ -2224,7 +2176,6 @@ struct virtqueue *__vring_new_virtqueue(unsigned int index,
+ 					void (*callback)(struct virtqueue *),
+ 					const char *name)
+ {
+-	struct virtio_driver *drv = drv_to_virtio(vdev->dev.driver);
+ 	struct vring_virtqueue *vq;
+ 
+ 	if (virtio_has_feature(vdev, VIRTIO_F_RING_PACKED))
+@@ -2284,15 +2235,6 @@ struct virtqueue *__vring_new_virtqueue(unsigned int index,
+ 	if (!vq->split.desc_extra)
+ 		goto err_extra;
+ 
+-	if (!drv->suppress_used_validation || force_used_validation) {
+-		vq->buflen = kmalloc_array(vring.num, sizeof(*vq->buflen),
+-					   GFP_KERNEL);
+-		if (!vq->buflen)
+-			goto err_buflen;
+-	} else {
+-		vq->buflen = NULL;
+-	}
+-
+ 	/* Put everything in free lists. */
+ 	vq->free_head = 0;
+ 	memset(vq->split.desc_state, 0, vring.num *
+@@ -2303,8 +2245,6 @@ struct virtqueue *__vring_new_virtqueue(unsigned int index,
+ 	spin_unlock(&vdev->vqs_list_lock);
+ 	return &vq->vq;
+ 
+-err_buflen:
+-	kfree(vq->split.desc_extra);
+ err_extra:
+ 	kfree(vq->split.desc_state);
+ err_state:
+diff --git a/include/linux/virtio.h b/include/linux/virtio.h
+index 44d0e09da2d9..41edbc01ffa4 100644
+--- a/include/linux/virtio.h
++++ b/include/linux/virtio.h
+@@ -152,7 +152,6 @@ size_t virtio_max_dma_size(struct virtio_device *vdev);
+  * @feature_table_size: number of entries in the feature table array.
+  * @feature_table_legacy: same as feature_table but when working in legacy mode.
+  * @feature_table_size_legacy: number of entries in feature table legacy array.
+- * @suppress_used_validation: set to not have core validate used length
+  * @probe: the function to call when a device is found.  Returns 0 or -errno.
+  * @scan: optional function to call after successful probe; intended
+  *    for virtio-scsi to invoke a scan.
+@@ -169,7 +168,6 @@ struct virtio_driver {
+ 	unsigned int feature_table_size;
+ 	const unsigned int *feature_table_legacy;
+ 	unsigned int feature_table_size_legacy;
+-	bool suppress_used_validation;
+ 	int (*validate)(struct virtio_device *dev);
+ 	int (*probe)(struct virtio_device *dev);
+ 	void (*scan)(struct virtio_device *dev);
+-- 
+2.34.1
+
