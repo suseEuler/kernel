@@ -172,6 +172,30 @@ if ($verbose) {
 } else {
 	$progress_cb = \&progress_silent;
 }
+
+my $have_separated_pkgs = exists($ENV{SEPARATE_PKGS})? 1 : 0;
+my %upload_pkgs = ();
+if ($have_separated_pkgs) {
+	foreach my $pkg (split /\,/, $ENV{SEPARATE_PKGS}) {
+		if ($pkg =~ /(.*)=(0|1)/) {
+			my $key = $1;
+			$key = "kernel-$key" if $key !~ /^kernel-/;
+			$upload_pkgs{$key} = $2;
+		}
+	}
+	if (exists($upload_pkgs{$package})) {
+		@limit_packages = ($package);
+	} elsif ($package eq 'kernel-source') {
+		opendir(my $dh, $dir) or die "$dir: $!\n";
+		while ((my $name = CORE::readdir($dh))) {
+			if ($name =~ /(.*)\.spec$/) {
+				next if (exists($upload_pkgs{$1}));
+				push(@limit_packages, $1);
+			}
+		}
+	}
+}
+
 my $rev = $bs->upload_package($dir, $prj, $package, $commit, {
 		no_init => $no_init,
 		progresscb => $progress_cb,
@@ -179,15 +203,42 @@ my $rev = $bs->upload_package($dir, $prj, $package, $commit, {
 		limit_packages => \@limit_packages,
 		extra_links => \@package_links,
 });
+
 if ($submit) {
 	if (!exists($repos{""})) {
 		die "No default submit target found in config.sh\n";
 	}
-	if (!$rev) {
-		exit 0;
+	if ($rev) {
+		&$progress_cb('SUBMIT', "$project/$package($rev)");
+		$bs->submit_package($project, $package, $rev, $repos{""}, $commit);
 	}
-	&$progress_cb('SUBMIT', "$project/$package($rev)");
-	$bs->submit_package($project, $package, $rev, $repos{""}, $commit);
+}
+
+if ($have_separated_pkgs) {
+	my @pkgs = ("kernel-headers", "kernel-tools");
+	foreach my $pkg (@pkgs) {
+		next if $upload_pkgs{$pkg} == 0;
+		&$progress_cb("Upload", $pkg);
+		@limit_packages = ($pkg);
+		@package_links = ();
+		$rev = $bs->upload_package($dir, $prj, $pkg, $commit, {
+			no_init => $no_init,
+			progress_cb => $progress_cb,
+			remove_packages => [qw(kernel-dummy)],
+			limit_packages => \@limit_packages,
+			extra_links => \@package_links,
+		});
+		if ($submit) {
+			if (!exists($repos{""})) {
+				die "No default submit target found in config.sh\n";
+			}
+			if (!$rev) {
+				next;
+			}
+			&$progress_cb('SUBMIT', "$project/$pkg($rev)");
+			$bs->submit_package($project, $pkg, $rev, $repos{""}, $commit);
+		}
+	}
 }
 
 exit 0;
