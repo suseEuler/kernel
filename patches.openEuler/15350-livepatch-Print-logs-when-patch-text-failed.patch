@@ -1,0 +1,180 @@
+From e4c4d3339439e3557e00f30e4d0589160caa0869 Mon Sep 17 00:00:00 2001
+From: Zheng Yejian <zhengyejian1@huawei.com>
+Date: Tue, 10 May 2022 23:04:38 +0800
+Subject: [PATCH] livepatch: Print logs when patch text failed
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: e4c4d3339439e3557e00f30e4d0589160caa0869
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I53WZ9
+
+--------------------------------
+
+Signed-off-by: Zheng Yejian <zhengyejian1@huawei.com>
+Reviewed-by: Kuohai Xu <xukuohai@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/kernel/livepatch.c      | 21 +++++++++++++++++----
+ arch/powerpc/kernel/livepatch_32.c | 21 ++++++++++++++++-----
+ arch/powerpc/kernel/livepatch_64.c | 16 ++++++++++++----
+ 3 files changed, 45 insertions(+), 13 deletions(-)
+
+diff --git a/arch/arm64/kernel/livepatch.c b/arch/arm64/kernel/livepatch.c
+index c7110c7c291c..ad4c8337f7f3 100644
+--- a/arch/arm64/kernel/livepatch.c
++++ b/arch/arm64/kernel/livepatch.c
+@@ -342,12 +342,16 @@ long arch_klp_save_old_code(struct arch_klp_data *arch_data, void *old_func)
+ static int do_patch(unsigned long pc, unsigned long new_addr)
+ {
+ 	u32 insns[LJMP_INSN_SIZE];
++	int ret;
+ 
+ 	if (offset_in_range(pc, new_addr, SZ_128M)) {
+ 		insns[0] = aarch64_insn_gen_branch_imm(pc, new_addr,
+ 						       AARCH64_INSN_BRANCH_NOLINK);
+-		if (aarch64_insn_patch_text_nosync((void *)pc, insns[0]))
++		ret = aarch64_insn_patch_text_nosync((void *)pc, insns[0]);
++		if (ret) {
++			pr_err("patch instruction small range failed, ret=%d\n", ret);
+ 			return -EPERM;
++		}
+ 	} else {
+ #ifdef CONFIG_ARM64_MODULE_PLTS
+ 		int i;
+@@ -357,8 +361,12 @@ static int do_patch(unsigned long pc, unsigned long new_addr)
+ 		insns[2] = cpu_to_le32(0xf2c00010 | (((new_addr >> 32) & 0xffff)) << 5);
+ 		insns[3] = cpu_to_le32(0xd61f0200);
+ 		for (i = 0; i < LJMP_INSN_SIZE; i++) {
+-			if (aarch64_insn_patch_text_nosync(((u32 *)pc) + i, insns[i]))
++			ret = aarch64_insn_patch_text_nosync(((u32 *)pc) + i, insns[i]);
++			if (ret) {
++				pr_err("patch instruction(%d) large range failed, ret=%d\n",
++				       i, ret);
+ 				return -EPERM;
++			}
+ 		}
+ #else
+ 		/*
+@@ -391,14 +399,19 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 	struct klp_func *next_func;
+ 	unsigned long pc;
+ 	int i;
++	int ret;
+ 
+ 	func_node = func->func_node;
+ 	pc = (unsigned long)func_node->old_func;
+ 	list_del_rcu(&func->stack_node);
+ 	if (list_empty(&func_node->func_stack)) {
+ 		for (i = 0; i < LJMP_INSN_SIZE; i++) {
+-			aarch64_insn_patch_text_nosync(((u32 *)pc) + i,
+-					func_node->arch_data.old_insns[i]);
++			ret = aarch64_insn_patch_text_nosync(((u32 *)pc) + i,
++							     func_node->arch_data.old_insns[i]);
++			if (ret) {
++				pr_err("restore instruction(%d) failed, ret=%d\n", i, ret);
++				return;
++			}
+ 		}
+ 	} else {
+ 		next_func = list_first_or_null_rcu(&func_node->func_stack,
+diff --git a/arch/powerpc/kernel/livepatch_32.c b/arch/powerpc/kernel/livepatch_32.c
+index 063546851c0a..8fe9ebe43b25 100644
+--- a/arch/powerpc/kernel/livepatch_32.c
++++ b/arch/powerpc/kernel/livepatch_32.c
+@@ -403,8 +403,10 @@ static int do_patch(unsigned long pc, unsigned long new_addr)
+ 
+ 		create_branch(&instr, (struct ppc_inst *)pc, new_addr, 0);
+ 		ret = patch_instruction((struct ppc_inst *)pc, instr);
+-		if (ret)
++		if (ret) {
++			pr_err("patch instruction small range failed, ret=%d\n", ret);
+ 			return -EPERM;
++		}
+ 	} else {
+ 		/*
+ 		 * lis r12,sym@ha
+@@ -420,8 +422,11 @@ static int do_patch(unsigned long pc, unsigned long new_addr)
+ 		for (i = 0; i < LJMP_INSN_SIZE; i++) {
+ 			ret = patch_instruction((struct ppc_inst *)(((u32 *)pc) + i),
+ 						ppc_inst(insns[i]));
+-			if (ret)
++			if (ret) {
++				pr_err("patch instruction(%d) large range failed, ret=%d\n",
++				       i, ret);
+ 				return -EPERM;
++			}
+ 		}
+ 	}
+ 	return 0;
+@@ -446,14 +451,20 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 	struct klp_func *next_func;
+ 	unsigned long pc;
+ 	int i;
++	int ret;
+ 
+ 	func_node = func->func_node;
+ 	pc = (unsigned long)func_node->old_func;
+ 	list_del_rcu(&func->stack_node);
+ 	if (list_empty(&func_node->func_stack)) {
+-		for (i = 0; i < LJMP_INSN_SIZE; i++)
+-			patch_instruction((struct ppc_inst *)(((u32 *)pc) + i),
+-					  ppc_inst(func_node->arch_data.old_insns[i]));
++		for (i = 0; i < LJMP_INSN_SIZE; i++) {
++			ret = patch_instruction((struct ppc_inst *)(((u32 *)pc) + i),
++						ppc_inst(func_node->arch_data.old_insns[i]));
++			if (ret) {
++				pr_err("restore instruction(%d) failed, ret=%d\n", i, ret);
++				return;
++			}
++		}
+ 	} else {
+ 		next_func = list_first_or_null_rcu(&func_node->func_stack,
+ 					struct klp_func, stack_node);
+diff --git a/arch/powerpc/kernel/livepatch_64.c b/arch/powerpc/kernel/livepatch_64.c
+index 770e68fae6c8..90d3e37a0bfe 100644
+--- a/arch/powerpc/kernel/livepatch_64.c
++++ b/arch/powerpc/kernel/livepatch_64.c
+@@ -446,8 +446,10 @@ static int do_patch(unsigned long pc, unsigned long new_addr,
+ 
+ 	ret = livepatch_create_branch(pc, (unsigned long)&arch_data->trampoline,
+ 				      new_addr, old_mod);
+-	if (ret)
++	if (ret) {
++		pr_err("create branch failed, ret=%d\n", ret);
+ 		return -EPERM;
++	}
+ 	flush_icache_range(pc, pc + LJMP_INSN_SIZE * PPC64_INSN_SIZE);
+ 	pr_debug("[%s %d] old = 0x%lx/0x%lx/%pS, new = 0x%lx/0x%lx/%pS\n",
+ 		 __func__, __LINE__,
+@@ -478,14 +480,20 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 	struct klp_func *next_func;
+ 	unsigned long pc;
+ 	int i;
++	int ret;
+ 
+ 	func_node = func->func_node;
+ 	pc = (unsigned long)func_node->old_func;
+ 	list_del_rcu(&func->stack_node);
+ 	if (list_empty(&func_node->func_stack)) {
+-		for (i = 0; i < LJMP_INSN_SIZE; i++)
+-			patch_instruction((struct ppc_inst *)((u32 *)pc + i),
+-					  ppc_inst(func_node->arch_data.old_insns[i]));
++		for (i = 0; i < LJMP_INSN_SIZE; i++) {
++			ret = patch_instruction((struct ppc_inst *)((u32 *)pc + i),
++						ppc_inst(func_node->arch_data.old_insns[i]));
++			if (ret) {
++				pr_err("restore instruction(%d) failed, ret=%d\n", i, ret);
++				break;
++			}
++		}
+ 
+ 		pr_debug("[%s %d] restore insns at 0x%lx\n", __func__, __LINE__, pc);
+ 		flush_icache_range(pc, pc + LJMP_INSN_SIZE * PPC64_INSN_SIZE);
+-- 
+2.34.1
+

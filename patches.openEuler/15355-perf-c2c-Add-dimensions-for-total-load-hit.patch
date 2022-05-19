@@ -1,0 +1,203 @@
+From 02179fb087156aea4f9cca84bab646fce1f25175 Mon Sep 17 00:00:00 2001
+From: Yang Jihong <yangjihong1@huawei.com>
+Date: Tue, 10 May 2022 23:04:43 +0800
+Subject: [PATCH] perf c2c: Add dimensions for total load hit
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 02179fb087156aea4f9cca84bab646fce1f25175
+Modified-by-SEL: No
+
+
+maillist inclusion
+category: Feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I53L83
+CVE: NA
+
+Reference: https://lore.kernel.org/all/20210104020930.GA4897@leoy-ThinkPad-X240s/
+
+-------------------
+
+Arm SPE trace data doesn't support HITM, but we still want to explore
+"perf c2c" tool to analyze cache false sharing.  If without HITM tag,
+the tool cannot give out accurate result for cache false sharing, a
+candidate solution is to sort the total load operations and connect with
+the threads info, e.g. if multiple threads hit the same cache line for
+many times, this can give out the hint that it's likely to cause cache
+false sharing issue.
+
+Unlike having HITM tag, the proposed solution is not accurate and might
+introduce false positive reporting, but it's a pragmatic approach for
+detecting false sharing if memory event doesn't support HITM.
+
+To sort with the cache line hit, this patch adds dimensions for total
+load hit and the associated percentage calculation.
+
+Signed-off-by: Leo Yan <leo.yan@linaro.org>
+Signed-off-by: Yang Jihong <yangjihong1@huawei.com>
+Reviewed-by: Wei Li <liwei391@huawei.com>
+Reviewed-by: Hanjun Guo <guohanjun@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ tools/perf/builtin-c2c.c | 112 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 112 insertions(+)
+
+diff --git a/tools/perf/builtin-c2c.c b/tools/perf/builtin-c2c.c
+index d247f9878948..570f523b6e1d 100644
+--- a/tools/perf/builtin-c2c.c
++++ b/tools/perf/builtin-c2c.c
+@@ -615,6 +615,47 @@ tot_hitm_cmp(struct perf_hpp_fmt *fmt __maybe_unused,
+ 	return tot_hitm_left - tot_hitm_right;
+ }
+ 
++#define TOT_LD_HIT(stats)		\
++	((stats)->ld_fbhit +		\
++	 (stats)->ld_l1hit +		\
++	 (stats)->ld_l2hit +		\
++	 (stats)->ld_llchit +		\
++	 (stats)->lcl_hitm +		\
++	 (stats)->rmt_hitm +		\
++	 (stats)->rmt_hit)
++
++static int tot_ld_hit_entry(struct perf_hpp_fmt *fmt,
++			    struct perf_hpp *hpp,
++			    struct hist_entry *he)
++{
++	struct c2c_hist_entry *c2c_he;
++	int width = c2c_width(fmt, hpp, he->hists);
++	unsigned int tot_hit;
++
++	c2c_he = container_of(he, struct c2c_hist_entry, he);
++	tot_hit = TOT_LD_HIT(&c2c_he->stats);
++
++	return scnprintf(hpp->buf, hpp->size, "%*u", width, tot_hit);
++}
++
++static int64_t tot_ld_hit_cmp(struct perf_hpp_fmt *fmt __maybe_unused,
++			      struct hist_entry *left,
++			      struct hist_entry *right)
++{
++	struct c2c_hist_entry *c2c_left;
++	struct c2c_hist_entry *c2c_right;
++	uint64_t tot_hit_left;
++	uint64_t tot_hit_right;
++
++	c2c_left  = container_of(left, struct c2c_hist_entry, he);
++	c2c_right = container_of(right, struct c2c_hist_entry, he);
++
++	tot_hit_left  = TOT_LD_HIT(&c2c_left->stats);
++	tot_hit_right = TOT_LD_HIT(&c2c_right->stats);
++
++	return tot_hit_left - tot_hit_right;
++}
++
+ #define STAT_FN_ENTRY(__f)					\
+ static int							\
+ __f ## _entry(struct perf_hpp_fmt *fmt, struct perf_hpp *hpp,	\
+@@ -860,6 +901,58 @@ percent_hitm_cmp(struct perf_hpp_fmt *fmt __maybe_unused,
+ 	return per_left - per_right;
+ }
+ 
++static double percent_tot_ld_hit(struct c2c_hist_entry *c2c_he)
++{
++	struct c2c_hists *hists;
++	int tot = 0, st = 0;
++
++	hists = container_of(c2c_he->he.hists, struct c2c_hists, hists);
++
++	st  = TOT_LD_HIT(&c2c_he->stats);
++	tot = TOT_LD_HIT(&hists->stats);
++
++	return tot ? (double) st * 100 / tot : 0;
++}
++
++static int
++percent_tot_ld_hit_entry(struct perf_hpp_fmt *fmt, struct perf_hpp *hpp,
++			 struct hist_entry *he)
++{
++	struct c2c_hist_entry *c2c_he;
++	int width = c2c_width(fmt, hpp, he->hists);
++	char buf[10];
++	double per;
++
++	c2c_he = container_of(he, struct c2c_hist_entry, he);
++	per = percent_tot_ld_hit(c2c_he);
++	return scnprintf(hpp->buf, hpp->size, "%*s", width, PERC_STR(buf, per));
++}
++
++static int
++percent_tot_ld_hit_color(struct perf_hpp_fmt *fmt, struct perf_hpp *hpp,
++			 struct hist_entry *he)
++{
++	return percent_color(fmt, hpp, he, percent_tot_ld_hit);
++}
++
++static int64_t
++percent_tot_ld_hit_cmp(struct perf_hpp_fmt *fmt __maybe_unused,
++		   struct hist_entry *left, struct hist_entry *right)
++{
++	struct c2c_hist_entry *c2c_left;
++	struct c2c_hist_entry *c2c_right;
++	double per_left;
++	double per_right;
++
++	c2c_left  = container_of(left, struct c2c_hist_entry, he);
++	c2c_right = container_of(right, struct c2c_hist_entry, he);
++
++	per_left  = percent_tot_ld_hit(c2c_left);
++	per_right = percent_tot_ld_hit(c2c_right);
++
++	return per_left - per_right;
++}
++
+ static struct c2c_stats *he_stats(struct hist_entry *he)
+ {
+ 	struct c2c_hist_entry *c2c_he;
+@@ -1419,6 +1512,14 @@ static struct c2c_dimension dim_ld_rmthit = {
+ 	.width		= 8,
+ };
+ 
++static struct c2c_dimension dim_tot_ld_hit = {
++	.header		= HEADER_BOTH("Load Hit", "Total"),
++	.name		= "tot_ld_hit",
++	.cmp		= tot_ld_hit_cmp,
++	.entry		= tot_ld_hit_entry,
++	.width		= 8,
++};
++
+ static struct c2c_dimension dim_tot_recs = {
+ 	.header		= HEADER_BOTH("Total", "records"),
+ 	.name		= "tot_recs",
+@@ -1467,6 +1568,15 @@ static struct c2c_dimension dim_percent_lcl_hitm = {
+ 	.width		= 7,
+ };
+ 
++static struct c2c_dimension dim_percent_tot_ld_hit = {
++	.header         = HEADER_BOTH("Load Hit", "Pct"),
++	.name		= "percent_tot_ld_hit",
++	.cmp		= percent_tot_ld_hit_cmp,
++	.entry		= percent_tot_ld_hit_entry,
++	.color		= percent_tot_ld_hit_color,
++	.width		= 8,
++};
++
+ static struct c2c_dimension dim_percent_stores_l1hit = {
+ 	.header		= HEADER_SPAN("-- Store Refs --", "L1 Hit", 1),
+ 	.name		= "percent_stores_l1hit",
+@@ -1622,11 +1732,13 @@ static struct c2c_dimension *dimensions[] = {
+ 	&dim_ld_l2hit,
+ 	&dim_ld_llchit,
+ 	&dim_ld_rmthit,
++	&dim_tot_ld_hit,
+ 	&dim_tot_recs,
+ 	&dim_tot_loads,
+ 	&dim_percent_hitm,
+ 	&dim_percent_rmt_hitm,
+ 	&dim_percent_lcl_hitm,
++	&dim_percent_tot_ld_hit,
+ 	&dim_percent_stores_l1hit,
+ 	&dim_percent_stores_l1miss,
+ 	&dim_dram_lcl,
+-- 
+2.34.1
+

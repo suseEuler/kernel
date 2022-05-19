@@ -1,0 +1,132 @@
+From deeeaf92d0b7751772ce4270b0dbb37628a23902 Mon Sep 17 00:00:00 2001
+From: Guan Jing <guanjing6@huawei.com>
+Date: Tue, 10 May 2022 23:04:58 +0800
+Subject: [PATCH] sched: Add tracepoint for qos smt expeller
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: deeeaf92d0b7751772ce4270b0dbb37628a23902
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I52611
+CVE: NA
+
+--------------------------------
+
+There are two caces that we add tracepoint:
+a) while online task of sibling cpu is running, it is running
+that offline task of local cpu will be set TIF_NEED_RESCHED;
+b) while online task of sibling cpu is running, it will expell
+that next picked offline task of local cpu.
+
+Signed-off-by: Guan Jing <guanjing6@huawei.com>
+Reviewed-by: Chen Hui <judy.chenhui@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/trace/events/sched.h | 55 ++++++++++++++++++++++++++++++++++++
+ kernel/sched/fair.c          |  9 ++++--
+ 2 files changed, 62 insertions(+), 2 deletions(-)
+
+diff --git a/include/trace/events/sched.h b/include/trace/events/sched.h
+index c96a4337afe6..028f49662ac3 100644
+--- a/include/trace/events/sched.h
++++ b/include/trace/events/sched.h
+@@ -183,6 +183,61 @@ TRACE_EVENT(sched_switch,
+ 		__entry->next_comm, __entry->next_pid, __entry->next_prio)
+ );
+ 
++#ifdef CONFIG_QOS_SCHED_SMT_EXPELLER
++/*
++ * Tracepoint for a offline task being resched:
++ */
++TRACE_EVENT(sched_qos_smt_expel,
++
++	TP_PROTO(struct task_struct *sibling_p, int qos_smt_status),
++
++	TP_ARGS(sibling_p, qos_smt_status),
++
++	TP_STRUCT__entry(
++		__array(	char,	sibling_comm,	TASK_COMM_LEN	)
++		__field(	pid_t,	sibling_pid			)
++		__field(	int,	sibling_qos_status		)
++		__field(	int,	sibling_cpu			)
++	),
++
++	TP_fast_assign(
++		memcpy(__entry->sibling_comm, sibling_p->comm, TASK_COMM_LEN);
++		__entry->sibling_pid		= sibling_p->pid;
++		__entry->sibling_qos_status	= qos_smt_status;
++		__entry->sibling_cpu		= task_cpu(sibling_p);
++	),
++
++	TP_printk("sibling_comm=%s sibling_pid=%d sibling_qos_status=%d sibling_cpu=%d",
++		  __entry->sibling_comm, __entry->sibling_pid, __entry->sibling_qos_status,
++		  __entry->sibling_cpu)
++);
++
++/*
++ * Tracepoint for a offline task being expelled:
++ */
++TRACE_EVENT(sched_qos_smt_expelled,
++
++	TP_PROTO(struct task_struct *p, int qos_smt_status),
++
++	TP_ARGS(p, qos_smt_status),
++
++	TP_STRUCT__entry(
++		__array(	char,	comm,	TASK_COMM_LEN	)
++		__field(	pid_t,	pid			)
++		__field(	int,	qos_status		)
++	),
++
++	TP_fast_assign(
++		memcpy(__entry->comm, p->comm, TASK_COMM_LEN);
++		__entry->pid		= p->pid;
++		__entry->qos_status	= qos_smt_status;
++	),
++
++	TP_printk("comm=%s pid=%d qos_status=%d",
++		  __entry->comm, __entry->pid, __entry->qos_status)
++);
++#endif
++
+ /*
+  * Tracepoint for a task being migrated:
+  */
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 88f95910eab9..f577d581166b 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -7485,12 +7485,16 @@ static bool _qos_smt_check_need_resched(int this_cpu, struct rq *rq)
+ 		*    and current cpu only has SCHED_IDLE tasks enqueued.
+ 		*/
+ 		if (per_cpu(qos_smt_status, cpu) == QOS_LEVEL_ONLINE &&
+-		    task_group(current)->qos_level < QOS_LEVEL_ONLINE)
++		    task_group(current)->qos_level < QOS_LEVEL_ONLINE) {
++			trace_sched_qos_smt_expel(cpu_curr(cpu), per_cpu(qos_smt_status, cpu));
+ 			return true;
++		}
+ 
+ 		if (per_cpu(qos_smt_status, cpu) == QOS_LEVEL_OFFLINE &&
+-		    rq->curr == rq->idle && sched_idle_cpu(this_cpu))
++		    rq->curr == rq->idle && sched_idle_cpu(this_cpu)) {
++			trace_sched_qos_smt_expel(cpu_curr(cpu), per_cpu(qos_smt_status, cpu));
+ 			return true;
++		}
+ 	}
+ 
+ 	return false;
+@@ -7528,6 +7532,7 @@ pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf
+ 	if (qos_smt_expelled(this_cpu)) {
+ 		__this_cpu_write(qos_smt_status, QOS_LEVEL_OFFLINE);
+ 		schedstat_inc(rq->curr->se.statistics.nr_qos_smt_expelled);
++		trace_sched_qos_smt_expelled(rq->curr, per_cpu(qos_smt_status, this_cpu));
+ 		return NULL;
+ 	}
+ #endif
+-- 
+2.34.1
+

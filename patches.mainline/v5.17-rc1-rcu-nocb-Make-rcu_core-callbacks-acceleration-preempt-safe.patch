@@ -1,0 +1,72 @@
+From 24ee940d89277602147ce1b8b4fd87b01b9a6660 Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Tue, 19 Oct 2021 02:08:09 +0200
+Subject: [PATCH] rcu/nocb: Make rcu_core() callbacks acceleration preempt-safe
+Git-commit: 24ee940d89277602147ce1b8b4fd87b01b9a6660
+Patch-mainline: v5.17-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified due to different context, also aligns with
+		 openEuler commit e3a88deb7241bc9cee6d809386f032554aacab94
+
+
+While reporting a quiescent state for a given CPU, rcu_core() takes
+advantage of the freshly loaded grace period sequence number and the
+locked rnp to accelerate the callbacks whose sequence number have been
+assigned a stale value.
+
+This action is only necessary when the rdp isn't offloaded, otherwise
+the NOCB kthreads already take care of the callbacks progression.
+
+However the check for the offloaded state is volatile because it is
+performed outside the IRQs disabled section. It's possible for the
+offloading process to preempt rcu_core() at that point on PREEMPT_RT.
+
+This is dangerous because rcu_core() may end up accelerating callbacks
+concurrently with NOCB kthreads without appropriate locking.
+
+Fix this with moving the offloaded check inside the rnp locking section.
+
+Reported-and-tested-by: Valentin Schneider <valentin.schneider@arm.com>
+Reviewed-by: Valentin Schneider <valentin.schneider@arm.com>
+Tested-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Cc: Josh Triplett <josh@joshtriplett.org>
+Cc: Joel Fernandes <joel@joelfernandes.org>
+Cc: Boqun Feng <boqun.feng@gmail.com>
+Cc: Neeraj Upadhyay <neeraju@codeaurora.org>
+Cc: Uladzislau Rezki <urezki@gmail.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Frederic Weisbecker <frederic@kernel.org>
+Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/rcu/tree.c |    6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@ -2301,8 +2301,6 @@ rcu_report_qs_rdp(struct rcu_data *rdp)
+ 	unsigned long flags;
+ 	unsigned long mask;
+ 	bool needwake = false;
+-	const bool offloaded = IS_ENABLED(CONFIG_RCU_NOCB_CPU) &&
+-			       rcu_segcblist_is_offloaded(&rdp->cblist);
+ 	struct rcu_node *rnp;
+ 
+ 	WARN_ON_ONCE(rdp->cpu != smp_processor_id());
+@@ -2326,9 +2324,13 @@ rcu_report_qs_rdp(struct rcu_data *rdp)
+ 	if ((rnp->qsmask & mask) == 0) {
+ 		raw_spin_unlock_irqrestore_rcu_node(rnp, flags);
+ 	} else {
++		const bool offloaded = IS_ENABLED(CONFIG_RCU_NOCB_CPU) &&
++				       rcu_segcblist_is_offloaded(&rdp->cblist);
+ 		/*
+ 		 * This GP can't end until cpu checks in, so all of our
+ 		 * callbacks can be processed during the next GP.
++		 *
++		 * NOCB kthreads have their own way to deal with that.
+ 		 */
+ 		if (!offloaded)
+ 			needwake = rcu_accelerate_cbs(rnp, rdp);

@@ -1,0 +1,111 @@
+From 23982daecf9047b2655a8fcbbdf651858ec9ff0d Mon Sep 17 00:00:00 2001
+From: Zheng Yejian <zhengyejian1@huawei.com>
+Date: Tue, 10 May 2022 23:04:41 +0800
+Subject: [PATCH] livepatch/arm64: Fix incorrect endian conversion when long
+ jump
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 23982daecf9047b2655a8fcbbdf651858ec9ff0d
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4ZII6
+
+--------------------------------
+
+Kernel panic happened on 'arm64 big endian' board after calling function
+that has been live-patched. It can be reproduced as follows:
+  1. Insert 'livepatch-sample.ko' to patch function 'cmdline_proc_show';
+  2. Enable patch by execute:
+     echo 1 > /sys/kernel/livepatch/livepatch-sample/enabled
+  3. Call 'cmdline_proc_show' by execute:
+     cat /proc/cmdline
+  4. Then we get following panic logs:
+     > kernel BUG at arch/arm64/kernel/traps.c:408!
+     > Internal error: Oops - BUG: 0 [#1] SMP
+     > Modules linked in: dump_mem(OE) livepatch_cmdline1(OEK)
+     > [last unloaded: dump_mem]
+     > CPU: 3 PID: 1752 Comm: cat Session: 0 Tainted: G           OE K
+     > 5.10.0+ #2
+     > Hardware name: Hisilicon PhosphorHi1382 (DT)
+     > pstate: 00000005 (nzcv daif -PAN -UAO -TCO BTYPE=--)
+     > pc : do_undefinstr+0x23c/0x2b4
+     > lr : do_undefinstr+0x5c/0x2b4
+     > sp : ffffffc010ac3a80
+     > x29: ffffffc010ac3a80 x28: ffffff82eb0a8000
+     > x27: 0000000000000000 x26: 0000000000000001
+     > x25: 0000000000000000 x24: 0000000000001000
+     > x23: 0000000000000000 x22: ffffffd0e0f16000
+     > x21: ffffffd0e0ae7000 x20: ffffffc010ac3b00
+     > x19: 0000000000021fd6 x18: ffffffd0e04aad94
+     > x17: 0000000000000000 x16: 0000000000000000
+     > x15: ffffffd0e04b519c x14: 0000000000000000
+     > x13: 0000000000000000 x12: 0000000000000000
+     > x11: 0000000000000000 x10: 0000000000000000
+     > x9 : 0000000000000000 x8 : 0000000000000000
+     > x7 : 0000000000000000 x6 : ffffffd0e0f16100
+     > x5 : 0000000000000000 x4 : 00000000d5300000
+     > x3 : 0000000000000000 x2 : ffffffd0e0f160f0
+     > x1 : ffffffd0e0f16103 x0 : 0000000000000005
+     > Call trace:
+     >  do_undefinstr+0x23c/0x2b4
+     >  el1_undef+0x2c/0x44
+     >  el1_sync_handler+0xa4/0xb0
+     >  el1_sync+0x74/0x100
+     >  cmdline_proc_show+0xc/0x44
+     >  proc_reg_read_iter+0xb0/0xc4
+     >  new_sync_read+0x10c/0x15c
+     >  vfs_read+0x144/0x18c
+     >  ksys_read+0x78/0xe8
+     >  __arm64_sys_read+0x24/0x30
+
+We compare first 6 instructions of 'cmdline_proc_show' before and after
+patch (see below). There are 4 instructions modified, so this is case
+that offset between old and new function is out of 128M. And we found
+that instruction at 'cmdline_proc_show+0xc' seems incorrect (it expects
+to be '00021fd6').
+  origin:     patched:
+  --------    --------
+  fd7bbea9    929ff7f0
+  21d500f0    f2a91b30
+  fd030091    f2d00010
+  211040f9    d61f0200 <-- cmdline_proc_show+0xc (expect is '00021fd6')
+  f30b00f9    f30b00f9
+  f30300aa    f30300aa
+
+It is caused by an incorrect big-to-little endian conversion, and we
+correct it.
+
+Fixes: e429c61d12bf livepatch/arm64: Support livepatch without ftrace
+Signed-off-by: Zheng Yejian <zhengyejian1@huawei.com>
+Reviewed-by: Kuohai Xu <xukuohai@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/kernel/livepatch.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/arch/arm64/kernel/livepatch.c b/arch/arm64/kernel/livepatch.c
+index e83e4ce94887..4bc35725af36 100644
+--- a/arch/arm64/kernel/livepatch.c
++++ b/arch/arm64/kernel/livepatch.c
+@@ -358,10 +358,10 @@ static int do_patch(unsigned long pc, unsigned long new_addr)
+ #ifdef CONFIG_ARM64_MODULE_PLTS
+ 		int i;
+ 
+-		insns[0] = cpu_to_le32(0x92800010 | (((~new_addr) & 0xffff)) << 5);
+-		insns[1] = cpu_to_le32(0xf2a00010 | (((new_addr >> 16) & 0xffff)) << 5);
+-		insns[2] = cpu_to_le32(0xf2c00010 | (((new_addr >> 32) & 0xffff)) << 5);
+-		insns[3] = cpu_to_le32(0xd61f0200);
++		insns[0] = 0x92800010 | (((~new_addr) & 0xffff)) << 5;
++		insns[1] = 0xf2a00010 | (((new_addr >> 16) & 0xffff)) << 5;
++		insns[2] = 0xf2c00010 | (((new_addr >> 32) & 0xffff)) << 5;
++		insns[3] = 0xd61f0200;
+ 		for (i = 0; i < LJMP_INSN_SIZE; i++) {
+ 			ret = aarch64_insn_patch_text_nosync(((u32 *)pc) + i, insns[i]);
+ 			if (ret) {
+-- 
+2.34.1
+

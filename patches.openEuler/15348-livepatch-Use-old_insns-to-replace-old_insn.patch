@@ -1,0 +1,257 @@
+From 704d988e075004f9d6a42acd0825173e9ead0565 Mon Sep 17 00:00:00 2001
+From: Zheng Yejian <zhengyejian1@huawei.com>
+Date: Tue, 10 May 2022 23:04:36 +0800
+Subject: [PATCH] livepatch: Use 'old_insns' to replace 'old_insn'
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 704d988e075004f9d6a42acd0825173e9ead0565
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I53WZ9
+
+--------------------------------
+
+Structure 'arch_klp_data' contains fields which are used to save codes of
+a function before patching. In arm, they are 'old_insns' and 'old_insn'
+(depending on CONFIG_ARM_MODULE_PLTS enabled or not):
+    struct arch_klp_data {
+    #ifdef CONFIG_ARM_MODULE_PLTS
+            u32 old_insns[LJMP_INSN_SIZE];
+    #else
+            u32 old_insn;
+    #endif
+    };
+
+We can use array 'old_insns' to replace 'old_insn' so that no need to
+depend on CONFIG_ARM_MODULE_PLTS.
+
+The similar scenario exists in arm64, so we also do the optimization.
+
+Suggested-by: Xu Kuohai <xukuohai@huawei.com>
+Signed-off-by: Zheng Yejian <zhengyejian1@huawei.com>
+Reviewed-by: Kuohai Xu <xukuohai@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm/include/asm/livepatch.h   |  8 +++-----
+ arch/arm/kernel/livepatch.c        | 21 +++------------------
+ arch/arm64/include/asm/livepatch.h |  9 ++++-----
+ arch/arm64/kernel/livepatch.c      | 25 ++++---------------------
+ 4 files changed, 14 insertions(+), 49 deletions(-)
+
+diff --git a/arch/arm/include/asm/livepatch.h b/arch/arm/include/asm/livepatch.h
+index 4f1cf4c72097..befa1efbbcd1 100644
+--- a/arch/arm/include/asm/livepatch.h
++++ b/arch/arm/include/asm/livepatch.h
+@@ -41,14 +41,12 @@ int klp_check_calltrace(struct klp_patch *patch, int enable);
+ 
+ #ifdef CONFIG_ARM_MODULE_PLTS
+ #define LJMP_INSN_SIZE	3
+-#endif
++#else
++#define LJMP_INSN_SIZE	1
++#endif /* CONFIG_ARM_MODULE_PLTS */
+ 
+ struct arch_klp_data {
+-#ifdef CONFIG_ARM_MODULE_PLTS
+ 	u32 old_insns[LJMP_INSN_SIZE];
+-#else
+-	u32 old_insn;
+-#endif
+ };
+ 
+ long arch_klp_save_old_code(struct arch_klp_data *arch_data, void *old_func);
+diff --git a/arch/arm/kernel/livepatch.c b/arch/arm/kernel/livepatch.c
+index 21efd265149a..6c6f268c8d3d 100644
+--- a/arch/arm/kernel/livepatch.c
++++ b/arch/arm/kernel/livepatch.c
+@@ -37,15 +37,9 @@
+ #define ARM_INSN_SIZE	4
+ #endif
+ 
+-#ifdef CONFIG_ARM_MODULE_PLTS
+ #define MAX_SIZE_TO_CHECK (LJMP_INSN_SIZE * ARM_INSN_SIZE)
+ #define CHECK_JUMP_RANGE LJMP_INSN_SIZE
+ 
+-#else
+-#define MAX_SIZE_TO_CHECK ARM_INSN_SIZE
+-#define CHECK_JUMP_RANGE 1
+-#endif
+-
+ #ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
+ /*
+  * The instruction set on arm is A32.
+@@ -356,7 +350,6 @@ long arm_insn_read(void *addr, u32 *insnp)
+ long arch_klp_save_old_code(struct arch_klp_data *arch_data, void *old_func)
+ {
+ 	long ret;
+-#ifdef CONFIG_ARM_MODULE_PLTS
+ 	int i;
+ 
+ 	for (i = 0; i < LJMP_INSN_SIZE; i++) {
+@@ -364,20 +357,16 @@ long arch_klp_save_old_code(struct arch_klp_data *arch_data, void *old_func)
+ 		if (ret)
+ 			break;
+ 	}
+-#else
+-	ret = arm_insn_read(old_func, &arch_data->old_insn);
+-#endif
+ 	return ret;
+ }
+ 
+ static int do_patch(unsigned long pc, unsigned long new_addr)
+ {
+-	u32 insn;
++	u32 insns[LJMP_INSN_SIZE];
+ 
+ 	if (!offset_in_range(pc, new_addr, SZ_32M)) {
+ #ifdef CONFIG_ARM_MODULE_PLTS
+ 		int i;
+-		u32 insns[LJMP_INSN_SIZE];
+ 
+ 		/*
+ 		 * [0] LDR PC, [PC+8]
+@@ -399,8 +388,8 @@ static int do_patch(unsigned long pc, unsigned long new_addr)
+ 		return -EFAULT;
+ #endif
+ 	} else {
+-		insn = arm_gen_branch(pc, new_addr);
+-		__patch_text((void *)pc, insn);
++		insns[0] = arm_gen_branch(pc, new_addr);
++		__patch_text((void *)pc, insns[0]);
+ 	}
+ 	return 0;
+ }
+@@ -427,15 +416,11 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 	func_node = func->func_node;
+ 	pc = (unsigned long)func_node->old_func;
+ 	if (list_is_singular(&func_node->func_stack)) {
+-#ifdef CONFIG_ARM_MODULE_PLTS
+ 		int i;
+ 
+ 		for (i = 0; i < LJMP_INSN_SIZE; i++) {
+ 			__patch_text(((u32 *)pc) + i, func_node->arch_data.old_insns[i]);
+ 		}
+-#else
+-		__patch_text((void *)pc, func_node->arch_data.old_insn);
+-#endif
+ 		list_del_rcu(&func->stack_node);
+ 	} else {
+ 		list_del_rcu(&func->stack_node);
+diff --git a/arch/arm64/include/asm/livepatch.h b/arch/arm64/include/asm/livepatch.h
+index a9bc7ce4cc6e..7b9ea5dcea4d 100644
+--- a/arch/arm64/include/asm/livepatch.h
++++ b/arch/arm64/include/asm/livepatch.h
+@@ -48,17 +48,16 @@ int klp_check_calltrace(struct klp_patch *patch, int enable);
+ #error Live patching support is disabled; check CONFIG_LIVEPATCH
+ #endif
+ 
+-
+ #if defined(CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY)
+ 
++#ifdef CONFIG_ARM64_MODULE_PLTS
+ #define LJMP_INSN_SIZE 4
++#else
++#define LJMP_INSN_SIZE 1
++#endif /* CONFIG_ARM64_MODULE_PLTS */
+ 
+ struct arch_klp_data {
+-#ifdef CONFIG_ARM64_MODULE_PLTS
+ 	u32 old_insns[LJMP_INSN_SIZE];
+-#else
+-	u32 old_insn;
+-#endif
+ };
+ 
+ long arch_klp_save_old_code(struct arch_klp_data *arch_data, void *old_func);
+diff --git a/arch/arm64/kernel/livepatch.c b/arch/arm64/kernel/livepatch.c
+index 74405b77e40e..4ced7d3d824c 100644
+--- a/arch/arm64/kernel/livepatch.c
++++ b/arch/arm64/kernel/livepatch.c
+@@ -34,7 +34,6 @@
+ #include <linux/sched/debug.h>
+ #include <linux/kallsyms.h>
+ 
+-#ifdef CONFIG_ARM64_MODULE_PLTS
+ #define MAX_SIZE_TO_CHECK (LJMP_INSN_SIZE * sizeof(u32))
+ #define CHECK_JUMP_RANGE LJMP_INSN_SIZE
+ 
+@@ -46,11 +45,6 @@ static inline bool offset_in_range(unsigned long pc, unsigned long addr,
+ 	return (offset >= -range && offset < range);
+ }
+ 
+-#else
+-#define MAX_SIZE_TO_CHECK sizeof(u32)
+-#define CHECK_JUMP_RANGE 1
+-#endif
+-
+ #ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
+ /*
+  * The instruction set on arm64 is A64.
+@@ -334,7 +328,6 @@ int klp_check_calltrace(struct klp_patch *patch, int enable)
+ long arch_klp_save_old_code(struct arch_klp_data *arch_data, void *old_func)
+ {
+ 	long ret;
+-#ifdef CONFIG_ARM64_MODULE_PLTS
+ 	int i;
+ 
+ 	for (i = 0; i < LJMP_INSN_SIZE; i++) {
+@@ -343,25 +336,21 @@ long arch_klp_save_old_code(struct arch_klp_data *arch_data, void *old_func)
+ 		if (ret)
+ 			break;
+ 	}
+-#else
+-	ret = aarch64_insn_read(old_func, &arch_data->old_insn);
+-#endif
+ 	return ret;
+ }
+ 
+ static int do_patch(unsigned long pc, unsigned long new_addr)
+ {
+-	u32 insn;
++	u32 insns[LJMP_INSN_SIZE];
+ 
+ 	if (offset_in_range(pc, new_addr, SZ_128M)) {
+-		insn = aarch64_insn_gen_branch_imm(pc, new_addr,
+-						   AARCH64_INSN_BRANCH_NOLINK);
+-		if (aarch64_insn_patch_text_nosync((void *)pc, insn))
++		insns[0] = aarch64_insn_gen_branch_imm(pc, new_addr,
++						       AARCH64_INSN_BRANCH_NOLINK);
++		if (aarch64_insn_patch_text_nosync((void *)pc, insns[0]))
+ 			return -EPERM;
+ 	} else {
+ #ifdef CONFIG_ARM64_MODULE_PLTS
+ 		int i;
+-		u32 insns[LJMP_INSN_SIZE];
+ 
+ 		insns[0] = cpu_to_le32(0x92800010 | (((~new_addr) & 0xffff)) << 5);
+ 		insns[1] = cpu_to_le32(0xf2a00010 | (((new_addr >> 16) & 0xffff)) << 5);
+@@ -401,22 +390,16 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 	struct klp_func_node *func_node;
+ 	struct klp_func *next_func;
+ 	unsigned long pc;
+-#ifdef CONFIG_ARM64_MODULE_PLTS
+ 	int i;
+-#endif
+ 
+ 	func_node = func->func_node;
+ 	pc = (unsigned long)func_node->old_func;
+ 	if (list_is_singular(&func_node->func_stack)) {
+ 		list_del_rcu(&func->stack_node);
+-#ifdef CONFIG_ARM64_MODULE_PLTS
+ 		for (i = 0; i < LJMP_INSN_SIZE; i++) {
+ 			aarch64_insn_patch_text_nosync(((u32 *)pc) + i,
+ 					func_node->arch_data.old_insns[i]);
+ 		}
+-#else
+-		aarch64_insn_patch_text_nosync((void *)pc, func_node->arch_data.old_insn);
+-#endif
+ 	} else {
+ 		list_del_rcu(&func->stack_node);
+ 		next_func = list_first_or_null_rcu(&func_node->func_stack,
+-- 
+2.34.1
+

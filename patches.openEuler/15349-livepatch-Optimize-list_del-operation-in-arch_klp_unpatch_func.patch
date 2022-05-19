@@ -1,0 +1,151 @@
+From 9ab7f4115f9a2e758b05461280702969868941d9 Mon Sep 17 00:00:00 2001
+From: Zheng Yejian <zhengyejian1@huawei.com>
+Date: Tue, 10 May 2022 23:04:37 +0800
+Subject: [PATCH] livepatch: Optimize list_del operation in
+ 'arch_klp_unpatch_func'
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 9ab7f4115f9a2e758b05461280702969868941d9
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I53WZ9
+
+--------------------------------
+
+Currently when unpatch a function, we check whether 'func_stack' has only
+one item then delete it:
+  > if (list_is_singular(&func_node->func_stack)) {
+  > 	list_del_rcu(&func->stack_node);
+  > 	......
+  > } else {
+  > 	list_del_rcu(&func->stack_node);
+  > 	next_func = list_first_or_null_rcu(&func_node->func_stack);
+  > 	......
+  > }
+
+We can optimize it as delete first then check whether 'func_stack' is
+empty or not.
+
+Suggested-by: Xu Kuohai <xukuohai@huawei.com>
+Signed-off-by: Zheng Yejian <zhengyejian1@huawei.com>
+Reviewed-by: Kuohai Xu <xukuohai@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm/kernel/livepatch.c        | 5 ++---
+ arch/arm64/kernel/livepatch.c      | 5 ++---
+ arch/powerpc/kernel/livepatch_32.c | 5 ++---
+ arch/powerpc/kernel/livepatch_64.c | 5 ++---
+ arch/x86/kernel/livepatch.c        | 5 ++---
+ 5 files changed, 10 insertions(+), 15 deletions(-)
+
+diff --git a/arch/arm/kernel/livepatch.c b/arch/arm/kernel/livepatch.c
+index 6c6f268c8d3d..d5223046cc66 100644
+--- a/arch/arm/kernel/livepatch.c
++++ b/arch/arm/kernel/livepatch.c
+@@ -415,15 +415,14 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 
+ 	func_node = func->func_node;
+ 	pc = (unsigned long)func_node->old_func;
+-	if (list_is_singular(&func_node->func_stack)) {
++	list_del_rcu(&func->stack_node);
++	if (list_empty(&func_node->func_stack)) {
+ 		int i;
+ 
+ 		for (i = 0; i < LJMP_INSN_SIZE; i++) {
+ 			__patch_text(((u32 *)pc) + i, func_node->arch_data.old_insns[i]);
+ 		}
+-		list_del_rcu(&func->stack_node);
+ 	} else {
+-		list_del_rcu(&func->stack_node);
+ 		next_func = list_first_or_null_rcu(&func_node->func_stack,
+ 					struct klp_func, stack_node);
+ 
+diff --git a/arch/arm64/kernel/livepatch.c b/arch/arm64/kernel/livepatch.c
+index 4ced7d3d824c..c7110c7c291c 100644
+--- a/arch/arm64/kernel/livepatch.c
++++ b/arch/arm64/kernel/livepatch.c
+@@ -394,14 +394,13 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 
+ 	func_node = func->func_node;
+ 	pc = (unsigned long)func_node->old_func;
+-	if (list_is_singular(&func_node->func_stack)) {
+-		list_del_rcu(&func->stack_node);
++	list_del_rcu(&func->stack_node);
++	if (list_empty(&func_node->func_stack)) {
+ 		for (i = 0; i < LJMP_INSN_SIZE; i++) {
+ 			aarch64_insn_patch_text_nosync(((u32 *)pc) + i,
+ 					func_node->arch_data.old_insns[i]);
+ 		}
+ 	} else {
+-		list_del_rcu(&func->stack_node);
+ 		next_func = list_first_or_null_rcu(&func_node->func_stack,
+ 					struct klp_func, stack_node);
+ 		if (WARN_ON(!next_func))
+diff --git a/arch/powerpc/kernel/livepatch_32.c b/arch/powerpc/kernel/livepatch_32.c
+index ece36990699e..063546851c0a 100644
+--- a/arch/powerpc/kernel/livepatch_32.c
++++ b/arch/powerpc/kernel/livepatch_32.c
+@@ -449,13 +449,12 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 
+ 	func_node = func->func_node;
+ 	pc = (unsigned long)func_node->old_func;
+-	if (list_is_singular(&func_node->func_stack)) {
+-		list_del_rcu(&func->stack_node);
++	list_del_rcu(&func->stack_node);
++	if (list_empty(&func_node->func_stack)) {
+ 		for (i = 0; i < LJMP_INSN_SIZE; i++)
+ 			patch_instruction((struct ppc_inst *)(((u32 *)pc) + i),
+ 					  ppc_inst(func_node->arch_data.old_insns[i]));
+ 	} else {
+-		list_del_rcu(&func->stack_node);
+ 		next_func = list_first_or_null_rcu(&func_node->func_stack,
+ 					struct klp_func, stack_node);
+ 		do_patch(pc, (unsigned long)next_func->new_func);
+diff --git a/arch/powerpc/kernel/livepatch_64.c b/arch/powerpc/kernel/livepatch_64.c
+index 9de727a7b455..770e68fae6c8 100644
+--- a/arch/powerpc/kernel/livepatch_64.c
++++ b/arch/powerpc/kernel/livepatch_64.c
+@@ -481,8 +481,8 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 
+ 	func_node = func->func_node;
+ 	pc = (unsigned long)func_node->old_func;
+-	if (list_is_singular(&func_node->func_stack)) {
+-		list_del_rcu(&func->stack_node);
++	list_del_rcu(&func->stack_node);
++	if (list_empty(&func_node->func_stack)) {
+ 		for (i = 0; i < LJMP_INSN_SIZE; i++)
+ 			patch_instruction((struct ppc_inst *)((u32 *)pc + i),
+ 					  ppc_inst(func_node->arch_data.old_insns[i]));
+@@ -490,7 +490,6 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 		pr_debug("[%s %d] restore insns at 0x%lx\n", __func__, __LINE__, pc);
+ 		flush_icache_range(pc, pc + LJMP_INSN_SIZE * PPC64_INSN_SIZE);
+ 	} else {
+-		list_del_rcu(&func->stack_node);
+ 		next_func = list_first_or_null_rcu(&func_node->func_stack,
+ 					struct klp_func, stack_node);
+ 		do_patch(pc, (unsigned long)next_func->new_func,
+diff --git a/arch/x86/kernel/livepatch.c b/arch/x86/kernel/livepatch.c
+index 2a541c7de167..385b8428da91 100644
+--- a/arch/x86/kernel/livepatch.c
++++ b/arch/x86/kernel/livepatch.c
+@@ -412,11 +412,10 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 
+ 	func_node = func->func_node;
+ 	ip = (unsigned long)func_node->old_func;
+-	if (list_is_singular(&func_node->func_stack)) {
+-		list_del_rcu(&func->stack_node);
++	list_del_rcu(&func->stack_node);
++	if (list_empty(&func_node->func_stack)) {
+ 		new = func_node->arch_data.old_code;
+ 	} else {
+-		list_del_rcu(&func->stack_node);
+ 		next_func = list_first_or_null_rcu(&func_node->func_stack,
+ 						struct klp_func, stack_node);
+ 
+-- 
+2.34.1
+
