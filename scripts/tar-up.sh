@@ -2,6 +2,7 @@
 
 #############################################################################
 # Copyright (c) 2003-2009 Novell, Inc.
+# Copyright (c) 2022 Yunche Information Technology (Shenzhen) Co., Ltd.
 # All Rights Reserved.
 #
 # This program is free software; you can redistribute it and/or
