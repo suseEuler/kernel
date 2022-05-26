@@ -1,0 +1,86 @@
+From 064a71f51335b310a40642990f31d57da7f55836 Mon Sep 17 00:00:00 2001
+From: Zhang Yi <yi.zhang@huawei.com>
+Date: Sat, 21 May 2022 12:19:16 +0800
+Subject: [PATCH] ext4: fix warning when submitting superblock in
+ ext4_commit_super()
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 064a71f51335b310a40642990f31d57da7f55836
+Modified-by-SEL: Yes, modified due to different context
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 186737, https://gitee.com/openeuler/kernel/issues/I58COJ
+CVE: NA
+
+--------------------------------
+
+We have already check the io_error and uptodate flag before submitting
+the superblock buffer, and re-set the uptodate flag if it has been
+failed to write out. But it was lockless and could be raced by another
+ext4_commit_super(), and finally trigger '!uptodate' WARNING when
+marking buffer dirty. Fix it by submit buffer directly.
+
+Signed-off-by: Zhang Yi <yi.zhang@huawei.com>
+Signed-off-by: Zhihao Cheng <chengzhihao1@huawei.com>
+Reviewed-by: Zhang Yi <yi.zhang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/ext4/super.c |   27 +++++++++++++++++++--------
+ 1 file changed, 19 insertions(+), 8 deletions(-)
+
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -5649,13 +5649,21 @@ static void ext4_update_super(struct sup
+ static int ext4_commit_super(struct super_block *sb)
+ {
+ 	struct buffer_head *sbh = EXT4_SB(sb)->s_sbh;
+-	int error = 0;
+ 
+-	if (!sbh || block_device_ejected(sb))
+-		return error;
++	if (!sbh)
++		return -EINVAL;
++	if (block_device_ejected(sb))
++		return -ENODEV;
+ 
+ 	ext4_update_super(sb);
+ 
++	lock_buffer(sbh);
++	/* Buffer got discarded which means block device got invalidated */
++	if (!buffer_mapped(sbh)) {
++		unlock_buffer(sbh);
++		return -EIO;
++	}
++
+ 	if (buffer_write_io_error(sbh) || !buffer_uptodate(sbh)) {
+ 		/*
+ 		 * Oh, dear.  A previous attempt to write the
+@@ -5670,17 +5678,20 @@ static int ext4_commit_super(struct supe
+ 		clear_buffer_write_io_error(sbh);
+ 		set_buffer_uptodate(sbh);
+ 	}
+-	BUFFER_TRACE(sbh, "marking dirty");
+-	mark_buffer_dirty(sbh);
+-	error = __sync_dirty_buffer(sbh,
+-		REQ_SYNC | (test_opt(sb, BARRIER) ? REQ_FUA : 0));
++	get_bh(sbh);
++	sbh->b_end_io = end_buffer_write_sync;
++	clear_buffer_dirty(sbh);
++	submit_bh(REQ_OP_WRITE,
++		  REQ_SYNC | (test_opt(sb, BARRIER) ? REQ_FUA : 0), sbh);
++	wait_on_buffer(sbh);
+ 	if (buffer_write_io_error(sbh)) {
+ 		ext4_msg(sb, KERN_ERR, "I/O error while writing "
+ 		       "superblock");
+ 		clear_buffer_write_io_error(sbh);
+ 		set_buffer_uptodate(sbh);
++		return -EIO;
+ 	}
+-	return error;
++	return 0;
+ }
+ 
+ /*
