@@ -5,6 +5,7 @@ Subject: [PATCH] mm: add Kernel Electric-Fence infrastructure
 Git-commit: 0ce20dd840897b12ae70869c69f1ba34d6d16965
 Patch-mainline: v5.12-rc2
 References: bsn#12
+Modified-by-SEL: Yes, modified due to context change
 
 
 Patch series "KFENCE: A low-overhead sampling-based memory safety error detector", v7.
@@ -163,15 +164,15 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
 [jyang: fixby euler OLK-5.10 commit e8d38c9d984e20367d6bd7bda410c84b6d0c9f86]
 Signed-off-by: Jun Yang <jun.yang@suse.com>
 ---
- include/linux/kfence.h | 216 +++++++++++
- init/main.c            |   3 +
- lib/Kconfig.debug      |   1 +
- lib/Kconfig.kfence     |  67 ++++
- mm/Makefile            |   1 +
- mm/kfence/Makefile     |   3 +
- mm/kfence/core.c       | 840 +++++++++++++++++++++++++++++++++++++++++
- mm/kfence/kfence.h     | 113 ++++++
- mm/kfence/report.c     | 240 ++++++++++++
+ include/linux/kfence.h |  216 ++++++++++++
+ init/main.c            |    3 
+ lib/Kconfig.debug      |    1 
+ lib/Kconfig.kfence     |   67 +++
+ mm/Makefile            |    1 
+ mm/kfence/Makefile     |    3 
+ mm/kfence/core.c       |  840 +++++++++++++++++++++++++++++++++++++++++++++++++
+ mm/kfence/kfence.h     |  113 ++++++
+ mm/kfence/report.c     |  240 ++++++++++++++
  9 files changed, 1484 insertions(+)
  create mode 100644 include/linux/kfence.h
  create mode 100644 lib/Kconfig.kfence
@@ -180,9 +181,6 @@ Signed-off-by: Jun Yang <jun.yang@suse.com>
  create mode 100644 mm/kfence/kfence.h
  create mode 100644 mm/kfence/report.c
 
-diff --git a/include/linux/kfence.h b/include/linux/kfence.h
-new file mode 100644
-index 000000000000..81f3911cb298
 --- /dev/null
 +++ b/include/linux/kfence.h
 @@ -0,0 +1,216 @@
@@ -402,8 +400,6 @@ index 000000000000..81f3911cb298
 +#endif
 +
 +#endif /* _LINUX_KFENCE_H */
-diff --git a/init/main.c b/init/main.c
-index e9933cbf60d4..261051070e3c 100644
 --- a/init/main.c
 +++ b/init/main.c
 @@ -40,6 +40,7 @@
@@ -414,7 +410,7 @@ index e9933cbf60d4..261051070e3c 100644
  #include <linux/rcupdate.h>
  #include <linux/moduleparam.h>
  #include <linux/kallsyms.h>
-@@ -824,6 +825,7 @@ static void __init mm_init(void)
+@@ -827,6 +828,7 @@ static void __init mm_init(void)
  	 */
  	page_ext_init_flatmem();
  	init_debug_pagealloc();
@@ -422,19 +418,17 @@ index e9933cbf60d4..261051070e3c 100644
  	report_meminit();
  	mem_init();
  	/* page_owner must be initialized after buddy is ready */
-@@ -955,6 +957,7 @@ asmlinkage __visible void __init __no_sanitize_address start_kernel(void)
- 	hrtimers_init();
+@@ -955,6 +957,7 @@ asmlinkage __visible void __init __no_sa
  	softirq_init();
  	timekeeping_init();
+ 	time_init();
 +	kfence_init();
  
  	/*
  	 * For best initial stack canary entropy, prepare it after:
-diff --git a/lib/Kconfig.debug b/lib/Kconfig.debug
-index f9febffffc21..2779c29d9981 100644
 --- a/lib/Kconfig.debug
 +++ b/lib/Kconfig.debug
-@@ -938,6 +938,7 @@ config DEBUG_STACKOVERFLOW
+@@ -887,6 +887,7 @@ config DEBUG_STACKOVERFLOW
  	  If in doubt, say "N".
  
  source "lib/Kconfig.kasan"
@@ -442,9 +436,6 @@ index f9febffffc21..2779c29d9981 100644
  
  endmenu # "Memory Debugging"
  
-diff --git a/lib/Kconfig.kfence b/lib/Kconfig.kfence
-new file mode 100644
-index 000000000000..b88ac9d6b2e6
 --- /dev/null
 +++ b/lib/Kconfig.kfence
 @@ -0,0 +1,67 @@
@@ -515,11 +506,9 @@ index 000000000000..b88ac9d6b2e6
 +	  Only for KFENCE testing; set to 0 if you are not a KFENCE developer.
 +
 +endif # KFENCE
-diff --git a/mm/Makefile b/mm/Makefile
-index 135bbb65511a..72227b24a616 100644
 --- a/mm/Makefile
 +++ b/mm/Makefile
-@@ -81,6 +81,7 @@ obj-$(CONFIG_PAGE_POISONING) += page_poison.o
+@@ -81,6 +81,7 @@ obj-$(CONFIG_PAGE_POISONING) += page_poi
  obj-$(CONFIG_SLAB) += slab.o
  obj-$(CONFIG_SLUB) += slub.o
  obj-$(CONFIG_KASAN)	+= kasan/
@@ -527,18 +516,12 @@ index 135bbb65511a..72227b24a616 100644
  obj-$(CONFIG_FAILSLAB) += failslab.o
  obj-$(CONFIG_MEMORY_HOTPLUG) += memory_hotplug.o
  obj-$(CONFIG_MEMTEST)		+= memtest.o
-diff --git a/mm/kfence/Makefile b/mm/kfence/Makefile
-new file mode 100644
-index 000000000000..d991e9a349f0
 --- /dev/null
 +++ b/mm/kfence/Makefile
 @@ -0,0 +1,3 @@
 +# SPDX-License-Identifier: GPL-2.0
 +
 +obj-$(CONFIG_KFENCE) := core.o report.o
-diff --git a/mm/kfence/core.c b/mm/kfence/core.c
-new file mode 100644
-index 000000000000..d6a32c13336b
 --- /dev/null
 +++ b/mm/kfence/core.c
 @@ -0,0 +1,840 @@
@@ -1382,9 +1365,6 @@ index 000000000000..d6a32c13336b
 +
 +	return kfence_unprotect(addr); /* Unprotect and let access proceed. */
 +}
-diff --git a/mm/kfence/kfence.h b/mm/kfence/kfence.h
-new file mode 100644
-index 000000000000..1014060f9707
 --- /dev/null
 +++ b/mm/kfence/kfence.h
 @@ -0,0 +1,113 @@
@@ -1501,9 +1481,6 @@ index 000000000000..1014060f9707
 +void kfence_print_object(struct seq_file *seq, const struct kfence_metadata *meta);
 +
 +#endif /* MM_KFENCE_KFENCE_H */
-diff --git a/mm/kfence/report.c b/mm/kfence/report.c
-new file mode 100644
-index 000000000000..64f27c8d46a3
 --- /dev/null
 +++ b/mm/kfence/report.c
 @@ -0,0 +1,240 @@
@@ -1747,6 +1724,3 @@ index 000000000000..64f27c8d46a3
 +	/* We encountered a memory unsafety error, taint the kernel! */
 +	add_taint(TAINT_BAD_PAGE, LOCKDEP_STILL_OK);
 +}
--- 
-2.31.1
-
