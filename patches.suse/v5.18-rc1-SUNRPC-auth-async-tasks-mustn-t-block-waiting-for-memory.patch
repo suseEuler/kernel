@@ -1,9 +1,12 @@
+From a41b05edfedb939440e83666f23de3ef9af33acf Mon Sep 17 00:00:00 2001
 From: NeilBrown <neilb@suse.de>
-Date: Wed, 27 Oct 2021 15:12:30 +1100
+Date: Mon, 7 Mar 2022 10:41:44 +1100
 Subject: [PATCH] SUNRPC/auth: async tasks mustn't block waiting for memory
-Patch-mainline: Not yet - undergoing review
-References: bsn#120 bsc#1191876
-Modified-by-SEL: No
+Git-commit: a41b05edfedb939440e83666f23de3ef9af33acf
+Patch-mainline: v5.18-rc1
+References: bsn#263
+Modified-by-SEL: Yes, modified due to different context
+
 
 When memory is short, new worker threads cannot be created and we depend
 on the minimum one rpciod thread to be able to handle everything.  So it
@@ -21,15 +24,15 @@ a short while and try again.  HZ>>4 is chosen as it is used elsewhere
 for -ENOMEM retries.
 
 Signed-off-by: NeilBrown <neilb@suse.de>
-Acked-by: NeilBrown <neilb@suse.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
 Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
 ---
  include/linux/sunrpc/auth.h    |    1 +
  net/sunrpc/auth.c              |    6 +++++-
  net/sunrpc/auth_gss/auth_gss.c |    6 +++++-
- net/sunrpc/auth_unix.c         |    8 +++++++-
+ net/sunrpc/auth_unix.c         |    9 ++++++++-
  net/sunrpc/clnt.c              |    3 +++
- 5 files changed, 21 insertions(+), 3 deletions(-)
+ 5 files changed, 22 insertions(+), 3 deletions(-)
 
 --- a/include/linux/sunrpc/auth.h
 +++ b/include/linux/sunrpc/auth.h
@@ -77,7 +80,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  gss_lookup_cred(struct rpc_auth *auth, struct auth_cred *acred, int flags)
  {
 -	return rpcauth_lookup_credcache(auth, acred, flags, GFP_NOFS);
-+	gfp_t gfp = GFP_NOFS;
++	gfp_t gfp = GFP_KERNEL;
 +
 +	if (flags & RPCAUTH_LOOKUP_ASYNC)
 +		gfp = GFP_NOWAIT | __GFP_NOWARN;
@@ -87,25 +90,25 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  static struct rpc_cred *
 --- a/net/sunrpc/auth_unix.c
 +++ b/net/sunrpc/auth_unix.c
-@@ -43,8 +43,14 @@ unx_destroy(struct rpc_auth *auth)
+@@ -43,7 +43,14 @@ unx_destroy(struct rpc_auth *auth)
  static struct rpc_cred *
  unx_lookup_cred(struct rpc_auth *auth, struct auth_cred *acred, int flags)
  {
 -	struct rpc_cred *ret = mempool_alloc(unix_pool, GFP_NOFS);
-+	gfp_t gfp = GFP_NOFS;
++	gfp_t gfp = GFP_KERNEL;
 +	struct rpc_cred *ret;
- 
++
 +	if (flags & RPCAUTH_LOOKUP_ASYNC)
 +		gfp = GFP_NOWAIT | __GFP_NOWARN;
 +	ret = mempool_alloc(unix_pool, gfp);
 +	if (!ret)
 +		return ERR_PTR(-ENOMEM);
+ 
  	rpcauth_init_cred(ret, acred, auth, &unix_credops);
  	ret->cr_flags = 1UL << RPCAUTH_CRED_UPTODATE;
- 	return ret;
 --- a/net/sunrpc/clnt.c
 +++ b/net/sunrpc/clnt.c
-@@ -1750,6 +1750,9 @@ call_refreshresult(struct rpc_task *task
+@@ -1747,6 +1747,9 @@ call_refreshresult(struct rpc_task *task
  		task->tk_cred_retry--;
  		trace_rpc_retry_refresh_status(task);
  		return;
