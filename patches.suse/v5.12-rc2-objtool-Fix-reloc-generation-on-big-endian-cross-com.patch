@@ -1,0 +1,112 @@
+From a1a664ece586457e9f7652b0bc5b08386259e358 Mon Sep 17 00:00:00 2001
+Message-Id: <a1a664ece586457e9f7652b0bc5b08386259e358.1652325941.git.geliang.tang@suse.com>
+From: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Date: Fri, 13 Nov 2020 00:03:26 +0100
+Subject: [PATCH] objtool: Fix reloc generation on big endian cross-compiles
+Git-commit: a1a664ece586457e9f7652b0bc5b08386259e358
+Patch-mainline: v5.12-rc2
+References: bsn#258
+Modified-by-SEL: No
+
+
+Relocations generated in elf_rebuild_rel[a]_reloc_section() are broken
+if objtool is built and run on a big endian system.
+
+The following errors pop up during x86 cross-compilation:
+
+  x86_64-9.1.0-ld: fs/efivarfs/inode.o: bad reloc symbol index (0x2000000 >= 0x22) for offset 0 in section `.orc_unwind_ip'
+  x86_64-9.1.0-ld: final link failed: bad value
+
+Convert those functions to use gelf_update_rel[a](), similar to what
+elf_write_reloc() does.
+
+Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Co-developed-by: Vasily Gorbik <gor@linux.ibm.com>
+Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Acked-by: Masami Hiramatsu <mhiramat@kernel.org>
+Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/objtool/elf.c | 34 +++++++++++++++++++---------------
+ 1 file changed, 19 insertions(+), 15 deletions(-)
+
+diff --git a/tools/objtool/elf.c b/tools/objtool/elf.c
+index be89c741ba9a..c784122b7ecb 100644
+--- a/tools/objtool/elf.c
++++ b/tools/objtool/elf.c
+@@ -855,25 +855,27 @@ static int elf_rebuild_rel_reloc_section(struct section *sec, int nr)
+ {
+ 	struct reloc *reloc;
+ 	int idx = 0, size;
+-	GElf_Rel *relocs;
++	void *buf;
+ 
+ 	/* Allocate a buffer for relocations */
+-	size = nr * sizeof(*relocs);
+-	relocs = malloc(size);
+-	if (!relocs) {
++	size = nr * sizeof(GElf_Rel);
++	buf = malloc(size);
++	if (!buf) {
+ 		perror("malloc");
+ 		return -1;
+ 	}
+ 
+-	sec->data->d_buf = relocs;
++	sec->data->d_buf = buf;
+ 	sec->data->d_size = size;
++	sec->data->d_type = ELF_T_REL;
+ 
+ 	sec->sh.sh_size = size;
+ 
+ 	idx = 0;
+ 	list_for_each_entry(reloc, &sec->reloc_list, list) {
+-		relocs[idx].r_offset = reloc->offset;
+-		relocs[idx].r_info = GELF_R_INFO(reloc->sym->idx, reloc->type);
++		reloc->rel.r_offset = reloc->offset;
++		reloc->rel.r_info = GELF_R_INFO(reloc->sym->idx, reloc->type);
++		gelf_update_rel(sec->data, idx, &reloc->rel);
+ 		idx++;
+ 	}
+ 
+@@ -884,26 +886,28 @@ static int elf_rebuild_rela_reloc_section(struct section *sec, int nr)
+ {
+ 	struct reloc *reloc;
+ 	int idx = 0, size;
+-	GElf_Rela *relocs;
++	void *buf;
+ 
+ 	/* Allocate a buffer for relocations with addends */
+-	size = nr * sizeof(*relocs);
+-	relocs = malloc(size);
+-	if (!relocs) {
++	size = nr * sizeof(GElf_Rela);
++	buf = malloc(size);
++	if (!buf) {
+ 		perror("malloc");
+ 		return -1;
+ 	}
+ 
+-	sec->data->d_buf = relocs;
++	sec->data->d_buf = buf;
+ 	sec->data->d_size = size;
++	sec->data->d_type = ELF_T_RELA;
+ 
+ 	sec->sh.sh_size = size;
+ 
+ 	idx = 0;
+ 	list_for_each_entry(reloc, &sec->reloc_list, list) {
+-		relocs[idx].r_offset = reloc->offset;
+-		relocs[idx].r_addend = reloc->addend;
+-		relocs[idx].r_info = GELF_R_INFO(reloc->sym->idx, reloc->type);
++		reloc->rela.r_offset = reloc->offset;
++		reloc->rela.r_addend = reloc->addend;
++		reloc->rela.r_info = GELF_R_INFO(reloc->sym->idx, reloc->type);
++		gelf_update_rela(sec->data, idx, &reloc->rela);
+ 		idx++;
+ 	}
+ 
+-- 
+2.34.1
+

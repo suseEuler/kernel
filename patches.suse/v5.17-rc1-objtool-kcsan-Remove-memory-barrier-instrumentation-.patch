@@ -1,0 +1,108 @@
+From 0509811952e41ad1e04c50d2378078250b6b7be3 Mon Sep 17 00:00:00 2001
+Message-Id: <0509811952e41ad1e04c50d2378078250b6b7be3.1652325022.git.geliang.tang@suse.com>
+From: Marco Elver <elver@google.com>
+Date: Tue, 30 Nov 2021 12:44:31 +0100
+Subject: [PATCH] objtool, kcsan: Remove memory barrier instrumentation from
+ noinstr
+Git-commit: 0509811952e41ad1e04c50d2378078250b6b7be3
+Patch-mainline: v5.17-rc1
+References: bsn#258
+Modified-by-SEL: No
+
+
+Teach objtool to turn instrumentation required for memory barrier
+modeling into nops in noinstr text.
+
+The __tsan_func_entry/exit calls are still emitted by compilers even
+with the __no_sanitize_thread attribute. The memory barrier
+instrumentation will be inserted explicitly (without compiler help), and
+thus needs to also explicitly be removed.
+
+Signed-off-by: Marco Elver <elver@google.com>
+Acked-by: Josh Poimboeuf <jpoimboe@redhat.com>
+Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/objtool/check.c               | 37 ++++++++++++++++++++++++-----
+ tools/objtool/include/objtool/elf.h |  2 +-
+ 2 files changed, 32 insertions(+), 7 deletions(-)
+
+diff --git a/tools/objtool/check.c b/tools/objtool/check.c
+index 61dfb66b30b6..a9a1f7259d62 100644
+--- a/tools/objtool/check.c
++++ b/tools/objtool/check.c
+@@ -1072,11 +1072,11 @@ static void annotate_call_site(struct objtool_file *file,
+ 	}
+ 
+ 	/*
+-	 * Many compilers cannot disable KCOV with a function attribute
+-	 * so they need a little help, NOP out any KCOV calls from noinstr
+-	 * text.
++	 * Many compilers cannot disable KCOV or sanitizer calls with a function
++	 * attribute so they need a little help, NOP out any such calls from
++	 * noinstr text.
+ 	 */
+-	if (insn->sec->noinstr && sym->kcov) {
++	if (insn->sec->noinstr && sym->profiling_func) {
+ 		if (reloc) {
+ 			reloc->type = R_NONE;
+ 			elf_write_reloc(file->elf, reloc);
+@@ -1991,6 +1991,31 @@ static int read_intra_function_calls(struct objtool_file *file)
+ 	return 0;
+ }
+ 
++/*
++ * Return true if name matches an instrumentation function, where calls to that
++ * function from noinstr code can safely be removed, but compilers won't do so.
++ */
++static bool is_profiling_func(const char *name)
++{
++	/*
++	 * Many compilers cannot disable KCOV with a function attribute.
++	 */
++	if (!strncmp(name, "__sanitizer_cov_", 16))
++		return true;
++
++	/*
++	 * Some compilers currently do not remove __tsan_func_entry/exit nor
++	 * __tsan_atomic_signal_fence (used for barrier instrumentation) with
++	 * the __no_sanitize_thread attribute, remove them. Once the kernel's
++	 * minimum Clang version is 14.0, this can be removed.
++	 */
++	if (!strncmp(name, "__tsan_func_", 12) ||
++	    !strcmp(name, "__tsan_atomic_signal_fence"))
++		return true;
++
++	return false;
++}
++
+ static int classify_symbols(struct objtool_file *file)
+ {
+ 	struct section *sec;
+@@ -2011,8 +2036,8 @@ static int classify_symbols(struct objtool_file *file)
+ 			if (!strcmp(func->name, "__fentry__"))
+ 				func->fentry = true;
+ 
+-			if (!strncmp(func->name, "__sanitizer_cov_", 16))
+-				func->kcov = true;
++			if (is_profiling_func(func->name))
++				func->profiling_func = true;
+ 		}
+ 	}
+ 
+diff --git a/tools/objtool/include/objtool/elf.h b/tools/objtool/include/objtool/elf.h
+index cdc739fa9a6f..d22336781401 100644
+--- a/tools/objtool/include/objtool/elf.h
++++ b/tools/objtool/include/objtool/elf.h
+@@ -58,7 +58,7 @@ struct symbol {
+ 	u8 static_call_tramp : 1;
+ 	u8 retpoline_thunk   : 1;
+ 	u8 fentry            : 1;
+-	u8 kcov              : 1;
++	u8 profiling_func    : 1;
+ 	struct list_head pv_target;
+ };
+ 
+-- 
+2.34.1
+

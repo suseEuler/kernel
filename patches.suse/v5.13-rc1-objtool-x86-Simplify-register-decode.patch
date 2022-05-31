@@ -1,0 +1,256 @@
+From 16ef7f159c503c7befec7018ee0e82fdc311721e Mon Sep 17 00:00:00 2001
+Message-Id: <16ef7f159c503c7befec7018ee0e82fdc311721e.1652325617.git.geliang.tang@suse.com>
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Tue, 9 Feb 2021 19:59:43 +0100
+Subject: [PATCH] objtool,x86: Simplify register decode
+Git-commit: 16ef7f159c503c7befec7018ee0e82fdc311721e
+Patch-mainline: v5.13-rc1
+References: bsn#258
+Modified-by-SEL: Yes, refreshed due to context changes
+
+
+Since the CFI_reg number now matches the instruction encoding order do
+away with the op_to_cfi_reg[] and use direct assignment.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Acked-by: Josh Poimboeuf <jpoimboe@redhat.com>
+Tested-by: Nick Desaulniers <ndesaulniers@google.com>
+Link: https://lkml.kernel.org/r/20210211173627.362004522@infradead.org
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/objtool/arch/x86/decode.c | 79 ++++++++++++++++-----------------
+ 1 file changed, 39 insertions(+), 40 deletions(-)
+
+--- a/tools/objtool/arch/x86/decode.c
++++ b/tools/objtool/arch/x86/decode.c
+@@ -21,17 +21,6 @@
+ #include <objtool/warn.h>
+ #include <arch/elf.h>
+ 
+-static unsigned char op_to_cfi_reg[][2] = {
+-	{CFI_AX, CFI_R8},
+-	{CFI_CX, CFI_R9},
+-	{CFI_DX, CFI_R10},
+-	{CFI_BX, CFI_R11},
+-	{CFI_SP, CFI_R12},
+-	{CFI_BP, CFI_R13},
+-	{CFI_SI, CFI_R14},
+-	{CFI_DI, CFI_R15},
+-};
+-
+ static int is_x86_64(const struct elf *elf)
+ {
+ 	switch (elf->ehdr.e_machine) {
+@@ -98,7 +87,7 @@ int arch_decode_instruction(const struct
+ 	unsigned char op1, op2,
+ 		      rex = 0, rex_b = 0, rex_r = 0, rex_w = 0, rex_x = 0,
+ 		      modrm = 0, modrm_mod = 0, modrm_rm = 0, modrm_reg = 0,
+-		      sib = 0;
++		      sib = 0 /* , sib_scale = 0, sib_index = 0, sib_base = 0 */;
+ 	struct stack_op *op = NULL;
+ 	struct symbol *sym;
+ 
+@@ -133,23 +122,29 @@ int arch_decode_instruction(const struct
+ 	if (insn.modrm.nbytes) {
+ 		modrm = insn.modrm.bytes[0];
+ 		modrm_mod = X86_MODRM_MOD(modrm);
+-		modrm_reg = X86_MODRM_REG(modrm);
+-		modrm_rm = X86_MODRM_RM(modrm);
++		modrm_reg = X86_MODRM_REG(modrm) + 8*rex_r;
++		modrm_rm  = X86_MODRM_RM(modrm)  + 8*rex_b;
+ 	}
+ 
+-	if (insn.sib.nbytes)
++	if (insn.sib.nbytes) {
+ 		sib = insn.sib.bytes[0];
++		/*
++		sib_scale = X86_SIB_SCALE(sib);
++		sib_index = X86_SIB_INDEX(sib) + 8*rex_x;
++		sib_base  = X86_SIB_BASE(sib)  + 8*rex_b;
++		 */
++	}
+ 
+ 	switch (op1) {
+ 
+ 	case 0x1:
+ 	case 0x29:
+-		if (rex_w && !rex_b && modrm_mod == 3 && modrm_rm == 4) {
++		if (rex_w && modrm_mod == 3 && modrm_rm == CFI_SP) {
+ 
+ 			/* add/sub reg, %rsp */
+ 			ADD_OP(op) {
+ 				op->src.type = OP_SRC_ADD;
+-				op->src.reg = op_to_cfi_reg[modrm_reg][rex_r];
++				op->src.reg = modrm_reg;
+ 				op->dest.type = OP_DEST_REG;
+ 				op->dest.reg = CFI_SP;
+ 			}
+@@ -161,7 +156,7 @@ int arch_decode_instruction(const struct
+ 		/* push reg */
+ 		ADD_OP(op) {
+ 			op->src.type = OP_SRC_REG;
+-			op->src.reg = op_to_cfi_reg[op1 & 0x7][rex_b];
++			op->src.reg = (op1 & 0x7) + 8*rex_b;
+ 			op->dest.type = OP_DEST_PUSH;
+ 		}
+ 
+@@ -173,7 +168,7 @@ int arch_decode_instruction(const struct
+ 		ADD_OP(op) {
+ 			op->src.type = OP_SRC_POP;
+ 			op->dest.type = OP_DEST_REG;
+-			op->dest.reg = op_to_cfi_reg[op1 & 0x7][rex_b];
++			op->dest.reg = (op1 & 0x7) + 8*rex_b;
+ 		}
+ 
+ 		break;
+@@ -226,7 +221,7 @@ int arch_decode_instruction(const struct
+ 		break;
+ 
+ 	case 0x89:
+-		if (rex_w && !rex_r && modrm_reg == 4) {
++		if (rex_w && modrm_reg == CFI_SP) {
+ 
+ 			if (modrm_mod == 3) {
+ 				/* mov %rsp, reg */
+@@ -234,17 +229,17 @@ int arch_decode_instruction(const struct
+ 					op->src.type = OP_SRC_REG;
+ 					op->src.reg = CFI_SP;
+ 					op->dest.type = OP_DEST_REG;
+-					op->dest.reg = op_to_cfi_reg[modrm_rm][rex_b];
++					op->dest.reg = modrm_rm;
+ 				}
+ 				break;
+ 
+ 			} else {
+ 				/* skip nontrivial SIB */
+-				if (modrm_rm == 4 && !(sib == 0x24 && rex_b == rex_x))
++				if ((modrm_rm & 7) == 4 && !(sib == 0x24 && rex_b == rex_x))
+ 					break;
+ 
+ 				/* skip RIP relative displacement */
+-				if (modrm_rm == 5 && modrm_mod == 0)
++				if ((modrm_rm & 7) == 5 && modrm_mod == 0)
+ 					break;
+ 
+ 				/* mov %rsp, disp(%reg) */
+@@ -252,7 +247,7 @@ int arch_decode_instruction(const struct
+ 					op->src.type = OP_SRC_REG;
+ 					op->src.reg = CFI_SP;
+ 					op->dest.type = OP_DEST_REG_INDIRECT;
+-					op->dest.reg = op_to_cfi_reg[modrm_rm][rex_b];
++					op->dest.reg = modrm_rm;
+ 					op->dest.offset = insn.displacement.value;
+ 				}
+ 				break;
+@@ -261,12 +256,12 @@ int arch_decode_instruction(const struct
+ 			break;
+ 		}
+ 
+-		if (rex_w && !rex_b && modrm_mod == 3 && modrm_rm == 4) {
++		if (rex_w && modrm_mod == 3 && modrm_rm == CFI_SP) {
+ 
+ 			/* mov reg, %rsp */
+ 			ADD_OP(op) {
+ 				op->src.type = OP_SRC_REG;
+-				op->src.reg = op_to_cfi_reg[modrm_reg][rex_r];
++				op->src.reg = modrm_reg;
+ 				op->dest.type = OP_DEST_REG;
+ 				op->dest.reg = CFI_SP;
+ 			}
+@@ -275,13 +270,12 @@ int arch_decode_instruction(const struct
+ 
+ 		/* fallthrough */
+ 	case 0x88:
+-		if (!rex_b &&
+-		    (modrm_mod == 1 || modrm_mod == 2) && modrm_rm == 5) {
++		if ((modrm_mod == 1 || modrm_mod == 2) && modrm_rm == CFI_BP) {
+ 
+ 			/* mov reg, disp(%rbp) */
+ 			ADD_OP(op) {
+ 				op->src.type = OP_SRC_REG;
+-				op->src.reg = op_to_cfi_reg[modrm_reg][rex_r];
++				op->src.reg = modrm_reg;
+ 				op->dest.type = OP_DEST_REG_INDIRECT;
+ 				op->dest.reg = CFI_BP;
+ 				op->dest.offset = insn.displacement.value;
+@@ -289,12 +283,12 @@ int arch_decode_instruction(const struct
+ 			break;
+ 		}
+ 
+-		if (rex_w && !rex_b && modrm_rm == 4 && sib == 0x24) {
++		if (rex_w && modrm_rm == CFI_SP && sib == 0x24) {
+ 
+ 			/* mov reg, disp(%rsp) */
+ 			ADD_OP(op) {
+ 				op->src.type = OP_SRC_REG;
+-				op->src.reg = op_to_cfi_reg[modrm_reg][rex_r];
++				op->src.reg = modrm_reg;
+ 				op->dest.type = OP_DEST_REG_INDIRECT;
+ 				op->dest.reg = CFI_SP;
+ 				op->dest.offset = insn.displacement.value;
+@@ -305,7 +299,10 @@ int arch_decode_instruction(const struct
+ 		break;
+ 
+ 	case 0x8b:
+-		if (rex_w && !rex_b && modrm_mod == 1 && modrm_rm == 5) {
++		if (!rex_w)
++			break;
++
++		if (modrm_mod == 1 && modrm_rm == CFI_BP) {
+ 
+ 			/* mov disp(%rbp), reg */
+ 			ADD_OP(op) {
+@@ -313,11 +310,12 @@ int arch_decode_instruction(const struct
+ 				op->src.reg = CFI_BP;
+ 				op->src.offset = insn.displacement.value;
+ 				op->dest.type = OP_DEST_REG;
+-				op->dest.reg = op_to_cfi_reg[modrm_reg][rex_r];
++				op->dest.reg = modrm_reg;
+ 			}
++			break;
++		}
+ 
+-		} else if (rex_w && !rex_b && sib == 0x24 &&
+-			   modrm_mod != 3 && modrm_rm == 4) {
++		if (modrm_mod != 3 && modrm_rm == CFI_SP && sib == 0x24) {
+ 
+ 			/* mov disp(%rsp), reg */
+ 			ADD_OP(op) {
+@@ -325,8 +323,9 @@ int arch_decode_instruction(const struct
+ 				op->src.reg = CFI_SP;
+ 				op->src.offset = insn.displacement.value;
+ 				op->dest.type = OP_DEST_REG;
+-				op->dest.reg = op_to_cfi_reg[modrm_reg][rex_r];
++				op->dest.reg = modrm_reg;
+ 			}
++			break;
+ 		}
+ 
+ 		break;
+@@ -342,11 +341,11 @@ int arch_decode_instruction(const struct
+ 			break;
+ 
+ 		/* skip nontrivial SIB */
+-		if (modrm_rm == 4 && !(sib == 0x24 && rex_b == rex_x))
++		if ((modrm_rm & 7) == 4 && !(sib == 0x24 && rex_b == rex_x))
+ 			break;
+ 
+ 		/* skip RIP relative displacement */
+-		if (modrm_rm == 5 && modrm_mod == 0)
++		if ((modrm_rm & 7) == 5 && modrm_mod == 0)
+ 			break;
+ 
+ 		/* lea disp(%src), %dst */
+@@ -359,9 +358,9 @@ int arch_decode_instruction(const struct
+ 				/* lea disp(%src), %dst */
+ 				op->src.type = OP_SRC_ADD;
+ 			}
+-			op->src.reg = op_to_cfi_reg[modrm_rm][rex_b];
++			op->src.reg = modrm_rm;
+ 			op->dest.type = OP_DEST_REG;
+-			op->dest.reg = op_to_cfi_reg[modrm_reg][rex_r];
++			op->dest.reg = modrm_reg;
+ 		}
+ 		break;
+ 

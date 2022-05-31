@@ -1,0 +1,67 @@
+From 0507503671f9b1c867e889cbec0f43abf904f23c Mon Sep 17 00:00:00 2001
+Message-Id: <0507503671f9b1c867e889cbec0f43abf904f23c.1653915014.git.geliang.tang@suse.com>
+From: "H. Peter Anvin" <hpa@zytor.com>
+Date: Fri, 10 Sep 2021 12:59:10 -0700
+Subject: [PATCH] x86/asm: Avoid adding register pressure for the init case in
+ static_cpu_has()
+Git-commit: 0507503671f9b1c867e889cbec0f43abf904f23c
+Patch-mainline: v5.16-rc1
+References: bsn#258
+Modified-by-SEL: No
+
+gcc will sometimes manifest the address of boot_cpu_data in a register
+as part of constant propagation. When multiple static_cpu_has() are used
+this may foul the mainline code with a register load which will only be
+used on the fallback path, which is unused after initialization.
+
+Explicitly force gcc to use immediate (rip-relative) addressing for
+the fallback path, thus removing any possible register use from
+static_cpu_has().
+
+While making changes, modernize the code to use
+.pushsection...popsection instead of .section...previous.
+
+Signed-off-by: H. Peter Anvin (Intel) <hpa@zytor.com>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20210910195910.2542662-4-hpa@zytor.com
+---
+ arch/x86/include/asm/cpufeature.h | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/arch/x86/include/asm/cpufeature.h b/arch/x86/include/asm/cpufeature.h
+index 16a51e7288d5..1261842d006c 100644
+--- a/arch/x86/include/asm/cpufeature.h
++++ b/arch/x86/include/asm/cpufeature.h
+@@ -173,20 +173,25 @@ extern void clear_cpu_cap(struct cpuinfo_x86 *c, unsigned int bit);
+  * means that the boot_cpu_has() variant is already fast enough for the
+  * majority of cases and you should stick to using it as it is generally
+  * only two instructions: a RIP-relative MOV and a TEST.
++ *
++ * Do not use an "m" constraint for [cap_byte] here: gcc doesn't know
++ * that this is only used on a fallback path and will sometimes cause
++ * it to manifest the address of boot_cpu_data in a register, fouling
++ * the mainline (post-initialization) code.
+  */
+ static __always_inline bool _static_cpu_has(u16 bit)
+ {
+ 	asm_volatile_goto(
+ 		ALTERNATIVE_TERNARY("jmp 6f", %P[feature], "", "jmp %l[t_no]")
+-		".section .altinstr_aux,\"ax\"\n"
++		".pushsection .altinstr_aux,\"ax\"\n"
+ 		"6:\n"
+-		" testb %[bitnum],%[cap_byte]\n"
++		" testb %[bitnum]," _ASM_RIP(%P[cap_byte]) "\n"
+ 		" jnz %l[t_yes]\n"
+ 		" jmp %l[t_no]\n"
+-		".previous\n"
++		".popsection\n"
+ 		 : : [feature]  "i" (bit),
+ 		     [bitnum]   "i" (1 << (bit & 7)),
+-		     [cap_byte] "m" (((const char *)boot_cpu_data.x86_capability)[bit >> 3])
++		     [cap_byte] "i" (&((const char *)boot_cpu_data.x86_capability)[bit >> 3])
+ 		 : : t_yes, t_no);
+ t_yes:
+ 	return true;
+-- 
+2.34.1
+

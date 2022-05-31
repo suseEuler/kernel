@@ -1,0 +1,148 @@
+From 8ad15c6900840e8a2163012f4581c52127622e02 Mon Sep 17 00:00:00 2001
+Message-Id: <8ad15c6900840e8a2163012f4581c52127622e02.1652325576.git.geliang.tang@suse.com>
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Fri, 26 Feb 2021 10:59:59 +0100
+Subject: [PATCH] objtool: Add --backup
+Git-commit: 8ad15c6900840e8a2163012f4581c52127622e02
+Patch-mainline: v5.13-rc1
+References: bsn#258
+Modified-by-SEL: Yes, refreshed due to context changes
+
+
+Teach objtool to write backups files, such that it becomes easier to
+see what objtool did to the object file.
+
+Backup files will be ${name}.orig.
+
+Suggested-by: Borislav Petkov <bp@alien8.de>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Acked-by: Borislav Petkov <bp@suse.de>
+Acked-by: Josh Poimboeuf <jpoimboe@redhat.com>
+Link: https://lkml.kernel.org/r/YD4obT3aoXPWl7Ax@hirez.programming.kicks-ass.net
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/objtool/builtin-check.c           |  4 +-
+ tools/objtool/include/objtool/builtin.h |  3 +-
+ tools/objtool/objtool.c                 | 64 +++++++++++++++++++++++++
+ 3 files changed, 69 insertions(+), 2 deletions(-)
+
+--- a/tools/objtool/builtin-check.c
++++ b/tools/objtool/builtin-check.c
+@@ -18,7 +18,8 @@
+ #include <objtool/builtin.h>
+ #include <objtool/objtool.h>
+ 
+-bool no_fp, no_unreachable, retpoline, module, backtrace, uaccess, stats, validate_dup, vmlinux, mcount, noinstr;
++bool no_fp, no_unreachable, retpoline, module, backtrace, uaccess, stats,
++     validate_dup, vmlinux, mcount, noinstr, backup;
+ 
+ static const char * const check_usage[] = {
+ 	"objtool check [<options>] file.o",
+@@ -37,6 +38,7 @@ const struct option check_options[] = {
+ 	OPT_BOOLEAN('n', "noinstr", &noinstr, "noinstr validation for vmlinux.o"),
+ 	OPT_BOOLEAN('l', "vmlinux", &vmlinux, "vmlinux.o validation"),
+ 	OPT_BOOLEAN('M', "mcount", &mcount, "generate __mcount_loc"),
++	OPT_BOOLEAN('B', "backup", &backup, "create .orig files before modification"),
+ 	OPT_END(),
+ };
+ 
+--- a/tools/objtool/include/objtool/builtin.h
++++ b/tools/objtool/include/objtool/builtin.h
+@@ -8,7 +8,8 @@
+ #include <subcmd/parse-options.h>
+ 
+ extern const struct option check_options[];
+-extern bool no_fp, no_unreachable, retpoline, module, backtrace, uaccess, stats, validate_dup, vmlinux, mcount, noinstr;
++extern bool no_fp, no_unreachable, retpoline, module, backtrace, uaccess, stats,
++            validate_dup, vmlinux, mcount, noinstr, backup;
+ 
+ extern int cmd_check(int argc, const char **argv);
+ extern int cmd_orc(int argc, const char **argv);
+--- a/tools/objtool/objtool.c
++++ b/tools/objtool/objtool.c
+@@ -17,6 +17,7 @@
+ #include <stdbool.h>
+ #include <string.h>
+ #include <stdlib.h>
++#include <unistd.h>
+ #include <subcmd/exec-cmd.h>
+ #include <subcmd/pager.h>
+ #include <linux/kernel.h>
+@@ -44,6 +45,64 @@ bool help;
+ const char *objname;
+ static struct objtool_file file;
+ 
++static bool objtool_create_backup(const char *_objname)
++{
++	int len = strlen(_objname);
++	char *buf, *base, *name = malloc(len+6);
++	int s, d, l, t;
++
++	if (!name) {
++		perror("failed backup name malloc");
++		return false;
++	}
++
++	strcpy(name, _objname);
++	strcpy(name + len, ".orig");
++
++	d = open(name, O_CREAT|O_WRONLY|O_TRUNC, 0644);
++	if (d < 0) {
++		perror("failed to create backup file");
++		return false;
++	}
++
++	s = open(_objname, O_RDONLY);
++	if (s < 0) {
++		perror("failed to open orig file");
++		return false;
++	}
++
++	buf = malloc(4096);
++	if (!buf) {
++		perror("failed backup data malloc");
++		return false;
++	}
++
++	while ((l = read(s, buf, 4096)) > 0) {
++		base = buf;
++		do {
++			t = write(d, base, l);
++			if (t < 0) {
++				perror("failed backup write");
++				return false;
++			}
++			base += t;
++			l -= t;
++		} while (l);
++	}
++
++	if (l < 0) {
++		perror("failed backup read");
++		return false;
++	}
++
++	free(name);
++	free(buf);
++	close(d);
++	close(s);
++
++	return true;
++}
++
+ struct objtool_file *objtool_open_read(const char *_objname)
+ {
+ 	if (objname) {
+@@ -59,6 +118,11 @@ struct objtool_file *objtool_open_read(c
+ 	if (!file.elf)
+ 		return NULL;
+ 
++	if (backup && !objtool_create_backup(objname)) {
++		WARN("can't create backup file");
++		return NULL;
++	}
++
+ 	INIT_LIST_HEAD(&file.insn_list);
+ 	hash_init(file.insn_hash);
+ 	INIT_LIST_HEAD(&file.retpoline_call_list);

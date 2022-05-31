@@ -1,0 +1,85 @@
+From ba08abca66d46381df60842f64f70099d5482b92 Mon Sep 17 00:00:00 2001
+Message-Id: <ba08abca66d46381df60842f64f70099d5482b92.1652325546.git.geliang.tang@suse.com>
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Mon, 8 Mar 2021 15:46:04 +0100
+Subject: [PATCH] objtool,x86: Fix uaccess PUSHF/POPF validation
+Git-commit: ba08abca66d46381df60842f64f70099d5482b92
+Patch-mainline: v5.12-rc3
+References: bsn#258
+Modified-by-SEL: No
+
+
+Commit ab234a260b1f ("x86/pv: Rework arch_local_irq_restore() to not
+use popf") replaced "push %reg; popf" with something like: "test
+$0x200, %reg; jz 1f; sti; 1:", which breaks the pushf/popf symmetry
+that commit ea24213d8088 ("objtool: Add UACCESS validation") relies
+on.
+
+The result is:
+
+  drivers/gpu/drm/amd/amdgpu/si.o: warning: objtool: si_common_hw_init()+0xf36: PUSHF stack exhausted
+
+Meanwhile, commit c9c324dc22aa ("objtool: Support stack layout changes
+in alternatives") makes that we can actually use stack-ops in
+alternatives, which means we can revert 1ff865e343c2 ("x86,smap: Fix
+smap_{save,restore}() alternatives").
+
+That in turn means we can limit the PUSHF/POPF handling of
+ea24213d8088 to those instructions that are in alternatives.
+
+Fixes: ab234a260b1f ("x86/pv: Rework arch_local_irq_restore() to not use popf")
+Reported-by: Borislav Petkov <bp@alien8.de>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Acked-by: Josh Poimboeuf <jpoimboe@redhat.com>
+Link: https://lkml.kernel.org/r/YEY4rIbQYa5fnnEp@hirez.programming.kicks-ass.net
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ arch/x86/include/asm/smap.h | 10 ++++------
+ tools/objtool/check.c       |  3 +++
+ 2 files changed, 7 insertions(+), 6 deletions(-)
+
+diff --git a/arch/x86/include/asm/smap.h b/arch/x86/include/asm/smap.h
+index 8b58d6975d5d..0bc9b0895f33 100644
+--- a/arch/x86/include/asm/smap.h
++++ b/arch/x86/include/asm/smap.h
+@@ -58,9 +58,8 @@ static __always_inline unsigned long smap_save(void)
+ 	unsigned long flags;
+ 
+ 	asm volatile ("# smap_save\n\t"
+-		      ALTERNATIVE("jmp 1f", "", X86_FEATURE_SMAP)
+-		      "pushf; pop %0; " __ASM_CLAC "\n\t"
+-		      "1:"
++		      ALTERNATIVE("", "pushf; pop %0; " __ASM_CLAC "\n\t",
++				  X86_FEATURE_SMAP)
+ 		      : "=rm" (flags) : : "memory", "cc");
+ 
+ 	return flags;
+@@ -69,9 +68,8 @@ static __always_inline unsigned long smap_save(void)
+ static __always_inline void smap_restore(unsigned long flags)
+ {
+ 	asm volatile ("# smap_restore\n\t"
+-		      ALTERNATIVE("jmp 1f", "", X86_FEATURE_SMAP)
+-		      "push %0; popf\n\t"
+-		      "1:"
++		      ALTERNATIVE("", "push %0; popf\n\t",
++				  X86_FEATURE_SMAP)
+ 		      : : "g" (flags) : "memory", "cc");
+ }
+ 
+diff --git a/tools/objtool/check.c b/tools/objtool/check.c
+index 068cdb41f76f..5e5388a38e2a 100644
+--- a/tools/objtool/check.c
++++ b/tools/objtool/check.c
+@@ -2442,6 +2442,9 @@ static int handle_insn_ops(struct instruction *insn, struct insn_state *state)
+ 		if (update_cfi_state(insn, &state->cfi, op))
+ 			return 1;
+ 
++		if (!insn->alt_group)
++			continue;
++
+ 		if (op->dest.type == OP_DEST_PUSHF) {
+ 			if (!state->uaccess_stack) {
+ 				state->uaccess_stack = 1;
+-- 
+2.34.1
+

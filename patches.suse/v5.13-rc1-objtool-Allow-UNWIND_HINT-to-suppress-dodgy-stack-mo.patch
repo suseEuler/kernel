@@ -1,0 +1,93 @@
+From d54dba41999498b38a40940e1123019d50b26496 Mon Sep 17 00:00:00 2001
+Message-Id: <d54dba41999498b38a40940e1123019d50b26496.1652325665.git.geliang.tang@suse.com>
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Thu, 11 Feb 2021 13:03:28 +0100
+Subject: [PATCH] objtool: Allow UNWIND_HINT to suppress dodgy stack
+ modifications
+Git-commit: d54dba41999498b38a40940e1123019d50b26496
+Patch-mainline: v5.13-rc1
+References: bsn#258
+Modified-by-SEL: Yes, refreshed due to context changes
+
+
+rewind_stack_do_exit()
+	UNWIND_HINT_FUNC
+	/* Prevent any naive code from trying to unwind to our caller. */
+
+	xorl	%ebp, %ebp
+	movq	PER_CPU_VAR(cpu_current_top_of_stack), %rax
+	leaq	-PTREGS_SIZE(%rax), %rsp
+	UNWIND_HINT_REGS
+
+	call	do_exit
+
+Does unspeakable things to the stack, which objtool currently fails to
+detect due to a limitation in instruction decoding. This will be
+rectified after which the above will result in:
+
+arch/x86/entry/entry_64.o: warning: objtool: .text+0xab: unsupported stack register modification
+
+Allow the UNWIND_HINT on the next instruction to suppress this, it
+will overwrite the state anyway.
+
+Suggested-by: Josh Poimboeuf <jpoimboe@redhat.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Acked-by: Josh Poimboeuf <jpoimboe@redhat.com>
+Tested-by: Nick Desaulniers <ndesaulniers@google.com>
+Link: https://lkml.kernel.org/r/20210211173626.918498579@infradead.org
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/objtool/check.c | 15 +++++++++------
+ 1 file changed, 9 insertions(+), 6 deletions(-)
+
+--- a/tools/objtool/check.c
++++ b/tools/objtool/check.c
+@@ -1970,8 +1970,9 @@ static void restore_reg(struct cfi_state
+  *   41 5d			pop    %r13
+  *   c3				retq
+  */
+-static int update_cfi_state(struct instruction *insn, struct cfi_state *cfi,
+-			     struct stack_op *op)
++static int update_cfi_state(struct instruction *insn,
++			    struct instruction *next_insn,
++			    struct cfi_state *cfi, struct stack_op *op)
+ {
+ 	struct cfi_reg *cfa = &cfi->cfa;
+ 	struct cfi_reg *regs = cfi->regs;
+@@ -2172,7 +2173,7 @@ static int update_cfi_state(struct instr
+ 				break;
+ 			}
+ 
+-			if (op->dest.reg == cfi->cfa.base) {
++			if (op->dest.reg == cfi->cfa.base && !(next_insn && next_insn->hint)) {
+ 				WARN_FUNC("unsupported stack register modification",
+ 					  insn->sec, insn->offset);
+ 				return -1;
+@@ -2444,13 +2445,15 @@ static int propagate_alt_cfi(struct objt
+ 	return 0;
+ }
+ 
+-static int handle_insn_ops(struct instruction *insn, struct insn_state *state)
++static int handle_insn_ops(struct instruction *insn,
++			   struct instruction *next_insn,
++			   struct insn_state *state)
+ {
+ 	struct stack_op *op;
+ 
+ 	list_for_each_entry(op, &insn->stack_ops, list) {
+ 
+-		if (update_cfi_state(insn, &state->cfi, op))
++		if (update_cfi_state(insn, next_insn, &state->cfi, op))
+ 			return 1;
+ 
+ 		if (!insn->alt_group)
+@@ -2733,7 +2736,7 @@ static int validate_branch(struct objtoo
+ 				return 0;
+ 		}
+ 
+-		if (handle_insn_ops(insn, &state))
++		if (handle_insn_ops(insn, next_insn, &state))
+ 			return 1;
+ 
+ 		switch (insn->type) {

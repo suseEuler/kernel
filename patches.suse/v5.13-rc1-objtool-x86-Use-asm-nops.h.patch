@@ -1,0 +1,158 @@
+From 301cddc21a157a3072d789a3097857202e550a24 Mon Sep 17 00:00:00 2001
+Message-Id: <301cddc21a157a3072d789a3097857202e550a24.1652325516.git.geliang.tang@suse.com>
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Fri, 12 Mar 2021 12:32:55 +0100
+Subject: [PATCH] objtool/x86: Use asm/nops.h
+Git-commit: 301cddc21a157a3072d789a3097857202e550a24
+Patch-mainline: v5.13-rc1
+References: bsn#258
+Modified-by-SEL: No
+
+
+Since the kernel will rely on a single canonical set of NOPs, make sure
+objtool uses the exact same ones.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20210312115749.136357911@infradead.org
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ tools/arch/x86/include/asm/nops.h | 81 +++++++++++++++++++++++++++++++
+ tools/objtool/arch/x86/decode.c   | 13 +++--
+ tools/objtool/sync-check.sh       |  1 +
+ 3 files changed, 90 insertions(+), 5 deletions(-)
+ create mode 100644 tools/arch/x86/include/asm/nops.h
+
+diff --git a/tools/arch/x86/include/asm/nops.h b/tools/arch/x86/include/asm/nops.h
+new file mode 100644
+index 000000000000..c1e5e818ba16
+--- /dev/null
++++ b/tools/arch/x86/include/asm/nops.h
+@@ -0,0 +1,81 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _ASM_X86_NOPS_H
++#define _ASM_X86_NOPS_H
++
++/*
++ * Define nops for use with alternative() and for tracing.
++ */
++
++#ifndef CONFIG_64BIT
++
++/*
++ * Generic 32bit nops from GAS:
++ *
++ * 1: nop
++ * 2: movl %esi,%esi
++ * 3: leal 0x0(%esi),%esi
++ * 4: leal 0x0(%esi,%eiz,1),%esi
++ * 5: leal %ds:0x0(%esi,%eiz,1),%esi
++ * 6: leal 0x0(%esi),%esi
++ * 7: leal 0x0(%esi,%eiz,1),%esi
++ * 8: leal %ds:0x0(%esi,%eiz,1),%esi
++ *
++ * Except 5 and 8, which are DS prefixed 4 and 7 resp, where GAS would emit 2
++ * nop instructions.
++ */
++#define BYTES_NOP1	0x90
++#define BYTES_NOP2	0x89,0xf6
++#define BYTES_NOP3	0x8d,0x76,0x00
++#define BYTES_NOP4	0x8d,0x74,0x26,0x00
++#define BYTES_NOP5	0x3e,BYTES_NOP4
++#define BYTES_NOP6	0x8d,0xb6,0x00,0x00,0x00,0x00
++#define BYTES_NOP7	0x8d,0xb4,0x26,0x00,0x00,0x00,0x00
++#define BYTES_NOP8	0x3e,BYTES_NOP7
++
++#else
++
++/*
++ * Generic 64bit nops from GAS:
++ *
++ * 1: nop
++ * 2: osp nop
++ * 3: nopl (%eax)
++ * 4: nopl 0x00(%eax)
++ * 5: nopl 0x00(%eax,%eax,1)
++ * 6: osp nopl 0x00(%eax,%eax,1)
++ * 7: nopl 0x00000000(%eax)
++ * 8: nopl 0x00000000(%eax,%eax,1)
++ */
++#define BYTES_NOP1	0x90
++#define BYTES_NOP2	0x66,BYTES_NOP1
++#define BYTES_NOP3	0x0f,0x1f,0x00
++#define BYTES_NOP4	0x0f,0x1f,0x40,0x00
++#define BYTES_NOP5	0x0f,0x1f,0x44,0x00,0x00
++#define BYTES_NOP6	0x66,BYTES_NOP5
++#define BYTES_NOP7	0x0f,0x1f,0x80,0x00,0x00,0x00,0x00
++#define BYTES_NOP8	0x0f,0x1f,0x84,0x00,0x00,0x00,0x00,0x00
++
++#endif /* CONFIG_64BIT */
++
++#ifdef __ASSEMBLY__
++#define _ASM_MK_NOP(x) .byte x
++#else
++#define _ASM_MK_NOP(x) ".byte " __stringify(x) "\n"
++#endif
++
++#define ASM_NOP1 _ASM_MK_NOP(BYTES_NOP1)
++#define ASM_NOP2 _ASM_MK_NOP(BYTES_NOP2)
++#define ASM_NOP3 _ASM_MK_NOP(BYTES_NOP3)
++#define ASM_NOP4 _ASM_MK_NOP(BYTES_NOP4)
++#define ASM_NOP5 _ASM_MK_NOP(BYTES_NOP5)
++#define ASM_NOP6 _ASM_MK_NOP(BYTES_NOP6)
++#define ASM_NOP7 _ASM_MK_NOP(BYTES_NOP7)
++#define ASM_NOP8 _ASM_MK_NOP(BYTES_NOP8)
++
++#define ASM_NOP_MAX 8
++
++#ifndef __ASSEMBLY__
++extern const unsigned char * const x86_nops[];
++#endif
++
++#endif /* _ASM_X86_NOPS_H */
+diff --git a/tools/objtool/arch/x86/decode.c b/tools/objtool/arch/x86/decode.c
+index 549813cff8ab..c117bfc60370 100644
+--- a/tools/objtool/arch/x86/decode.c
++++ b/tools/objtool/arch/x86/decode.c
+@@ -11,6 +11,9 @@
+ #include "../../../arch/x86/lib/inat.c"
+ #include "../../../arch/x86/lib/insn.c"
+ 
++#define CONFIG_64BIT 1
++#include <asm/nops.h>
++
+ #include <asm/orc_types.h>
+ #include <objtool/check.h>
+ #include <objtool/elf.h>
+@@ -596,11 +599,11 @@ void arch_initial_func_cfi_state(struct cfi_init_state *state)
+ const char *arch_nop_insn(int len)
+ {
+ 	static const char nops[5][5] = {
+-		/* 1 */ { 0x90 },
+-		/* 2 */ { 0x66, 0x90 },
+-		/* 3 */ { 0x0f, 0x1f, 0x00 },
+-		/* 4 */ { 0x0f, 0x1f, 0x40, 0x00 },
+-		/* 5 */ { 0x0f, 0x1f, 0x44, 0x00, 0x00 },
++		{ BYTES_NOP1 },
++		{ BYTES_NOP2 },
++		{ BYTES_NOP3 },
++		{ BYTES_NOP4 },
++		{ BYTES_NOP5 },
+ 	};
+ 
+ 	if (len < 1 || len > 5) {
+diff --git a/tools/objtool/sync-check.sh b/tools/objtool/sync-check.sh
+index 606a4b5e929f..d23268683910 100755
+--- a/tools/objtool/sync-check.sh
++++ b/tools/objtool/sync-check.sh
+@@ -10,6 +10,7 @@ FILES="include/linux/objtool.h"
+ 
+ if [ "$SRCARCH" = "x86" ]; then
+ FILES="$FILES
++arch/x86/include/asm/nops.h
+ arch/x86/include/asm/inat_types.h
+ arch/x86/include/asm/orc_types.h
+ arch/x86/include/asm/emulate_prefix.h
+-- 
+2.34.1
+
