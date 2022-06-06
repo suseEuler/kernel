@@ -1,0 +1,149 @@
+From 4117cebf1a9fcbf35b9aabf0e37b6c5eea296798 Mon Sep 17 00:00:00 2001
+From: Chengming Zhou <zhouchengming@bytedance.com>
+Date: Wed, 3 Mar 2021 11:46:59 +0800
+Subject: [PATCH] psi: Optimize task switch inside shared cgroups
+Git-commit: 4117cebf1a9fcbf35b9aabf0e37b6c5eea296798
+Patch-mainline: v5.13-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+The commit 36b238d57172 ("psi: Optimize switching tasks inside shared
+cgroups") only update cgroups whose state actually changes during a
+task switch only in task preempt case, not in task sleep case.
+
+We actually don't need to clear and set TSK_ONCPU state for common cgroups
+of next and prev task in sleep case, that can save many psi_group_change
+especially when most activity comes from one leaf cgroup.
+
+sleep before:
+psi_dequeue()
+  while ((group = iterate_groups(prev)))  # all ancestors
+    psi_group_change(prev, .clear=TSK_RUNNING|TSK_ONCPU)
+psi_task_switch()
+  while ((group = iterate_groups(next)))  # all ancestors
+    psi_group_change(next, .set=TSK_ONCPU)
+
+sleep after:
+psi_dequeue()
+  nop
+psi_task_switch()
+  while ((group = iterate_groups(next)))  # until (prev & next)
+    psi_group_change(next, .set=TSK_ONCPU)
+  while ((group = iterate_groups(prev)))  # all ancestors
+    psi_group_change(prev, .clear=common?TSK_RUNNING:TSK_RUNNING|TSK_ONCPU)
+
+When a voluntary sleep switches to another task, we remove one call of
+psi_group_change() for every common cgroup ancestor of the two tasks.
+
+Co-developed-by: Muchun Song <songmuchun@bytedance.com>
+Signed-off-by: Muchun Song <songmuchun@bytedance.com>
+Signed-off-by: Chengming Zhou <zhouchengming@bytedance.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Link: https://lkml.kernel.org/r/20210303034659.91735-5-zhouchengming@bytedance.com
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/sched/psi.c   | 35 +++++++++++++++++++++++++----------
+ kernel/sched/stats.h | 28 ++++++++++++----------------
+ 2 files changed, 37 insertions(+), 26 deletions(-)
+
+diff --git a/kernel/sched/psi.c b/kernel/sched/psi.c
+index 3907a6b847aa..ee3c5b48622f 100644
+--- a/kernel/sched/psi.c
++++ b/kernel/sched/psi.c
+@@ -840,20 +840,35 @@ void psi_task_switch(struct task_struct *prev, struct task_struct *next,
+ 		}
+ 	}
+ 
+-	/*
+-	 * If this is a voluntary sleep, dequeue will have taken care
+-	 * of the outgoing TSK_ONCPU alongside TSK_RUNNING already. We
+-	 * only need to deal with it during preemption.
+-	 */
+-	if (sleep)
+-		return;
+-
+ 	if (prev->pid) {
+-		psi_flags_change(prev, TSK_ONCPU, 0);
++		int clear = TSK_ONCPU, set = 0;
++
++		/*
++		 * When we're going to sleep, psi_dequeue() lets us handle
++		 * TSK_RUNNING and TSK_IOWAIT here, where we can combine it
++		 * with TSK_ONCPU and save walking common ancestors twice.
++		 */
++		if (sleep) {
++			clear |= TSK_RUNNING;
++			if (prev->in_iowait)
++				set |= TSK_IOWAIT;
++		}
++
++		psi_flags_change(prev, clear, set);
+ 
+ 		iter = NULL;
+ 		while ((group = iterate_groups(prev, &iter)) && group != common)
+-			psi_group_change(group, cpu, TSK_ONCPU, 0, true);
++			psi_group_change(group, cpu, clear, set, true);
++
++		/*
++		 * TSK_ONCPU is handled up to the common ancestor. If we're tasked
++		 * with dequeuing too, finish that for the rest of the hierarchy.
++		 */
++		if (sleep) {
++			clear &= ~TSK_ONCPU;
++			for (; group; group = iterate_groups(prev, &iter))
++				psi_group_change(group, cpu, clear, set, true);
++		}
+ 	}
+ }
+ 
+diff --git a/kernel/sched/stats.h b/kernel/sched/stats.h
+index 9e4e67a94731..dc218e9f4558 100644
+--- a/kernel/sched/stats.h
++++ b/kernel/sched/stats.h
+@@ -84,28 +84,24 @@ static inline void psi_enqueue(struct task_struct *p, bool wakeup)
+ 
+ static inline void psi_dequeue(struct task_struct *p, bool sleep)
+ {
+-	int clear = TSK_RUNNING, set = 0;
++	int clear = TSK_RUNNING;
+ 
+ 	if (static_branch_likely(&psi_disabled))
+ 		return;
+ 
+-	if (!sleep) {
+-		if (p->in_memstall)
+-			clear |= TSK_MEMSTALL;
+-	} else {
+-		/*
+-		 * When a task sleeps, schedule() dequeues it before
+-		 * switching to the next one. Merge the clearing of
+-		 * TSK_RUNNING and TSK_ONCPU to save an unnecessary
+-		 * psi_task_change() call in psi_sched_switch().
+-		 */
+-		clear |= TSK_ONCPU;
++	/*
++	 * A voluntary sleep is a dequeue followed by a task switch. To
++	 * avoid walking all ancestors twice, psi_task_switch() handles
++	 * TSK_RUNNING and TSK_IOWAIT for us when it moves TSK_ONCPU.
++	 * Do nothing here.
++	 */
++	if (sleep)
++		return;
+ 
+-		if (p->in_iowait)
+-			set |= TSK_IOWAIT;
+-	}
++	if (p->in_memstall)
++		clear |= TSK_MEMSTALL;
+ 
+-	psi_task_change(p, clear, set);
++	psi_task_change(p, clear, 0);
+ }
+ 
+ static inline void psi_ttwu_dequeue(struct task_struct *p)
+-- 
+2.34.1
+

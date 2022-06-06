@@ -1,0 +1,208 @@
+From b97f541e78a539c914e0c179132b1485bd92ecd5 Mon Sep 17 00:00:00 2001
+From: Yufen Yu <yuyufen@huawei.com>
+Date: Tue, 31 May 2022 23:19:45 +0800
+Subject: [PATCH] blk-mq: fix kabi broken by "blk-mq: Use request queue-wide
+ tags for tagset-wide sbitmap"
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: b97f541e78a539c914e0c179132b1485bd92ecd5
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I597XM
+CVE: NA
+
+---------------------------
+
+Signed-off-by: Yufen Yu <yuyufen@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ block/blk-core.c       | 10 ++++++----
+ block/blk-mq-sched.c   | 17 ++++++++++-------
+ block/blk-mq.c         |  7 ++++---
+ block/blk-sysfs.c      |  2 +-
+ block/blk.h            | 13 +++++++++++++
+ include/linux/blkdev.h |  3 ---
+ 6 files changed, 34 insertions(+), 18 deletions(-)
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 019d583b355c..9e43501d7759 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -517,13 +517,15 @@ static void blk_timeout_work(struct work_struct *work)
+ struct request_queue *blk_alloc_queue(int node_id)
+ {
+ 	struct request_queue *q;
++	struct request_queue_wrapper *q_wrapper;
+ 	int ret;
+ 
+-	q = kmem_cache_alloc_node(blk_requestq_cachep,
++	q_wrapper = kmem_cache_alloc_node(blk_requestq_cachep,
+ 				GFP_KERNEL | __GFP_ZERO, node_id);
+-	if (!q)
++	if (!q_wrapper)
+ 		return NULL;
+ 
++	q = &q_wrapper->q;
+ 	q->last_merge = NULL;
+ 
+ 	q->id = ida_simple_get(&blk_queue_ida, 0, 0, GFP_KERNEL);
+@@ -594,7 +596,7 @@ struct request_queue *blk_alloc_queue(int node_id)
+ fail_id:
+ 	ida_simple_remove(&blk_queue_ida, q->id);
+ fail_q:
+-	kmem_cache_free(blk_requestq_cachep, q);
++	kmem_cache_free(blk_requestq_cachep, q_wrapper);
+ 	return NULL;
+ }
+ EXPORT_SYMBOL(blk_alloc_queue);
+@@ -1796,7 +1798,7 @@ int __init blk_dev_init(void)
+ 		panic("Failed to create kblockd\n");
+ 
+ 	blk_requestq_cachep = kmem_cache_create("request_queue",
+-			sizeof(struct request_queue), 0, SLAB_PANIC, NULL);
++			sizeof(struct request_queue_wrapper), 0, SLAB_PANIC, NULL);
+ 
+ 	blk_debugfs_root = debugfs_create_dir("block", NULL);
+ 
+diff --git a/block/blk-mq-sched.c b/block/blk-mq-sched.c
+index 972bd9a3a977..324b59505894 100644
+--- a/block/blk-mq-sched.c
++++ b/block/blk-mq-sched.c
+@@ -548,13 +548,14 @@ static int blk_mq_init_sched_shared_sbitmap(struct request_queue *queue)
+ 	int alloc_policy = BLK_MQ_FLAG_TO_ALLOC_POLICY(set->flags);
+ 	struct blk_mq_hw_ctx *hctx;
+ 	int ret, i;
++	struct request_queue_wrapper *q_wrapper = queue_to_wrapper(queue);
+ 
+ 	/*
+ 	 * Set initial depth at max so that we don't need to reallocate for
+ 	 * updating nr_requests.
+ 	 */
+-	ret = blk_mq_init_bitmaps(&queue->sched_bitmap_tags,
+-				  &queue->sched_breserved_tags,
++	ret = blk_mq_init_bitmaps(&q_wrapper->sched_bitmap_tags,
++				  &q_wrapper->sched_breserved_tags,
+ 				  MAX_SCHED_RQ, set->reserved_tags,
+ 				  set->numa_node, alloc_policy);
+ 	if (ret)
+@@ -562,12 +563,12 @@ static int blk_mq_init_sched_shared_sbitmap(struct request_queue *queue)
+ 
+ 	queue_for_each_hw_ctx(queue, hctx, i) {
+ 		hctx->sched_tags->bitmap_tags =
+-					&queue->sched_bitmap_tags;
++					&q_wrapper->sched_bitmap_tags;
+ 		hctx->sched_tags->breserved_tags =
+-					&queue->sched_breserved_tags;
++					&q_wrapper->sched_breserved_tags;
+ 	}
+ 
+-	sbitmap_queue_resize(&queue->sched_bitmap_tags,
++	sbitmap_queue_resize(&q_wrapper->sched_bitmap_tags,
+ 			     queue->nr_requests - set->reserved_tags);
+ 
+ 	return 0;
+@@ -575,8 +576,10 @@ static int blk_mq_init_sched_shared_sbitmap(struct request_queue *queue)
+ 
+ static void blk_mq_exit_sched_shared_sbitmap(struct request_queue *queue)
+ {
+-	sbitmap_queue_free(&queue->sched_bitmap_tags);
+-	sbitmap_queue_free(&queue->sched_breserved_tags);
++	struct request_queue_wrapper *q_wrapper = queue_to_wrapper(queue);
++
++	sbitmap_queue_free(&q_wrapper->sched_bitmap_tags);
++	sbitmap_queue_free(&q_wrapper->sched_breserved_tags);
+ }
+ 
+ int blk_mq_init_sched(struct request_queue *q, struct elevator_type *e)
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 1e4448c1e042..c654981a6d50 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -3671,6 +3671,7 @@ int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr)
+ 	struct blk_mq_tag_set *set = q->tag_set;
+ 	struct blk_mq_hw_ctx *hctx;
+ 	int i, ret;
++	struct request_queue_wrapper *q_wrapper = queue_to_wrapper(q);
+ 
+ 	if (!set)
+ 		return -EINVAL;
+@@ -3699,9 +3700,9 @@ int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr)
+ 							nr, true);
+ 			if (blk_mq_is_sbitmap_shared(set->flags)) {
+ 				hctx->sched_tags->bitmap_tags =
+-					&q->sched_bitmap_tags;
++					&q_wrapper->sched_bitmap_tags;
+ 				hctx->sched_tags->breserved_tags =
+-					&q->sched_breserved_tags;
++					&q_wrapper->sched_breserved_tags;
+ 			}
+ 		}
+ 		if (ret)
+@@ -3712,7 +3713,7 @@ int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr)
+ 	if (!ret) {
+ 		q->nr_requests = nr;
+ 		if (q->elevator && blk_mq_is_sbitmap_shared(set->flags))
+-			sbitmap_queue_resize(&q->sched_bitmap_tags,
++			sbitmap_queue_resize(&q_wrapper->sched_bitmap_tags,
+ 					     nr - set->reserved_tags);
+ 	}
+ 
+diff --git a/block/blk-sysfs.c b/block/blk-sysfs.c
+index 66765740902b..751b7b0bec88 100644
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@ -726,7 +726,7 @@ static void blk_free_queue_rcu(struct rcu_head *rcu_head)
+ {
+ 	struct request_queue *q = container_of(rcu_head, struct request_queue,
+ 					       rcu_head);
+-	kmem_cache_free(blk_requestq_cachep, q);
++	kmem_cache_free(blk_requestq_cachep, queue_to_wrapper(q));
+ }
+ 
+ /* Unconfigure the I/O scheduler and dissociate from the cgroup controller. */
+diff --git a/block/blk.h b/block/blk.h
+index 3165c16725d5..b8948fda06e1 100644
+--- a/block/blk.h
++++ b/block/blk.h
+@@ -28,6 +28,19 @@ struct blk_flush_queue {
+ 	spinlock_t		mq_flush_lock;
+ };
+ 
++/*
++ * The wrapper of request_queue to fix kabi while adding members.
++ */
++struct request_queue_wrapper {
++	struct request_queue q;
++
++	struct sbitmap_queue	sched_bitmap_tags;
++	struct sbitmap_queue	sched_breserved_tags;
++};
++
++#define queue_to_wrapper(queue) \
++	container_of(queue, struct request_queue_wrapper, q)
++
+ extern struct kmem_cache *blk_requestq_cachep;
+ extern struct kobj_type blk_queue_ktype;
+ extern struct ida blk_queue_ida;
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index dc274953e661..6a4b2a01a462 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -500,9 +500,6 @@ struct request_queue {
+ 
+ 	atomic_t		nr_active_requests_shared_sbitmap;
+ 
+-	struct sbitmap_queue	sched_bitmap_tags;
+-	struct sbitmap_queue	sched_breserved_tags;
+-
+ 	struct list_head	icq_list;
+ #ifdef CONFIG_BLK_CGROUP
+ 	DECLARE_BITMAP		(blkcg_pols, BLKCG_MAX_POLS);
+-- 
+2.34.1
+

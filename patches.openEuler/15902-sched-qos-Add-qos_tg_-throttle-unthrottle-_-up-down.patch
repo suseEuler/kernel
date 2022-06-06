@@ -1,0 +1,126 @@
+From bd285756a1873eec44391cd8ce670151131c4c19 Mon Sep 17 00:00:00 2001
+From: Zhang Qiao <zhangqiao22@huawei.com>
+Date: Sat, 28 May 2022 17:57:26 +0800
+Subject: [PATCH] sched/qos: Add qos_tg_{throttle,unthrottle}_{up,down}
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: bd285756a1873eec44391cd8ce670151131c4c19
+Modified-by-SEL: Yes, refreshed due to different context
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4VZJT
+CVE: NA
+
+--------------------------------
+
+1. Qos throttle reuse tg_{throttle,unthrottle}_{up,down} that
+can write some cfs-bandwidth fields, it may cause some unknown
+data error. So add qos_tg_{throttle,unthrottle}_{up,down} for
+qos throttle.
+
+2. walk_tg_tree_from() caller must hold rcu_lock, currently there is
+none, so add it now.
+
+Signed-off-by: Zhang Qiao <zhangqiao22@huawei.com>
+Reviewed-by: Chen Hui <judy.chenhui@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/sched/fair.c |   39 +++++++++++++++++++++++++++++----------
+ 1 file changed, 29 insertions(+), 10 deletions(-)
+
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -5460,6 +5460,10 @@ static void __maybe_unused unthrottle_of
+ 
+ 	lockdep_assert_held(&rq->lock);
+ 
++#ifdef CONFIG_QOS_SCHED
++	unthrottle_qos_cfs_rqs(cpu_of(rq));
++#endif
++
+ 	rcu_read_lock();
+ 	list_for_each_entry_rcu(tg, &task_groups, list) {
+ 		struct cfs_rq *cfs_rq = tg->cfs_rq[cpu_of(rq)];
+@@ -5482,10 +5486,6 @@ static void __maybe_unused unthrottle_of
+ 			unthrottle_cfs_rq(cfs_rq);
+ 	}
+ 	rcu_read_unlock();
+-
+-#ifdef CONFIG_QOS_SCHED
+-	unthrottle_qos_cfs_rqs(cpu_of(rq));
+-#endif
+ }
+ 
+ #else /* CONFIG_CFS_BANDWIDTH */
+@@ -7181,6 +7181,27 @@ preempt:
+ #ifdef CONFIG_QOS_SCHED
+ 
+ static void start_qos_hrtimer(int cpu);
++
++static int qos_tg_unthrottle_up(struct task_group *tg, void *data)
++{
++	struct rq *rq = data;
++	struct cfs_rq *cfs_rq = tg->cfs_rq[cpu_of(rq)];
++
++	cfs_rq->throttle_count--;
++
++	return 0;
++}
++
++static int qos_tg_throttle_down(struct task_group *tg, void *data)
++{
++	struct rq *rq = data;
++	struct cfs_rq *cfs_rq = tg->cfs_rq[cpu_of(rq)];
++
++	cfs_rq->throttle_count++;
++
++	return 0;
++}
++
+ static void throttle_qos_cfs_rq(struct cfs_rq *cfs_rq)
+ {
+ 	struct rq *rq = rq_of(cfs_rq);
+@@ -7192,7 +7213,7 @@ static void throttle_qos_cfs_rq(struct c
+ 
+ 	/* freeze hierarchy runnable averages while throttled */
+ 	rcu_read_lock();
+-	walk_tg_tree_from(cfs_rq->tg, tg_throttle_down, tg_nop, (void *)rq);
++	walk_tg_tree_from(cfs_rq->tg, qos_tg_throttle_down, tg_nop, (void *)rq);
+ 	rcu_read_unlock();
+ 
+ 	task_delta = cfs_rq->h_nr_running;
+@@ -7223,7 +7244,6 @@ static void throttle_qos_cfs_rq(struct c
+ 		start_qos_hrtimer(cpu_of(rq));
+ 
+ 	cfs_rq->throttled = 1;
+-	cfs_rq->throttled_clock = rq_clock(rq);
+ 
+ 	list_add(&cfs_rq->qos_throttled_list,
+ 		 &per_cpu(qos_throttled_cfs_rq, cpu_of(rq)));
+@@ -7232,7 +7252,6 @@ static void throttle_qos_cfs_rq(struct c
+ static void unthrottle_qos_cfs_rq(struct cfs_rq *cfs_rq)
+ {
+ 	struct rq *rq = rq_of(cfs_rq);
+-	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
+ 	struct sched_entity *se;
+ 	int enqueue = 1;
+ 	unsigned int prev_nr = cfs_rq->h_nr_running;
+@@ -7243,12 +7262,12 @@ static void unthrottle_qos_cfs_rq(struct
+ 	cfs_rq->throttled = 0;
+ 
+ 	update_rq_clock(rq);
+-
+-	cfs_b->throttled_time += rq_clock(rq) - cfs_rq->throttled_clock;
+ 	list_del_init(&cfs_rq->qos_throttled_list);
+ 
+ 	/* update hierarchical throttle state */
+-	walk_tg_tree_from(cfs_rq->tg, tg_nop, tg_unthrottle_up, (void *)rq);
++	rcu_read_lock();
++	walk_tg_tree_from(cfs_rq->tg, tg_nop, qos_tg_unthrottle_up, (void *)rq);
++	rcu_read_unlock();
+ 
+ 	if (!cfs_rq->load.weight)
+ 		return;

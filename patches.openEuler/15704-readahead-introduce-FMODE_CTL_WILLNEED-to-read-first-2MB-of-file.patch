@@ -1,0 +1,143 @@
+From 301dec65ba06b2849fe1043cccd5616377733f6f Mon Sep 17 00:00:00 2001
+From: Yufen Yu <yuyufen@huawei.com>
+Date: Mon, 23 May 2022 21:18:10 +0800
+Subject: [PATCH] readahead: introduce FMODE_CTL_WILLNEED to read first 2MB of
+ file
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 301dec65ba06b2849fe1043cccd5616377733f6f
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I53R0H
+CVE: NA
+backport: openEuler-22.03-LTS
+
+-------------------------------------------------
+
+In some scenario, likely spark-sql, almost all meta file's size is
+less then 2MB and applications read these smaller files in random
+mode. That means, it may issue multiple times random io to rotate
+disk, which can cause performance degradation.
+
+To improve the small files random read, we try to read the first
+2MB into pagecache on the first time of read. Then it can avoid
+multiple random io.
+
+In fact, applications can call fadvise system with POSIX_FADV_WILLNEED
+to achieve this goal. But, some apps may cannot easily do that.
+So, we provide a new file flag FMODE_CTL_WILLNEED.
+
+Signed-off-by: Yufen Yu <yuyufen@huawei.com>
+Reviewed-by: Hou Tao <houtao1@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Conflicts:
+	include/linux/fs.h
+	Value '0x40000000' has been used for flag FMODE_BUF_RASYNC.
+Signed-off-by: Zhihao Cheng <chengzhihao1@huawei.com>
+Reviewed-by: Zhang Yi <yi.zhang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/fs.h |  7 +++++++
+ mm/readahead.c     | 40 +++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 46 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index db632747781a..dd023a3023b5 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -183,6 +183,12 @@ typedef int (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
+ /* File supports async buffered reads */
+ #define FMODE_BUF_RASYNC	((__force fmode_t)0x40000000)
+ 
++/* File mode control flag, expect random access pattern */
++#define FMODE_CTL_RANDOM	((__force fmode_t)0x1)
++
++/* File mode control flag, will try to read head of the file into pagecache */
++#define FMODE_CTL_WILLNEED	((__force fmode_t)0x2)
++
+ /*
+  * Attribute flags.  These should be or-ed together to figure out what
+  * has been changed!
+@@ -947,6 +953,7 @@ struct file {
+ 	atomic_long_t		f_count;
+ 	unsigned int 		f_flags;
+ 	fmode_t			f_mode;
++	fmode_t			f_ctl_mode;
+ 	struct mutex		f_pos_lock;
+ 	loff_t			f_pos;
+ 	struct fown_struct	f_owner;
+diff --git a/mm/readahead.c b/mm/readahead.c
+index c5b0457415be..ed23d5dec123 100644
+--- a/mm/readahead.c
++++ b/mm/readahead.c
+@@ -26,6 +26,7 @@
+ 
+ #include "internal.h"
+ 
++#define READAHEAD_FIRST_SIZE	(2 * 1024 * 1024)
+ /*
+  * Initialise a struct file's readahead state.  Assumes that the caller has
+  * memset *ra to zero.
+@@ -549,10 +550,41 @@ static void ondemand_readahead(struct readahead_control *ractl,
+ 	do_page_cache_ra(ractl, ra->size, ra->async_size);
+ }
+ 
++/*
++ * Try to read first @ra_size from head of the file.
++ */
++static bool page_cache_readahead_from_head(struct address_space *mapping,
++					struct file *filp, pgoff_t offset,
++					unsigned long req_size,
++					unsigned long ra_size)
++{
++	struct backing_dev_info *bdi = inode_to_bdi(mapping->host);
++	struct file_ra_state *ra = &filp->f_ra;
++	unsigned long size = min_t(unsigned long, ra_size,
++					file_inode(filp)->i_size);
++	unsigned long nrpages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
++	unsigned long max_pages;
++	unsigned int offs = 0;
++
++	/* Cannot read date over target size, back to normal way */
++	if (offset + req_size > nrpages)
++		return false;
++
++	max_pages = max_t(unsigned long, bdi->io_pages, ra->ra_pages);
++	max_pages = min(max_pages, nrpages);
++	while (offs < nrpages) {
++		force_page_cache_readahead(mapping, filp, offs, max_pages);
++		offs += max_pages;
++	}
++	return true;
++}
++
+ void page_cache_sync_ra(struct readahead_control *ractl,
+ 		struct file_ra_state *ra, unsigned long req_count)
+ {
+-	bool do_forced_ra = ractl->file && (ractl->file->f_mode & FMODE_RANDOM);
++	bool do_forced_ra = ractl->file &&
++			    ((ractl->file->f_mode & FMODE_RANDOM) ||
++			     (ractl->file->f_ctl_mode & FMODE_CTL_RANDOM));
+ 
+ 	/*
+ 	 * Even if read-ahead is disabled, issue this request as read-ahead
+@@ -567,6 +599,12 @@ void page_cache_sync_ra(struct readahead_control *ractl,
+ 		do_forced_ra = true;
+ 	}
+ 
++	/* try to read first READAHEAD_FIRST_SIZE into pagecache */
++	if (ractl->file && (ractl->file->f_ctl_mode & FMODE_CTL_WILLNEED) &&
++		page_cache_readahead_from_head(ractl->mapping, ractl->file,
++			ractl->_index, req_count, READAHEAD_FIRST_SIZE))
++		return;
++
+ 	/* be dumb */
+ 	if (do_forced_ra) {
+ 		force_page_cache_ra(ractl, ra, req_count);
+-- 
+2.34.1
+
