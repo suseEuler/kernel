@@ -1,0 +1,92 @@
+From 0530020a7c8f2204e784f0dbdc882bbd961fdbde Mon Sep 17 00:00:00 2001
+Message-Id: <0530020a7c8f2204e784f0dbdc882bbd961fdbde.1654482357.git.geliang.tang@suse.com>
+From: Geliang Tang <geliang.tang@suse.com>
+Date: Fri, 22 Apr 2022 14:55:38 -0700
+Subject: [PATCH] mptcp: track and update contiguous data status
+Git-commit: 0530020a7c8f2204e784f0dbdc882bbd961fdbde
+Patch-mainline: v5.19-rc1
+References: bsn#2
+Modified-by-SEL: No
+
+
+This patch adds a new member allow_infinite_fallback in mptcp_sock,
+which is initialized to 'true' when the connection begins and is set
+to 'false' on any retransmit or successful MP_JOIN. Only do infinite
+mapping fallback if there is a single subflow AND there have been no
+retransmissions AND there have never been any MP_JOINs.
+
+Suggested-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+ net/mptcp/protocol.c | 3 +++
+ net/mptcp/protocol.h | 1 +
+ net/mptcp/subflow.c  | 4 +++-
+ 3 files changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index 0492aa9308c7..6d653914e9fe 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -2465,6 +2465,7 @@ static void __mptcp_retrans(struct sock *sk)
+ 		dfrag->already_sent = max(dfrag->already_sent, info.sent);
+ 		tcp_push(ssk, 0, info.mss_now, tcp_sk(ssk)->nonagle,
+ 			 info.size_goal);
++		WRITE_ONCE(msk->allow_infinite_fallback, false);
+ 	}
+ 
+ 	release_sock(ssk);
+@@ -2539,6 +2540,7 @@ static int __mptcp_init_sock(struct sock *sk)
+ 	msk->first = NULL;
+ 	inet_csk(sk)->icsk_sync_mss = mptcp_sync_mss;
+ 	WRITE_ONCE(msk->csum_enabled, mptcp_is_checksum_enabled(sock_net(sk)));
++	WRITE_ONCE(msk->allow_infinite_fallback, true);
+ 	msk->recovery = false;
+ 
+ 	mptcp_pm_data_init(msk);
+@@ -3275,6 +3277,7 @@ bool mptcp_finish_join(struct sock *ssk)
+ 	}
+ 
+ 	subflow->map_seq = READ_ONCE(msk->ack_seq);
++	WRITE_ONCE(msk->allow_infinite_fallback, false);
+ 
+ out:
+ 	mptcp_event(MPTCP_EVENT_SUB_ESTABLISHED, msk, ssk, GFP_ATOMIC);
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index aca1fb56523f..88d292374599 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -263,6 +263,7 @@ struct mptcp_sock {
+ 	bool		rcv_fastclose;
+ 	bool		use_64bit_ack; /* Set when we received a 64-bit DSN */
+ 	bool		csum_enabled;
++	bool		allow_infinite_fallback;
+ 	u8		recvmsg_inq:1,
+ 			cork:1,
+ 			nodelay:1;
+diff --git a/net/mptcp/subflow.c b/net/mptcp/subflow.c
+index 7f26a5b04ad3..31dcb550316f 100644
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@ -1206,7 +1206,8 @@ static bool subflow_check_data_avail(struct sock *ssk)
+ 	if (!__mptcp_check_fallback(msk)) {
+ 		/* RFC 8684 section 3.7. */
+ 		if (subflow->send_mp_fail) {
+-			if (mptcp_has_another_subflow(ssk)) {
++			if (mptcp_has_another_subflow(ssk) ||
++			    !READ_ONCE(msk->allow_infinite_fallback)) {
+ 				ssk->sk_err = EBADMSG;
+ 				tcp_set_state(ssk, TCP_CLOSE);
+ 				subflow->reset_transient = 0;
+@@ -1486,6 +1487,7 @@ int __mptcp_subflow_connect(struct sock *sk, const struct mptcp_addr_info *loc,
+ 	/* discard the subflow socket */
+ 	mptcp_sock_graft(ssk, sk->sk_socket);
+ 	iput(SOCK_INODE(sf));
++	WRITE_ONCE(msk->allow_infinite_fallback, false);
+ 	return err;
+ 
+ failed_unlink:
+-- 
+2.34.1
+

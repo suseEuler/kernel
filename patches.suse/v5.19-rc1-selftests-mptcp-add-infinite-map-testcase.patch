@@ -1,0 +1,159 @@
+From b6e074e171bc5cc83eb91b03c2558c2d9fccf26e Mon Sep 17 00:00:00 2001
+Message-Id: <b6e074e171bc5cc83eb91b03c2558c2d9fccf26e.1654482246.git.geliang.tang@suse.com>
+From: Geliang Tang <geliang.tang@suse.com>
+Date: Tue, 26 Apr 2022 14:57:11 -0700
+Subject: [PATCH] selftests: mptcp: add infinite map testcase
+Git-commit: b6e074e171bc5cc83eb91b03c2558c2d9fccf26e
+Patch-mainline: v5.19-rc1
+References: bsn#2
+Modified-by-SEL: Yes, refreshed due to context changes
+
+
+Add the single subflow test case for MP_FAIL, to test the infinite
+mapping case. Use the test_linkfail value to make 128KB test files.
+
+Add a new function reset_with_fail(), in it use 'iptables' and 'tc
+action pedit' rules to produce the bit flips to trigger the checksum
+failures. Set validate_checksum to enable checksums for the MP_FAIL
+tests without passing the '-C' argument. Set check_invert flag to
+enable the invert bytes check for the output data in check_transfer().
+Instead of the file mismatch error, this test prints out the inverted
+bytes.
+
+Add a new function pedit_action_pkts() to get the numbers of the packets
+edited by the tc pedit actions. Print this numbers to the output.
+
+Also add the needed kernel configures in the selftests config file.
+
+Suggested-by: Davide Caratti <dcaratti@redhat.com>
+Co-developed-by: Matthieu Baerts <matthieu.baerts@tessares.net>
+Signed-off-by: Matthieu Baerts <matthieu.baerts@tessares.net>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+ tools/testing/selftests/net/mptcp/config      |  8 +++
+ .../testing/selftests/net/mptcp/mptcp_join.sh | 70 ++++++++++++++++++-
+ 2 files changed, 77 insertions(+), 1 deletion(-)
+
+--- a/tools/testing/selftests/net/mptcp/config
++++ b/tools/testing/selftests/net/mptcp/config
+@@ -12,6 +12,9 @@ CONFIG_NF_TABLES=m
+ CONFIG_NFT_COMPAT=m
+ CONFIG_NETFILTER_XTABLES=m
+ CONFIG_NETFILTER_XT_MATCH_BPF=m
++CONFIG_NETFILTER_XT_MATCH_LENGTH=m
++CONFIG_NETFILTER_XT_MATCH_STATISTIC=m
++CONFIG_NETFILTER_XT_TARGET_MARK=m
+ CONFIG_NF_TABLES_INET=y
+ CONFIG_NFT_TPROXY=m
+ CONFIG_NFT_SOCKET=m
+@@ -19,3 +22,8 @@ CONFIG_IP_ADVANCED_ROUTER=y
+ CONFIG_IP_MULTIPLE_TABLES=y
+ CONFIG_IP_NF_TARGET_REJECT=m
+ CONFIG_IPV6_MULTIPLE_TABLES=y
++CONFIG_NET_ACT_CSUM=m
++CONFIG_NET_ACT_PEDIT=m
++CONFIG_NET_CLS_ACT=y
++CONFIG_NET_CLS_FW=m
++CONFIG_NET_SCH_INGRESS=m
+--- a/tools/testing/selftests/net/mptcp/mptcp_join.sh
++++ b/tools/testing/selftests/net/mptcp/mptcp_join.sh
+@@ -266,6 +266,58 @@ reset_with_allow_join_id0()
+ 	ip netns exec $ns2 sysctl -q net.mptcp.allow_join_initial_addr_port=$ns2_enable
+ }
+ 
++# Modify TCP payload without corrupting the TCP packet
++#
++# This rule inverts a 8-bit word at byte offset 148 for the 2nd TCP ACK packets
++# carrying enough data.
++# Once it is done, the TCP Checksum field is updated so the packet is still
++# considered as valid at the TCP level.
++# Because the MPTCP checksum, covering the TCP options and data, has not been
++# updated, the modification will be detected and an MP_FAIL will be emitted:
++# what we want to validate here without corrupting "random" MPTCP options.
++#
++# To avoid having tc producing this pr_info() message for each TCP ACK packets
++# not carrying enough data:
++#
++#     tc action pedit offset 162 out of bounds
++#
++# Netfilter is used to mark packets with enough data.
++reset_with_fail()
++{
++	reset "${1}" || return 1
++
++	ip netns exec $ns1 sysctl -q net.mptcp.checksum_enabled=1
++	ip netns exec $ns2 sysctl -q net.mptcp.checksum_enabled=1
++
++	check_invert=1
++	validate_checksum=1
++	local i="$2"
++	local ip="${3:-4}"
++	local tables
++
++	tables="iptables"
++	if [ $ip -eq 6 ]; then
++		tables="ip6tables"
++	fi
++
++	ip netns exec $ns2 $tables \
++		-t mangle \
++		-A OUTPUT \
++		-o ns2eth$i \
++		-p tcp \
++		-m length --length 150:9999 \
++		-m statistic --mode nth --packet 1 --every 99999 \
++		-j MARK --set-mark 42 || exit 1
++
++	tc -n $ns2 qdisc add dev ns2eth$i clsact || exit 1
++	tc -n $ns2 filter add dev ns2eth$i egress \
++		protocol ip prio 1000 \
++		handle 42 fw \
++		action pedit munge offset 148 u8 invert \
++		pipe csum tcp \
++		index 100 || exit 1
++}
++
+ fail_test()
+ {
+ 	ret=1
+@@ -1199,7 +1251,7 @@ chk_join_nr()
+ 		echo "[ ok ]"
+ 	fi
+ 	[ "${dump_stats}" = 1 ] && dump_stats
+-	if [ $checksum -eq 1 ]; then
++	if [ $validate_checksum -eq 1 ]; then
+ 		chk_csum_nr $csum_ns1 $csum_ns2
+ 		chk_fail_nr $fail_nr $fail_nr
+ 		chk_rst_nr $rst_nr $rst_nr
+@@ -2617,6 +2669,21 @@ fastclose_tests()
+ 	fi
+ }
+ 
++pedit_action_pkts()
++{
++	tc -n $ns2 -j -s action show action pedit index 100 | \
++		sed 's/.*"packets":\([0-9]\+\),.*/\1/'
++}
++
++fail_tests()
++{
++	# single subflow
++	if reset_with_fail "Infinite map" 1; then
++		run_tests $ns1 $ns2 10.0.1.1 128
++		chk_join_nr 0 0 0 +1 +0 1 0 1 "$(pedit_action_pkts)"
++	fi
++}
++
+ endpoint_tests()
+ {
+ 	# userspace pm type prevents add_addr
+@@ -2702,6 +2769,7 @@ all_tests_sorted=(
+ 	d@deny_join_id0_tests
+ 	m@fullmesh_tests
+ 	z@fastclose_tests
++	F@fail_tests
+ 	I@endpoint_tests
+ )
+ 

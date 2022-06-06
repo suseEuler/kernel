@@ -1,0 +1,155 @@
+From 1e39e5a32ad7fdd82d6e071aa14ecd511eedc1f7 Mon Sep 17 00:00:00 2001
+Message-Id: <1e39e5a32ad7fdd82d6e071aa14ecd511eedc1f7.1654482338.git.geliang.tang@suse.com>
+From: Geliang Tang <geliang.tang@suse.com>
+Date: Fri, 22 Apr 2022 14:55:39 -0700
+Subject: [PATCH] mptcp: infinite mapping sending
+Git-commit: 1e39e5a32ad7fdd82d6e071aa14ecd511eedc1f7
+Patch-mainline: v5.19-rc1
+References: bsn#2
+Modified-by-SEL: Yes, refreshed due to context changes
+
+
+This patch adds the infinite mapping sending logic.
+
+Add a new flag send_infinite_map in struct mptcp_subflow_context. Set
+it true when a single contiguous subflow is in use and the
+allow_infinite_fallback flag is true in mptcp_pm_mp_fail_received().
+
+In mptcp_sendmsg_frag(), if this flag is true, call the new function
+mptcp_update_infinite_map() to set the infinite mapping.
+
+Add a new flag infinite_map in struct mptcp_ext, set it true in
+mptcp_update_infinite_map(), and check this flag in a new helper
+mptcp_check_infinite_map().
+
+In mptcp_update_infinite_map(), set data_len to 0, and clear the
+send_infinite_map flag, then do fallback.
+
+In mptcp_established_options(), use the helper mptcp_check_infinite_map()
+to let the infinite mapping DSS can be sent out in the fallback mode.
+
+Suggested-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+ include/net/mptcp.h  |  3 ++-
+ net/mptcp/options.c  |  8 ++++++--
+ net/mptcp/pm.c       |  6 ++++++
+ net/mptcp/protocol.c | 17 +++++++++++++++++
+ net/mptcp/protocol.h | 12 ++++++++++++
+ 5 files changed, 43 insertions(+), 3 deletions(-)
+
+--- a/include/net/mptcp.h
++++ b/include/net/mptcp.h
+@@ -35,7 +35,8 @@ struct mptcp_ext {
+ 			frozen:1,
+ 			reset_transient:1;
+ 	u8		reset_reason:4,
+-			csum_reqd:1;
++			csum_reqd:1,
++			infinite_map:1;
+ };
+ 
+ #define MPTCP_RM_IDS_MAX	8
+--- a/net/mptcp/options.c
++++ b/net/mptcp/options.c
+@@ -825,7 +825,7 @@ bool mptcp_established_options(struct so
+ 
+ 	opts->suboptions = 0;
+ 
+-	if (unlikely(__mptcp_check_fallback(msk)))
++	if (unlikely(__mptcp_check_fallback(msk) && !mptcp_check_infinite_map(skb)))
+ 		return false;
+ 
+ 	if (unlikely(skb && TCP_SKB_CB(skb)->tcp_flags & TCPHDR_RST)) {
+@@ -1350,8 +1350,11 @@ void mptcp_write_options(__be32 *ptr, co
+ 			put_unaligned_be32(mpext->subflow_seq, ptr);
+ 			ptr += 1;
+ 			if (opts->csum_reqd) {
++				/* data_len == 0 is reserved for the infinite mapping,
++				 * the checksum will also be set to 0.
++				 */
+ 				put_len_csum(mpext->data_len,
+-					     mptcp_make_csum(mpext),
++					     (mpext->data_len ? mptcp_make_csum(mpext) : 0),
+ 					     ptr);
+ 			} else {
+ 				put_unaligned_be32(mpext->data_len << 16 |
+--- a/net/mptcp/pm.c
++++ b/net/mptcp/pm.c
+@@ -284,7 +284,13 @@ void mptcp_pm_mp_prio_received(struct so
+ 
+ void mptcp_pm_mp_fail_received(struct sock *sk, u64 fail_seq)
+ {
++	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(sk);
++	struct mptcp_sock *msk = mptcp_sk(subflow->conn);
++
+ 	pr_debug("fail_seq=%llu", fail_seq);
++
++	if (!mptcp_has_another_subflow(sk) && READ_ONCE(msk->allow_infinite_fallback))
++		subflow->send_infinite_map = 1;
+ }
+ 
+ /* path manager helpers */
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -1230,6 +1230,21 @@ static void mptcp_update_data_checksum(s
+ 	mpext->csum = csum_fold(csum_block_add(csum, skb_checksum(skb, offset, added, 0), offset));
+ }
+ 
++static void mptcp_update_infinite_map(struct mptcp_sock *msk,
++				      struct sock *ssk,
++				      struct mptcp_ext *mpext)
++{
++	if (!mpext)
++		return;
++
++	mpext->infinite_map = 1;
++	mpext->data_len = 0;
++
++	mptcp_subflow_ctx(ssk)->send_infinite_map = 0;
++	pr_fallback(msk);
++	__mptcp_do_fallback(msk);
++}
++
+ static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
+ 			      struct mptcp_data_frag *dfrag,
+ 			      struct mptcp_sendmsg_info *info)
+@@ -1361,6 +1376,8 @@ alloc_skb:
+ out:
+ 	if (READ_ONCE(msk->csum_enabled))
+ 		mptcp_update_data_checksum(skb, copy);
++	if (mptcp_subflow_ctx(ssk)->send_infinite_map)
++		mptcp_update_infinite_map(msk, ssk, mpext);
+ 	trace_mptcp_sendmsg_frag(mpext);
+ 	mptcp_subflow_ctx(ssk)->rel_write_seq += copy;
+ 	return copy;
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -441,6 +441,7 @@ struct mptcp_subflow_context {
+ 		send_mp_prio : 1,
+ 		send_mp_fail : 1,
+ 		send_fastclose : 1,
++		send_infinite_map : 1,
+ 		rx_eof : 1,
+ 		can_ack : 1,        /* only after processing the remote a key */
+ 		disposable : 1,	    /* ctx can be free at ulp release time */
+@@ -892,6 +893,17 @@ static inline void mptcp_do_fallback(str
+ 
+ #define pr_fallback(a) pr_debug("%s:fallback to TCP (msk=%p)", __func__, a)
+ 
++static inline bool mptcp_check_infinite_map(struct sk_buff *skb)
++{
++	struct mptcp_ext *mpext;
++
++	mpext = skb ? mptcp_get_ext(skb) : NULL;
++	if (mpext && mpext->infinite_map)
++		return true;
++
++	return false;
++}
++
+ static inline bool subflow_simultaneous_connect(struct sock *sk)
+ {
+ 	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(sk);

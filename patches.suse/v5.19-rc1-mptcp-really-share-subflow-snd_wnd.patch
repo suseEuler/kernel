@@ -1,0 +1,97 @@
+From b713d0067574e15cddd08ee7f25acd535b7437cf Mon Sep 17 00:00:00 2001
+Message-Id: <b713d0067574e15cddd08ee7f25acd535b7437cf.1654481582.git.geliang.tang@suse.com>
+From: Paolo Abeni <pabeni@redhat.com>
+Date: Wed, 4 May 2022 14:54:04 -0700
+Subject: [PATCH] mptcp: really share subflow snd_wnd
+Git-commit: b713d0067574e15cddd08ee7f25acd535b7437cf
+Patch-mainline: v5.19-rc1
+References: bsn#2
+Modified-by-SEL: No
+
+
+As per RFC, mptcp subflows use a "shared" snd_wnd: the effective
+window is the maximum among the current values received on all
+subflows. Without such feature a data transfer using multiple
+subflows could block.
+
+Window sharing is currently implemented in the RX side:
+__tcp_select_window uses the mptcp-level receive buffer to compute
+the announced window.
+
+That is not enough: the TCP stack will stick to the window size
+received on the given subflow; we need to propagate the msk window
+value on each subflow at xmit time.
+
+Change the packet scheduler to ignore the subflow level window
+and use instead the msk level one
+
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ net/mptcp/protocol.c | 24 +++++++++++++++---------
+ 1 file changed, 15 insertions(+), 9 deletions(-)
+
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index 7a9e2545884f..0e7f556ea2c7 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -1141,19 +1141,20 @@ struct mptcp_sendmsg_info {
+ 	bool data_lock_held;
+ };
+ 
+-static int mptcp_check_allowed_size(struct mptcp_sock *msk, u64 data_seq,
+-				    int avail_size)
++static int mptcp_check_allowed_size(const struct mptcp_sock *msk, struct sock *ssk,
++				    u64 data_seq, int avail_size)
+ {
+ 	u64 window_end = mptcp_wnd_end(msk);
++	u64 mptcp_snd_wnd;
+ 
+ 	if (__mptcp_check_fallback(msk))
+ 		return avail_size;
+ 
+-	if (!before64(data_seq + avail_size, window_end)) {
+-		u64 allowed_size = window_end - data_seq;
++	mptcp_snd_wnd = window_end - data_seq;
++	avail_size = min_t(unsigned int, mptcp_snd_wnd, avail_size);
+ 
+-		return min_t(unsigned int, allowed_size, avail_size);
+-	}
++	if (unlikely(tcp_sk(ssk)->snd_wnd < mptcp_snd_wnd))
++		tcp_sk(ssk)->snd_wnd = min_t(u64, U32_MAX, mptcp_snd_wnd);
+ 
+ 	return avail_size;
+ }
+@@ -1305,7 +1306,7 @@ static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
+ 	}
+ 
+ 	/* Zero window and all data acked? Probe. */
+-	copy = mptcp_check_allowed_size(msk, data_seq, copy);
++	copy = mptcp_check_allowed_size(msk, ssk, data_seq, copy);
+ 	if (copy == 0) {
+ 		u64 snd_una = READ_ONCE(msk->snd_una);
+ 
+@@ -1498,11 +1499,16 @@ static struct sock *mptcp_subflow_get_send(struct mptcp_sock *msk)
+ 	 * to check that subflow has a non empty cwin.
+ 	 */
+ 	ssk = send_info[SSK_MODE_ACTIVE].ssk;
+-	if (!ssk || !sk_stream_memory_free(ssk) || !tcp_sk(ssk)->snd_wnd)
++	if (!ssk || !sk_stream_memory_free(ssk))
+ 		return NULL;
+ 
+-	burst = min_t(int, MPTCP_SEND_BURST_SIZE, tcp_sk(ssk)->snd_wnd);
++	burst = min_t(int, MPTCP_SEND_BURST_SIZE, mptcp_wnd_end(msk) - msk->snd_nxt);
+ 	wmem = READ_ONCE(ssk->sk_wmem_queued);
++	if (!burst) {
++		msk->last_snd = NULL;
++		return ssk;
++	}
++
+ 	subflow = mptcp_subflow_ctx(ssk);
+ 	subflow->avg_pacing_rate = div_u64((u64)subflow->avg_pacing_rate * wmem +
+ 					   READ_ONCE(ssk->sk_pacing_rate) * burst,
+-- 
+2.34.1
+

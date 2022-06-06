@@ -1,0 +1,92 @@
+From 70c708e82606f842dc1bcf0943b8acae30c4088f Mon Sep 17 00:00:00 2001
+Message-Id: <70c708e82606f842dc1bcf0943b8acae30c4088f.1654481913.git.geliang.tang@suse.com>
+From: Kishen Maloor <kishen.maloor@intel.com>
+Date: Mon, 2 May 2022 13:52:35 -0700
+Subject: [PATCH] mptcp: establish subflows from either end of connection
+Git-commit: 70c708e82606f842dc1bcf0943b8acae30c4088f
+Patch-mainline: v5.19-rc1
+References: bsn#2
+Modified-by-SEL: No
+
+
+This change updates internal logic to permit subflows to be
+established from either the client or server ends of MPTCP
+connections. This symmetry and added flexibility may be
+harnessed by PM implementations running on either end in
+creating new subflows.
+
+The essence of this change lies in not relying on the
+"server_side" flag (which continues to be available if needed).
+
+Acked-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Kishen Maloor <kishen.maloor@intel.com>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ net/mptcp/options.c  | 2 +-
+ net/mptcp/protocol.c | 5 +----
+ net/mptcp/protocol.h | 8 ++++++--
+ 3 files changed, 8 insertions(+), 7 deletions(-)
+
+diff --git a/net/mptcp/options.c b/net/mptcp/options.c
+index c9625fea3ef9..e05d9458a025 100644
+--- a/net/mptcp/options.c
++++ b/net/mptcp/options.c
+@@ -931,7 +931,7 @@ static bool check_fully_established(struct mptcp_sock *msk, struct sock *ssk,
+ 		if (TCP_SKB_CB(skb)->seq == subflow->ssn_offset + 1 &&
+ 		    TCP_SKB_CB(skb)->end_seq == TCP_SKB_CB(skb)->seq &&
+ 		    subflow->mp_join && (mp_opt->suboptions & OPTIONS_MPTCP_MPJ) &&
+-		    READ_ONCE(msk->pm.server_side))
++		    !subflow->request_join)
+ 			tcp_send_ack(ssk);
+ 		goto fully_established;
+ 	}
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index a5d466e6b538..5d529143ad77 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -3321,15 +3321,12 @@ bool mptcp_finish_join(struct sock *ssk)
+ 		return false;
+ 	}
+ 
+-	if (!msk->pm.server_side)
++	if (!list_empty(&subflow->node))
+ 		goto out;
+ 
+ 	if (!mptcp_pm_allow_new_subflow(msk))
+ 		goto err_prohibited;
+ 
+-	if (WARN_ON_ONCE(!list_empty(&subflow->node)))
+-		goto err_prohibited;
+-
+ 	/* active connections are already on conn_list.
+ 	 * If we can't acquire msk socket lock here, let the release callback
+ 	 * handle it
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index a762b789f5ab..187c932deef0 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -911,13 +911,17 @@ static inline bool mptcp_check_infinite_map(struct sk_buff *skb)
+ 	return false;
+ }
+ 
++static inline bool is_active_ssk(struct mptcp_subflow_context *subflow)
++{
++	return (subflow->request_mptcp || subflow->request_join);
++}
++
+ static inline bool subflow_simultaneous_connect(struct sock *sk)
+ {
+ 	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(sk);
+-	struct sock *parent = subflow->conn;
+ 
+ 	return sk->sk_state == TCP_ESTABLISHED &&
+-	       !mptcp_sk(parent)->pm.server_side &&
++	       is_active_ssk(subflow) &&
+ 	       !subflow->conn_finished;
+ }
+ 
+-- 
+2.34.1
+

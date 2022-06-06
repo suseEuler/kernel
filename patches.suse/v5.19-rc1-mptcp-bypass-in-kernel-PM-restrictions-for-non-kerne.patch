@@ -1,0 +1,133 @@
+From 4d25247d3ae486e6e4c59394487fd01523628234 Mon Sep 17 00:00:00 2001
+Message-Id: <4d25247d3ae486e6e4c59394487fd01523628234.1654481991.git.geliang.tang@suse.com>
+From: Kishen Maloor <kishen.maloor@intel.com>
+Date: Mon, 2 May 2022 13:52:31 -0700
+Subject: [PATCH] mptcp: bypass in-kernel PM restrictions for non-kernel PMs
+Git-commit: 4d25247d3ae486e6e4c59394487fd01523628234
+Patch-mainline: v5.19-rc1
+References: bsn#2
+Modified-by-SEL: Yes, refreshed due to context changes
+
+
+Current limits on the # of addresses/subflows must apply only to
+in-kernel PM managed sockets. Thus this change removes such
+restrictions on connections overseen by non-kernel (e.g. userspace)
+PMs. This change also ensures that the kernel does not record stats
+inside struct mptcp_pm_data updated along kernel code paths when exercised
+via non-kernel PMs.
+
+Additionally, address announcements are acknolwedged and subflow
+requests are honored only when it's deemed that	a userspace path
+manager	is active at the time.
+
+Acked-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Kishen Maloor <kishen.maloor@intel.com>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ net/mptcp/pm.c         | 15 +++++++++++++--
+ net/mptcp/pm_netlink.c | 10 ++++++++++
+ net/mptcp/protocol.h   |  6 ++++++
+ net/mptcp/subflow.c    |  4 +++-
+ 4 files changed, 32 insertions(+), 3 deletions(-)
+
+--- a/net/mptcp/pm.c
++++ b/net/mptcp/pm.c
+@@ -87,6 +87,9 @@ bool mptcp_pm_allow_new_subflow(struct m
+ 	unsigned int subflows_max;
+ 	int ret = 0;
+ 
++	if (mptcp_pm_is_userspace(msk))
++		return mptcp_userspace_pm_active(msk);
++
+ 	subflows_max = mptcp_pm_get_subflows_max(msk);
+ 
+ 	pr_debug("msk=%p subflows=%d max=%d allow=%d", msk, pm->subflows,
+@@ -178,7 +181,8 @@ void mptcp_pm_subflow_check_next(struct
+ 	struct mptcp_pm_data *pm = &msk->pm;
+ 	bool update_subflows;
+ 
+-	update_subflows = subflow->request_join || subflow->mp_join;
++	update_subflows = (subflow->request_join || subflow->mp_join) &&
++			  mptcp_pm_is_kernel(msk);
+ 	if (!READ_ONCE(pm->work_pending) && !update_subflows)
+ 		return;
+ 
+@@ -207,7 +211,14 @@ void mptcp_pm_add_addr_received(struct m
+ 
+ 	spin_lock_bh(&pm->lock);
+ 
+-	if (!READ_ONCE(pm->accept_addr) || mptcp_pm_is_userspace(msk)) {
++	if (mptcp_pm_is_userspace(msk)) {
++		if (mptcp_userspace_pm_active(msk)) {
++			mptcp_pm_announce_addr(msk, addr, true);
++			mptcp_pm_add_addr_send_ack(msk);
++		} else {
++			__MPTCP_INC_STATS(sock_net((struct sock *)msk), MPTCP_MIB_ADDADDRDROP);
++		}
++	} else if (!READ_ONCE(pm->accept_addr)) {
+ 		mptcp_pm_announce_addr(msk, addr, true);
+ 		mptcp_pm_add_addr_send_ack(msk);
+ 	} else if (mptcp_pm_schedule_work(msk, MPTCP_PM_ADD_ADDR_RECEIVED)) {
+--- a/net/mptcp/pm_netlink.c
++++ b/net/mptcp/pm_netlink.c
+@@ -805,6 +805,9 @@ static void mptcp_pm_nl_rm_addr_or_subfl
+ 		if (!removed)
+ 			continue;
+ 
++		if (!mptcp_pm_is_kernel(msk))
++			continue;
++
+ 		if (rm_type == MPTCP_MIB_RMADDR) {
+ 			msk->pm.add_addr_accepted--;
+ 			WRITE_ONCE(msk->pm.accept_addr, true);
+@@ -1855,6 +1858,13 @@ static void mptcp_nl_mcast_send(struct n
+ 				nlskb, 0, MPTCP_PM_EV_GRP_OFFSET, gfp);
+ }
+ 
++bool mptcp_userspace_pm_active(const struct mptcp_sock *msk)
++{
++	return genl_has_listeners(&mptcp_genl_family,
++				  sock_net((const struct sock *)msk),
++				  MPTCP_PM_EV_GRP_OFFSET);
++}
++
+ static int mptcp_event_add_subflow(struct sk_buff *skb, const struct sock *ssk)
+ {
+ 	const struct inet_sock *issk = inet_sk(ssk);
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -785,6 +785,7 @@ void mptcp_event(enum mptcp_event_type t
+ 		 const struct sock *ssk, gfp_t gfp);
+ void mptcp_event_addr_announced(const struct mptcp_sock *msk, const struct mptcp_addr_info *info);
+ void mptcp_event_addr_removed(const struct mptcp_sock *msk, u8 id);
++bool mptcp_userspace_pm_active(const struct mptcp_sock *msk);
+ 
+ static inline bool mptcp_pm_should_add_signal(struct mptcp_sock *msk)
+ {
+@@ -812,6 +813,11 @@ static inline bool mptcp_pm_is_userspace
+ 	return READ_ONCE(msk->pm.pm_type) == MPTCP_PM_TYPE_USERSPACE;
+ }
+ 
++static inline bool mptcp_pm_is_kernel(const struct mptcp_sock *msk)
++{
++	return READ_ONCE(msk->pm.pm_type) == MPTCP_PM_TYPE_KERNEL;
++}
++
+ static inline unsigned int mptcp_add_addr_len(int family, bool echo, bool port)
+ {
+ 	u8 len = TCPOLEN_MPTCP_ADD_ADDR_BASE;
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@ -62,7 +62,9 @@ static void subflow_generate_hmac(u64 ke
+ static bool mptcp_can_accept_new_subflow(const struct mptcp_sock *msk)
+ {
+ 	return mptcp_is_fully_established((void *)msk) &&
+-	       READ_ONCE(msk->pm.accept_subflow);
++		((mptcp_pm_is_userspace(msk) &&
++		  mptcp_userspace_pm_active(msk)) ||
++		 READ_ONCE(msk->pm.accept_subflow));
+ }
+ 
+ /* validate received token and create truncated hmac and nonce for SYN-ACK */

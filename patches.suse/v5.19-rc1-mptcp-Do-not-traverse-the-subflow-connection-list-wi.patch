@@ -1,0 +1,86 @@
+From d9fb797046c596187b97a08ea88b954964cc2d33 Mon Sep 17 00:00:00 2001
+Message-Id: <d9fb797046c596187b97a08ea88b954964cc2d33.1654481282.git.geliang.tang@suse.com>
+From: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Date: Wed, 18 May 2022 15:04:45 -0700
+Subject: [PATCH] mptcp: Do not traverse the subflow connection list without
+ lock
+Git-commit: d9fb797046c596187b97a08ea88b954964cc2d33
+Patch-mainline: v5.19-rc1
+References: bsn#2
+Modified-by-SEL: No
+
+
+The MPTCP socket's conn_list (list of subflows) requires the socket lock
+to access. The MP_FAIL timeout code added such an access, where it would
+check the list of subflows both in timer context and (later) in workqueue
+context where the socket lock is held.
+
+Rather than check the list twice, remove the check in the timeout
+handler and only depend on the check in the workqueue. Also remove the
+MPTCP_FAIL_NO_RESPONSE flag, since mptcp_mp_fail_no_response() has
+insignificant overhead and can be checked on each worker run.
+
+Fixes: 49fa1919d6bc ("mptcp: reset subflow when MP_FAIL doesn't respond")
+Reported-by: Paolo Abeni <pabeni@redhat.com>
+Reviewed-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ net/mptcp/protocol.c | 16 +---------------
+ net/mptcp/protocol.h |  1 -
+ 2 files changed, 1 insertion(+), 16 deletions(-)
+
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index 921d67174e49..17e13396024a 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -2190,23 +2190,10 @@ mp_fail_response_expect_subflow(struct mptcp_sock *msk)
+ 	return ret;
+ }
+ 
+-static void mptcp_check_mp_fail_response(struct mptcp_sock *msk)
+-{
+-	struct mptcp_subflow_context *subflow;
+-	struct sock *sk = (struct sock *)msk;
+-
+-	bh_lock_sock(sk);
+-	subflow = mp_fail_response_expect_subflow(msk);
+-	if (subflow)
+-		__set_bit(MPTCP_FAIL_NO_RESPONSE, &msk->flags);
+-	bh_unlock_sock(sk);
+-}
+-
+ static void mptcp_timeout_timer(struct timer_list *t)
+ {
+ 	struct sock *sk = from_timer(sk, t, sk_timer);
+ 
+-	mptcp_check_mp_fail_response(mptcp_sk(sk));
+ 	mptcp_schedule_work(sk);
+ 	sock_put(sk);
+ }
+@@ -2588,8 +2575,7 @@ static void mptcp_worker(struct work_struct *work)
+ 	if (test_and_clear_bit(MPTCP_WORK_RTX, &msk->flags))
+ 		__mptcp_retrans(sk);
+ 
+-	if (test_and_clear_bit(MPTCP_FAIL_NO_RESPONSE, &msk->flags))
+-		mptcp_mp_fail_no_response(msk);
++	mptcp_mp_fail_no_response(msk);
+ 
+ unlock:
+ 	release_sock(sk);
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index fb4760ee8d47..200f89f6d62f 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -117,7 +117,6 @@
+ #define MPTCP_WORK_EOF		3
+ #define MPTCP_FALLBACK_DONE	4
+ #define MPTCP_WORK_CLOSE_SUBFLOW 5
+-#define MPTCP_FAIL_NO_RESPONSE	6
+ 
+ /* MPTCP socket release cb flags */
+ #define MPTCP_PUSH_PENDING	1
+-- 
+2.34.1
+

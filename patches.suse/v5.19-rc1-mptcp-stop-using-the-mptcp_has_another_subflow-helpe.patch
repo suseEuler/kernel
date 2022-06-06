@@ -1,0 +1,90 @@
+From 7b16871f9932d8a371488d2967b033387870a747 Mon Sep 17 00:00:00 2001
+Message-Id: <7b16871f9932d8a371488d2967b033387870a747.1654481322.git.geliang.tang@suse.com>
+From: Paolo Abeni <pabeni@redhat.com>
+Date: Wed, 18 May 2022 15:04:43 -0700
+Subject: [PATCH] mptcp: stop using the mptcp_has_another_subflow() helper
+Git-commit: 7b16871f9932d8a371488d2967b033387870a747
+Patch-mainline: v5.19-rc1
+References: bsn#2
+Modified-by-SEL: No
+
+
+The mentioned helper requires the msk socket lock, and the
+current callers don't own it nor can't acquire it, so the
+access is racy.
+
+All the current callers are really checking for infinite mapping
+fallback, and the latter condition is explicitly tracked by
+the relevant msk variable: we can safely remove the caller usage
+- and the caller itself.
+
+The issue is present since MP_FAIL implementation, but the
+fix only applies since the infinite fallback support, ence the
+somewhat unexpected fixes tag.
+
+Fixes: 0530020a7c8f ("mptcp: track and update contiguous data status")
+Acked-and-tested-by: Geliang Tang <geliang.tang@suse.com>
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ net/mptcp/pm.c       |  2 +-
+ net/mptcp/protocol.h | 13 -------------
+ net/mptcp/subflow.c  |  3 +--
+ 3 files changed, 2 insertions(+), 16 deletions(-)
+
+diff --git a/net/mptcp/pm.c b/net/mptcp/pm.c
+index 59fdab2d0c27..8ba51120f35b 100644
+--- a/net/mptcp/pm.c
++++ b/net/mptcp/pm.c
+@@ -303,7 +303,7 @@ void mptcp_pm_mp_fail_received(struct sock *sk, u64 fail_seq)
+ 
+ 	pr_debug("fail_seq=%llu", fail_seq);
+ 
+-	if (mptcp_has_another_subflow(sk) || !READ_ONCE(msk->allow_infinite_fallback))
++	if (!READ_ONCE(msk->allow_infinite_fallback))
+ 		return;
+ 
+ 	if (!READ_ONCE(subflow->mp_fail_response_expect)) {
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index 08b8015cb69f..fb4760ee8d47 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -650,19 +650,6 @@ static inline void mptcp_subflow_tcp_fallback(struct sock *sk,
+ 	inet_csk(sk)->icsk_af_ops = ctx->icsk_af_ops;
+ }
+ 
+-static inline bool mptcp_has_another_subflow(struct sock *ssk)
+-{
+-	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(ssk), *tmp;
+-	struct mptcp_sock *msk = mptcp_sk(subflow->conn);
+-
+-	mptcp_for_each_subflow(msk, tmp) {
+-		if (tmp != subflow)
+-			return true;
+-	}
+-
+-	return false;
+-}
+-
+ void __init mptcp_proto_init(void);
+ #if IS_ENABLED(CONFIG_MPTCP_IPV6)
+ int __init mptcp_proto_v6_init(void);
+diff --git a/net/mptcp/subflow.c b/net/mptcp/subflow.c
+index aecd98ac5dfe..27273cf091db 100644
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@ -1233,8 +1233,7 @@ static bool subflow_check_data_avail(struct sock *ssk)
+ 	if (!__mptcp_check_fallback(msk)) {
+ 		/* RFC 8684 section 3.7. */
+ 		if (subflow->send_mp_fail) {
+-			if (mptcp_has_another_subflow(ssk) ||
+-			    !READ_ONCE(msk->allow_infinite_fallback)) {
++			if (!READ_ONCE(msk->allow_infinite_fallback)) {
+ 				ssk->sk_err = EBADMSG;
+ 				tcp_set_state(ssk, TCP_CLOSE);
+ 				subflow->reset_transient = 0;
+-- 
+2.34.1
+
