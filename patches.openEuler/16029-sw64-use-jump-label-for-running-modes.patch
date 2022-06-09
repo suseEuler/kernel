@@ -1,0 +1,129 @@
+From db1bcdd57485aafd1dc258300eefaa3d460715f3 Mon Sep 17 00:00:00 2001
+From: Mao Minkai <maominkai@wxiat.com>
+Date: Tue, 7 Jun 2022 17:41:49 +0800
+Subject: [PATCH] sw64: use jump label for running modes
+Patch-mainline: NO, OTHERS
+References: openEuler-22.03-LTS
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: performance
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56XPR
+
+--------------------------------
+
+Use jump label instead of normal if-else statement for running modes
+to improve performance.
+
+Signed-off-by: Mao Minkai <maominkai@wxiat.com>
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Acked-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/include/asm/hw_init.h | 26 +++++++-------------------
+ arch/sw_64/kernel/setup.c        | 19 +++++++++++++++----
+ 2 files changed, 22 insertions(+), 23 deletions(-)
+
+diff --git a/arch/sw_64/include/asm/hw_init.h b/arch/sw_64/include/asm/hw_init.h
+index 9a56590ef653..f3d75e0fda7a 100644
+--- a/arch/sw_64/include/asm/hw_init.h
++++ b/arch/sw_64/include/asm/hw_init.h
+@@ -2,6 +2,7 @@
+ #ifndef _ASM_SW64_HW_INIT_H
+ #define _ASM_SW64_HW_INIT_H
+ #include <linux/numa.h>
++#include <linux/jump_label.h>
+ 
+ #define MMSIZE		__va(0x2040)
+ 
+@@ -96,26 +97,13 @@ static inline bool icache_is_vivt_no_ictag(void)
+ 	return (cpu_desc.arch_var == 0x3 && cpu_desc.arch_rev == 0x1);
+ }
+ 
+-enum RUNMODE {
+-	HOST_MODE = 0,
+-	GUEST_MODE = 1,
+-	EMUL_MODE = 2,
+-};
++DECLARE_STATIC_KEY_TRUE(run_mode_host_key);
++DECLARE_STATIC_KEY_FALSE(run_mode_guest_key);
++DECLARE_STATIC_KEY_FALSE(run_mode_emul_key);
+ 
+-static inline bool is_in_host(void)
+-{
+-	return !cpu_desc.run_mode;
+-}
+-
+-static inline bool is_in_guest(void)
+-{
+-	return cpu_desc.run_mode == GUEST_MODE;
+-}
+-
+-static inline bool is_guest_or_emul(void)
+-{
+-	return !!cpu_desc.run_mode;
+-}
++#define is_in_host()		static_branch_likely(&run_mode_host_key)
++#define is_in_guest()		static_branch_unlikely(&run_mode_guest_key)
++#define is_guest_or_emul()	!static_branch_likely(&run_mode_host_key)
+ 
+ #define CPU_SW3231		0x31
+ #define CPU_SW831		0x32
+diff --git a/arch/sw_64/kernel/setup.c b/arch/sw_64/kernel/setup.c
+index 4f735f44ccc3..27f59fe0d1b1 100644
+--- a/arch/sw_64/kernel/setup.c
++++ b/arch/sw_64/kernel/setup.c
+@@ -133,6 +133,9 @@ static struct resource bss_resource = {
+ struct cpuinfo_sw64 cpu_data[NR_CPUS];
+ EXPORT_SYMBOL(cpu_data);
+ 
++DEFINE_STATIC_KEY_TRUE(run_mode_host_key);
++DEFINE_STATIC_KEY_FALSE(run_mode_guest_key);
++DEFINE_STATIC_KEY_FALSE(run_mode_emul_key);
+ struct cpu_desc_t cpu_desc;
+ struct socket_desc_t socket_desc[MAX_NUMSOCKETS];
+ int memmap_nr;
+@@ -639,10 +642,18 @@ static void __init setup_cpu_info(void)
+ 	cpu_desc.arch_rev = CPUID_ARCH_REV(val);
+ 	cpu_desc.pa_bits = CPUID_PA_BITS(val);
+ 	cpu_desc.va_bits = CPUID_VA_BITS(val);
+-	cpu_desc.run_mode = HOST_MODE;
+ 
+-	if (*(unsigned long *)MMSIZE)
+-		cpu_desc.run_mode = GUEST_MODE;
++	if (*(unsigned long *)MMSIZE) {
++		pr_info("run mode: guest\n");
++		static_branch_disable(&run_mode_host_key);
++		static_branch_enable(&run_mode_guest_key);
++		static_branch_disable(&run_mode_emul_key);
++	} else {
++		pr_info("run mode: host\n");
++		static_branch_enable(&run_mode_host_key);
++		static_branch_disable(&run_mode_guest_key);
++		static_branch_disable(&run_mode_emul_key);
++	}
+ 
+ 	for (i = 0; i < VENDOR_ID_MAX; i++) {
+ 		val = cpuid(GET_VENDOR_ID, i);
+@@ -747,6 +758,7 @@ void __init sw64_kvm_reserve(void)
+ void __init
+ setup_arch(char **cmdline_p)
+ {
++	jump_label_init();
+ 	setup_cpu_info();
+ 	sw64_chip->fixup();
+ 	sw64_chip_init->fixup();
+@@ -754,7 +766,6 @@ setup_arch(char **cmdline_p)
+ 	show_socket_mem_layout();
+ 	sw64_chip_init->early_init.setup_core_start(&core_start);
+ 
+-	jump_label_init();
+ 	setup_sched_clock();
+ #ifdef CONFIG_GENERIC_SCHED_CLOCK
+ 	sw64_sched_clock_init();
+-- 
+2.34.1
+

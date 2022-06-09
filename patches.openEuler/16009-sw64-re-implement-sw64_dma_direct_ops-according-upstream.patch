@@ -1,0 +1,432 @@
+From b25d04a0aa8e9b3aec7632ba839bd506c428d5b5 Mon Sep 17 00:00:00 2001
+From: Zheng Chongzhen <zhengchongzhen@wxiat.com>
+Date: Tue, 7 Jun 2022 17:41:29 +0800
+Subject: [PATCH] sw64: re-implement sw64_dma_direct_ops according upstream
+Patch-mainline: NO, check it manually
+References: openEuler-22.03-LTS
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56OSP
+
+--------------------------------
+
+The upstream changes the interface implementation of the dma map to
+remove the swiotlb_dma_ops and the dma_direct_ops, which is mentioned
+in commit 55897af63091 ("dma-direct: merge swiotlb_dma_ops into the
+dma_direct code") and commit 356da6d0cde3 ("dma-mapping: bypass
+indirect calls for dma-direct"), so we re-implement the arch-specific
+direct dma_ops and merge swiotlb_dma_ops.
+
+There is still a risk for 32-bit devices, as there is no guarantee that
+less than 4G address will be successfully allocated under the current
+default policy. In this case, it should add "swiotlb=force" to cmdline
+to use swiotlb map to ensure correctness. Why not use swiotlb in the
+default policy? One reason is that there are few 32-bit devices today,
+while dma performance of 64-bit devices will suffer when enabled.
+
+Signed-off-by: Zheng Chongzhen <zhengchongzhen@wxiat.com>
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Acked-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/Kconfig             |  17 +-
+ arch/sw_64/kernel/Makefile     |   3 +-
+ arch/sw_64/kernel/pci_common.c | 274 +++++++++------------------------
+ 3 files changed, 75 insertions(+), 219 deletions(-)
+
+diff --git a/arch/sw_64/Kconfig b/arch/sw_64/Kconfig
+index bef7ab381674..a81d388ed304 100644
+--- a/arch/sw_64/Kconfig
++++ b/arch/sw_64/Kconfig
+@@ -39,6 +39,7 @@ config SW64
+ 	select GENERIC_STRNLEN_USER
+ 	select HAVE_ARCH_KGDB
+ 	select ARCH_HAS_PHYS_TO_DMA
++	select SWIOTLB
+ 	select HAVE_MEMBLOCK
+ 	select HAVE_MEMBLOCK_NODE_MAP
+ 	select NO_BOOTMEM
+@@ -249,22 +250,6 @@ config LOCK_MEMB
+ 	bool "Insert mem barrier before lock instruction"
+ 	default y
+ 
+-choice
+-	prompt "DMA Mapping Type"
+-	depends on SW64 && PCI
+-
+-config DIRECT_DMA
+-	bool "Direct DMA Mapping"
+-	depends on SW64 && PCI
+-
+-config SWIOTLB
+-	bool "Software IO TLB"
+-	depends on SW64 && PCI
+-	help
+-	  Software IO TLB
+-
+-endchoice
+-
+ # clear all implied options (don't want default values for those):
+ # Most of these machines have ISA slots; not exactly sure which don't,
+ # and this doesn't activate hordes of code, so do it always.
+diff --git a/arch/sw_64/kernel/Makefile b/arch/sw_64/kernel/Makefile
+index d9e2fcbc1e91..99516d3ca7cf 100644
+--- a/arch/sw_64/kernel/Makefile
++++ b/arch/sw_64/kernel/Makefile
+@@ -29,8 +29,7 @@ obj-$(CONFIG_SUSPEND)	+= suspend_asm.o suspend.o
+ obj-$(CONFIG_PERF_EVENTS) += perf_event.o
+ obj-$(CONFIG_HIBERNATION) += hibernate_asm.o hibernate.o
+ obj-$(CONFIG_AUDIT)     += audit.o
+-obj-$(CONFIG_DIRECT_DMA) += pci_common.o
+-obj-$(CONFIG_SWIOTLB) += dma_swiotlb.o
++obj-$(CONFIG_PCI) += pci_common.o
+ obj-$(CONFIG_RELOCATABLE)   += relocate.o
+ obj-$(CONFIG_DEBUG_FS)	+= unaligned.o segvdbg.o
+ obj-$(CONFIG_JUMP_LABEL) += jump_label.o
+diff --git a/arch/sw_64/kernel/pci_common.c b/arch/sw_64/kernel/pci_common.c
+index c8c4bf08a458..f6316ca507a2 100644
+--- a/arch/sw_64/kernel/pci_common.c
++++ b/arch/sw_64/kernel/pci_common.c
+@@ -19,194 +19,108 @@
+ #include <linux/cache.h>
+ #include <linux/module.h>
+ #include <asm/dma.h>
+-#include <asm/io.h>
+-
+-#include "pci_impl.h"
+-
+-#define DEBUG_ALLOC 0
+-#if DEBUG_ALLOC > 0
+-# define DBGA(args...)		printk(KERN_DEBUG args)
+-#else
+-# define DBGA(args...)
+-#endif
+-#if DEBUG_ALLOC > 1
+-# define DBGA2(args...)		printk(KERN_DEBUG args)
+-#else
+-# define DBGA2(args...)
+-#endif
+-
+-#define DEBUG_NODIRECT 0
+-
+-#define ISA_DMA_MASK		0x00ffffff
+-
+-/*
+- * Map a single buffer of the indicated size for PCI DMA in streaming
+- * mode.  The 32-bit PCI bus mastering address to use is returned.
+- * Once the device is given the dma address, the device owns this memory
+- * until either pci_unmap_single or pci_dma_sync_single is performed.
+- */
+-
+-static dma_addr_t
+-pci_direct_map_single_1(struct pci_dev *pdev, void *cpu_addr)
+-{
+-	struct pci_controller *hose = pdev->sysdata;
+-	unsigned long paddr;
+-	unsigned long dma_offset;
+-
+-	if (hose == NULL) {
+-		pr_err("%s: hose does not exist!\n", __func__);
+-		return 0;
+-	}
+-
+-	dma_offset = read_piu_ior0(hose->node, hose->index, EPDMABAR);
+-	paddr = __pa(cpu_addr) + dma_offset;
+-	return paddr;
+-}
+-
+-/* Helper for generic DMA-mapping functions. */
+-static struct pci_dev *sw64_direct_gendev_to_pci(struct device *dev)
+-{
+-	if (dev && dev->bus == &pci_bus_type)
+-		return to_pci_dev(dev);
+-
+-	/* This assumes ISA bus master with dma_mask 0xffffff. */
+-	return NULL;
+-}
+ 
+ static dma_addr_t sw64_direct_map_page(struct device *dev, struct page *page,
+ 		unsigned long offset, size_t size,
+ 		enum dma_data_direction dir,
+ 		unsigned long attrs)
+ {
+-	struct pci_dev *pdev = sw64_direct_gendev_to_pci(dev);
++	dma_addr_t dma_addr = page_to_phys(page) + offset;
+ 
+-	if (dir == PCI_DMA_NONE)
+-		BUG();
++	if (unlikely(swiotlb_force == SWIOTLB_FORCE))
++		return swiotlb_map(dev, dma_addr, size, dir, attrs);
+ 
+-	return pci_direct_map_single_1(pdev, (char *)page_address(page) + offset);
+-}
++	if (unlikely(!dma_capable(dev, dma_addr, size, true))) {
++		if (swiotlb_force != SWIOTLB_NO_FORCE)
++			return swiotlb_map(dev, dma_addr, size, dir, attrs);
+ 
+-/*
+- * Unmap a single streaming mode DMA translation.  The DMA_ADDR and
+- * SIZE must match what was provided for in a previous pci_map_single
+- * call.  All other usages are undefined.  After this call, reads by
+- * the cpu to the buffer are guaranteed to see whatever the device
+- * wrote there.
+- */
++		dev_WARN_ONCE(dev, 1,
++			     "DMA addr %pad+%zu overflow (mask %llx, bus limit %llx).\n",
++			     &dma_addr, size, *dev->dma_mask, dev->bus_dma_limit);
++		return DMA_MAPPING_ERROR;
++	}
+ 
+-static inline void sw64_direct_unmap_page(struct device *dev, dma_addr_t dma_addr,
++	return dma_addr;
++}
++
++static inline void sw64_direct_unmap_page(struct device *dev, dma_addr_t addr,
+ 		size_t size, enum dma_data_direction dir,
+ 		unsigned long attrs)
+ {
++	if (unlikely(is_swiotlb_buffer(addr)))
++		swiotlb_tbl_unmap_single(dev, addr, size, size, dir, attrs);
+ }
+ 
+-/* Allocate and map kernel buffer using consistent mode DMA for PCI
+- * device.  Returns non-NULL cpu-view pointer to the buffer if
+- * successful and sets *DMA_ADDRP to the pci side dma address as well,
+- * else DMA_ADDRP is undefined.
+- */
++static bool dma_coherent_ok(struct device *dev, phys_addr_t phys, size_t size)
++{
++	return phys + size - 1 <=
++		min_not_zero(dev->coherent_dma_mask, dev->bus_dma_limit);
++}
+ 
+ static void *sw64_direct_alloc_coherent(struct device *dev, size_t size,
+ 		dma_addr_t *dma_addrp, gfp_t gfp,
+ 		unsigned long attrs)
+ {
+-	struct pci_dev *pdev = sw64_direct_gendev_to_pci(dev);
+-	void *cpu_addr;
+-	long order = get_order(size);
+-
+-	gfp &= ~GFP_DMA;
+-
+-#ifdef CONFIG_ZONE_DMA
+-	if (dev->coherent_dma_mask < DMA_BIT_MASK(32))
+-		gfp |= GFP_DMA;
+-#endif
+-
+-try_again:
+-	cpu_addr = (void *)__get_free_pages(gfp, order);
+-	if (!cpu_addr) {
+-		pr_info("pci_alloc_consistent: get_free_pages failed from %ps\n",
+-				__builtin_return_address(0));
+-		/* ??? Really atomic allocation?  Otherwise we could play
+-		 * with vmalloc and sg if we can't find contiguous memory.
+-		 */
+-		return NULL;
++	struct page *page;
++	void *ret;
++	u64 dma_limit;
++
++	size = PAGE_ALIGN(size);
++	if (attrs & DMA_ATTR_NO_WARN)
++		gfp |= __GFP_NOWARN;
++
++	dma_limit = min_not_zero(dev->coherent_dma_mask, dev->bus_dma_limit);
++	if (dma_limit <= DMA_BIT_MASK(32))
++		gfp |= GFP_DMA32;
++
++	/* we always manually zero the memory once we are done */
++	gfp &= ~__GFP_ZERO;
++again:
++	page = alloc_pages_node(dev_to_node(dev), gfp, get_order(size));
++	if (page && !dma_coherent_ok(dev, page_to_phys(page), size)) {
++		dma_free_contiguous(dev, page, size);
++		page = NULL;
++
++		if (IS_ENABLED(CONFIG_ZONE_DMA32) &&
++				dma_limit < DMA_BIT_MASK(64) &&
++				!(gfp & (GFP_DMA32 | GFP_DMA))) {
++			gfp |= GFP_DMA32;
++			goto again;
++		}
+ 	}
+-	memset(cpu_addr, 0, size);
+ 
+-	*dma_addrp = pci_direct_map_single_1(pdev, cpu_addr);
+-	if (*dma_addrp == 0) {
+-		free_pages((unsigned long)cpu_addr, order);
+-		if (gfp & GFP_DMA)
+-			return NULL;
+-		/* The address doesn't fit required mask and we
+-		 * do not have iommu. Try again with GFP_DMA.
+-		 */
+-		gfp |= GFP_DMA;
+-		goto try_again;
+-	}
++	if (!page)
++		return NULL;
+ 
+-	DBGA2("pci_alloc_consistent: %zx -> [%p,%llx] from %ps\n",
+-			size, cpu_addr, *dma_addrp, __builtin_return_address(0));
++	ret = page_address(page);
++	memset(ret, 0, size);
++	*dma_addrp = page_to_phys(page);
+ 
+-	return cpu_addr;
++	return ret;
+ }
+ 
+-/* Free and unmap a consistent DMA buffer.  CPU_ADDR and DMA_ADDR must
+- * be values that were returned from pci_alloc_consistent.  SIZE must
+- * be the same as what as passed into pci_alloc_consistent.
+- * References to the memory and mappings associated with CPU_ADDR or
+- * DMA_ADDR past this call are illegal.
+- */
+-
+ static void sw64_direct_free_coherent(struct device *dev, size_t size,
+ 		void *cpu_addr, dma_addr_t dma_addr,
+ 		unsigned long attrs)
+ {
+-	struct pci_dev *pdev = sw64_direct_gendev_to_pci(dev);
+-
+-	pci_unmap_single(pdev, dma_addr, size, PCI_DMA_BIDIRECTIONAL);
+-	free_pages((unsigned long)cpu_addr, get_order(size));
+-	DBGA2("pci_free_consistent: [%llx,%zx] from %ps\n",
+-			dma_addr, size, __builtin_return_address(0));
+-}
+-#define SG_ENT_VIRT_ADDRESS(SG) (sg_virt((SG)))
+-#define SG_ENT_PHYS_ADDRESS(SG) __pa(SG_ENT_VIRT_ADDRESS(SG))
+-
+-static dma_addr_t sw64_phys_to_dma(struct device *dev, phys_addr_t pa)
+-{
+-	unsigned long dma_offset;
+-	struct pci_dev *pdev = sw64_gendev_to_pci(dev);
+-	struct pci_controller *hose = pdev->sysdata;
+-
+-	if (hose == NULL) {
+-		pr_err("%s: hose does not exist!\n", __func__);
+-		return 0;
++	if (attrs & DMA_ATTR_NO_KERNEL_MAPPING) {
++		/* cpu_addr is a struct page cookie, not a kernel address */
++		dma_free_contiguous(dev, cpu_addr, size);
++		return;
+ 	}
+ 
+-	dma_offset = read_piu_ior0(hose->node, hose->index, EPDMABAR);
+-	return pa + dma_offset;
++	free_pages((unsigned long)cpu_addr, get_order(size));
+ }
+ 
+-static bool
+-check_addr(struct device *dev, dma_addr_t dma_addr, size_t size,
+-		const char *caller)
++static void sw64_direct_unmap_sg(struct device *dev, struct scatterlist *sgl,
++		int nents, enum dma_data_direction dir, unsigned long attrs)
+ {
+-	if (unlikely(dev && !dma_capable(dev, dma_addr, size, true))) {
+-		if (!dev->dma_mask) {
+-			dev_err(dev,
+-					"%s: call on device without dma_mask\n",
+-					caller);
+-			return false;
+-		}
++	struct scatterlist *sg;
++	int i;
+ 
+-		if (*dev->dma_mask >= DMA_BIT_MASK(32)) {
+-			dev_err(dev,
+-					"%s: overflow %pad+%zu of device mask %llx\n",
+-					caller, &dma_addr, size, *dev->dma_mask);
+-		}
+-		return false;
+-	}
+-	return true;
++	for_each_sg(sgl, sg, nents, i)
++		sw64_direct_unmap_page(dev, sg->dma_address, sg_dma_len(sg), dir,
++				attrs);
+ }
+ 
+ static int sw64_direct_map_sg(struct device *dev, struct scatterlist *sgl,
+@@ -216,58 +130,16 @@ static int sw64_direct_map_sg(struct device *dev, struct scatterlist *sgl,
+ 	struct scatterlist *sg;
+ 
+ 	for_each_sg(sgl, sg, nents, i) {
+-		BUG_ON(!sg_page(sg));
+-
+-		sg_dma_address(sg) = sw64_phys_to_dma(dev, sg_phys(sg));
+-		if (!check_addr(dev, sg_dma_address(sg), sg->length, __func__))
+-			return 0;
++		sg_dma_address(sg) = sw64_direct_map_page(dev, sg_page(sg),
++				   sg->offset, sg->length, dir, attrs);
++		if (sg->dma_address == DMA_MAPPING_ERROR)
++			goto out_unmap;
+ 		sg_dma_len(sg) = sg->length;
+ 	}
+-
+ 	return nents;
+-}
+-
+-/* Unmap a set of streaming mode DMA translations.  Again, cpu read
+- * rules concerning calls here are the same as for pci_unmap_single()
+- * above.
+- */
+-
+-static inline void sw64_direct_unmap_sg(struct device *dev, struct scatterlist *sg,
+-		int nents, enum dma_data_direction dir,
+-		unsigned long attrs)
+-{
+-}
+-
+-/* Return whether the given PCI device DMA address mask can be
+- * supported properly.
+- */
+-
+-static int sw64_direct_supported(struct device *dev, u64 mask)
+-{
+-	struct pci_dev *pdev = sw64_direct_gendev_to_pci(dev);
+-	struct pci_controller *hose;
+-
+-	if ((max_low_pfn << PAGE_SHIFT) - 1 <= mask)
+-		return 1;
+-
+-	/* Check that we have a scatter-gather arena that fits.  */
+-	hose = pdev->sysdata;
+-	if (hose == NULL) {
+-		pr_err("%s: hose does not exist!\n", __func__);
+-		return 0;
+-	}
+-
+-	/* As last resort try ZONE_DMA.  */
+-	if (MAX_DMA_ADDRESS - PAGE_OFFSET - 1 <= mask)
+-		return 1;
+-
+-	/*
+-	 * Upstream PCI/PCIe bridges or SoC interconnects may not carry
+-	 * as many DMA address bits as the device itself supports.
+-	 */
+-	if (dev->bus_dma_limit && mask > dev->bus_dma_limit)
+-		return 0;
+ 
++out_unmap:
++	sw64_direct_unmap_sg(dev, sgl, i, dir, attrs | DMA_ATTR_SKIP_CPU_SYNC);
+ 	return 0;
+ }
+ 
+@@ -278,7 +150,7 @@ const struct dma_map_ops sw64_dma_direct_ops = {
+ 	.unmap_page = sw64_direct_unmap_page,
+ 	.map_sg = sw64_direct_map_sg,
+ 	.unmap_sg = sw64_direct_unmap_sg,
+-	.dma_supported = sw64_direct_supported,
++	.dma_supported = dma_direct_supported,
+ };
+ 
+ const struct dma_map_ops *dma_ops = &sw64_dma_direct_ops;
+-- 
+2.34.1
+

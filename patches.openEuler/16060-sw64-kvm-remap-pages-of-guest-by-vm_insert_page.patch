@@ -1,0 +1,161 @@
+From 8dcd62ea641f55c637e2d8bb2e30dc3c4688dbbd Mon Sep 17 00:00:00 2001
+From: Du Yilong <duyilong@wxiat.com>
+Date: Tue, 7 Jun 2022 17:42:20 +0800
+Subject: [PATCH] sw64: kvm: remap pages of guest by vm_insert_page()
+Patch-mainline: NO, OTHERS
+References: openEuler-22.03-LTS
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56WV8
+
+--------------------------------
+
+It used to clear VM_IO and VM_PFNMAP of the vma flag, then
+set again before release this vma to get the physical pages
+corresponding to the user virtual address.
+
+But __get_user_pages() will fail because of bad pte without
+VM_PFNMAP if HAVE_GENERIC_GUP and ARCH_HAS_PTE_SPECIAL are
+enabled.
+
+To fix this issue, remap pages by vm_insert_page() to insert
+individual pages allocated for guest.
+
+Signed-off-by: Du Yilong <duyilong@wxiat.com>
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Acked-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/include/asm/mmu_context.h |  8 ------
+ arch/sw_64/kernel/setup.c            |  2 ++
+ arch/sw_64/kvm/kvm-sw64.c            |  9 +++----
+ arch/sw_64/kvm/vmem.c                | 37 +++++++++++++++++++++++++---
+ 4 files changed, 38 insertions(+), 18 deletions(-)
+
+diff --git a/arch/sw_64/include/asm/mmu_context.h b/arch/sw_64/include/asm/mmu_context.h
+index 4866ea6d81bb..e3d7ae7c873e 100644
+--- a/arch/sw_64/include/asm/mmu_context.h
++++ b/arch/sw_64/include/asm/mmu_context.h
+@@ -195,14 +195,6 @@ static inline int arch_dup_mmap(struct mm_struct *oldmm,
+ 
+ static inline void arch_exit_mmap(struct mm_struct *mm)
+ {
+-	struct vm_area_struct *vma;
+-
+-	vma = mm->mmap;
+-	while (vma) {
+-		if (vma->vm_flags & VM_ARCH_1)
+-			vma->vm_flags |= VM_IO | VM_PFNMAP;
+-		vma = vma->vm_next;
+-	}
+ }
+ 
+ static inline void arch_unmap(struct mm_struct *mm, unsigned long start,
+diff --git a/arch/sw_64/kernel/setup.c b/arch/sw_64/kernel/setup.c
+index e081483194e6..95d25c7c8204 100644
+--- a/arch/sw_64/kernel/setup.c
++++ b/arch/sw_64/kernel/setup.c
+@@ -1053,6 +1053,8 @@ static int __init sw64_kvm_pool_init(void)
+ 	while (page_ref_count(p) == 0 &&
+ 			(unsigned long)p <= (unsigned long)end_page) {
+ 		set_page_count(p, 1);
++		page_mapcount_reset(p);
++		SetPageReserved(p);
+ 		p++;
+ 	}
+ 
+diff --git a/arch/sw_64/kvm/kvm-sw64.c b/arch/sw_64/kvm/kvm-sw64.c
+index 4e7933fd80ed..cc9817037b58 100644
+--- a/arch/sw_64/kvm/kvm-sw64.c
++++ b/arch/sw_64/kvm/kvm-sw64.c
+@@ -311,17 +311,14 @@ int kvm_arch_prepare_memory_region(struct kvm *kvm,
+ 		vma->vm_ops = &vmem_vm_ops;
+ 		vma->vm_ops->open(vma);
+ 
+-		remap_pfn_range(vma, mem->userspace_addr,
+-				addr >> PAGE_SHIFT,
+-				mem->memory_size, vma->vm_page_prot);
++		ret = vmem_vm_insert_page(vma);
++		if ((int)ret < 0)
++			return ret;
+ 	} else {
+ 		info = vm_file->private_data;
+ 		addr = info->start;
+ 	}
+ 
+-	vma->vm_flags &= ~(VM_IO | VM_PFNMAP);
+-	vma->vm_flags |= VM_ARCH_1;
+-
+ 	pr_info("guest phys addr = %#lx, size = %#lx\n",
+ 			addr, vma->vm_end - vma->vm_start);
+ 	kvm->arch.mem.membank[0].guest_phys_addr = 0;
+diff --git a/arch/sw_64/kvm/vmem.c b/arch/sw_64/kvm/vmem.c
+index b8a585ec1ad1..c6f9d6cdf03b 100644
+--- a/arch/sw_64/kvm/vmem.c
++++ b/arch/sw_64/kvm/vmem.c
+@@ -28,6 +28,35 @@ static bool addr_in_pool(struct gen_pool *pool,
+ 	return found;
+ }
+ 
++static int vmem_vm_insert_page(struct vm_area_struct *vma)
++{
++	unsigned long addr, uaddr;
++	struct page *vmem_page;
++	struct vmem_info *info;
++	size_t size;
++	int ret;
++
++	info = vma->vm_private_data;
++	addr = info->start;
++	size = info->size;
++	uaddr = vma->vm_start;
++
++	vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP | VM_MIXEDMAP;
++	vmem_page = pfn_to_page(addr >> PAGE_SHIFT);
++	do {
++		ret = vm_insert_page(vma, uaddr, vmem_page);
++		if (ret < 0) {
++			pr_info("vm_insert_page failed: %d\n", ret);
++			return ret;
++		}
++		vmem_page++;
++		uaddr += PAGE_SIZE;
++		size -= PAGE_SIZE;
++	} while (size > 0);
++
++	return 0;
++}
++
+ static void vmem_vm_open(struct vm_area_struct *vma)
+ {
+ 	struct vmem_info *info = vma->vm_private_data;
+@@ -83,6 +112,7 @@ static int vmem_mmap(struct file *flip, struct vm_area_struct *vma)
+ 	unsigned long addr;
+ 	static struct vmem_info *info;
+ 	size_t size = vma->vm_end - vma->vm_start;
++	int ret;
+ 
+ 	if (!(vma->vm_flags & VM_SHARED)) {
+ 		pr_err("%s: mapping must be shared\n", __func__);
+@@ -114,10 +144,9 @@ static int vmem_mmap(struct file *flip, struct vm_area_struct *vma)
+ 	/*to do if size bigger than vm_mem_size*/
+ 	pr_info("sw64_vmem: vm_start=%#lx, size= %#lx\n", vma->vm_start, size);
+ 
+-	/*remap_pfn_range - remap kernel memory to userspace*/
+-	if (remap_pfn_range(vma, vma->vm_start, addr >> PAGE_SHIFT, size,
+-			    vma->vm_page_prot))
+-		return  -EAGAIN;
++	vmem_vm_insert_page(vma);
++	if (ret < 0)
++		return ret;
+ 
+ 	return 0;
+ }
+-- 
+2.34.1
+

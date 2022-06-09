@@ -1,0 +1,81 @@
+From 7643bbb2797a2159aa64cf76541508a3a9b7fa31 Mon Sep 17 00:00:00 2001
+From: Wang Wensheng <wangwensheng4@huawei.com>
+Date: Tue, 7 Jun 2022 21:58:59 +0800
+Subject: [PATCH] share_pool: Fix ABBA deadlock
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 7643bbb2797a2159aa64cf76541508a3a9b7fa31
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I54I7W
+CVE: NA
+backport: openEuler-22.03-LTS
+
+--------------------------------------------------
+
+There is a ABBA deadlock in the process of sp_group_add_task and
+proc_stat_show().
+
+PROCESS A:
+sp_group_add_task()        acquire sp_group_sem write lock
+    ->sp_init_proc_stat()  acquire sp_spg_stat_sem  write lock
+PROCESS B:
+proc_stat_show()           acquire sp_spg_stat_sem read lock
+    ->idr_proc_stat_cb()   acquire sp_group_sem read lock
+
+Here we choose the simplest way that acquires sp_group_sem and
+sp_stat_sem read lock subsequently in proc_stat_show(), since it just
+has effect on the process of debug feature.
+
+Signed-off-by: Wang Wensheng <wangwensheng4@huawei.com>
+Reviewed-by: Weilong Chen <chenweilong@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/share_pool.c | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/mm/share_pool.c b/mm/share_pool.c
+index cd45852919a1..85d175def6ae 100644
+--- a/mm/share_pool.c
++++ b/mm/share_pool.c
+@@ -4083,7 +4083,6 @@ static int idr_proc_stat_cb(int id, void *p, void *data)
+ 	long sp_res, sp_res_nsize, non_sp_res, non_sp_shm;
+ 
+ 	/* to prevent ABBA deadlock, first hold sp_group_sem */
+-	down_read(&sp_group_sem);
+ 	mutex_lock(&spg_stat->lock);
+ 	hash_for_each(spg_stat->hash, i, spg_proc_stat, gnode) {
+ 		proc_stat = spg_proc_stat->proc_stat;
+@@ -4112,7 +4111,6 @@ static int idr_proc_stat_cb(int id, void *p, void *data)
+ 		seq_putc(seq, '\n');
+ 	}
+ 	mutex_unlock(&spg_stat->lock);
+-	up_read(&sp_group_sem);
+ 	return 0;
+ }
+ 
+@@ -4130,10 +4128,16 @@ static int proc_stat_show(struct seq_file *seq, void *offset)
+ 		   byte2kb(atomic64_read(&kthread_stat.alloc_size)),
+ 		   byte2kb(atomic64_read(&kthread_stat.k2u_size)));
+ 
+-	/* pay attention to potential ABBA deadlock */
++	/*
++	 * This ugly code is just for fixing the ABBA deadlock against
++	 * sp_group_add_task.
++	 */
++	down_read(&sp_group_sem);
+ 	down_read(&sp_spg_stat_sem);
+ 	idr_for_each(&sp_spg_stat_idr, idr_proc_stat_cb, seq);
+ 	up_read(&sp_spg_stat_sem);
++	up_read(&sp_group_sem);
++
+ 	return 0;
+ }
+ 
+-- 
+2.34.1
+

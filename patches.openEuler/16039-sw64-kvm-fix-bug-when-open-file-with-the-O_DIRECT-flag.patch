@@ -1,0 +1,108 @@
+From 4f0a664438961bbb4cae8addb9998e9d25f909a9 Mon Sep 17 00:00:00 2001
+From: Du Yilong <duyilong@wxiat.com>
+Date: Tue, 7 Jun 2022 17:41:59 +0800
+Subject: [PATCH] sw64: kvm: fix bug when open file with the O_DIRECT flag
+Patch-mainline: NO, OTHERS
+References: openEuler-22.03-LTS
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56WV8
+
+--------------------------------
+
+sw_64/kvm map the memory of VM instance to QEMU's user space by
+remap_pfn_range(), which set the vma flag with VM_IO and VM_PFNMAP.
+
+The previous commit set these pages as reserved and follow_pfn()
+method will get pfn of a PFNMAP vma correctly to fix bug if user
+do munmap on the vma.
+
+But in generic_file_read_iter() with O_DIRECT flag will call
+__get_user_pages() and return -EFAULT because of VM_IO and
+VM_PFNMAP, then bio_iov_iter_get_pages() failed to get the
+physical pages corresponding to the user virtual address.
+
+To solve this problem, VM_IO and VM_PFNMAP of the vma flag were
+cleared and set again before release this vma.
+
+Signed-off-by: Du Yilong <duyilong@wxiat.com>
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Acked-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/include/asm/mmu_context.h | 8 ++++++++
+ arch/sw_64/kernel/setup.c            | 1 -
+ arch/sw_64/kvm/kvm-sw64.c            | 9 ++++++---
+ 3 files changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/arch/sw_64/include/asm/mmu_context.h b/arch/sw_64/include/asm/mmu_context.h
+index e3d7ae7c873e..4866ea6d81bb 100644
+--- a/arch/sw_64/include/asm/mmu_context.h
++++ b/arch/sw_64/include/asm/mmu_context.h
+@@ -195,6 +195,14 @@ static inline int arch_dup_mmap(struct mm_struct *oldmm,
+ 
+ static inline void arch_exit_mmap(struct mm_struct *mm)
+ {
++	struct vm_area_struct *vma;
++
++	vma = mm->mmap;
++	while (vma) {
++		if (vma->vm_flags & VM_ARCH_1)
++			vma->vm_flags |= VM_IO | VM_PFNMAP;
++		vma = vma->vm_next;
++	}
+ }
+ 
+ static inline void arch_unmap(struct mm_struct *mm, unsigned long start,
+diff --git a/arch/sw_64/kernel/setup.c b/arch/sw_64/kernel/setup.c
+index 26a611448ad6..e081483194e6 100644
+--- a/arch/sw_64/kernel/setup.c
++++ b/arch/sw_64/kernel/setup.c
+@@ -1053,7 +1053,6 @@ static int __init sw64_kvm_pool_init(void)
+ 	while (page_ref_count(p) == 0 &&
+ 			(unsigned long)p <= (unsigned long)end_page) {
+ 		set_page_count(p, 1);
+-		SetPageReserved(p);
+ 		p++;
+ 	}
+ 
+diff --git a/arch/sw_64/kvm/kvm-sw64.c b/arch/sw_64/kvm/kvm-sw64.c
+index e1f7a82fbc26..4e7933fd80ed 100644
+--- a/arch/sw_64/kvm/kvm-sw64.c
++++ b/arch/sw_64/kvm/kvm-sw64.c
+@@ -297,6 +297,9 @@ int kvm_arch_prepare_memory_region(struct kvm *kvm,
+ 		ret = vm_mmap(vm_file, mem->userspace_addr, mem->memory_size,
+ 				PROT_READ | PROT_WRITE,
+ 				MAP_SHARED | MAP_FIXED, 0);
++		if ((long)ret < 0)
++			return ret;
++
+ 		vma = find_vma(current->mm, mem->userspace_addr);
+ 		if (!vma)
+ 			return -ENOMEM;
+@@ -311,14 +314,14 @@ int kvm_arch_prepare_memory_region(struct kvm *kvm,
+ 		remap_pfn_range(vma, mem->userspace_addr,
+ 				addr >> PAGE_SHIFT,
+ 				mem->memory_size, vma->vm_page_prot);
+-
+-		if ((long)ret < 0)
+-			return ret;
+ 	} else {
+ 		info = vm_file->private_data;
+ 		addr = info->start;
+ 	}
+ 
++	vma->vm_flags &= ~(VM_IO | VM_PFNMAP);
++	vma->vm_flags |= VM_ARCH_1;
++
+ 	pr_info("guest phys addr = %#lx, size = %#lx\n",
+ 			addr, vma->vm_end - vma->vm_start);
+ 	kvm->arch.mem.membank[0].guest_phys_addr = 0;
+-- 
+2.34.1
+

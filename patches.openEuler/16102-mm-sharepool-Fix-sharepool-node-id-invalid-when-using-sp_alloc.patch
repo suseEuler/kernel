@@ -1,0 +1,223 @@
+From 7f6d9434fd8a07e1baf93c56da0cafb7dcaa67a7 Mon Sep 17 00:00:00 2001
+From: Zhang Jian <zhangjian210@huawei.com>
+Date: Tue, 7 Jun 2022 21:59:00 +0800
+Subject: [PATCH] mm/sharepool: Fix sharepool node id invalid when using
+ sp_alloc
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 7f6d9434fd8a07e1baf93c56da0cafb7dcaa67a7
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I54IL8
+CVE: NA
+backport: openEuler-22.03-LTS
+
+-----------------------------
+
+When passing numa id to sp_alloc, sometimes numa id does not work.
+This is because memory policy will change numa id to a preferred one if
+memory policy is set. Fix the error by mbind virtual address to desired
+numa id.
+
+Signed-off-by: Zhang Jian <zhangjian210@huawei.com>
+Signed-off-by: Zhou Guanghui <zhouguanghui1@huawei.com>
+Signed-off-by: Wang Wensheng <wangwensheng4@huawei.com>
+Reviewed-by: Weilong Chen <chenweilong@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/mempolicy.h | 10 ++++++
+ mm/mempolicy.c            | 14 ++++++---
+ mm/share_pool.c           | 66 +++++++++++++++++++++++++--------------
+ 3 files changed, 62 insertions(+), 28 deletions(-)
+
+diff --git a/include/linux/mempolicy.h b/include/linux/mempolicy.h
+index 64ab4398ba90..ba74e7399dc6 100644
+--- a/include/linux/mempolicy.h
++++ b/include/linux/mempolicy.h
+@@ -201,6 +201,9 @@ extern bool vma_migratable(struct vm_area_struct *vma);
+ extern int mpol_misplaced(struct page *, struct vm_area_struct *, unsigned long);
+ extern void mpol_put_task_policy(struct task_struct *);
+ 
++extern long __do_mbind(unsigned long start, unsigned long len,
++		       unsigned short mode, unsigned short mode_flags,
++		       nodemask_t *nmask, unsigned long flags, struct mm_struct *mm);
+ #else
+ 
+ struct mempolicy {};
+@@ -301,6 +304,13 @@ static inline int mpol_misplaced(struct page *page, struct vm_area_struct *vma,
+ 	return -1; /* no node preference */
+ }
+ 
++static inline long __do_mbind(unsigned long start, unsigned long len,
++			unsigned short mode, unsigned short mode_flags,
++			nodemask_t *nmask, unsigned long flags, struct mm_struct *mm)
++{
++	return 0;
++}
++
+ static inline void mpol_put_task_policy(struct task_struct *task)
+ {
+ }
+diff --git a/mm/mempolicy.c b/mm/mempolicy.c
+index 5ce39dbc84e1..d2326f9a38a8 100644
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@ -1308,11 +1308,10 @@ static struct page *new_page(struct page *page, unsigned long start)
+ }
+ #endif
+ 
+-static long do_mbind(unsigned long start, unsigned long len,
+-		     unsigned short mode, unsigned short mode_flags,
+-		     nodemask_t *nmask, unsigned long flags)
++long __do_mbind(unsigned long start, unsigned long len,
++		       unsigned short mode, unsigned short mode_flags,
++		       nodemask_t *nmask, unsigned long flags, struct mm_struct *mm)
+ {
+-	struct mm_struct *mm = current->mm;
+ 	struct mempolicy *new;
+ 	unsigned long end;
+ 	int err;
+@@ -1411,6 +1410,13 @@ static long do_mbind(unsigned long start, unsigned long len,
+ 	return err;
+ }
+ 
++static long do_mbind(unsigned long start, unsigned long len,
++		     unsigned short mode, unsigned short mode_flags,
++		     nodemask_t *nmask, unsigned long flags)
++{
++	return __do_mbind(start, len, mode, mode_flags, nmask, flags, current->mm);
++}
++
+ /*
+  * User space interface with variable sized bitmaps for nodelists.
+  */
+diff --git a/mm/share_pool.c b/mm/share_pool.c
+index 85d175def6ae..76088952d0a5 100644
+--- a/mm/share_pool.c
++++ b/mm/share_pool.c
+@@ -16,7 +16,6 @@
+  * it under the terms of the GNU General Public License version 2 as
+  * published by the Free Software Foundation.
+  */
+-
+ #define pr_fmt(fmt) "share pool: " fmt
+ 
+ #include <linux/share_pool.h>
+@@ -2157,6 +2156,7 @@ struct sp_alloc_context {
+ 	bool need_fallocate;
+ 	struct timespec64 start;
+ 	struct timespec64 end;
++	bool have_mbind;
+ };
+ 
+ static void trace_sp_alloc_begin(struct sp_alloc_context *ac)
+@@ -2298,6 +2298,7 @@ static int sp_alloc_prepare(unsigned long size, unsigned long sp_flags,
+ 	ac->sp_flags = sp_flags;
+ 	ac->state = ALLOC_NORMAL;
+ 	ac->need_fallocate = false;
++	ac->have_mbind = false;
+ 	return 0;
+ }
+ 
+@@ -2391,7 +2392,7 @@ static void sp_alloc_fallback(struct sp_area *spa, struct sp_alloc_context *ac)
+ }
+ 
+ static int sp_alloc_populate(struct mm_struct *mm, struct sp_area *spa,
+-	struct sp_group_node *spg_node, struct sp_alloc_context *ac)
++			     struct sp_alloc_context *ac)
+ {
+ 	int ret = 0;
+ 	unsigned long sp_addr = spa->va_start;
+@@ -2423,25 +2424,20 @@ static int sp_alloc_populate(struct mm_struct *mm, struct sp_area *spa,
+ 		if (ret)
+ 			sp_add_work_compact();
+ 	}
+-	if (ret) {
+-		if (spa->spg != spg_none)
+-			sp_alloc_unmap(list_next_entry(spg_node, proc_node)->master->mm, spa, spg_node);
+-		else
+-			sp_munmap(mm, spa->va_start, spa->real_size);
+-
+-		if (unlikely(fatal_signal_pending(current)))
+-			pr_warn_ratelimited("allocation failed, current thread is killed\n");
+-		else
+-			pr_warn_ratelimited("allocation failed due to mm populate failed(potential no enough memory when -12): %d\n",
+-					    ret);
+-		sp_fallocate(spa);  /* need this, otherwise memleak */
+-		sp_alloc_fallback(spa, ac);
+-	} else {
+-		ac->need_fallocate = true;
+-	}
+ 	return ret;
+ }
+ 
++static long sp_mbind(struct mm_struct *mm, unsigned long start, unsigned long len,
++		unsigned long node)
++{
++	nodemask_t nmask;
++
++	nodes_clear(nmask);
++	node_set(node, nmask);
++	return __do_mbind(start, len, MPOL_BIND, MPOL_F_STATIC_NODES,
++			&nmask, MPOL_MF_STRICT, mm);
++}
++
+ static int __sp_alloc_mmap_populate(struct mm_struct *mm, struct sp_area *spa,
+ 	struct sp_group_node *spg_node, struct sp_alloc_context *ac)
+ {
+@@ -2457,7 +2453,34 @@ static int __sp_alloc_mmap_populate(struct mm_struct *mm, struct sp_area *spa,
+ 		return ret;
+ 	}
+ 
+-	ret = sp_alloc_populate(mm, spa, spg_node, ac);
++	if (!ac->have_mbind) {
++		ret = sp_mbind(mm, spa->va_start, spa->real_size, spa->node_id);
++		if (ret < 0) {
++			pr_err("cannot bind the memory range to specified node:%d, err:%d\n",
++				spa->node_id, ret);
++			goto err;
++		}
++		ac->have_mbind = true;
++	}
++
++	ret = sp_alloc_populate(mm, spa, ac);
++	if (ret) {
++err:
++		if (spa->spg != spg_none)
++			sp_alloc_unmap(list_next_entry(spg_node, proc_node)->master->mm, spa, spg_node);
++		else
++			sp_munmap(mm, spa->va_start, spa->real_size);
++
++		if (unlikely(fatal_signal_pending(current)))
++			pr_warn_ratelimited("allocation failed, current thread is killed\n");
++		else
++			pr_warn_ratelimited("allocation failed due to mm populate failed(potential no enough memory when -12): %d\n",
++					    ret);
++		sp_fallocate(spa);  /* need this, otherwise memleak */
++		sp_alloc_fallback(spa, ac);
++	} else
++		ac->need_fallocate = true;
++
+ 	return ret;
+ }
+ 
+@@ -2479,11 +2502,6 @@ static int sp_alloc_mmap_populate(struct sp_area *spa,
+ 			if (mmap_ret) {
+ 				if (ac->state != ALLOC_COREDUMP)
+ 					return mmap_ret;
+-				if (ac->spg == spg_none) {
+-					sp_alloc_unmap(mm, spa, spg_node);
+-					pr_err("dvpp allocation failed due to coredump");
+-					return mmap_ret;
+-				}
+ 				ac->state = ALLOC_NORMAL;
+ 				continue;
+ 			}
+-- 
+2.34.1
+

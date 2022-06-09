@@ -1,0 +1,305 @@
+From c3b6218abf1b4ae9e4af4758c4bbab877e682b2e Mon Sep 17 00:00:00 2001
+From: Xu Chenjiao <xuchenjiao@wxiat.com>
+Date: Tue, 7 Jun 2022 17:42:54 +0800
+Subject: [PATCH] sw64: pcie: enable PME and AER support
+Patch-mainline: NO, OTHERS
+References: openEuler-22.03-LTS
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56XUF
+
+--------------------------------
+
+Refactor PME and AER relative codes to use builtin kernel module, one
+can enable this feature support via selecting CONFIG_PCIEPORTBUS=y,
+CONFIG_PCIE_PME=y and CONFIG_PCIEAER=y. Since PME and AER events route
+to CPU by MSI mechanism has been hardcoded and lack of flexibility,
+we use PCI INTx mechanism to handle these events.
+
+Signed-off-by: Xu Chenjiao <xuchenjiao@wxiat.com>
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Acked-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/Kconfig                |  1 +
+ arch/sw_64/chip/chip3/chip.c      | 96 +++++++------------------------
+ arch/sw_64/include/asm/chip3_io.h |  3 +
+ arch/sw_64/include/asm/pci.h      |  1 +
+ arch/sw_64/kernel/pci.c           | 18 +++++-
+ arch/sw_64/kernel/suspend.c       | 10 +---
+ 6 files changed, 45 insertions(+), 84 deletions(-)
+
+diff --git a/arch/sw_64/Kconfig b/arch/sw_64/Kconfig
+index 45e411d7ca69..472a916fd93e 100644
+--- a/arch/sw_64/Kconfig
++++ b/arch/sw_64/Kconfig
+@@ -95,6 +95,7 @@ config SW64
+ 	select DMA_OPS if PCI
+ 	select HAVE_REGS_AND_STACK_ACCESS_API
+ 	select ARCH_HAS_PTE_SPECIAL
++	select HARDIRQS_SW_RESEND
+ 
+ config LOCKDEP_SUPPORT
+ 	def_bool y
+diff --git a/arch/sw_64/chip/chip3/chip.c b/arch/sw_64/chip/chip3/chip.c
+index 2d8f3c81e1c6..4d2f99cc6402 100644
+--- a/arch/sw_64/chip/chip3/chip.c
++++ b/arch/sw_64/chip/chip3/chip.c
+@@ -412,14 +412,17 @@ static int chip3_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
+ {
+ 	struct pci_controller *hose = dev->sysdata;
+ 
+-	return hose->int_irq;
++	if (pci_pcie_type(dev) == PCI_EXP_TYPE_ROOT_PORT)
++		return hose->service_irq;
++	else
++		return hose->int_irq;
+ }
+ 
+ extern struct pci_controller *hose_head, **hose_tail;
+ static void sw6_handle_intx(unsigned int offset)
+ {
+ 	struct pci_controller *hose;
+-	unsigned long value;
++	unsigned long value, pme_value, aer_value;
+ 
+ 	hose = hose_head;
+ 	for (hose = hose_head; hose; hose = hose->next) {
+@@ -431,6 +434,18 @@ static void sw6_handle_intx(unsigned int offset)
+ 			value = value | (1UL << 62);
+ 			write_piu_ior0(hose->node, hose->index, INTACONFIG + (offset << 7), value);
+ 		}
++
++		pme_value = read_piu_ior0(hose->node, hose->index, PMEINTCONFIG);
++		aer_value = read_piu_ior0(hose->node, hose->index, AERERRINTCONFIG);
++		if ((pme_value >> 63) || (aer_value >> 63)) {
++			handle_irq(hose->service_irq);
++
++			if (pme_value >> 63)
++				write_piu_ior0(hose->node, hose->index, PMEINTCONFIG, pme_value);
++			if (aer_value >> 63)
++				write_piu_ior0(hose->node, hose->index, AERERRINTCONFIG, aer_value);
++		}
++
+ 		if (hose->iommu_enable) {
+ 			value = read_piu_ior0(hose->node, hose->index, IOMMUEXCPT_STATUS);
+ 			if (value >> 63)
+@@ -454,76 +469,6 @@ static void chip3_device_interrupt(unsigned long irq_info)
+ 	}
+ }
+ 
+-static void set_devint_wken(int node, int val)
+-{
+-	sw64_io_write(node, DEVINT_WKEN, val);
+-	sw64_io_write(node, DEVINTWK_INTEN, 0x0);
+-}
+-
+-static void clear_rc_status(int node, int rc)
+-{
+-	unsigned int val, status;
+-
+-	val = 0x10000;
+-	do {
+-		write_rc_conf(node, rc, RC_STATUS, val);
+-		mb();
+-		status = read_rc_conf(node, rc, RC_STATUS);
+-	} while (status >> 16);
+-}
+-
+-static void chip3_suspend(int wake)
+-{
+-	unsigned long val;
+-	unsigned int val_32;
+-	unsigned long rc_start;
+-	int node, rc, index, cpus;
+-
+-	cpus = chip3_get_cpu_nums();
+-	for (node = 0; node < cpus; node++) {
+-		rc = -1;
+-		rc_start = sw64_io_read(node, IO_START);
+-		index = ffs(rc_start);
+-		while (index) {
+-			rc += index;
+-			if (wake) {
+-				val_32 = read_rc_conf(node, rc, RC_CONTROL);
+-				val_32 &= ~0x8;
+-				write_rc_conf(node, rc, RC_CONTROL, val_32);
+-
+-				set_devint_wken(node, 0x0);
+-				val = 0x8000000000000000UL;
+-				write_piu_ior0(node, rc, PMEINTCONFIG, val);
+-				write_piu_ior0(node, rc, PMEMSICONFIG, val);
+-
+-				clear_rc_status(node, rc);
+-			} else {
+-				val_32 = read_rc_conf(node, rc, RC_CONTROL);
+-				val_32 |= 0x8;
+-				write_rc_conf(node, rc, RC_CONTROL, val_32);
+-
+-				clear_rc_status(node, rc);
+-				set_devint_wken(node, 0x1f0);
+-#ifdef CONFIG_PCI_MSI    //USE MSI
+-				val_32 = read_rc_conf(node, rc, RC_COMMAND);
+-				val_32 |= 0x400;
+-				write_rc_conf(node, rc, RC_COMMAND, val_32);
+-				val_32 = read_rc_conf(node, rc, RC_MSI_CONTROL);
+-				val_32 |= 0x10000;
+-				write_rc_conf(node, rc, RC_MSI_CONTROL, val_32);
+-				val = 0x4000000000000000UL;
+-				write_piu_ior0(node, rc, PMEMSICONFIG, val);
+-#else //USE INT
+-				val = 0x4000000000000400UL;
+-				write_piu_ior0(node, rc, PMEINTCONFIG, val);
+-#endif
+-			}
+-			rc_start = rc_start >> index;
+-			index = ffs(rc_start);
+-		}
+-	}
+-}
+-
+ static void chip3_hose_init(struct pci_controller *hose)
+ {
+ 	unsigned long pci_io_base;
+@@ -605,7 +550,6 @@ static struct sw64_chip_init_ops chip3_chip_init_ops = {
+ 
+ static struct sw64_chip_ops chip3_chip_ops = {
+ 	.get_cpu_num = chip3_get_cpu_nums,
+-	.suspend = chip3_suspend,
+ 	.fixup = chip3_ops_fixup,
+ };
+ 
+@@ -784,14 +728,16 @@ static void chip3_pci_fixup_root_complex(struct pci_dev *dev)
+ 		}
+ 
+ 		dev->class &= 0xff;
+-		dev->class |= PCI_CLASS_BRIDGE_HOST << 8;
++		dev->class |= PCI_CLASS_BRIDGE_PCI << 8;
+ 		for (i = 0; i < PCI_NUM_RESOURCES; i++) {
+ 			dev->resource[i].start = 0;
+ 			dev->resource[i].end   = 0;
+-			dev->resource[i].flags = 0;
++			dev->resource[i].flags = IORESOURCE_PCI_FIXED;
+ 		}
+ 	}
+ 	atomic_inc(&dev->enable_cnt);
++
++	dev->no_msi = 1;
+ }
+ 
+ DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_JN, PCI_DEVICE_ID_CHIP3, chip3_pci_fixup_root_complex);
+diff --git a/arch/sw_64/include/asm/chip3_io.h b/arch/sw_64/include/asm/chip3_io.h
+index 0125b950da7c..14d02c080607 100644
+--- a/arch/sw_64/include/asm/chip3_io.h
++++ b/arch/sw_64/include/asm/chip3_io.h
+@@ -69,6 +69,9 @@
+ #define DLI_PHY_CTL		(0x10UL << 24)
+ #define PCI_VT_LEGACY_IO	(IO_BASE | PCI_BASE | PCI_LEGACY_IO)
+ 
++#define PME_ENABLE_INTD_CORE0	(0x1UL << 62 | 0x1UL << 10)
++#define AER_ENABLE_INTD_CORE0	(0x1UL << 62 | 0x1UL << 10)
++
+ /*-----------------------addr-----------------------*/
+ /* CAB0 REG */
+ enum {
+diff --git a/arch/sw_64/include/asm/pci.h b/arch/sw_64/include/asm/pci.h
+index fc6a4b469f30..ed875e0c3162 100644
+--- a/arch/sw_64/include/asm/pci.h
++++ b/arch/sw_64/include/asm/pci.h
+@@ -41,6 +41,7 @@ struct pci_controller {
+ 	unsigned long node;
+ 	DECLARE_BITMAP(piu_msiconfig, 256);
+ 	int int_irq;
++	int service_irq;
+ 	/* For compatibility with current (as of July 2003) pciutils
+ 	 * and XFree86. Eventually will be removed.
+ 	 */
+diff --git a/arch/sw_64/kernel/pci.c b/arch/sw_64/kernel/pci.c
+index 81393484ed51..44264e3da18f 100644
+--- a/arch/sw_64/kernel/pci.c
++++ b/arch/sw_64/kernel/pci.c
+@@ -605,6 +605,16 @@ sw64_init_host(unsigned long node, unsigned long index)
+ 	}
+ }
+ 
++static void set_devint_wken(int node)
++{
++	unsigned long val;
++
++	/* enable INTD wakeup */
++	val = 0x80;
++	sw64_io_write(node, DEVINT_WKEN, val);
++	sw64_io_write(node, DEVINTWK_INTEN, val);
++}
++
+ void __init sw64_init_arch(void)
+ {
+ 	if (IS_ENABLED(CONFIG_PCI)) {
+@@ -617,6 +627,7 @@ void __init sw64_init_arch(void)
+ 		cpu_num = sw64_chip->get_cpu_num();
+ 
+ 		for (node = 0; node < cpu_num; node++) {
++			set_devint_wken(node);
+ 			rc_enable = sw64_chip_init->pci_init.get_rc_enable(node);
+ 			if (rc_enable == 0) {
+ 				printk("PCIe is disabled on node %ld\n", node);
+@@ -658,11 +669,13 @@ static void __init sw64_init_intx(struct pci_controller *hose)
+ 		val_node = next_node_in(node, node_online_map);
+ 	else
+ 		val_node = node;
+-	irq = irq_alloc_descs_from(NR_IRQS_LEGACY, 1, val_node);
++	irq = irq_alloc_descs_from(NR_IRQS_LEGACY, 2, val_node);
+ 	WARN_ON(irq < 0);
+ 	irq_set_chip_and_handler(irq, &dummy_irq_chip, handle_level_irq);
+ 	irq_set_status_flags(irq, IRQ_LEVEL);
+ 	hose->int_irq = irq;
++	irq_set_chip_and_handler(irq + 1, &dummy_irq_chip, handle_level_irq);
++	hose->service_irq = irq + 1;
+ 	rcid = cpu_to_rcid(0);
+ 
+ 	printk_once(KERN_INFO "INTx are directed to node %d core %d.\n",
+@@ -670,6 +683,9 @@ static void __init sw64_init_intx(struct pci_controller *hose)
+ 	int_conf = 1UL << 62 | rcid; /* rebase all intx on the first logical cpu */
+ 	if (sw64_chip_init->pci_init.set_intx)
+ 		sw64_chip_init->pci_init.set_intx(node, index, int_conf);
++
++	write_piu_ior0(node, index, PMEINTCONFIG, PME_ENABLE_INTD_CORE0);
++	write_piu_ior0(node, index, AERERRINTCONFIG, AER_ENABLE_INTD_CORE0);
+ }
+ 
+ void __init sw64_init_irq(void)
+diff --git a/arch/sw_64/kernel/suspend.c b/arch/sw_64/kernel/suspend.c
+index c5de4df9d084..369bc1e19b85 100644
+--- a/arch/sw_64/kernel/suspend.c
++++ b/arch/sw_64/kernel/suspend.c
+@@ -33,20 +33,14 @@ void sw64_suspend_enter(void)
+ 	 */
+ 
+ 	disable_local_timer();
+-#ifdef CONFIG_PCI
+-	if (sw64_chip->suspend)
+-		sw64_chip->suspend(0);
+-#endif
++
+ #ifdef CONFIG_SW64_SUSPEND_DEEPSLEEP_BOOTCORE
+ 	sw64_suspend_deep_sleep(&suspend_state);
+ #else
+ 	mtinten();
+ 	asm("halt");
+ #endif
+-#ifdef CONFIG_PCI
+-	if (sw64_chip->suspend)
+-		sw64_chip->suspend(1);
+-#endif
++
+ 	disable_local_timer();
+ }
+ 
+-- 
+2.34.1
+

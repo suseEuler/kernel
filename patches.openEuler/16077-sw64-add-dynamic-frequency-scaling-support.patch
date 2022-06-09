@@ -1,0 +1,811 @@
+From d7058c4e9d7cea141d5d67742ca3b8138c7a8112 Mon Sep 17 00:00:00 2001
+From: Tang Jinyang <tangjinyang@wxiat.com>
+Date: Tue, 7 Jun 2022 17:42:37 +0800
+Subject: [PATCH] sw64: add dynamic frequency scaling support
+Patch-mainline: NO, OTHERS
+References: openEuler-22.03-LTS
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56QDM
+
+--------------------------------
+
+Dynamic voltage and frequency scaling (DVFS) is a well-known technique
+to reduce power/or energy consumption of various applications. But in
+the past, cpu frequency scaling has to be done manually on sw64. Now we
+add dynamic frequency scaling support, which allows system to scale
+frequency dynamically according to workload.
+
+Signed-off-by: Tang Jinyang <tangjinyang@wxiat.com>
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Acked-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/Kconfig               | 239 +++++++++++++++++++++++++++++++
+ arch/sw_64/include/asm/clock.h   |  51 +++++++
+ arch/sw_64/include/asm/hw_init.h |   1 +
+ arch/sw_64/kernel/Makefile       |   3 +-
+ arch/sw_64/kernel/clock.c        | 176 +++++++++++++++++++++++
+ arch/sw_64/kernel/platform.c     |  20 +++
+ arch/sw_64/kernel/timer.c        |   8 ++
+ drivers/cpufreq/Makefile         |   1 +
+ drivers/cpufreq/sw64_cpufreq.c   | 184 ++++++++++++++++++++++++
+ 9 files changed, 682 insertions(+), 1 deletion(-)
+ create mode 100644 arch/sw_64/include/asm/clock.h
+ create mode 100644 arch/sw_64/kernel/clock.c
+ create mode 100644 arch/sw_64/kernel/platform.c
+ create mode 100644 drivers/cpufreq/sw64_cpufreq.c
+
+diff --git a/arch/sw_64/Kconfig b/arch/sw_64/Kconfig
+index eebe6c940660..88ffc98c779e 100644
+--- a/arch/sw_64/Kconfig
++++ b/arch/sw_64/Kconfig
+@@ -243,6 +243,245 @@ config LOCK_MEMB
+ 	bool "Insert mem barrier before lock instruction"
+ 	default y
+ 
++menu "CPU Frequency scaling"
++
++config CPU_FREQ
++	bool "CPU Frequency scaling"
++	select SRCU
++	help
++	  CPU Frequency scaling allows you to change the clock speed of
++	  CPUs on the fly. This is a nice method to save power, because
++	  the lower the CPU clock speed, the less power the CPU consumes.
++
++	  Note that this driver doesn't automatically change the CPU
++	  clock speed, you need to either enable a dynamic cpufreq governor
++	  (see below) after boot, or use a userspace tool.
++
++	  For details, take a look at <file:Documentation/cpu-freq>.
++
++	  If in doubt, say N.
++
++if CPU_FREQ
++
++config SW64_CPUFREQ
++        bool "sw64 CPU Frequency interface for Chip3 Asic"
++	depends on SW64_CHIP3
++	default y
++        help
++          Turns on the interface for SW64_CPU Frequency.
++
++config CPU_FREQ_GOV_ATTR_SET
++	bool
++
++config CPU_FREQ_GOV_COMMON
++	select CPU_FREQ_GOV_ATTR_SET
++	select IRQ_WORK
++	bool
++
++config CPU_FREQ_BOOST_SW
++	bool
++	depends on THERMAL
++
++config CPU_FREQ_STAT
++	bool "CPU frequency transition statistics"
++	help
++	  Export CPU frequency statistics information through sysfs.
++
++	  If in doubt, say N.
++
++choice
++	prompt "Default CPUFreq governor"
++	default CPU_FREQ_DEFAULT_GOV_USERSPACE if ARM_SA1100_CPUFREQ || ARM_SA1110_CPUFREQ
++	default CPU_FREQ_DEFAULT_GOV_PERFORMANCE
++	help
++	  This option sets which CPUFreq governor shall be loaded at
++	  startup. If in doubt, select 'performance'.
++
++config CPU_FREQ_DEFAULT_GOV_PERFORMANCE
++	bool "performance"
++	select CPU_FREQ_GOV_PERFORMANCE
++	help
++	  Use the CPUFreq governor 'performance' as default. This sets
++	  the frequency statically to the highest frequency supported by
++	  the CPU.
++
++config CPU_FREQ_DEFAULT_GOV_POWERSAVE
++	bool "powersave"
++	select CPU_FREQ_GOV_POWERSAVE
++	help
++	  Use the CPUFreq governor 'powersave' as default. This sets
++	  the frequency statically to the lowest frequency supported by
++	  the CPU.
++
++config CPU_FREQ_DEFAULT_GOV_USERSPACE
++	bool "userspace"
++	select CPU_FREQ_GOV_USERSPACE
++	help
++	  Use the CPUFreq governor 'userspace' as default. This allows
++	  you to set the CPU frequency manually or when a userspace
++	  program shall be able to set the CPU dynamically without having
++	  to enable the userspace governor manually.
++
++config CPU_FREQ_DEFAULT_GOV_ONDEMAND
++	bool "ondemand"
++	select CPU_FREQ_GOV_ONDEMAND
++	select CPU_FREQ_GOV_PERFORMANCE
++	help
++	  Use the CPUFreq governor 'ondemand' as default. This allows
++	  you to get a full dynamic frequency capable system by simply
++	  loading your cpufreq low-level hardware driver.
++	  Be aware that not all cpufreq drivers support the ondemand
++	  governor. If unsure have a look at the help section of the
++	  driver. Fallback governor will be the performance governor.
++
++config CPU_FREQ_DEFAULT_GOV_CONSERVATIVE
++	bool "conservative"
++	select CPU_FREQ_GOV_CONSERVATIVE
++	select CPU_FREQ_GOV_PERFORMANCE
++	help
++	  Use the CPUFreq governor 'conservative' as default. This allows
++	  you to get a full dynamic frequency capable system by simply
++	  loading your cpufreq low-level hardware driver.
++	  Be aware that not all cpufreq drivers support the conservative
++	  governor. If unsure have a look at the help section of the
++	  driver. Fallback governor will be the performance governor.
++
++config CPU_FREQ_DEFAULT_GOV_SCHEDUTIL
++	bool "schedutil"
++	depends on SMP
++	select CPU_FREQ_GOV_SCHEDUTIL
++	select CPU_FREQ_GOV_PERFORMANCE
++	help
++	  Use the 'schedutil' CPUFreq governor by default. If unsure,
++	  have a look at the help section of that governor. The fallback
++	  governor will be 'performance'.
++
++endchoice
++
++config CPU_FREQ_GOV_PERFORMANCE
++	tristate "'performance' governor"
++	help
++	  This cpufreq governor sets the frequency statically to the
++	  highest available CPU frequency.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called cpufreq_performance.
++
++	  If in doubt, say Y.
++
++config CPU_FREQ_GOV_POWERSAVE
++	tristate "'powersave' governor"
++	help
++	  This cpufreq governor sets the frequency statically to the
++	  lowest available CPU frequency.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called cpufreq_powersave.
++
++	  If in doubt, say Y.
++
++config CPU_FREQ_GOV_USERSPACE
++	tristate "'userspace' governor for userspace frequency scaling"
++	help
++	  Enable this cpufreq governor when you either want to set the
++	  CPU frequency manually or when a userspace program shall
++	  be able to set the CPU dynamically, like on LART
++	  <http://www.lartmaker.nl/>.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called cpufreq_userspace.
++
++	  For details, take a look at <file:Documentation/cpu-freq/>.
++
++	  If in doubt, say Y.
++
++config CPU_FREQ_GOV_ONDEMAND
++	tristate "'ondemand' cpufreq policy governor"
++	select CPU_FREQ_GOV_COMMON
++	help
++	  'ondemand' - This driver adds a dynamic cpufreq policy governor.
++	  The governor does a periodic polling and
++	  changes frequency based on the CPU utilization.
++	  The support for this governor depends on CPU capability to
++	  do fast frequency switching (i.e, very low latency frequency
++	  transitions).
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called cpufreq_ondemand.
++
++	  For details, take a look at linux/Documentation/cpu-freq.
++
++	  If in doubt, say N.
++
++config CPU_FREQ_GOV_CONSERVATIVE
++	tristate "'conservative' cpufreq governor"
++	depends on CPU_FREQ
++	select CPU_FREQ_GOV_COMMON
++	help
++	  'conservative' - this driver is rather similar to the 'ondemand'
++	  governor both in its source code and its purpose, the difference is
++	  its optimisation for better suitability in a battery powered
++	  environment.  The frequency is gracefully increased and decreased
++	  rather than jumping to 100% when speed is required.
++
++	  If you have a desktop machine then you should really be considering
++	  the 'ondemand' governor instead, however if you are using a laptop,
++	  PDA or even an AMD64 based computer (due to the unacceptable
++	  step-by-step latency issues between the minimum and maximum frequency
++	  transitions in the CPU) you will probably want to use this governor.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called cpufreq_conservative.
++
++	  For details, take a look at linux/Documentation/cpu-freq.
++
++	  If in doubt, say N.
++
++config CPU_FREQ_GOV_SCHEDUTIL
++	bool "'schedutil' cpufreq policy governor"
++	depends on CPU_FREQ && SMP
++	select CPU_FREQ_GOV_ATTR_SET
++	select IRQ_WORK
++	help
++	  This governor makes decisions based on the utilization data provided
++	  by the scheduler.  It sets the CPU frequency to be proportional to
++	  the utilization/capacity ratio coming from the scheduler.  If the
++	  utilization is frequency-invariant, the new frequency is also
++	  proportional to the maximum available frequency.  If that is not the
++	  case, it is proportional to the current frequency of the CPU.  The
++	  frequency tipping point is at utilization/capacity equal to 80% in
++	  both cases.
++
++	  If in doubt, say N.
++
++comment "CPU frequency scaling drivers"
++
++config CPUFREQ_DT
++	tristate "Generic DT based cpufreq driver"
++	depends on HAVE_CLK && OF
++	# if CPU_THERMAL is on and THERMAL=m, CPUFREQ_DT cannot be =y:
++	depends on !CPU_THERMAL || THERMAL
++	select CPUFREQ_DT_PLATDEV
++	select PM_OPP
++	help
++	  This adds a generic DT based cpufreq driver for frequency management.
++	  It supports both uniprocessor (UP) and symmetric multiprocessor (SMP)
++	  systems.
++
++	  If in doubt, say N.
++
++config CPUFREQ_DT_PLATDEV
++	bool
++	help
++	  This adds a generic DT based cpufreq platdev driver for frequency
++	  management.  This creates a 'cpufreq-dt' platform device, on the
++	  supported platforms.
++
++	  If in doubt, say N.
++
++endif
++endmenu
++
+ # clear all implied options (don't want default values for those):
+ # Most of these machines have ISA slots; not exactly sure which don't,
+ # and this doesn't activate hordes of code, so do it always.
+diff --git a/arch/sw_64/include/asm/clock.h b/arch/sw_64/include/asm/clock.h
+new file mode 100644
+index 000000000000..437031a65ff1
+--- /dev/null
++++ b/arch/sw_64/include/asm/clock.h
+@@ -0,0 +1,51 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++#ifndef _ASM_SW64_CLOCK_H
++#define _ASM_SW64_CLOCK_H
++
++#include <linux/kref.h>
++#include <linux/list.h>
++#include <linux/seq_file.h>
++#include <linux/clk.h>
++#include <linux/cpufreq.h>
++
++struct clk;
++
++extern struct cpufreq_frequency_table sw64_clockmod_table[];
++
++struct clk_ops {
++	void (*init)(struct clk *clk);
++	void (*enable)(struct clk *clk);
++	void (*disable)(struct clk *clk);
++	void (*recalc)(struct clk *clk);
++	int (*set_rate)(struct clk *clk, unsigned long rate, int algo_id);
++	long (*round_rate)(struct clk *clk, unsigned long rate);
++};
++
++struct clk {
++	struct list_head node;
++	const char *name;
++	int id;
++	struct module *owner;
++
++	struct clk *parent;
++	const struct clk_ops *ops;
++
++	struct kref kref;
++
++	unsigned long rate;
++	unsigned long flags;
++};
++
++#define CLK_ALWAYS_ENABLED	(1 << 0)
++#define CLK_RATE_PROPAGATES	(1 << 1)
++
++int clk_init(void);
++
++int sw64_set_rate(int index, unsigned long rate);
++
++struct clk *sw64_clk_get(struct device *dev, const char *id);
++unsigned long sw64_clk_get_rate(struct clk *clk);
++
++void sw64_update_clockevents(unsigned long cpu, u32 freq);
++#endif				/* _ASM_SW64_CLOCK_H */
+diff --git a/arch/sw_64/include/asm/hw_init.h b/arch/sw_64/include/asm/hw_init.h
+index 594704756e72..f60a58570a92 100644
+--- a/arch/sw_64/include/asm/hw_init.h
++++ b/arch/sw_64/include/asm/hw_init.h
+@@ -168,5 +168,6 @@ DECLARE_STATIC_KEY_FALSE(run_mode_emul_key);
+ #define CACHE_INDEX_BITS_MASK	(0x3fUL << CACHE_INDEX_BITS_SHIFT)
+ #define CACHE_INDEX_BITS(val)	\
+ 	(((val) & CACHE_INDEX_BITS_MASK) >> CACHE_INDEX_BITS_SHIFT)
++#define current_cpu_data cpu_data[smp_processor_id()]
+ 
+ #endif /* HW_INIT_H */
+diff --git a/arch/sw_64/kernel/Makefile b/arch/sw_64/kernel/Makefile
+index 99516d3ca7cf..628e0c1bd44b 100644
+--- a/arch/sw_64/kernel/Makefile
++++ b/arch/sw_64/kernel/Makefile
+@@ -15,7 +15,7 @@ endif
+ 
+ obj-y    := entry.o traps.o process.o sys_sw64.o irq.o \
+ 	    irq_sw64.o signal.o setup.o ptrace.o time.o \
+-	    systbls.o dup_print.o tc.o \
++	    systbls.o dup_print.o tc.o platform.o \
+ 	    insn.o early_init.o topology.o cacheinfo.o \
+ 	    vdso.o vdso/
+ 
+@@ -44,6 +44,7 @@ endif
+ 
+ # Core logic support
+ obj-$(CONFIG_SW64)	+= core.o timer.o
++obj-$(CONFIG_SW64_CPUFREQ) += clock.o
+ 
+ obj-$(CONFIG_CRASH_DUMP)    += crash_dump.o
+ obj-$(CONFIG_KEXEC)		+= machine_kexec.o relocate_kernel.o
+diff --git a/arch/sw_64/kernel/clock.c b/arch/sw_64/kernel/clock.c
+new file mode 100644
+index 000000000000..fd154a0a66e9
+--- /dev/null
++++ b/arch/sw_64/kernel/clock.c
+@@ -0,0 +1,176 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ *  linux/arch/sw/kernel/setup.c
++ *
++ *  Copyright (C) 1995  Linus Torvalds
++ */
++
++#include <linux/clk.h>
++#include <linux/cpufreq.h>
++#include <linux/errno.h>
++#include <linux/export.h>
++#include <linux/delay.h>
++
++#include <asm/sw64io.h>
++#include <asm/hw_init.h>
++#include <asm/debug.h>
++#include <asm/clock.h>
++
++#define CLK_PRT         0x1UL
++#define CORE_CLK0_V     (0x1UL << 1)
++#define CORE_CLK0_R     (0x1UL << 2)
++#define CORE_CLK2_V     (0x1UL << 15)
++#define CORE_CLK2_R     (0x1UL << 16)
++
++#define CLK_LV1_SEL_PRT         0x1UL
++#define CLK_LV1_SEL_MUXA        (0x1UL << 2)
++#define CLK_LV1_SEL_MUXB        (0x1UL << 3)
++
++#define CORE_PLL0_CFG_SHIFT     4
++#define CORE_PLL2_CFG_SHIFT     18
++
++/* Minimum CLK support */
++enum {
++	DC_0, DC_1, DC_2, DC_3, DC_4, DC_5, DC_6, DC_7, DC_8,
++	DC_9, DC_10, DC_11, DC_12, DC_13, DC_14, DC_15, DC_16, DC_RESV
++};
++
++static int cpu_freq[14] = {
++	0,	1200,	1800,	1900,
++	1950,	2000,	2050,	2100,
++	2150,	2200,	2250,	2300,
++	2350,	2400	};
++
++struct cpufreq_frequency_table sw64_clockmod_table[] = {
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{0, DC_1, 0},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{0, DC_2, 0},
++	{-1, DC_RESV, CPUFREQ_ENTRY_INVALID},
++	{0, DC_3, 0},
++	{0, DC_4, 0},
++	{0, DC_5, 0},
++	{0, DC_6, 0},
++	{0, DC_7, 0},
++	{0, DC_8, 0},
++	{0, DC_9, 0},
++	{0, DC_10, 0},
++	{0, DC_11, 0},
++	{0, DC_12, 0},
++	{0, DC_13, 0},
++{-1, DC_RESV, CPUFREQ_TABLE_END},
++};
++EXPORT_SYMBOL_GPL(sw64_clockmod_table);
++
++static struct clk cpu_clk = {
++	.name = "cpu_clk",
++	.flags = CLK_ALWAYS_ENABLED | CLK_RATE_PROPAGATES,
++	.rate = 2400000000,
++};
++
++struct clk *sw64_clk_get(struct device *dev, const char *id)
++{
++	return &cpu_clk;
++}
++EXPORT_SYMBOL(sw64_clk_get);
++
++unsigned long sw64_clk_get_rate(struct clk *clk)
++{
++	if (!clk)
++		return 0;
++
++	return (unsigned long)clk->rate;
++}
++EXPORT_SYMBOL(sw64_clk_get_rate);
++
++int sw64_set_rate(int index, unsigned long rate)
++{
++	unsigned int i, val;
++
++	rate /= 1000000;
++
++	for (i = 0; i < sizeof(cpu_freq)/sizeof(int); i++) {
++		if (rate == cpu_freq[i]) {
++			index = i;
++			break;
++		}
++	}
++
++	if (index < 0)
++		return -EINVAL;
++
++	sw64_io_write(0, CLK_CTL, CORE_CLK2_R | CORE_CLK2_V | CLK_PRT);
++	sw64_io_write(1, CLK_CTL, CORE_CLK2_R | CORE_CLK2_V | CLK_PRT);
++	val = sw64_io_read(0, CLK_CTL);
++
++	sw64_io_write(0, CLK_CTL, val | index << CORE_PLL2_CFG_SHIFT);
++	sw64_io_write(1, CLK_CTL, val | index << CORE_PLL2_CFG_SHIFT);
++
++	udelay(1);
++
++	sw64_io_write(0, CLK_CTL, CORE_CLK2_V | CLK_PRT
++			| index << CORE_PLL2_CFG_SHIFT);
++	sw64_io_write(1, CLK_CTL, CORE_CLK2_V | CLK_PRT
++			| index << CORE_PLL2_CFG_SHIFT);
++	val = sw64_io_read(0, CLK_CTL);
++
++	/* LV1 select PLL1/PLL2 */
++	sw64_io_write(0, CLU_LV1_SEL, CLK_LV1_SEL_MUXA | CLK_LV1_SEL_PRT);
++	sw64_io_write(1, CLU_LV1_SEL, CLK_LV1_SEL_MUXA | CLK_LV1_SEL_PRT);
++
++	/* Set CLK_CTL PLL0 */
++	sw64_io_write(0, CLK_CTL, val | CORE_CLK0_R | CORE_CLK0_V);
++	sw64_io_write(1, CLK_CTL, val | CORE_CLK0_R | CORE_CLK0_V);
++
++	sw64_io_write(0, CLK_CTL, val | CORE_CLK0_R | CORE_CLK0_V
++			| index << CORE_PLL0_CFG_SHIFT);
++	sw64_io_write(1, CLK_CTL, val | CORE_CLK0_R | CORE_CLK0_V
++			| index << CORE_PLL0_CFG_SHIFT);
++
++	udelay(1);
++
++	sw64_io_write(0, CLK_CTL, val | CORE_CLK0_V
++			| index << CORE_PLL0_CFG_SHIFT);
++	sw64_io_write(1, CLK_CTL, val | CORE_CLK0_V
++			| index << CORE_PLL0_CFG_SHIFT);
++
++	/* LV1 select PLL0/PLL1 */
++	sw64_io_write(0, CLU_LV1_SEL, CLK_LV1_SEL_MUXB | CLK_LV1_SEL_PRT);
++	sw64_io_write(1, CLU_LV1_SEL, CLK_LV1_SEL_MUXB | CLK_LV1_SEL_PRT);
++
++	return index;
++}
++EXPORT_SYMBOL_GPL(sw64_set_rate);
+diff --git a/arch/sw_64/kernel/platform.c b/arch/sw_64/kernel/platform.c
+new file mode 100644
+index 000000000000..f4c880acaa40
+--- /dev/null
++++ b/arch/sw_64/kernel/platform.c
+@@ -0,0 +1,20 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ *  linux/arch/sw/kernel/setup.c
++ *
++ *  Copyright (C) 1995  Linus Torvalds
++ */
++
++#include <linux/platform_device.h>
++
++static struct platform_device sw64_cpufreq_device = {
++	.name = "sw64_cpufreq",
++	.id = -1,
++};
++
++static int __init sw64_cpufreq_init(void)
++{
++	return platform_device_register(&sw64_cpufreq_device);
++}
++
++arch_initcall(sw64_cpufreq_init);
+diff --git a/arch/sw_64/kernel/timer.c b/arch/sw_64/kernel/timer.c
+index 60c75096d8c4..268537d5e483 100644
+--- a/arch/sw_64/kernel/timer.c
++++ b/arch/sw_64/kernel/timer.c
+@@ -87,6 +87,14 @@ static int timer_set_oneshot(struct clock_event_device *evt)
+ 	return 0;
+ }
+ 
++void sw64_update_clockevents(unsigned long cpu, u32 freq)
++{
++	struct clock_event_device *swevt = &per_cpu(timer_events, cpu);
++
++	if (cpu == smp_processor_id())
++		clockevents_update_freq(swevt, freq);
++}
++
+ /*
+  * Setup the local timer for this CPU. Copy the initilized values
+  * of the boot CPU and register the clock event in the framework.
+diff --git a/drivers/cpufreq/Makefile b/drivers/cpufreq/Makefile
+index f1b7e3dd6e5d..7c762e105146 100644
+--- a/drivers/cpufreq/Makefile
++++ b/drivers/cpufreq/Makefile
+@@ -109,3 +109,4 @@ obj-$(CONFIG_LOONGSON1_CPUFREQ)		+= loongson1-cpufreq.o
+ obj-$(CONFIG_SH_CPU_FREQ)		+= sh-cpufreq.o
+ obj-$(CONFIG_SPARC_US2E_CPUFREQ)	+= sparc-us2e-cpufreq.o
+ obj-$(CONFIG_SPARC_US3_CPUFREQ)		+= sparc-us3-cpufreq.o
++obj-$(CONFIG_SW64_CPUFREQ)		+= sw64_cpufreq.o
+diff --git a/drivers/cpufreq/sw64_cpufreq.c b/drivers/cpufreq/sw64_cpufreq.c
+new file mode 100644
+index 000000000000..ba180e389c9e
+--- /dev/null
++++ b/drivers/cpufreq/sw64_cpufreq.c
+@@ -0,0 +1,184 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ *  linux/arch/sw/kernel/setup.c
++ *
++ *  Copyright (C) 1995  Linus Torvalds
++ */
++
++/*
++ * Cpufreq driver for the sw64 processors
++ *
++ */
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/cpufreq.h>
++#include <linux/module.h>
++#include <linux/err.h>
++#include <linux/sched.h>	/* set_cpus_allowed() */
++#include <linux/delay.h>
++#include <linux/platform_device.h>
++#include <linux/mod_devicetable.h>
++
++#include <asm/hw_init.h>
++#include <asm/clock.h>
++
++static uint nowait;
++
++static struct clk *cpuclk;
++
++static int sw64_cpu_freq_notifier(struct notifier_block *nb,
++					unsigned long val, void *data);
++
++static struct notifier_block sw64_cpufreq_notifier_block = {
++	.notifier_call = sw64_cpu_freq_notifier
++};
++
++static int sw64_cpu_freq_notifier(struct notifier_block *nb,
++					unsigned long val, void *data)
++{
++	struct cpufreq_freqs *freqs = (struct cpufreq_freqs *)data;
++	unsigned long cpu;
++
++	for_each_online_cpu(cpu) {
++		if (val == CPUFREQ_POSTCHANGE) {
++			sw64_update_clockevents(cpu, freqs->new * 1000);
++			current_cpu_data.loops_per_jiffy = loops_per_jiffy;
++		}
++	}
++
++	return 0;
++}
++
++static unsigned int sw64_cpufreq_get(unsigned int cpu)
++{
++	struct cpufreq_policy *policy = cpufreq_cpu_get_raw(cpu);
++
++	if (!policy || IS_ERR(policy->clk)) {
++		pr_err("%s: No %s associated to cpu: %d\n",
++			__func__, policy ? "clk" : "policy", cpu);
++		return 0;
++	}
++
++	return sw64_clk_get_rate(policy->clk);
++}
++
++/*
++ * Here we notify other drivers of the proposed change and the final change.
++ */
++static int sw64_cpufreq_target(struct cpufreq_policy *policy,
++				     unsigned int index)
++{
++	unsigned long freq;
++
++	freq = (get_cpu_freq() / 1000) * index / 48;
++
++	/* setting the cpu frequency */
++	sw64_set_rate(-1, freq * 1000);
++
++	return 0;
++}
++
++static int sw64_cpufreq_cpu_init(struct cpufreq_policy *policy)
++{
++	unsigned long rate;
++	int i;
++
++	cpuclk = sw64_clk_get(NULL, "cpu_clk");
++	if (IS_ERR(cpuclk)) {
++		pr_err("couldn't get CPU clk\n");
++		return PTR_ERR(cpuclk);
++	}
++
++	rate = get_cpu_freq() / 1000;
++
++	/* clock table init */
++	for (i = 0;
++	     (sw64_clockmod_table[i].frequency != CPUFREQ_TABLE_END);
++	     i++)
++		if (sw64_clockmod_table[i].frequency == 0)
++			sw64_clockmod_table[i].frequency = (rate * i) / 48;
++
++	sw64_set_rate(-1, rate * 1000);
++
++	policy->clk = cpuclk;
++
++	cpufreq_generic_init(policy, &sw64_clockmod_table[0], 0);
++
++	return 0;
++}
++
++static int sw64_cpufreq_verify(struct cpufreq_policy_data *policy)
++{
++	return cpufreq_frequency_table_verify(policy, &sw64_clockmod_table[0]);
++}
++
++static int sw64_cpufreq_exit(struct cpufreq_policy *policy)
++{
++	return 0;
++}
++
++static struct freq_attr *sw64_table_attr[] = {
++	&cpufreq_freq_attr_scaling_available_freqs, NULL,
++};
++
++static struct cpufreq_driver sw64_cpufreq_driver = {
++	.name = "sw64",
++	.init = sw64_cpufreq_cpu_init,
++	.verify = sw64_cpufreq_verify,
++	.target_index = sw64_cpufreq_target,
++	.get = sw64_cpufreq_get,
++	.exit = sw64_cpufreq_exit,
++	.attr = sw64_table_attr,
++};
++
++static const struct platform_device_id platform_device_ids[] = {
++	{
++		.name = "sw64_cpufreq",
++	},
++	{}
++};
++
++MODULE_DEVICE_TABLE(platform, platform_device_ids);
++
++static struct platform_driver platform_driver = {
++	.driver = {
++		.name = "sw64_cpufreq",
++	},
++	.id_table = platform_device_ids,
++};
++
++
++static int __init cpufreq_init(void)
++{
++	int ret;
++
++	/* Register platform stuff */
++	ret = platform_driver_register(&platform_driver);
++	if (ret)
++		return ret;
++
++	pr_info("SW-64 CPU frequency driver\n");
++
++	cpufreq_register_notifier(&sw64_cpufreq_notifier_block,
++				  CPUFREQ_TRANSITION_NOTIFIER);
++
++	return cpufreq_register_driver(&sw64_cpufreq_driver);
++}
++
++static void __exit cpufreq_exit(void)
++{
++	cpufreq_unregister_driver(&sw64_cpufreq_driver);
++	cpufreq_unregister_notifier(&sw64_cpufreq_notifier_block,
++				    CPUFREQ_TRANSITION_NOTIFIER);
++
++	platform_driver_unregister(&platform_driver);
++}
++
++module_init(cpufreq_init);
++module_exit(cpufreq_exit);
++
++module_param(nowait, uint, 0644);
++MODULE_PARM_DESC(nowait, "Disable SW-64 specific wait");
++
++MODULE_DESCRIPTION("cpufreq driver for sw64");
++MODULE_LICENSE("GPL");
+-- 
+2.34.1
+

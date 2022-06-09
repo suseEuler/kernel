@@ -1,0 +1,648 @@
+From 83101aa79f077ea9807c21e0b00646b642264e01 Mon Sep 17 00:00:00 2001
+From: Cui Mingrui <cuimingrui@wxiat.com>
+Date: Tue, 7 Jun 2022 17:41:50 +0800
+Subject: [PATCH] sw64: optimize ip checksum calculation
+Patch-mainline: NO, OTHERS
+References: openEuler-22.03-LTS
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: performance
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56W9F
+
+--------------------------------
+
+Function csum_partial_copy_from_user() copy data from userspace and
+return checksum result. It used to read 8 bytes data from userspace
+every time, calculate checksum and store it to the destination, which
+slowed down the copying process. This patch moves the copying process
+to the beginning. This patch also rewrites do_csum and move some common
+codes to header file to avoid duplication.
+
+Signed-off-by: Cui Mingrui <cuimingrui@wxiat.com>
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Acked-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/include/asm/checksum.h  |  58 +++++-
+ arch/sw_64/lib/checksum.c          | 136 +++++--------
+ arch/sw_64/lib/csum_partial_copy.c | 310 +++++------------------------
+ 3 files changed, 150 insertions(+), 354 deletions(-)
+
+diff --git a/arch/sw_64/include/asm/checksum.h b/arch/sw_64/include/asm/checksum.h
+index 0bb933350dc6..284c1678f51e 100644
+--- a/arch/sw_64/include/asm/checksum.h
++++ b/arch/sw_64/include/asm/checksum.h
+@@ -4,9 +4,33 @@
+ 
+ #include <linux/in6.h>
+ 
++#define extll(x, y, z) \
++	({__asm__ __volatile__("extll %1, %2, %0" : "=r" (z) \
++			       : "r" (x), "r" (y)); })
++
++#define exthl(x, y, z) \
++	({__asm__ __volatile__("exthl %1, %2, %0" : "=r" (z) \
++			       : "r" (x), "r" (y)); })
++
++#define maskll(x, y, z) \
++	({__asm__ __volatile__("maskll %1, %2, %0" : "=r" (z) \
++			       : "r" (x), "r" (y)); })
++
++#define maskhl(x, y, z) \
++	({__asm__ __volatile__("maskhl %1, %2, %0" : "=r" (z) \
++			       : "r" (x), "r" (y)); })
++
++#define insll(x, y, z) \
++	({__asm__ __volatile__("insll %1, %2, %0" : "=r" (z) \
++			       : "r" (x), "r" (y)); })
++
++#define inshl(x, y, z) \
++	({__asm__ __volatile__("inshl %1, %2, %0" : "=r" (z) \
++			       : "r" (x), "r" (y)); })
++
+ /*
+- *	This is a version of ip_compute_csum() optimized for IP headers,
+- *	which always checksum on 4 octet boundaries.
++ * This is a version of ip_compute_csum() optimized for IP headers,
++ * which always checksum on 4 octet boundaries.
+  */
+ extern __sum16 ip_fast_csum(const void *iph, unsigned int ihl);
+ 
+@@ -55,7 +79,7 @@ __wsum csum_partial_copy_nocheck(const void *src, void *dst, int len);
+ extern __sum16 ip_compute_csum(const void *buff, int len);
+ 
+ /*
+- *	Fold a partial checksum without adding pseudo headers
++ * Fold a partial checksum without adding pseudo headers
+  */
+ 
+ static inline __sum16 csum_fold(__wsum csum)
+@@ -71,4 +95,32 @@ static inline __sum16 csum_fold(__wsum csum)
+ extern __sum16 csum_ipv6_magic(const struct in6_addr *saddr,
+ 			       const struct in6_addr *daddr, __u32 len,
+ 			       __u8 proto, __wsum sum);
++
++static inline unsigned short from64to16(unsigned long x)
++{
++	/*
++	 * Using extract instructions is a bit more efficient
++	 * than the original shift/bitmask version.
++	 */
++
++	union {
++		unsigned long	ul;
++		unsigned int	ui[2];
++		unsigned short	us[4];
++	} in_v, tmp_v, out_v;
++
++	in_v.ul = x;
++	tmp_v.ul = (unsigned long)in_v.ui[0] + (unsigned long)in_v.ui[1];
++
++	/*
++	 * Since the bits of tmp_v.sh[3] are going to always be zero,
++	 * we don't have to bother to add that in.
++	 */
++	out_v.ul = (unsigned long)tmp_v.us[0] + (unsigned long)tmp_v.us[1]
++			+ (unsigned long)tmp_v.us[2];
++
++	/* Similarly, out_v.us[2] is always zero for the final add.  */
++	return out_v.us[0] + out_v.us[1];
++}
++
+ #endif
+diff --git a/arch/sw_64/lib/checksum.c b/arch/sw_64/lib/checksum.c
+index 561bbac59f8d..1531b09cad11 100644
+--- a/arch/sw_64/lib/checksum.c
++++ b/arch/sw_64/lib/checksum.c
+@@ -7,31 +7,7 @@
+ #include <linux/module.h>
+ #include <linux/string.h>
+ #include <asm/byteorder.h>
+-
+-static inline unsigned short from64to16(unsigned long x)
+-{
+-	/* Using extract instructions is a bit more efficient
+-	 * than the original shift/bitmask version.
+-	 */
+-
+-	union {
+-		unsigned long	ul;
+-		unsigned int	ui[2];
+-		unsigned short	us[4];
+-	} in_v, tmp_v, out_v;
+-
+-	in_v.ul = x;
+-	tmp_v.ul = (unsigned long) in_v.ui[0] + (unsigned long) in_v.ui[1];
+-
+-	/* Since the bits of tmp_v.sh[3] are going to always be zero,
+-	 *we don't have to bother to add that in.
+-	 */
+-	out_v.ul = (unsigned long) tmp_v.us[0] + (unsigned long) tmp_v.us[1]
+-		+ (unsigned long) tmp_v.us[2];
+-
+-	/* Similarly, out_v.us[2] is always zero for the final add. */
+-	return out_v.us[0] + out_v.us[1];
+-}
++#include <asm/checksum.h>
+ 
+ /*
+  * computes the checksum of the TCP/UDP pseudo-header
+@@ -69,73 +45,61 @@ EXPORT_SYMBOL(csum_tcpudp_nofold);
+ 
+ /*
+  * Do a 64-bit checksum on an arbitrary memory area..
+- *
+- * This isn't a great routine, but it's not _horrible_ either. The
+- * inner loop could be unrolled a bit further, and there are better
+- * ways to do the carry, but this is reasonable.
+  */
+ static inline unsigned long do_csum(const unsigned char *buff, int len)
+ {
+-	int odd, count;
+-	unsigned long result = 0;
+-
+-	if (len <= 0)
+-		goto out;
+-	odd = 1 & (unsigned long) buff;
+-	if (odd) {
+-		result = *buff << 8;
+-		len--;
+-		buff++;
+-	}
+-	count = len >> 1;		/* nr of 16-bit words.. */
+-	if (count) {
+-		if (2 & (unsigned long) buff) {
+-			result += *(unsigned short *) buff;
+-			count--;
+-			len -= 2;
+-			buff += 2;
+-		}
+-		count >>= 1;		/* nr of 32-bit words.. */
+-		if (count) {
+-			if (4 & (unsigned long) buff) {
+-				result += *(unsigned int *) buff;
+-				count--;
+-				len -= 4;
+-				buff += 4;
+-			}
+-			count >>= 1;	/* nr of 64-bit words.. */
+-			if (count) {
+-				unsigned long carry = 0;
+-
+-				do {
+-					unsigned long w = *(unsigned long *) buff;
+-
+-					count--;
+-					buff += 8;
+-					result += carry;
+-					result += w;
+-					carry = (w > result);
+-				} while (count);
+-				result += carry;
+-				result = (result & 0xffffffff) + (result >> 32);
+-			}
+-			if (len & 4) {
+-				result += *(unsigned int *) buff;
+-				buff += 4;
+-			}
++	const unsigned long *dst = (unsigned long *)buff;
++	unsigned long doff = 7 & (unsigned long) dst;
++	unsigned long checksum = 0;
++	unsigned long word, patch;
++	unsigned long partial_dest, second_dest;
++
++	len -= 8;
++
++	if (!doff) {
++		while (len > 0) {
++			word = *dst;
++			checksum += word;
++			checksum += (checksum < word);
++			dst++;
++			len -= 8;
+ 		}
+-		if (len & 2) {
+-			result += *(unsigned short *) buff;
+-			buff += 2;
++
++		len += 8;
++		word = *dst;
++
++		if (len != 8)
++			maskll(word, len, word);
++
++		checksum += word;
++		checksum += (checksum < word);
++	} else {
++		dst = (unsigned long *)((unsigned long)dst & (~7UL));
++		word = *dst;
++		inshl(word, doff, partial_dest);
++		dst++;
++
++		while (len >= 0) {
++			word = *dst;
++			insll(word, doff, second_dest);
++			patch = partial_dest | second_dest;
++			checksum += patch;
++			checksum += (checksum < patch);
++			inshl(word, doff, partial_dest);
++			dst++;
++			len -= 8;
+ 		}
++
++		len += 8;
++		word = *dst;
++		insll(word, doff, second_dest);
++		patch = partial_dest | second_dest;
++		maskll(patch, len, patch);
++		checksum += patch;
++		checksum += (checksum < patch);
+ 	}
+-	if (len & 1)
+-		result += *buff;
+-	result = from64to16(result);
+-	if (odd)
+-		result = ((result >> 8) & 0xff) | ((result & 0xff) << 8);
+-out:
+-	return result;
++
++	return from64to16(checksum);
+ }
+ 
+ /*
+diff --git a/arch/sw_64/lib/csum_partial_copy.c b/arch/sw_64/lib/csum_partial_copy.c
+index 678d9aa78d15..f45d64631281 100644
+--- a/arch/sw_64/lib/csum_partial_copy.c
++++ b/arch/sw_64/lib/csum_partial_copy.c
+@@ -11,6 +11,7 @@
+ #include <linux/types.h>
+ #include <linux/string.h>
+ #include <linux/uaccess.h>
++#include <asm/checksum.h>
+ 
+ 
+ #define ldl_u(x, y) \
+@@ -37,25 +38,6 @@ static inline void sthl_u(unsigned long data, unsigned long *dst)
+ 		*((char *)dst + 8 - doff + i) = *((char *)&data + 8 - doff + i);
+ }
+ 
+-#define extll(x, y, z) \
+-	__asm__ __volatile__("extll %1, %2, %0":"=r" (z):"r" (x), "r" (y))
+-
+-#define exthl(x, y, z) \
+-	__asm__ __volatile__("exthl %1, %2, %0":"=r" (z):"r" (x), "r" (y))
+-
+-#define maskll(x, y, z) \
+-	__asm__ __volatile__("maskll %1, %2, %0":"=r" (z):"r" (x), "r" (y))
+-
+-#define maskhl(x, y, z) \
+-	__asm__ __volatile__("maskhl %1, %2, %0":"=r" (z):"r" (x), "r" (y))
+-
+-#define insll(x, y, z) \
+-	__asm__ __volatile__("insll %1, %2, %0":"=r" (z):"r" (x), "r" (y))
+-
+-#define inshl(x, y, z) \
+-	__asm__ __volatile__("inshl %1, %2, %0":"=r" (z):"r" (x), "r" (y))
+-
+-
+ #define __get_word(insn, x, ptr)			\
+ ({							\
+ 	long __guu_err;					\
+@@ -71,286 +53,84 @@ static inline void sthl_u(unsigned long data, unsigned long *dst)
+ 	__guu_err;					\
+ })
+ 
+-static inline unsigned short from64to16(unsigned long x)
+-{
+-	/* Using extract instructions is a bit more efficient
+-	 * than the original shift/bitmask version.
+-	 */
+-
+-	union {
+-		unsigned long	ul;
+-		unsigned int	ui[2];
+-		unsigned short	us[4];
+-	} in_v, tmp_v, out_v;
+-
+-	in_v.ul = x;
+-	tmp_v.ul = (unsigned long) in_v.ui[0] + (unsigned long) in_v.ui[1];
+-
+-	/* Since the bits of tmp_v.sh[3] are going to always be zero,
+-	 * we don't have to bother to add that in.
+-	 */
+-	out_v.ul = (unsigned long) tmp_v.us[0] + (unsigned long) tmp_v.us[1]
+-			+ (unsigned long) tmp_v.us[2];
+-
+-	/* Similarly, out_v.us[2] is always zero for the final add.  */
+-	return out_v.us[0] + out_v.us[1];
+-}
+-
+-/*
+- * Ok. This isn't fun, but this is the EASY case.
+- */
+-static inline unsigned long
+-csum_partial_cfu_aligned(const unsigned long __user *src, unsigned long *dst,
+-		long len)
+-{
+-	unsigned long checksum = ~0U;
+-	unsigned long carry = 0;
+-
+-	while (len >= 0) {
+-		unsigned long word;
+-
+-		if (__get_word(ldl, word, src))
+-			return 0;
+-		checksum += carry;
+-		src++;
+-		checksum += word;
+-		len -= 8;
+-		carry = checksum < word;
+-		*dst = word;
+-		dst++;
+-	}
+-	len += 8;
+-	checksum += carry;
+-	if (len) {
+-		int i = 0;
+-		unsigned long word;
+-
+-		if (__get_word(ldl, word, src))
+-			return 0;
+-		maskll(word, len, word);
+-		checksum += word;
+-		carry = checksum < word;
+-		for (; i < len; i++)
+-			*((char *)dst + i) = *((char *)&word + i);
+-		checksum += carry;
+-	}
+-	return checksum;
+-}
+-
+-/*
+- * This is even less fun, but this is still reasonably
+- * easy.
+- */
+ static inline unsigned long
+ csum_partial_cfu_dest_aligned(const unsigned long __user *src,
+-		unsigned long *dst, unsigned long soff, long len)
++		unsigned long *dst, long len)
+ {
+-	unsigned long first;
+-	unsigned long word, carry;
+-	unsigned long lastsrc = 7+len+(unsigned long)src;
+-	unsigned long checksum = ~0U;
+-
+-	if (__get_word(ldl_u, first, src))
+-		return 0;
+-	carry = 0;
+-	while (len >= 0) {
+-		unsigned long second;
+-
+-		if (__get_word(ldl_u, second, src+1))
+-			return 0;
+-		extll(first, soff, word);
+-		len -= 8;
+-		src++;
+-		exthl(second, soff, first);
+-		checksum += carry;
+-		word |= first;
+-		first = second;
+-		checksum += word;
+-		*dst = word;
+-		dst++;
+-		carry = checksum < word;
+-	}
+-	len += 8;
+-	checksum += carry;
+-	if (len) {
+-		int i = 0;
+-		unsigned long second;
+-
+-		if (__get_word(ldl_u, second, lastsrc))
+-			return 0;
+-		extll(first, soff, word);
+-		exthl(second, soff, first);
+-		word |= first;
+-		maskll(word, len, word);
+-		checksum += word;
+-		carry = checksum < word;
+-		for (; i < len; i++)
+-			*((char *)dst + i) = *((char *)&word + i);
+-		checksum += carry;
+-	}
+-	return checksum;
+-}
+-
+-/*
+- * This is slightly less fun than the above..
+- */
+-static inline unsigned long
+-csum_partial_cfu_src_aligned(const unsigned long __user *src,
+-		unsigned long *dst, unsigned long doff,
+-		long len, unsigned long partial_dest)
+-{
+-	unsigned long carry = 0;
+ 	unsigned long word;
+-	unsigned long second_dest;
+-	int i;
+ 	unsigned long checksum = ~0U;
++	int err = 0;
+ 
+-	if (len >= 0) {
+-		if (__get_word(ldl, word, src))
+-			return 0;
+-		checksum += carry;
++	err = __copy_from_user(dst, src, len+8);
++	while (len > 0) {
++		word = *dst;
+ 		checksum += word;
+-		carry = checksum < word;
+-		stll_u(word, dst);
+-		len -= 8;
+-		src++;
++		checksum += (checksum < word);
+ 		dst++;
+-
+-		inshl(word, doff, partial_dest);
+-		while (len >= 0) {
+-			if (__get_word(ldl, word, src))
+-				return 0;
+-			len -= 8;
+-			insll(word, doff, second_dest);
+-			checksum += carry;
+-			stl_u(partial_dest | second_dest, dst);
+-			src++;
+-			checksum += word;
+-			inshl(word, doff, partial_dest);
+-			carry = checksum < word;
+-			dst++;
+-		}
+-		sthl_u(word, dst - 1);
++		len -= 8;
+ 	}
+ 	len += 8;
++	word = *dst;
+ 
+-	if (__get_word(ldl, word, src))
+-		return 0;
+-	maskll(word, len, word);
+-	checksum += carry;
++	if (len != 8)
++		maskll(word, len, word);
+ 	checksum += word;
+-	carry = checksum < word;
+-	for (i = 0; i < len; i++)
+-		*((char *)dst + i) = *((char *)&word + i);
++	checksum += (checksum < word);
+ 
+-	checksum += carry;
+ 	return checksum;
+ }
+ 
+-/*
+- * This is so totally un-fun that it's frightening. Don't
+- * look at this too closely, you'll go blind.
+- */
+ static inline unsigned long
+-csum_partial_cfu_unaligned(const unsigned long __user *src,
+-		unsigned long *dst, unsigned long soff, unsigned long doff,
+-		long len, unsigned long partial_dest)
++csum_partial_cfu_dest_unaligned(const unsigned long __user *src,
++		unsigned long *dst, unsigned long doff, long len)
+ {
+-	unsigned long carry = 0;
+-	unsigned long first;
+-	unsigned long second, word;
+-	unsigned long second_dest;
+-	int i;
++	unsigned long word, patch;
++	unsigned long partial_dest, second_dest;
+ 	unsigned long checksum = ~0U;
++	int err = 0;
+ 
+-	if (__get_word(ldl_u, first, src))
+-		return 0;
+-	if (len >= 0) {
+-		extll(first, soff, word);
+-		if (__get_word(ldl_u, second, src+1))
+-			return 0;
+-		exthl(second, soff, first);
+-		word |= first;
+-		checksum += carry;
+-		checksum += word;
+-		carry = checksum < word;
+-		stll_u(word, dst);
+-		sthl_u(word, dst);
+-		len -= 8;
+-		src++;
+-		dst++;
++	err = __copy_from_user(dst, src, len+8);
++
++	dst = (unsigned long *)((unsigned long)dst & (~7UL));
++	word = *dst;
++	inshl(word, doff, partial_dest);
++	dst++;
+ 
+-		if (__get_word(ldl_u, first, src))
+-			return 0;
+-		ldl_u(partial_dest, dst);
+-		maskll(partial_dest, doff, partial_dest);
+-		while (len >= 0) {
+-			if (__get_word(ldl_u, second, src+1))
+-				return 0;
+-			extll(first, soff, word);
+-			checksum += carry;
+-			len -= 8;
+-			exthl(second, soff, first);
+-			src++;
+-			word |= first;
+-			first = second;
+-			insll(word, doff, second_dest);
+-			checksum += word;
+-			stl_u(partial_dest | second_dest, dst);
+-			carry = checksum < word;
+-			inshl(word, doff, partial_dest);
+-			dst++;
+-		}
+-		sthl_u(word, dst - 1);
++	while (len >= 0) {
++		word = *dst;
++		insll(word, doff, second_dest);
++		patch = partial_dest | second_dest;
++		checksum += patch;
++		checksum += (checksum < patch);
++		inshl(word, doff, partial_dest);
++		dst++;
++		len -= 8;
+ 	}
+-	len += 8;
+ 
+-	checksum += carry;
+-	if (__get_word(ldl_u, second, src+1))
+-		return 0;
+-	extll(first, soff, word);
+-	exthl(second, soff, first);
+-	word |= first;
+-	maskll(word, len, word);
+-	checksum += word;
+-	carry = checksum < word;
+-	for (i = 0; i < len; i++)
+-		*((char *)dst + i) = *((char *)&word + i);
++	len += 8;
++	word = *dst;
++	insll(word, doff, second_dest);
++	patch = partial_dest | second_dest;
++	maskll(patch, len, patch);
++	checksum += patch;
++	checksum += (checksum < patch);
+ 
+-	checksum += carry;
+ 	return checksum;
+ }
+ 
+ static __wsum __csum_and_copy(const void __user *src, void *dst, int len)
+ {
+ 	unsigned long checksum;
+-	unsigned long soff = 7 & (unsigned long) src;
+ 	unsigned long doff = 7 & (unsigned long) dst;
+ 
+ 	if (!doff) {
+-		if (!soff)
+-			checksum = csum_partial_cfu_aligned(
+-				(const unsigned long __user *) src,
+-				(unsigned long *) dst, len-8);
+-		else
+-			checksum = csum_partial_cfu_dest_aligned(
+-				(const unsigned long __user *) src,
+-				(unsigned long *) dst,
+-				soff, len-8);
++		checksum = csum_partial_cfu_dest_aligned(
++			(const unsigned long __user *) src,
++			(unsigned long *) dst, len-8);
+ 	} else {
+-		unsigned long partial_dest;
+-
+-		ldl_u(partial_dest, dst);
+-		if (!soff)
+-			checksum = csum_partial_cfu_src_aligned(
+-				(const unsigned long __user *) src,
+-				(unsigned long *) dst,
+-				doff, len-8, partial_dest);
+-		else
+-			checksum = csum_partial_cfu_unaligned(
+-				(const unsigned long __user *) src,
+-				(unsigned long *) dst,
+-				soff, doff, len-8, partial_dest);
++		checksum = csum_partial_cfu_dest_aligned(
++			(const unsigned long __user *) src,
++			(unsigned long *) dst, len-8);
+ 	}
+ 	return (__force __wsum)from64to16(checksum);
+ }
+-- 
+2.34.1
+

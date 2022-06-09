@@ -1,0 +1,76 @@
+From f2b76a0f7a4c77f3f76b38fecd9ceffb4edee448 Mon Sep 17 00:00:00 2001
+From: He Sheng <hesheng@wxiat.com>
+Date: Tue, 7 Jun 2022 17:42:33 +0800
+Subject: [PATCH] sw64: fix setup_rt_frame for non SA_SIGINFO
+Patch-mainline: NO, OTHERS
+References: openEuler-22.03-LTS
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56YJ1
+
+--------------------------------
+
+Original implementation has deprecated sigframe and always use
+rt_sigframe for signal handler. But glibc remain unchanged, where
+handler takes $a2 as sigcontext pointer when SA_SIGINFO is not set
+and compatibility is break. As on sw64, SA_SIGINFO is not only a
+flag to specify sa_sigaction but also a flag to specify rt_sigframe
+and rt_sigreturn. It used to setup old sigframe and specify sigreturn
+for handler if SA_SIGINFO is not set.
+
+To maintain compatibility, this patch set $a1 with exception code and
+and set $a2 with sigcontext pointer in that case, which seems a mix
+of modern rt_sigframe and traditional sigframe.
+
+Actually, it is unnecessary to setup rt_sigframe for non SA_SIGINFO
+handler, because a rt_sigframe is larger than sigframe. Maybe the old
+sigframe will be reverted some day.
+
+Signed-off-by: He Sheng <hesheng@wxiat.com>
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Acked-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/kernel/signal.c | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/arch/sw_64/kernel/signal.c b/arch/sw_64/kernel/signal.c
+index 17cc9850daaa..8b966e1c38aa 100644
+--- a/arch/sw_64/kernel/signal.c
++++ b/arch/sw_64/kernel/signal.c
+@@ -240,7 +240,8 @@ setup_rt_frame(struct ksignal *ksig, sigset_t *set, struct pt_regs *regs)
+ 	if (!access_ok(frame, sizeof(*frame)))
+ 		return -EFAULT;
+ 
+-	err |= copy_siginfo_to_user(&frame->info, &ksig->info);
++	if (ksig->ka.sa.sa_flags & SA_SIGINFO)
++		err |= copy_siginfo_to_user(&frame->info, &ksig->info);
+ 
+ 	/* Create the ucontext.  */
+ 	err |= __put_user(0, &frame->uc.uc_flags);
+@@ -262,8 +263,15 @@ setup_rt_frame(struct ksignal *ksig, sigset_t *set, struct pt_regs *regs)
+ 	regs->r26 = r26;
+ 	regs->r27 = regs->pc = (unsigned long) ksig->ka.sa.sa_handler;
+ 	regs->r16 = ksig->sig;                    /* a0: signal number */
+-	regs->r17 = (unsigned long) &frame->info; /* a1: siginfo pointer */
+-	regs->r18 = (unsigned long) &frame->uc;   /* a2: ucontext pointer */
++	if (ksig->ka.sa.sa_flags & SA_SIGINFO) {
++		/* a1: siginfo pointer, a2: ucontext pointer */
++		regs->r17 = (unsigned long) &frame->info;
++		regs->r18 = (unsigned long) &frame->uc;
++	} else {
++		/* a1: exception code, a2: sigcontext pointer */
++		regs->r17 = 0;
++		regs->r18 = (unsigned long) &frame->uc.uc_mcontext;
++	}
+ 	wrusp((unsigned long) frame);
+ 
+ #if DEBUG_SIG
+-- 
+2.34.1
+

@@ -1,0 +1,628 @@
+From 2690fa6165c3e41a6b9117450f9458cc46fa2034 Mon Sep 17 00:00:00 2001
+From: Mao Minkai <maominkai@wxiat.com>
+Date: Tue, 7 Jun 2022 17:42:57 +0800
+Subject: [PATCH] sw64: optimize simd version of memcpy and memset
+Patch-mainline: NO, OTHERS
+References: openEuler-22.03-LTS
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: performance
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56XPR
+
+--------------------------------
+
+Optimize the use of memb instruction in memset.
+
+Rewrite memcpy and use simd instruction to copy data when src and dest
+are not co-aligned.
+
+When data size is larger than 2KB, use _nc store instruction to improve
+performance.
+
+Signed-off-by: Mao Minkai <maominkai@wxiat.com>
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Acked-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/lib/deep-memcpy.S | 449 ++++++++++++++++++++---------------
+ arch/sw_64/lib/deep-memset.S |  26 +-
+ 2 files changed, 282 insertions(+), 193 deletions(-)
+
+diff --git a/arch/sw_64/lib/deep-memcpy.S b/arch/sw_64/lib/deep-memcpy.S
+index e847ec3d08df..83c726d42778 100644
+--- a/arch/sw_64/lib/deep-memcpy.S
++++ b/arch/sw_64/lib/deep-memcpy.S
+@@ -1,240 +1,309 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
++
+ #include <asm/export.h>
+-	.set noreorder
+-	.set noat
+ 
+-	.align  4
++#define NC_STORE_THRESHOLD	2048
++
++#define SAVE_SIMD_REGS \
++	ldi	$sp, -0x60($sp); \
++	addl	$sp, 0x1f, $23; \
++	bic	$23, 0x1f, $23; \
++	vstd	$f1, 0($23); \
++	vstd	$f2, 0x20($23)
++
++#define RESTORE_SIMD_REGS \
++	addl	$sp, 0x1f, $23; \
++	bic	$23, 0x1f, $23; \
++	vldd	$f1, 0($23); \
++	vldd	$f2, 0x20($23); \
++	ldi	$sp, 0x60($sp)
++
++#define SAVE_SIMD_U_REGS \
++	ldi	$sp, -0x120($sp); \
++	addl	$sp, 0x1f, $23; \
++	bic	$23, 0x1f, $23; \
++	vstd	$f1, 0($23); \
++	vstd	$f2, 0x20($23); \
++	vstd	$f4, 0x40($23); \
++	vstd	$f5, 0x60($23); \
++	vstd	$f10, 0x80($23); \
++	vstd	$f11, 0xa0($23); \
++	vstd	$f20, 0xc0($23); \
++	vstd	$f21, 0xe0($23)
++
++#define RESTORE_SIMD_U_REGS \
++	addl	$sp, 0x1f, $23; \
++	bic	$23, 0x1f, $23; \
++	vldd	$f1, 0($23); \
++	vldd	$f2, 0x20($23); \
++	vldd	$f4, 0x40($23); \
++	vldd	$f5, 0x60($23); \
++	vldd	$f10, 0x80($23); \
++	vldd	$f11, 0xa0($23); \
++	vldd	$f20, 0xc0($23); \
++	vldd	$f21, 0xe0($23); \
++	ldi	$sp, 0x120($sp)
++
++	.set noat
++	.align 4
+ 	.globl memcpy
+ 	.ent memcpy
+-
+ memcpy:
+ 	.frame $30, 0, $26, 0
+ 	.prologue 0
+ 
+-	subl	$sp, 0xa0, $sp
+-	ldi	$4, 0x40($sp)
+-	stl	$4, 0($sp)
+-	bic	$4, 0x1f, $4
+-	vstd	$f4, 0($4)
+-	vstd	$f5, 0x20($4)
+-
+ 	mov	$16, $0
+-	ble	$18, $nomoredata
+-	xor	$16, $17, $1
+-	and	$1, 7, $1
+-
+-	bne	$1, $misaligned
+-
++	ble	$18, $out
+ 	and	$16, 7, $1
+-	beq	$1, $both_0mod8
++	beq	$1, $dest_aligned_8
+ 
+-$head_align:
+-	ldbu	$1, 0($17)
++	.align 4
++$byte_loop_head:
++	ldbu	$2, 0($17)
+ 	subl	$18, 1, $18
+ 	addl	$17, 1, $17
+-	stb	$1, 0($16)
++	stb	$2, 0($16)
+ 	addl	$16, 1, $16
++	ble	$18, $out
+ 	and	$16, 7, $1
+-	ble	$18, $nomoredata
+-	bne	$1, $head_align
++	bne	$1, $byte_loop_head
+ 
+-$both_0mod8:
+-	cmple	$18, 127, $1
+-	bne	$1, $no_unroll
+-	and	$16, 63, $1
+-	beq	$1, $do_unroll
+-
+-$single_head_quad:
+-	ldl	$1, 0($17)
++$dest_aligned_8:
++	and	$17, 7, $4
++	subl	$18, 16, $18
++	blt	$18, $quad_end
++	subl	$18, 64, $18
++	blt	$18, $simd_end
++	and	$16, 31, $1
++	beq	$1, $dest_aligned_32
++	bne	$4, $quad_u_loop_head
++
++	.align 5
++$quad_loop_head:
++	ldl	$2, 0($17)
+ 	subl	$18, 8, $18
+ 	addl	$17, 8, $17
+-
+-	stl	$1, 0($16)
++	stl	$2, 0($16)
+ 	addl	$16, 8, $16
+-	and	$16, 63, $1
+-	bne	$1, $single_head_quad
+-
+-$do_unroll:
+-	addl	$16, 64, $7
+-	cmple	$18, 127, $1
+-	bne	$1, $tail_quads
+-
+-#JJ
+-	and	$17, 31, $1
+-	bne	$1, $unroll_body
+-
+-$unroll_body_simd:
+-	ldwe	$f31,128*5($17)
+-	vldd	$f4, 0($17)
+-	vldd	$f5, 32($17)
+-	vstd_nc	$f4, 0($16)
+-	vstd_nc	$f5, 32($16)
++	and	$16, 31, $1
++	blt	$18, $simd_end
++	beq	$16, $dest_aligned_32
++	br	$31, $quad_loop_head
++
++$dest_aligned_32:
++	and	$17, 31, $5
++	bne	$5, $prep_simd_u_loop
++
++$prep_simd_loop:
++	SAVE_SIMD_REGS
++	ldi	$1, NC_STORE_THRESHOLD($31)
++	cmple	$18, $1, $1
++	bne	$1, $simd_loop
++
++	.align 5
++$simd_loop_nc:
++	fillcs	128 * 5($17)
++	vldd	$f1, 0($17)
++	vldd	$f2, 32($17)
++	subl	$18, 64, $18
++	addl	$17, 64, $17
++	vstd_nc	$f1, 0($16)
++	vstd_nc	$f2, 32($16)
+ 	addl	$16, 64, $16
++	bge	$18, $simd_loop_nc
++	memb			# required for _nc store instructions
++	br	$31, $simd_loop_end
++
++	.align 5
++$simd_loop:
++	fillcs	128 * 5($17)
++	vldd	$f1, 0($17)
++	vldd	$f2, 32($17)
+ 	subl	$18, 64, $18
+ 	addl	$17, 64, $17
+-	cmple	$18, 63, $1
+-	beq	$1, $unroll_body_simd
+-	memb
+-	br	$no_unroll
+-#endJJ
+-
+-$unroll_body:
+-	#wh64 ($7)
+-	#e_fillcs 0($7)
+-
+-	ldl	$6, 0($17)
+-	#e_fillcs 256($17)
+-
+-	ldl	$4, 8($17)
+-	ldl	$5, 16($17)
+-	addl	$7, 64, $7
+-
+-	ldl	$3, 24($17)
+-	addl	$16, 64, $1
+-
++	vstd	$f1, 0($16)
++	vstd	$f2, 32($16)
++	addl	$16, 64, $16
++	bge	$18, $simd_loop
++
++$simd_loop_end:
++	addl	$18, 64, $1
++	cmplt	$1, 32, $1
++	bne	$1, $no_more_simd
++	vldd	$f1, 0($17)
++	subl	$18, 32, $18
+ 	addl	$17, 32, $17
+-	stl_nc	$6, 0($16)
+-
+-	stl_nc	$4, 8($16)
+-	stl_nc	$5, 16($16)
+-	subl	$18, 192, $2
+-
+-	stl_nc	$3, 24($16)
++	vstd	$f1, 0($16)
+ 	addl	$16, 32, $16
+ 
+-	ldl	$6, 0($17)
+-	ldwe	$f31, 4*128($17)
+-	#e_fillcs 288($17)
+-	ldl	$4, 8($17)
+-	#cmovlt	$2, $1, $7
+-	sellt	$2, $1, $7, $7
++$no_more_simd:
++	RESTORE_SIMD_REGS
+ 
+-	ldl	$5, 16($17)
+-	ldl	$3, 24($17)
+-	addl	$16, 32, $16
+-	subl	$18, 64, $18
+-
+-	addl	$17, 32, $17
+-	stl_nc	$6, -32($16)
+-	stl_nc	$4, -24($16)
+-	cmple	$18, 63, $1
+-
+-	stl_nc	$5, -16($16)
+-	stl_nc	$3, -8($16)
+-	beq	$1, $unroll_body
++$simd_end:
++	addl	$18, 64, $18
++	blt	$18, $quad_end
++	bne	$4, $prep_quad_u_loop_tail
+ 
+-	memb
+-
+-$tail_quads:
+-$no_unroll:
+ 	.align 4
+-	subl	$18, 8, $18
+-	blt	$18, $less_than_8
+-
+-$move_a_quad:
+-	ldl	$1, 0($17)
++$quad_loop_tail:
++	ldl	$2, 0($17)
++	ldl	$3, 8($17)
++	subl	$18, 16, $18
++	addl	$17, 16, $17
++	stl	$2, 0($16)
++	stl	$3, 8($16)
++	addl	$16, 16, $16
++	bge	$18, $quad_loop_tail
++
++$quad_end:
++	addl	$18, 16, $18
++	ble	$18, $out
++	cmplt	$18, 8, $1
++	bne	$1, $byte_loop_tail
++	bne	$4, $move_one_quad_u
++
++$move_one_quad:
++	ldl	$2, 0($17)
+ 	subl	$18, 8, $18
+ 	addl	$17, 8, $17
+-
+-	stl	$1, 0($16)
++	stl	$2, 0($16)
+ 	addl	$16, 8, $16
+-	bge	$18, $move_a_quad
++	ble	$18, $out
+ 
+-$less_than_8:
+ 	.align 4
+-	addl	$18, 8, $18
+-	ble	$18, $nomoredata
+-
+-
+-$tail_bytes:
++$byte_loop_tail:
++	ldbu	$2, 0($17)
+ 	subl	$18, 1, $18
+-	ldbu	$1, 0($17)
+ 	addl	$17, 1, $17
+-
+-	stb	$1, 0($16)
++	stb	$2, 0($16)
+ 	addl	$16, 1, $16
+-	bgt	$18, $tail_bytes
+-
+-	ldi	$4, 0x40($sp)
+-	bic	$4, 0x1f, $4
+-	vldd	$f4, 0($4)
+-	vldd	$f5, 0x20($4)
+-	ldl	$4, 0($sp)
+-	addl	$sp, 0xa0, $sp
++	bgt	$18, $byte_loop_tail
+ 
++$out:
+ 	ret	$31, ($26), 1
+ 
+-$misaligned:
+-	mov	$0, $4
+-	and	$0, 7, $1
+-	beq	$1, $dest_0mod8
+-
+-$aligndest:
+-	ble	$18, $nomoredata
+-	ldbu	$1, 0($17)
+-	subl	$18, 1, $18
+-	addl	$17, 1, $17
+ 
+-	stb	$1, 0($4)
+-	addl	$4, 1, $4
+-	and	$4, 7, $1
+-	bne	$1, $aligndest
+ 
+-
+-$dest_0mod8:
++	.align 5
++$quad_u_loop_head:
++	ldl_u	$2, 0($17)
++	ldl_u	$3, 7($17)
+ 	subl	$18, 8, $18
+-	blt	$18, $misalign_tail
+-	ldl_u	$3, 0($17)
+-
+-$mis_quad:
+-	ldl_u	$16, 8($17)
+-	#extql	$3, $17, $3
+-	fillde	256($17)
+-	and	$17, 7, $1
+-	sll	$1, 3, $1
+-	srl	$3, $1, $3
+-
+-	#extqh $16, $17, $1
+-	subl	$1, 64, $1
+-	negl	$1, $1
+-	sll	$16, $1, $1
+-
+-	bis	$3, $1, $1
++	addl	$17, 8, $17
++	extll	$2, $4, $2
++	exthl	$3, $4, $3
++	bis	$2, $3, $2
++	stl	$2, 0($16)
++	addl	$16, 8, $16
++	blt	$18, $simd_end
++	beq	$16, $dest_aligned_32
++	br	$31, $quad_u_loop_head
++
++$prep_simd_u_loop:
++	SAVE_SIMD_U_REGS
++	andnot	$17, 31, $3
++	ldi	$2, 256($31)
++	sll	$5, 3, $1
++	subl	$2, $1, $2
++	sll	$1, 29, $1
++	sll	$2, 29, $2
++	ifmovd	$1, $f1
++	ifmovd	$2, $f2
++	vldd	$f4, 0($3)
++	ldi	$1, NC_STORE_THRESHOLD($31)
++	cmple	$18, $1, $1
++	bne	$1, $simd_u_loop
++
++	.align 5
++$simd_u_loop_nc:
++	vldd	$f5, 32($3)
++	fillcs	128 * 5($3)
++	srlow	$f4, $f1, $f10
++	sllow	$f5, $f2, $f11
++	vlogfc	$f10, $f11, $f31, $f10
++	vldd	$f4, 64($3)
++	srlow	$f5, $f1, $f20
++	sllow	$f4, $f2, $f21
++	vlogfc	$f20, $f21, $f31, $f20
++	vstd_nc	$f10, 0($16)
++	vstd_nc	$f20, 32($16)
++	subl	$18, 64, $18
++	addl	$3, 64, $3
++	addl	$16, 64, $16
++	bge	$18, $simd_u_loop_nc
++	memb			# required for _nc store instructions
++	br	$31, $simd_u_loop_end
++
++	.align 5
++$simd_u_loop:
++	vldd	$f5, 32($3)
++	fillcs	128 * 5($3)
++	srlow	$f4, $f1, $f10
++	sllow	$f5, $f2, $f11
++	vlogfc	$f10, $f11, $f31, $f10
++	vldd	$f4, 64($3)
++	srlow	$f5, $f1, $f20
++	sllow	$f4, $f2, $f21
++	vlogfc	$f20, $f21, $f31, $f20
++	vstd	$f10, 0($16)
++	vstd	$f20, 32($16)
++	subl	$18, 64, $18
++	addl	$3, 64, $3
++	addl	$16, 64, $16
++	bge	$18, $simd_u_loop
++
++$simd_u_loop_end:
++	addl	$18, 64, $1
++	cmplt	$1, 32, $1
++	bne	$1, $no_more_simd_u
++	vldd	$f5, 32($3)
++	srlow	$f4, $f1, $f10
++	sllow	$f5, $f2, $f11
++	vlogfc	$f10, $f11, $f31, $f10
++	vstd	$f10, 0($16)
++	subl	$18, 32, $18
++	addl	$3, 32, $3
++	addl	$16, 32, $16
+ 
++$no_more_simd_u:
++	RESTORE_SIMD_U_REGS
++	bis	$3, $5, $17
++	br	$31, $simd_end
++
++$prep_quad_u_loop_tail:
++	ldl_u	$2, 0($17)
++	.align 5
++$quad_u_loop_tail:
++	ldl_u	$3, 8($17)
++	extll	$2, $4, $22
++	exthl	$3, $4, $23
++	bis	$22, $23, $22
++	stl	$22, 0($16)
++	ldl_u	$2, 16($17)
++	extll	$3, $4, $24
++	exthl	$2, $4, $25
++	bis	$24, $25, $24
++	stl	$24, 8($16)
++	subl	$18, 16, $18
++	addl	$17, 16, $17
++	addl	$16, 16, $16
++	bge	$18, $quad_u_loop_tail
++	br	$31, $quad_end
++
++$move_one_quad_u:
++	ldl_u	$2, 0($17)
++	ldl_u	$3, 8($17)
+ 	subl	$18, 8, $18
+ 	addl	$17, 8, $17
+-	fillde	128($4)
+-	stl	$1, 0($4)
+-	mov	$16, $3
+-
+-	addl	$4, 8, $4
+-	bge	$18, $mis_quad
+-
+-$misalign_tail:
+-	addl	$18, 8, $18
+-	ble	$18, $nomoredata
+-
+-$misalign_byte:
+-	ldbu	$1, 0($17)
+-	subl	$18, 1, $18
+-	addl	$17, 1, $17
+-
+-	stb	$1, 0($4)
+-	addl	$4, 1, $4
+-	bgt	$18, $misalign_byte
+-
+-
+-$nomoredata:
+-	ldi	$4, 0x40($sp)
+-	bic	$4, 0x1f, $4
+-	vldd	$f4, 0($4)
+-	vldd	$f5, 0x20($4)
+-	ldl	$4, 0($sp)
+-	addl	$sp, 0xa0, $sp
+-
+-	ret	$31, ($26), 1
++	extll	$2, $4, $22
++	exthl	$3, $4, $23
++	bis	$22, $23, $22
++	stl	$22, 0($16)
++	addl	$16, 8, $16
++	ble	$18, $out
++	br	$31, $byte_loop_tail
+ 
+ 	.end memcpy
+-	 EXPORT_SYMBOL(memcpy)
++	EXPORT_SYMBOL(memcpy)
+ __memcpy = memcpy
+ .globl __memcpy
+diff --git a/arch/sw_64/lib/deep-memset.S b/arch/sw_64/lib/deep-memset.S
+index ffadc9a52707..ed2171c56d4d 100644
+--- a/arch/sw_64/lib/deep-memset.S
++++ b/arch/sw_64/lib/deep-memset.S
+@@ -27,6 +27,8 @@
+ 
+ #include <asm/export.h>
+ 
++#define NC_STORE_THRESHOLD	2048
++
+ 	.set noat
+ 	.set noreorder
+ 	.text
+@@ -57,6 +59,7 @@ __constant_c_memset:
+ 	bne	$5, $tail_loop
+ 
+ /* loop until SRC is 8 bytes aligned */
++	.align 5
+ $head_loop:
+ 	and	$16, 0x7, $1
+ 	beq	$1, $mod8_aligned
+@@ -69,6 +72,7 @@ $head_loop:
+ $mod8_aligned:
+ 
+ /* set 8 bytes each time */
++	.align 5
+ $mod8_loop:
+ 	and	$16, 0x1f, $1
+ 	beq	$1, $mod32_aligned
+@@ -87,23 +91,39 @@ $mod32_aligned:
+ 	ifmovd	$17, $f10
+ 	vcpyf	$f10, $f10
+ 
++	ldi	$1, NC_STORE_THRESHOLD($31)
++	cmple	$18, $1, $1
++	bne	$1, $mod32_loop
++
+ /* set 64 bytes each time */
+-$mod32_loop:
++	.align 5
++$mod32_loop_nc:
+ 	subl	$18, 64, $18
+ 	blt	$18, $mod32_tail
+ 	vstd_nc	$f10, 0($16)
+ 	vstd_nc	$f10, 32($16)
+ 	addl	$16, 64, $16
++	br	$31, $mod32_loop_nc
++	memb			# required for _nc store instructions
++
++	.align 5
++$mod32_loop:
++	subl	$18, 64, $18
++	blt	$18, $mod32_tail
++	vstd	$f10, 0($16)
++	vstd	$f10, 32($16)
++	addl	$16, 64, $16
+ 	br	$31, $mod32_loop
+ 
+ $mod32_tail:
+ 	vldd	$f10, 0($4)
+ 	addl	$sp, 64, $sp
+ 	addl	$18, 64, $18
++	.align 5
+ $mod32_tail_loop:
+ 	subl	$18, 8, $18
+ 	blt	$18, $tail
+-	stl_nc	$17, 0($16)
++	stl	$17, 0($16)
+ 	addl	$16, 8, $16
+ 	br	$31, $mod32_tail_loop
+ 
+@@ -111,6 +131,7 @@ $tail:
+ 	addl	$18, 8, $18
+ 
+ /* set one byte each time */
++	.align 5
+ $tail_loop:
+ 	beq	$18, $out
+ 	stb	$17, 0($16)
+@@ -120,7 +141,6 @@ $tail_loop:
+ 
+ /* done, return */
+ $out:
+-	memb			# required for _nc store instructions
+ 	ret
+ 
+ 	.end ___memset
+-- 
+2.34.1
+
