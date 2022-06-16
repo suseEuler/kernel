@@ -1,0 +1,90 @@
+From 3446f5189d1d043b30ddb48c73b83482baec7f06 Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Tue, 14 Jun 2022 16:23:12 +0800
+Subject: [PATCH] block: fix NULL pointer dereference in disk_release()
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 3446f5189d1d043b30ddb48c73b83482baec7f06
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I58VDJ
+CVE: NA
+
+--------------------------------
+
+Our test report a crash:
+
+run fstests generic/349 at 2022-05-20 20:55:10
+sd 3:0:0:0: Power-on or device reset occurred
+BUG: kernel NULL pointer dereference, address: 0000000000000030
+Call Trace:
+ disk_release+0x42/0x170
+ device_release+0x92/0x120
+ kobject_put+0x183/0x350
+ put_disk+0x23/0x30
+ sg_device_destroy+0x77/0xd0
+ sg_remove_device+0x1b8/0x220
+ device_del+0x19b/0x610
+ ? kfree_const+0x3e/0x50
+ ? kobject_put+0x1d1/0x350
+ device_unregister+0x36/0xa0
+ __scsi_remove_device+0x1ba/0x240
+ scsi_forget_host+0x95/0xd0
+ scsi_remove_host+0xba/0x1f0
+ sdebug_driver_remove+0x30/0x110 [scsi_debug]
+ device_release_driver_internal+0x1ab/0x340
+ device_release_driver+0x16/0x20
+ bus_remove_device+0x167/0x220
+ device_del+0x23e/0x610
+ device_unregister+0x36/0xa0
+ sdebug_do_remove_host+0x159/0x190 [scsi_debug]
+ scsi_debug_exit+0x2d/0x120 [scsi_debug]
+ __se_sys_delete_module+0x34c/0x420
+ ? exit_to_user_mode_prepare+0x93/0x210
+ __x64_sys_delete_module+0x1a/0x30
+ do_syscall_64+0x4d/0x70
+ entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+Such crash happened since commit 2a19b28f7929 ("blk-mq: cancel blk-mq
+dispatch work in both blk_cleanup_queue and disk_release()") was
+backported from mainline.
+
+commit 61a35cfc2633 ("block: hold a request_queue reference for the
+lifetime of struct gendisk") is not backported, thus we can't ensure
+request_queue still exist in disk_release(), and that's why
+blk_mq_cancel_work_sync() will triggered the problem in disk_release().
+However, in order to backport it, there are too many relied patches and
+kabi will be broken.
+
+Since we didn't backport related patches to tear down file system I/O in
+del_gendisk, which fix issues introduced by refactor patches to move bdi
+from request_queue to the disk, there is no need to call
+blk_mq_cancel_work_sync() from disk_release(). This patch just remove
+blk_mq_cancel_work_sync() from disk_release() to fix the above crash.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ block/genhd.c | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/block/genhd.c b/block/genhd.c
+index 5b6cd992c6a6..f94152e99876 100644
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -1572,7 +1572,6 @@ static void disk_release(struct device *dev)
+ 	might_sleep();
+ 
+ 	blk_free_devt(dev->devt);
+-	blk_mq_cancel_work_sync(disk->queue);
+ 	disk_release_events(disk);
+ 	kfree(disk->random);
+ 	disk_replace_part_tbl(disk, NULL);
+-- 
+2.34.1
+

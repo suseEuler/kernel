@@ -1,0 +1,101 @@
+From 7f99612f395ade56d19d472db8705c186d590214 Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Tue, 14 Jun 2022 16:23:10 +0800
+Subject: [PATCH] blk-mq: fix panic during blk_mq_run_work_fn()
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 7f99612f395ade56d19d472db8705c186d590214
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I58VDJ
+CVE: NA
+
+--------------------------------
+
+Our test report a following crash:
+
+BUG: kernel NULL pointer dereference, address: 0000000000000018
+PGD 0 P4D 0
+Oops: 0000 [#1] SMP NOPTI
+CPU: 6 PID: 265 Comm: kworker/6:1H Kdump: loaded Tainted: G           O      5.10.0-60.17.0.h43.eulerosv2r11.x86_64 #1
+Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.12.1-0-ga5cab58-20220320_160524-szxrtosci10000 04/01/2014
+Workqueue: kblockd blk_mq_run_work_fn
+RIP: 0010:blk_mq_delay_run_hw_queues+0xb6/0xe0
+RSP: 0018:ffffacc6803d3d88 EFLAGS: 00010246
+RAX: 0000000000000006 RBX: ffff99e2c3d25008 RCX: 00000000ffffffff
+RDX: 0000000000000000 RSI: 0000000000000003 RDI: ffff99e2c911ae18
+RBP: ffffacc6803d3dd8 R08: 0000000000000000 R09: ffff99e2c0901f6c
+R10: 0000000000000018 R11: 0000000000000018 R12: ffff99e2c911ae18
+R13: 0000000000000000 R14: 0000000000000003 R15: ffff99e2c911ae18
+FS:  0000000000000000(0000) GS:ffff99e6bbf00000(0000) knlGS:0000000000000000
+CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+CR2: 0000000000000018 CR3: 000000007460a006 CR4: 00000000003706e0
+Call Trace:
+ __blk_mq_do_dispatch_sched+0x2a7/0x2c0
+ ? newidle_balance+0x23e/0x2f0
+ __blk_mq_sched_dispatch_requests+0x13f/0x190
+ blk_mq_sched_dispatch_requests+0x30/0x60
+ __blk_mq_run_hw_queue+0x47/0xd0
+ process_one_work+0x1b0/0x350
+ worker_thread+0x49/0x300
+ ? rescuer_thread+0x3a0/0x3a0
+ kthread+0xfe/0x140
+ ? kthread_park+0x90/0x90
+ ret_from_fork+0x22/0x30
+
+After digging from vmcore, I found that the queue is cleaned
+up(blk_cleanup_queue() is done) and tag set is
+freed(blk_mq_free_tag_set() is done).
+
+There are two problems here:
+
+1) blk_mq_delay_run_hw_queues() will only be called from
+__blk_mq_do_dispatch_sched() if e->type->ops.has_work() return true.
+This seems impossible because blk_cleanup_queue() is done, and there
+should be no io. However, bfq_has_work() can return true even if no
+io is queued. This is because bfq_has_work() is using busy queues, and
+bfq_queue can stay busy after dispatching all the requests.
+
+2) 'hctx->run_work' still exists after blk_cleanup_queue().
+blk_mq_cancel_work_sync() is called from blk_cleanup_queue() to cancel
+all the 'run_work'. However, there is no guarantee that new 'run_work'
+won't be queued after that(and before blk_mq_exit_queue() is done).
+
+The first problem is not the root cause, this patch just fix the second
+problem by grabbing 'q_usage_counter' before queuing 'hctx->run_work'.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ block/blk-mq.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index c654981a6d50..41885145e57b 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -1627,8 +1627,16 @@ static void __blk_mq_delay_run_hw_queue(struct blk_mq_hw_ctx *hctx, bool async,
+ 		put_cpu();
+ 	}
+ 
++	/*
++	 * No need to queue work if there is no io, and this can avoid race
++	 * with blk_cleanup_queue().
++	 */
++	if (!percpu_ref_tryget(&hctx->queue->q_usage_counter))
++		return;
++
+ 	kblockd_mod_delayed_work_on(blk_mq_hctx_next_cpu(hctx), &hctx->run_work,
+ 				    msecs_to_jiffies(msecs));
++	percpu_ref_put(&hctx->queue->q_usage_counter);
+ }
+ 
+ /**
+-- 
+2.34.1
+
