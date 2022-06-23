@@ -1,0 +1,128 @@
+From 758c9c457553f6ecbf3cd8caa6ecd3b02241c318 Mon Sep 17 00:00:00 2001
+From: Zhengchao Shao <shaozhengchao@huawei.com>
+Date: Tue, 21 Jun 2022 17:06:03 +0800
+Subject: [PATCH] net/ns: put workqueue of cleanup_net sleep for a while when
+ notify.
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 758c9c457553f6ecbf3cd8caa6ecd3b02241c318
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 186807 https://gitee.com/openeuler/kernel/issues/I5ATLD
+CVE: NA
+
+--------------------------------
+
+When we clean up namespace, we have to notify every netdevice that
+dev is down. If device that registered too many, the notify time will
+take too many CPU time, It will course CPU soft-lockup issue. The
+reprocedure is followed:
+NIFS=50
+for ((i=0; i<$NIFS; i++))
+do
+        ip netns add dummy-ns$i
+        ip netns exec dummy-ns$i ip link set lo up
+done
+
+for ((j=0; j<$NIFS; j++))
+do
+        for ((i=0; i<1000; i++))
+        do
+                if=eth$j$i
+                ip netns exec dummy-ns$j ip link add $if type dummy
+                ip netns exec dummy-ns$j ip link set $if up
+                done
+done
+
+for ((i=0; i<$NIFS; i++))
+do
+        ip netns del dummy-ns$i
+done
+The test will result in the following stack. So clean up work must
+sleep for a while when notify device down/change.
+
+watchdog: BUG: soft lockup - CPU#0 stuck for 22s! [kworker/u8:5:288]
+Modules linked in:
+CPU: 0 PID: 288 Comm: kworker/u8:5 Tainted: G    B             5.10.0+ #5
+Hardware name: linux,dummy-virt (DT)
+Workqueue: netns cleanup_net
+pstate: 20000005 (nzCv daif -PAN -UAO -TCO BTYPE=--)
+pc : atomic_set include/asm-generic/atomic-instrumented.h:46 [inline]
+pc : __alloc_skb+0x268/0x450 net/core/skbuff.c:241
+lr : atomic_set include/asm-generic/atomic-instrumented.h:46 [inline]
+lr : __alloc_skb+0x268/0x450 net/core/skbuff.c:241
+sp : ffff000015607610
+x29: ffff000015607610 x28: 00000000ffffffff
+x27: 0000000000000001 x26: ffff0000cc9400e0
+x25: ffff0000c745c1be x24: 1fffe00002ac0ed0
+x23: 0000000000000000 x22: ffff0000cc9400c0
+x21: ffff0000c745c234 x20: ffff0000cc940000
+x19: ffff0000c745c140 x18: 0000000000000000
+x17: 0000000000000000 x16: 0000000000000000
+x15: 0000000000000000 x14: 1fffe00002ac0f00
+x13: 0000000000000000 x12: ffff80001992801d
+x11: 1fffe0001992801c x10: ffff80001992801c
+x9 : dfffa00000000000 x8 : ffff0000cc9400e3
+x7 : 0000000000000001 x6 : ffff80001992801c
+x5 : ffff0000cc9400e0 x4 : dfffa00000000000
+x3 : ffffa00011529a78 x2 : 0000000000000003
+x1 : 0000000000000000 x0 : ffff0000cc9400e0
+Call trace:
+ atomic_set include/asm-generic/atomic-instrumented.h:46 [inline]
+ __alloc_skb+0x268/0x450 net/core/skbuff.c:241
+ alloc_skb include/linux/skbuff.h:1107 [inline]
+ nlmsg_new include/net/netlink.h:958 [inline]
+ rtmsg_ifa+0xf4/0x1e0 net/ipv4/devinet.c:1900
+ __inet_del_ifa+0x328/0x650 net/ipv4/devinet.c:427
+ inet_del_ifa net/ipv4/devinet.c:465 [inline]
+ inetdev_destroy net/ipv4/devinet.c:318 [inline]
+ inetdev_event+0x2ac/0xac0 net/ipv4/devinet.c:1599
+ notifier_call_chain kernel/notifier.c:83 [inline]
+ raw_notifier_call_chain+0x94/0xd0 kernel/notifier.c:410
+ call_netdevice_notifiers_info+0x9c/0x14c net/core/dev.c:2047
+ call_netdevice_notifiers_extack net/core/dev.c:2059 [inline]
+ call_netdevice_notifiers net/core/dev.c:2073 [inline]
+ rollback_registered_many+0x3d0/0x7dc net/core/dev.c:9558
+ unregister_netdevice_many+0x40/0x1b0 net/core/dev.c:10779
+ default_device_exit_batch+0x24c/0x2a0 net/core/dev.c:11262
+ ops_exit_list+0xb4/0xd0 net/core/net_namespace.c:192
+ cleanup_net+0x2b8/0x540 net/core/net_namespace.c:608
+ process_one_work+0x3ec/0xa40 kernel/workqueue.c:2279
+ worker_thread+0x110/0x8b0 kernel/workqueue.c:2425
+ kthread+0x1ac/0x1fc kernel/kthread.c:313
+ ret_from_fork+0x10/0x18 arch/arm64/kernel/entry.S:1034
+
+Signed-off-by: Zhengchao Shao <shaozhengchao@huawei.com>
+Reviewed-by: Wei Yongjun <weiyongjun1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ net/core/dev.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 406ed8c7f22d..12089c484b30 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -1648,6 +1648,7 @@ void dev_close_many(struct list_head *head, bool unlink)
+ 		call_netdevice_notifiers(NETDEV_DOWN, dev);
+ 		if (unlink)
+ 			list_del_init(&dev->close_list);
++		cond_resched();
+ 	}
+ }
+ EXPORT_SYMBOL(dev_close_many);
+@@ -9591,6 +9592,7 @@ static void rollback_registered_many(struct list_head *head)
+ 		/* Remove XPS queueing entries */
+ 		netif_reset_xps_queues_gt(dev, 0);
+ #endif
++		cond_resched();
+ 	}
+ 
+ 	synchronize_net();
+-- 
+2.34.1
+

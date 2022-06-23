@@ -1,0 +1,100 @@
+From fe2df3cdcf6fd14976574b2ec98d09b153471d12 Mon Sep 17 00:00:00 2001
+From: ChenXiaoSong <chenxiaosong2@huawei.com>
+Date: Tue, 21 Jun 2022 17:06:21 +0800
+Subject: [PATCH] Revert "nfs: nfs_file_write() should check for writeback
+ errors"
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: fe2df3cdcf6fd14976574b2ec98d09b153471d12
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 186345, https://gitee.com/openeuler/kernel/issues/I4T2WV
+CVE: NA
+
+--------------------------------
+
+This reverts commit ce368536dd614452407dc31e2449eb84681a06af.
+
+filemap_sample_wb_err() will return 0 if nobody has seen the error yet,
+then filemap_check_wb_err() will return the unchanged writeback error,
+async write() will become sync write().
+
+Reproducer:
+        nfs server               |       nfs client
+ --------------------------------|----------------------------------------------
+ # No space left on server       |
+ fallocate -l 100G /server/nospc |
+                                 |
+                                 | mount -t nfs $nfs_server_ip:/ /mnt
+                                 |
+                                 | # Expected error: No space left on device
+                                 | dd if=/dev/zero of=/mnt/file count=1 ibs=1K
+                                 |
+                                 | # Release space on mountpoint
+                                 | rm /mnt/nospc
+                                 |
+                                 | # Very very slow
+                                 | dd if=/dev/zero of=/mnt/file count=1 ibs=1K
+
+Signed-off-by: ChenXiaoSong <chenxiaosong2@huawei.com>
+Reviewed-by: Zhang Xiaoxu <zhangxiaoxu5@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/nfs/file.c | 12 +++---------
+ 1 file changed, 3 insertions(+), 9 deletions(-)
+
+diff --git a/fs/nfs/file.c b/fs/nfs/file.c
+index 4556e75d4591..f96367a2463e 100644
+--- a/fs/nfs/file.c
++++ b/fs/nfs/file.c
+@@ -587,14 +587,12 @@ static const struct vm_operations_struct nfs_file_vm_ops = {
+ 	.page_mkwrite = nfs_vm_page_mkwrite,
+ };
+ 
+-static int nfs_need_check_write(struct file *filp, struct inode *inode,
+-				int error)
++static int nfs_need_check_write(struct file *filp, struct inode *inode)
+ {
+ 	struct nfs_open_context *ctx;
+ 
+ 	ctx = nfs_file_open_context(filp);
+-	if (nfs_error_is_fatal_on_server(error) ||
+-	    nfs_ctx_key_to_expire(ctx, inode))
++	if (nfs_ctx_key_to_expire(ctx, inode))
+ 		return 1;
+ 	return 0;
+ }
+@@ -605,8 +603,6 @@ ssize_t nfs_file_write(struct kiocb *iocb, struct iov_iter *from)
+ 	struct inode *inode = file_inode(file);
+ 	unsigned long written = 0;
+ 	ssize_t result;
+-	errseq_t since;
+-	int error;
+ 
+ 	result = nfs_key_timeout_notify(file, inode);
+ 	if (result)
+@@ -631,7 +627,6 @@ ssize_t nfs_file_write(struct kiocb *iocb, struct iov_iter *from)
+ 	if (iocb->ki_pos > i_size_read(inode))
+ 		nfs_revalidate_mapping(inode, file->f_mapping);
+ 
+-	since = filemap_sample_wb_err(file->f_mapping);
+ 	nfs_start_io_write(inode);
+ 	result = generic_write_checks(iocb, from);
+ 	if (result > 0) {
+@@ -650,8 +645,7 @@ ssize_t nfs_file_write(struct kiocb *iocb, struct iov_iter *from)
+ 		goto out;
+ 
+ 	/* Return error values */
+-	error = filemap_check_wb_err(file->f_mapping, since);
+-	if (nfs_need_check_write(file, inode, error)) {
++	if (nfs_need_check_write(file, inode)) {
+ 		int err = nfs_wb_all(inode);
+ 		if (err < 0)
+ 			result = err;
+-- 
+2.34.1
+
