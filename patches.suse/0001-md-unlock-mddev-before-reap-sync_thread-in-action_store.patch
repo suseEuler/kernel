@@ -1,0 +1,102 @@
+From c049d8aa4cbd53a60b395209db87d05885c7c66a Mon Sep 17 00:00:00 2001
+From: Guoqing Jiang <guoqing.jiang@linux.dev>
+Date: Tue, 21 Jun 2022 11:11:29 +0800
+Subject: [PATCH] md: unlock mddev before reap sync_thread in action_store
+Patch-mainline: Queued in subsystem maintainer repository
+Git-repo: git://git.kernel.org/pub/scm/linux/kernel/git/song/md.git
+Git-commit: c049d8aa4cbd53a60b395209db87d05885c7c66a
+References: bsc#1197659
+Modified-by-SEL: No
+
+Since the bug which commit 8b48ec23cc51a ("md: don't unregister sync_thread
+with reconfig_mutex held") fixed is related with action_store path, other
+callers which reap sync_thread didn't need to be changed.
+
+Let's pull md_unregister_thread from md_reap_sync_thread, then fix previous
+bug with belows.
+
+1. unlock mddev before md_reap_sync_thread in action_store.
+2. save reshape_position before unlock, then restore it to ensure position
+   not changed accidentally by others.
+
+Signed-off-by: Guoqing Jiang <guoqing.jiang@linux.dev>
+Signed-off-by: Song Liu <song@kernel.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/md/dm-raid.c |  1 +
+ drivers/md/md.c      | 19 +++++++++++++++++--
+ 2 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/md/dm-raid.c b/drivers/md/dm-raid.c
+index 9526ccbedafb..d43b8075c055 100644
+--- a/drivers/md/dm-raid.c
++++ b/drivers/md/dm-raid.c
+@@ -3725,6 +3725,7 @@ static int raid_message(struct dm_target *ti, unsigned int argc, char **argv,
+ 	if (!strcasecmp(argv[0], "idle") || !strcasecmp(argv[0], "frozen")) {
+ 		if (mddev->sync_thread) {
+ 			set_bit(MD_RECOVERY_INTR, &mddev->recovery);
++			md_unregister_thread(&mddev->sync_thread);
+ 			md_reap_sync_thread(mddev);
+ 		}
+ 	} else if (decipher_sync_action(mddev, mddev->recovery) != st_idle)
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index ce9d2845d3ac..b64de313838f 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -4830,6 +4830,19 @@ action_store(struct mddev *mddev, const char *page, size_t len)
+ 			if (work_pending(&mddev->del_work))
+ 				flush_workqueue(md_misc_wq);
+ 			if (mddev->sync_thread) {
++				sector_t save_rp = mddev->reshape_position;
++
++				mddev_unlock(mddev);
++				set_bit(MD_RECOVERY_INTR, &mddev->recovery);
++				md_unregister_thread(&mddev->sync_thread);
++				mddev_lock_nointr(mddev);
++				/*
++				 * set RECOVERY_INTR again and restore reshape
++				 * position in case others changed them after
++				 * got lock, eg, reshape_position_store and
++				 * md_check_recovery.
++				 */
++				mddev->reshape_position = save_rp;
+ 				set_bit(MD_RECOVERY_INTR, &mddev->recovery);
+ 				md_reap_sync_thread(mddev);
+ 			}
+@@ -6197,6 +6210,7 @@ static void __md_stop_writes(struct mddev *mddev)
+ 		flush_workqueue(md_misc_wq);
+ 	if (mddev->sync_thread) {
+ 		set_bit(MD_RECOVERY_INTR, &mddev->recovery);
++		md_unregister_thread(&mddev->sync_thread);
+ 		md_reap_sync_thread(mddev);
+ 	}
+ 
+@@ -9309,6 +9323,7 @@ void md_check_recovery(struct mddev *mddev)
+ 			 * ->spare_active and clear saved_raid_disk
+ 			 */
+ 			set_bit(MD_RECOVERY_INTR, &mddev->recovery);
++			md_unregister_thread(&mddev->sync_thread);
+ 			md_reap_sync_thread(mddev);
+ 			clear_bit(MD_RECOVERY_RECOVER, &mddev->recovery);
+ 			clear_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
+@@ -9344,6 +9359,7 @@ void md_check_recovery(struct mddev *mddev)
+ 			goto unlock;
+ 		}
+ 		if (mddev->sync_thread) {
++			md_unregister_thread(&mddev->sync_thread);
+ 			md_reap_sync_thread(mddev);
+ 			goto unlock;
+ 		}
+@@ -9423,8 +9439,7 @@ void md_reap_sync_thread(struct mddev *mddev)
+ 	sector_t old_dev_sectors = mddev->dev_sectors;
+ 	bool is_reshaped = false;
+ 
+-	/* resync has finished, collect result */
+-	md_unregister_thread(&mddev->sync_thread);
++	/* sync_thread should be unregistered, collect result */
+ 	if (!test_bit(MD_RECOVERY_INTR, &mddev->recovery) &&
+ 	    !test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery) &&
+ 	    mddev->degraded != mddev->raid_disks) {
+-- 
+2.34.1
+
