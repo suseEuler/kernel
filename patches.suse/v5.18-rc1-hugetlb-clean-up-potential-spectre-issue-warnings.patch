@@ -1,0 +1,77 @@
+From f9317f77a6e06d15604a079a9d35a2f500c60c08 Mon Sep 17 00:00:00 2001
+From: Mike Kravetz <mike.kravetz@oracle.com>
+Date: Tue, 22 Mar 2022 14:45:20 -0700
+Subject: [PATCH] hugetlb: clean up potential spectre issue warnings
+Git-commit: f9317f77a6e06d15604a079a9d35a2f500c60c08
+Patch-mainline: v5.18-rc1
+References: git-fix
+Modified-by-SEL: Yes, modified due to different context
+
+
+Recently introduced code allows numa nodes to be specified on the kernel
+command line for hugetlb allocations or CMA reservations.  The node
+values are user specified and used as indicies into arrays.  This
+generated the following smatch warnings:
+
+  mm/hugetlb.c:4170 hugepages_setup() warn: potential spectre issue 'default_hugepages_in_node' [w]
+  mm/hugetlb.c:4172 hugepages_setup() warn: potential spectre issue 'parsed_hstate->max_huge_pages_node' [w]
+  mm/hugetlb.c:6898 cmdline_parse_hugetlb_cma() warn: potential spectre issue 'hugetlb_cma_size_in_node' [w] (local cap)
+
+Clean up by using array_index_nospec to sanitize array indicies.
+
+The routine cmdline_parse_hugetlb_cma has the same overflow/truncation
+issue addressed in [1].  That is also fixed with this change.
+
+[1] https://lore.kernel.org/linux-mm/20220209134018.8242-1-liuyuntao10@huawei.com/
+
+As Michal pointed out, this is unlikely to be exploitable because it is
+__init code.  But the patch suppresses the warnings.
+
+[mike.kravetz@oracle.com: v2]
+  Link: https://lkml.kernel.org/r/20220218212946.35441-1-mike.kravetz@oracle.com
+
+Link: https://lkml.kernel.org/r/20220217234218.192885-1-mike.kravetz@oracle.com
+Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Zhenguo Yao <yaozhenguo1@gmail.com>
+Cc: Liu Yuntao <liuyuntao10@huawei.com>
+Cc: Dan Carpenter <dan.carpenter@oracle.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/hugetlb.c |    7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -30,6 +30,7 @@
+ #include <linux/numa.h>
+ #include <linux/llist.h>
+ #include <linux/cma.h>
++#include <linux/nospec.h>
+ 
+ #include <asm/page.h>
+ #include <asm/pgalloc.h>
+@@ -3673,7 +3674,7 @@ static int __init hugepages_setup(char *
+ 			}
+ 			if (tmp >= nr_online_nodes)
+ 				goto invalid;
+-			node = tmp;
++			node = array_index_nospec(tmp, nr_online_nodes);
+ 			p += count + 1;
+ 			/* Parse hugepages */
+ 			if (sscanf(p, "%lu%n", &tmp, &count) != 1)
+@@ -6131,9 +6132,9 @@ static int __init cmdline_parse_hugetlb_
+ 			break;
+ 
+ 		if (s[count] == ':') {
+-			nid = tmp;
+-			if (nid < 0 || nid >= MAX_NUMNODES)
++			if (tmp >= MAX_NUMNODES)
+ 				break;
++			nid = array_index_nospec(tmp, MAX_NUMNODES);
+ 
+ 			s += count + 1;
+ 			tmp = memparse(s, &s);

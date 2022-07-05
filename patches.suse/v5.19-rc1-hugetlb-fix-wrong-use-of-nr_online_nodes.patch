@@ -1,0 +1,120 @@
+From 0a7a0f6f7f3679c906fc55e3805c1d5e2c566f55 Mon Sep 17 00:00:00 2001
+From: Peng Liu <liupeng256@huawei.com>
+Date: Fri, 29 Apr 2022 14:36:57 -0700
+Subject: [PATCH] hugetlb: fix wrong use of nr_online_nodes
+Git-commit: 0a7a0f6f7f3679c906fc55e3805c1d5e2c566f55
+Patch-mainline: v5.19-rc1
+References: git-fix
+Modified-by-SEL: No
+
+
+Patch series "hugetlb: Fix some incorrect behavior", v3.
+
+This series fix three bugs of hugetlb:
+1) Invalid use of nr_online_nodes;
+2) Inconsistency between 1G hugepage and 2M hugepage;
+3) Useless information in dmesg.
+
+
+This patch (of 4):
+
+Certain systems are designed to have sparse/discontiguous nodes.  In this
+case, nr_online_nodes can not be used to walk through numa node.  Also, a
+valid node may be greater than nr_online_nodes.
+
+However, in hugetlb, it is assumed that nodes are contiguous.
+
+For sparse/discontiguous nodes, the current code may treat a valid node
+as invalid, and will fail to allocate all hugepages on a valid node that
+"nid >= nr_online_nodes".
+
+As David suggested:
+
+	if (tmp >= nr_online_nodes)
+		goto invalid;
+
+Just imagine node 0 and node 2 are online, and node 1 is offline.
+Assuming that "node < 2" is valid is wrong.
+
+Recheck all the places that use nr_online_nodes, and repair them one by
+one.
+
+[liupeng256@huawei.com: v4]
+  Link: https://lkml.kernel.org/r/20220416103526.3287348-1-liupeng256@huawei.com
+Link: https://lkml.kernel.org/r/20220413032915.251254-1-liupeng256@huawei.com
+Link: https://lkml.kernel.org/r/20220413032915.251254-2-liupeng256@huawei.com
+Fixes: 4178158ef8ca ("hugetlbfs: fix issue of preallocation of gigantic pages can't work")
+Fixes: b5389086ad7b ("hugetlbfs: extend the definition of hugepages parameter to support node allocation")
+Fixes: e79ce9832316 ("hugetlbfs: fix a truncation issue in hugepages parameter")
+Fixes: f9317f77a6e0 ("hugetlb: clean up potential spectre issue warnings")
+Signed-off-by: Peng Liu <liupeng256@huawei.com>
+Suggested-by: David Hildenbrand <david@redhat.com>
+Reviewed-by: Baolin Wang <baolin.wang@linux.alibaba.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Reviewed-by: Davidlohr Bueso <dave@stgolabs.net>
+Reviewed-by: Mike Kravetz <mike.kravetz@oracle.com>
+Acked-by: David Hildenbrand <david@redhat.com>
+Cc: Zhenguo Yao <yaozhenguo1@gmail.com>
+Cc: Muchun Song <songmuchun@bytedance.com>
+Cc: Liu Yuntao <liuyuntao10@huawei.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/hugetlb.c | 12 +++++-------
+ 1 file changed, 5 insertions(+), 7 deletions(-)
+
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 87ba50b270a3..6385f86a865a 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -2984,8 +2984,6 @@ int __alloc_bootmem_huge_page(struct hstate *h, int nid)
+ 	struct huge_bootmem_page *m = NULL; /* initialize for clang */
+ 	int nr_nodes, node;
+ 
+-	if (nid != NUMA_NO_NODE && nid >= nr_online_nodes)
+-		return 0;
+ 	/* do node specific alloc */
+ 	if (nid != NUMA_NO_NODE) {
+ 		m = memblock_alloc_try_nid_raw(huge_page_size(h), huge_page_size(h),
+@@ -3093,7 +3091,7 @@ static void __init hugetlb_hstate_alloc_pages(struct hstate *h)
+ 	}
+ 
+ 	/* do node specific alloc */
+-	for (i = 0; i < nr_online_nodes; i++) {
++	for_each_online_node(i) {
+ 		if (h->max_huge_pages_node[i] > 0) {
+ 			hugetlb_hstate_alloc_pages_onenode(h, i);
+ 			node_specific_alloc = true;
+@@ -4057,7 +4055,7 @@ static int __init hugetlb_init(void)
+ 			default_hstate.max_huge_pages =
+ 				default_hstate_max_huge_pages;
+ 
+-			for (i = 0; i < nr_online_nodes; i++)
++			for_each_online_node(i)
+ 				default_hstate.max_huge_pages_node[i] =
+ 					default_hugepages_in_node[i];
+ 		}
+@@ -4172,9 +4170,9 @@ static int __init hugepages_setup(char *s)
+ 				pr_warn("HugeTLB: architecture can't support node specific alloc, ignoring!\n");
+ 				return 0;
+ 			}
+-			if (tmp >= nr_online_nodes)
++			if (tmp >= MAX_NUMNODES || !node_online(tmp))
+ 				goto invalid;
+-			node = array_index_nospec(tmp, nr_online_nodes);
++			node = array_index_nospec(tmp, MAX_NUMNODES);
+ 			p += count + 1;
+ 			/* Parse hugepages */
+ 			if (sscanf(p, "%lu%n", &tmp, &count) != 1)
+@@ -4302,7 +4300,7 @@ static int __init default_hugepagesz_setup(char *s)
+ 	 */
+ 	if (default_hstate_max_huge_pages) {
+ 		default_hstate.max_huge_pages = default_hstate_max_huge_pages;
+-		for (i = 0; i < nr_online_nodes; i++)
++		for_each_online_node(i)
+ 			default_hstate.max_huge_pages_node[i] =
+ 				default_hugepages_in_node[i];
+ 		if (hstate_is_gigantic(&default_hstate))
+-- 
+2.34.1
+
