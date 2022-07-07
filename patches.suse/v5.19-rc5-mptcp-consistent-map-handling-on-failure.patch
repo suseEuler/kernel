@@ -1,0 +1,75 @@
+From f745a3ebdfb9041d3a55e66eb345895cd8ecc90c Mon Sep 17 00:00:00 2001
+Message-Id: <f745a3ebdfb9041d3a55e66eb345895cd8ecc90c.1657167319.git.geliang.tang@suse.com>
+From: Paolo Abeni <pabeni@redhat.com>
+Date: Mon, 27 Jun 2022 18:02:39 -0700
+Subject: [PATCH] mptcp: consistent map handling on failure
+Git-commit: f745a3ebdfb9041d3a55e66eb345895cd8ecc90c
+Patch-mainline: v5.19-rc5
+References: bsn#210
+Modified-by-SEL: No
+
+When the MPTCP receive path reach a non fatal fall-back condition, e.g.
+when the MPC sockets must fall-back to TCP, the existing code is a little
+self-inconsistent: it reports that new data is available - return true -
+but sets the MPC flag to the opposite value.
+
+As the consequence read operations in some exceptional scenario may block
+unexpectedly.
+
+Address the issue setting the correct MPC read status. Additionally avoid
+some code duplication in the fatal fall-back scenario.
+
+Fixes: 9c81be0dbc89 ("mptcp: add MP_FAIL response support")
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ net/mptcp/subflow.c | 19 +++++++++----------
+ 1 file changed, 9 insertions(+), 10 deletions(-)
+
+diff --git a/net/mptcp/subflow.c b/net/mptcp/subflow.c
+index b34b96fb742f..03862103665d 100644
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@ -1252,17 +1252,12 @@ static bool subflow_check_data_avail(struct sock *ssk)
+ 			subflow->send_mp_fail = 1;
+ 
+ 			if (!READ_ONCE(msk->allow_infinite_fallback)) {
+-				ssk->sk_err = EBADMSG;
+-				tcp_set_state(ssk, TCP_CLOSE);
+ 				subflow->reset_transient = 0;
+ 				subflow->reset_reason = MPTCP_RST_EMIDDLEBOX;
+-				tcp_send_active_reset(ssk, GFP_ATOMIC);
+-				while ((skb = skb_peek(&ssk->sk_receive_queue)))
+-					sk_eat_skb(ssk, skb);
+-			} else {
+-				mptcp_subflow_fail(msk, ssk);
++				goto reset;
+ 			}
+-			WRITE_ONCE(subflow->data_avail, MPTCP_SUBFLOW_NODATA);
++			mptcp_subflow_fail(msk, ssk);
++			WRITE_ONCE(subflow->data_avail, MPTCP_SUBFLOW_DATA_AVAIL);
+ 			return true;
+ 		}
+ 
+@@ -1270,10 +1265,14 @@ static bool subflow_check_data_avail(struct sock *ssk)
+ 			/* fatal protocol error, close the socket.
+ 			 * subflow_error_report() will introduce the appropriate barriers
+ 			 */
+-			ssk->sk_err = EBADMSG;
+-			tcp_set_state(ssk, TCP_CLOSE);
+ 			subflow->reset_transient = 0;
+ 			subflow->reset_reason = MPTCP_RST_EMPTCP;
++
++reset:
++			ssk->sk_err = EBADMSG;
++			tcp_set_state(ssk, TCP_CLOSE);
++			while ((skb = skb_peek(&ssk->sk_receive_queue)))
++				sk_eat_skb(ssk, skb);
+ 			tcp_send_active_reset(ssk, GFP_ATOMIC);
+ 			WRITE_ONCE(subflow->data_avail, MPTCP_SUBFLOW_NODATA);
+ 			return false;
+-- 
+2.35.3
+

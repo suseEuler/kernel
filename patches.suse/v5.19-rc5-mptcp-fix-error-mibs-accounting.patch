@@ -1,0 +1,99 @@
+From 0c1f78a49af721490a5ad70b73e8b4d382465dae Mon Sep 17 00:00:00 2001
+Message-Id: <0c1f78a49af721490a5ad70b73e8b4d382465dae.1657167326.git.geliang.tang@suse.com>
+From: Paolo Abeni <pabeni@redhat.com>
+Date: Mon, 27 Jun 2022 18:02:35 -0700
+Subject: [PATCH] mptcp: fix error mibs accounting
+Git-commit: 0c1f78a49af721490a5ad70b73e8b4d382465dae
+Patch-mainline: v5.19-rc5
+References: bsn#210
+Modified-by-SEL: No
+
+The current accounting for MP_FAIL and FASTCLOSE is not very
+accurate: both can be increased even when the related option is
+not really sent. Move the accounting into the correct place.
+
+Fixes: eb7f33654dc1 ("mptcp: add the mibs for MP_FAIL")
+Fixes: 1e75629cb964 ("mptcp: add the mibs for MP_FASTCLOSE")
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ net/mptcp/options.c | 5 +++--
+ net/mptcp/pm.c      | 1 -
+ net/mptcp/subflow.c | 4 +---
+ 3 files changed, 4 insertions(+), 6 deletions(-)
+
+diff --git a/net/mptcp/options.c b/net/mptcp/options.c
+index be3b918a6d15..2a6351d55a7d 100644
+--- a/net/mptcp/options.c
++++ b/net/mptcp/options.c
+@@ -765,6 +765,7 @@ static noinline bool mptcp_established_options_rst(struct sock *sk, struct sk_bu
+ 	opts->suboptions |= OPTION_MPTCP_RST;
+ 	opts->reset_transient = subflow->reset_transient;
+ 	opts->reset_reason = subflow->reset_reason;
++	MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_MPRSTTX);
+ 
+ 	return true;
+ }
+@@ -788,6 +789,7 @@ static bool mptcp_established_options_fastclose(struct sock *sk,
+ 	opts->rcvr_key = msk->remote_key;
+ 
+ 	pr_debug("FASTCLOSE key=%llu", opts->rcvr_key);
++	MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_MPFASTCLOSETX);
+ 	return true;
+ }
+ 
+@@ -809,6 +811,7 @@ static bool mptcp_established_options_mp_fail(struct sock *sk,
+ 	opts->fail_seq = subflow->map_seq;
+ 
+ 	pr_debug("MP_FAIL fail_seq=%llu", opts->fail_seq);
++	MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_MPFAILTX);
+ 
+ 	return true;
+ }
+@@ -833,13 +836,11 @@ bool mptcp_established_options(struct sock *sk, struct sk_buff *skb,
+ 		    mptcp_established_options_mp_fail(sk, &opt_size, remaining, opts)) {
+ 			*size += opt_size;
+ 			remaining -= opt_size;
+-			MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_MPFASTCLOSETX);
+ 		}
+ 		/* MP_RST can be used with MP_FASTCLOSE and MP_FAIL if there is room */
+ 		if (mptcp_established_options_rst(sk, skb, &opt_size, remaining, opts)) {
+ 			*size += opt_size;
+ 			remaining -= opt_size;
+-			MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_MPRSTTX);
+ 		}
+ 		return true;
+ 	}
+diff --git a/net/mptcp/pm.c b/net/mptcp/pm.c
+index 59a85220edc9..91a62b598de4 100644
+--- a/net/mptcp/pm.c
++++ b/net/mptcp/pm.c
+@@ -310,7 +310,6 @@ void mptcp_pm_mp_fail_received(struct sock *sk, u64 fail_seq)
+ 		pr_debug("send MP_FAIL response and infinite map");
+ 
+ 		subflow->send_mp_fail = 1;
+-		MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_MPFAILTX);
+ 		subflow->send_infinite_map = 1;
+ 	} else if (!sock_flag(sk, SOCK_DEAD)) {
+ 		pr_debug("MP_FAIL response received");
+diff --git a/net/mptcp/subflow.c b/net/mptcp/subflow.c
+index 8841e8cd9ad8..50ad19adc003 100644
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@ -958,10 +958,8 @@ static enum mapping_status validate_data_csum(struct sock *ssk, struct sk_buff *
+ 				 subflow->map_data_csum);
+ 	if (unlikely(csum)) {
+ 		MPTCP_INC_STATS(sock_net(ssk), MPTCP_MIB_DATACSUMERR);
+-		if (subflow->mp_join || subflow->valid_csum_seen) {
++		if (subflow->mp_join || subflow->valid_csum_seen)
+ 			subflow->send_mp_fail = 1;
+-			MPTCP_INC_STATS(sock_net(ssk), MPTCP_MIB_MPFAILTX);
+-		}
+ 		return subflow->mp_join ? MAPPING_INVALID : MAPPING_DUMMY;
+ 	}
+ 
+-- 
+2.35.3
+
