@@ -1,0 +1,189 @@
+From 3c0c2ad1ae75963c05bf89ec91918c6a53a72696 Mon Sep 17 00:00:00 2001
+From: Sean Christopherson <sean.j.christopherson@intel.com>
+Date: Mon, 12 Apr 2021 16:21:37 +1200
+Subject: [PATCH] KVM: VMX: Add basic handling of VM-Exit from SGX enclave
+Git-commit: 3c0c2ad1ae75963c05bf89ec91918c6a53a72696
+Patch-mainline: v5.13-rc1
+References: bsn#291
+Modified-by-SEL: Yes, refreshed due to different context
+
+
+Add support for handling VM-Exits that originate from a guest SGX
+enclave.  In SGX, an "enclave" is a new CPL3-only execution environment,
+wherein the CPU and memory state is protected by hardware to make the
+state inaccesible to code running outside of the enclave.  When exiting
+an enclave due to an asynchronous event (from the perspective of the
+enclave), e.g. exceptions, interrupts, and VM-Exits, the enclave's state
+is automatically saved and scrubbed (the CPU loads synthetic state), and
+then reloaded when re-entering the enclave.  E.g. after an instruction
+based VM-Exit from an enclave, vmcs.GUEST_RIP will not contain the RIP
+of the enclave instruction that trigered VM-Exit, but will instead point
+to a RIP in the enclave's untrusted runtime (the guest userspace code
+that coordinates entry/exit to/from the enclave).
+
+To help a VMM recognize and handle exits from enclaves, SGX adds bits to
+existing VMCS fields, VM_EXIT_REASON.VMX_EXIT_REASON_FROM_ENCLAVE and
+GUEST_INTERRUPTIBILITY_INFO.GUEST_INTR_STATE_ENCLAVE_INTR.  Define the
+new architectural bits, and add a boolean to struct vcpu_vmx to cache
+VMX_EXIT_REASON_FROM_ENCLAVE.  Clear the bit in exit_reason so that
+checks against exit_reason do not need to account for SGX, e.g.
+"if (exit_reason == EXIT_REASON_EXCEPTION_NMI)" continues to work.
+
+KVM is a largely a passive observer of the new bits, e.g. KVM needs to
+account for the bits when propagating information to a nested VMM, but
+otherwise doesn't need to act differently for the majority of VM-Exits
+from enclaves.
+
+The one scenario that is directly impacted is emulation, which is for
+all intents and purposes impossible[1] since KVM does not have access to
+the RIP or instruction stream that triggered the VM-Exit.  The inability
+to emulate is a non-issue for KVM, as most instructions that might
+trigger VM-Exit unconditionally #UD in an enclave (before the VM-Exit
+check.  For the few instruction that conditionally #UD, KVM either never
+sets the exiting control, e.g. PAUSE_EXITING[2], or sets it if and only
+if the feature is not exposed to the guest in order to inject a #UD,
+e.g. RDRAND_EXITING.
+
+But, because it is still possible for a guest to trigger emulation,
+e.g. MMIO, inject a #UD if KVM ever attempts emulation after a VM-Exit
+from an enclave.  This is architecturally accurate for instruction
+VM-Exits, and for MMIO it's the least bad choice, e.g. it's preferable
+to killing the VM.  In practice, only broken or particularly stupid
+guests should ever encounter this behavior.
+
+Add a WARN in skip_emulated_instruction to detect any attempt to
+modify the guest's RIP during an SGX enclave VM-Exit as all such flows
+should either be unreachable or must handle exits from enclaves before
+getting to skip_emulated_instruction.
+
+[1] Impossible for all practical purposes.  Not truly impossible
+    since KVM could implement some form of para-virtualization scheme.
+
+[2] PAUSE_LOOP_EXITING only affects CPL0 and enclaves exist only at
+    CPL3, so we also don't need to worry about that interaction.
+
+Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Signed-off-by: Kai Huang <kai.huang@intel.com>
+Message-Id: <315f54a8507d09c292463ef29104e1d4c62e9090.1618196135.git.kai.huang@intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/include/asm/vmx.h      |    1 
+ arch/x86/include/uapi/asm/vmx.h |    1 
+ arch/x86/kvm/vmx/nested.c       |    2 +
+ arch/x86/kvm/vmx/vmx.c          |   45 ++++++++++++++++++++++++++++++++++++++--
+ 4 files changed, 47 insertions(+), 2 deletions(-)
+
+--- a/arch/x86/include/asm/vmx.h
++++ b/arch/x86/include/asm/vmx.h
+@@ -371,6 +371,7 @@ enum vmcs_field {
+ #define GUEST_INTR_STATE_MOV_SS		0x00000002
+ #define GUEST_INTR_STATE_SMI		0x00000004
+ #define GUEST_INTR_STATE_NMI		0x00000008
++#define GUEST_INTR_STATE_ENCLAVE_INTR	0x00000010
+ 
+ /* GUEST_ACTIVITY_STATE flags */
+ #define GUEST_ACTIVITY_ACTIVE		0
+--- a/arch/x86/include/uapi/asm/vmx.h
++++ b/arch/x86/include/uapi/asm/vmx.h
+@@ -27,6 +27,7 @@
+ 
+ 
+ #define VMX_EXIT_REASONS_FAILED_VMENTRY         0x80000000
++#define VMX_EXIT_REASONS_SGX_ENCLAVE_MODE	0x08000000
+ 
+ #define EXIT_REASON_EXCEPTION_NMI       0
+ #define EXIT_REASON_EXTERNAL_INTERRUPT  1
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@ -4166,6 +4166,8 @@ static void prepare_vmcs12(struct kvm_vc
+ {
+ 	/* update exit information fields: */
+ 	vmcs12->vm_exit_reason = vm_exit_reason;
++	if (to_vmx(vcpu)->exit_reason.enclave_mode)
++		vmcs12->vm_exit_reason |= VMX_EXIT_REASONS_SGX_ENCLAVE_MODE;
+ 	vmcs12->exit_qualification = exit_qualification;
+ 
+ 	/*
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -1630,12 +1630,25 @@ static int vmx_rtit_ctl_check(struct kvm
+ 
+ static bool vmx_can_emulate_instruction(struct kvm_vcpu *vcpu, void *insn, int insn_len)
+ {
++	/*
++	 * Emulation of instructions in SGX enclaves is impossible as RIP does
++	 * not point  tthe failing instruction, and even if it did, the code
++	 * stream is inaccessible.  Inject #UD instead of exiting to userspace
++	 * so that guest userspace can't DoS the guest simply by triggering
++	 * emulation (enclaves are CPL3 only).
++	 */
++	if (to_vmx(vcpu)->exit_reason.enclave_mode) {
++		kvm_queue_exception(vcpu, UD_VECTOR);
++		return false;
++	}
+ 	return true;
+ }
+ 
+ static int skip_emulated_instruction(struct kvm_vcpu *vcpu)
+ {
++	union vmx_exit_reason exit_reason = to_vmx(vcpu)->exit_reason;
+ 	unsigned long rip, orig_rip;
++	u32 instr_len;
+ 
+ 	/*
+ 	 * Using VMCS.VM_EXIT_INSTRUCTION_LEN on EPT misconfig depends on
+@@ -1646,9 +1659,33 @@ static int skip_emulated_instruction(str
+ 	 * i.e. we end up advancing IP with some random value.
+ 	 */
+ 	if (!static_cpu_has(X86_FEATURE_HYPERVISOR) ||
+-	    to_vmx(vcpu)->exit_reason.basic != EXIT_REASON_EPT_MISCONFIG) {
++	    exit_reason.basic != EXIT_REASON_EPT_MISCONFIG) {
++		instr_len = vmcs_read32(VM_EXIT_INSTRUCTION_LEN);
++
++		/*
++		 * Emulating an enclave's instructions isn't supported as KVM
++		 * cannot access the enclave's memory or its true RIP, e.g. the
++		 * vmcs.GUEST_RIP points at the exit point of the enclave, not
++		 * the RIP that actually triggered the VM-Exit.  But, because
++		 * most instructions that cause VM-Exit will #UD in an enclave,
++		 * most instruction-based VM-Exits simply do not occur.
++		 *
++		 * There are a few exceptions, notably the debug instructions
++		 * INT1ICEBRK and INT3, as they are allowed in debug enclaves
++		 * and generate #DB/#BP as expected, which KVM might intercept.
++		 * But again, the CPU does the dirty work and saves an instr
++		 * length of zero so VMMs don't shoot themselves in the foot.
++		 * WARN if KVM tries to skip a non-zero length instruction on
++		 * a VM-Exit from an enclave.
++		 */
++		if (!instr_len)
++			goto rip_updated;
++
++		WARN(exit_reason.enclave_mode,
++		     "KVM: skipping instruction after SGX enclave VM-Exit");
++
+ 		orig_rip = kvm_rip_read(vcpu);
+-		rip = orig_rip + vmcs_read32(VM_EXIT_INSTRUCTION_LEN);
++		rip = orig_rip + instr_len;
+ #ifdef CONFIG_X86_64
+ 		/*
+ 		 * We need to mask out the high 32 bits of RIP if not in 64-bit
+@@ -1664,6 +1701,7 @@ static int skip_emulated_instruction(str
+ 			return 0;
+ 	}
+ 
++rip_updated:
+ 	/* skipping an emulated instruction also counts */
+ 	vmx_set_interrupt_shadow(vcpu, 0);
+ 
+@@ -5505,6 +5543,9 @@ static int handle_ept_misconfig(struct k
+ {
+ 	gpa_t gpa;
+ 
++	if (!vmx_can_emulate_instruction(vcpu, NULL, 0))
++		return 1;
++
+ 	/*
+ 	 * A nested guest cannot optimize MMIO vmexits, because we have an
+ 	 * nGPA here instead of the required GPA.

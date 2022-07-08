@@ -1,0 +1,143 @@
+From 9798adbc04cf1b14325dc7e2c882639693516a69 Mon Sep 17 00:00:00 2001
+From: Sean Christopherson <sean.j.christopherson@intel.com>
+Date: Mon, 12 Apr 2021 16:21:38 +1200
+Subject: [PATCH] KVM: VMX: Frame in ENCLS handler for SGX virtualization
+Git-commit: 9798adbc04cf1b14325dc7e2c882639693516a69
+Patch-mainline: v5.13-rc1
+References: bsn#291
+Modified-by-SEL: Yes, refreshed due to different context
+
+
+Introduce sgx.c and sgx.h, along with the framework for handling ENCLS
+VM-Exits.  Add a bool, enable_sgx, that will eventually be wired up to a
+module param to control whether or not SGX virtualization is enabled at
+runtime.
+
+Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Signed-off-by: Kai Huang <kai.huang@intel.com>
+Message-Id: <1c782269608b2f5e1034be450f375a8432fb705d.1618196135.git.kai.huang@intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/kvm/Makefile  |    2 +
+ arch/x86/kvm/vmx/sgx.c |   50 +++++++++++++++++++++++++++++++++++++++++++++++++
+ arch/x86/kvm/vmx/sgx.h |   15 ++++++++++++++
+ arch/x86/kvm/vmx/vmx.c |    9 +++++---
+ 4 files changed, 73 insertions(+), 3 deletions(-)
+ create mode 100644 arch/x86/kvm/vmx/sgx.c
+ create mode 100644 arch/x86/kvm/vmx/sgx.h
+
+--- a/arch/x86/kvm/Makefile
++++ b/arch/x86/kvm/Makefile
+@@ -20,6 +20,8 @@ kvm-y			+= x86.o emulate.o i8259.o irq.o
+ 
+ kvm-intel-y		+= vmx/vmx.o vmx/vmenter.o vmx/pmu_intel.o vmx/vmcs12.o \
+ 			   vmx/evmcs.o vmx/nested.o vmx/posted_intr.o
++kvm-intel-$(CONFIG_X86_SGX_KVM)	+= vmx/sgx.o
++
+ kvm-amd-y		+= svm/svm.o svm/vmenter.o svm/pmu.o svm/nested.o svm/avic.o svm/sev.o
+ 
+ obj-$(CONFIG_KVM)	+= kvm.o
+--- /dev/null
++++ b/arch/x86/kvm/vmx/sgx.c
+@@ -0,0 +1,50 @@
++// SPDX-License-Identifier: GPL-2.0
++/*  Copyright(c) 2021 Intel Corporation. */
++
++#include <asm/sgx.h>
++
++#include "cpuid.h"
++#include "kvm_cache_regs.h"
++#include "sgx.h"
++#include "vmx.h"
++#include "x86.h"
++
++bool __read_mostly enable_sgx;
++
++static inline bool encls_leaf_enabled_in_guest(struct kvm_vcpu *vcpu, u32 leaf)
++{
++	if (!enable_sgx || !guest_cpuid_has(vcpu, X86_FEATURE_SGX))
++		return false;
++
++	if (leaf >= ECREATE && leaf <= ETRACK)
++		return guest_cpuid_has(vcpu, X86_FEATURE_SGX1);
++
++	if (leaf >= EAUG && leaf <= EMODT)
++		return guest_cpuid_has(vcpu, X86_FEATURE_SGX2);
++
++	return false;
++}
++
++static inline bool sgx_enabled_in_guest_bios(struct kvm_vcpu *vcpu)
++{
++	const u64 bits = FEAT_CTL_SGX_ENABLED | FEAT_CTL_LOCKED;
++
++	return (to_vmx(vcpu)->msr_ia32_feature_control & bits) == bits;
++}
++
++int handle_encls(struct kvm_vcpu *vcpu)
++{
++	u32 leaf = (u32)kvm_rax_read(vcpu);
++
++	if (!encls_leaf_enabled_in_guest(vcpu, leaf)) {
++		kvm_queue_exception(vcpu, UD_VECTOR);
++	} else if (!sgx_enabled_in_guest_bios(vcpu)) {
++		kvm_inject_gp(vcpu, 0);
++	} else {
++		WARN(1, "KVM: unexpected exit on ENCLS[%u]", leaf);
++		vcpu->run->exit_reason = KVM_EXIT_UNKNOWN;
++		vcpu->run->hw.hardware_exit_reason = EXIT_REASON_ENCLS;
++		return 0;
++	}
++	return 1;
++}
+--- /dev/null
++++ b/arch/x86/kvm/vmx/sgx.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __KVM_X86_SGX_H
++#define __KVM_X86_SGX_H
++
++#include <linux/kvm_host.h>
++
++#ifdef CONFIG_X86_SGX_KVM
++extern bool __read_mostly enable_sgx;
++
++int handle_encls(struct kvm_vcpu *vcpu);
++#else
++#define enable_sgx 0
++#endif
++
++#endif /* __KVM_X86_SGX_H */
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -58,6 +58,7 @@
+ #include "mmu.h"
+ #include "nested.h"
+ #include "pmu.h"
++#include "sgx.h"
+ #include "trace.h"
+ #include "vmcs.h"
+ #include "vmcs12.h"
+@@ -5794,16 +5795,18 @@ static int handle_vmx_instruction(struct
+ 	return 1;
+ }
+ 
++#ifndef CONFIG_X86_SGX_KVM
+ static int handle_encls(struct kvm_vcpu *vcpu)
+ {
+ 	/*
+-	 * SGX virtualization is not yet supported.  There is no software
+-	 * enable bit for SGX, so we have to trap ENCLS and inject a #UD
+-	 * to prevent the guest from executing ENCLS.
++	 * SGX virtualization is disabled.  There is no software enable bit for
++	 * SGX, so KVM intercepts all ENCLS leafs and injects a #UD to prevent
++	 * the guest from executing ENCLS (when SGX is supported by hardware).
+ 	 */
+ 	kvm_queue_exception(vcpu, UD_VECTOR);
+ 	return 1;
+ }
++#endif /* CONFIG_X86_SGX_KVM */
+ 
+ /*
+  * The exit handlers return 1 if the exit was handled fully and guest execution

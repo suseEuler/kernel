@@ -1,0 +1,140 @@
+From 332bfc7becf479de8a55864cc5ed0024baea28aa Mon Sep 17 00:00:00 2001
+From: Sean Christopherson <sean.j.christopherson@intel.com>
+Date: Fri, 19 Mar 2021 20:22:58 +1300
+Subject: [PATCH] x86/cpu/intel: Allow SGX virtualization without Launch
+ Control support
+Git-commit: 332bfc7becf479de8a55864cc5ed0024baea28aa
+Patch-mainline: v5.13-rc1
+References: bsn#291
+Modified-by-SEL: No
+
+
+The kernel will currently disable all SGX support if the hardware does
+not support launch control.  Make it more permissive to allow SGX
+virtualization on systems without Launch Control support.  This will
+allow KVM to expose SGX to guests that have less-strict requirements on
+the availability of flexible launch control.
+
+Improve error message to distinguish between three cases.  There are two
+cases where SGX support is completely disabled:
+1) SGX has been disabled completely by the BIOS
+2) SGX LC is locked by the BIOS.  Bare-metal support is disabled because
+   of LC unavailability.  SGX virtualization is unavailable (because of
+   Kconfig).
+One where it is partially available:
+3) SGX LC is locked by the BIOS.  Bare-metal support is disabled because
+   of LC unavailability.  SGX virtualization is supported.
+
+Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Co-developed-by: Kai Huang <kai.huang@intel.com>
+Signed-off-by: Kai Huang <kai.huang@intel.com>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Acked-by: Jarkko Sakkinen <jarkko@kernel.org>
+Acked-by: Dave Hansen <dave.hansen@intel.com>
+Link: https://lkml.kernel.org/r/b3329777076509b3b601550da288c8f3c406a865.1616136308.git.kai.huang@intel.com
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/kernel/cpu/feat_ctl.c | 59 +++++++++++++++++++++++++---------
+ 1 file changed, 44 insertions(+), 15 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/feat_ctl.c b/arch/x86/kernel/cpu/feat_ctl.c
+index 27533a6e04fa..da696eb4821a 100644
+--- a/arch/x86/kernel/cpu/feat_ctl.c
++++ b/arch/x86/kernel/cpu/feat_ctl.c
+@@ -104,8 +104,9 @@ early_param("nosgx", nosgx);
+ 
+ void init_ia32_feat_ctl(struct cpuinfo_x86 *c)
+ {
++	bool enable_sgx_kvm = false, enable_sgx_driver = false;
+ 	bool tboot = tboot_enabled();
+-	bool enable_sgx;
++	bool enable_vmx;
+ 	u64 msr;
+ 
+ 	if (rdmsrl_safe(MSR_IA32_FEAT_CTL, &msr)) {
+@@ -114,13 +115,19 @@ void init_ia32_feat_ctl(struct cpuinfo_x86 *c)
+ 		return;
+ 	}
+ 
+-	/*
+-	 * Enable SGX if and only if the kernel supports SGX and Launch Control
+-	 * is supported, i.e. disable SGX if the LE hash MSRs can't be written.
+-	 */
+-	enable_sgx = cpu_has(c, X86_FEATURE_SGX) &&
+-		     cpu_has(c, X86_FEATURE_SGX_LC) &&
+-		     IS_ENABLED(CONFIG_X86_SGX);
++	enable_vmx = cpu_has(c, X86_FEATURE_VMX) &&
++		     IS_ENABLED(CONFIG_KVM_INTEL);
++
++	if (cpu_has(c, X86_FEATURE_SGX) && IS_ENABLED(CONFIG_X86_SGX)) {
++		/*
++		 * Separate out SGX driver enabling from KVM.  This allows KVM
++		 * guests to use SGX even if the kernel SGX driver refuses to
++		 * use it.  This happens if flexible Launch Control is not
++		 * available.
++		 */
++		enable_sgx_driver = cpu_has(c, X86_FEATURE_SGX_LC);
++		enable_sgx_kvm = enable_vmx && IS_ENABLED(CONFIG_X86_SGX_KVM);
++	}
+ 
+ 	if (msr & FEAT_CTL_LOCKED)
+ 		goto update_caps;
+@@ -136,15 +143,18 @@ void init_ia32_feat_ctl(struct cpuinfo_x86 *c)
+ 	 * i.e. KVM is enabled, to avoid unnecessarily adding an attack vector
+ 	 * for the kernel, e.g. using VMX to hide malicious code.
+ 	 */
+-	if (cpu_has(c, X86_FEATURE_VMX) && IS_ENABLED(CONFIG_KVM_INTEL)) {
++	if (enable_vmx) {
+ 		msr |= FEAT_CTL_VMX_ENABLED_OUTSIDE_SMX;
+ 
+ 		if (tboot)
+ 			msr |= FEAT_CTL_VMX_ENABLED_INSIDE_SMX;
+ 	}
+ 
+-	if (enable_sgx)
+-		msr |= FEAT_CTL_SGX_ENABLED | FEAT_CTL_SGX_LC_ENABLED;
++	if (enable_sgx_kvm || enable_sgx_driver) {
++		msr |= FEAT_CTL_SGX_ENABLED;
++		if (enable_sgx_driver)
++			msr |= FEAT_CTL_SGX_LC_ENABLED;
++	}
+ 
+ 	wrmsrl(MSR_IA32_FEAT_CTL, msr);
+ 
+@@ -167,10 +177,29 @@ void init_ia32_feat_ctl(struct cpuinfo_x86 *c)
+ 	}
+ 
+ update_sgx:
+-	if (!(msr & FEAT_CTL_SGX_ENABLED) ||
+-	    !(msr & FEAT_CTL_SGX_LC_ENABLED) || !enable_sgx) {
+-		if (enable_sgx)
+-			pr_err_once("SGX disabled by BIOS\n");
++	if (!(msr & FEAT_CTL_SGX_ENABLED)) {
++		if (enable_sgx_kvm || enable_sgx_driver)
++			pr_err_once("SGX disabled by BIOS.\n");
+ 		clear_cpu_cap(c, X86_FEATURE_SGX);
++		return;
++	}
++
++	/*
++	 * VMX feature bit may be cleared due to being disabled in BIOS,
++	 * in which case SGX virtualization cannot be supported either.
++	 */
++	if (!cpu_has(c, X86_FEATURE_VMX) && enable_sgx_kvm) {
++		pr_err_once("SGX virtualization disabled due to lack of VMX.\n");
++		enable_sgx_kvm = 0;
++	}
++
++	if (!(msr & FEAT_CTL_SGX_LC_ENABLED) && enable_sgx_driver) {
++		if (!enable_sgx_kvm) {
++			pr_err_once("SGX Launch Control is locked. Disable SGX.\n");
++			clear_cpu_cap(c, X86_FEATURE_SGX);
++		} else {
++			pr_err_once("SGX Launch Control is locked. Support SGX virtualization only.\n");
++			clear_cpu_cap(c, X86_FEATURE_SGX_LC);
++		}
+ 	}
+ }
+-- 
+2.34.1
+

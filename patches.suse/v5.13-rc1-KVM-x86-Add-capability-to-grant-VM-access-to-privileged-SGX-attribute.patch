@@ -1,0 +1,134 @@
+From fe7e948837f312d87853b3fce743795d1ae3715a Mon Sep 17 00:00:00 2001
+From: Sean Christopherson <sean.j.christopherson@intel.com>
+Date: Mon, 12 Apr 2021 16:21:43 +1200
+Subject: [PATCH] KVM: x86: Add capability to grant VM access to privileged SGX
+ attribute
+Git-commit: fe7e948837f312d87853b3fce743795d1ae3715a
+Patch-mainline: v5.13-rc1
+References: bsn#291
+Modified-by-SEL: Yes, modified due to different context
+
+
+Add a capability, KVM_CAP_SGX_ATTRIBUTE, that can be used by userspace
+to grant a VM access to a priveleged attribute, with args[0] holding a
+file handle to a valid SGX attribute file.
+
+The SGX subsystem restricts access to a subset of enclave attributes to
+provide additional security for an uncompromised kernel, e.g. to prevent
+malware from using the PROVISIONKEY to ensure its nodes are running
+inside a geniune SGX enclave and/or to obtain a stable fingerprint.
+
+To prevent userspace from circumventing such restrictions by running an
+enclave in a VM, KVM restricts guest access to privileged attributes by
+default.
+
+Cc: Andy Lutomirski <luto@amacapital.net>
+Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Signed-off-by: Kai Huang <kai.huang@intel.com>
+Message-Id: <0b099d65e933e068e3ea934b0523bab070cb8cea.1618196135.git.kai.huang@intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ Documentation/virt/kvm/api.rst |   23 +++++++++++++++++++++++
+ arch/x86/kvm/cpuid.c           |    2 +-
+ arch/x86/kvm/x86.c             |   21 +++++++++++++++++++++
+ include/uapi/linux/kvm.h       |    1 +
+ 4 files changed, 46 insertions(+), 1 deletion(-)
+
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@ -6022,6 +6022,29 @@ KVM_EXIT_X86_RDMSR and KVM_EXIT_X86_WRMS
+ can then handle to implement model specific MSR handling and/or user notifications
+ to inform a user that an MSR was not handled.
+ 
++7.25 KVM_CAP_SGX_ATTRIBUTE
++----------------------
++
++:Architectures: x86
++:Target: VM
++:Parameters: args[0] is a file handle of a SGX attribute file in securityfs
++:Returns: 0 on success, -EINVAL if the file handle is invalid or if a requested
++          attribute is not supported by KVM.
++
++KVM_CAP_SGX_ATTRIBUTE enables a userspace VMM to grant a VM access to one or
++more priveleged enclave attributes.  args[0] must hold a file handle to a valid
++SGX attribute file corresponding to an attribute that is supported/restricted
++by KVM (currently only PROVISIONKEY).
++
++The SGX subsystem restricts access to a subset of enclave attributes to provide
++additional security for an uncompromised kernel, e.g. use of the PROVISIONKEY
++is restricted to deter malware from using the PROVISIONKEY to obtain a stable
++system fingerprint.  To prevent userspace from circumventing such restrictions
++by running an enclave in a VM, KVM prevents access to privileged attributes by
++default.
++
++See Documentation/x86/sgx/2.Kernel-internals.rst for more details.
++
+ 8. Other capabilities.
+ ======================
+ 
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@ -839,7 +839,7 @@ static inline int __do_cpuid_func(struct
+ 		 * expected to derive it from supported XCR0.
+ 		 */
+ 		entry->eax &= SGX_ATTR_DEBUG | SGX_ATTR_MODE64BIT |
+-			      /* PROVISIONKEY | */ SGX_ATTR_EINITTOKENKEY |
++			      SGX_ATTR_PROVISIONKEY | SGX_ATTR_EINITTOKENKEY |
+ 			      SGX_ATTR_KSS;
+ 		entry->ebx &= 0;
+ 		break;
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -74,6 +74,7 @@
+ #include <asm/tlbflush.h>
+ #include <asm/intel_pt.h>
+ #include <asm/emulate_prefix.h>
++#include <asm/sgx.h>
+ #include <clocksource/hyperv_timer.h>
+ 
+ #define CREATE_TRACE_POINTS
+@@ -3776,6 +3777,9 @@ int kvm_vm_ioctl_check_extension(struct
+ 	case KVM_CAP_X86_USER_SPACE_MSR:
+ 	case KVM_CAP_X86_MSR_FILTER:
+ 	case KVM_CAP_ENFORCE_PV_FEATURE_CPUID:
++#ifdef CONFIG_X86_SGX_KVM
++	case KVM_CAP_SGX_ATTRIBUTE:
++#endif
+ 		r = 1;
+ 		break;
+ 	case KVM_CAP_SYNC_REGS:
+@@ -5331,6 +5335,23 @@ split_irqchip_unlock:
+ 		kvm->arch.user_space_msr_mask = cap->args[0];
+ 		r = 0;
+ 		break;
++#ifdef CONFIG_X86_SGX_KVM
++	case KVM_CAP_SGX_ATTRIBUTE: {
++		unsigned long allowed_attributes = 0;
++
++		r = sgx_set_attribute(&allowed_attributes, cap->args[0]);
++		if (r)
++			break;
++
++		/* KVM only supports the PROVISIONKEY privileged attribute. */
++		if ((allowed_attributes & SGX_ATTR_PROVISIONKEY) &&
++		    !(allowed_attributes & ~SGX_ATTR_PROVISIONKEY))
++			kvm->arch.sgx_provisioning_allowed = true;
++		else
++			r = -EINVAL;
++		break;
++	}
++#endif
+ 	default:
+ 		r = -EINVAL;
+ 		break;
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@ -1053,6 +1053,7 @@ struct kvm_ppc_resize_hpt {
+ #define KVM_CAP_X86_USER_SPACE_MSR 188
+ #define KVM_CAP_X86_MSR_FILTER 189
+ #define KVM_CAP_ENFORCE_PV_FEATURE_CPUID 190
++#define KVM_CAP_SGX_ATTRIBUTE 196
+ 
+ #ifdef KVM_CAP_IRQ_ROUTING
+ 
