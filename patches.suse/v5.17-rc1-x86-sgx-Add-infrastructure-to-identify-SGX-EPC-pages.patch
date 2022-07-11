@@ -1,0 +1,95 @@
+From 40e0e7843e23d164625b9031514f5672f8758bf4 Mon Sep 17 00:00:00 2001
+From: Tony Luck <tony.luck@intel.com>
+Date: Tue, 26 Oct 2021 15:00:45 -0700
+Subject: [PATCH] x86/sgx: Add infrastructure to identify SGX EPC pages
+Git-commit: 40e0e7843e23d164625b9031514f5672f8758bf4
+Patch-mainline: v5.17-rc1
+References: bsn#291
+Modified-by-SEL: No
+
+
+X86 machine check architecture reports a physical address when there
+is a memory error. Handling that error requires a method to determine
+whether the physical address reported is in any of the areas reserved
+for EPC pages by BIOS.
+
+SGX EPC pages do not have Linux "struct page" associated with them.
+
+Keep track of the mapping from ranges of EPC pages to the sections
+that contain them using an xarray. N.B. adds CONFIG_XARRAY_MULTI to
+the SGX dependecies. So "select" that in arch/x86/Kconfig for X86/SGX.
+
+Create a function arch_is_platform_page() that simply reports whether an
+address is an EPC page for use elsewhere in the kernel. The ACPI error
+injection code needs this function and is typically built as a module,
+so export it.
+
+Note that arch_is_platform_page() will be slower than other similar
+"what type is this page" functions that can simply check bits in the
+"struct page".  If there is some future performance critical user of
+this function it may need to be implemented in a more efficient way.
+
+Note also that the current implementation of xarray allocates a few
+hundred kilobytes for this usage on a system with 4GB of SGX EPC memory
+configured. This isn't ideal, but worth it for the code simplicity.
+
+Signed-off-by: Tony Luck <tony.luck@intel.com>
+Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+Reviewed-by: Jarkko Sakkinen <jarkko@kernel.org>
+Tested-by: Reinette Chatre <reinette.chatre@intel.com>
+Link: https://lkml.kernel.org/r/20211026220050.697075-3-tony.luck@intel.com
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/Kconfig               | 1 +
+ arch/x86/kernel/cpu/sgx/main.c | 9 +++++++++
+ 2 files changed, 10 insertions(+)
+
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index 95dd1ee01546..b9281fab4e3e 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -1917,6 +1917,7 @@ config X86_SGX
+ 	select SRCU
+ 	select MMU_NOTIFIER
+ 	select NUMA_KEEP_MEMINFO if NUMA
++	select XARRAY_MULTI
+ 	help
+ 	  Intel(R) Software Guard eXtensions (SGX) is a set of CPU instructions
+ 	  that can be used by applications to set aside private regions of code
+diff --git a/arch/x86/kernel/cpu/sgx/main.c b/arch/x86/kernel/cpu/sgx/main.c
+index 825aa91516c8..5c02cffdabc8 100644
+--- a/arch/x86/kernel/cpu/sgx/main.c
++++ b/arch/x86/kernel/cpu/sgx/main.c
+@@ -20,6 +20,7 @@ struct sgx_epc_section sgx_epc_sections[SGX_MAX_EPC_SECTIONS];
+ static int sgx_nr_epc_sections;
+ static struct task_struct *ksgxd_tsk;
+ static DECLARE_WAIT_QUEUE_HEAD(ksgxd_waitq);
++static DEFINE_XARRAY(sgx_epc_address_space);
+ 
+ /*
+  * These variables are part of the state of the reclaimer, and must be accessed
+@@ -650,6 +651,8 @@ static bool __init sgx_setup_epc_section(u64 phys_addr, u64 size,
+ 	}
+ 
+ 	section->phys_addr = phys_addr;
++	xa_store_range(&sgx_epc_address_space, section->phys_addr,
++		       phys_addr + size - 1, section, GFP_KERNEL);
+ 
+ 	for (i = 0; i < nr_pages; i++) {
+ 		section->pages[i].section = index;
+@@ -661,6 +664,12 @@ static bool __init sgx_setup_epc_section(u64 phys_addr, u64 size,
+ 	return true;
+ }
+ 
++bool arch_is_platform_page(u64 paddr)
++{
++	return !!xa_load(&sgx_epc_address_space, paddr);
++}
++EXPORT_SYMBOL_GPL(arch_is_platform_page);
++
+ /**
+  * A section metric is concatenated in a way that @low bits 12-31 define the
+  * bits 12-31 of the metric and @high bits 0-19 define the bits 32-51 of the
+-- 
+2.34.1
+

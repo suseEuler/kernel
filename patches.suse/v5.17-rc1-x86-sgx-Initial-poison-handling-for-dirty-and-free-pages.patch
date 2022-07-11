@@ -1,0 +1,113 @@
+From 992801ae92431761b3d8ec88abd5793d154d34ac Mon Sep 17 00:00:00 2001
+From: Tony Luck <tony.luck@intel.com>
+Date: Tue, 26 Oct 2021 15:00:46 -0700
+Subject: [PATCH] x86/sgx: Initial poison handling for dirty and free pages
+Git-commit: 992801ae92431761b3d8ec88abd5793d154d34ac
+Patch-mainline: v5.17-rc1
+References: bsn#291
+Modified-by-SEL: Yes, modified due to different context
+
+
+A memory controller patrol scrubber can report poison in a page
+that isn't currently being used.
+
+Add "poison" field in the sgx_epc_page that can be set for an
+sgx_epc_page. Check for it:
+1) When sanitizing dirty pages
+2) When freeing epc pages
+
+Poison is a new field separated from flags to avoid having to make all
+updates to flags atomic, or integrate poison state changes into some
+other locking scheme to protect flags (Currently just sgx_reclaimer_lock
+which protects the SGX_EPC_PAGE_RECLAIMER_TRACKED bit in page->flags).
+
+In both cases place the poisoned page on a per-node list of poisoned
+epc pages to make sure it will not be reallocated.
+
+Signed-off-by: Tony Luck <tony.luck@intel.com>
+Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+Reviewed-by: Jarkko Sakkinen <jarkko@kernel.org>
+Tested-by: Reinette Chatre <reinette.chatre@intel.com>
+Link: https://lkml.kernel.org/r/20211026220050.697075-4-tony.luck@intel.com
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/kernel/cpu/sgx/main.c |   26 +++++++++++++++++++++++++-
+ arch/x86/kernel/cpu/sgx/sgx.h  |    4 +++-
+ 2 files changed, 28 insertions(+), 2 deletions(-)
+
+--- a/arch/x86/kernel/cpu/sgx/main.c
++++ b/arch/x86/kernel/cpu/sgx/main.c
+@@ -61,6 +61,24 @@ static void __sgx_sanitize_pages(struct
+ 
+ 		page = list_first_entry(dirty_page_list, struct sgx_epc_page, list);
+ 
++		/*
++		 * Checking page->poison without holding the node->lock
++		 * is racy, but losing the race (i.e. poison is set just
++		 * after the check) just means __eremove() will be uselessly
++		 * called for a page that sgx_free_epc_page() will put onto
++		 * the node->sgx_poison_page_list later.
++		 */
++		if (page->poison) {
++			struct sgx_epc_section *section = &sgx_epc_sections[page->section];
++			struct sgx_numa_node *node = section->node;
++
++			spin_lock(&node->lock);
++			list_move(&page->list, &node->sgx_poison_page_list);
++			spin_unlock(&node->lock);
++
++			continue;
++		}
++
+ 		ret = __eremove(sgx_get_epc_virt_addr(page));
+ 		if (!ret) {
+ 			/*
+@@ -626,7 +644,11 @@ void sgx_free_epc_page(struct sgx_epc_pa
+ 
+ 	spin_lock(&node->lock);
+ 
+-	list_add_tail(&page->list, &node->free_page_list);
++	page->owner = NULL;
++	if (page->poison)
++		list_add(&page->list, &node->sgx_poison_page_list);
++	else
++		list_add_tail(&page->list, &node->free_page_list);
+ 	page->flags = SGX_EPC_PAGE_IS_FREE;
+ 
+ 	spin_unlock(&node->lock);
+@@ -658,6 +680,7 @@ static bool __init sgx_setup_epc_section
+ 		section->pages[i].section = index;
+ 		section->pages[i].flags = 0;
+ 		section->pages[i].owner = NULL;
++		section->pages[i].poison = 0;
+ 		list_add_tail(&section->pages[i].list, &sgx_dirty_page_list);
+ 	}
+ 
+@@ -724,6 +747,7 @@ static bool __init sgx_page_cache_init(v
+ 		if (!node_isset(nid, sgx_numa_mask)) {
+ 			spin_lock_init(&sgx_numa_nodes[nid].lock);
+ 			INIT_LIST_HEAD(&sgx_numa_nodes[nid].free_page_list);
++			INIT_LIST_HEAD(&sgx_numa_nodes[nid].sgx_poison_page_list);
+ 			node_set(nid, sgx_numa_mask);
+ 		}
+ 
+--- a/arch/x86/kernel/cpu/sgx/sgx.h
++++ b/arch/x86/kernel/cpu/sgx/sgx.h
+@@ -31,7 +31,8 @@
+ 
+ struct sgx_epc_page {
+ 	unsigned int section;
+-	unsigned int flags;
++	u16 flags;
++	u16 poison;
+ 	struct sgx_encl_page *owner;
+ 	struct list_head list;
+ };
+@@ -42,6 +43,7 @@ struct sgx_epc_page {
+  */
+ struct sgx_numa_node {
+ 	struct list_head free_page_list;
++	struct list_head sgx_poison_page_list;
+ 	spinlock_t lock;
+ };
+ 

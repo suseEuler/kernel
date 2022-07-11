@@ -1,0 +1,130 @@
+From 03b122da74b22fbe7cd98184fa5657a9ce13970c Mon Sep 17 00:00:00 2001
+From: Tony Luck <tony.luck@intel.com>
+Date: Tue, 26 Oct 2021 15:00:48 -0700
+Subject: [PATCH] x86/sgx: Hook arch_memory_failure() into mainline code
+Git-commit: 03b122da74b22fbe7cd98184fa5657a9ce13970c
+Patch-mainline: v5.17-rc1
+References: bsn#291
+Modified-by-SEL: Yes, modified due to different context
+
+
+Add a call inside memory_failure() to call the arch specific code
+to check if the address is an SGX EPC page and handle it.
+
+Note the SGX EPC pages do not have a "struct page" entry, so the hook
+goes in at the same point as the device mapping hook.
+
+Pull the call to acquire the mutex earlier so the SGX errors are also
+protected.
+
+Make set_mce_nospec() skip SGX pages when trying to adjust
+the 1:1 map.
+
+Signed-off-by: Tony Luck <tony.luck@intel.com>
+Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+Reviewed-by: Jarkko Sakkinen <jarkko@kernel.org>
+Reviewed-by: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Tested-by: Reinette Chatre <reinette.chatre@intel.com>
+Link: https://lkml.kernel.org/r/20211026220050.697075-6-tony.luck@intel.com
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/include/asm/processor.h  |    8 ++++++++
+ arch/x86/include/asm/set_memory.h |    4 ++++
+ include/linux/mm.h                |   13 +++++++++++++
+ mm/memory-failure.c               |   19 +++++++++++++------
+ 4 files changed, 38 insertions(+), 6 deletions(-)
+
+--- a/arch/x86/include/asm/processor.h
++++ b/arch/x86/include/asm/processor.h
+@@ -864,4 +864,12 @@ enum mds_mitigations {
+ 	MDS_MITIGATION_VMWERV,
+ };
+ 
++#ifdef CONFIG_X86_SGX
++int arch_memory_failure(unsigned long pfn, int flags);
++#define arch_memory_failure arch_memory_failure
++
++bool arch_is_platform_page(u64 paddr);
++#define arch_is_platform_page arch_is_platform_page
++#endif
++
+ #endif /* _ASM_X86_PROCESSOR_H */
+--- a/arch/x86/include/asm/set_memory.h
++++ b/arch/x86/include/asm/set_memory.h
+@@ -2,6 +2,7 @@
+ #ifndef _ASM_X86_SET_MEMORY_H
+ #define _ASM_X86_SET_MEMORY_H
+ 
++#include <linux/mm.h>
+ #include <asm/page.h>
+ #include <asm-generic/set_memory.h>
+ 
+@@ -97,6 +98,9 @@ static inline int set_mce_nospec(unsigne
+ 	unsigned long decoy_addr;
+ 	int rc;
+ 
++	/* SGX pages are not in the 1:1 map */
++	if (arch_is_platform_page(pfn << PAGE_SHIFT))
++		return 0;
+ 	/*
+ 	 * We would like to just call:
+ 	 *      set_memory_XX((unsigned long)pfn_to_kaddr(pfn), 1);
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -3105,6 +3105,19 @@ extern void shake_page(struct page *p, i
+ extern atomic_long_t num_poisoned_pages __read_mostly;
+ extern int soft_offline_page(unsigned long pfn, int flags);
+ 
++#ifndef arch_memory_failure
++static inline int arch_memory_failure(unsigned long pfn, int flags)
++{
++	return -ENXIO;
++}
++#endif
++
++#ifndef arch_is_platform_page
++static inline bool arch_is_platform_page(u64 paddr)
++{
++	return false;
++}
++#endif
+ 
+ /*
+  * Error handlers for various types of pages.
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@ -1331,21 +1331,28 @@ int memory_failure(unsigned long pfn, in
+ 	if (!sysctl_memory_failure_recovery)
+ 		panic("Memory failure on page %lx", pfn);
+ 
++	mutex_lock(&mf_mutex);
++
+ 	p = pfn_to_online_page(pfn);
+ 	if (!p) {
++		res = arch_memory_failure(pfn, flags);
++		if (res == 0)
++			goto unlock_mutex;
++
+ 		if (pfn_valid(pfn)) {
+ 			pgmap = get_dev_pagemap(pfn, NULL);
+-			if (pgmap)
+-				return memory_failure_dev_pagemap(pfn, flags,
+-								  pgmap);
++			if (pgmap) {
++				res = memory_failure_dev_pagemap(pfn, flags,
++								 pgmap);
++				goto unlock_mutex;
++			}
+ 		}
+ 		pr_err("Memory failure: %#lx: memory outside kernel control\n",
+ 			pfn);
+-		return -ENXIO;
++		res = -ENXIO;
++		goto unlock_mutex;
+ 	}
+ 
+-	mutex_lock(&mf_mutex);
+-
+ 	if (PageHuge(p)) {
+ 		res = memory_failure_hugetlb(pfn, flags);
+ 		goto unlock_mutex;

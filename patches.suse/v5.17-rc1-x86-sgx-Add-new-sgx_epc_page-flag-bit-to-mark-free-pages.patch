@@ -1,0 +1,74 @@
+From d6d261bded8a57aed4faa12d08a5b193418d3aa4 Mon Sep 17 00:00:00 2001
+From: Tony Luck <tony.luck@intel.com>
+Date: Tue, 26 Oct 2021 15:00:44 -0700
+Subject: [PATCH] x86/sgx: Add new sgx_epc_page flag bit to mark free pages
+Git-commit: d6d261bded8a57aed4faa12d08a5b193418d3aa4
+Patch-mainline: v5.17-rc1
+References: bsn#291
+Modified-by-SEL: Yes, modified due to different context
+
+
+SGX EPC pages go through the following life cycle:
+
+        DIRTY ---> FREE ---> IN-USE --\
+                    ^                 |
+                    \-----------------/
+
+Recovery action for poison for a DIRTY or FREE page is simple. Just
+make sure never to allocate the page. IN-USE pages need some extra
+handling.
+
+Add a new flag bit SGX_EPC_PAGE_IS_FREE that is set when a page
+is added to a free list and cleared when the page is allocated.
+
+Notes:
+
+1) These transitions are made while holding the node->lock so that
+   future code that checks the flags while holding the node->lock
+   can be sure that if the SGX_EPC_PAGE_IS_FREE bit is set, then the
+   page is on the free list.
+
+2) Initially while the pages are on the dirty list the
+   SGX_EPC_PAGE_IS_FREE bit is cleared.
+
+Signed-off-by: Tony Luck <tony.luck@intel.com>
+Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+Reviewed-by: Jarkko Sakkinen <jarkko@kernel.org>
+Tested-by: Reinette Chatre <reinette.chatre@intel.com>
+Link: https://lkml.kernel.org/r/20211026220050.697075-2-tony.luck@intel.com
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/kernel/cpu/sgx/main.c |    2 ++
+ arch/x86/kernel/cpu/sgx/sgx.h  |    3 +++
+ 2 files changed, 5 insertions(+)
+
+--- a/arch/x86/kernel/cpu/sgx/main.c
++++ b/arch/x86/kernel/cpu/sgx/main.c
+@@ -471,6 +471,7 @@ static struct sgx_epc_page *__sgx_alloc_
+ 
+ 	page = list_first_entry(&node->free_page_list, struct sgx_epc_page, list);
+ 	list_del_init(&page->list);
++	page->flags = 0;
+ 
+ 	spin_unlock(&node->lock);
+ 	atomic_long_dec(&sgx_nr_free_pages);
+@@ -625,6 +626,7 @@ void sgx_free_epc_page(struct sgx_epc_pa
+ 	spin_lock(&node->lock);
+ 
+ 	list_add_tail(&page->list, &node->free_page_list);
++	page->flags = SGX_EPC_PAGE_IS_FREE;
+ 
+ 	spin_unlock(&node->lock);
+ 	atomic_long_inc(&sgx_nr_free_pages);
+--- a/arch/x86/kernel/cpu/sgx/sgx.h
++++ b/arch/x86/kernel/cpu/sgx/sgx.h
+@@ -26,6 +26,9 @@
+ /* Pages, which are being tracked by the page reclaimer. */
+ #define SGX_EPC_PAGE_RECLAIMER_TRACKED	BIT(0)
+ 
++/* Pages on free list */
++#define SGX_EPC_PAGE_IS_FREE		BIT(1)
++
+ struct sgx_epc_page {
+ 	unsigned int section;
+ 	unsigned int flags;

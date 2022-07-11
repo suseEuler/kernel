@@ -1,0 +1,75 @@
+From c6acb1e7bf4656b9434335c72b8245cc84575fde Mon Sep 17 00:00:00 2001
+From: Tony Luck <tony.luck@intel.com>
+Date: Tue, 26 Oct 2021 15:00:49 -0700
+Subject: [PATCH] x86/sgx: Add hook to error injection address validation
+Git-commit: c6acb1e7bf4656b9434335c72b8245cc84575fde
+Patch-mainline: v5.17-rc1
+References: bsn#291
+Modified-by-SEL: No
+
+
+SGX reserved memory does not appear in the standard address maps.
+
+Add hook to call into the SGX code to check if an address is located
+in SGX memory.
+
+There are other challenges in injecting errors into SGX. Update the
+documentation with a sequence of operations to inject.
+
+Signed-off-by: Tony Luck <tony.luck@intel.com>
+Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+Reviewed-by: Jarkko Sakkinen <jarkko@kernel.org>
+Tested-by: Reinette Chatre <reinette.chatre@intel.com>
+Link: https://lkml.kernel.org/r/20211026220050.697075-7-tony.luck@intel.com
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ .../firmware-guide/acpi/apei/einj.rst         | 19 +++++++++++++++++++
+ drivers/acpi/apei/einj.c                      |  3 ++-
+ 2 files changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/Documentation/firmware-guide/acpi/apei/einj.rst b/Documentation/firmware-guide/acpi/apei/einj.rst
+index c042176e1707..55e2331a6438 100644
+--- a/Documentation/firmware-guide/acpi/apei/einj.rst
++++ b/Documentation/firmware-guide/acpi/apei/einj.rst
+@@ -181,5 +181,24 @@ You should see something like this in dmesg::
+   [22715.834759] EDAC sbridge MC3: PROCESSOR 0:306e7 TIME 1422553404 SOCKET 0 APIC 0
+   [22716.616173] EDAC MC3: 1 CE memory read error on CPU_SrcID#0_Channel#0_DIMM#0 (channel:0 slot:0 page:0x12345 offset:0x0 grain:32 syndrome:0x0 -  area:DRAM err_code:0001:0090 socket:0 channel_mask:1 rank:0)
+ 
++Special notes for injection into SGX enclaves:
++
++There may be a separate BIOS setup option to enable SGX injection.
++
++The injection process consists of setting some special memory controller
++trigger that will inject the error on the next write to the target
++address. But the h/w prevents any software outside of an SGX enclave
++from accessing enclave pages (even BIOS SMM mode).
++
++The following sequence can be used:
++  1) Determine physical address of enclave page
++  2) Use "notrigger=1" mode to inject (this will setup
++     the injection address, but will not actually inject)
++  3) Enter the enclave
++  4) Store data to the virtual address matching physical address from step 1
++  5) Execute CLFLUSH for that virtual address
++  6) Spin delay for 250ms
++  7) Read from the virtual address. This will trigger the error
++
+ For more information about EINJ, please refer to ACPI specification
+ version 4.0, section 17.5 and ACPI 5.0, section 18.6.
+diff --git a/drivers/acpi/apei/einj.c b/drivers/acpi/apei/einj.c
+index edb2622fd35f..95cc2a9f3e05 100644
+--- a/drivers/acpi/apei/einj.c
++++ b/drivers/acpi/apei/einj.c
+@@ -545,7 +545,8 @@ static int einj_error_inject(u32 type, u32 flags, u64 param1, u64 param2,
+ 	    ((region_intersects(base_addr, size, IORESOURCE_SYSTEM_RAM, IORES_DESC_NONE)
+ 				!= REGION_INTERSECTS) &&
+ 	     (region_intersects(base_addr, size, IORESOURCE_MEM, IORES_DESC_PERSISTENT_MEMORY)
+-				!= REGION_INTERSECTS)))
++				!= REGION_INTERSECTS) &&
++	     !arch_is_platform_page(base_addr)))
+ 		return -EINVAL;
+ 
+ inject:
+-- 
+2.34.1
+
