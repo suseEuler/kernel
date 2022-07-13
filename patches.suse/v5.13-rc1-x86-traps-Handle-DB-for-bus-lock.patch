@@ -5,7 +5,7 @@ Subject: [PATCH] x86/traps: Handle #DB for bus lock
 Git-commit: ebb1064e7c2e90b56e4d40ab154ef9796060a1c3
 Patch-mainline: v5.13-rc1
 References: bsn#177
-Modified-by-SEL: Yes, modified due to different context
+Modified-by-SEL: No
 
 
 Bus locks degrade performance for the whole system, not just for the CPU
@@ -59,17 +59,19 @@ Reviewed-by: Tony Luck <tony.luck@intel.com>
 Link: https://lore.kernel.org/r/20210322135325.682257-3-fenghua.yu@intel.com
 Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
 ---
- arch/x86/include/asm/cpu.h           |    7 +-
- arch/x86/include/asm/msr-index.h     |    1 
- arch/x86/include/uapi/asm/debugreg.h |    1 
- arch/x86/kernel/cpu/common.c         |    2 
- arch/x86/kernel/cpu/intel.c          |  111 +++++++++++++++++++++++++++++------
- arch/x86/kernel/traps.c              |    4 +
+ arch/x86/include/asm/cpu.h           |   7 +-
+ arch/x86/include/asm/msr-index.h     |   1 +
+ arch/x86/include/uapi/asm/debugreg.h |   1 +
+ arch/x86/kernel/cpu/common.c         |   2 +-
+ arch/x86/kernel/cpu/intel.c          | 111 ++++++++++++++++++++++-----
+ arch/x86/kernel/traps.c              |   4 +
  6 files changed, 104 insertions(+), 22 deletions(-)
 
+diff --git a/arch/x86/include/asm/cpu.h b/arch/x86/include/asm/cpu.h
+index da78ccbd493b..0d7fc0e2bfc9 100644
 --- a/arch/x86/include/asm/cpu.h
 +++ b/arch/x86/include/asm/cpu.h
-@@ -41,12 +41,13 @@ unsigned int x86_family(unsigned int sig
+@@ -41,12 +41,13 @@ unsigned int x86_family(unsigned int sig);
  unsigned int x86_model(unsigned int sig);
  unsigned int x86_stepping(unsigned int sig);
  #ifdef CONFIG_CPU_SUP_INTEL
@@ -85,7 +87,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  static inline void switch_to_sld(unsigned long tifn) {}
  static inline bool handle_user_split_lock(struct pt_regs *regs, long error_code)
  {
-@@ -57,6 +58,8 @@ static inline bool handle_guest_split_lo
+@@ -57,6 +58,8 @@ static inline bool handle_guest_split_lock(unsigned long ip)
  {
  	return false;
  }
@@ -94,9 +96,11 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  #endif
  #ifdef CONFIG_IA32_FEAT_CTL
  void init_ia32_feat_ctl(struct cpuinfo_x86 *c);
+diff --git a/arch/x86/include/asm/msr-index.h b/arch/x86/include/asm/msr-index.h
+index 546d6ecf0a35..32c496fb11b6 100644
 --- a/arch/x86/include/asm/msr-index.h
 +++ b/arch/x86/include/asm/msr-index.h
-@@ -264,6 +264,7 @@
+@@ -265,6 +265,7 @@
  #define DEBUGCTLMSR_LBR			(1UL <<  0) /* last branch recording */
  #define DEBUGCTLMSR_BTF_SHIFT		1
  #define DEBUGCTLMSR_BTF			(1UL <<  1) /* single-step on branches */
@@ -104,6 +108,8 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  #define DEBUGCTLMSR_TR			(1UL <<  6)
  #define DEBUGCTLMSR_BTS			(1UL <<  7)
  #define DEBUGCTLMSR_BTINT		(1UL <<  8)
+diff --git a/arch/x86/include/uapi/asm/debugreg.h b/arch/x86/include/uapi/asm/debugreg.h
+index d95d080b30e3..0007ba077c0c 100644
 --- a/arch/x86/include/uapi/asm/debugreg.h
 +++ b/arch/x86/include/uapi/asm/debugreg.h
 @@ -24,6 +24,7 @@
@@ -114,9 +120,11 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  #define DR_STEP		(0x4000)	/* single-step */
  #define DR_SWITCH	(0x8000)	/* task switch */
  
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index ab640abe26b6..1a4e260b9027 100644
 --- a/arch/x86/kernel/cpu/common.c
 +++ b/arch/x86/kernel/cpu/common.c
-@@ -1331,7 +1331,7 @@ static void __init early_identify_cpu(st
+@@ -1330,7 +1330,7 @@ static void __init early_identify_cpu(struct cpuinfo_x86 *c)
  
  	cpu_set_bug_bits(c);
  
@@ -125,9 +133,11 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  
  	fpu__init_system(c);
  
+diff --git a/arch/x86/kernel/cpu/intel.c b/arch/x86/kernel/cpu/intel.c
+index 0e422a544835..e25e52bafeb6 100644
 --- a/arch/x86/kernel/cpu/intel.c
 +++ b/arch/x86/kernel/cpu/intel.c
-@@ -43,9 +43,9 @@ enum split_lock_detect_state {
+@@ -44,9 +44,9 @@ enum split_lock_detect_state {
  };
  
  /*
@@ -140,7 +150,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
   */
  static enum split_lock_detect_state sld_state __ro_after_init = sld_off;
  static u64 msr_test_ctrl_cache __ro_after_init;
-@@ -602,6 +602,7 @@ static void init_intel_misc_features(str
+@@ -603,6 +603,7 @@ static void init_intel_misc_features(struct cpuinfo_x86 *c)
  }
  
  static void split_lock_init(void);
@@ -148,15 +158,15 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  
  static void init_intel(struct cpuinfo_x86 *c)
  {
-@@ -719,6 +720,7 @@ static void init_intel(struct cpuinfo_x8
+@@ -720,6 +721,7 @@ static void init_intel(struct cpuinfo_x86 *c)
  		tsx_disable();
  
  	split_lock_init();
 +	bus_lock_init();
- }
  
- #ifdef CONFIG_X86_32
-@@ -1017,16 +1019,15 @@ static bool split_lock_verify_msr(bool o
+ 	intel_init_thermal(c);
+ }
+@@ -1020,16 +1022,15 @@ static bool split_lock_verify_msr(bool on)
  	return ctrl == tmp;
  }
  
@@ -176,7 +186,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  
  	ret = cmdline_find_option(boot_command_line, "split_lock_detect",
  				  arg, sizeof(arg));
-@@ -1038,17 +1039,14 @@ static void __init split_lock_setup(void
+@@ -1041,17 +1042,14 @@ static void __init split_lock_setup(void)
  			}
  		}
  	}
@@ -200,7 +210,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  	}
  
  	rdmsrl(MSR_TEST_CTRL, msr_test_ctrl_cache);
-@@ -1058,7 +1056,9 @@ static void __init split_lock_setup(void
+@@ -1061,7 +1059,9 @@ static void __init split_lock_setup(void)
  		return;
  	}
  
@@ -211,7 +221,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  	setup_force_cpu_cap(X86_FEATURE_SPLIT_LOCK_DETECT);
  }
  
-@@ -1115,6 +1115,29 @@ bool handle_guest_split_lock(unsigned lo
+@@ -1118,6 +1118,29 @@ bool handle_guest_split_lock(unsigned long ip)
  }
  EXPORT_SYMBOL_GPL(handle_guest_split_lock);
  
@@ -241,7 +251,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  bool handle_user_split_lock(struct pt_regs *regs, long error_code)
  {
  	if ((regs->flags & X86_EFLAGS_AC) || sld_state == sld_fatal)
-@@ -1123,6 +1146,21 @@ bool handle_user_split_lock(struct pt_re
+@@ -1126,6 +1149,21 @@ bool handle_user_split_lock(struct pt_regs *regs, long error_code)
  	return true;
  }
  
@@ -263,7 +273,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  /*
   * This function is called only when switching between tasks with
   * different split-lock detection modes. It sets the MSR for the
-@@ -1163,7 +1201,7 @@ static const struct x86_cpu_id split_loc
+@@ -1166,7 +1204,7 @@ static const struct x86_cpu_id split_lock_cpu_ids[] __initconst = {
  	{}
  };
  
@@ -272,7 +282,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  {
  	const struct x86_cpu_id *m;
  	u64 ia32_core_caps;
-@@ -1190,5 +1228,40 @@ void __init cpu_set_core_cap_bits(struct
+@@ -1193,5 +1231,40 @@ void __init cpu_set_core_cap_bits(struct cpuinfo_x86 *c)
  	}
  
  	cpu_model_supports_sld = true;
@@ -314,9 +324,11 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
 +	sld_state_setup();
 +	sld_state_show();
  }
+diff --git a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
+index ac1874a2a70e..7bb94a6edc04 100644
 --- a/arch/x86/kernel/traps.c
 +++ b/arch/x86/kernel/traps.c
-@@ -1013,6 +1013,10 @@ static __always_inline void exc_debug_us
+@@ -978,6 +978,10 @@ static __always_inline void exc_debug_user(struct pt_regs *regs,
  		goto out_irq;
  	}
  
@@ -327,3 +339,6 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  	/* Add the virtual_dr6 bits for signals. */
  	dr6 |= current->thread.virtual_dr6;
  	if (dr6 & (DR_STEP | DR_TRAP_BITS) || icebp)
+-- 
+2.34.1
+
