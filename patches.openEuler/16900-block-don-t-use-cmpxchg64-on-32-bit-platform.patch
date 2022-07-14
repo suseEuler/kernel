@@ -1,0 +1,129 @@
+From 73f2375543585646bb85c64d83936cd3541a1121 Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Wed, 13 Jul 2022 17:52:10 +0800
+Subject: [PATCH] block: don't use cmpxchg64() on 32-bit platform
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 73f2375543585646bb85c64d83936cd3541a1121
+Modified-by-SEL: Yes, refreshed due to different context
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I57S8D
+CVE: NA
+
+--------------------------------
+
+Some 32-bit platform doesn't support cmpxchg64(), using it in generic
+code will cause compile error.
+
+Fixes: 4c8f034bf1e6 ("[Huawei] block: update nsecs[] in part_stat_show() and diskstats_show()")
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ block/blk-core.c |    6 ++++++
+ block/blk-mq.c   |    3 ++-
+ block/blk-mq.h   |    2 ++
+ block/genhd.c    |    8 ++++++--
+ 4 files changed, 16 insertions(+), 3 deletions(-)
+
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -1292,13 +1292,16 @@ void blk_account_io_done(struct request
+ 	    !(req->rq_flags & RQF_FLUSH_SEQ)) {
+ 		const int sgrp = op_stat_group(req_op(req));
+ 		struct hd_struct *part;
++#ifdef CONFIG_64BIT
+ 		u64 stat_time;
+ 		struct request_wrapper *rq_wrapper = request_to_wrapper(req);
++#endif
+ 
+ 		part_stat_lock();
+ 		part = req->part;
+ 		update_io_ticks(part, jiffies, true);
+ 		part_stat_inc(part, ios[sgrp]);
++#ifdef CONFIG_64BIT
+ 		stat_time = READ_ONCE(rq_wrapper->stat_time_ns);
+ 		/*
+ 		 * This might fail if 'stat_time_ns' is updated
+@@ -1312,6 +1315,9 @@ void blk_account_io_done(struct request
+ 
+ 			part_stat_add(req->part, nsecs[sgrp], duation);
+ 		}
++#else
++		part_stat_add(part, nsecs[sgrp], now - req->start_time_ns);
++#endif
+ 		part_stat_unlock();
+ 
+ 		hd_struct_put(part);
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -102,6 +102,7 @@ struct mq_inflight {
+ 	unsigned int inflight[2];
+ };
+ 
++#ifdef CONFIG_64BIT
+ static bool blk_mq_check_inflight_with_stat(struct blk_mq_hw_ctx *hctx,
+ 					    struct request *rq, void *priv,
+ 					    bool reserved)
+@@ -154,7 +155,7 @@ unsigned int blk_mq_in_flight_with_stat(
+ 
+ 	return mi.inflight[0] + mi.inflight[1];
+ }
+-
++#endif
+ 
+ static bool blk_mq_check_inflight(struct blk_mq_hw_ctx *hctx,
+ 				  struct request *rq, void *priv,
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -188,8 +188,10 @@ static inline bool blk_mq_hw_queue_mappe
+ unsigned int blk_mq_in_flight(struct request_queue *q, struct hd_struct *part);
+ void blk_mq_in_flight_rw(struct request_queue *q, struct hd_struct *part,
+ 			 unsigned int inflight[2]);
++#ifdef CONFIG_64BIT
+ unsigned int blk_mq_in_flight_with_stat(struct request_queue *q,
+ 					struct hd_struct *part);
++#endif
+ 
+ static inline void blk_mq_put_dispatch_budget(struct request_queue *q,
+ 					      int budget_token)
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -1293,6 +1293,7 @@ ssize_t part_size_show(struct device *de
+ 		(unsigned long long)part_nr_sects_read(p));
+ }
+ 
++#ifdef CONFIG_64BIT
+ static void part_set_stat_time(struct hd_struct *hd)
+ {
+ 	u64 now = ktime_get_ns();
+@@ -1304,12 +1305,13 @@ again:
+ 		goto again;
+ 	}
+ }
++#endif
+ 
+ static void part_get_stat_info(struct hd_struct *hd, struct disk_stats *stat,
+ 			       unsigned int *inflight)
+ {
++#ifdef CONFIG_64BIT
+ 	struct request_queue *q = part_to_disk(hd)->queue;
+-
+ 	if (queue_is_mq(q)) {
+ 		mutex_lock(&part_to_dev(hd)->mutex);
+ 		part_stat_lock();
+@@ -1320,7 +1322,9 @@ static void part_get_stat_info(struct hd
+ 	} else {
+ 		*inflight = part_in_flight(hd);
+ 	}
+-
++#else
++	*inflight = part_in_flight(hd);
++#endif
+ 	if (*inflight) {
+ 		part_stat_lock();
+ 		update_io_ticks(hd, jiffies, true);

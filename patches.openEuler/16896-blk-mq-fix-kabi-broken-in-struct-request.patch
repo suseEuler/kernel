@@ -1,0 +1,160 @@
+From f60df4a0a6adbecd7f5d1a354eed037645eee13a Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Wed, 13 Jul 2022 17:52:06 +0800
+Subject: [PATCH] blk-mq: fix kabi broken in struct request
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: f60df4a0a6adbecd7f5d1a354eed037645eee13a
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I57S8D
+CVE: NA
+
+--------------------------------
+
+Since there are no reserved fields, declare a wrapper to fix kabi
+broken.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ block/blk-core.c       |  7 ++++---
+ block/blk-mq.c         | 12 +++++++-----
+ include/linux/blk-mq.h | 13 +++++++++++--
+ include/linux/blkdev.h |  2 --
+ 4 files changed, 22 insertions(+), 12 deletions(-)
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index f5f419dd8ab6..8b93366c76e4 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -1293,17 +1293,18 @@ void blk_account_io_done(struct request *req, u64 now)
+ 		const int sgrp = op_stat_group(req_op(req));
+ 		struct hd_struct *part;
+ 		u64 stat_time;
++		struct request_wrapper *rq_wrapper = request_to_wrapper(req);
+ 
+ 		part_stat_lock();
+ 		part = req->part;
+ 		update_io_ticks(part, jiffies, true);
+ 		part_stat_inc(part, ios[sgrp]);
+-		stat_time = READ_ONCE(req->stat_time_ns);
++		stat_time = READ_ONCE(rq_wrapper->stat_time_ns);
+ 		/*
+-		 * This might fail if 'req->stat_time_ns' is updated
++		 * This might fail if 'stat_time_ns' is updated
+ 		 * in blk_mq_check_inflight_with_stat().
+ 		 */
+-		if (likely(cmpxchg64(&req->stat_time_ns, stat_time, now)
++		if (likely(cmpxchg64(&rq_wrapper->stat_time_ns, stat_time, now)
+ 			   == stat_time)) {
+ 			u64 duation = stat_time ? now - stat_time :
+ 				now - req->start_time_ns;
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 2cf387697a41..76ff229e7fb2 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -111,17 +111,19 @@ static bool blk_mq_check_inflight_with_stat(struct blk_mq_hw_ctx *hctx,
+ 	if ((!mi->part->partno || rq->part == mi->part) &&
+ 	    blk_mq_rq_state(rq) == MQ_RQ_IN_FLIGHT) {
+ 		u64 stat_time;
++		struct request_wrapper *rq_wrapper;
+ 
+ 		mi->inflight[rq_data_dir(rq)]++;
+ 		if (!rq->part)
+ 			return true;
+ 
+-		stat_time = READ_ONCE(rq->stat_time_ns);
++		rq_wrapper = request_to_wrapper(rq);
++		stat_time = READ_ONCE(rq_wrapper->stat_time_ns);
+ 		/*
+-		 * This might fail if 'req->stat_time_ns' is updated in
++		 * This might fail if 'stat_time_ns' is updated in
+ 		 * blk_account_io_done().
+ 		 */
+-		if (likely(cmpxchg64(&rq->stat_time_ns, stat_time,
++		if (likely(cmpxchg64(&rq_wrapper->stat_time_ns, stat_time,
+ 				   rq->part->stat_time) == stat_time)) {
+ 			int sgrp = op_stat_group(req_op(rq));
+ 			u64 duation = stat_time ?
+@@ -368,11 +370,11 @@ static struct request *blk_mq_rq_ctx_init(struct blk_mq_alloc_data *data,
+ #ifdef CONFIG_BLK_RQ_ALLOC_TIME
+ 	rq->alloc_time_ns = alloc_time_ns;
+ #endif
++	request_to_wrapper(rq)->stat_time_ns = 0;
+ 	if (blk_mq_need_time_stamp(rq))
+ 		rq->start_time_ns = ktime_get_ns();
+ 	else
+ 		rq->start_time_ns = 0;
+-	rq->stat_time_ns = 0;
+ 	rq->io_start_time_ns = 0;
+ 	rq->stats_sectors = 0;
+ 	rq->nr_phys_segments = 0;
+@@ -2555,7 +2557,7 @@ int blk_mq_alloc_rqs(struct blk_mq_tag_set *set, struct blk_mq_tags *tags,
+ 	 * rq_size is the size of the request plus driver payload, rounded
+ 	 * to the cacheline size
+ 	 */
+-	rq_size = round_up(sizeof(struct request) + set->cmd_size,
++	rq_size = round_up(sizeof(struct request_wrapper) + set->cmd_size,
+ 				cache_line_size());
+ 	left = rq_size * depth;
+ 
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index c9210fb70e4d..ac83257972a0 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -304,6 +304,15 @@ struct blk_mq_queue_data {
+ 	KABI_RESERVE(1)
+ };
+ 
++struct request_wrapper {
++	struct request rq;
++
++	/* Time that I/O was counted in part_get_stat_info(). */
++	u64 stat_time_ns;
++};
++
++#define request_to_wrapper(_rq) container_of(_rq, struct request_wrapper, rq)
++
+ typedef bool (busy_iter_fn)(struct blk_mq_hw_ctx *, struct request *, void *,
+ 		bool);
+ typedef bool (busy_tag_iter_fn)(struct request *, void *, bool);
+@@ -595,7 +604,7 @@ static inline bool blk_should_fake_timeout(struct request_queue *q)
+  */
+ static inline struct request *blk_mq_rq_from_pdu(void *pdu)
+ {
+-	return pdu - sizeof(struct request);
++	return pdu - sizeof(struct request_wrapper);
+ }
+ 
+ /**
+@@ -609,7 +618,7 @@ static inline struct request *blk_mq_rq_from_pdu(void *pdu)
+  */
+ static inline void *blk_mq_rq_to_pdu(struct request *rq)
+ {
+-	return rq + 1;
++	return request_to_wrapper(rq) + 1;
+ }
+ 
+ static inline struct blk_mq_hw_ctx *queue_hctx(struct request_queue *q, int id)
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 46feee6bd45c..49540ce9e325 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -207,8 +207,6 @@ struct request {
+ 	u64 start_time_ns;
+ 	/* Time that I/O was submitted to the device. */
+ 	u64 io_start_time_ns;
+-	/* Time that I/O was counted in part_get_stat_info(). */
+-	u64 stat_time_ns;
+ #ifdef CONFIG_BLK_WBT
+ 	unsigned short wbt_flags;
+ #endif
+-- 
+2.34.1
+

@@ -1,0 +1,103 @@
+From d518f3fde0a758f70fa5a0a7909e69a43a0b77eb Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Wed, 13 Jul 2022 17:52:09 +0800
+Subject: [PATCH] block: fix that iostat can show huge wait time
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: d518f3fde0a758f70fa5a0a7909e69a43a0b77eb
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I57S8D
+CVE: NA
+
+--------------------------------
+
+There might be a problem that iostat can read less 'nsecs' than the
+last time.
+
+1) io is started after 'hd->stat_time' is set.
+
+2) following concurrent scenario:
+
+t1                              t2
+                                blk_mq_end_request
+				 time1 -> before hd->stat_time
+
+				 blk_account_io_done
+part_get_stat_info
+ part_set_stat_time
+  hd->stat_time = time2
+  -> time1 < time2
+ blk_mq_in_flight_with_stat
+  blk_mq_check_inflight_with_stat
+   cmpxchg64()
+   -> set stat_time_ns to time2
+				  cmpxchg64()
+				  -> set stat_time to time1
+				  duation = time1 - time2;
+				  -> time1 < time2
+				  part_stat_add(xx, nsecs, duation)
+				  -> problematic
+
+3) Similar concurrent scenario the other way around.
+
+Fix the problem by don't add 'duation' if the calculation might underflow.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ block/blk-core.c |  3 ++-
+ block/blk-mq.c   | 12 ++++++++++--
+ 2 files changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 8b93366c76e4..715b61c239ea 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -1304,7 +1304,8 @@ void blk_account_io_done(struct request *req, u64 now)
+ 		 * This might fail if 'stat_time_ns' is updated
+ 		 * in blk_mq_check_inflight_with_stat().
+ 		 */
+-		if (likely(cmpxchg64(&rq_wrapper->stat_time_ns, stat_time, now)
++		if (likely(now > stat_time &&
++			   cmpxchg64(&rq_wrapper->stat_time_ns, stat_time, now)
+ 			   == stat_time)) {
+ 			u64 duation = stat_time ? now - stat_time :
+ 				now - req->start_time_ns;
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 76ff229e7fb2..5031c4fc4412 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -117,14 +117,22 @@ static bool blk_mq_check_inflight_with_stat(struct blk_mq_hw_ctx *hctx,
+ 		if (!rq->part)
+ 			return true;
+ 
++		/*
++		 * If the request is started after 'part->stat_time' is set,
++		 * don't update 'nsces' here.
++		 */
++		if (rq->part->stat_time <= rq->start_time_ns)
++			return true;
++
+ 		rq_wrapper = request_to_wrapper(rq);
+ 		stat_time = READ_ONCE(rq_wrapper->stat_time_ns);
+ 		/*
+ 		 * This might fail if 'stat_time_ns' is updated in
+ 		 * blk_account_io_done().
+ 		 */
+-		if (likely(cmpxchg64(&rq_wrapper->stat_time_ns, stat_time,
+-				   rq->part->stat_time) == stat_time)) {
++		if (likely(rq->part->stat_time > stat_time &&
++			   cmpxchg64(&rq_wrapper->stat_time_ns, stat_time,
++				     rq->part->stat_time) == stat_time)) {
+ 			int sgrp = op_stat_group(req_op(rq));
+ 			u64 duation = stat_time ?
+ 				rq->part->stat_time - stat_time :
+-- 
+2.34.1
+

@@ -1,0 +1,263 @@
+From d8e6687dea9e87600586303c49269105a2366110 Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Wed, 13 Jul 2022 17:52:05 +0800
+Subject: [PATCH] block: update nsecs[] in part_stat_show() and
+ diskstats_show()
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: d8e6687dea9e87600586303c49269105a2366110
+Modified-by-SEL: Yes, refreshed due to different context
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I57S8D
+CVE: NA
+
+--------------------------------
+
+commit 7ec2ec682568 ("block: update io_ticks when io hang") fixed that
+%util will be zero for iostat when io is hanged, however, avgqu-sz is
+still zero while it represents the number of io that are hunged. On the
+other hand, for some slow device, if an io is started before and done
+after diskstats is read, the avgqu-sz will be miscalculated.
+
+To fix the problem, update 'nsecs[]' when part_stat_show() or
+diskstats_show() is called. In order to do that, add 'stat_time' in
+struct hd_struct and 'rq_stat_time' in struct request to record the
+time. And during iteration, update 'nsecs[]' for each inflight request.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ block/blk-core.c        |   15 ++++++++++-
+ block/blk-mq.c          |   45 +++++++++++++++++++++++++++++++++++
+ block/blk-mq.h          |    2 +
+ block/genhd.c           |   61 ++++++++++++++++++++++++++++++------------------
+ block/partitions/core.c |    2 +
+ include/linux/blkdev.h  |    3 +-
+ include/linux/genhd.h   |    2 +
+ 7 files changed, 105 insertions(+), 25 deletions(-)
+
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -1292,13 +1292,24 @@ void blk_account_io_done(struct request
+ 	    !(req->rq_flags & RQF_FLUSH_SEQ)) {
+ 		const int sgrp = op_stat_group(req_op(req));
+ 		struct hd_struct *part;
++		u64 stat_time;
+ 
+ 		part_stat_lock();
+ 		part = req->part;
+-
+ 		update_io_ticks(part, jiffies, true);
+ 		part_stat_inc(part, ios[sgrp]);
+-		part_stat_add(part, nsecs[sgrp], now - req->start_time_ns);
++		stat_time = READ_ONCE(req->stat_time_ns);
++		/*
++		 * This might fail if 'req->stat_time_ns' is updated
++		 * in blk_mq_check_inflight_with_stat().
++		 */
++		if (likely(cmpxchg64(&req->stat_time_ns, stat_time, now)
++			   == stat_time)) {
++			u64 duation = stat_time ? now - stat_time :
++				now - req->start_time_ns;
++
++			part_stat_add(req->part, nsecs[sgrp], duation);
++		}
+ 		part_stat_unlock();
+ 
+ 		hd_struct_put(part);
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -102,6 +102,50 @@ struct mq_inflight {
+ 	unsigned int inflight[2];
+ };
+ 
++static bool blk_mq_check_inflight_with_stat(struct blk_mq_hw_ctx *hctx,
++					    struct request *rq, void *priv,
++					    bool reserved)
++{
++	struct mq_inflight *mi = priv;
++
++	if ((!mi->part->partno || rq->part == mi->part) &&
++	    blk_mq_rq_state(rq) == MQ_RQ_IN_FLIGHT) {
++		u64 stat_time;
++
++		mi->inflight[rq_data_dir(rq)]++;
++		if (!rq->part)
++			return true;
++
++		stat_time = READ_ONCE(rq->stat_time_ns);
++		/*
++		 * This might fail if 'req->stat_time_ns' is updated in
++		 * blk_account_io_done().
++		 */
++		if (likely(cmpxchg64(&rq->stat_time_ns, stat_time,
++				   rq->part->stat_time) == stat_time)) {
++			int sgrp = op_stat_group(req_op(rq));
++			u64 duation = stat_time ?
++				rq->part->stat_time - stat_time :
++				rq->part->stat_time - rq->start_time_ns;
++
++			part_stat_add(rq->part, nsecs[sgrp], duation);
++		}
++	}
++
++	return true;
++}
++
++unsigned int blk_mq_in_flight_with_stat(struct request_queue *q,
++					struct hd_struct *part)
++{
++	struct mq_inflight mi = { .part = part };
++
++	blk_mq_queue_tag_busy_iter(q, blk_mq_check_inflight_with_stat, &mi);
++
++	return mi.inflight[0] + mi.inflight[1];
++}
++
++
+ static bool blk_mq_check_inflight(struct blk_mq_hw_ctx *hctx,
+ 				  struct request *rq, void *priv,
+ 				  bool reserved)
+@@ -340,6 +384,7 @@ static struct request *blk_mq_rq_ctx_ini
+ 		rq->start_time_ns = ktime_get_ns();
+ 	else
+ 		rq->start_time_ns = 0;
++	rq->stat_time_ns = 0;
+ 	rq->io_start_time_ns = 0;
+ 	rq->stats_sectors = 0;
+ 	rq->nr_phys_segments = 0;
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -188,6 +188,8 @@ static inline bool blk_mq_hw_queue_mappe
+ unsigned int blk_mq_in_flight(struct request_queue *q, struct hd_struct *part);
+ void blk_mq_in_flight_rw(struct request_queue *q, struct hd_struct *part,
+ 			 unsigned int inflight[2]);
++unsigned int blk_mq_in_flight_with_stat(struct request_queue *q,
++					struct hd_struct *part);
+ 
+ static inline void blk_mq_put_dispatch_budget(struct request_queue *q,
+ 					      int budget_token)
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -1293,25 +1293,52 @@ ssize_t part_size_show(struct device *de
+ 		(unsigned long long)part_nr_sects_read(p));
+ }
+ 
++static void part_set_stat_time(struct hd_struct *hd)
++{
++	u64 now = ktime_get_ns();
++
++again:
++	hd->stat_time = now;
++	if (hd->partno) {
++		hd = &part_to_disk(hd)->part0;
++		goto again;
++	}
++}
++
++static void part_get_stat_info(struct hd_struct *hd, struct disk_stats *stat,
++			       unsigned int *inflight)
++{
++	struct request_queue *q = part_to_disk(hd)->queue;
++
++	if (queue_is_mq(q)) {
++		part_stat_lock();
++		spin_lock(&hd->bd_stat_lock);
++		part_set_stat_time(hd);
++		*inflight = blk_mq_in_flight_with_stat(q, hd);
++		spin_unlock(&hd->bd_stat_lock);
++		part_stat_unlock();
++	} else {
++		*inflight = part_in_flight(hd);
++	}
++
++	if (*inflight) {
++		part_stat_lock();
++		update_io_ticks(hd, jiffies, true);
++		part_stat_unlock();
++	}
++
++	part_stat_read_all(hd, stat);
++}
++
+ ssize_t part_stat_show(struct device *dev,
+ 		       struct device_attribute *attr, char *buf)
+ {
+ 	struct hd_struct *p = dev_to_part(dev);
+-	struct request_queue *q = part_to_disk(p)->queue;
+ 	struct disk_stats stat;
+ 	unsigned int inflight;
+ 
+-	if (queue_is_mq(q))
+-		inflight = blk_mq_in_flight(q, p);
+-	else
+-		inflight = part_in_flight(p);
++	part_get_stat_info(p, &stat, &inflight);
+ 
+-	if (inflight) {
+-		part_stat_lock();
+-		update_io_ticks(p, jiffies, true);
+-		part_stat_unlock();
+-	}
+-	part_stat_read_all(p, &stat);
+ 	return sprintf(buf,
+ 		"%8lu %8lu %8llu %8u "
+ 		"%8lu %8lu %8llu %8u "
+@@ -1628,17 +1655,7 @@ static int diskstats_show(struct seq_fil
+ 
+ 	disk_part_iter_init(&piter, gp, DISK_PITER_INCL_EMPTY_PART0);
+ 	while ((hd = disk_part_iter_next(&piter))) {
+-		if (queue_is_mq(gp->queue))
+-			inflight = blk_mq_in_flight(gp->queue, hd);
+-		else
+-			inflight = part_in_flight(hd);
+-
+-		if (inflight) {
+-			part_stat_lock();
+-			update_io_ticks(hd, jiffies, true);
+-			part_stat_unlock();
+-		}
+-		part_stat_read_all(hd, &stat);
++		part_get_stat_info(hd, &stat, &inflight);
+ 		seq_printf(seqf, "%4d %7d %s "
+ 			   "%lu %lu %lu %u "
+ 			   "%lu %lu %lu %u "
+--- a/block/partitions/core.c
++++ b/block/partitions/core.c
+@@ -415,6 +415,8 @@ static struct hd_struct *add_partition(s
+ 	p->nr_sects = len;
+ 	p->partno = partno;
+ 	p->read_only = get_disk_ro(disk) | test_bit(partno, disk->user_ro_bitmap);
++	p->stat_time = 0;
++	spin_lock_init(&p->bd_stat_lock);
+ 
+ 	if (info) {
+ 		struct partition_meta_info *pinfo;
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -207,7 +207,8 @@ struct request {
+ 	u64 start_time_ns;
+ 	/* Time that I/O was submitted to the device. */
+ 	u64 io_start_time_ns;
+-
++	/* Time that I/O was counted in part_get_stat_info(). */
++	u64 stat_time_ns;
+ #ifdef CONFIG_BLK_WBT
+ 	unsigned short wbt_flags;
+ #endif
+--- a/include/linux/genhd.h
++++ b/include/linux/genhd.h
+@@ -63,6 +63,8 @@ struct hd_struct {
+ 	seqcount_t nr_sects_seq;
+ #endif
+ 	unsigned long stamp;
++	spinlock_t bd_stat_lock;
++	u64 stat_time;
+ 	struct disk_stats __percpu *dkstats;
+ 	struct percpu_ref ref;
+ 
