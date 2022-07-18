@@ -1,0 +1,124 @@
+From bc1bb416bbb9203e250f5c49aaf1d11b5d9c8adb Mon Sep 17 00:00:00 2001
+From: Al Viro <viro@zeniv.linux.org.uk>
+Date: Mon, 31 May 2021 00:32:44 -0400
+Subject: [PATCH] generic_perform_write()/iomap_write_actor(): saner logics for
+ short copy
+Git-commit: bc1bb416bbb9203e250f5c49aaf1d11b5d9c8adb
+Patch-mainline: v5.14-rc1
+References: bsn#307
+Modified-by-SEL: No
+
+
+if we run into a short copy and ->write_end() refuses to advance at all,
+use the amount we'd managed to copy for the next iteration to handle.
+
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/iomap/buffered-io.c | 25 ++++++++++---------------
+ mm/filemap.c           | 24 +++++++++---------------
+ 2 files changed, 19 insertions(+), 30 deletions(-)
+
+diff --git a/fs/iomap/buffered-io.c b/fs/iomap/buffered-io.c
+index f2cd2034a87b..354b41d20e5d 100644
+--- a/fs/iomap/buffered-io.c
++++ b/fs/iomap/buffered-io.c
+@@ -771,10 +771,6 @@ iomap_write_actor(struct inode *inode, loff_t pos, loff_t length, void *data,
+ 		 * Otherwise there's a nasty deadlock on copying from the
+ 		 * same page as we're writing to, without it being marked
+ 		 * up-to-date.
+-		 *
+-		 * Not only is this an optimisation, but it is also required
+-		 * to check that the address is actually valid, when atomic
+-		 * usercopies are used, below.
+ 		 */
+ 		if (unlikely(iov_iter_fault_in_readable(i, bytes))) {
+ 			status = -EFAULT;
+@@ -791,25 +787,24 @@ iomap_write_actor(struct inode *inode, loff_t pos, loff_t length, void *data,
+ 
+ 		copied = iov_iter_copy_from_user_atomic(page, i, offset, bytes);
+ 
+-		copied = iomap_write_end(inode, pos, bytes, copied, page, iomap,
++		status = iomap_write_end(inode, pos, bytes, copied, page, iomap,
+ 				srcmap);
+ 
+ 		cond_resched();
+ 
+-		iov_iter_advance(i, copied);
+-		if (unlikely(copied == 0)) {
++		if (unlikely(status == 0)) {
+ 			/*
+-			 * If we were unable to copy any data at all, we must
+-			 * fall back to a single segment length write.
+-			 *
+-			 * If we didn't fallback here, we could livelock
+-			 * because not all segments in the iov can be copied at
+-			 * once without a pagefault.
++			 * A short copy made iomap_write_end() reject the
++			 * thing entirely.  Might be memory poisoning
++			 * halfway through, might be a race with munmap,
++			 * might be severe memory pressure.
+ 			 */
+-			bytes = min_t(unsigned long, PAGE_SIZE - offset,
+-						iov_iter_single_seg_count(i));
++			if (copied)
++				bytes = copied;
+ 			goto again;
+ 		}
++		copied = status;
++		iov_iter_advance(i, copied);
+ 		pos += copied;
+ 		written += copied;
+ 		length -= copied;
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 66f7e9fdfbc4..0be24942bf8e 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -3642,10 +3642,6 @@ ssize_t generic_perform_write(struct file *file,
+ 		 * Otherwise there's a nasty deadlock on copying from the
+ 		 * same page as we're writing to, without it being marked
+ 		 * up-to-date.
+-		 *
+-		 * Not only is this an optimisation, but it is also required
+-		 * to check that the address is actually valid, when atomic
+-		 * usercopies are used, below.
+ 		 */
+ 		if (unlikely(iov_iter_fault_in_readable(i, bytes))) {
+ 			status = -EFAULT;
+@@ -3672,24 +3668,22 @@ ssize_t generic_perform_write(struct file *file,
+ 						page, fsdata);
+ 		if (unlikely(status < 0))
+ 			break;
+-		copied = status;
+ 
+ 		cond_resched();
+ 
+-		iov_iter_advance(i, copied);
+-		if (unlikely(copied == 0)) {
++		if (unlikely(status == 0)) {
+ 			/*
+-			 * If we were unable to copy any data at all, we must
+-			 * fall back to a single segment length write.
+-			 *
+-			 * If we didn't fallback here, we could livelock
+-			 * because not all segments in the iov can be copied at
+-			 * once without a pagefault.
++			 * A short copy made ->write_end() reject the
++			 * thing entirely.  Might be memory poisoning
++			 * halfway through, might be a race with munmap,
++			 * might be severe memory pressure.
+ 			 */
+-			bytes = min_t(unsigned long, PAGE_SIZE - offset,
+-						iov_iter_single_seg_count(i));
++			if (copied)
++				bytes = copied;
+ 			goto again;
+ 		}
++		copied = status;
++		iov_iter_advance(i, copied);
+ 		pos += copied;
+ 		written += copied;
+ 
+-- 
+2.34.1
+

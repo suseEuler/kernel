@@ -1,0 +1,93 @@
+From 17e395b60f5b3dea204fcae60c7b38e84a00d87a Mon Sep 17 00:00:00 2001
+From: Oscar Salvador <osalvador@suse.de>
+Date: Mon, 14 Dec 2020 19:11:28 -0800
+Subject: [PATCH] mm,hwpoison: drain pcplists before bailing out for non-buddy
+ zero-refcount page
+Git-commit: 17e395b60f5b3dea204fcae60c7b38e84a00d87a
+Patch-mainline: v5.11-rc1
+References: bsn#307
+Modified-by-SEL: No
+
+
+Patch series "HWpoison: further fixes and cleanups", v5.
+
+This patchset includes some more fixes and a cleanup.
+
+Patch#2 and patch#3 are both fixes for taking a HWpoison page off a buddy
+freelist, since having them there has proved to be bad (see [1] and
+pathch#2's commit log).  Patch#3 does the same for hugetlb pages.
+
+[1] https://lkml.org/lkml/2020/9/22/565
+
+This patch (of 4):
+
+A page with 0-refcount and !PageBuddy could perfectly be a pcppage.
+Currently, we bail out with an error if we encounter such a page, meaning
+that we do not handle pcppages neither from hard-offline nor from
+soft-offline path.
+
+Fix this by draining pcplists whenever we find this kind of page and retry
+the check again.  It might be that pcplists have been spilled into the
+buddy allocator and so we can handle it.
+
+Link: https://lkml.kernel.org/r/20201013144447.6706-1-osalvador@suse.de
+Link: https://lkml.kernel.org/r/20201013144447.6706-2-osalvador@suse.de
+Signed-off-by: Oscar Salvador <osalvador@suse.de>
+Acked-by: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/memory-failure.c | 24 ++++++++++++++++++++++--
+ 1 file changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/mm/memory-failure.c b/mm/memory-failure.c
+index 71295bb984af..5bcb619e13b2 100644
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@ -946,13 +946,13 @@ static int page_action(struct page_state *ps, struct page *p,
+ }
+ 
+ /**
+- * get_hwpoison_page() - Get refcount for memory error handling:
++ * __get_hwpoison_page() - Get refcount for memory error handling:
+  * @page:	raw error page (hit by memory error)
+  *
+  * Return: return 0 if failed to grab the refcount, otherwise true (some
+  * non-zero value.)
+  */
+-static int get_hwpoison_page(struct page *page)
++static int __get_hwpoison_page(struct page *page)
+ {
+ 	struct page *head = compound_head(page);
+ 
+@@ -982,6 +982,26 @@ static int get_hwpoison_page(struct page *page)
+ 	return 0;
+ }
+ 
++static int get_hwpoison_page(struct page *p)
++{
++	int ret;
++	bool drained = false;
++
++retry:
++	ret = __get_hwpoison_page(p);
++	if (!ret && !is_free_buddy_page(p) && !page_count(p) && !drained) {
++		/*
++		 * The page might be in a pcplist, so try to drain those
++		 * and see if we are lucky.
++		 */
++		drain_all_pages(page_zone(p));
++		drained = true;
++		goto retry;
++	}
++
++	return ret;
++}
++
+ /*
+  * Do all that is necessary to remove user space mappings. Unmap
+  * the pages and send SIGBUS to the processes if the data was dirty.
+-- 
+2.34.1
+
