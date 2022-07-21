@@ -1,0 +1,64 @@
+From 5ccc944dce3df5fd2fd683a7df4fd49d1068eba2 Mon Sep 17 00:00:00 2001
+From: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+Date: Fri, 10 Jun 2022 14:44:41 -0400
+Subject: [PATCH] filemap: Correct the conditions for marking a folio as
+ accessed
+Git-commit: 5ccc944dce3df5fd2fd683a7df4fd49d1068eba2
+Patch-mainline: v5.19-rc4
+References: bsn#12
+Modified-by-SEL: Yes, refered to openEuler commit 8c2e5597a4e
+
+
+We had an off-by-one error which meant that we never marked the first page
+in a read as accessed.  This was visible as a slowdown when re-reading
+a file as pages were being evicted from cache too soon.  In reviewing
+this code, we noticed a second bug where a multi-page folio would be
+marked as accessed multiple times when doing reads that were less than
+the size of the folio.
+
+Abstract the comparison of whether two file positions are in the same
+folio into a new function, fixing both of these bugs.
+
+Reported-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Kent Overstreet <kent.overstreet@gmail.com>
+Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/filemap.c | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 9e209e8a3b0d..edb94663c5df 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -2437,6 +2437,13 @@ static int generic_file_buffered_read_get_pages(struct kiocb *iocb,
+ 	goto find_page;
+ }
+ 
++static inline bool pos_same_page(loff_t pos1, loff_t pos2, struct page *page)
++{
++	unsigned int shift = page_shift(page);
++
++	return (pos1 >> shift == pos2 >> shift);
++}
++
+ /**
+  * generic_file_buffered_read - generic file read routine
+  * @iocb:	the iocb to read
+@@ -2527,11 +2534,10 @@ ssize_t generic_file_buffered_read(struct kiocb *iocb,
+ 		writably_mapped = mapping_writably_mapped(mapping);
+ 
+ 		/*
+-		 * When a sequential read accesses a page several times, only
++		 * When a read accesses a page several times, only
+ 		 * mark it as accessed the first time.
+ 		 */
+-		if (iocb->ki_pos >> PAGE_SHIFT !=
+-		    ra->prev_pos >> PAGE_SHIFT)
++		if (pos_same_page(iocb->ki_pos, ra->prev_pos -1, pages[0]))
+ 			mark_page_accessed(pages[0]);
+ 		for (i = 1; i < pg_nr; i++)
+ 			mark_page_accessed(pages[i]);
+-- 
+2.34.1
+
