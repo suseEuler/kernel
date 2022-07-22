@@ -6,6 +6,7 @@ Subject: [PATCH] nvme-fabrics: reject I/O to offline device
 Git-commit: 8c4dfea97f15b80097b3f882ca428fb2751ec30c
 Patch-mainline: v5.11-rc1
 References: bsn#51
+Modified-by-SEL: Yes, refreshed due to context changes
 
 
 Commands get stuck while Host NVMe-oF controller is in reconnect state.
@@ -41,11 +42,9 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  drivers/nvme/host/nvme.h      |  3 +++
  5 files changed, 77 insertions(+), 4 deletions(-)
 
-diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
-index fff90200497c..9c1645f28a7a 100644
 --- a/drivers/nvme/host/core.c
 +++ b/drivers/nvme/host/core.c
-@@ -148,6 +148,38 @@ int nvme_try_sched_reset(struct nvme_ctrl *ctrl)
+@@ -147,6 +147,38 @@ int nvme_try_sched_reset(struct nvme_ctr
  }
  EXPORT_SYMBOL_GPL(nvme_try_sched_reset);
  
@@ -84,7 +83,7 @@ index fff90200497c..9c1645f28a7a 100644
  int nvme_reset_ctrl(struct nvme_ctrl *ctrl)
  {
  	if (!nvme_change_ctrl_state(ctrl, NVME_CTRL_RESETTING))
-@@ -433,8 +465,17 @@ bool nvme_change_ctrl_state(struct nvme_ctrl *ctrl,
+@@ -453,8 +485,17 @@ bool nvme_change_ctrl_state(struct nvme_
  	}
  
  	spin_unlock_irqrestore(&ctrl->lock, flags);
@@ -103,15 +102,15 @@ index fff90200497c..9c1645f28a7a 100644
  	return changed;
  }
  EXPORT_SYMBOL_GPL(nvme_change_ctrl_state);
-@@ -4372,6 +4413,7 @@ void nvme_stop_ctrl(struct nvme_ctrl *ctrl)
+@@ -4458,6 +4499,7 @@ void nvme_stop_ctrl(struct nvme_ctrl *ct
  {
  	nvme_mpath_stop(ctrl);
  	nvme_stop_keep_alive(ctrl);
 +	nvme_stop_failfast_work(ctrl);
  	flush_work(&ctrl->async_event_work);
  	cancel_work_sync(&ctrl->fw_act_work);
- }
-@@ -4437,6 +4479,7 @@ int nvme_init_ctrl(struct nvme_ctrl *ctrl, struct device *dev,
+ 	if (ctrl->ops->stop_ctrl)
+@@ -4538,6 +4580,7 @@ int nvme_init_ctrl(struct nvme_ctrl *ctr
  	int ret;
  
  	ctrl->state = NVME_CTRL_NEW;
@@ -119,7 +118,7 @@ index fff90200497c..9c1645f28a7a 100644
  	spin_lock_init(&ctrl->lock);
  	mutex_init(&ctrl->scan_lock);
  	INIT_LIST_HEAD(&ctrl->namespaces);
-@@ -4453,6 +4496,7 @@ int nvme_init_ctrl(struct nvme_ctrl *ctrl, struct device *dev,
+@@ -4554,6 +4597,7 @@ int nvme_init_ctrl(struct nvme_ctrl *ctr
  	init_waitqueue_head(&ctrl->state_wq);
  
  	INIT_DELAYED_WORK(&ctrl->ka_work, nvme_keep_alive_work);
@@ -127,11 +126,9 @@ index fff90200497c..9c1645f28a7a 100644
  	memset(&ctrl->ka_cmd, 0, sizeof(ctrl->ka_cmd));
  	ctrl->ka_cmd.common.opcode = nvme_admin_keep_alive;
  
-diff --git a/drivers/nvme/host/fabrics.c b/drivers/nvme/host/fabrics.c
-index 8575724734e0..72ac00173500 100644
 --- a/drivers/nvme/host/fabrics.c
 +++ b/drivers/nvme/host/fabrics.c
-@@ -549,6 +549,7 @@ blk_status_t nvmf_fail_nonready_command(struct nvme_ctrl *ctrl,
+@@ -554,6 +554,7 @@ blk_status_t nvmf_fail_nonready_command(
  {
  	if (ctrl->state != NVME_CTRL_DELETING_NOIO &&
  	    ctrl->state != NVME_CTRL_DEAD &&
@@ -139,7 +136,7 @@ index 8575724734e0..72ac00173500 100644
  	    !blk_noretry_request(rq) && !(rq->cmd_flags & REQ_NVME_MPATH))
  		return BLK_STS_RESOURCE;
  
-@@ -615,6 +616,7 @@ static const match_table_t opt_tokens = {
+@@ -620,6 +621,7 @@ static const match_table_t opt_tokens =
  	{ NVMF_OPT_NR_WRITE_QUEUES,	"nr_write_queues=%d"	},
  	{ NVMF_OPT_NR_POLL_QUEUES,	"nr_poll_queues=%d"	},
  	{ NVMF_OPT_TOS,			"tos=%d"		},
@@ -147,7 +144,7 @@ index 8575724734e0..72ac00173500 100644
  	{ NVMF_OPT_ERR,			NULL			}
  };
  
-@@ -634,6 +636,7 @@ static int nvmf_parse_options(struct nvmf_ctrl_options *opts,
+@@ -639,6 +641,7 @@ static int nvmf_parse_options(struct nvm
  	opts->reconnect_delay = NVMF_DEF_RECONNECT_DELAY;
  	opts->kato = NVME_DEFAULT_KATO;
  	opts->duplicate_connect = false;
@@ -155,7 +152,7 @@ index 8575724734e0..72ac00173500 100644
  	opts->hdr_digest = false;
  	opts->data_digest = false;
  	opts->tos = -1; /* < 0 == use transport default */
-@@ -754,6 +757,17 @@ static int nvmf_parse_options(struct nvmf_ctrl_options *opts,
+@@ -759,6 +762,17 @@ static int nvmf_parse_options(struct nvm
  				pr_warn("ctrl_loss_tmo < 0 will reconnect forever\n");
  			ctrl_loss_tmo = token;
  			break;
@@ -173,7 +170,7 @@ index 8575724734e0..72ac00173500 100644
  		case NVMF_OPT_HOSTNQN:
  			if (opts->host) {
  				pr_err("hostnqn already user-assigned: %s\n",
-@@ -884,11 +898,15 @@ static int nvmf_parse_options(struct nvmf_ctrl_options *opts,
+@@ -889,11 +903,15 @@ static int nvmf_parse_options(struct nvm
  		opts->nr_poll_queues = 0;
  		opts->duplicate_connect = true;
  	}
@@ -191,7 +188,7 @@ index 8575724734e0..72ac00173500 100644
  
  	if (!opts->host) {
  		kref_get(&nvmf_default_host->ref);
-@@ -988,7 +1006,8 @@ EXPORT_SYMBOL_GPL(nvmf_free_options);
+@@ -993,7 +1011,8 @@ EXPORT_SYMBOL_GPL(nvmf_free_options);
  #define NVMF_ALLOWED_OPTS	(NVMF_OPT_QUEUE_SIZE | NVMF_OPT_NR_IO_QUEUES | \
  				 NVMF_OPT_KATO | NVMF_OPT_HOSTNQN | \
  				 NVMF_OPT_HOST_ID | NVMF_OPT_DUP_CONNECT |\
@@ -201,8 +198,6 @@ index 8575724734e0..72ac00173500 100644
  
  static struct nvme_ctrl *
  nvmf_create_ctrl(struct device *dev, const char *buf)
-diff --git a/drivers/nvme/host/fabrics.h b/drivers/nvme/host/fabrics.h
-index a9c1e3b4585e..733010d2eafd 100644
 --- a/drivers/nvme/host/fabrics.h
 +++ b/drivers/nvme/host/fabrics.h
 @@ -15,6 +15,8 @@
@@ -238,11 +233,9 @@ index a9c1e3b4585e..733010d2eafd 100644
  };
  
  /*
-diff --git a/drivers/nvme/host/multipath.c b/drivers/nvme/host/multipath.c
-index 74896be40c17..71696819c228 100644
 --- a/drivers/nvme/host/multipath.c
 +++ b/drivers/nvme/host/multipath.c
-@@ -279,6 +279,8 @@ static bool nvme_available_path(struct nvme_ns_head *head)
+@@ -278,6 +278,8 @@ static bool nvme_available_path(struct n
  	struct nvme_ns *ns;
  
  	list_for_each_entry_rcu(ns, &head->list, siblings) {
@@ -251,11 +244,9 @@ index 74896be40c17..71696819c228 100644
  		switch (ns->ctrl->state) {
  		case NVME_CTRL_LIVE:
  		case NVME_CTRL_RESETTING:
-diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
-index 83fb30e317e0..ae017f727798 100644
 --- a/drivers/nvme/host/nvme.h
 +++ b/drivers/nvme/host/nvme.h
-@@ -305,6 +305,7 @@ struct nvme_ctrl {
+@@ -310,6 +310,7 @@ struct nvme_ctrl {
  	struct work_struct scan_work;
  	struct work_struct async_event_work;
  	struct delayed_work ka_work;
@@ -263,7 +254,7 @@ index 83fb30e317e0..ae017f727798 100644
  	struct nvme_command ka_cmd;
  	struct work_struct fw_act_work;
  	unsigned long events;
-@@ -338,6 +339,8 @@ struct nvme_ctrl {
+@@ -343,6 +344,8 @@ struct nvme_ctrl {
  	u16 icdoff;
  	u16 maxcmd;
  	int nr_reconnects;
@@ -272,6 +263,3 @@ index 83fb30e317e0..ae017f727798 100644
  	struct nvmf_ctrl_options *opts;
  
  	struct page *discard_page;
--- 
-2.31.1
-
