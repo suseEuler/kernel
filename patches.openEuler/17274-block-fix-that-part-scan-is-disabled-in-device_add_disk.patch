@@ -1,0 +1,144 @@
+From 9f8da758736235459f2a17d03d26d9b64b8ead7b Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Tue, 26 Jul 2022 20:10:44 +0800
+Subject: [PATCH] block: fix that part scan is disabled in device_add_disk()
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 9f8da758736235459f2a17d03d26d9b64b8ead7b
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5ETAB
+CVE: NA
+
+--------------------------------
+
+Patch ("block: Fix warning in bd_link_disk_holder()") moves the
+setting of flag 'GENHD_FL_UP' behind blkdev_get, which will
+disabled part scan:
+
+devcie_add_disk
+ register_disk
+  blkdev_get
+   __blkdev_get
+    bdev_get_gendisk
+     get_gendisk -> failed because 'GENHD_FL_UP' is not set
+
+And this will cause tests block/017, block/018 and scsi/004 to fail.
+
+Fix the problem by moving part scan as well.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ block/blk-sysfs.c | 33 +++++++++++++++++++++++++++++++++
+ block/genhd.c     | 27 ---------------------------
+ 2 files changed, 33 insertions(+), 27 deletions(-)
+
+diff --git a/block/blk-sysfs.c b/block/blk-sysfs.c
+index aff53c3ae836..f7cd16cec0ed 100644
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@ -821,6 +821,38 @@ struct kobj_type blk_queue_ktype = {
+ 	.release	= blk_release_queue,
+ };
+ 
++static void disk_scan_partitions(struct gendisk *disk)
++{
++	struct block_device *bdev;
++
++	if (!get_capacity(disk) || !disk_part_scan_enabled(disk))
++		return;
++
++	set_bit(GD_NEED_PART_SCAN, &disk->state);
++	bdev = blkdev_get_by_dev(disk_devt(disk), FMODE_READ, NULL);
++	if (!IS_ERR(bdev))
++		blkdev_put(bdev, FMODE_READ);
++}
++
++static void disk_init_partition(struct gendisk *disk)
++{
++	struct device *ddev = disk_to_dev(disk);
++	struct disk_part_iter piter;
++	struct hd_struct *part;
++
++	disk_scan_partitions(disk);
++
++	/* announce disk after possible partitions are created */
++	dev_set_uevent_suppress(ddev, 0);
++	kobject_uevent(&ddev->kobj, KOBJ_ADD);
++
++	/* announce possible partitions */
++	disk_part_iter_init(&piter, disk, 0);
++	while ((part = disk_part_iter_next(&piter)))
++		kobject_uevent(&part_to_dev(part)->kobj, KOBJ_ADD);
++	disk_part_iter_exit(&piter);
++}
++
+ /**
+  * blk_register_queue - register a block layer queue with sysfs
+  * @disk: Disk of which the request queue should be registered with sysfs.
+@@ -916,6 +948,7 @@ int blk_register_queue(struct gendisk *disk)
+ 	 * before it's registration is done.
+ 	 */
+ 	disk->flags |= GENHD_FL_UP;
++	disk_init_partition(disk);
+ 	ret = 0;
+ unlock:
+ 	mutex_unlock(&q->sysfs_dir_lock);
+diff --git a/block/genhd.c b/block/genhd.c
+index 9d91f880ea95..021c9c2d7231 100644
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -687,25 +687,10 @@ static int exact_lock(dev_t devt, void *data)
+ 	return 0;
+ }
+ 
+-static void disk_scan_partitions(struct gendisk *disk)
+-{
+-	struct block_device *bdev;
+-
+-	if (!get_capacity(disk) || !disk_part_scan_enabled(disk))
+-		return;
+-
+-	set_bit(GD_NEED_PART_SCAN, &disk->state);
+-	bdev = blkdev_get_by_dev(disk_devt(disk), FMODE_READ, NULL);
+-	if (!IS_ERR(bdev))
+-		blkdev_put(bdev, FMODE_READ);
+-}
+-
+ static void register_disk(struct device *parent, struct gendisk *disk,
+ 			  const struct attribute_group **groups)
+ {
+ 	struct device *ddev = disk_to_dev(disk);
+-	struct disk_part_iter piter;
+-	struct hd_struct *part;
+ 	int err;
+ 
+ 	ddev->parent = parent;
+@@ -743,18 +728,6 @@ static void register_disk(struct device *parent, struct gendisk *disk,
+ 	if (disk->flags & GENHD_FL_HIDDEN)
+ 		return;
+ 
+-	disk_scan_partitions(disk);
+-
+-	/* announce disk after possible partitions are created */
+-	dev_set_uevent_suppress(ddev, 0);
+-	kobject_uevent(&ddev->kobj, KOBJ_ADD);
+-
+-	/* announce possible partitions */
+-	disk_part_iter_init(&piter, disk, 0);
+-	while ((part = disk_part_iter_next(&piter)))
+-		kobject_uevent(&part_to_dev(part)->kobj, KOBJ_ADD);
+-	disk_part_iter_exit(&piter);
+-
+ 	if (disk->queue->backing_dev_info->dev) {
+ 		err = sysfs_create_link(&ddev->kobj,
+ 			  &disk->queue->backing_dev_info->dev->kobj,
+-- 
+2.34.1
+

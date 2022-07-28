@@ -1,0 +1,119 @@
+From f3e4c00e7c88658936b86e6522995e933813a375 Mon Sep 17 00:00:00 2001
+From: Luo Meng <luomeng12@huawei.com>
+Date: Tue, 26 Jul 2022 20:10:43 +0800
+Subject: [PATCH] block: Fix warning in bd_link_disk_holder()
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: f3e4c00e7c88658936b86e6522995e933813a375
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5ETAB
+CVE: NA
+
+--------------------------------
+
+Warning reports as follows:
+
+ WARNING: CPU: 3 PID: 674 at fs/block_dev.c:1272 bd_link_disk_holder+0xcd/0x270
+ Modules linked in: null_blk(+)
+ CPU: 3 PID: 674 Comm: dmsetup Not tainted 5.10.0-16691-gf6076432827d-dirty #158
+ Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS ?-20190727_073836-4
+ RIP: 0010:bd_link_disk_holder+0xcd/0x270
+ Code: 69 73 ee 00 44 89 e8 5b 48 83 05 c5 bf 6d 0c 01 5d 41 5c 41 5d 41 5e 41 8
+ RSP: 0018:ffffc9000049bbb8 EFLAGS: 00010202
+ RAX: ffff888104e39038 RBX: ffff888104185000 RCX: 0000000000000000
+ RDX: 0000000000000001 RSI: ffffffffaa085692 RDI: 0000000000000000
+ RBP: ffff88810cc2ae00 R08: ffffffffa853659b R09: 0000000000000000
+ R10: ffffc9000049bbb0 R11: 720030626c6c756e R12: ffff88810e800000
+ R13: ffff88810e800090 R14: ffff888103570c98 R15: ffff888103570c80
+ FS:  00007fb49dc13dc0(0000) GS:ffff88813bd00000(0000) knlGS:0000000000000000
+ CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+ CR2: 00007ff994ebde70 CR3: 000000010d54a000 CR4: 00000000000006e0
+ DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+ DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+ Call Trace:
+  dm_get_table_device+0x175/0x300
+  dm_get_device+0x238/0x360
+  linear_ctr+0xee/0x170
+  dm_table_add_target+0x199/0x4b0
+  table_load+0x18c/0x480
+  ? table_clear+0x190/0x190
+  ctl_ioctl+0x21d/0x640
+  ? check_preemption_disabled+0x140/0x150
+  dm_ctl_ioctl+0x12/0x20
+  __se_sys_ioctl+0xb1/0x100
+  __x64_sys_ioctl+0x1e/0x30
+  do_syscall_64+0x45/0x70
+  entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+This can reproduce by concurrent operations:
+	1. modprobe null_blk
+	2. echo -e "0 10000 linear /dev/nullb0 0" > table
+	   dmsetup create xxx table
+
+t1: create disk a                   |     t2: dm setup
+                                    |
+device_add_disk                     |
+ dev->devt = devt                   |
+                        	    | dm_get_table_device
+                        	    | open_table_device
+                        	    | blkdev_get_by_dev -> succeed
+				    | bd_link_disk_holder
+                        	    |  -> holder_dir is still NULL
+ register_disk -> create holder_dir
+  kobject_create_and_add
+
+device_add_disk() will set devt before creating holder_dir, which
+leaves a window that dm_get_table_device() can find the disk by
+devt while it's holder_dir is NULL.
+
+So move GENHD_FL_UP in blk_register_queue() to avoid this warning and
+fix a NULL-ptr in  __blk_mq_sched_bio_merge().
+
+Signed-off-by: Luo Meng <luomeng12@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ block/blk-sysfs.c | 6 ++++++
+ block/genhd.c     | 2 --
+ 2 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/block/blk-sysfs.c b/block/blk-sysfs.c
+index 0a4fcbda8ab4..aff53c3ae836 100644
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@ -910,6 +910,12 @@ int blk_register_queue(struct gendisk *disk)
+ 		kobject_uevent(&q->elevator->kobj, KOBJ_ADD);
+ 	mutex_unlock(&q->sysfs_lock);
+ 
++
++	/*
++	 * Set the flag at last, so that block devcie can't be opened
++	 * before it's registration is done.
++	 */
++	disk->flags |= GENHD_FL_UP;
+ 	ret = 0;
+ unlock:
+ 	mutex_unlock(&q->sysfs_dir_lock);
+diff --git a/block/genhd.c b/block/genhd.c
+index 8b37fcfa10d1..9d91f880ea95 100644
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -799,8 +799,6 @@ static void __device_add_disk(struct device *parent, struct gendisk *disk,
+ 	WARN_ON(!disk->minors &&
+ 		!(disk->flags & (GENHD_FL_EXT_DEVT | GENHD_FL_HIDDEN)));
+ 
+-	disk->flags |= GENHD_FL_UP;
+-
+ 	retval = blk_alloc_devt(&disk->part0, &devt);
+ 	if (retval) {
+ 		WARN_ON(1);
+-- 
+2.34.1
+
