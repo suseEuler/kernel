@@ -6,7 +6,7 @@ Subject: [PATCH] objtool: Fix x86 orc generation on big endian cross-compiles
 Git-commit: 8bfe273238d77d3cee18e4c03b2f26ae360b5661
 Patch-mainline: v5.12-rc2
 References: bsn#258
-Modified-by-SEL: No
+Modified-by-SEL: Yes, refreshed due to context changes
 
 
 Correct objtool orc generation endianness problems to enable fully
@@ -36,8 +36,6 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  create mode 100644 tools/objtool/arch/x86/include/arch_endianness.h
  create mode 100644 tools/objtool/endianness.h
 
-diff --git a/arch/x86/include/asm/orc_types.h b/arch/x86/include/asm/orc_types.h
-index fdbffec4cfde..5a2baf28a1dc 100644
 --- a/arch/x86/include/asm/orc_types.h
 +++ b/arch/x86/include/asm/orc_types.h
 @@ -40,6 +40,8 @@
@@ -68,8 +66,6 @@ index fdbffec4cfde..5a2baf28a1dc 100644
  } __packed;
  
  #endif /* __ASSEMBLY__ */
-diff --git a/tools/arch/x86/include/asm/orc_types.h b/tools/arch/x86/include/asm/orc_types.h
-index fdbffec4cfde..5a2baf28a1dc 100644
 --- a/tools/arch/x86/include/asm/orc_types.h
 +++ b/tools/arch/x86/include/asm/orc_types.h
 @@ -40,6 +40,8 @@
@@ -100,9 +96,6 @@ index fdbffec4cfde..5a2baf28a1dc 100644
  } __packed;
  
  #endif /* __ASSEMBLY__ */
-diff --git a/tools/objtool/arch/x86/include/arch_endianness.h b/tools/objtool/arch/x86/include/arch_endianness.h
-new file mode 100644
-index 000000000000..7c362527da20
 --- /dev/null
 +++ b/tools/objtool/arch/x86/include/arch_endianness.h
 @@ -0,0 +1,9 @@
@@ -115,11 +108,9 @@ index 000000000000..7c362527da20
 +#define __TARGET_BYTE_ORDER __LITTLE_ENDIAN
 +
 +#endif /* _ARCH_ENDIANNESS_H */
-diff --git a/tools/objtool/check.c b/tools/objtool/check.c
-index 270adc38d896..8cda0ef06522 100644
 --- a/tools/objtool/check.c
 +++ b/tools/objtool/check.c
-@@ -13,6 +13,7 @@
+@@ -15,6 +15,7 @@
  #include "special.h"
  #include "warn.h"
  #include "arch_elf.h"
@@ -127,27 +118,15 @@ index 270adc38d896..8cda0ef06522 100644
  
  #include <linux/objtool.h>
  #include <linux/hashtable.h>
-@@ -1435,7 +1436,7 @@ static int read_unwind_hints(struct objtool_file *file)
- 		cfa = &insn->cfi.cfa;
- 
- 		if (hint->type == UNWIND_HINT_TYPE_RET_OFFSET) {
--			insn->ret_offset = hint->sp_offset;
-+			insn->ret_offset = bswap_if_needed(hint->sp_offset);
- 			continue;
- 		}
- 
-@@ -1447,7 +1448,7 @@ static int read_unwind_hints(struct objtool_file *file)
+@@ -1766,7 +1767,7 @@ static int read_unwind_hints(struct objt
  			return -1;
  		}
  
--		cfa->offset = hint->sp_offset;
-+		cfa->offset = bswap_if_needed(hint->sp_offset);
- 		insn->cfi.type = hint->type;
- 		insn->cfi.end = hint->end;
- 	}
-diff --git a/tools/objtool/endianness.h b/tools/objtool/endianness.h
-new file mode 100644
-index 000000000000..ebece3191b58
+-		cfi.cfa.offset = hint->sp_offset;
++		cfi.cfa.offset = bswap_if_needed(hint->sp_offset);
+ 		cfi.type = hint->type;
+ 		cfi.end = hint->end;
+ 
 --- /dev/null
 +++ b/tools/objtool/endianness.h
 @@ -0,0 +1,38 @@
@@ -189,8 +168,6 @@ index 000000000000..ebece3191b58
 +})
 +
 +#endif /* _OBJTOOL_ENDIANNESS_H */
-diff --git a/tools/objtool/orc_dump.c b/tools/objtool/orc_dump.c
-index 5e6a95368d35..4e818a22e44b 100644
 --- a/tools/objtool/orc_dump.c
 +++ b/tools/objtool/orc_dump.c
 @@ -8,6 +8,7 @@
@@ -215,8 +192,6 @@ index 5e6a95368d35..4e818a22e44b 100644
  
  		printf(" type:%s end:%d\n",
  		       orc_type_name(orc[i].type), orc[i].end);
-diff --git a/tools/objtool/orc_gen.c b/tools/objtool/orc_gen.c
-index 9ce68b385a1b..1be7e16b2595 100644
 --- a/tools/objtool/orc_gen.c
 +++ b/tools/objtool/orc_gen.c
 @@ -11,6 +11,7 @@
@@ -225,19 +200,17 @@ index 9ce68b385a1b..1be7e16b2595 100644
  #include "warn.h"
 +#include "endianness.h"
  
- int create_orc(struct objtool_file *file)
- {
-@@ -96,6 +97,8 @@ static int create_orc_entry(struct elf *elf, struct section *u_sec, struct secti
+ static int init_orc_entry(struct orc_entry *orc, struct cfi_state *cfi,
+ 			  struct instruction *insn)
+@@ -96,6 +97,8 @@ static int write_orc_entry(struct elf *e
  	/* populate ORC data */
- 	orc = (struct orc_entry *)u_sec->data->d_buf + idx;
+ 	orc = (struct orc_entry *)orc_sec->data->d_buf + idx;
  	memcpy(orc, o, sizeof(*orc));
 +	orc->sp_offset = bswap_if_needed(orc->sp_offset);
 +	orc->bp_offset = bswap_if_needed(orc->bp_offset);
  
  	/* populate reloc for ip */
- 	reloc = malloc(sizeof(*reloc));
-diff --git a/tools/objtool/special.c b/tools/objtool/special.c
-index 1a2420febd08..ab7cb1e13411 100644
+ 	if (elf_add_reloc_to_insn(elf, ip_sec, idx * sizeof(int), R_X86_64_PC32,
 --- a/tools/objtool/special.c
 +++ b/tools/objtool/special.c
 @@ -15,6 +15,7 @@
@@ -248,7 +221,7 @@ index 1a2420febd08..ab7cb1e13411 100644
  
  struct special_entry {
  	const char *sec;
-@@ -77,8 +78,9 @@ static int get_alt_entry(struct elf *elf, struct special_entry *entry,
+@@ -84,8 +85,9 @@ static int get_alt_entry(struct elf *elf
  	if (entry->feature) {
  		unsigned short feature;
  
@@ -260,6 +233,3 @@ index 1a2420febd08..ab7cb1e13411 100644
  		arch_handle_alternative(feature, alt);
  	}
  
--- 
-2.34.1
-

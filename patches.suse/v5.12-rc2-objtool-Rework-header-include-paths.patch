@@ -155,7 +155,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  CFLAGS   := -Werror $(WARNINGS) $(KBUILD_HOSTCFLAGS) -g $(INCLUDES) $(LIBELF_FLAGS)
 --- a/tools/objtool/arch.h
 +++ /dev/null
-@@ -1,93 +0,0 @@
+@@ -1,96 +0,0 @@
 -/* SPDX-License-Identifier: GPL-2.0-or-later */
 -/*
 - * Copyright (C) 2015 Josh Poimboeuf <jpoimboe@redhat.com>
@@ -168,10 +168,6 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 -#include <linux/list.h>
 -#include "objtool.h"
 -#include "cfi.h"
--
--#ifdef INSN_USE_ORC
--#include <asm/orc_types.h>
--#endif
 -
 -enum insn_type {
 -	INSN_JUMP_CONDITIONAL,
@@ -188,6 +184,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 -	INSN_CLAC,
 -	INSN_STD,
 -	INSN_CLD,
+-	INSN_TRAP,
 -	INSN_OTHER,
 -};
 -
@@ -245,13 +242,19 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 -unsigned long arch_dest_reloc_offset(int addend);
 -
 -const char *arch_nop_insn(int len);
+-const char *arch_ret_insn(int len);
 -
--int arch_decode_hint_reg(struct instruction *insn, u8 sp_reg);
+-int arch_decode_hint_reg(u8 sp_reg, int *base);
+-
+-bool arch_is_retpoline(struct symbol *sym);
+-bool arch_is_rethunk(struct symbol *sym);
+-
+-int arch_rewrite_retpolines(struct objtool_file *file);
 -
 -#endif /* _ARCH_H */
 --- a/tools/objtool/arch/x86/decode.c
 +++ b/tools/objtool/arch/x86/decode.c
-@@ -11,11 +11,11 @@
+@@ -11,12 +11,12 @@
  #include "../../../arch/x86/lib/inat.c"
  #include "../../../arch/x86/lib/insn.c"
  
@@ -260,10 +263,12 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 -#include "../../arch.h"
 -#include "../../warn.h"
  #include <asm/orc_types.h>
+-#include "arch_elf.h"
 +#include <objtool/check.h>
 +#include <objtool/elf.h>
 +#include <objtool/arch.h>
 +#include <objtool/warn.h>
++#include <arch/elf.h>
  
  static unsigned char op_to_cfi_reg[][2] = {
  	{CFI_AX, CFI_R8},
@@ -331,7 +336,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 +#define JUMP_ORIG_OFFSET	0
 +#define JUMP_NEW_OFFSET		4
 +
-+#define ALT_ENTRY_SIZE		13
++#define ALT_ENTRY_SIZE		12
 +#define ALT_ORIG_OFFSET		0
 +#define ALT_NEW_OFFSET		4
 +#define ALT_FEATURE_OFFSET	8
@@ -375,7 +380,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 -#define JUMP_ORIG_OFFSET	0
 -#define JUMP_NEW_OFFSET		4
 -
--#define ALT_ENTRY_SIZE		13
+-#define ALT_ENTRY_SIZE		12
 -#define ALT_ORIG_OFFSET		0
 -#define ALT_NEW_OFFSET		4
 -#define ALT_FEATURE_OFFSET	8
@@ -435,8 +440,8 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 +#include <objtool/builtin.h>
 +#include <objtool/objtool.h>
  
- bool no_fp, no_unreachable, retpoline, module, backtrace, uaccess, stats, validate_dup, vmlinux;
- 
+ bool no_fp, no_unreachable, retpoline, module, backtrace, uaccess, stats,
+      validate_dup, vmlinux, sls, unret, rethunk;
 --- a/tools/objtool/builtin-orc.c
 +++ b/tools/objtool/builtin-orc.c
 @@ -13,8 +13,8 @@
@@ -452,7 +457,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  	"objtool orc generate [<options>] file.o",
 --- a/tools/objtool/builtin.h
 +++ /dev/null
-@@ -1,16 +0,0 @@
+@@ -1,17 +0,0 @@
 -/* SPDX-License-Identifier: GPL-2.0-or-later */
 -/*
 - * Copyright (C) 2015 Josh Poimboeuf <jpoimboe@redhat.com>
@@ -463,7 +468,8 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 -#include <subcmd/parse-options.h>
 -
 -extern const struct option check_options[];
--extern bool no_fp, no_unreachable, retpoline, module, backtrace, uaccess, stats, validate_dup, vmlinux;
+-extern bool no_fp, no_unreachable, retpoline, module, backtrace, uaccess, stats,
+-            validate_dup, vmlinux, sls, unret, rethunk;
 -
 -extern int cmd_check(int argc, const char **argv);
 -extern int cmd_orc(int argc, const char **argv);
@@ -471,7 +477,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 -#endif /* _BUILTIN_H */
 --- a/tools/objtool/cfi.h
 +++ /dev/null
-@@ -1,38 +0,0 @@
+@@ -1,40 +0,0 @@
 -/* SPDX-License-Identifier: GPL-2.0-or-later */
 -/*
 - * Copyright (C) 2015-2017 Josh Poimboeuf <jpoimboe@redhat.com>
@@ -481,6 +487,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 -#define _OBJTOOL_CFI_H
 -
 -#include "cfi_regs.h"
+-#include <linux/list.h>
 -
 -#define CFI_UNDEFINED		-1
 -#define CFI_CFA			-2
@@ -498,6 +505,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 -};
 -
 -struct cfi_state {
+-	struct hlist_node hash; /* must be first, cficmp() */
 -	struct cfi_reg regs[CFI_NUM_REGS];
 -	struct cfi_reg vals[CFI_NUM_REGS];
 -	struct cfi_reg cfa;
@@ -512,9 +520,9 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 -#endif /* _OBJTOOL_CFI_H */
 --- a/tools/objtool/check.c
 +++ b/tools/objtool/check.c
-@@ -6,14 +6,14 @@
- #include <string.h>
- #include <stdlib.h>
+@@ -8,14 +8,14 @@
+ #include <inttypes.h>
+ #include <sys/mman.h>
  
 -#include "builtin.h"
 -#include "cfi.h"
@@ -536,8 +544,8 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  #include <linux/objtool.h>
  #include <linux/hashtable.h>
 --- a/tools/objtool/check.h
-+++ b/tools/objtool/check.h
-@@ -1,80 +0,0 @@
++++ /dev/null
+@@ -1,101 +0,0 @@
 -/* SPDX-License-Identifier: GPL-2.0-or-later */
 -/*
 - * Copyright (C) 2017 Josh Poimboeuf <jpoimboe@redhat.com>
@@ -559,10 +567,27 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 -	s8 instr;
 -};
 -
+-struct alt_group {
+-	/*
+-	 * Pointer from a replacement group to the original group.  NULL if it
+-	 * *is* the original group.
+-	 */
+-	struct alt_group *orig_group;
+-
+-	/* First and last instructions in the group */
+-	struct instruction *first_insn, *last_insn;
+-
+-	/*
+-	 * Byte-offset-addressed len-sized array of pointers to CFI structs.
+-	 * This is shared with the other alt_groups in the same alternative.
+-	 */
+-	struct cfi_state **cfi;
+-};
+-
 -struct instruction {
 -	struct list_head list;
 -	struct hlist_node hash;
--	struct list_head static_call_node;
+-	struct list_head call_node;
 -	struct section *sec;
 -	unsigned long offset;
 -	unsigned int len;
@@ -570,23 +595,27 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 -	unsigned long immediate;
 -	bool dead_end, ignore, ignore_alts;
 -	bool hint;
+-	bool save, restore;
 -	bool retpoline_safe;
+-	bool entry;
 -	s8 instr;
 -	u8 visited;
--	u8 ret_offset;
--	int alt_group;
+-	struct alt_group *alt_group;
 -	struct symbol *call_dest;
 -	struct instruction *jump_dest;
 -	struct instruction *first_jump_src;
 -	struct reloc *jump_table;
+-	struct reloc *reloc;
 -	struct list_head alts;
 -	struct symbol *func;
 -	struct list_head stack_ops;
--	struct cfi_state cfi;
--#ifdef INSN_USE_ORC
--	struct orc_entry orc;
--#endif
+-	struct cfi_state *cfi;
 -};
+-
+-#define VISITED_BRANCH		0x01
+-#define VISITED_BRANCH_UACCESS	0x02
+-#define VISITED_BRANCH_MASK	0x03
+-#define VISITED_ENTRY		0x04
 -
 -static inline bool is_static_jump(struct instruction *insn)
 -{
@@ -636,7 +665,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  
 --- a/tools/objtool/elf.h
 +++ /dev/null
-@@ -1,150 +0,0 @@
+@@ -1,156 +0,0 @@
 -/* SPDX-License-Identifier: GPL-2.0-or-later */
 -/*
 - * Copyright (C) 2015 Josh Poimboeuf <jpoimboe@redhat.com>
@@ -694,8 +723,12 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 -	unsigned long offset;
 -	unsigned int len;
 -	struct symbol *pfunc, *cfunc, *alias;
--	bool uaccess_safe;
--	bool static_call_tramp;
+-	u8 uaccess_safe      : 1;
+-	u8 static_call_tramp : 1;
+-	u8 retpoline_thunk   : 1;
+-	u8 return_thunk      : 1;
+-	u8 fentry            : 1;
+-	u8 kcov              : 1;
 -};
 -
 -struct reloc {
@@ -709,7 +742,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 -	struct symbol *sym;
 -	unsigned long offset;
 -	unsigned int type;
--	int addend;
+-	s64 addend;
 -	int idx;
 -	bool jump_table_start;
 -};
@@ -761,8 +794,13 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 -
 -struct elf *elf_open_read(const char *name, int flags);
 -struct section *elf_create_section(struct elf *elf, const char *name, unsigned int sh_flags, size_t entsize, int nr);
--struct section *elf_create_reloc_section(struct elf *elf, struct section *base, int reltype);
--void elf_add_reloc(struct elf *elf, struct reloc *reloc);
+-
+-int elf_add_reloc(struct elf *elf, struct section *sec, unsigned long offset,
+-		  unsigned int type, struct symbol *sym, s64 addend);
+-int elf_add_reloc_to_insn(struct elf *elf, struct section *sec,
+-			  unsigned long offset, unsigned int type,
+-			  struct section *insn_sec, unsigned long insn_off);
+-
 -int elf_write_insn(struct elf *elf, struct section *sec,
 -		   unsigned long offset, unsigned int len,
 -		   const char *insn);
@@ -779,9 +817,6 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 -struct reloc *find_reloc_by_dest_range(const struct elf *elf, struct section *sec,
 -				     unsigned long offset, unsigned int len);
 -struct symbol *find_func_containing(struct section *sec, unsigned long offset);
--void insn_to_reloc_sym_addend(struct section *sec, unsigned long offset,
--			      struct reloc *reloc);
--int elf_rebuild_reloc_section(struct elf *elf, struct section *sec);
 -
 -#define for_each_sec(file, sec)						\
 -	list_for_each_entry(sec, &file->elf->sections, list)
@@ -830,7 +865,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 -#endif /* _OBJTOOL_ENDIANNESS_H */
 --- /dev/null
 +++ b/tools/objtool/include/objtool/arch.h
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,100 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later */
 +/*
 + * Copyright (C) 2015 Josh Poimboeuf <jpoimboe@redhat.com>
@@ -863,6 +898,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 +	INSN_CLAC,
 +	INSN_STD,
 +	INSN_CLD,
++	INSN_TRAP,
 +	INSN_OTHER,
 +};
 +
@@ -920,13 +956,19 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 +unsigned long arch_dest_reloc_offset(int addend);
 +
 +const char *arch_nop_insn(int len);
++const char *arch_ret_insn(int len);
 +
-+int arch_decode_hint_reg(struct instruction *insn, u8 sp_reg);
++int arch_decode_hint_reg(u8 sp_reg, int *base);
++
++bool arch_is_retpoline(struct symbol *sym);
++bool arch_is_rethunk(struct symbol *sym);
++
++int arch_rewrite_retpolines(struct objtool_file *file);
 +
 +#endif /* _ARCH_H */
 --- /dev/null
 +++ b/tools/objtool/include/objtool/builtin.h
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,17 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later */
 +/*
 + * Copyright (C) 2015 Josh Poimboeuf <jpoimboe@redhat.com>
@@ -937,7 +979,8 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 +#include <subcmd/parse-options.h>
 +
 +extern const struct option check_options[];
-+extern bool no_fp, no_unreachable, retpoline, module, backtrace, uaccess, stats, validate_dup, vmlinux;
++extern bool no_fp, no_unreachable, retpoline, module, backtrace, uaccess, stats,
++            validate_dup, vmlinux, sls, unret, rethunk;
 +
 +extern int cmd_check(int argc, const char **argv);
 +extern int cmd_orc(int argc, const char **argv);
@@ -945,7 +988,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 +#endif /* _BUILTIN_H */
 --- /dev/null
 +++ b/tools/objtool/include/objtool/cfi.h
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,40 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later */
 +/*
 + * Copyright (C) 2015-2017 Josh Poimboeuf <jpoimboe@redhat.com>
@@ -955,6 +998,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 +#define _OBJTOOL_CFI_H
 +
 +#include <arch/cfi_regs.h>
++#include <linux/list.h>
 +
 +#define CFI_UNDEFINED		-1
 +#define CFI_CFA			-2
@@ -972,6 +1016,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 +};
 +
 +struct cfi_state {
++	struct hlist_node hash; /* must be first, cficmp() */
 +	struct cfi_reg regs[CFI_NUM_REGS];
 +	struct cfi_reg vals[CFI_NUM_REGS];
 +	struct cfi_reg cfa;
@@ -986,7 +1031,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 +#endif /* _OBJTOOL_CFI_H */
 --- /dev/null
 +++ b/tools/objtool/include/objtool/check.h
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,101 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later */
 +/*
 + * Copyright (C) 2017 Josh Poimboeuf <jpoimboe@redhat.com>
@@ -1008,10 +1053,27 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 +	s8 instr;
 +};
 +
++struct alt_group {
++	/*
++	 * Pointer from a replacement group to the original group.  NULL if it
++	 * *is* the original group.
++	 */
++	struct alt_group *orig_group;
++
++	/* First and last instructions in the group */
++	struct instruction *first_insn, *last_insn;
++
++	/*
++	 * Byte-offset-addressed len-sized array of pointers to CFI structs.
++	 * This is shared with the other alt_groups in the same alternative.
++	 */
++	struct cfi_state **cfi;
++};
++
 +struct instruction {
 +	struct list_head list;
 +	struct hlist_node hash;
-+	struct list_head static_call_node;
++	struct list_head call_node;
 +	struct section *sec;
 +	unsigned long offset;
 +	unsigned int len;
@@ -1019,23 +1081,27 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 +	unsigned long immediate;
 +	bool dead_end, ignore, ignore_alts;
 +	bool hint;
++	bool save, restore;
 +	bool retpoline_safe;
++	bool entry;
 +	s8 instr;
 +	u8 visited;
-+	u8 ret_offset;
-+	int alt_group;
++	struct alt_group *alt_group;
 +	struct symbol *call_dest;
 +	struct instruction *jump_dest;
 +	struct instruction *first_jump_src;
 +	struct reloc *jump_table;
++	struct reloc *reloc;
 +	struct list_head alts;
 +	struct symbol *func;
 +	struct list_head stack_ops;
-+	struct cfi_state cfi;
-+#ifdef INSN_USE_ORC
-+	struct orc_entry orc;
-+#endif
++	struct cfi_state *cfi;
 +};
++
++#define VISITED_BRANCH		0x01
++#define VISITED_BRANCH_UACCESS	0x02
++#define VISITED_BRANCH_MASK	0x03
++#define VISITED_ENTRY		0x04
 +
 +static inline bool is_static_jump(struct instruction *insn)
 +{
@@ -1069,7 +1135,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 +#endif /* _CHECK_H */
 --- /dev/null
 +++ b/tools/objtool/include/objtool/elf.h
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,156 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later */
 +/*
 + * Copyright (C) 2015 Josh Poimboeuf <jpoimboe@redhat.com>
@@ -1127,8 +1193,12 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 +	unsigned long offset;
 +	unsigned int len;
 +	struct symbol *pfunc, *cfunc, *alias;
-+	bool uaccess_safe;
-+	bool static_call_tramp;
++	u8 uaccess_safe      : 1;
++	u8 static_call_tramp : 1;
++	u8 retpoline_thunk   : 1;
++	u8 return_thunk      : 1;
++	u8 fentry            : 1;
++	u8 kcov              : 1;
 +};
 +
 +struct reloc {
@@ -1142,7 +1212,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 +	struct symbol *sym;
 +	unsigned long offset;
 +	unsigned int type;
-+	int addend;
++	s64 addend;
 +	int idx;
 +	bool jump_table_start;
 +};
@@ -1194,8 +1264,13 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 +
 +struct elf *elf_open_read(const char *name, int flags);
 +struct section *elf_create_section(struct elf *elf, const char *name, unsigned int sh_flags, size_t entsize, int nr);
-+struct section *elf_create_reloc_section(struct elf *elf, struct section *base, int reltype);
-+void elf_add_reloc(struct elf *elf, struct reloc *reloc);
++
++int elf_add_reloc(struct elf *elf, struct section *sec, unsigned long offset,
++		  unsigned int type, struct symbol *sym, s64 addend);
++int elf_add_reloc_to_insn(struct elf *elf, struct section *sec,
++			  unsigned long offset, unsigned int type,
++			  struct section *insn_sec, unsigned long insn_off);
++
 +int elf_write_insn(struct elf *elf, struct section *sec,
 +		   unsigned long offset, unsigned int len,
 +		   const char *insn);
@@ -1212,9 +1287,6 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 +struct reloc *find_reloc_by_dest_range(const struct elf *elf, struct section *sec,
 +				     unsigned long offset, unsigned int len);
 +struct symbol *find_func_containing(struct section *sec, unsigned long offset);
-+void insn_to_reloc_sym_addend(struct section *sec, unsigned long offset,
-+			      struct reloc *reloc);
-+int elf_rebuild_reloc_section(struct elf *elf, struct section *sec);
 +
 +#define for_each_sec(file, sec)						\
 +	list_for_each_entry(sec, &file->elf->sections, list)
@@ -1263,7 +1335,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 +#endif /* _OBJTOOL_ENDIANNESS_H */
 --- /dev/null
 +++ b/tools/objtool/include/objtool/objtool.h
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,33 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later */
 +/*
 + * Copyright (C) 2020 Matt Helsley <mhelsley@vmware.com>
@@ -1284,6 +1356,8 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 +	struct elf *elf;
 +	struct list_head insn_list;
 +	DECLARE_HASHTABLE(insn_hash, 20);
++	struct list_head retpoline_call_list;
++	struct list_head return_thunk_list;
 +	struct list_head static_call_list;
 +	bool ignore_unreachables, c_file, hints, rodata;
 +};
@@ -1292,8 +1366,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 +
 +int check(struct objtool_file *file);
 +int orc_dump(const char *objname);
-+int create_orc(struct objtool_file *file);
-+int create_orc_sections(struct objtool_file *file);
++int orc_create(struct objtool_file *file);
 +
 +#endif /* _OBJTOOL_H */
 --- /dev/null
@@ -1425,8 +1498,8 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  struct cmd_struct {
  	const char *name;
 --- a/tools/objtool/objtool.h
-+++ /dev/null
-@@ -1,32 +0,0 @@
++++ b/tools/objtool/objtool.h
+@@ -1,33 +0,0 @@
 -/* SPDX-License-Identifier: GPL-2.0-or-later */
 -/*
 - * Copyright (C) 2020 Matt Helsley <mhelsley@vmware.com>
@@ -1447,6 +1520,8 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 -	struct elf *elf;
 -	struct list_head insn_list;
 -	DECLARE_HASHTABLE(insn_hash, 20);
+-	struct list_head retpoline_call_list;
+-	struct list_head return_thunk_list;
 -	struct list_head static_call_list;
 -	bool ignore_unreachables, c_file, hints, rodata;
 -};
@@ -1455,8 +1530,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 -
 -int check(struct objtool_file *file);
 -int orc_dump(const char *objname);
--int create_orc(struct objtool_file *file);
--int create_orc_sections(struct objtool_file *file);
+-int orc_create(struct objtool_file *file);
 -
 -#endif /* _OBJTOOL_H */
 --- a/tools/objtool/orc_dump.c
@@ -1487,8 +1561,8 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 +#include <objtool/warn.h>
 +#include <objtool/endianness.h>
  
- int create_orc(struct objtool_file *file)
- {
+ static int init_orc_entry(struct orc_entry *orc, struct cfi_state *cfi,
+ 			  struct instruction *insn)
 --- a/tools/objtool/special.c
 +++ b/tools/objtool/special.c
 @@ -11,11 +11,11 @@
