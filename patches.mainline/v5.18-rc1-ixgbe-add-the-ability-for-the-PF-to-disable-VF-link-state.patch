@@ -5,7 +5,7 @@ Subject: [PATCH] ixgbe: add the ability for the PF to disable VF link state
 Git-commit: 366fd1000995d4cf64e1a61a0d78a051550b9841
 Patch-mainline: v5.18-rc1
 References: bsn#12
-Modified-by-SEL: No
+Modified-by-SEL: Yes, refreshed due to context changes
 
 
 Add support for ndo_set_vf_link_state the Network Device Option that
@@ -27,8 +27,6 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  .../net/ethernet/intel/ixgbe/ixgbe_sriov.h    |   4 +-
  5 files changed, 182 insertions(+), 44 deletions(-)
 
-diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe.h b/drivers/net/ethernet/intel/ixgbe/ixgbe.h
-index 4a69823e6abd..c9bf18086d9c 100644
 --- a/drivers/net/ethernet/intel/ixgbe/ixgbe.h
 +++ b/drivers/net/ethernet/intel/ixgbe/ixgbe.h
 @@ -177,6 +177,8 @@ struct vf_data_storage {
@@ -40,11 +38,9 @@ index 4a69823e6abd..c9bf18086d9c 100644
  	u8 spoofchk_enabled;
  	bool rss_query_enabled;
  	u8 trusted;
-diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
-index 60a72af39ff7..13df4e0f3796 100644
 --- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
 +++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
-@@ -5687,6 +5687,9 @@ static void ixgbe_up_complete(struct ixgbe_adapter *adapter)
+@@ -5683,6 +5683,9 @@ static void ixgbe_up_complete(struct ixg
  	ctrl_ext = IXGBE_READ_REG(hw, IXGBE_CTRL_EXT);
  	ctrl_ext |= IXGBE_CTRL_EXT_PFRSTD;
  	IXGBE_WRITE_REG(hw, IXGBE_CTRL_EXT, ctrl_ext);
@@ -54,7 +50,7 @@ index 60a72af39ff7..13df4e0f3796 100644
  }
  
  void ixgbe_reinit_locked(struct ixgbe_adapter *adapter)
-@@ -6144,11 +6147,8 @@ void ixgbe_down(struct ixgbe_adapter *adapter)
+@@ -6140,11 +6143,8 @@ void ixgbe_down(struct ixgbe_adapter *ad
  		for (i = 0 ; i < adapter->num_vfs; i++)
  			adapter->vfinfo[i].clear_to_send = false;
  
@@ -68,7 +64,7 @@ index 60a72af39ff7..13df4e0f3796 100644
  	}
  
  	/* disable transmits in the hardware now that interrupts are off */
-@@ -10284,6 +10284,7 @@ static const struct net_device_ops ixgbe_netdev_ops = {
+@@ -10264,6 +10264,7 @@ static const struct net_device_ops ixgbe
  	.ndo_set_vf_vlan	= ixgbe_ndo_set_vf_vlan,
  	.ndo_set_vf_rate	= ixgbe_ndo_set_vf_bw,
  	.ndo_set_vf_spoofchk	= ixgbe_ndo_set_vf_spoofchk,
@@ -76,8 +72,6 @@ index 60a72af39ff7..13df4e0f3796 100644
  	.ndo_set_vf_rss_query_en = ixgbe_ndo_set_vf_rss_query_en,
  	.ndo_set_vf_trust	= ixgbe_ndo_set_vf_trust,
  	.ndo_get_vf_config	= ixgbe_ndo_get_vf_config,
-diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_mbx.h b/drivers/net/ethernet/intel/ixgbe/ixgbe_mbx.h
-index a148534d7256..8f4316b19278 100644
 --- a/drivers/net/ethernet/intel/ixgbe/ixgbe_mbx.h
 +++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_mbx.h
 @@ -85,6 +85,8 @@ enum ixgbe_pfvf_api_rev {
@@ -89,11 +83,9 @@ index a148534d7256..8f4316b19278 100644
  /* length of permanent address message returned from PF */
  #define IXGBE_VF_PERMADDR_MSG_LEN 4
  /* word in permanent address message with the current multicast type */
-diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.c
-index 214a38de3f41..7f11c0a8e7a9 100644
 --- a/drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.c
 +++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.c
-@@ -96,6 +96,7 @@ static int __ixgbe_enable_sriov(struct ixgbe_adapter *adapter,
+@@ -96,6 +96,7 @@ static int __ixgbe_enable_sriov(struct i
  	for (i = 0; i < num_vfs; i++) {
  		/* enable spoof checking for all VFs */
  		adapter->vfinfo[i].spoofchk_enabled = true;
@@ -101,7 +93,7 @@ index 214a38de3f41..7f11c0a8e7a9 100644
  
  		/* We support VF RSS querying only for 82599 and x540
  		 * devices at the moment. These devices share RSS
-@@ -820,6 +821,57 @@ static inline void ixgbe_write_qde(struct ixgbe_adapter *adapter, u32 vf,
+@@ -823,6 +824,57 @@ static inline void ixgbe_write_qde(struc
  	}
  }
  
@@ -159,7 +151,7 @@ index 214a38de3f41..7f11c0a8e7a9 100644
  static int ixgbe_vf_reset_msg(struct ixgbe_adapter *adapter, u32 vf)
  {
  	struct ixgbe_ring_feature *vmdq = &adapter->ring_feature[RING_F_VMDQ];
-@@ -845,11 +897,6 @@ static int ixgbe_vf_reset_msg(struct ixgbe_adapter *adapter, u32 vf)
+@@ -848,11 +900,6 @@ static int ixgbe_vf_reset_msg(struct ixg
  	vf_shift = vf % 32;
  	reg_offset = vf / 32;
  
@@ -171,7 +163,7 @@ index 214a38de3f41..7f11c0a8e7a9 100644
  	/* force drop enable for all VF Rx queues */
  	reg = IXGBE_QDE_ENABLE;
  	if (adapter->vfinfo[vf].pf_vlan)
-@@ -857,27 +904,7 @@ static int ixgbe_vf_reset_msg(struct ixgbe_adapter *adapter, u32 vf)
+@@ -860,27 +907,7 @@ static int ixgbe_vf_reset_msg(struct ixg
  
  	ixgbe_write_qde(adapter, vf, reg);
  
@@ -200,7 +192,7 @@ index 214a38de3f41..7f11c0a8e7a9 100644
  
  	/* enable VF mailbox for further messages */
  	adapter->vfinfo[vf].clear_to_send = true;
-@@ -1202,6 +1229,26 @@ static int ixgbe_update_vf_xcast_mode(struct ixgbe_adapter *adapter,
+@@ -1205,6 +1232,26 @@ out:
  	return 0;
  }
  
@@ -227,7 +219,7 @@ index 214a38de3f41..7f11c0a8e7a9 100644
  static int ixgbe_rcv_msg_from_vf(struct ixgbe_adapter *adapter, u32 vf)
  {
  	u32 mbx_size = IXGBE_VFMAILBOX_SIZE;
-@@ -1267,6 +1314,9 @@ static int ixgbe_rcv_msg_from_vf(struct ixgbe_adapter *adapter, u32 vf)
+@@ -1270,6 +1317,9 @@ static int ixgbe_rcv_msg_from_vf(struct
  	case IXGBE_VF_UPDATE_XCAST_MODE:
  		retval = ixgbe_update_vf_xcast_mode(adapter, msgbuf, vf);
  		break;
@@ -237,8 +229,8 @@ index 214a38de3f41..7f11c0a8e7a9 100644
  	case IXGBE_VF_IPSEC_ADD:
  		retval = ixgbe_ipsec_vf_add_sa(adapter, msgbuf, vf);
  		break;
-@@ -1322,18 +1372,6 @@ void ixgbe_msg_task(struct ixgbe_adapter *adapter)
- 	}
+@@ -1328,18 +1378,6 @@ void ixgbe_msg_task(struct ixgbe_adapter
+ 	spin_unlock_irqrestore(&adapter->vfs_lock, flags);
  }
  
 -void ixgbe_disable_tx_rx(struct ixgbe_adapter *adapter)
@@ -256,7 +248,7 @@ index 214a38de3f41..7f11c0a8e7a9 100644
  static inline void ixgbe_ping_vf(struct ixgbe_adapter *adapter, int vf)
  {
  	struct ixgbe_hw *hw = &adapter->hw;
-@@ -1359,6 +1397,21 @@ void ixgbe_ping_all_vfs(struct ixgbe_adapter *adapter)
+@@ -1365,6 +1403,21 @@ void ixgbe_ping_all_vfs(struct ixgbe_ada
  	}
  }
  
@@ -278,7 +270,7 @@ index 214a38de3f41..7f11c0a8e7a9 100644
  int ixgbe_ndo_set_vf_mac(struct net_device *netdev, int vf, u8 *mac)
  {
  	struct ixgbe_adapter *adapter = netdev_priv(netdev);
-@@ -1656,6 +1709,84 @@ int ixgbe_ndo_set_vf_spoofchk(struct net_device *netdev, int vf, bool setting)
+@@ -1662,6 +1715,84 @@ int ixgbe_ndo_set_vf_spoofchk(struct net
  	return 0;
  }
  
@@ -363,11 +355,9 @@ index 214a38de3f41..7f11c0a8e7a9 100644
  int ixgbe_ndo_set_vf_rss_query_en(struct net_device *netdev, int vf,
  				  bool setting)
  {
-diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.h b/drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.h
-index 3ec21923c89c..0690ecb8dfa3 100644
 --- a/drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.h
 +++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.h
-@@ -17,8 +17,8 @@ void ixgbe_restore_vf_multicasts(struct ixgbe_adapter *adapter);
+@@ -17,8 +17,8 @@ void ixgbe_restore_vf_multicasts(struct
  #endif
  void ixgbe_msg_task(struct ixgbe_adapter *adapter);
  int ixgbe_vf_configuration(struct pci_dev *pdev, unsigned int event_mask);
@@ -377,7 +367,7 @@ index 3ec21923c89c..0690ecb8dfa3 100644
  int ixgbe_ndo_set_vf_mac(struct net_device *netdev, int queue, u8 *mac);
  int ixgbe_ndo_set_vf_vlan(struct net_device *netdev, int queue, u16 vlan,
  			   u8 qos, __be16 vlan_proto);
-@@ -31,7 +31,9 @@ int ixgbe_ndo_set_vf_rss_query_en(struct net_device *netdev, int vf,
+@@ -31,7 +31,9 @@ int ixgbe_ndo_set_vf_rss_query_en(struct
  int ixgbe_ndo_set_vf_trust(struct net_device *netdev, int vf, bool setting);
  int ixgbe_ndo_get_vf_config(struct net_device *netdev,
  			    int vf, struct ifla_vf_info *ivi);
@@ -387,6 +377,3 @@ index 3ec21923c89c..0690ecb8dfa3 100644
  int ixgbe_disable_sriov(struct ixgbe_adapter *adapter);
  #ifdef CONFIG_PCI_IOV
  void ixgbe_enable_sriov(struct ixgbe_adapter *adapter, unsigned int max_vfs);
--- 
-2.34.1
-
