@@ -1,0 +1,194 @@
+From 65ac56c47fc8f661d37d0e1f7d95a0d7ce77cf80 Mon Sep 17 00:00:00 2001
+From: Junhao He <hejunhao3@huawei.com>
+Date: Tue, 9 Aug 2022 22:15:53 +0800
+Subject: [PATCH] coresight: etm4x: Workaround CPU hung bug on HiSilicon ETM
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 65ac56c47fc8f661d37d0e1f7d95a0d7ce77cf80
+Modified-by-SEL: No
+
+
+driver inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5EZY2
+
+------------------------------------------------------------------
+
+In FIFO mode, when the state of sink buffer is full, the sink device will
+continuously backpressures the ETM, so that the ETM cannot switch to the
+idle state. In this case, the WFx instruction cannot be executed because
+the CPU detects that the ETM is not in the idle state which that will
+cause CPU hung.
+We workaround this issue on HiSilicon ETM by setting bit 13 of TRCAUXCTLR
+which is used to indicate that the ETM is in the idle state.
+
+The call trace is shown below:
+ rcu: INFO: rcu_sched detected stalls on CPUs/tasks:
+ rcu: 	10-...0: (1 ticks this GP) idle=5b6/1/0x4000000000000000 softirq=12309/12318 fqs=114196
+ 	(detected by 67, t=330041 jiffies, g=309253, q=453663)
+ Task dump for CPU 10:
+ task:ksoftirqd/10    state:R  running task     stack:    0 pid:   64 ppid:     2 flags:0x0000000a
+ Call trace:
+  __switch_to+0xbc/0xfc
+ irqtime_account_irq+0x58/0xc4
+ __do_softirq+0x6c/0x358
+ run_ksoftirqd+0x68/0x90
+ smpboot_thread_fn+0x15c/0x1a0
+ kthread+0x108/0x13c
+ ret_from_fork+0x10/0x18
+watchdog: BUG: soft lockup - CPU#35 stuck for 22s! [bash:133345]
+...
+Call trace:
+ smp_call_function_single+0x178/0x190
+ etm4_disable_sysfs+0x74/0xfc [coresight_etm4x]
+ etm4_disable+0x6c/0x70 [coresight_etm4x]
+ coresight_disable_source+0x7c/0xa0 [coresight]
+ coresight_disable+0x6c/0x13c [coresight]
+ enable_source_store+0x88/0xa0 [coresight]
+ dev_attr_store+0x20/0x34
+ sysfs_kf_write+0x4c/0x5c
+ kernfs_fop_write_iter+0x130/0x1c0
+ new_sync_write+0xec/0x18c
+ vfs_write+0x214/0x2ac
+ ksys_write+0x70/0xfc
+ __arm64_sys_write+0x24/0x30
+ el0_svc_common.constprop.0+0x7c/0x1bc
+ do_el0_svc+0x2c/0x94
+ el0_svc+0x20/0x30
+ el0_sync_handler+0xb0/0xb4
+ el0_sync+0x160/0x180
+
+Signed-off-by: Qi Liu <liuqi115@huawei.com>
+Signed-off-by: Junhao He <hejunhao3@huawei.com>
+Reviewed-by: Jay Fang <f.fangjian@huawei.com>
+Acked-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ .../coresight/coresight-etm4x-core.c          | 37 +++++++++++++++----
+ drivers/hwtracing/coresight/coresight-etm4x.h |  1 +
+ 2 files changed, 30 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/hwtracing/coresight/coresight-etm4x-core.c b/drivers/hwtracing/coresight/coresight-etm4x-core.c
+index d4d9c8bb88ca..881da29cbd5a 100644
+--- a/drivers/hwtracing/coresight/coresight-etm4x-core.c
++++ b/drivers/hwtracing/coresight/coresight-etm4x-core.c
+@@ -116,8 +116,10 @@ struct etm4_enable_arg {
+ #define HISI_HIP08_CORE_COMMIT_LVL_1	0b01
+ #define HISI_HIP08_CORE_COMMIT_REG	sys_reg(3, 1, 15, 2, 5)
+ 
++#define HISI_HIP08_AUXCTRL_CHICKEN_BIT		BIT(13)
++
+ struct etm4_arch_features {
+-	void (*arch_callback)(bool enable);
++	void (*arch_callback)(void *info);
+ };
+ 
+ static bool etm4_hisi_match_pid(unsigned int id)
+@@ -125,8 +127,9 @@ static bool etm4_hisi_match_pid(unsigned int id)
+ 	return (id & ETM4_AMBA_MASK) == HISI_HIP08_AMBA_ID;
+ }
+ 
+-static void etm4_hisi_config_core_commit(bool enable)
++static void etm4_hisi_config_core_commit(void *info)
+ {
++	bool enable = *(bool *)info;
+ 	u8 commit = enable ? HISI_HIP08_CORE_COMMIT_LVL_1 :
+ 		    HISI_HIP08_CORE_COMMIT_FULL;
+ 	u64 val;
+@@ -143,48 +146,67 @@ static void etm4_hisi_config_core_commit(bool enable)
+ 	write_sysreg_s(val, HISI_HIP08_CORE_COMMIT_REG);
+ }
+ 
++static void etm4_hisi_config_auxctrlr(void *info)
++{
++	struct etmv4_drvdata *drvdata = info;
++
++	/* Switch the ETM to idle state */
++	writel_relaxed(HISI_HIP08_AUXCTRL_CHICKEN_BIT, drvdata->base + TRCAUXCTLR);
++}
++
+ static struct etm4_arch_features etm4_features[] = {
+ 	[ETM4_IMPDEF_HISI_CORE_COMMIT] = {
+ 		.arch_callback = etm4_hisi_config_core_commit,
+ 	},
++	[ETM4_IMPDEF_HISI_SET_AUXCTRLR] = {
++		.arch_callback = etm4_hisi_config_auxctrlr,
++	},
+ 	{},
+ };
+ 
+ static void etm4_enable_arch_specific(struct etmv4_drvdata *drvdata)
+ {
+ 	struct etm4_arch_features *ftr;
++	bool enable = true;
+ 	int bit;
+ 
+ 	for_each_set_bit(bit, drvdata->arch_features, ETM4_IMPDEF_FEATURE_MAX) {
+ 		ftr = &etm4_features[bit];
+ 
+-		if (ftr->arch_callback)
+-			ftr->arch_callback(true);
++		if (bit == ETM4_IMPDEF_HISI_CORE_COMMIT && ftr->arch_callback)
++			ftr->arch_callback(&enable);
++
++		if (bit == ETM4_IMPDEF_HISI_SET_AUXCTRLR && ftr->arch_callback)
++			ftr->arch_callback(drvdata);
+ 	}
+ }
+ 
+ static void etm4_disable_arch_specific(struct etmv4_drvdata *drvdata)
+ {
+ 	struct etm4_arch_features *ftr;
++	bool enable = false;
+ 	int bit;
+ 
+ 	for_each_set_bit(bit, drvdata->arch_features, ETM4_IMPDEF_FEATURE_MAX) {
+ 		ftr = &etm4_features[bit];
+ 
+-		if (ftr->arch_callback)
+-			ftr->arch_callback(false);
++		if (bit == ETM4_IMPDEF_HISI_CORE_COMMIT && ftr->arch_callback)
++			ftr->arch_callback(&enable);
+ 	}
+ }
+ 
+ static void etm4_check_arch_features(struct etmv4_drvdata *drvdata,
+ 				      unsigned int id)
+ {
+-	if (etm4_hisi_match_pid(id))
++	if (etm4_hisi_match_pid(id)) {
+ 		set_bit(ETM4_IMPDEF_HISI_CORE_COMMIT, drvdata->arch_features);
++		set_bit(ETM4_IMPDEF_HISI_SET_AUXCTRLR, drvdata->arch_features);
++	}
+ }
+ #else
+ static void etm4_enable_arch_specific(struct etmv4_drvdata *drvdata)
+ {
++	writel_relaxed(0x0, drvdata->base + TRCAUXCTLR);
+ }
+ 
+ static void etm4_disable_arch_specific(struct etmv4_drvdata *drvdata)
+@@ -223,7 +245,6 @@ static int etm4_enable_hw(struct etmv4_drvdata *drvdata)
+ 		writel_relaxed(config->pe_sel, drvdata->base + TRCPROCSELR);
+ 	writel_relaxed(config->cfg, drvdata->base + TRCCONFIGR);
+ 	/* nothing specific implemented */
+-	writel_relaxed(0x0, drvdata->base + TRCAUXCTLR);
+ 	writel_relaxed(config->eventctrl0, drvdata->base + TRCEVENTCTL0R);
+ 	writel_relaxed(config->eventctrl1, drvdata->base + TRCEVENTCTL1R);
+ 	if (drvdata->stallctl)
+diff --git a/drivers/hwtracing/coresight/coresight-etm4x.h b/drivers/hwtracing/coresight/coresight-etm4x.h
+index 3dd3e0633328..ef9d7365c2da 100644
+--- a/drivers/hwtracing/coresight/coresight-etm4x.h
++++ b/drivers/hwtracing/coresight/coresight-etm4x.h
+@@ -206,6 +206,7 @@
+ 
+ enum etm_impdef_type {
+ 	ETM4_IMPDEF_HISI_CORE_COMMIT,
++	ETM4_IMPDEF_HISI_SET_AUXCTRLR,
+ 	ETM4_IMPDEF_FEATURE_MAX,
+ };
+ 
+-- 
+2.34.1
+

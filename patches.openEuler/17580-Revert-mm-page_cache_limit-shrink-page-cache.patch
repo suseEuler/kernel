@@ -1,0 +1,206 @@
+From f8f215875c80ee7f4fe1edd4cc616fa286dd6d5c Mon Sep 17 00:00:00 2001
+From: Chen Wandun <chenwandun@huawei.com>
+Date: Tue, 16 Aug 2022 21:10:25 +0800
+Subject: [PATCH] Revert "mm/page_cache_limit: shrink page cache"
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: f8f215875c80ee7f4fe1edd4cc616fa286dd6d5c
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56I4P
+CVE: NA
+backport: openEuler-22.03-LTS
+
+--------------------------------
+
+This reverts commit 7be2f4c4fdd7938f161ff6e43a0c60d9c9412a62.
+
+Signed-off-by: Chen Wandun <chenwandun@huawei.com>
+Reviewed-by: Tong Tiangen <tongtiangen@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/page_cache_limit.h |  9 ------
+ mm/page_cache_limit.c            | 27 +++-------------
+ mm/vmscan.c                      | 53 ++------------------------------
+ 3 files changed, 6 insertions(+), 83 deletions(-)
+
+diff --git a/include/linux/page_cache_limit.h b/include/linux/page_cache_limit.h
+index e4ef5919cb92..98f12734114b 100644
+--- a/include/linux/page_cache_limit.h
++++ b/include/linux/page_cache_limit.h
+@@ -2,21 +2,12 @@
+ #define _PAGECACHE_H
+ 
+ #ifdef CONFIG_SHRINK_PAGECACHE
+-enum page_cache_reclaim_flag {
+-	PAGE_CACHE_RECLAIM_NO_UNMAP,
+-	PAGE_CACHE_RECLAIM_UNMAP,
+-	PAGE_CACHE_RECLAIM_WRITEPAGE,
+-	PAGE_CACHE_RECLAIM_NR_FLAGS,
+-};
+-
+ extern int pagecache_reclaim_enable;
+ extern int pagecache_limit_ratio;
+ extern int pagecache_reclaim_ratio;
+ 
+ int proc_page_cache_limit(struct ctl_table *table, int write,
+ 		void __user *buffer, size_t *lenp, loff_t *ppos);
+-unsigned long __shrink_node_page_cache(int nid, gfp_t mask,
+-		unsigned long nr_to_reclaim, enum page_cache_reclaim_flag flag);
+ #else
+ #endif
+ 
+diff --git a/mm/page_cache_limit.c b/mm/page_cache_limit.c
+index 1581334429e1..33164e19cfa2 100644
+--- a/mm/page_cache_limit.c
++++ b/mm/page_cache_limit.c
+@@ -4,8 +4,6 @@
+ #include <linux/kthread.h>
+ #include <linux/module.h>
+ #include <linux/err.h>
+-#include <linux/swap.h>
+-#include <linux/page_cache_limit.h>
+ 
+ int pagecache_reclaim_enable;
+ int pagecache_limit_ratio;
+@@ -144,31 +142,14 @@ static unsigned long node_nr_page_reclaim(int nid)
+ 	return nr_to_reclaim;
+ }
+ 
+-static void shrink_node_page_cache(int nid, gfp_t mask)
++static void shrink_node_page_cache(int nid)
+ {
+-	int i;
+ 	unsigned long nr_to_reclaim;
+-	unsigned long nr_reclaimed;
+-	enum page_cache_reclaim_flag flag;
+ 
+ 	nr_to_reclaim = node_nr_page_reclaim(nid);
+-	if (nr_to_reclaim <= 0)
+-		return;
+-
+-	flag = 0;
+-	for (i = PAGE_CACHE_RECLAIM_NO_UNMAP;
+-			i < PAGE_CACHE_RECLAIM_NR_FLAGS; i++) {
+-		nr_reclaimed = __shrink_node_page_cache(nid, mask, nr_to_reclaim, flag);
+-		nr_to_reclaim -= nr_reclaimed;
+-
+-		if (nr_to_reclaim <= 0)
+-			break;
+-
+-		flag |= i;
+-	}
+ }
+ 
+-static void shrink_page_cache(gfp_t mask)
++static void shrink_page_cache(void)
+ {
+ 	int nid;
+ 
+@@ -176,7 +157,7 @@ static void shrink_page_cache(gfp_t mask)
+ 		return;
+ 
+ 	for_each_node_state(nid, N_MEMORY)
+-		shrink_node_page_cache(nid, mask);
++		shrink_node_page_cache(nid);
+ }
+ 
+ static DECLARE_COMPLETION(setup_done);
+@@ -192,7 +173,7 @@ static int pagecache_limitd(void *arg)
+ 	set_freezable();
+ 	for (;;) {
+ 		try_to_freeze();
+-		shrink_page_cache(GFP_KERNEL | __GFP_HIGHMEM);
++		shrink_page_cache();
+ 
+ 		prepare_to_wait(pagecache_limitd_wait_queue[nid], &wait,
+ 				TASK_INTERRUPTIBLE);
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 1bfbe1fc67d0..c504e530287b 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -66,10 +66,6 @@
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/vmscan.h>
+ 
+-#ifdef CONFIG_SHRINK_PAGECACHE
+-#include <linux/page_cache_limit.h>
+-#endif
+-
+ struct scan_control {
+ 	/* How many pages shrink_list() should reclaim */
+ 	unsigned long nr_to_reclaim;
+@@ -130,9 +126,6 @@ struct scan_control {
+ 	/* The file pages on the current node are dangerously low */
+ 	unsigned int file_is_tiny:1;
+ 
+-	/* can't shrink slab pages */
+-	unsigned int no_shrink_slab:1;
+-
+ 	/* Allocation order */
+ 	s8 order;
+ 
+@@ -2906,9 +2899,8 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
+ 
+ 		shrink_lruvec(lruvec, sc);
+ 
+-		if (!sc->no_shrink_slab)
+-			shrink_slab(sc->gfp_mask, pgdat->node_id, memcg,
+-				    sc->priority);
++		shrink_slab(sc->gfp_mask, pgdat->node_id, memcg,
++			    sc->priority);
+ 
+ 		/* Record the group's reclaim efficiency */
+ 		vmpressure(sc->gfp_mask, memcg, false,
+@@ -4644,44 +4636,3 @@ struct page *get_page_from_vaddr(struct mm_struct *mm, unsigned long vaddr)
+ 	return page;
+ }
+ EXPORT_SYMBOL_GPL(get_page_from_vaddr);
+-
+-#ifdef CONFIG_SHRINK_PAGECACHE
+-/*
+- * return the number of reclaimed pages
+- */
+-unsigned long __shrink_node_page_cache(int nid, gfp_t mask, unsigned long nr_to_reclaim,
+-			     enum page_cache_reclaim_flag reclaim_flag)
+-{
+-	struct scan_control sc = {
+-		.nr_to_reclaim = nr_to_reclaim,
+-		.gfp_mask = mask,
+-		.may_swap = 0,
+-		.may_unmap = reclaim_flag | PAGE_CACHE_RECLAIM_UNMAP,
+-		.may_writepage = reclaim_flag | PAGE_CACHE_RECLAIM_WRITEPAGE,
+-		.target_mem_cgroup = NULL,
+-		.priority = DEF_PRIORITY,
+-		.reclaim_idx = MAX_NR_ZONES,
+-		.no_shrink_slab = 1,
+-	};
+-
+-	struct zonelist *zonelist = node_zonelist(nid, __GFP_THISNODE);
+-	struct reclaim_state *old_rs = current->reclaim_state;
+-	unsigned long nr_reclaimed;
+-	unsigned int noreclaim_flag;
+-
+-	if (!(mask & __GFP_RECLAIM))
+-		return 0;
+-
+-	noreclaim_flag = memalloc_noreclaim_save();
+-	fs_reclaim_acquire(sc.gfp_mask);
+-	current->reclaim_state = NULL;
+-
+-	nr_reclaimed = do_try_to_free_pages(zonelist, &sc);
+-
+-	current->reclaim_state = old_rs;
+-	fs_reclaim_release(sc.gfp_mask);
+-	memalloc_noreclaim_restore(noreclaim_flag);
+-
+-	return nr_reclaimed;
+-}
+-#endif
+-- 
+2.34.1
+

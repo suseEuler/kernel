@@ -1,0 +1,247 @@
+From a84d429e525a3115493ac16246f6a7fbf6cf7f3b Mon Sep 17 00:00:00 2001
+From: Chen Wandun <chenwandun@huawei.com>
+Date: Tue, 16 Aug 2022 21:10:22 +0800
+Subject: [PATCH] Revert "mm/page_cache_limit: add support for droping caches
+ for target node"
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: a84d429e525a3115493ac16246f6a7fbf6cf7f3b
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56I4P
+CVE: NA
+backport: openEuler-22.03-LTS
+
+--------------------------------
+
+This reverts commit e56e8310a3ea2751463ab8ed03dd64baab3fee46.
+
+Signed-off-by: Chen Wandun <chenwandun@huawei.com>
+Reviewed-by: Tong Tiangen <tongtiangen@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/drop_caches.c                 | 36 ++------------------------------
+ include/linux/fs.h               |  9 --------
+ include/linux/page_cache_limit.h |  3 ---
+ kernel/sysctl.c                  |  8 -------
+ mm/page_cache_limit.c            |  2 --
+ mm/truncate.c                    | 34 +++---------------------------
+ 6 files changed, 5 insertions(+), 87 deletions(-)
+
+diff --git a/fs/drop_caches.c b/fs/drop_caches.c
+index ff70ef7674e3..f00fcc4a4f72 100644
+--- a/fs/drop_caches.c
++++ b/fs/drop_caches.c
+@@ -9,17 +9,12 @@
+ #include <linux/writeback.h>
+ #include <linux/sysctl.h>
+ #include <linux/gfp.h>
+-
+-#ifdef CONFIG_SHRINK_PAGECACHE
+-#include <linux/page_cache_limit.h>
+-#endif
+-
+ #include "internal.h"
+ 
+ /* A global variable is a bit ugly, but it keeps the code simple */
+ int sysctl_drop_caches;
+ 
+-static void drop_pagecache_sb(struct super_block *sb, void *nid)
++static void drop_pagecache_sb(struct super_block *sb, void *unused)
+ {
+ 	struct inode *inode, *toput_inode = NULL;
+ 
+@@ -40,12 +35,7 @@ static void drop_pagecache_sb(struct super_block *sb, void *nid)
+ 		spin_unlock(&inode->i_lock);
+ 		spin_unlock(&sb->s_inode_list_lock);
+ 
+-		if (!nid)
+-			invalidate_mapping_pages(inode->i_mapping, 0, -1);
+-		else
+-			node_invalidate_mapping_pages(inode->i_mapping,
+-						      *(int *)nid, 0, -1);
+-
++		invalidate_mapping_pages(inode->i_mapping, 0, -1);
+ 		iput(toput_inode);
+ 		toput_inode = inode;
+ 
+@@ -84,25 +74,3 @@ int drop_caches_sysctl_handler(struct ctl_table *table, int write,
+ 	}
+ 	return 0;
+ }
+-
+-#ifdef CONFIG_SHRINK_PAGECACHE
+-int proc_shrink_node_caches(struct ctl_table *table, int write,
+-		void __user *buffer, size_t *lenp, loff_t *ppos)
+-{
+-	int ret;
+-
+-	ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+-	if (ret || !write)
+-		return ret;
+-
+-	if (node_to_shrink >= MAX_NUMNODES)
+-		return -EINVAL;
+-
+-	if (!node_isset(node_to_shrink, node_states[N_MEMORY]))
+-		return 0;
+-
+-	iterate_supers(drop_pagecache_sb, &node_to_shrink);
+-
+-	return 0;
+-}
+-#endif
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 18259e38dcd7..5c71b826c89c 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -2680,15 +2680,6 @@ extern bool is_bad_inode(struct inode *);
+ unsigned long invalidate_mapping_pages(struct address_space *mapping,
+ 					pgoff_t start, pgoff_t end);
+ 
+-#ifdef CONFIG_SHRINK_PAGECACHE
+-unsigned long node_invalidate_mapping_pages(struct address_space *mapping,
+-					int nid, pgoff_t start, pgoff_t end);
+-#else
+-static inline unsigned long
+-node_invalidate_mapping_pages(struct address_space *mapping, int nid,
+-		pgoff_t start, pgoff_t end) { return 0; }
+-#endif
+-
+ void invalidate_mapping_pagevec(struct address_space *mapping,
+ 				pgoff_t start, pgoff_t end,
+ 				unsigned long *nr_pagevec);
+diff --git a/include/linux/page_cache_limit.h b/include/linux/page_cache_limit.h
+index 442d6126c529..2df08a0604d8 100644
+--- a/include/linux/page_cache_limit.h
++++ b/include/linux/page_cache_limit.h
+@@ -12,7 +12,6 @@ enum page_cache_reclaim_flag {
+ extern int pagecache_reclaim_enable;
+ extern int pagecache_limit_ratio;
+ extern int pagecache_reclaim_ratio;
+-extern int node_to_shrink;
+ 
+ int proc_page_cache_limit(struct ctl_table *table, int write,
+ 		void __user *buffer, size_t *lenp, loff_t *ppos);
+@@ -21,8 +20,6 @@ unsigned long __shrink_node_page_cache(int nid, gfp_t mask,
+ void kpagecache_limitd_stop(int nid);
+ int kpagecache_limitd_run(int nid);
+ void wakeup_all_kpagecache_limitd(void);
+-int proc_shrink_node_caches(struct ctl_table *table, int write,
+-		void __user *buffer, size_t *lenp, loff_t *ppos);
+ #else
+ static inline void kpagecache_limitd_stop(int nid) {}
+ static inline int kpagecache_limitd_run(int nid) { return 0; }
+diff --git a/kernel/sysctl.c b/kernel/sysctl.c
+index 91812d673c6b..c81713cd19f0 100644
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -3229,14 +3229,6 @@ static struct ctl_table vm_table[] = {
+ 		.extra1		= SYSCTL_ZERO,
+ 		.extra2		= (void *)&one_hundred,
+ 	},
+-	{
+-		.procname	= "node_drop_caches",
+-		.data		= &node_to_shrink,
+-		.maxlen		= sizeof(node_to_shrink),
+-		.mode		= 0600,
+-		.proc_handler	= proc_shrink_node_caches,
+-		.extra1		= SYSCTL_ZERO,
+-	},
+ #endif
+ #ifdef CONFIG_ASCEND_SHARE_POOL
+ 	{
+diff --git a/mm/page_cache_limit.c b/mm/page_cache_limit.c
+index 0ccc1388c8dc..0a3098c9bb33 100644
+--- a/mm/page_cache_limit.c
++++ b/mm/page_cache_limit.c
+@@ -5,13 +5,11 @@
+ #include <linux/module.h>
+ #include <linux/err.h>
+ #include <linux/swap.h>
+-#include <linux/fs.h>
+ #include <linux/page_cache_limit.h>
+ 
+ int pagecache_reclaim_enable;
+ int pagecache_limit_ratio;
+ int pagecache_reclaim_ratio;
+-int node_to_shrink;
+ 
+ static unsigned long pagecache_limit_pages;
+ static unsigned long node_pagecache_limit_pages[MAX_NUMNODES];
+diff --git a/mm/truncate.c b/mm/truncate.c
+index 6d4887a43cd8..98d08f197766 100644
+--- a/mm/truncate.c
++++ b/mm/truncate.c
+@@ -465,7 +465,7 @@ void truncate_inode_pages_final(struct address_space *mapping)
+ EXPORT_SYMBOL(truncate_inode_pages_final);
+ 
+ static unsigned long __invalidate_mapping_pages(struct address_space *mapping,
+-		pgoff_t start, pgoff_t end, unsigned long *nr_pagevec, int nid)
++		pgoff_t start, pgoff_t end, unsigned long *nr_pagevec)
+ {
+ 	pgoff_t indices[PAGEVEC_SIZE];
+ 	struct pagevec pvec;
+@@ -487,10 +487,6 @@ static unsigned long __invalidate_mapping_pages(struct address_space *mapping,
+ 							     page);
+ 				continue;
+ 			}
+-
+-			if (nid != NUMA_NO_NODE && page_to_nid(page) != nid)
+-				continue;
+-
+ 			index += thp_nr_pages(page) - 1;
+ 
+ 			ret = invalidate_inode_page(page);
+@@ -533,34 +529,10 @@ static unsigned long __invalidate_mapping_pages(struct address_space *mapping,
+ unsigned long invalidate_mapping_pages(struct address_space *mapping,
+ 		pgoff_t start, pgoff_t end)
+ {
+-	return __invalidate_mapping_pages(mapping, start, end, NULL, NUMA_NO_NODE);
++	return __invalidate_mapping_pages(mapping, start, end, NULL);
+ }
+ EXPORT_SYMBOL(invalidate_mapping_pages);
+ 
+-
+-/**
+- * node_invalidate_mapping_pages - Invalidate all the unlocked pages in @nid of one inode
+- * @mapping: the address_space which holds the pages to invalidate
+- * @nid: pages belong to this node will be invalidate
+- * @start: the offset 'from' which to invalidate
+- * @end: the offset 'to' which to invalidate (inclusive)
+- *
+- * This function only removes the unlocked pages, if you want to
+- * remove all the pages of one inode, you must call truncate_inode_pages.
+- *
+- * node_invalidate_mapping_pages() will not block on IO activity. It will not
+- * invalidate pages which are dirty, locked, under writeback or mapped into
+- * pagetables.
+- *
+- * Return: the number of the pages that were invalidated
+- */
+-#ifdef CONFIG_SHRINK_PAGECACHE
+-unsigned long node_invalidate_mapping_pages(struct address_space *mapping,
+-		int nid, pgoff_t start, pgoff_t end)
+-{
+-	return __invalidate_mapping_pages(mapping, start, end, NULL, nid);
+-}
+-#endif
+ /**
+  * This helper is similar with the above one, except that it accounts for pages
+  * that are likely on a pagevec and count them in @nr_pagevec, which will used by
+@@ -569,7 +541,7 @@ unsigned long node_invalidate_mapping_pages(struct address_space *mapping,
+ void invalidate_mapping_pagevec(struct address_space *mapping,
+ 		pgoff_t start, pgoff_t end, unsigned long *nr_pagevec)
+ {
+-	__invalidate_mapping_pages(mapping, start, end, nr_pagevec, NUMA_NO_NODE);
++	__invalidate_mapping_pages(mapping, start, end, nr_pagevec);
+ }
+ 
+ /*
+-- 
+2.34.1
+

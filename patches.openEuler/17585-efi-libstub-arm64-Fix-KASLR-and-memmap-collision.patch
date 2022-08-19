@@ -1,0 +1,205 @@
+From 469caa301a5a3ff930565ffe0bf2f8538c7a98a9 Mon Sep 17 00:00:00 2001
+From: Cui GaoSheng <cuigaosheng1@huawei.com>
+Date: Tue, 16 Aug 2022 21:10:30 +0800
+Subject: [PATCH] efi/libstub: arm64: Fix KASLR and memmap= collision
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 469caa301a5a3ff930565ffe0bf2f8538c7a98a9
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5J0X7
+CVE: NA
+
+--------------------------------
+
+CONFIG_RANDOMIZE_BASE=y relocates the kernel to a random base address.
+
+However, on arm64, it does not take into account the memmap= parameter
+passed in from the kernel command line. This results in the kernel
+sometimes being put in the middle of memmap.
+
+Add support for memmap kernel parameters parsing on ARM64. The below
+modes are only supported:
+
+memmap=nn[KMG]$ss[KMG]
+
+Region of memory to be reserved is from ss to ss+nn, the region must
+be in the range of existed memory, otherwise will be ignored.
+
+Teach KASLR to not insert the kernel in memmap defined regions. We
+support up to 32 memmap regions: any additional regions will cause
+KASLR to disable.
+
+Signed-off-by: Cui GaoSheng <cuigaosheng1@huawei.com>
+Reviewed-by: Wang Weiyang <wangweiyang2@huawei.com>
+Reviewed-by: Xiu Jianfeng <xiujianfeng@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/firmware/efi/libstub/arm64-stub.c     | 89 +++++++++++++++++++
+ .../firmware/efi/libstub/efi-stub-helper.c    |  2 +
+ drivers/firmware/efi/libstub/efi-stub.c       |  3 +
+ drivers/firmware/efi/libstub/efistub.h        | 10 +++
+ 4 files changed, 104 insertions(+)
+
+diff --git a/drivers/firmware/efi/libstub/arm64-stub.c b/drivers/firmware/efi/libstub/arm64-stub.c
+index 4ee5ced0c6a4..143e3c13e742 100644
+--- a/drivers/firmware/efi/libstub/arm64-stub.c
++++ b/drivers/firmware/efi/libstub/arm64-stub.c
+@@ -15,6 +15,95 @@
+ 
+ #include "efistub.h"
+ 
++#define MAX_MEMMAP_REGIONS 32
++
++struct mem_vector {
++	unsigned long long start;
++	unsigned long long size;
++};
++
++static struct mem_vector mem_avoid[MAX_MEMMAP_REGIONS];
++
++static int
++efi_parse_memmap(char *p, unsigned long long *start, unsigned long long *size)
++{
++	char *oldp;
++	u64 mem_size;
++
++	if (!p)
++		return -EINVAL;
++
++	oldp = p;
++	mem_size = memparse(p, &p);
++	if (p == oldp)
++		return -EINVAL;
++	if (!mem_size)
++		return -EINVAL;
++	if (*p != '$')
++		return -EINVAL;
++
++	*start = memparse(p + 1, &p);
++	*size = mem_size;
++
++	return 0;
++}
++
++void efi_parse_option_memmap(const char *str)
++{
++	int rc;
++	static int idx;
++	char *k, *p = (char *)str;
++
++	while (p && (idx < MAX_MEMMAP_REGIONS)) {
++		k = strchr(p, ',');
++		if (k)
++			*k++ = 0;
++
++		rc = efi_parse_memmap(p, &mem_avoid[idx].start, &mem_avoid[idx].size);
++		if (rc < 0)
++			efi_err("Failed to parse memmap cmdlines, index: %d, str: %s\n", idx, p);
++
++		p = k;
++		idx++;
++	}
++}
++
++void mem_avoid_memmap(void)
++{
++	int i;
++	efi_status_t status;
++	unsigned long nr_pages;
++	unsigned long long start, end;
++
++	for (i = 0; i < MAX_MEMMAP_REGIONS; i++) {
++		if (!mem_avoid[i].size)
++			continue;
++		start = round_down(mem_avoid[i].start, EFI_ALLOC_ALIGN);
++		end = round_up(mem_avoid[i].start + mem_avoid[i].size, EFI_ALLOC_ALIGN);
++		nr_pages = (end - start) / EFI_PAGE_SIZE;
++
++		mem_avoid[i].start = start;
++		mem_avoid[i].size = end - start;
++		status = efi_bs_call(allocate_pages, EFI_ALLOCATE_ADDRESS,
++				     EFI_LOADER_DATA, nr_pages, &mem_avoid[i].start);
++		if (status != EFI_SUCCESS) {
++			efi_err("Failed to reserve memmap, index: %d, status: %lu\n", i, status);
++			mem_avoid[i].size = 0;
++		}
++	}
++}
++
++void free_avoid_memmap(void)
++{
++	int i;
++
++	for (i = 0; i < MAX_MEMMAP_REGIONS; i++) {
++		if (!mem_avoid[i].size)
++			continue;
++		efi_free(mem_avoid[i].size, mem_avoid[i].start);
++	}
++}
++
+ efi_status_t check_platform_features(void)
+ {
+ 	u64 tg;
+diff --git a/drivers/firmware/efi/libstub/efi-stub-helper.c b/drivers/firmware/efi/libstub/efi-stub-helper.c
+index aa8da0a49829..0e0033fa7d51 100644
+--- a/drivers/firmware/efi/libstub/efi-stub-helper.c
++++ b/drivers/firmware/efi/libstub/efi-stub-helper.c
+@@ -232,6 +232,8 @@ efi_status_t efi_parse_options(char const *cmdline)
+ 		} else if (!strcmp(param, "video") &&
+ 			   val && strstarts(val, "efifb:")) {
+ 			efi_parse_option_graphics(val + strlen("efifb:"));
++		} else if (!strcmp(param, "memmap") && val) {
++			efi_parse_option_memmap(val);
+ 		}
+ 	}
+ 	efi_bs_call(free_pool, buf);
+diff --git a/drivers/firmware/efi/libstub/efi-stub.c b/drivers/firmware/efi/libstub/efi-stub.c
+index 0ab439c53eee..6840a57b8f3b 100644
+--- a/drivers/firmware/efi/libstub/efi-stub.c
++++ b/drivers/firmware/efi/libstub/efi-stub.c
+@@ -194,6 +194,8 @@ efi_status_t __efiapi efi_pe_entry(efi_handle_t handle,
+ 
+ 	si = setup_graphics();
+ 
++	mem_avoid_memmap();
++
+ 	status = handle_kernel_image(&image_addr, &image_size,
+ 				     &reserve_addr,
+ 				     &reserve_size,
+@@ -311,6 +313,7 @@ efi_status_t __efiapi efi_pe_entry(efi_handle_t handle,
+ 	efi_free(image_size, image_addr);
+ 	efi_free(reserve_size, reserve_addr);
+ fail_free_screeninfo:
++	free_avoid_memmap();
+ 	free_screen_info(si);
+ fail_free_cmdline:
+ 	efi_bs_call(free_pool, cmdline_ptr);
+diff --git a/drivers/firmware/efi/libstub/efistub.h b/drivers/firmware/efi/libstub/efistub.h
+index 2d7abcd99de9..cf59df863fa7 100644
+--- a/drivers/firmware/efi/libstub/efistub.h
++++ b/drivers/firmware/efi/libstub/efistub.h
+@@ -805,6 +805,16 @@ efi_status_t efi_parse_options(char const *cmdline);
+ 
+ void efi_parse_option_graphics(char *option);
+ 
++#ifdef CONFIG_ARM64
++void efi_parse_option_memmap(const char *str);
++void mem_avoid_memmap(void);
++void free_avoid_memmap(void);
++#else
++static inline void efi_parse_option_memmap(const char *str) { }
++static inline void mem_avoid_memmap(void) { }
++static inline void free_avoid_memmap(void) { }
++#endif
++
+ efi_status_t efi_setup_gop(struct screen_info *si, efi_guid_t *proto,
+ 			   unsigned long size);
+ 
+-- 
+2.34.1
+

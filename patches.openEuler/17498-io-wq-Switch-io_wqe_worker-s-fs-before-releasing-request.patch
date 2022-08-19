@@ -1,0 +1,85 @@
+From a5e9a87207c2df303830bfe93a7f92f43aa6ada9 Mon Sep 17 00:00:00 2001
+From: Zhihao Cheng <chengzhihao1@huawei.com>
+Date: Tue, 9 Aug 2022 22:15:54 +0800
+Subject: [PATCH] io-wq: Switch io_wqe_worker's fs before releasing request
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: a5e9a87207c2df303830bfe93a7f92f43aa6ada9
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 187369, https://gitee.com/openeuler/kernel/issues/I5K66O
+CVE: NA
+
+--------------------------------
+
+Following process triggers an use-after-free problem while iterating
+every process's fs:
+
+main
+   fd = setup_iouring
+   fork => main'                      // task->fs->users = 1
+   submit(fd, STATX, async)
+     id->fs = current->fs
+     req->work.identity = id
+    io_submit_sqes
+     ...
+      io_grab_identity
+       id = req->work.identity
+       id->fs->users++               // fs->users = 2
+
+io_wqe_worker
+    current->fs = work->identity->fs
+    io_req_clean_work
+      fs = req->work.identity->fs
+      --fs->users                    // fs->user = 1
+
+main' exit
+    exit_fs
+     --fs->users                     // fs->user = 0
+     free_fs_struct(fs)              // FREE fs
+
+pivot_root
+chroot_fs_refs
+ do_each_thread(g, p) {
+  fs = p->fs                // io_wqe_worker->fs
+  if (fs)
+    spin_lock(&fs->lock)    // UAF!
+ }
+
+io_wqe_worker
+    io_worker_exit
+     __io_worker_unuse
+      if (current->fs != worker->restore_fs)
+        current->fs = worker->restore_fs
+
+Task's fs_struct is used in do_work() and destroyed in free_work(),
+this problem can be fixed by switching io_wqe_worker's fs before
+releasing request.
+
+Signed-off-by: Zhihao Cheng <chengzhihao1@huawei.com>
+Reviewed-by: Zhang Yi <yi.zhang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/io-wq.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/fs/io-wq.c b/fs/io-wq.c
+index 3d5fc76b92d0..56d00f31003b 100644
+--- a/fs/io-wq.c
++++ b/fs/io-wq.c
+@@ -578,6 +578,8 @@ static void io_worker_handle_work(struct io_worker *worker)
+ 				linked = NULL;
+ 			}
+ 			io_assign_current_work(worker, work);
++			if (current->fs != worker->restore_fs)
++				current->fs = worker->restore_fs;
+ 			wq->free_work(old_work);
+ 
+ 			if (linked)
+-- 
+2.34.1
+

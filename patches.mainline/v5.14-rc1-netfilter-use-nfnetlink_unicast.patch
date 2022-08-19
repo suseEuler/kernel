@@ -1,0 +1,398 @@
+From e0241ae6ac59ffa318255640c047f7c90457fbe5 Mon Sep 17 00:00:00 2001
+From: Pablo Neira Ayuso <pablo@netfilter.org>
+Date: Mon, 17 May 2021 14:43:08 +0200
+Subject: [PATCH] netfilter: use nfnetlink_unicast()
+Git-commit: e0241ae6ac59ffa318255640c047f7c90457fbe5
+Patch-mainline: v5.14-rc1
+References: bsn#12
+Modified-by-SEL: Yes, refer to OE commit 6ca6ad7db4df88647b1e438c5322ed4b872b74de
+
+
+Replace netlink_unicast() calls by nfnetlink_unicast() which already
+deals with translating EAGAIN to ENOBUFS as the nfnetlink core expects.
+
+nfnetlink_unicast() calls nlmsg_unicast() which returns zero in case of
+success, otherwise the netlink core function netlink_rcv_skb() turns
+err > 0 into an acknowlegment.
+
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ net/netfilter/ipset/ip_set_core.c    | 44 +++++---------------
+ net/netfilter/nf_conntrack_netlink.c | 62 ++++++++--------------------
+ net/netfilter/nfnetlink_acct.c       |  9 +---
+ net/netfilter/nfnetlink_cthelper.c   | 10 ++---
+ net/netfilter/nfnetlink_cttimeout.c  | 34 ++++-----------
+ 5 files changed, 42 insertions(+), 117 deletions(-)
+
+diff --git a/net/netfilter/ipset/ip_set_core.c b/net/netfilter/ipset/ip_set_core.c
+index 2b19189a930f..1db4fa0580ff 100644
+--- a/net/netfilter/ipset/ip_set_core.c
++++ b/net/netfilter/ipset/ip_set_core.c
+@@ -1706,8 +1706,8 @@ static const struct nla_policy ip_set_adt_policy[IPSET_ATTR_CMD_MAX + 1] = {
+ };
+ 
+ static int
+-call_ad(struct sock *ctnl, struct sk_buff *skb, struct ip_set *set,
+-	struct nlattr *tb[], enum ipset_adt adt,
++call_ad(struct net *net, struct sock *ctnl, struct sk_buff *skb,
++	struct ip_set *set, struct nlattr *tb[], enum ipset_adt adt,
+ 	u32 flags, bool use_lineno)
+ {
+ 	int ret;
+@@ -1759,8 +1759,7 @@ call_ad(struct sock *ctnl, struct sk_buff *skb, struct ip_set *set,
+ 
+ 		*errline = lineno;
+ 
+-		netlink_unicast(ctnl, skb2, NETLINK_CB(skb).portid,
+-				MSG_DONTWAIT);
++		nfnetlink_unicast(skb2, net, NETLINK_CB(skb).portid);
+ 		/* Signal netlink not to send its ACK/errmsg.  */
+ 		return -EINTR;
+ 	}
+@@ -1804,7 +1803,7 @@ static int ip_set_ad(struct net *net, struct sock *ctnl,
+ 				     attr[IPSET_ATTR_DATA],
+ 				     set->type->adt_policy, NULL))
+ 			return -IPSET_ERR_PROTOCOL;
+-		ret = call_ad(ctnl, skb, set, tb, adt, flags,
++		ret = call_ad(net, ctnl, skb, set, tb, adt, flags,
+ 			      use_lineno);
+ 	} else {
+ 		int nla_rem;
+@@ -1815,7 +1814,7 @@ static int ip_set_ad(struct net *net, struct sock *ctnl,
+ 			    nla_parse_nested(tb, IPSET_ATTR_ADT_MAX, nla,
+ 					     set->type->adt_policy, NULL))
+ 				return -IPSET_ERR_PROTOCOL;
+-			ret = call_ad(ctnl, skb, set, tb, adt,
++			ret = call_ad(net, ctnl, skb, set, tb, adt,
+ 				      flags, use_lineno);
+ 			if (ret < 0)
+ 				return ret;
+@@ -1888,7 +1887,6 @@ static int ip_set_header(struct net *net, struct sock *ctnl,
+ 	const struct ip_set *set;
+ 	struct sk_buff *skb2;
+ 	struct nlmsghdr *nlh2;
+-	int ret = 0;
+ 
+ 	if (unlikely(protocol_min_failed(attr) ||
+ 		     !attr[IPSET_ATTR_SETNAME]))
+@@ -1914,11 +1912,7 @@ static int ip_set_header(struct net *net, struct sock *ctnl,
+ 		goto nla_put_failure;
+ 	nlmsg_end(skb2, nlh2);
+ 
+-	ret = netlink_unicast(ctnl, skb2, NETLINK_CB(skb).portid, MSG_DONTWAIT);
+-	if (ret < 0)
+-		return ret;
+-
+-	return 0;
++	return nfnetlink_unicast(skb2, net, NETLINK_CB(skb).portid);
+ 
+ nla_put_failure:
+ 	nlmsg_cancel(skb2, nlh2);
+@@ -1975,11 +1969,8 @@ static int ip_set_type(struct net *net, struct sock *ctnl, struct sk_buff *skb,
+ 	nlmsg_end(skb2, nlh2);
+ 
+ 	pr_debug("Send TYPE, nlmsg_len: %u\n", nlh2->nlmsg_len);
+-	ret = netlink_unicast(ctnl, skb2, NETLINK_CB(skb).portid, MSG_DONTWAIT);
+-	if (ret < 0)
+-		return ret;
+ 
+-	return 0;
++	return nfnetlink_unicast(skb2, net, NETLINK_CB(skb).portid);
+ 
+ nla_put_failure:
+ 	nlmsg_cancel(skb2, nlh2);
+@@ -2002,7 +1993,6 @@ static int ip_set_protocol(struct net *net, struct sock *ctnl,
+ {
+ 	struct sk_buff *skb2;
+ 	struct nlmsghdr *nlh2;
+-	int ret = 0;
+ 
+ 	if (unlikely(!attr[IPSET_ATTR_PROTOCOL]))
+ 		return -IPSET_ERR_PROTOCOL;
+@@ -2021,11 +2011,7 @@ static int ip_set_protocol(struct net *net, struct sock *ctnl,
+ 		goto nla_put_failure;
+ 	nlmsg_end(skb2, nlh2);
+ 
+-	ret = netlink_unicast(ctnl, skb2, NETLINK_CB(skb).portid, MSG_DONTWAIT);
+-	if (ret < 0)
+-		return ret;
+-
+-	return 0;
++	return nfnetlink_unicast(skb2, net, NETLINK_CB(skb).portid);
+ 
+ nla_put_failure:
+ 	nlmsg_cancel(skb2, nlh2);
+@@ -2046,7 +2032,6 @@ static int ip_set_byname(struct net *net, struct sock *ctnl,
+ 	struct nlmsghdr *nlh2;
+ 	ip_set_id_t id = IPSET_INVALID_ID;
+ 	const struct ip_set *set;
+-	int ret = 0;
+ 
+ 	if (unlikely(protocol_failed(attr) ||
+ 		     !attr[IPSET_ATTR_SETNAME]))
+@@ -2070,11 +2055,7 @@ static int ip_set_byname(struct net *net, struct sock *ctnl,
+ 		goto nla_put_failure;
+ 	nlmsg_end(skb2, nlh2);
+ 
+-	ret = netlink_unicast(ctnl, skb2, NETLINK_CB(skb).portid, MSG_DONTWAIT);
+-	if (ret < 0)
+-		return ret;
+-
+-	return 0;
++	return nfnetlink_unicast(skb2, net, NETLINK_CB(skb).portid);
+ 
+ nla_put_failure:
+ 	nlmsg_cancel(skb2, nlh2);
+@@ -2098,7 +2079,6 @@ static int ip_set_byindex(struct net *net, struct sock *ctnl,
+ 	struct nlmsghdr *nlh2;
+ 	ip_set_id_t id = IPSET_INVALID_ID;
+ 	const struct ip_set *set;
+-	int ret = 0;
+ 
+ 	if (unlikely(protocol_failed(attr) ||
+ 		     !attr[IPSET_ATTR_INDEX]))
+@@ -2124,11 +2104,7 @@ static int ip_set_byindex(struct net *net, struct sock *ctnl,
+ 		goto nla_put_failure;
+ 	nlmsg_end(skb2, nlh2);
+ 
+-	ret = netlink_unicast(ctnl, skb2, NETLINK_CB(skb).portid, MSG_DONTWAIT);
+-	if (ret < 0)
+-		return ret;
+-
+-	return 0;
++	return nfnetlink_unicast(skb2, net, NETLINK_CB(skb).portid);
+ 
+ nla_put_failure:
+ 	nlmsg_cancel(skb2, nlh2);
+diff --git a/net/netfilter/nf_conntrack_netlink.c b/net/netfilter/nf_conntrack_netlink.c
+index eeeaa34b3e7b..a753762fb078 100644
+--- a/net/netfilter/nf_conntrack_netlink.c
++++ b/net/netfilter/nf_conntrack_netlink.c
+@@ -1634,9 +1634,8 @@ static int ctnetlink_get_conntrack(struct net *net, struct sock *ctnl,
+ 
+ 	ct = nf_ct_tuplehash_to_ctrack(h);
+ 
+-	err = -ENOMEM;
+ 	skb2 = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
+-	if (skb2 == NULL) {
++	if (!skb2) {
+ 		nf_ct_put(ct);
+ 		return -ENOMEM;
+ 	}
+@@ -1644,20 +1643,12 @@ static int ctnetlink_get_conntrack(struct net *net, struct sock *ctnl,
+ 	err = ctnetlink_fill_info(skb2, NETLINK_CB(skb).portid, nlh->nlmsg_seq,
+ 				  NFNL_MSG_TYPE(nlh->nlmsg_type), ct, true, 0);
+ 	nf_ct_put(ct);
+-	if (err <= 0)
+-		goto free;
+-
+-	err = netlink_unicast(ctnl, skb2, NETLINK_CB(skb).portid, MSG_DONTWAIT);
+-	if (err < 0)
+-		goto out;
+-
+-	return 0;
++	if (err <= 0) {
++		kfree_skb(skb2);
++		return -ENOMEM;
++	}
+ 
+-free:
+-	kfree_skb(skb2);
+-out:
+-	/* this avoids a loop in nfnetlink. */
+-	return err == -EAGAIN ? -ENOBUFS : err;
++	return nfnetlink_unicast(skb2, net, NETLINK_CB(skb).portid);
+ }
+ 
+ static int ctnetlink_done_list(struct netlink_callback *cb)
+@@ -2613,20 +2604,12 @@ static int ctnetlink_stat_ct(struct net *net, struct sock *ctnl,
+ 					  nlh->nlmsg_seq,
+ 					  NFNL_MSG_TYPE(nlh->nlmsg_type),
+ 					  sock_net(skb->sk));
+-	if (err <= 0)
+-		goto free;
+-
+-	err = netlink_unicast(ctnl, skb2, NETLINK_CB(skb).portid, MSG_DONTWAIT);
+-	if (err < 0)
+-		goto out;
+-
+-	return 0;
++	if (err <= 0) {
++		kfree_skb(skb2);
++		return -ENOMEM;
++	}
+ 
+-free:
+-	kfree_skb(skb2);
+-out:
+-	/* this avoids a loop in nfnetlink. */
+-	return err == -EAGAIN ? -ENOBUFS : err;
++	return nfnetlink_unicast(skb2, net, NETLINK_CB(skb).portid);
+ }
+ 
+ static const struct nla_policy exp_nla_policy[CTA_EXPECT_MAX+1] = {
+@@ -3368,11 +3351,10 @@ static int ctnetlink_get_expect(struct net *net, struct sock *ctnl,
+ 		}
+ 	}
+ 
+-	err = -ENOMEM;
+ 	skb2 = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
+-	if (skb2 == NULL) {
++	if (!skb2) {
+ 		nf_ct_expect_put(exp);
+-		goto out;
++		return -ENOMEM;
+ 	}
+ 
+ 	rcu_read_lock();
+@@ -3380,20 +3362,12 @@ static int ctnetlink_get_expect(struct net *net, struct sock *ctnl,
+ 				      nlh->nlmsg_seq, IPCTNL_MSG_EXP_NEW, exp);
+ 	rcu_read_unlock();
+ 	nf_ct_expect_put(exp);
+-	if (err <= 0)
+-		goto free;
+-
+-	err = netlink_unicast(ctnl, skb2, NETLINK_CB(skb).portid, MSG_DONTWAIT);
+-	if (err < 0)
+-		goto out;
+-
+-	return 0;
++	if (err <= 0) {
++		kfree_skb(skb2);
++		return -ENOMEM;
++	}
+ 
+-free:
+-	kfree_skb(skb2);
+-out:
+-	/* this avoids a loop in nfnetlink. */
+-	return err == -EAGAIN ? -ENOBUFS : err;
++	return nfnetlink_unicast(skb2, net, NETLINK_CB(skb).portid);
+ }
+ 
+ static bool expect_iter_name(struct nf_conntrack_expect *exp, void *data)
+diff --git a/net/netfilter/nfnetlink_acct.c b/net/netfilter/nfnetlink_acct.c
+index 5bfec829c12f..a9091b721181 100644
+--- a/net/netfilter/nfnetlink_acct.c
++++ b/net/netfilter/nfnetlink_acct.c
+@@ -308,13 +308,8 @@ static int nfnl_acct_get(struct net *net, struct sock *nfnl,
+ 			kfree_skb(skb2);
+ 			break;
+ 		}
+-		ret = netlink_unicast(nfnl, skb2, NETLINK_CB(skb).portid,
+-					MSG_DONTWAIT);
+-		if (ret > 0)
+-			ret = 0;
+-
+-		/* this avoids a loop in nfnetlink. */
+-		return ret == -EAGAIN ? -ENOBUFS : ret;
++		ret = nfnetlink_unicast(skb2, net, NETLINK_CB(skb).portid);
++		break;
+ 	}
+ 	return ret;
+ }
+diff --git a/net/netfilter/nfnetlink_cthelper.c b/net/netfilter/nfnetlink_cthelper.c
+index 91afbf8ac8cf..7e5820e19de3 100644
+--- a/net/netfilter/nfnetlink_cthelper.c
++++ b/net/netfilter/nfnetlink_cthelper.c
+@@ -676,14 +676,10 @@ static int nfnl_cthelper_get(struct net *net, struct sock *nfnl,
+ 			break;
+ 		}
+ 
+-		ret = netlink_unicast(nfnl, skb2, NETLINK_CB(skb).portid,
+-				      MSG_DONTWAIT);
+-		if (ret > 0)
+-			ret = 0;
+-
+-		/* this avoids a loop in nfnetlink. */
+-		return ret == -EAGAIN ? -ENOBUFS : ret;
++		ret = nfnetlink_unicast(skb2, net, NETLINK_CB(skb).portid);
++		break;
+ 	}
++
+ 	return ret;
+ }
+ 
+diff --git a/net/netfilter/nfnetlink_cttimeout.c b/net/netfilter/nfnetlink_cttimeout.c
+index 89a381f7f945..49d7499cd4ac 100644
+--- a/net/netfilter/nfnetlink_cttimeout.c
++++ b/net/netfilter/nfnetlink_cttimeout.c
+@@ -279,13 +279,8 @@ static int cttimeout_get_timeout(struct net *net, struct sock *ctnl,
+ 			kfree_skb(skb2);
+ 			break;
+ 		}
+-		ret = netlink_unicast(ctnl, skb2, NETLINK_CB(skb).portid,
+-					MSG_DONTWAIT);
+-		if (ret > 0)
+-			ret = 0;
+-
+-		/* this avoids a loop in nfnetlink. */
+-		return ret == -EAGAIN ? -ENOBUFS : ret;
++		ret = nfnetlink_unicast(skb2, net, NETLINK_CB(skb).portid);
++		break;
+ 	}
+ 	return ret;
+ }
+@@ -429,9 +424,9 @@ static int cttimeout_default_get(struct net *net, struct sock *ctnl,
+ 	const struct nf_conntrack_l4proto *l4proto;
+ 	unsigned int *timeouts = NULL;
+ 	struct sk_buff *skb2;
+-	int ret, err;
+ 	__u16 l3num;
+ 	__u8 l4num;
++	int ret;
+ 
+ 	if (!cda[CTA_TIMEOUT_L3PROTO] || !cda[CTA_TIMEOUT_L4PROTO])
+ 		return -EINVAL;
+@@ -440,9 +435,8 @@ static int cttimeout_default_get(struct net *net, struct sock *ctnl,
+ 	l4num = nla_get_u8(cda[CTA_TIMEOUT_L4PROTO]);
+ 	l4proto = nf_ct_l4proto_find(l4num);
+ 
+-	err = -EOPNOTSUPP;
+ 	if (l4proto->l4proto != l4num)
+-		goto err;
++		return -EOPNOTSUPP;
+ 
+ 	switch (l4proto->l4proto) {
+ 	case IPPROTO_ICMP:
+@@ -482,13 +476,11 @@ static int cttimeout_default_get(struct net *net, struct sock *ctnl,
+ 	}
+ 
+ 	if (!timeouts)
+-		goto err;
++		return -EOPNOTSUPP;
+ 
+ 	skb2 = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
+-	if (skb2 == NULL) {
+-		err = -ENOMEM;
+-		goto err;
+-	}
++	if (!skb2)
++		return -ENOMEM;
+ 
+ 	ret = cttimeout_default_fill_info(net, skb2, NETLINK_CB(skb).portid,
+ 					  nlh->nlmsg_seq,
+@@ -497,17 +489,9 @@ static int cttimeout_default_get(struct net *net, struct sock *ctnl,
+ 					  l3num, l4proto, timeouts);
+ 	if (ret <= 0) {
+ 		kfree_skb(skb2);
+-		err = -ENOMEM;
+-		goto err;
++		return -ENOMEM;
+ 	}
+-	ret = netlink_unicast(ctnl, skb2, NETLINK_CB(skb).portid, MSG_DONTWAIT);
+-	if (ret > 0)
+-		ret = 0;
+-
+-	/* this avoids a loop in nfnetlink. */
+-	return ret == -EAGAIN ? -ENOBUFS : ret;
+-err:
+-	return err;
++	return nfnetlink_unicast(skb2, net, NETLINK_CB(skb).portid);
+ }
+ 
+ static struct nf_ct_timeout *ctnl_timeout_find_get(struct net *net,
+-- 
+2.34.1
+

@@ -1,0 +1,157 @@
+From 3de5421d4ce821f29589785835ddd6e25a8c71d8 Mon Sep 17 00:00:00 2001
+From: Luo Meng <luomeng12@huawei.com>
+Date: Tue, 16 Aug 2022 21:10:32 +0800
+Subject: [PATCH] dm-mpath: fix UAF in multipath_message()
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 3de5421d4ce821f29589785835ddd6e25a8c71d8
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5KK52
+CVE: NA
+
+--------------------------------
+
+If dm_get_device() create dd in multipath_message(),
+and then call table_deps() after dm_put_table_device(),
+it will lead to concurrency UAF bugs.
+
+One of the concurrency UAF can be shown as below:
+
+         (USE)                        |    (FREE)
+                                      |  target_message
+                                      |    multipath_message
+                                      |      dm_put_device
+                                      |        dm_put_table_device #
+                                      |          kfree(td) # table_device *td
+ioctl # DM_TABLE_DEPS_CMD             |         ...
+  table_deps                          |         ...
+  dm_get_live_or_inactive_table       |         ...
+    retrieve_dep                      |         ...
+    list_for_each_entry               |         ...
+      deps->dev[count++] =            |         ...
+          huge_encode_dev             |         ...
+          (dd->dm_dev->bdev->bd_dev)  |        list_del(&dd->list)
+                                      |        kfree(dd) # dm_dev_internal
+
+The root cause of UAF bugs is that find_device() failed in
+dm_get_device() and will create dd and refcount set 1, kfree()
+in dm_put_table() is not protected. When td, which there are
+still pointers point to, is released, the concurrency UAF bug
+will happen.
+
+This patch add a flag to determine whether to create a new dd.
+
+Signed-off-by: Luo Meng <luomeng12@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/md/dm-mpath.c         |  2 +-
+ drivers/md/dm-table.c         | 44 +++++++++++++++++++++--------------
+ include/linux/device-mapper.h |  2 ++
+ 3 files changed, 30 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/md/dm-mpath.c b/drivers/md/dm-mpath.c
+index bced42f082b0..e0bfa16aab37 100644
+--- a/drivers/md/dm-mpath.c
++++ b/drivers/md/dm-mpath.c
+@@ -1962,7 +1962,7 @@ static int multipath_message(struct dm_target *ti, unsigned argc, char **argv,
+ 		goto out;
+ 	}
+ 
+-	r = dm_get_device(ti, argv[1], dm_table_get_mode(ti->table), &dev);
++	r = __dm_get_device(ti, argv[1], dm_table_get_mode(ti->table), &dev, false);
+ 	if (r) {
+ 		DMWARN("message: error getting device %s",
+ 		       argv[1]);
+diff --git a/drivers/md/dm-table.c b/drivers/md/dm-table.c
+index 5c590895c14c..78627402b5fb 100644
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@ -361,12 +361,8 @@ dev_t dm_get_dev_t(const char *path)
+ }
+ EXPORT_SYMBOL_GPL(dm_get_dev_t);
+ 
+-/*
+- * Add a device to the list, or just increment the usage count if
+- * it's already present.
+- */
+-int dm_get_device(struct dm_target *ti, const char *path, fmode_t mode,
+-		  struct dm_dev **result)
++int __dm_get_device(struct dm_target *ti, const char *path, fmode_t mode,
++		    struct dm_dev **result, bool create_dd)
+ {
+ 	int r;
+ 	dev_t dev;
+@@ -390,19 +386,22 @@ int dm_get_device(struct dm_target *ti, const char *path, fmode_t mode,
+ 
+ 	dd = find_device(&t->devices, dev);
+ 	if (!dd) {
+-		dd = kmalloc(sizeof(*dd), GFP_KERNEL);
+-		if (!dd)
+-			return -ENOMEM;
+-
+-		if ((r = dm_get_table_device(t->md, dev, mode, &dd->dm_dev))) {
+-			kfree(dd);
+-			return r;
+-		}
++		if (create_dd) {
++			dd = kmalloc(sizeof(*dd), GFP_KERNEL);
++			if (!dd)
++				return -ENOMEM;
+ 
+-		refcount_set(&dd->count, 1);
+-		list_add(&dd->list, &t->devices);
+-		goto out;
++			r = dm_get_table_device(t->md, dev, mode, &dd->dm_dev);
++			if (r) {
++				kfree(dd);
++				return r;
++			}
+ 
++			refcount_set(&dd->count, 1);
++			list_add(&dd->list, &t->devices);
++			goto out;
++		} else
++			return -ENODEV;
+ 	} else if (dd->dm_dev->mode != (mode | dd->dm_dev->mode)) {
+ 		r = upgrade_mode(dd, mode, t->md);
+ 		if (r)
+@@ -413,6 +412,17 @@ int dm_get_device(struct dm_target *ti, const char *path, fmode_t mode,
+ 	*result = dd->dm_dev;
+ 	return 0;
+ }
++EXPORT_SYMBOL(__dm_get_device);
++
++/*
++ * Add a device to the list, or just increment the usage count if
++ * it's already present.
++ */
++int dm_get_device(struct dm_target *ti, const char *path, fmode_t mode,
++		  struct dm_dev **result)
++{
++	return __dm_get_device(ti, path, mode, result, true);
++}
+ EXPORT_SYMBOL(dm_get_device);
+ 
+ static int dm_set_device_limits(struct dm_target *ti, struct dm_dev *dev,
+diff --git a/include/linux/device-mapper.h b/include/linux/device-mapper.h
+index 50cc070cb1f7..47db4a14c925 100644
+--- a/include/linux/device-mapper.h
++++ b/include/linux/device-mapper.h
+@@ -162,6 +162,8 @@ dev_t dm_get_dev_t(const char *path);
+ int dm_get_device(struct dm_target *ti, const char *path, fmode_t mode,
+ 		  struct dm_dev **result);
+ void dm_put_device(struct dm_target *ti, struct dm_dev *d);
++int __dm_get_device(struct dm_target *ti, const char *path, fmode_t mode,
++		    struct dm_dev **result, bool create_dd);
+ 
+ /*
+  * Information about a target type
+-- 
+2.34.1
+
