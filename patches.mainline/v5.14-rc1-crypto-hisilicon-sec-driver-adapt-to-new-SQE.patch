@@ -5,6 +5,7 @@ Subject: [PATCH] crypto: hisilicon/sec - driver adapt to new SQE
 Git-commit: adc3f65a7806dda12894870731509b6778735319
 Patch-mainline: v5.14-rc1
 References: bsn#12
+Modified-by-SEL: Yes, refreshed due to context changes
 
 
 Due to Kunpeng930 adds new SQE data structure, the SEC driver needs
@@ -20,8 +21,6 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  drivers/crypto/hisilicon/sec2/sec_crypto.h |   7 +
  3 files changed, 256 insertions(+), 43 deletions(-)
 
-diff --git a/drivers/crypto/hisilicon/sec2/sec.h b/drivers/crypto/hisilicon/sec2/sec.h
-index 28679cf4e468..14ba66da7585 100644
 --- a/drivers/crypto/hisilicon/sec2/sec.h
 +++ b/drivers/crypto/hisilicon/sec2/sec.h
 @@ -140,6 +140,7 @@ struct sec_ctx {
@@ -32,8 +31,6 @@ index 28679cf4e468..14ba66da7585 100644
  	struct device *dev;
  };
  
-diff --git a/drivers/crypto/hisilicon/sec2/sec_crypto.c b/drivers/crypto/hisilicon/sec2/sec_crypto.c
-index 133aede8bf07..f4b1c8cbb4d5 100644
 --- a/drivers/crypto/hisilicon/sec2/sec_crypto.c
 +++ b/drivers/crypto/hisilicon/sec2/sec_crypto.c
 @@ -37,10 +37,22 @@
@@ -59,7 +56,7 @@ index 133aede8bf07..f4b1c8cbb4d5 100644
  
  #define SEC_TOTAL_IV_SZ		(SEC_IV_SIZE * QM_Q_DEPTH)
  #define SEC_SGL_SGE_NR		128
-@@ -145,44 +157,90 @@ static int sec_aead_verify(struct sec_req *req)
+@@ -145,44 +157,90 @@ static int sec_aead_verify(struct sec_re
  	return 0;
  }
  
@@ -168,7 +165,7 @@ index 133aede8bf07..f4b1c8cbb4d5 100644
  
  	if (ctx->alg_type == SEC_AEAD && !req->c_req.encrypt)
  		err = sec_aead_verify(req);
-@@ -382,10 +440,11 @@ static int sec_create_qp_ctx(struct hisi_qm *qm, struct sec_ctx *ctx,
+@@ -382,10 +440,11 @@ static int sec_create_qp_ctx(struct hisi
  	qp = ctx->qps[qp_ctx_id];
  	qp->req_type = 0;
  	qp->qp_ctx = qp_ctx;
@@ -178,10 +175,10 @@ index 133aede8bf07..f4b1c8cbb4d5 100644
  
 +	qp->req_cb = sec_req_cb;
 +
- 	mutex_init(&qp_ctx->req_lock);
+ 	spin_lock_init(&qp_ctx->req_lock);
  	idr_init(&qp_ctx->req_idr);
  	INIT_LIST_HEAD(&qp_ctx->backlog);
-@@ -615,19 +674,25 @@ static int sec_skcipher_aes_sm4_setkey(struct sec_cipher_ctx *c_ctx,
+@@ -615,19 +674,25 @@ static int sec_skcipher_aes_sm4_setkey(s
  			return -EINVAL;
  		}
  	} else {
@@ -219,7 +216,7 @@ index 133aede8bf07..f4b1c8cbb4d5 100644
  		}
  	}
  
-@@ -915,6 +980,12 @@ static int sec_aead_setkey(struct crypto_aead *tfm, const u8 *key,
+@@ -915,6 +980,12 @@ static int sec_aead_setkey(struct crypto
  		goto bad_key;
  	}
  
@@ -232,7 +229,7 @@ index 133aede8bf07..f4b1c8cbb4d5 100644
  	return 0;
  
  bad_key:
-@@ -1014,29 +1085,75 @@ static int sec_skcipher_bd_fill(struct sec_ctx *ctx, struct sec_req *req)
+@@ -1014,29 +1085,75 @@ static int sec_skcipher_bd_fill(struct s
  		cipher = SEC_CIPHER_DEC << SEC_CIPHER_OFFSET;
  	sec_sqe->type_cipher_auth = bd_type | cipher;
  
@@ -317,7 +314,7 @@ index 133aede8bf07..f4b1c8cbb4d5 100644
  static void sec_update_iv(struct sec_req *req, enum sec_alg_type alg_type)
  {
  	struct aead_request *aead_req = req->aead_req.aead_req;
-@@ -1170,6 +1287,57 @@ static int sec_aead_bd_fill(struct sec_ctx *ctx, struct sec_req *req)
+@@ -1170,6 +1287,57 @@ static int sec_aead_bd_fill(struct sec_c
  	return 0;
  }
  
@@ -375,7 +372,7 @@ index 133aede8bf07..f4b1c8cbb4d5 100644
  static void sec_aead_callback(struct sec_ctx *c, struct sec_req *req, int err)
  {
  	struct aead_request *a_req = req->aead_req.aead_req;
-@@ -1303,13 +1471,44 @@ static const struct sec_req_op sec_aead_req_ops = {
+@@ -1303,13 +1471,44 @@ static const struct sec_req_op sec_aead_
  	.process	= sec_process,
  };
  
@@ -408,8 +405,7 @@ index 133aede8bf07..f4b1c8cbb4d5 100644
 +	ret = sec_skcipher_init(tfm);
 +	if (ret)
 +		return ret;
- 
--	return sec_skcipher_init(tfm);
++
 +	if (ctx->sec->qm.ver < QM_HW_V3) {
 +		ctx->type_supported = SEC_BD_TYPE2;
 +		ctx->req_op = &sec_skcipher_req_ops;
@@ -417,12 +413,13 @@ index 133aede8bf07..f4b1c8cbb4d5 100644
 +		ctx->type_supported = SEC_BD_TYPE3;
 +		ctx->req_op = &sec_skcipher_req_ops_v3;
 +	}
-+
+ 
+-	return sec_skcipher_init(tfm);
 +	return ret;
  }
  
  static void sec_skcipher_ctx_exit(struct crypto_skcipher *tfm)
-@@ -1330,10 +1529,16 @@ static int sec_aead_init(struct crypto_aead *tfm)
+@@ -1330,10 +1529,16 @@ static int sec_aead_init(struct crypto_a
  		return -EINVAL;
  	}
  
@@ -440,11 +437,9 @@ index 133aede8bf07..f4b1c8cbb4d5 100644
  
  	ret = sec_auth_init(ctx);
  	if (ret)
-diff --git a/drivers/crypto/hisilicon/sec2/sec_crypto.h b/drivers/crypto/hisilicon/sec2/sec_crypto.h
-index 3b64e1705479..163e8134bb3d 100644
 --- a/drivers/crypto/hisilicon/sec2/sec_crypto.h
 +++ b/drivers/crypto/hisilicon/sec2/sec_crypto.h
-@@ -64,6 +64,13 @@ enum sec_addr_type {
+@@ -65,6 +65,13 @@ enum sec_addr_type {
  	SEC_PRP  = 0x2,
  };
  
@@ -458,6 +453,3 @@ index 3b64e1705479..163e8134bb3d 100644
  enum {
  	AUTHPAD_PAD,
  	AUTHPAD_NOPAD,
--- 
-2.31.1
-
