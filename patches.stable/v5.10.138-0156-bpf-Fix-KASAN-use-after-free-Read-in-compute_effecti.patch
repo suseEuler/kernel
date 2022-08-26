@@ -1,21 +1,11 @@
-From d8666bf2e25b0e6674cd04553abef100e961b757 Mon Sep 17 00:00:00 2001
+Git-commit: 3527e3cbb84d8868c4d4e91ba55915f96d39ec3d
 From: Tadeusz Struk <tadeusz.struk@linaro.org>
-Date: Mon, 27 Jun 2022 18:36:17 +0800
+Date: Tue, 17 May 2022 11:04:20 -0700
 Subject: [PATCH] bpf: Fix KASAN use-after-free Read in compute_effective_progs
-Patch-mainline: Not yet, from openEuler
-References: bsn#22
-openEuler-commit: d8666bf2e25b0e6674cd04553abef100e961b757
-Modified-by-SEL: Yes, refreshed due to different context
+References: bsn#19
+Patch-mainline: v5.10.138
 
-
-maillist inclusion
-category: bugfix
-bugzilla: https://gitee.com/openeuler/kernel/issues/I5D7NF
-CVE: NA
-
-Reference: https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git/commit/?h=next-20220616&id=4c46091ee985ae84c60c5e95055d779fcd291d87
-
---------------------------------
+commit 4c46091ee985ae84c60c5e95055d779fcd291d87 upstream.
 
 Syzbot found a Use After Free bug in compute_effective_progs().
 The reproducer creates a number of BPF links, and causes a fault
@@ -41,31 +31,33 @@ Cc: <stable@vger.kernel.org>
 Link: https://syzkaller.appspot.com/bug?id=8ebf179a95c2a2670f7cf1ba62429ec044369db4
 Link: https://lore.kernel.org/bpf/20220517180420.87954-1-tadeusz.struk@linaro.org
 Signed-off-by: Pu Lehui <pulehui@huawei.com>
-Reviewed-by: Kuohai Xu <xukuohai@huawei.com>
-Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
-Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 ---
- kernel/bpf/cgroup.c |   70 ++++++++++++++++++++++++++++++++++++++++++++--------
+ kernel/bpf/cgroup.c | 70 ++++++++++++++++++++++++++++++++++++++-------
  1 file changed, 60 insertions(+), 10 deletions(-)
 
+diff --git a/kernel/bpf/cgroup.c b/kernel/bpf/cgroup.c
+index 6aa9e10c6335..d154e52dd7ae 100644
 --- a/kernel/bpf/cgroup.c
 +++ b/kernel/bpf/cgroup.c
-@@ -748,6 +748,60 @@ static struct bpf_prog_list *find_detach
+@@ -653,6 +653,60 @@ static struct bpf_prog_list *find_detach_entry(struct list_head *progs,
+ 	return ERR_PTR(-ENOENT);
  }
  
- /**
++/**
 + * purge_effective_progs() - After compute_effective_progs fails to alloc new
-+ *                           cgrp->bpf.inactive table we can recover by
-+ *                           recomputing the array in place.
++ *			     cgrp->bpf.inactive table we can recover by
++ *			     recomputing the array in place.
 + *
 + * @cgrp: The cgroup which descendants to travers
 + * @prog: A program to detach or NULL
 + * @link: A link to detach or NULL
-+ * @atype: Type of detach operation
++ * @type: Type of detach operation
 + */
 +static void purge_effective_progs(struct cgroup *cgrp, struct bpf_prog *prog,
 +				  struct bpf_cgroup_link *link,
-+				  enum cgroup_bpf_attach_type atype)
++				  enum bpf_attach_type type)
 +{
 +	struct cgroup_subsys_state *css;
 +	struct bpf_prog_array *progs;
@@ -83,10 +75,10 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
 +
 +		/* find position of link or prog in effective progs array */
 +		for (pos = 0, cg = desc; cg; cg = cgroup_parent(cg)) {
-+			if (pos && !(cg->bpf.flags[atype] & BPF_F_ALLOW_MULTI))
++			if (pos && !(cg->bpf.flags[type] & BPF_F_ALLOW_MULTI))
 +				continue;
 +
-+			head = &cg->bpf.progs[atype];
++			head = &cg->bpf.progs[type];
 +			list_for_each_entry(pl, head, node) {
 +				if (!prog_list_prog(pl))
 +					continue;
@@ -98,7 +90,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
 +found:
 +		BUG_ON(!cg);
 +		progs = rcu_dereference_protected(
-+				desc->bpf.effective[atype],
++				desc->bpf.effective[type],
 +				lockdep_is_held(&cgroup_mutex));
 +
 +		/* Remove the program from the array */
@@ -107,37 +99,36 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
 +	}
 +}
 +
-+/**
+ /**
   * __cgroup_bpf_detach() - Detach the program or link from a cgroup, and
   *                         propagate the change to descendants
-  * @cgrp: The cgroup which descendants to traverse
-@@ -766,7 +820,6 @@ static int __cgroup_bpf_detach(struct cg
+@@ -671,7 +725,6 @@ int __cgroup_bpf_detach(struct cgroup *cgrp, struct bpf_prog *prog,
+ 	u32 flags = cgrp->bpf.flags[type];
  	struct bpf_prog_list *pl;
- 	struct list_head *progs;
- 	u32 flags;
+ 	struct bpf_prog *old_prog;
 -	int err;
  
- 	atype = to_cgroup_bpf_attach_type(type);
- 	if (atype < 0)
-@@ -788,9 +841,12 @@ static int __cgroup_bpf_detach(struct cg
+ 	if (prog && link)
+ 		/* only one of prog or link can be specified */
+@@ -686,9 +739,12 @@ int __cgroup_bpf_detach(struct cgroup *cgrp, struct bpf_prog *prog,
  	pl->prog = NULL;
  	pl->link = NULL;
  
--	err = update_effective_progs(cgrp, atype);
+-	err = update_effective_progs(cgrp, type);
 -	if (err)
 -		goto cleanup;
-+	if (update_effective_progs(cgrp, atype)) {
++	if (update_effective_progs(cgrp, type)) {
 +		/* if update effective array failed replace the prog with a dummy prog*/
 +		pl->prog = old_prog;
 +		pl->link = link;
-+		purge_effective_progs(cgrp, old_prog, link, atype);
++		purge_effective_progs(cgrp, old_prog, link, type);
 +	}
  
  	/* now can actually delete it from this cgroup list */
  	list_del(&pl->node);
-@@ -802,12 +858,6 @@ static int __cgroup_bpf_detach(struct cg
+@@ -700,12 +756,6 @@ int __cgroup_bpf_detach(struct cgroup *cgrp, struct bpf_prog *prog,
  		bpf_prog_put(old_prog);
- 	static_branch_dec(&cgroup_bpf_enabled_key[atype]);
+ 	static_branch_dec(&cgroup_bpf_enabled_key);
  	return 0;
 -
 -cleanup:
@@ -147,4 +138,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
 -	return err;
  }
  
- static int cgroup_bpf_detach(struct cgroup *cgrp, struct bpf_prog *prog,
+ /* Must be called with cgroup_mutex held to avoid races. */
+-- 
+2.34.1
+
