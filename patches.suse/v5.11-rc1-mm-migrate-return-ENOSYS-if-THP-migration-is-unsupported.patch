@@ -1,0 +1,137 @@
+From d532e2e57e3c53ce74e519a07d7d2244482b7bd8 Mon Sep 17 00:00:00 2001
+From: Yang Shi <shy828301@gmail.com>
+Date: Mon, 14 Dec 2020 19:13:16 -0800
+Subject: [PATCH] mm: migrate: return -ENOSYS if THP migration is unsupported
+Git-commit: d532e2e57e3c53ce74e519a07d7d2244482b7bd8
+Patch-mainline: v5.11-rc1
+References: bsn#314
+Modified-by-SEL: No
+
+
+In the current implementation unmap_and_move() would return -ENOMEM if THP
+migration is unsupported, then the THP will be split.  If split is failed
+just exit without trying to migrate other pages.  It doesn't make too much
+sense since there may be enough free memory to migrate other pages and
+there may be a lot base pages on the list.
+
+Return -ENOSYS to make consistent with hugetlb.  And if THP split is
+failed just skip and try other pages on the list.
+
+Just skip the whole list and exit when free memory is really low.
+
+Link: https://lkml.kernel.org/r/20201113205359.556831-6-shy828301@gmail.com
+Signed-off-by: Yang Shi <shy828301@gmail.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Song Liu <songliubraving@fb.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/migrate.c | 62 ++++++++++++++++++++++++++++++++++++++--------------
+ 1 file changed, 46 insertions(+), 16 deletions(-)
+
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 76e2a6f3749f..4749e52106ba 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -1171,7 +1171,7 @@ static int unmap_and_move(new_page_t get_new_page,
+ 	struct page *newpage = NULL;
+ 
+ 	if (!thp_migration_supported() && PageTransHuge(page))
+-		return -ENOMEM;
++		return -ENOSYS;
+ 
+ 	if (page_count(page) == 1) {
+ 		/* page was freed from under us. So we are done. */
+@@ -1378,6 +1378,20 @@ static int unmap_and_move_huge_page(new_page_t get_new_page,
+ 	return rc;
+ }
+ 
++static inline int try_split_thp(struct page *page, struct page **page2,
++				struct list_head *from)
++{
++	int rc = 0;
++
++	lock_page(page);
++	rc = split_huge_page_to_list(page, from);
++	unlock_page(page);
++	if (!rc)
++		list_safe_reset_next(page, *page2, lru);
++
++	return rc;
++}
++
+ /*
+  * migrate_pages - migrate the pages specified in a list, to the free pages
+  *		   supplied as the target for the page migration
+@@ -1455,24 +1469,40 @@ int migrate_pages(struct list_head *from, new_page_t get_new_page,
+ 			 *		     from list
+ 			 */
+ 			switch(rc) {
++			/*
++			 * THP migration might be unsupported or the
++			 * allocation could've failed so we should
++			 * retry on the same page with the THP split
++			 * to base pages.
++			 *
++			 * Head page is retried immediately and tail
++			 * pages are added to the tail of the list so
++			 * we encounter them after the rest of the list
++			 * is processed.
++			 */
++			case -ENOSYS:
++				/* THP migration is unsupported */
++				if (is_thp) {
++					if (!try_split_thp(page, &page2, from)) {
++						nr_thp_split++;
++						goto retry;
++					}
++
++					nr_thp_failed++;
++					nr_failed += nr_subpages;
++					break;
++				}
++
++				/* Hugetlb migration is unsupported */
++				nr_failed++;
++				break;
+ 			case -ENOMEM:
+ 				/*
+-				 * THP migration might be unsupported or the
+-				 * allocation could've failed so we should
+-				 * retry on the same page with the THP split
+-				 * to base pages.
+-				 *
+-				 * Head page is retried immediately and tail
+-				 * pages are added to the tail of the list so
+-				 * we encounter them after the rest of the list
+-				 * is processed.
++				 * When memory is low, don't bother to try to migrate
++				 * other pages, just exit.
+ 				 */
+ 				if (is_thp) {
+-					lock_page(page);
+-					rc = split_huge_page_to_list(page, from);
+-					unlock_page(page);
+-					if (!rc) {
+-						list_safe_reset_next(page, page2, lru);
++					if (!try_split_thp(page, &page2, from)) {
+ 						nr_thp_split++;
+ 						goto retry;
+ 					}
+@@ -1500,7 +1530,7 @@ int migrate_pages(struct list_head *from, new_page_t get_new_page,
+ 				break;
+ 			default:
+ 				/*
+-				 * Permanent failure (-EBUSY, -ENOSYS, etc.):
++				 * Permanent failure (-EBUSY, etc.):
+ 				 * unlike -EAGAIN case, the failed page is
+ 				 * removed from migration page list and not
+ 				 * retried in the next outer loop.
+-- 
+2.31.1
+

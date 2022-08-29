@@ -1,0 +1,128 @@
+From e1499647c69c72c4583273e773d8c2786cb4bee9 Mon Sep 17 00:00:00 2001
+From: Christoph Hellwig <hch@lst.de>
+Date: Thu, 17 Jun 2021 16:22:10 +0200
+Subject: [PATCH] driver core: Better distinguish probe errors in really_probe
+Git-commit: e1499647c69c72c4583273e773d8c2786cb4bee9
+Patch-mainline: v5.14-rc1
+References: bsn#314
+Modified-by-SEL: Yes, refreshed due to different context
+
+
+really_probe tries to special case errors from ->probe, but due to all
+other initialization added to the function over time now a lot of
+internal errors hit that code path as well.  Untangle that by adding
+a new probe_err local variable and apply the special casing only to
+that.
+
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Cornelia Huck <cohuck@redhat.com>
+Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Reviewed-by: Kirti Wankhede <kwankhede@nvidia.com>
+Link: https://lore.kernel.org/r/20210617142218.1877096-3-hch@lst.de
+Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/base/dd.c |   72 +++++++++++++++++++++++++++++++-----------------------
+ 1 file changed, 42 insertions(+), 30 deletions(-)
+
+--- a/drivers/base/dd.c
++++ b/drivers/base/dd.c
+@@ -497,12 +497,44 @@ static ssize_t state_synced_show(struct
+ }
+ static DEVICE_ATTR_RO(state_synced);
+ 
++
++static int call_driver_probe(struct device *dev, struct device_driver *drv)
++{
++	int ret = 0;
++
++	if (dev->bus->probe)
++		ret = dev->bus->probe(dev);
++	else if (drv->probe)
++		ret = drv->probe(dev);
++
++	switch (ret) {
++	case 0:
++		break;
++	case -EPROBE_DEFER:
++		/* Driver requested deferred probing */
++		dev_dbg(dev, "Driver %s requests probe deferral\n", drv->name);
++		break;
++	case -ENODEV:
++	case -ENXIO:
++		pr_debug("%s: probe of %s rejects match %d\n",
++			 drv->name, dev_name(dev), ret);
++		break;
++	default:
++		/* driver matched but the probe failed */
++		pr_warn("%s: probe of %s failed with error %d\n",
++			drv->name, dev_name(dev), ret);
++		break;
++	}
++
++	return ret;
++}
++
+ static int really_probe(struct device *dev, struct device_driver *drv)
+ {
+-	int ret = -EPROBE_DEFER;
+ 	int local_trigger_count = atomic_read(&deferred_trigger_count);
+ 	bool test_remove = IS_ENABLED(CONFIG_DEBUG_TEST_DRIVER_REMOVE) &&
+ 			   !drv->suppress_bind_attrs;
++	int ret = -EPROBE_DEFER, probe_ret = 0;
+ 
+ 	if (defer_all_probes) {
+ 		/*
+@@ -557,14 +589,14 @@ re_probe:
+ 			goto probe_failed;
+ 	}
+ 
+-	if (dev->bus->probe) {
+-		ret = dev->bus->probe(dev);
+-		if (ret)
+-			goto probe_failed;
+-	} else if (drv->probe) {
+-		ret = drv->probe(dev);
+-		if (ret)
+-			goto probe_failed;
++	probe_ret = call_driver_probe(dev, drv);
++	if (probe_ret) {
++		/*
++		 * Ignore errors returned by ->probe so that the next driver can
++		 * try its luck.
++		 */
++		ret = 0;
++		goto probe_failed;
+ 	}
+ 
+ 	ret = device_add_groups(dev, drv->dev_groups);
+@@ -641,28 +673,8 @@ pinctrl_bind_failed:
+ 		dev->pm_domain->dismiss(dev);
+ 	pm_runtime_reinit(dev);
+ 	dev_pm_set_driver_flags(dev, 0);
+-
+-	switch (ret) {
+-	case -EPROBE_DEFER:
+-		/* Driver requested deferred probing */
+-		dev_dbg(dev, "Driver %s requests probe deferral\n", drv->name);
++	if (probe_ret == -EPROBE_DEFER)
+ 		driver_deferred_probe_add_trigger(dev, local_trigger_count);
+-		break;
+-	case -ENODEV:
+-	case -ENXIO:
+-		pr_debug("%s: probe of %s rejects match %d\n",
+-			 drv->name, dev_name(dev), ret);
+-		break;
+-	default:
+-		/* driver matched but the probe failed */
+-		pr_warn("%s: probe of %s failed with error %d\n",
+-			drv->name, dev_name(dev), ret);
+-	}
+-	/*
+-	 * Ignore errors returned by ->probe so that the next driver can try
+-	 * its luck.
+-	 */
+-	ret = 0;
+ done:
+ 	atomic_dec(&probe_count);
+ 	wake_up_all(&probe_waitqueue);

@@ -1,0 +1,129 @@
+From 204db60c83574559a8e08ce4bbd0029d56b8ab2e Mon Sep 17 00:00:00 2001
+From: Jason Gunthorpe <jgg@nvidia.com>
+Date: Thu, 17 Jun 2021 16:22:09 +0200
+Subject: [PATCH] driver core: Pull required checks into driver_probe_device()
+Git-commit: 204db60c83574559a8e08ce4bbd0029d56b8ab2e
+Patch-mainline: v5.14-rc1
+References: bsn#314
+Modified-by-SEL: No
+
+
+Checking if the dev is dead or if the dev is already bound is a required
+precondition to invoking driver_probe_device(). All the call chains
+leading here duplicate these checks.
+
+Add it directly to driver_probe_device() so the precondition is clear and
+remove the checks from device_driver_attach() and
+__driver_attach_async_helper().
+
+The other call chain going through __device_attach_driver() does have
+these same checks but they are inlined into logic higher up the call stack
+and can't be removed.
+
+The sysfs uAPI call chain starting at bind_store() is a bit confused
+because it reads dev->driver unlocked and returns -ENODEV if it is !NULL,
+otherwise it reads it again under lock and returns 0 if it is !NULL. Fix
+this to always return -EBUSY and always read dev->driver under its lock.
+
+Done in preparation for the next patches which will add additional
+callers to driver_probe_device() and will need these checks as well.
+
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+[hch: drop the extra checks in device_driver_attach and bind_store]
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Reviewed-by: Cornelia Huck <cohuck@redhat.com>
+Link: https://lore.kernel.org/r/20210617142218.1877096-2-hch@lst.de
+Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/base/bus.c |  2 +-
+ drivers/base/dd.c  | 32 ++++++++++----------------------
+ 2 files changed, 11 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/base/bus.c b/drivers/base/bus.c
+index 36d0c654ea61..7de13302e8c8 100644
+--- a/drivers/base/bus.c
++++ b/drivers/base/bus.c
+@@ -210,7 +210,7 @@ static ssize_t bind_store(struct device_driver *drv, const char *buf,
+ 	int err = -ENODEV;
+ 
+ 	dev = bus_find_device_by_name(bus, NULL, buf);
+-	if (dev && dev->driver == NULL && driver_match_device(drv, dev)) {
++	if (dev && driver_match_device(drv, dev)) {
+ 		err = device_driver_attach(drv, dev);
+ 
+ 		if (err > 0) {
+diff --git a/drivers/base/dd.c b/drivers/base/dd.c
+index ecd7cf848daf..7477d3322b3a 100644
+--- a/drivers/base/dd.c
++++ b/drivers/base/dd.c
+@@ -733,8 +733,9 @@ EXPORT_SYMBOL_GPL(wait_for_device_probe);
+  * @drv: driver to bind a device to
+  * @dev: device to try to bind to the driver
+  *
+- * This function returns -ENODEV if the device is not registered,
+- * 1 if the device is bound successfully and 0 otherwise.
++ * This function returns -ENODEV if the device is not registered, -EBUSY if it
++ * already has a driver, and 1 if the device is bound successfully and 0
++ * otherwise.
+  *
+  * This function must be called with @dev lock held.  When called for a
+  * USB interface, @dev->parent lock must be held as well.
+@@ -745,8 +746,10 @@ static int driver_probe_device(struct device_driver *drv, struct device *dev)
+ {
+ 	int ret = 0;
+ 
+-	if (!device_is_registered(dev))
++	if (dev->p->dead || !device_is_registered(dev))
+ 		return -ENODEV;
++	if (dev->driver)
++		return -EBUSY;
+ 
+ 	dev->can_match = true;
+ 	pr_debug("bus: '%s': %s: matched device %s with driver %s\n",
+@@ -1027,17 +1030,10 @@ static void __device_driver_unlock(struct device *dev, struct device *parent)
+  */
+ int device_driver_attach(struct device_driver *drv, struct device *dev)
+ {
+-	int ret = 0;
++	int ret;
+ 
+ 	__device_driver_lock(dev, dev->parent);
+-
+-	/*
+-	 * If device has been removed or someone has already successfully
+-	 * bound a driver before us just skip the driver probe call.
+-	 */
+-	if (!dev->p->dead && !dev->driver)
+-		ret = driver_probe_device(drv, dev);
+-
++	ret = driver_probe_device(drv, dev);
+ 	__device_driver_unlock(dev, dev->parent);
+ 
+ 	return ret;
+@@ -1047,19 +1043,11 @@ static void __driver_attach_async_helper(void *_dev, async_cookie_t cookie)
+ {
+ 	struct device *dev = _dev;
+ 	struct device_driver *drv;
+-	int ret = 0;
++	int ret;
+ 
+ 	__device_driver_lock(dev, dev->parent);
+-
+ 	drv = dev->p->async_driver;
+-
+-	/*
+-	 * If device has been removed or someone has already successfully
+-	 * bound a driver before us just skip the driver probe call.
+-	 */
+-	if (!dev->p->dead && !dev->driver)
+-		ret = driver_probe_device(drv, dev);
+-
++	ret = driver_probe_device(drv, dev);
+ 	__device_driver_unlock(dev, dev->parent);
+ 
+ 	dev_dbg(dev, "driver %s async attach completed: %d\n", drv->name, ret);
+-- 
+2.31.1
+

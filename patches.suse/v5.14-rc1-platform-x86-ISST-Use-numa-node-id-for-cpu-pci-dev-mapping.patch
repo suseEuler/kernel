@@ -1,0 +1,128 @@
+From aa2ddd24257213bdfd2f65058531810ac57455dc Mon Sep 17 00:00:00 2001
+From: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+Date: Wed, 16 Jun 2021 15:13:29 -0700
+Subject: [PATCH] platform/x86: ISST: Use numa node id for cpu pci dev mapping
+Git-commit: aa2ddd24257213bdfd2f65058531810ac57455dc
+Patch-mainline: v5.14-rc1
+References: bsn#314
+Modified-by-SEL: No
+
+
+There is a problem in mapping CPU to a PCI device instance when the
+bus numbers are reused in different packages. This was observed on
+some Sapphire Rapids systems.
+
+The current implementation reads bus number assigned to a CPU package
+via MSR 0x128. This allows to establish relationship between a CPU
+and a PCI device. This allows to update power related parameters to a
+MMIO offset in a PCI device space which is unique to a CPU. But if
+two packages uses same bus number then this mapping will not be unique.
+
+When bus number is reused, PCI device will use different domain number
+or segment number. So we need to be aware of this domain information
+while matching CPU to PCI bus number. This domain information is not
+available via any MSR. So need to use ACPI numa node information.
+
+There is an interface already available in the Linux to read numa
+node for a CPU and a PCI device. This change uses this interface
+to check the numa node of a match PCI device with bus number.
+If the bus number and numa node matches with the CPU's assigned
+bus number and numa node, the matched PCI device instance will be
+returned to the caller.
+
+It is possible that before Sapphire Rapids, the numa node is not
+defined for the Speed Select PCI device in some OEM systems. In this
+case to restore old behavior, return the last matched PCI device
+for domain 0 unlsess there are more than one matches.
+
+Signed-off-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+Link: https://lore.kernel.org/r/20210616221329.1909276-2-srinivas.pandruvada@linux.intel.com
+Reviewed-by: Hans de Goede <hdegoede@redhat.com>
+Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ .../intel_speed_select_if/isst_if_common.c    | 48 ++++++++++++++++++-
+ 1 file changed, 46 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/platform/x86/intel_speed_select_if/isst_if_common.c b/drivers/platform/x86/intel_speed_select_if/isst_if_common.c
+index bbd46b1d9c10..6f0cc679c8e5 100644
+--- a/drivers/platform/x86/intel_speed_select_if/isst_if_common.c
++++ b/drivers/platform/x86/intel_speed_select_if/isst_if_common.c
+@@ -283,13 +283,18 @@ struct isst_if_cpu_info {
+ 	int bus_info[2];
+ 	struct pci_dev *pci_dev[2];
+ 	int punit_cpu_id;
++	int numa_node;
+ };
+ 
+ static struct isst_if_cpu_info *isst_cpu_info;
++#define ISST_MAX_PCI_DOMAINS	8
+ 
+ static struct pci_dev *_isst_if_get_pci_dev(int cpu, int bus_no, int dev, int fn)
+ {
+-	int bus_number;
++	struct pci_dev *matched_pci_dev = NULL;
++	struct pci_dev *pci_dev = NULL;
++	int no_matches = 0;
++	int i, bus_number;
+ 
+ 	if (bus_no < 0 || bus_no > 1 || cpu < 0 || cpu >= nr_cpu_ids ||
+ 	    cpu >= num_possible_cpus())
+@@ -299,7 +304,45 @@ static struct pci_dev *_isst_if_get_pci_dev(int cpu, int bus_no, int dev, int fn
+ 	if (bus_number < 0)
+ 		return NULL;
+ 
+-	return pci_get_domain_bus_and_slot(0, bus_number, PCI_DEVFN(dev, fn));
++	for (i = 0; i < ISST_MAX_PCI_DOMAINS; ++i) {
++		struct pci_dev *_pci_dev;
++		int node;
++
++		_pci_dev = pci_get_domain_bus_and_slot(i, bus_number, PCI_DEVFN(dev, fn));
++		if (!_pci_dev)
++			continue;
++
++		++no_matches;
++		if (!matched_pci_dev)
++			matched_pci_dev = _pci_dev;
++
++		node = dev_to_node(&_pci_dev->dev);
++		if (node == NUMA_NO_NODE) {
++			pr_info("Fail to get numa node for CPU:%d bus:%d dev:%d fn:%d\n",
++				cpu, bus_no, dev, fn);
++			continue;
++		}
++
++		if (node == isst_cpu_info[cpu].numa_node) {
++			pci_dev = _pci_dev;
++			break;
++		}
++	}
++
++	/*
++	 * If there is no numa matched pci_dev, then there can be following cases:
++	 * 1. CONFIG_NUMA is not defined: In this case if there is only single device
++	 *    match, then we don't need numa information. Simply return last match.
++	 *    Othewise return NULL.
++	 * 2. NUMA information is not exposed via _SEG method. In this case it is similar
++	 *    to case 1.
++	 * 3. Numa information doesn't match with CPU numa node and more than one match
++	 *    return NULL.
++	 */
++	if (!pci_dev && no_matches == 1)
++		pci_dev = matched_pci_dev;
++
++	return pci_dev;
+ }
+ 
+ /**
+@@ -354,6 +397,7 @@ static int isst_if_cpu_online(unsigned int cpu)
+ 		return ret;
+ 	}
+ 	isst_cpu_info[cpu].punit_cpu_id = data;
++	isst_cpu_info[cpu].numa_node = cpu_to_node(cpu);
+ 
+ 	isst_restore_msr_local(cpu);
+ 
+-- 
+2.31.1
+
