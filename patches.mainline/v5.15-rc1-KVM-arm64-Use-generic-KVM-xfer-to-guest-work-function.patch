@@ -1,0 +1,144 @@
+From 6caa5812e2d126a0aa8a17816c1ba6f0a0c2b309 Mon Sep 17 00:00:00 2001
+From: Oliver Upton <oupton@google.com>
+Date: Mon, 2 Aug 2021 19:28:09 +0000
+Subject: [PATCH] KVM: arm64: Use generic KVM xfer to guest work function
+Git-commit: 6caa5812e2d126a0aa8a17816c1ba6f0a0c2b309
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified due to different context
+
+
+Clean up handling of checks for pending work by switching to the generic
+infrastructure to do so.
+
+We pick up handling for TIF_NOTIFY_RESUME from this switch, meaning that
+task work will be correctly handled.
+
+Signed-off-by: Oliver Upton <oupton@google.com>
+Signed-off-by: Marc Zyngier <maz@kernel.org>
+Link: https://lore.kernel.org/r/20210802192809.1851010-4-oupton@google.com
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/kvm/Kconfig |    1 
+ arch/arm64/kvm/arm.c   |   72 +++++++++++++++++++++++++++++--------------------
+ 2 files changed, 45 insertions(+), 28 deletions(-)
+
+--- a/arch/arm64/kvm/Kconfig
++++ b/arch/arm64/kvm/Kconfig
+@@ -28,6 +28,7 @@ menuconfig KVM
+ 	select HAVE_KVM_ARCH_TLB_FLUSH_ALL
+ 	select KVM_MMIO
+ 	select KVM_GENERIC_DIRTYLOG_READ_PROTECT
++	select KVM_XFER_TO_GUEST_WORK
+ 	select SRCU
+ 	select KVM_VFIO
+ 	select HAVE_KVM_EVENTFD
+--- a/arch/arm64/kvm/arm.c
++++ b/arch/arm64/kvm/arm.c
+@@ -6,6 +6,7 @@
+ 
+ #include <linux/bug.h>
+ #include <linux/cpu_pm.h>
++#include <linux/entry-kvm.h>
+ #include <linux/errno.h>
+ #include <linux/err.h>
+ #include <linux/kvm_host.h>
+@@ -661,6 +662,45 @@ static void check_vcpu_requests(struct k
+ }
+ 
+ /**
++ * kvm_vcpu_exit_request - returns true if the VCPU should *not* enter the guest
++ * @vcpu:	The VCPU pointer
++ * @ret:	Pointer to write optional return code
++ *
++ * Returns: true if the VCPU needs to return to a preemptible + interruptible
++ *	    and skip guest entry.
++ *
++ * This function disambiguates between two different types of exits: exits to a
++ * preemptible + interruptible kernel context and exits to userspace. For an
++ * exit to userspace, this function will write the return code to ret and return
++ * true. For an exit to preemptible + interruptible kernel context (i.e. check
++ * for pending work and re-enter), return true without writing to ret.
++ */
++static bool kvm_vcpu_exit_request(struct kvm_vcpu *vcpu, int *ret)
++{
++	struct kvm_run *run = vcpu->run;
++
++	/*
++	 * If we're using a userspace irqchip, then check if we need
++	 * to tell a userspace irqchip about timer or PMU level
++	 * changes and if so, exit to userspace (the actual level
++	 * state gets updated in kvm_timer_update_run and
++	 * kvm_pmu_update_run below).
++	 */
++	if (static_branch_unlikely(&userspace_irqchip_in_use)) {
++		if (kvm_timer_should_notify_user(vcpu) ||
++		    kvm_pmu_should_notify_user(vcpu)) {
++			*ret = -EINTR;
++			run->exit_reason = KVM_EXIT_INTR;
++			return true;
++		}
++	}
++
++	return kvm_request_pending(vcpu) ||
++			need_new_vmid_gen(&vcpu->arch.hw_mmu->vmid) ||
++			xfer_to_guest_mode_work_pending();
++}
++
++/**
+  * kvm_arch_vcpu_ioctl_run - the main VCPU run function to execute guest code
+  * @vcpu:	The VCPU pointer
+  *
+@@ -701,7 +741,9 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_v
+ 		/*
+ 		 * Check conditions before entering the guest
+ 		 */
+-		cond_resched();
++		ret = xfer_to_guest_mode_handle_work(vcpu);
++		if (!ret)
++			ret = 1;
+ 
+ 		update_vmid(&vcpu->arch.hw_mmu->vmid);
+ 
+@@ -721,31 +763,6 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_v
+ 		kvm_vgic_flush_hwstate(vcpu);
+ 
+ 		/*
+-		 * Exit if we have a signal pending so that we can deliver the
+-		 * signal to user space.
+-		 */
+-		if (signal_pending(current)) {
+-			ret = -EINTR;
+-			run->exit_reason = KVM_EXIT_INTR;
+-			++vcpu->stat.signal_exits;
+-		}
+-
+-		/*
+-		 * If we're using a userspace irqchip, then check if we need
+-		 * to tell a userspace irqchip about timer or PMU level
+-		 * changes and if so, exit to userspace (the actual level
+-		 * state gets updated in kvm_timer_update_run and
+-		 * kvm_pmu_update_run below).
+-		 */
+-		if (static_branch_unlikely(&userspace_irqchip_in_use)) {
+-			if (kvm_timer_should_notify_user(vcpu) ||
+-			    kvm_pmu_should_notify_user(vcpu)) {
+-				ret = -EINTR;
+-				run->exit_reason = KVM_EXIT_INTR;
+-			}
+-		}
+-
+-		/*
+ 		 * Ensure we set mode to IN_GUEST_MODE after we disable
+ 		 * interrupts and before the final VCPU requests check.
+ 		 * See the comment in kvm_vcpu_exiting_guest_mode() and
+@@ -753,8 +770,7 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_v
+ 		 */
+ 		smp_store_mb(vcpu->mode, IN_GUEST_MODE);
+ 
+-		if (ret <= 0 || need_new_vmid_gen(&vcpu->arch.hw_mmu->vmid) ||
+-		    kvm_request_pending(vcpu)) {
++		if (ret <= 0 || kvm_vcpu_exit_request(vcpu, &ret)) {
+ 			vcpu->mode = OUTSIDE_GUEST_MODE;
+ 			isb(); /* Ensure work in x_flush_hwstate is committed */
+ 			kvm_pmu_sync_hwstate(vcpu);
