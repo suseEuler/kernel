@@ -5,7 +5,7 @@ Subject: [PATCH] xfs: per-cpu deferred inode inactivation queues
 Git-commit: ab23a7768739a23d21d8a16ca37dff96b1ca957a
 Patch-mainline: v5.15-rc1
 References: bsn#12
-Modified-by-SEL: No
+Modified-by-SEL: Yes, refreshed due to different context
 
 
 Move inode inactivation to background work contexts so that it no
@@ -59,15 +59,15 @@ Signed-off-by: Darrick J. Wong <djwong@kernel.org>
 Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
 Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 ---
- fs/xfs/scrub/common.c    |   7 +
- fs/xfs/xfs_icache.c      | 346 +++++++++++++++++++++++++++++++++++----
- fs/xfs/xfs_icache.h      |   6 +
- fs/xfs/xfs_inode.h       |  20 ++-
- fs/xfs/xfs_log_recover.c |   7 +
- fs/xfs/xfs_mount.c       |  26 ++-
- fs/xfs/xfs_mount.h       |  43 ++++-
- fs/xfs/xfs_super.c       | 114 +++++++++++--
- fs/xfs/xfs_trace.h       |  50 +++++-
+ fs/xfs/scrub/common.c    |    7 
+ fs/xfs/xfs_icache.c      |  346 ++++++++++++++++++++++++++++++++++++++++++-----
+ fs/xfs/xfs_icache.h      |    6 
+ fs/xfs/xfs_inode.h       |   20 ++
+ fs/xfs/xfs_log_recover.c |    7 
+ fs/xfs/xfs_mount.c       |   26 +++
+ fs/xfs/xfs_mount.h       |   43 +++++
+ fs/xfs/xfs_super.c       |  114 ++++++++++++++-
+ fs/xfs/xfs_trace.h       |   50 ++++++
  9 files changed, 571 insertions(+), 48 deletions(-)
 
 --- a/fs/xfs/scrub/common.c
@@ -95,7 +95,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  }
 --- a/fs/xfs/xfs_icache.c
 +++ b/fs/xfs/xfs_icache.c
-@@ -211,7 +211,7 @@ xfs_blockgc_queue(
+@@ -212,7 +212,7 @@ xfs_blockgc_queue(
  {
  	rcu_read_lock();
  	if (radix_tree_tagged(&pag->pag_ici_root, XFS_ICI_BLOCKGC_TAG))
@@ -104,7 +104,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  				   &pag->pag_blockgc_work,
  				   msecs_to_jiffies(xfs_blockgc_secs * 1000));
  	rcu_read_unlock();
-@@ -448,6 +448,21 @@ xfs_iget_check_free_state(
+@@ -449,6 +449,21 @@ xfs_iget_check_free_state(
  	return 0;
  }
  
@@ -126,7 +126,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  /*
   * Check the validity of the inode we just found it the cache
   */
-@@ -480,13 +495,30 @@ xfs_iget_cache_hit(
+@@ -481,13 +496,30 @@ xfs_iget_cache_hit(
  	 * reclaimable state, wait for the initialisation to complete
  	 * before continuing.
  	 *
@@ -158,7 +158,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  	/*
  	 * Check the inode free state is valid. This also detects lookup
  	 * racing with unlinks.
-@@ -534,6 +566,17 @@ out_error:
+@@ -535,6 +567,17 @@ out_error:
  	spin_unlock(&ip->i_flags_lock);
  	rcu_read_unlock();
  	return error;
@@ -176,7 +176,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  }
  
  static int
-@@ -861,6 +904,7 @@ xfs_reclaim_inode(
+@@ -862,6 +905,7 @@ xfs_reclaim_inode(
  
  	xfs_iflags_clear(ip, XFS_IFLUSHING);
  reclaim:
@@ -184,7 +184,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  
  	/*
  	 * Because we use RCU freeing we need to ensure the inode always appears
-@@ -1347,6 +1391,8 @@ xfs_blockgc_start(
+@@ -1348,6 +1392,8 @@ xfs_blockgc_start(
  
  /* Don't try to run block gc on an inode that's in any of these states. */
  #define XFS_BLOCKGC_NOGRAB_IFLAGS	(XFS_INEW | \
@@ -193,7 +193,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  					 XFS_IRECLAIMABLE | \
  					 XFS_IRECLAIM)
  /*
-@@ -1748,25 +1794,13 @@ xfs_check_delalloc(
+@@ -1749,25 +1795,13 @@ xfs_check_delalloc(
  #define xfs_check_delalloc(ip, whichfork)	do { } while (0)
  #endif
  
@@ -222,7 +222,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  
  	if (!XFS_FORCED_SHUTDOWN(mp) && ip->i_delayed_blks) {
  		xfs_check_delalloc(ip, XFS_DATA_FORK);
-@@ -1774,30 +1808,276 @@ xfs_inode_mark_reclaimable(
+@@ -1775,30 +1809,276 @@ xfs_inode_mark_reclaimable(
  		ASSERT(0);
  	}
  
@@ -579,7 +579,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
   * Flags for inode locking.
 --- a/fs/xfs/xfs_log_recover.c
 +++ b/fs/xfs/xfs_log_recover.c
-@@ -2791,6 +2791,13 @@ xlog_recover_process_iunlinks(
+@@ -2793,6 +2793,13 @@ xlog_recover_process_iunlinks(
  		}
  		xfs_buf_rele(agibp);
  	}
@@ -785,16 +785,16 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  	destroy_workqueue(mp->m_reclaim_workqueue);
  	destroy_workqueue(mp->m_cil_workqueue);
  	destroy_workqueue(mp->m_unwritten_workqueue);
-@@ -730,6 +739,8 @@ xfs_fs_sync_fs(
- {
+@@ -731,6 +740,8 @@ xfs_fs_sync_fs(
  	struct xfs_mount	*mp = XFS_M(sb);
+ 	int			error;
  
 +	trace_xfs_fs_sync_fs(mp, __return_address);
 +
  	/*
  	 * Doing anything during the async pass would be counterproductive.
  	 */
-@@ -746,6 +757,22 @@ xfs_fs_sync_fs(
+@@ -750,6 +761,22 @@ xfs_fs_sync_fs(
  		flush_delayed_work(&mp->m_log->l_work);
  	}
  
@@ -817,7 +817,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  	return 0;
  }
  
-@@ -897,6 +924,17 @@ xfs_fs_freeze(
+@@ -901,6 +928,17 @@ xfs_fs_freeze(
  	xfs_quiesce_attr(mp);
  	ret = xfs_sync_sb(mp, true);
  	memalloc_nofs_restore(flags);
@@ -835,7 +835,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  	return ret;
  }
  
-@@ -909,6 +947,14 @@ xfs_fs_unfreeze(
+@@ -913,6 +951,14 @@ xfs_fs_unfreeze(
  	xfs_restore_resvblks(mp);
  	xfs_log_work_queue(mp);
  	xfs_blockgc_start(mp);
@@ -850,7 +850,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  	return 0;
  }
  
-@@ -1034,6 +1080,35 @@ xfs_destroy_percpu_counters(
+@@ -1038,6 +1084,35 @@ xfs_destroy_percpu_counters(
  	percpu_counter_destroy(&mp->m_delalloc_blks);
  }
  
@@ -886,7 +886,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  static void
  xfs_fs_put_super(
  	struct super_block	*sb)
-@@ -1051,6 +1126,7 @@ xfs_fs_put_super(
+@@ -1055,6 +1130,7 @@ xfs_fs_put_super(
  	xfs_freesb(mp);
  	free_percpu(mp->m_stats.xs_stats);
  	xfs_mount_list_del(mp);
@@ -894,7 +894,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  	xfs_destroy_percpu_counters(mp);
  	xfs_destroy_mount_workqueues(mp);
  	xfs_close_devices(mp);
-@@ -1406,6 +1482,10 @@ xfs_fs_fill_super(
+@@ -1426,6 +1502,10 @@ xfs_fs_fill_super(
  	if (error)
  		goto out_destroy_workqueues;
  
@@ -905,7 +905,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  	/*
  	 * All percpu data structures requiring cleanup when a cpu goes offline
  	 * must be allocated before adding this @mp to the cpu-dead handler's
-@@ -1417,7 +1497,7 @@ xfs_fs_fill_super(
+@@ -1437,7 +1517,7 @@ xfs_fs_fill_super(
  	mp->m_stats.xs_stats = alloc_percpu(struct xfsstats);
  	if (!mp->m_stats.xs_stats) {
  		error = -ENOMEM;
@@ -914,7 +914,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  	}
  
  	error = xfs_readsb(mp, flags);
-@@ -1581,8 +1661,10 @@ xfs_fs_fill_super(
+@@ -1601,8 +1681,10 @@ xfs_fs_fill_super(
  	xfs_freesb(mp);
   out_free_stats:
  	free_percpu(mp->m_stats.xs_stats);
@@ -926,7 +926,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  	xfs_destroy_percpu_counters(mp);
   out_destroy_workqueues:
  	xfs_destroy_mount_workqueues(mp);
-@@ -1665,6 +1747,9 @@ xfs_remount_rw(
+@@ -1685,6 +1767,9 @@ xfs_remount_rw(
  	if (error && error != -ENOSPC)
  		return error;
  
@@ -936,7 +936,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  	return 0;
  }
  
-@@ -1687,6 +1772,15 @@ xfs_remount_ro(
+@@ -1707,6 +1792,15 @@ xfs_remount_ro(
  		return error;
  	}
  
@@ -952,7 +952,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  	/* Free the per-AG metadata reservation pool. */
  	error = xfs_fs_unreserve_ag_blocks(mp);
  	if (error) {
-@@ -2087,7 +2181,7 @@ xfs_cpu_dead(
+@@ -2107,7 +2201,7 @@ xfs_cpu_dead(
  	spin_lock(&xfs_mount_list_lock);
  	list_for_each_entry_safe(mp, n, &xfs_mount_list, m_mount_list) {
  		spin_unlock(&xfs_mount_list_lock);
