@@ -17,17 +17,23 @@
 
 %bcond_with netinobs
 
+%define srcversion @SRCVERSION@
 %define patchversion @PATCHVERSION@
 %define variant @VARIANT@%{nil}
 
 %include %_sourcedir/kernel-spec-macros
 
 Name:           kernel-obs-qa
-BuildRequires:  kernel-default
 # kernel-obs-build must be also configured as VMinstall, but is required
 # here as well to avoid that qa and build package build parallel
 BuildRequires:  kernel-obs-build
 BuildRequires:  kmod
+# Verify ko sign
+%define flavors_for_ko_sign_verify	default sel+leap153
+BuildRequires:  kernel-default-srchash-@COMMIT_FULL@
+BuildRequires:  kernel-sel+leap153-srchash-@COMMIT_FULL@
+BuildRequires:  openssl
+
 %if %{with netinobs}
 BuildRequires:  iproute
 BuildRequires:  iputils
@@ -63,6 +69,29 @@ cat /etc/resolv.conf
 ping -c 4 www.suse.com
 %endif
 
+tar xf %_sourcedir/linux-%srcversion.tar.xz linux-%srcversion/scripts/{extract-module-sig.pl,extract-sys-certs.pl} --strip-components 2
+for build_flavor in %flavors_for_ko_sign_verify; do
+	modules_dir=%kernel_module_directory/%kernelrelease-$build_flavor
+	cp -rf $modules_dir/kernel .
+	cd kernel
+	cp ../{extract-module-sig.pl,extract-sys-certs.pl} .
+	cp %_sourcedir/checkmod.pl .
+	chmod a+x ./{extract-module-sig.pl,extract-sys-certs.pl,checkmod.pl}
+	cp /boot/vmlinux-%kernelrelease-$build_flavor.gz .
+	gzip -d vmlinux-%kernelrelease-$build_flavor.gz
+	./extract-sys-certs.pl vmlinux-%kernelrelease-$build_flavor cert.x509
+	openssl x509 -noout -pubkey -inform der -in cert.x509 -out pubkey.pem
+	find . -type f -name '*.xz' -exec xz -d {} \;
+	for i in $(find . -type f -name '*.ko'); do
+		if ! ./checkmod.pl pubkey.pem $i; then
+			echo Fail: $i
+			exit 1
+		fi
+	done
+	cd ../
+	rm -rf kernel
+done
+
 %check
 # More tests are comming, currently the main test is the existens of
 # this spec file. It does trigger a build within OBS VM which is using
@@ -70,13 +99,6 @@ ping -c 4 www.suse.com
 
 # test suites should be packaged in other packages, but build required
 # and called here.
-
-krel=$(uname -r)
-if test ! -d "/lib/modules/$krel/kernel" && test ! -d "/usr/lib/modules/$krel/kernel"; then
-	echo "Kernel package for $krel not installed; exiting"
-	exit 0
-fi
-/sbin/modprobe loop
 
 %install
 mkdir -p %{buildroot}/usr/share/%name
