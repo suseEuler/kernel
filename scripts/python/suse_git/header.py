@@ -3,13 +3,29 @@
 
 import sys
 import re
-from os import environ
+from os import environ, path as os_path
 from optparse import OptionParser
 from . import patch
 from io import StringIO
 
 diffstart = re.compile("^(---|\*\*\*|Index:|\+\+\+)[ \t][^ \t]\S+/|^diff -")
 tag_regex = re.compile("(\S+):[ \t]*(.*)")
+
+base_path = __file__.split(os_path.sep)[:-4]
+if base_path[0] == '':
+    base_path[0] = '/'
+maintainers = os_path.join(*base_path, 'MAINTAINERS')
+valid_users = []
+mail_pattern = re.compile(r'M:\s+.*<(.*)\@suse.com\>s*$')
+if os_path.exists(maintainers):
+    with open(maintainers) as fh:
+        for line in fh:
+            result = mail_pattern.match(line)
+            if result:
+                valid_users.append(result.groups()[0])
+
+valid_users = list(set(valid_users))
+valid_user = f'.*({"|".join(valid_users)})@suse.com'
 
 tag_map = {
     'Patch-mainline' : {
@@ -109,7 +125,7 @@ tag_map = {
         'accepted' : [
             {
                 'name' : 'SUSE',
-                'match' : '.*@suse\.(com|de|cz)',
+                'match' : valid_user,
             },
             {
                 'match' : '.*',
@@ -121,7 +137,7 @@ tag_map = {
         'accepted' : [
             {
                 'name' : 'SUSE',
-                'match' : '.*@suse\.(com|de|cz)',
+                'match' : valid_user,
             },
             {
                 'match' : '.*',
@@ -133,7 +149,7 @@ tag_map = {
         'accepted' : [
             {
                 'name' : 'SUSE',
-                'match' : '.*@suse\.(com|de|cz)',
+                'match' : valid_user,
             },
             {
                 'match' : '.*',
@@ -146,7 +162,7 @@ tag_map = {
         'accepted' : [
             {
                 'name' : 'SUSE',
-                'match' : '.*@suse\.(com|de|cz)',
+                'match' : valid_user,
             },
             {
                 'match' : '.*',
