@@ -1,0 +1,179 @@
+From 4c12d4d84c9b20e6a87ce2ba7784af8799b13315 Mon Sep 17 00:00:00 2001
+From: liubo <liubo254@huawei.com>
+Date: Tue, 20 Sep 2022 21:10:52 +0800
+Subject: [PATCH] etmem: Add a scan flag to support specified page swap-out
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 4c12d4d84c9b20e6a87ce2ba7784af8799b13315
+Modified-by-SEL: No
+
+
+euleros inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5DC4A
+CVE: NA
+
+-------------------------------------------------
+etmem, the memory vertical expansion technology,
+
+The existing memory expansion tool etmem swaps out all pages that can be
+swapped out for the process by default, unless the page is marked with
+lock flag.
+
+The function of swapping out specified pages is added. The process adds
+VM_SWAPFLAG flags for pages to be swapped out. The etmem adds filters to
+the scanning module and swaps out only these pages.
+
+Signed-off-by: liubo <liubo254@huawei.com>
+Reviewed-by: Miaohe Lin <linmiaohe@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/proc/etmem_scan.c                   | 11 +++++++++++
+ fs/proc/etmem_scan.h                   |  5 ++++-
+ fs/proc/etmem_swap.c                   |  1 +
+ include/linux/mm.h                     |  4 ++++
+ include/uapi/asm-generic/mman-common.h |  3 +++
+ mm/madvise.c                           | 17 ++++++++++++++++-
+ 6 files changed, 39 insertions(+), 2 deletions(-)
+
+diff --git a/fs/proc/etmem_scan.c b/fs/proc/etmem_scan.c
+index 8bcb8d3af7c5..e9cad598189a 100644
+--- a/fs/proc/etmem_scan.c
++++ b/fs/proc/etmem_scan.c
+@@ -1187,6 +1187,11 @@ static int mm_idle_test_walk(unsigned long start, unsigned long end,
+ 				 struct mm_walk *walk)
+ {
+ 	struct vm_area_struct *vma = walk->vma;
++	struct page_idle_ctrl *pic = walk->private;
++
++	/* If the specified page swapout is set, the untagged vma is skipped. */
++	if ((pic->flags & VMA_SCAN_FLAG) && !(vma->vm_flags & VM_SWAPFLAG))
++		return 1;
+ 
+ 	if (vma->vm_file) {
+ 		if (is_vm_hugetlb_page(vma))
+@@ -1325,6 +1330,12 @@ static long page_scan_ioctl(struct file *filp, unsigned int cmd, unsigned long a
+ 	case IDLE_SCAN_REMOVE_FLAGS:
+ 		filp->f_flags &= ~flags;
+ 		break;
++	case VMA_SCAN_ADD_FLAGS:
++		filp->f_flags |= flags;
++		break;
++	case VMA_SCAN_REMOVE_FLAGS:
++		filp->f_flags &= ~flags;
++		break;
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
+diff --git a/fs/proc/etmem_scan.h b/fs/proc/etmem_scan.h
+index 93a6e33f2025..e109f7f350e1 100644
+--- a/fs/proc/etmem_scan.h
++++ b/fs/proc/etmem_scan.h
+@@ -12,13 +12,16 @@
+ #define SCAN_AS_HUGE		0100000000      /* treat normal page as hugepage in vm */
+ #define SCAN_IGN_HOST		0200000000      /* ignore host access when scan vm */
+ #define VM_SCAN_HOST		0400000000      /* scan and add host page for vm hole(internal) */
++#define VMA_SCAN_FLAG           0x1000        /* scan the specifics vma with flag */
+ 
+ #define ALL_SCAN_FLAGS		(SCAN_HUGE_PAGE | SCAN_SKIM_IDLE | SCAN_DIRTY_PAGE | \
+-		SCAN_AS_HUGE | SCAN_IGN_HOST | VM_SCAN_HOST)
++				SCAN_AS_HUGE | SCAN_IGN_HOST | VM_SCAN_HOST | VMA_SCAN_FLAG)
+ 
+ #define IDLE_SCAN_MAGIC         0x66
+ #define IDLE_SCAN_ADD_FLAGS	_IOW(IDLE_SCAN_MAGIC, 0x0, unsigned int)
+ #define IDLE_SCAN_REMOVE_FLAGS	_IOW(IDLE_SCAN_MAGIC, 0x1, unsigned int)
++#define VMA_SCAN_ADD_FLAGS      _IOW(IDLE_SCAN_MAGIC, 0x2, unsigned int)
++#define VMA_SCAN_REMOVE_FLAGS   _IOW(IDLE_SCAN_MAGIC, 0x3, unsigned int)
+ 
+ enum ProcIdlePageType {
+ 	PTE_ACCESSED,	/* 4k page */
+diff --git a/fs/proc/etmem_swap.c b/fs/proc/etmem_swap.c
+index 0e0a5225e301..86f5cf8c90a1 100644
+--- a/fs/proc/etmem_swap.c
++++ b/fs/proc/etmem_swap.c
+@@ -63,6 +63,7 @@ static ssize_t swap_pages_write(struct file *file, const char __user *buf,
+ 		ret = kstrtoul(p, 16, &vaddr);
+ 		if (ret != 0)
+ 			continue;
++
+ 		/* If get page struct failed, ignore it, get next page */
+ 		page = get_page_from_vaddr(mm, vaddr);
+ 		if (!page)
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index eb27c2eacb4a..0331a8571cfd 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -325,6 +325,10 @@ extern unsigned int kobjsize(const void *objp);
+ 
+ #define VM_CHECKNODE	0x200000000
+ 
++#ifdef CONFIG_ETMEM
++#define VM_SWAPFLAG	0x400000000000000 /* memory swap out flag in vma */
++#endif
++
+ #ifdef CONFIG_USERSWAP
+ /* bit[32:36] is the protection key of intel, so use a large value for VM_USWAP */
+ #define VM_USWAP      0x2000000000000000
+diff --git a/include/uapi/asm-generic/mman-common.h b/include/uapi/asm-generic/mman-common.h
+index e75b65364dce..898ea134b2f3 100644
+--- a/include/uapi/asm-generic/mman-common.h
++++ b/include/uapi/asm-generic/mman-common.h
+@@ -74,6 +74,9 @@
+ #define MADV_COLD	20		/* deactivate these pages */
+ #define MADV_PAGEOUT	21		/* reclaim these pages */
+ 
++#define MADV_SWAPFLAG   203		/* for memory to be swap out */
++#define MADV_SWAPFLAG_REMOVE 204
++
+ /* compatibility flags */
+ #define MAP_FILE	0
+ 
+diff --git a/mm/madvise.c b/mm/madvise.c
+index 77e1dc2d4e18..bd851f2c687f 100644
+--- a/mm/madvise.c
++++ b/mm/madvise.c
+@@ -126,6 +126,14 @@ static long madvise_behavior(struct vm_area_struct *vma,
+ 		if (error)
+ 			goto out_convert_errno;
+ 		break;
++#ifdef CONFIG_ETMEM
++	case MADV_SWAPFLAG:
++		new_flags |= VM_SWAPFLAG;
++		break;
++	case MADV_SWAPFLAG_REMOVE:
++		new_flags &= ~VM_SWAPFLAG;
++		break;
++#endif
+ 	}
+ 
+ 	if (new_flags == vma->vm_flags) {
+@@ -974,9 +982,12 @@ madvise_behavior_valid(int behavior)
+ #ifdef CONFIG_MEMORY_FAILURE
+ 	case MADV_SOFT_OFFLINE:
+ 	case MADV_HWPOISON:
++#endif
++#ifdef CONFIG_ETMEM
++	case MADV_SWAPFLAG:
++	case MADV_SWAPFLAG_REMOVE:
+ #endif
+ 		return true;
+-
+ 	default:
+ 		return false;
+ 	}
+@@ -1046,6 +1057,10 @@ process_madvise_behavior_valid(int behavior)
+  *		easily if memory pressure hanppens.
+  *  MADV_PAGEOUT - the application is not expected to use this memory soon,
+  *		page out the pages in this range immediately.
++ *  MADV_SWAPFLAG - Used in the etmem memory extension feature, the process
++ *		specifies the memory swap area by adding a flag to a specific
++ *		vma address.
++ *  MADV_SWAPFLAG_REMOVE - remove the specific vma flag
+  *
+  * return values:
+  *  zero    - success
+-- 
+2.34.1
+
