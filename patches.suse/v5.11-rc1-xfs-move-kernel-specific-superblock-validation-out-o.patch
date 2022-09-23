@@ -1,0 +1,117 @@
+From 3945ae03d822aa47584dd502ac024ae1e1eb9e2d Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <darrick.wong@oracle.com>
+Date: Tue, 24 Nov 2020 11:45:54 -0800
+Subject: [PATCH] xfs: move kernel-specific superblock validation out of libxfs
+Git-commit: 3945ae03d822aa47584dd502ac024ae1e1eb9e2d
+Patch-mainline: v5.11-rc1
+References: bsn#342
+Modified-by-SEL: No
+
+
+A couple of the superblock validation checks apply only to the kernel,
+so move them to xfs_fc_fill_super before we add the needsrepair "feature",
+which will prevent the kernel (but not xfsprogs) from mounting the
+filesystem.  This also reduces the diff between kernel and userspace
+libxfs.
+
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Eric Sandeen <sandeen@redhat.com>
+Signed-off-by: Jun Yang <jun.yang@suse.com>
+---
+ fs/xfs/libxfs/xfs_sb.c | 27 ---------------------------
+ fs/xfs/xfs_super.c     | 32 ++++++++++++++++++++++++++++++++
+ 2 files changed, 32 insertions(+), 27 deletions(-)
+
+diff --git a/fs/xfs/libxfs/xfs_sb.c b/fs/xfs/libxfs/xfs_sb.c
+index 5aeafa59ed27..05359690aaed 100644
+--- a/fs/xfs/libxfs/xfs_sb.c
++++ b/fs/xfs/libxfs/xfs_sb.c
+@@ -382,17 +382,6 @@ xfs_validate_sb_common(
+ 		return -EFSCORRUPTED;
+ 	}
+ 
+-	/*
+-	 * Until this is fixed only page-sized or smaller data blocks work.
+-	 */
+-	if (unlikely(sbp->sb_blocksize > PAGE_SIZE)) {
+-		xfs_warn(mp,
+-		"File system with blocksize %d bytes. "
+-		"Only pagesize (%ld) or less will currently work.",
+-				sbp->sb_blocksize, PAGE_SIZE);
+-		return -ENOSYS;
+-	}
+-
+ 	/*
+ 	 * Currently only very few inode sizes are supported.
+ 	 */
+@@ -408,22 +397,6 @@ xfs_validate_sb_common(
+ 		return -ENOSYS;
+ 	}
+ 
+-	if (xfs_sb_validate_fsb_count(sbp, sbp->sb_dblocks) ||
+-	    xfs_sb_validate_fsb_count(sbp, sbp->sb_rblocks)) {
+-		xfs_warn(mp,
+-		"file system too large to be mounted on this system.");
+-		return -EFBIG;
+-	}
+-
+-	/*
+-	 * Don't touch the filesystem if a user tool thinks it owns the primary
+-	 * superblock.  mkfs doesn't clear the flag from secondary supers, so
+-	 * we don't check them at all.
+-	 */
+-	if (XFS_BUF_ADDR(bp) == XFS_SB_DADDR && sbp->sb_inprogress) {
+-		xfs_warn(mp, "Offline file system operation in progress!");
+-		return -EFSCORRUPTED;
+-	}
+ 	return 0;
+ }
+ 
+diff --git a/fs/xfs/xfs_super.c b/fs/xfs/xfs_super.c
+index e3e229e52512..599566c1a3b4 100644
+--- a/fs/xfs/xfs_super.c
++++ b/fs/xfs/xfs_super.c
+@@ -1467,6 +1467,38 @@ xfs_fc_fill_super(
+ #endif
+ 	}
+ 
++	/*
++	 * Don't touch the filesystem if a user tool thinks it owns the primary
++	 * superblock.  mkfs doesn't clear the flag from secondary supers, so
++	 * we don't check them at all.
++	 */
++	if (mp->m_sb.sb_inprogress) {
++		xfs_warn(mp, "Offline file system operation in progress!");
++		error = -EFSCORRUPTED;
++		goto out_free_sb;
++	}
++
++	/*
++	 * Until this is fixed only page-sized or smaller data blocks work.
++	 */
++	if (mp->m_sb.sb_blocksize > PAGE_SIZE) {
++		xfs_warn(mp,
++		"File system with blocksize %d bytes. "
++		"Only pagesize (%ld) or less will currently work.",
++				mp->m_sb.sb_blocksize, PAGE_SIZE);
++		error = -ENOSYS;
++		goto out_free_sb;
++	}
++
++	/* Ensure this filesystem fits in the page cache limits */
++	if (xfs_sb_validate_fsb_count(&mp->m_sb, mp->m_sb.sb_dblocks) ||
++	    xfs_sb_validate_fsb_count(&mp->m_sb, mp->m_sb.sb_rblocks)) {
++		xfs_warn(mp,
++		"file system too large to be mounted on this system.");
++		error = -EFBIG;
++		goto out_free_sb;
++	}
++
+ 	/*
+ 	 * XFS block mappings use 54 bits to store the logical block offset.
+ 	 * This should suffice to handle the maximum file size that the VFS
+-- 
+2.35.3
+
