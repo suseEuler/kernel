@@ -9,8 +9,8 @@ COMPRESS_MODULES="xz"
 # Compile binary devicetrees for Leap
 BUILD_DTBS="No"
 # buildservice projects to build the kernel against
-OBS_PROJECT=SEL:2.0:Everything
-OBS_PROJECT_ARM=SEL:2.0:Everything
+OBS_PROJECT=SEL:2.0:Update
+OBS_PROJECT_ARM=SEL:2.0:Update
 # Bugzilla info
 #BUGZILLA_SERVER="apibugzilla.suse.com"
 #BUGZILLA_PRODUCT="SUSE Linux Enterprise Server 15 SP3"
