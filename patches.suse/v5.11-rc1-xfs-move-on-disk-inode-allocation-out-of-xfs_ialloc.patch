@@ -7,7 +7,7 @@ Subject: [PATCH] xfs: move on-disk inode allocation out of xfs_ialloc()
 Git-commit: 1abcf261016e12246e1f0d2dada9c5c851a9ceb7
 Patch-mainline: v5.11-rc1
 References: bsn#12
-Modified-by-SEL: No
+Modified-by-SEL: Yes, refreshed due to context changes
 
 So xfs_ialloc() will only address in-core inode allocation then,
 Also, rename xfs_ialloc() to xfs_dir_ialloc_init() in order to
@@ -25,11 +25,9 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  fs/xfs/xfs_qm.c    |  26 +++---
  3 files changed, 86 insertions(+), 161 deletions(-)
 
-diff --git a/fs/xfs/xfs_inode.c b/fs/xfs/xfs_inode.c
-index 6329b049570b..bc1027ce0d1f 100644
 --- a/fs/xfs/xfs_inode.c
 +++ b/fs/xfs/xfs_inode.c
-@@ -761,68 +761,26 @@ xfs_inode_inherit_flags2(
+@@ -761,69 +761,27 @@ xfs_inode_inherit_flags2(
  }
  
  /*
@@ -75,7 +73,17 @@ index 6329b049570b..bc1027ce0d1f 100644
 -	prid_t		prid,
 -	xfs_buf_t	**ialloc_context,
 -	xfs_inode_t	**ipp)
--{
++xfs_init_new_inode(
++	struct xfs_trans	*tp,
++	struct xfs_inode	*pip,
++	xfs_ino_t		ino,
++	umode_t			mode,
++	xfs_nlink_t		nlink,
++	dev_t			rdev,
++	prid_t			prid,
++	struct xfs_inode	**ipp)
+ {
+ 	struct inode	*dir = pip ? VFS_I(pip) : NULL;
 -	struct xfs_mount *mp = tp->t_mountp;
 -	xfs_ino_t	ino;
 -	xfs_inode_t	*ip;
@@ -97,16 +105,6 @@ index 6329b049570b..bc1027ce0d1f 100644
 -		return 0;
 -	}
 -	ASSERT(*ialloc_context == NULL);
-+xfs_init_new_inode(
-+	struct xfs_trans	*tp,
-+	struct xfs_inode	*pip,
-+	xfs_ino_t		ino,
-+	umode_t			mode,
-+	xfs_nlink_t		nlink,
-+	dev_t			rdev,
-+	prid_t			prid,
-+	struct xfs_inode	**ipp)
-+{
 +	struct xfs_mount	*mp = tp->t_mountp;
 +	struct xfs_inode	*ip;
 +	unsigned int		flags;
@@ -116,7 +114,7 @@ index 6329b049570b..bc1027ce0d1f 100644
  
  	/*
  	 * Protect against obviously corrupt allocation btree records. Later
-@@ -837,14 +795,13 @@ xfs_ialloc(
+@@ -838,14 +796,13 @@ xfs_ialloc(
  	}
  
  	/*
@@ -134,7 +132,7 @@ index 6329b049570b..bc1027ce0d1f 100644
 +
  	ASSERT(ip != NULL);
  	inode = VFS_I(ip);
- 	inode->i_mode = mode;
+ 	set_nlink(inode, nlink);
 @@ -932,108 +889,76 @@ xfs_ialloc(
  }
  
@@ -146,11 +144,12 @@ index 6329b049570b..bc1027ce0d1f 100644
 - *
 - * This routine is designed to be called from xfs_create and
 - * xfs_create_dir.
+- *
 + * Allocates a new inode from disk and return a pointer to the incore copy. This
 + * routine will internally commit the current transaction and allocate a new one
 + * if we needed to allocate more on-disk free inodes to perform the requested
 + * operation.
-  *
++ *
 + * If we are allocating quota inodes, we do not have a parent inode to attach to
 + * or associate with (i.e. dp == NULL) because they are not linked into the
 + * directory structure - they are attached directly to the superblock - and so
@@ -168,14 +167,6 @@ index 6329b049570b..bc1027ce0d1f 100644
 -	prid_t		prid,		/* project id */
 -	xfs_inode_t	**ipp)		/* pointer to inode; it will be
 -					   locked. */
--{
--	xfs_trans_t	*tp;
--	xfs_inode_t	*ip;
--	xfs_buf_t	*ialloc_context = NULL;
--	int		code;
--
--	tp = *tpp;
--	ASSERT(tp->t_flags & XFS_TRANS_PERM_LOG_RES);
 +	struct xfs_trans	**tpp,
 +	struct xfs_inode	*dp,
 +	umode_t			mode,
@@ -183,12 +174,15 @@ index 6329b049570b..bc1027ce0d1f 100644
 +	dev_t			rdev,
 +	prid_t			prid,
 +	struct xfs_inode	**ipp)
-+{
-+	struct xfs_buf		*ialloc_context = NULL;
-+	xfs_ino_t		parent_ino = dp ? dp->i_ino : 0;
-+	xfs_ino_t		ino;
-+	int			error;
- 
+ {
+-	xfs_trans_t	*tp;
+-	xfs_inode_t	*ip;
+-	xfs_buf_t	*ialloc_context = NULL;
+-	int		code;
+-
+-	tp = *tpp;
+-	ASSERT(tp->t_flags & XFS_TRANS_PERM_LOG_RES);
+-
 -	/*
 -	 * xfs_ialloc will return a pointer to an incore inode if
 -	 * the Space Manager has an available inode on the free
@@ -203,15 +197,14 @@ index 6329b049570b..bc1027ce0d1f 100644
 -	 * ialloc_context. We will hold a lock on it across the
 -	 * transaction commit so that no other process can steal
 -	 * the inode(s) that we've just allocated.
--	 */
--	code = xfs_ialloc(tp, dp, mode, nlink, rdev, prid, &ialloc_context,
--			&ip);
++	struct xfs_buf		*ialloc_context = NULL;
++	xfs_ino_t		parent_ino = dp ? dp->i_ino : 0;
++	xfs_ino_t		ino;
++	int			error;
++
 +	ASSERT((*tpp)->t_flags & XFS_TRANS_PERM_LOG_RES);
- 
- 	/*
--	 * Return an error if we were unable to allocate a new inode.
--	 * This should only happen if we run out of space on disk or
--	 * encounter a disk error.
++
++	/*
 +	 * Call the space management code to pick the on-disk inode to be
 +	 * allocated and replenish the freelist.  Since we can only do one
 +	 * allocation per transaction without deadlocks, we will need to
@@ -222,6 +215,14 @@ index 6329b049570b..bc1027ce0d1f 100644
 +	 * commit so that no other process can steal the inode(s) that we've
 +	 * just allocated.
  	 */
+-	code = xfs_ialloc(tp, dp, mode, nlink, rdev, prid, &ialloc_context,
+-			&ip);
+-
+-	/*
+-	 * Return an error if we were unable to allocate a new inode.
+-	 * This should only happen if we run out of space on disk or
+-	 * encounter a disk error.
+-	 */
 -	if (code) {
 -		*ipp = NULL;
 -		return code;
@@ -253,21 +254,21 @@ index 6329b049570b..bc1027ce0d1f 100644
 +			return error;
  		}
 -
--		/*
+ 		/*
 -		 * Call ialloc again. Since we've locked out all
 -		 * other allocations in this allocation group,
 -		 * this call should always succeed.
--		 */
--		code = xfs_ialloc(tp, dp, mode, nlink, rdev, prid,
--				  &ialloc_context, &ip);
--
- 		/*
--		 * If we get an error at this point, return to the caller
--		 * so that the current transaction can be aborted.
 +		 * Call dialloc again. Since we've locked out all other
 +		 * allocations in this allocation group, this call should
 +		 * always succeed.
  		 */
+-		code = xfs_ialloc(tp, dp, mode, nlink, rdev, prid,
+-				  &ialloc_context, &ip);
+-
+-		/*
+-		 * If we get an error at this point, return to the caller
+-		 * so that the current transaction can be aborted.
+-		 */
 -		if (code) {
 -			*tpp = tp;
 -			*ipp = NULL;
@@ -292,11 +293,9 @@ index 6329b049570b..bc1027ce0d1f 100644
  }
  
  /*
-diff --git a/fs/xfs/xfs_inode.h b/fs/xfs/xfs_inode.h
-index 751a3d1d7d84..eca333f5f715 100644
 --- a/fs/xfs/xfs_inode.h
 +++ b/fs/xfs/xfs_inode.h
-@@ -407,9 +407,9 @@ void		xfs_lock_two_inodes(struct xfs_inode *ip0, uint ip0_mode,
+@@ -407,9 +407,9 @@ void		xfs_lock_two_inodes(struct xfs_ino
  xfs_extlen_t	xfs_get_extsz_hint(struct xfs_inode *ip);
  xfs_extlen_t	xfs_get_cowextsz_hint(struct xfs_inode *ip);
  
@@ -309,8 +308,6 @@ index 751a3d1d7d84..eca333f5f715 100644
  
  static inline int
  xfs_itruncate_extents(
-diff --git a/fs/xfs/xfs_qm.c b/fs/xfs/xfs_qm.c
-index b2a9abee8b2b..c134eb4aeaa8 100644
 --- a/fs/xfs/xfs_qm.c
 +++ b/fs/xfs/xfs_qm.c
 @@ -737,15 +737,15 @@ xfs_qm_destroy_quotainfo(
@@ -378,6 +375,3 @@ index b2a9abee8b2b..c134eb4aeaa8 100644
  	return error;
  }
  
--- 
-2.31.1
-

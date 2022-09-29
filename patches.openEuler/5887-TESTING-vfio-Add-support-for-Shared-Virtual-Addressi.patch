@@ -5,6 +5,7 @@ Subject: [PATCH] TESTING: vfio: Add support for Shared Virtual Addressing
 Patch-mainline: Not yet, from openEuler
 References: bsn#22
 openEuler-commit: 2d2df4d91764ada2453994f2648eceb755b21800
+Modified-by-SEL: Yes, refreshed due to context changes
 
 
 maillist inclusion
@@ -40,8 +41,6 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  include/uapi/linux/vfio.h       |  76 +++++++
  2 files changed, 436 insertions(+), 21 deletions(-)
 
-diff --git a/drivers/vfio/vfio_iommu_type1.c b/drivers/vfio/vfio_iommu_type1.c
-index fbd438e9b9b0..80bfc2b11031 100644
 --- a/drivers/vfio/vfio_iommu_type1.c
 +++ b/drivers/vfio/vfio_iommu_type1.c
 @@ -29,6 +29,7 @@
@@ -52,8 +51,8 @@ index fbd438e9b9b0..80bfc2b11031 100644
  #include <linux/rbtree.h>
  #include <linux/sched/signal.h>
  #include <linux/sched/mm.h>
-@@ -98,11 +99,22 @@ struct vfio_dma {
- 	unsigned long		*bitmap;
+@@ -104,11 +105,22 @@ struct vfio_batch {
+ 	int			capacity;	/* length of pages array */
  };
  
 +/* Bond between group and mm */
@@ -75,7 +74,7 @@ index fbd438e9b9b0..80bfc2b11031 100644
  };
  
  struct vfio_iova {
-@@ -1582,6 +1594,158 @@ static int vfio_iommu_replay(struct vfio_iommu *iommu,
+@@ -1651,6 +1663,158 @@ unwind:
  	return ret;
  }
  
@@ -234,7 +233,7 @@ index fbd438e9b9b0..80bfc2b11031 100644
  /*
   * We change our unmap behavior slightly depending on whether the IOMMU
   * supports fine-grained superpages.  IOMMUs like AMD-Vi will use a superpage
-@@ -2018,6 +2182,41 @@ static void vfio_iommu_iova_insert_copy(struct vfio_iommu *iommu,
+@@ -2060,6 +2224,41 @@ static void vfio_iommu_iova_insert_copy(
  	list_splice_tail(iova_copy, iova);
  }
  
@@ -276,7 +275,7 @@ index fbd438e9b9b0..80bfc2b11031 100644
  static int vfio_iommu_type1_attach_group(void *iommu_data,
  					 struct iommu_group *iommu_group)
  {
-@@ -2047,6 +2246,7 @@ static int vfio_iommu_type1_attach_group(void *iommu_data,
+@@ -2089,6 +2288,7 @@ static int vfio_iommu_type1_attach_group
  		goto out_free;
  	}
  
@@ -284,7 +283,7 @@ index fbd438e9b9b0..80bfc2b11031 100644
  	group->iommu_group = iommu_group;
  
  	/* Determine bus_type in order to allocate a domain */
-@@ -2164,27 +2364,15 @@ static int vfio_iommu_type1_attach_group(void *iommu_data,
+@@ -2204,27 +2404,15 @@ static int vfio_iommu_type1_attach_group
  	if (iommu_capable(bus, IOMMU_CAP_CACHE_COHERENCY))
  		domain->prot |= IOMMU_CACHE;
  
@@ -320,7 +319,7 @@ index fbd438e9b9b0..80bfc2b11031 100644
  		}
  	}
  
-@@ -2195,6 +2383,10 @@ static int vfio_iommu_type1_attach_group(void *iommu_data,
+@@ -2235,6 +2423,10 @@ static int vfio_iommu_type1_attach_group
  	if (ret)
  		goto out_detach;
  
@@ -331,7 +330,7 @@ index fbd438e9b9b0..80bfc2b11031 100644
  	if (resv_msi) {
  		ret = iommu_get_msi_cookie(domain->domain, resv_msi_base);
  		if (ret && ret != -ENODEV)
-@@ -2385,6 +2577,12 @@ static void vfio_iommu_type1_detach_group(void *iommu_data,
+@@ -2425,6 +2617,12 @@ static void vfio_iommu_type1_detach_grou
  		if (!group)
  			continue;
  
@@ -344,7 +343,7 @@ index fbd438e9b9b0..80bfc2b11031 100644
  		vfio_iommu_detach_group(domain, group);
  		update_dirty_scope = !group->pinned_page_dirty_scope;
  		list_del(&group->next);
-@@ -2858,10 +3056,147 @@ static int vfio_iommu_type1_dirty_pages(struct vfio_iommu *iommu,
+@@ -2898,10 +3096,147 @@ out_unlock:
  
  		return ret;
  	}
@@ -493,7 +492,7 @@ index fbd438e9b9b0..80bfc2b11031 100644
  static long vfio_iommu_type1_ioctl(void *iommu_data,
  				   unsigned int cmd, unsigned long arg)
  {
-@@ -2878,6 +3213,10 @@ static long vfio_iommu_type1_ioctl(void *iommu_data,
+@@ -2918,6 +3253,10 @@ static long vfio_iommu_type1_ioctl(void
  		return vfio_iommu_type1_unmap_dma(iommu, arg);
  	case VFIO_IOMMU_DIRTY_PAGES:
  		return vfio_iommu_type1_dirty_pages(iommu, arg);
@@ -504,11 +503,9 @@ index fbd438e9b9b0..80bfc2b11031 100644
  	default:
  		return -ENOTTY;
  	}
-diff --git a/include/uapi/linux/vfio.h b/include/uapi/linux/vfio.h
-index 2f313a238a8f..9dd0895b3f3c 100644
 --- a/include/uapi/linux/vfio.h
 +++ b/include/uapi/linux/vfio.h
-@@ -1180,6 +1180,82 @@ struct vfio_iommu_type1_dirty_bitmap_get {
+@@ -1180,6 +1180,82 @@ struct vfio_iommu_type1_dirty_bitmap_get
  
  #define VFIO_IOMMU_DIRTY_PAGES             _IO(VFIO_TYPE, VFIO_BASE + 17)
  
@@ -591,6 +588,3 @@ index 2f313a238a8f..9dd0895b3f3c 100644
  /* -------- Additional API for SPAPR TCE (Server POWERPC) IOMMU -------- */
  
  /*
--- 
-2.26.2
-
