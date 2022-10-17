@@ -159,7 +159,7 @@ for file in $referenced_files; do
 done
 
 [ "$flavor" == "vanilla" ] &&  \
-    sed -i '/^$\|\s*#\|patches\.\(kernel\.org\|rpmify\)/b; s/\(.*\)/#### \1/' \
+    sed -i '/^$\|\s*#\|patches\.\(stable\|rpmify\)\|patches\.suse\/Revert-v\(.*\)-[0-9]\+-Linux-\2\.patch/b; s/\(.*\)/#### \1/' \
     $build_dir/series.conf
 
 inconsistent=false

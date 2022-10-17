@@ -495,7 +495,7 @@ if ! [ -d $ORIG_DIR ]; then
 fi
 
 if $VANILLA; then
-	PATCHES=( $(scripts/guards $SYMBOLS < series.conf | egrep '^patches\.(kernel\.org|rpmify)/') )
+    PATCHES=( $(scripts/guards $SYMBOLS < series.conf | egrep '^patches\.(stable|rpmify)/|^patches\.suse/Revert-v(.*)-[0-9]+-Linux-\2.patch') )
 else
 	PATCHES=( $(scripts/guards $SYMBOLS < series.conf) )
 fi
