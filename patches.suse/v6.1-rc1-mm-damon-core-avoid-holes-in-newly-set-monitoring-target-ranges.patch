@@ -1,0 +1,88 @@
+From 9c950c22833cfd9887da7679534e5c6deb44b008 Mon Sep 17 00:00:00 2001
+From: SeongJae Park <sj@kernel.org>
+Date: Fri, 9 Sep 2022 20:28:56 +0000
+Subject: [PATCH] mm/damon/core: avoid holes in newly set monitoring target
+ ranges
+Git-commit: 9c950c22833cfd9887da7679534e5c6deb44b008
+Patch-mainline: v6.1-rc1
+References: git-fix
+Modified-by-SEL: No
+
+
+When there are two or more non-contiguous regions intersecting with given
+new ranges, 'damon_set_regions()' does not fill the holes.  This commit
+makes the function to fill the holes with newly created regions.
+
+[sj@kernel.org: handle error from 'damon_fill_regions_holes()']
+  Link: https://lkml.kernel.org/r/20220913215420.57761-1-sj@kernel.org
+Link: https://lkml.kernel.org/r/20220909202901.57977-3-sj@kernel.org
+Fixes: 3f49584b262c ("mm/damon: implement primitives for the virtual memory address spaces")
+Signed-off-by: SeongJae Park <sj@kernel.org>
+Reported-by: Yun Levi <ppbuk5246@gmail.com>
+Cc: Brendan Higgins <brendanhiggins@google.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Shuah Khan <shuah@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/damon/core.c | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/mm/damon/core.c b/mm/damon/core.c
+index bae41990f422..5ad31d2feae4 100644
+--- a/mm/damon/core.c
++++ b/mm/damon/core.c
+@@ -168,6 +168,30 @@ static bool damon_intersect(struct damon_region *r,
+ 	return !(r->ar.end <= re->start || re->end <= r->ar.start);
+ }
+ 
++/*
++ * Fill holes in regions with new regions.
++ */
++static int damon_fill_regions_holes(struct damon_region *first,
++		struct damon_region *last, struct damon_target *t)
++{
++	struct damon_region *r = first;
++
++	damon_for_each_region_from(r, t) {
++		struct damon_region *next, *newr;
++
++		if (r == last)
++			break;
++		next = damon_next_region(r);
++		if (r->ar.end != next->ar.start) {
++			newr = damon_new_region(r->ar.end, next->ar.start);
++			if (!newr)
++				return -ENOMEM;
++			damon_insert_region(newr, r, next, t);
++		}
++	}
++	return 0;
++}
++
+ /*
+  * damon_set_regions() - Set regions of a target for given address ranges.
+  * @t:		the given target.
+@@ -184,6 +208,7 @@ int damon_set_regions(struct damon_target *t, struct damon_addr_range *ranges,
+ {
+ 	struct damon_region *r, *next;
+ 	unsigned int i;
++	int err;
+ 
+ 	/* Remove regions which are not in the new ranges */
+ 	damon_for_each_region_safe(r, next, t) {
+@@ -226,6 +251,11 @@ int damon_set_regions(struct damon_target *t, struct damon_addr_range *ranges,
+ 			first->ar.start = ALIGN_DOWN(range->start,
+ 					DAMON_MIN_REGION);
+ 			last->ar.end = ALIGN(range->end, DAMON_MIN_REGION);
++
++			/* fill possible holes in the range */
++			err = damon_fill_regions_holes(first, last, t);
++			if (err)
++				return err;
+ 		}
+ 	}
+ 	return 0;
+-- 
+2.34.1
+
