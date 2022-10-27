@@ -1,0 +1,163 @@
+From 30267b43c5b08260da7c76cacd28bf855b06ab93 Mon Sep 17 00:00:00 2001
+From: Chenyi Qiang <chenyi.qiang@intel.com>
+Date: Tue, 24 May 2022 21:56:22 +0800
+Subject: [PATCH] KVM: selftests: Add a test to get/set triple fault event
+Git-commit: 30267b43c5b08260da7c76cacd28bf855b06ab93
+Patch-mainline: v6.0-rc1
+References: bsn#177
+Modified-by-SEL: Yes, modified per openEuler commit 3a51ec10
+
+
+Add a selftest for triple fault event:
+  - launch the L2 and exit to userspace via I/O.
+  - using KVM_SET_VCPU_EVENTS to pend a triple fault event.
+  - with the immediate_exit, check the triple fault is pending.
+  - run for real with pending triple fault and L1 can see the triple
+    fault.
+
+Suggested-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Chenyi Qiang <chenyi.qiang@intel.com>
+Message-Id: <20220524135624.22988-3-chenyi.qiang@intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ tools/testing/selftests/kvm/.gitignore        |   1 +
+ tools/testing/selftests/kvm/Makefile          |   1 +
+ .../kvm/x86_64/triple_fault_event_test.c      | 101 ++++++++++++++++++
+ 3 files changed, 103 insertions(+)
+ create mode 100644 tools/testing/selftests/kvm/x86_64/triple_fault_event_test.c
+
+diff --git a/tools/testing/selftests/kvm/.gitignore b/tools/testing/selftests/kvm/.gitignore
+index 7a2c242b7152..0c5b50e62419 100644
+--- a/tools/testing/selftests/kvm/.gitignore
++++ b/tools/testing/selftests/kvm/.gitignore
+@@ -25,6 +25,7 @@
+ /x86_64/vmx_tsc_adjust_test
+ /x86_64/xss_msr_test
+ /clear_dirty_log_test
++/x86_64/triple_fault_event_test
+ /demand_paging_test
+ /dirty_log_test
+ /dirty_log_perf_test
+diff --git a/tools/testing/selftests/kvm/Makefile b/tools/testing/selftests/kvm/Makefile
+index 3d14ef77755e..3f8cf43cbb1d 100644
+--- a/tools/testing/selftests/kvm/Makefile
++++ b/tools/testing/selftests/kvm/Makefile
+@@ -59,6 +59,7 @@ TEST_GEN_PROGS_x86_64 += x86_64/xss_msr_test
+ TEST_GEN_PROGS_x86_64 += x86_64/debug_regs
+ TEST_GEN_PROGS_x86_64 += x86_64/tsc_msrs_test
+ TEST_GEN_PROGS_x86_64 += x86_64/user_msr_test
++TEST_GEN_PROGS_x86_64 += x86_64/triple_fault_event_test
+ TEST_GEN_PROGS_x86_64 += demand_paging_test
+ TEST_GEN_PROGS_x86_64 += dirty_log_test
+ TEST_GEN_PROGS_x86_64 += dirty_log_perf_test
+diff --git a/tools/testing/selftests/kvm/x86_64/triple_fault_event_test.c b/tools/testing/selftests/kvm/x86_64/triple_fault_event_test.c
+new file mode 100644
+index 000000000000..6e1de0631ce9
+--- /dev/null
++++ b/tools/testing/selftests/kvm/x86_64/triple_fault_event_test.c
+@@ -0,0 +1,101 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include "test_util.h"
++#include "kvm_util.h"
++#include "processor.h"
++#include "vmx.h"
++
++#include <string.h>
++#include <sys/ioctl.h>
++
++#include "kselftest.h"
++
++#define VCPU_ID			0
++#define ARBITRARY_IO_PORT	0x2000
++
++/* The virtual machine object. */
++static struct kvm_vm *vm;
++
++static void l2_guest_code(void)
++{
++	asm volatile("inb %%dx, %%al"
++		     : : [port] "d" (ARBITRARY_IO_PORT) : "rax");
++}
++
++void l1_guest_code(struct vmx_pages *vmx)
++{
++#define L2_GUEST_STACK_SIZE 64
++	unsigned long l2_guest_stack[L2_GUEST_STACK_SIZE];
++
++	GUEST_ASSERT(vmx->vmcs_gpa);
++	GUEST_ASSERT(prepare_for_vmx_operation(vmx));
++	GUEST_ASSERT(load_vmcs(vmx));
++
++	prepare_vmcs(vmx, l2_guest_code,
++		     &l2_guest_stack[L2_GUEST_STACK_SIZE]);
++
++	GUEST_ASSERT(!vmlaunch());
++	/* L2 should triple fault after a triple fault event injected. */
++	GUEST_ASSERT(vmreadz(VM_EXIT_REASON) == EXIT_REASON_TRIPLE_FAULT);
++	GUEST_DONE();
++}
++
++int main(void)
++{
++	struct kvm_run *run;
++	struct kvm_vcpu_events events;
++	vm_vaddr_t vmx_pages_gva;
++	struct ucall uc;
++
++	struct kvm_enable_cap cap = {
++		.cap = KVM_CAP_TRIPLE_FAULT_EVENT,
++		.args = {1}
++	};
++
++	if (!nested_vmx_supported()) {
++		print_skip("Nested VMX not supported");
++		exit(KSFT_SKIP);
++	}
++
++	if (!kvm_check_cap(KVM_CAP_TRIPLE_FAULT_EVENT)) {
++		print_skip("KVM_CAP_TRIPLE_FAULT_EVENT not supported");
++		exit(KSFT_SKIP);
++	}
++
++	vm = vm_create_default(VCPU_ID, 0, (void *) l1_guest_code);
++	vm_enable_cap(vm, &cap);
++
++	run = vcpu_state(vm, VCPU_ID);
++	vcpu_alloc_vmx(vm, &vmx_pages_gva);
++	vcpu_args_set(vm, VCPU_ID, 1, vmx_pages_gva);
++	vcpu_run(vm, VCPU_ID);
++
++	TEST_ASSERT(run->exit_reason == KVM_EXIT_IO,
++		    "Expected KVM_EXIT_IO, got: %u (%s)\n",
++		    run->exit_reason, exit_reason_str(run->exit_reason));
++	TEST_ASSERT(run->io.port == ARBITRARY_IO_PORT,
++		    "Expected IN from port %d from L2, got port %d",
++		    ARBITRARY_IO_PORT, run->io.port);
++	vcpu_events_get(vm, VCPU_ID, &events);
++	events.flags |= KVM_VCPUEVENT_VALID_TRIPLE_FAULT;
++	events.triple_fault.pending = true;
++	vcpu_events_set(vm, VCPU_ID, &events);
++	run->immediate_exit = true;
++	vcpu_run_complete_io(vm, VCPU_ID);
++
++	vcpu_events_get(vm, VCPU_ID, &events);
++	TEST_ASSERT(events.flags & KVM_VCPUEVENT_VALID_TRIPLE_FAULT,
++		    "Triple fault event invalid");
++	TEST_ASSERT(events.triple_fault.pending,
++		    "No triple fault pending");
++	vcpu_run(vm, VCPU_ID);
++
++	switch (get_ucall(vm, VCPU_ID, &uc)) {
++	case UCALL_DONE:
++		break;
++	case UCALL_ABORT:
++		TEST_FAIL("%s", (const char *)uc.args[0]);
++	default:
++		TEST_FAIL("Unexpected ucall: %lu", uc.cmd);
++	}
++
++}
+-- 
+2.34.1
+

@@ -1,0 +1,222 @@
+From 9a3ecd5e2aa10af18d0d5a055122d6cc0b0944c7 Mon Sep 17 00:00:00 2001
+From: Chenyi Qiang <chenyi.qiang@intel.com>
+Date: Tue, 2 Feb 2021 17:04:31 +0800
+Subject: [PATCH] KVM: X86: Rename DR6_INIT to DR6_ACTIVE_LOW
+Git-commit: 9a3ecd5e2aa10af18d0d5a055122d6cc0b0944c7
+Patch-mainline: v5.12-rc2
+References: bsn#177
+Modified-by-SEL: Yes, modified per openEuler commit 9a3ecd5e2a
+
+
+DR6_INIT contains the 1-reserved bits as well as the bit that is cleared
+to 0 when the condition (e.g. RTM) happens. The value can be used to
+initialize dr6 and also be the XOR mask between the #DB exit
+qualification (or payload) and DR6.
+
+Concerning that DR6_INIT is used as initial value only once, rename it
+to DR6_ACTIVE_LOW and apply it in other places, which would make the
+incoming changes for bus lock debug exception more simple.
+
+Signed-off-by: Chenyi Qiang <chenyi.qiang@intel.com>
+Message-Id: <20210202090433.13441-2-chenyi.qiang@intel.com>
+[Define DR6_FIXED_1 from DR6_ACTIVE_LOW and DR6_VOLATILE. - Paolo]
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/include/asm/kvm_host.h | 12 ++++++++++--
+ arch/x86/kvm/emulate.c          |  2 +-
+ arch/x86/kvm/svm/nested.c       |  2 +-
+ arch/x86/kvm/svm/svm.c          |  6 +++---
+ arch/x86/kvm/vmx/nested.c       |  4 ++--
+ arch/x86/kvm/vmx/vmx.c          |  4 ++--
+ arch/x86/kvm/x86.c              | 33 +++++++++++++++++++--------------
+ 7 files changed, 38 insertions(+), 25 deletions(-)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 88bbf75e9047..7343d170924f 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -206,9 +206,17 @@ enum x86_intercept_stage;
+ #define DR6_BS		(1 << 14)
+ #define DR6_BT		(1 << 15)
+ #define DR6_RTM		(1 << 16)
+-#define DR6_FIXED_1	0xfffe0ff0
+-#define DR6_INIT	0xffff0ff0
++/*
++ * DR6_ACTIVE_LOW combines fixed-1 and active-low bits.
++ * We can regard all the bits in DR6_FIXED_1 as active_low bits;
++ * they will never be 0 for now, but when they are defined
++ * in the future it will require no code change.
++ *
++ * DR6_ACTIVE_LOW is also used as the init/reset value for DR6.
++ */
++#define DR6_ACTIVE_LOW	0xffff0ff0
+ #define DR6_VOLATILE	0x0001e00f
++#define DR6_FIXED_1	(DR6_ACTIVE_LOW & ~DR6_VOLATILE)
+ 
+ #define DR7_BP_EN_MASK	0x000000ff
+ #define DR7_GE		(1 << 9)
+diff --git a/arch/x86/kvm/emulate.c b/arch/x86/kvm/emulate.c
+index 737035f16a9e..fb2878c58a00 100644
+--- a/arch/x86/kvm/emulate.c
++++ b/arch/x86/kvm/emulate.c
+@@ -4276,7 +4276,7 @@ static int check_dr_read(struct x86_emulate_ctxt *ctxt)
+ 
+ 		ctxt->ops->get_dr(ctxt, 6, &dr6);
+ 		dr6 &= ~DR_TRAP_BITS;
+-		dr6 |= DR6_BD | DR6_RTM;
++		dr6 |= DR6_BD | DR6_ACTIVE_LOW;
+ 		ctxt->ops->set_dr(ctxt, 6, dr6);
+ 		return emulate_db(ctxt);
+ 	}
+diff --git a/arch/x86/kvm/svm/nested.c b/arch/x86/kvm/svm/nested.c
+index 150a06a6df37..1734c6ce976d 100644
+--- a/arch/x86/kvm/svm/nested.c
++++ b/arch/x86/kvm/svm/nested.c
+@@ -426,7 +426,7 @@ static void nested_prepare_vmcb_save(struct vcpu_svm *svm, struct vmcb *vmcb12)
+ 	svm->vmcb->save.rsp = vmcb12->save.rsp;
+ 	svm->vmcb->save.rip = vmcb12->save.rip;
+ 	svm->vmcb->save.dr7 = vmcb12->save.dr7 | DR7_FIXED_1;
+-	svm->vcpu.arch.dr6  = vmcb12->save.dr6 | DR6_FIXED_1 | DR6_RTM;
++	svm->vcpu.arch.dr6  = vmcb12->save.dr6 | DR6_ACTIVE_LOW;
+ 	svm->vmcb->save.cpl = vmcb12->save.cpl;
+ }
+ 
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index 5231f40e8312..e2677e38ea42 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -1788,7 +1788,7 @@ static void svm_sync_dirty_debug_regs(struct kvm_vcpu *vcpu)
+ 	get_debugreg(vcpu->arch.db[2], 2);
+ 	get_debugreg(vcpu->arch.db[3], 3);
+ 	/*
+-	 * We cannot reset svm->vmcb->save.dr6 to DR6_FIXED_1|DR6_RTM here,
++	 * We cannot reset svm->vmcb->save.dr6 to DR6_ACTIVE_LOW here,
+ 	 * because db_interception might need it.  We can do it before vmentry.
+ 	 */
+ 	vcpu->arch.dr6 = svm->vmcb->save.dr6;
+@@ -1836,7 +1836,7 @@ static int db_interception(struct vcpu_svm *svm)
+ 	if (!(svm->vcpu.guest_debug &
+ 	      (KVM_GUESTDBG_SINGLESTEP | KVM_GUESTDBG_USE_HW_BP)) &&
+ 		!svm->nmi_singlestep) {
+-		u32 payload = (svm->vmcb->save.dr6 ^ DR6_RTM) & ~DR6_FIXED_1;
++		u32 payload = svm->vmcb->save.dr6 ^ DR6_ACTIVE_LOW;
+ 		kvm_queue_exception_p(&svm->vcpu, DB_VECTOR, payload);
+ 		return 1;
+ 	}
+@@ -3595,7 +3595,7 @@ static __no_kcsan fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
+ 	if (unlikely(svm->vcpu.arch.switch_db_regs & KVM_DEBUGREG_WONT_EXIT))
+ 		svm_set_dr6(svm, vcpu->arch.dr6);
+ 	else
+-		svm_set_dr6(svm, DR6_FIXED_1 | DR6_RTM);
++		svm_set_dr6(svm, DR6_ACTIVE_LOW);
+ 
+ 	clgi();
+ 	kvm_load_guest_xsave_state(vcpu);
+diff --git a/arch/x86/kvm/vmx/nested.c b/arch/x86/kvm/vmx/nested.c
+index c6c0ff25acdb..6accb687d062 100644
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@ -413,8 +413,8 @@ static int nested_vmx_check_exception(struct kvm_vcpu *vcpu, unsigned long *exit
+ 		if (nr == DB_VECTOR) {
+ 			if (!has_payload) {
+ 				payload = vcpu->arch.dr6;
+-				payload &= ~(DR6_FIXED_1 | DR6_BT);
+-				payload ^= DR6_RTM;
++				payload &= ~DR6_BT;
++				payload ^= DR6_ACTIVE_LOW;
+ 			}
+ 			*exit_qual = payload;
+ 		} else
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 8b26b90e08cf..8d61ee00e7a9 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -5085,7 +5085,7 @@ static int handle_exception_nmi(struct kvm_vcpu *vcpu)
+ 			kvm_queue_exception_p(vcpu, DB_VECTOR, dr6);
+ 			return 1;
+ 		}
+-		kvm_run->debug.arch.dr6 = dr6 | DR6_FIXED_1 | DR6_RTM;
++		kvm_run->debug.arch.dr6 = dr6 | DR6_ACTIVE_LOW;
+ 		kvm_run->debug.arch.dr7 = vmcs_readl(GUEST_DR7);
+ 		fallthrough;
+ 	case BP_VECTOR:
+@@ -5330,7 +5330,7 @@ static int handle_dr(struct kvm_vcpu *vcpu)
+ 		 * guest debugging itself.
+ 		 */
+ 		if (vcpu->guest_debug & KVM_GUESTDBG_USE_HW_BP) {
+-			vcpu->run->debug.arch.dr6 = DR6_BD | DR6_RTM | DR6_FIXED_1;
++			vcpu->run->debug.arch.dr6 = DR6_BD | DR6_ACTIVE_LOW;
+ 			vcpu->run->debug.arch.dr7 = dr7;
+ 			vcpu->run->debug.arch.pc = kvm_get_linear_rip(vcpu);
+ 			vcpu->run->debug.arch.exception = DB_VECTOR;
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index c3845abf0397..17e026516965 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -552,19 +552,24 @@ void kvm_deliver_exception_payload(struct kvm_vcpu *vcpu)
+ 		 */
+ 		vcpu->arch.dr6 &= ~DR_TRAP_BITS;
+ 		/*
+-		 * DR6.RTM is set by all #DB exceptions that don't clear it.
++		 * In order to reflect the #DB exception payload in guest
++		 * dr6, three components need to be considered: active low
++		 * bit, FIXED_1 bits and active high bits (e.g. DR6_BD,
++		 * DR6_BS and DR6_BT)
++		 * DR6_ACTIVE_LOW contains the FIXED_1 and active low bits.
++		 * In the target guest dr6:
++		 * FIXED_1 bits should always be set.
++		 * Active low bits should be cleared if 1-setting in payload.
++		 * Active high bits should be set if 1-setting in payload.
++		 *
++		 * Note, the payload is compatible with the pending debug
++		 * exceptions/exit qualification under VMX, that active_low bits
++		 * are active high in payload.
++		 * So they need to be flipped for DR6.
+ 		 */
+-		vcpu->arch.dr6 |= DR6_RTM;
++		vcpu->arch.dr6 |= DR6_ACTIVE_LOW;
+ 		vcpu->arch.dr6 |= payload;
+-		/*
+-		 * Bit 16 should be set in the payload whenever the #DB
+-		 * exception should clear DR6.RTM. This makes the payload
+-		 * compatible with the pending debug exceptions under VMX.
+-		 * Though not currently documented in the SDM, this also
+-		 * makes the payload compatible with the exit qualification
+-		 * for #DB exceptions under VMX.
+-		 */
+-		vcpu->arch.dr6 ^= payload & DR6_RTM;
++		vcpu->arch.dr6 ^= payload & DR6_ACTIVE_LOW;
+ 
+ 		/*
+ 		 * The #DB payload is defined as compatible with the 'pending
+@@ -7429,7 +7434,7 @@ static int kvm_vcpu_do_singlestep(struct kvm_vcpu *vcpu)
+ 	struct kvm_run *kvm_run = vcpu->run;
+ 
+ 	if (vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP) {
+-		kvm_run->debug.arch.dr6 = DR6_BS | DR6_FIXED_1 | DR6_RTM;
++		kvm_run->debug.arch.dr6 = DR6_BS | DR6_ACTIVE_LOW;
+ 		kvm_run->debug.arch.pc = kvm_get_linear_rip(vcpu);
+ 		kvm_run->debug.arch.exception = DB_VECTOR;
+ 		kvm_run->exit_reason = KVM_EXIT_DEBUG;
+@@ -7473,7 +7478,7 @@ static bool kvm_vcpu_check_code_breakpoint(struct kvm_vcpu *vcpu, int *r)
+ 					   vcpu->arch.eff_db);
+ 
+ 		if (dr6 != 0) {
+-			kvm_run->debug.arch.dr6 = dr6 | DR6_FIXED_1 | DR6_RTM;
++			kvm_run->debug.arch.dr6 = dr6 | DR6_ACTIVE_LOW;
+ 			kvm_run->debug.arch.pc = eip;
+ 			kvm_run->debug.arch.exception = DB_VECTOR;
+ 			kvm_run->exit_reason = KVM_EXIT_DEBUG;
+@@ -10351,7 +10356,7 @@ void kvm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
+ 
+ 	memset(vcpu->arch.db, 0, sizeof(vcpu->arch.db));
+ 	kvm_update_dr0123(vcpu);
+-	vcpu->arch.dr6 = DR6_INIT;
++	vcpu->arch.dr6 = DR6_ACTIVE_LOW;
+ 	vcpu->arch.dr7 = DR7_FIXED_1;
+ 	kvm_update_dr7(vcpu);
+ 
+-- 
+2.34.1
+
