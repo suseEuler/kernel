@@ -1,0 +1,128 @@
+From 51ddf58f769d6687937e176a457fc5c85efaa705 Mon Sep 17 00:00:00 2001
+From: Zhang Wensheng <zhangwensheng5@huawei.com>
+Date: Wed, 2 Nov 2022 15:36:24 +0800
+Subject: [PATCH] block: fix null-deref in percpu_ref_put
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 51ddf58f769d6687937e176a457fc5c85efaa705
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5N162
+CVE: NA
+
+--------------------------------
+
+In the use of q_usage_counter of request_queue, blk_cleanup_queue using
+"wait_event(q->mq_freeze_wq, percpu_ref_is_zero(&q->q_usage_counter))"
+to wait q_usage_counter becoming zero. however, if the q_usage_counter
+becoming zero quickly, and percpu_ref_exit will execute and ref->data
+will be freed, maybe another process will cause a null-defef problem
+like below:
+
+	CPU0                             CPU1
+blk_cleanup_queue
+ blk_freeze_queue
+  blk_mq_freeze_queue_wait
+				scsi_end_request
+				 percpu_ref_get
+				 ...
+				 percpu_ref_put
+				  atomic_long_sub_and_test
+  percpu_ref_exit
+   ref->data -> NULL
+   				   ref->data->release(ref) -> null-deref
+
+Fix it by setting flag(QUEUE_FLAG_USAGE_COUNT_SYNC) to add synchronization
+mechanism, when ref->data->release is called, the flag will be setted,
+and the "wait_event" in blk_mq_freeze_queue_wait must wait flag becoming
+true as well, which will limit percpu_ref_exit to execute ahead of time.
+
+Signed-off-by: Zhang Wensheng <zhangwensheng5@huawei.com>
+Reviewed-by: Yu Kuai <yukuai3@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ block/blk-core.c       | 4 +++-
+ block/blk-mq.c         | 7 +++++++
+ include/linux/blk-mq.h | 1 +
+ include/linux/blkdev.h | 2 ++
+ 4 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 0b496dabc5ac..448e4d70af7f 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -385,7 +385,8 @@ void blk_cleanup_queue(struct request_queue *q)
+ 	 * prevent that blk_mq_run_hw_queues() accesses the hardware queues
+ 	 * after draining finished.
+ 	 */
+-	blk_freeze_queue(q);
++	blk_freeze_queue_start(q);
++	blk_mq_freeze_queue_wait_sync(q);
+ 
+ 	rq_qos_exit(q);
+ 
+@@ -502,6 +503,7 @@ static void blk_queue_usage_counter_release(struct percpu_ref *ref)
+ 	struct request_queue *q =
+ 		container_of(ref, struct request_queue, q_usage_counter);
+ 
++	blk_queue_flag_set(QUEUE_FLAG_USAGE_COUNT_SYNC, q);
+ 	wake_up_all(&q->mq_freeze_wq);
+ }
+ 
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index e1fcdbefcac0..ab1b0bfc64f9 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -193,6 +193,7 @@ void blk_freeze_queue_start(struct request_queue *q)
+ {
+ 	mutex_lock(&q->mq_freeze_lock);
+ 	if (++q->mq_freeze_depth == 1) {
++		blk_queue_flag_clear(QUEUE_FLAG_USAGE_COUNT_SYNC, q);
+ 		percpu_ref_kill(&q->q_usage_counter);
+ 		mutex_unlock(&q->mq_freeze_lock);
+ 		if (queue_is_mq(q))
+@@ -203,6 +204,12 @@ void blk_freeze_queue_start(struct request_queue *q)
+ }
+ EXPORT_SYMBOL_GPL(blk_freeze_queue_start);
+ 
++void blk_mq_freeze_queue_wait_sync(struct request_queue *q)
++{
++	wait_event(q->mq_freeze_wq, percpu_ref_is_zero(&q->q_usage_counter) &&
++			test_bit(QUEUE_FLAG_USAGE_COUNT_SYNC, &q->queue_flags));
++}
++
+ void blk_mq_freeze_queue_wait(struct request_queue *q)
+ {
+ 	wait_event(q->mq_freeze_wq, percpu_ref_is_zero(&q->q_usage_counter));
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index ac83257972a0..e4e46229d0eb 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -574,6 +574,7 @@ void blk_mq_freeze_queue(struct request_queue *q);
+ void blk_mq_unfreeze_queue(struct request_queue *q);
+ void blk_freeze_queue_start(struct request_queue *q);
+ void blk_mq_freeze_queue_wait(struct request_queue *q);
++void blk_mq_freeze_queue_wait_sync(struct request_queue *q);
+ int blk_mq_freeze_queue_wait_timeout(struct request_queue *q,
+ 				     unsigned long timeout);
+ 
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 49540ce9e325..4c046530edb9 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -643,6 +643,8 @@ struct request_queue {
+ #define QUEUE_FLAG_NOWAIT       29	/* device supports NOWAIT */
+ /*at least one blk-mq hctx can't get driver tag */
+ #define QUEUE_FLAG_HCTX_WAIT	30
++/* sync for q_usage_counter */
++#define QUEUE_FLAG_USAGE_COUNT_SYNC    31
+ 
+ #define QUEUE_FLAG_MQ_DEFAULT	((1 << QUEUE_FLAG_IO_STAT) |		\
+ 				 (1 << QUEUE_FLAG_SAME_COMP) |		\
+-- 
+2.34.1
+

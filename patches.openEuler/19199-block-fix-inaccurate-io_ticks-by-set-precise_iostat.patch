@@ -1,0 +1,155 @@
+From eb090da6ce7ec5b507b047aa4ad3ec330c770e72 Mon Sep 17 00:00:00 2001
+From: Zhang Wensheng <zhangwensheng5@huawei.com>
+Date: Wed, 2 Nov 2022 15:36:46 +0800
+Subject: [PATCH] block: fix inaccurate io_ticks by set 'precise_iostat'
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: eb090da6ce7ec5b507b047aa4ad3ec330c770e72
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5X6RT
+CVE: NA
+
+--------------------------------
+
+After introducing commit 5b18b5a73760 ("block: delete part_round_stats
+and switch to less precise counting"), '%util' accounted by iostat
+will be over reality data. In fact, the device is quite idle, but
+iostat may show '%util' as a big number (e.g. 50%). It can produce by fio:
+
+fio --name=1 --direct=1 --bs=4k --rw=read --filename=/dev/sda \
+	   --thinktime=4ms --runtime=180
+We fix this by using a switch(precise_iostat=1) to control whether or not
+acconut ioticks precisely.
+
+fixes: 5b18b5a73760 ("block: delete part_round_stats and switch to less precise counting")
+Signed-off-by: Zhang Wensheng <zhangwensheng5@huawei.com>
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ block/blk-core.c       | 28 ++++++++++++++++++++++++++--
+ block/blk-merge.c      |  2 ++
+ block/genhd.c          |  2 +-
+ include/linux/blkdev.h |  1 +
+ include/linux/genhd.h  |  1 +
+ 5 files changed, 31 insertions(+), 3 deletions(-)
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 7b6d5c8c036f..a4ec5e168312 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -62,6 +62,21 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(block_unplug);
+ 
+ DEFINE_IDA(blk_queue_ida);
+ 
++bool precise_iostat;
++
++static int __init precise_iostat_setup(char *str)
++{
++	bool precise;
++
++	if (!strtobool(str, &precise)) {
++		precise_iostat = precise;
++		pr_info("precise iostat %d\n", precise_iostat);
++	}
++
++	return 1;
++}
++__setup("precise_iostat=", precise_iostat_setup);
++
+ /*
+  * For queue allocation
+  */
+@@ -1258,9 +1273,14 @@ void update_io_ticks(struct hd_struct *part, unsigned long now, bool end)
+ 	unsigned long stamp;
+ again:
+ 	stamp = READ_ONCE(part->stamp);
+-	if (unlikely(time_after(now, stamp))) {
+-		if (likely(cmpxchg(&part->stamp, stamp, now) == stamp))
++	if (unlikely(time_after(now, stamp)) &&
++		likely(cmpxchg(&part->stamp, stamp, now) == stamp)) {
++		if (precise_iostat) {
++			if (end || part_in_flight(part))
++				__part_stat_add(part, io_ticks, now - stamp);
++		} else {
+ 			__part_stat_add(part, io_ticks, end ? now - stamp : 1);
++		}
+ 	}
+ 	if (part->partno) {
+ 		part = &part_to_disk(part)->part0;
+@@ -1318,6 +1338,8 @@ void blk_account_io_done(struct request *req, u64 now)
+ #else
+ 		part_stat_add(part, nsecs[sgrp], now - req->start_time_ns);
+ #endif
++		if (precise_iostat)
++			part_stat_local_dec(part, in_flight[rq_data_dir(req)]);
+ 		part_stat_unlock();
+ 
+ 		hd_struct_put(part);
+@@ -1333,6 +1355,8 @@ void blk_account_io_start(struct request *rq)
+ 
+ 	part_stat_lock();
+ 	update_io_ticks(rq->part, jiffies, false);
++	if (precise_iostat)
++		part_stat_local_inc(rq->part, in_flight[rq_data_dir(rq)]);
+ 	part_stat_unlock();
+ }
+ 
+diff --git a/block/blk-merge.c b/block/blk-merge.c
+index 6518e0ae2835..cfb88d2fbf38 100644
+--- a/block/blk-merge.c
++++ b/block/blk-merge.c
+@@ -696,6 +696,8 @@ static void blk_account_io_merge_request(struct request *req)
+ 	if (blk_do_io_stat(req)) {
+ 		part_stat_lock();
+ 		part_stat_inc(req->part, merges[op_stat_group(req_op(req))]);
++		if (precise_iostat)
++			part_stat_local_dec(req->part, in_flight[rq_data_dir(req)]);
+ 		part_stat_unlock();
+ 
+ 		hd_struct_put(req->part);
+diff --git a/block/genhd.c b/block/genhd.c
+index 021c9c2d7231..4f6a0be74d85 100644
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -112,7 +112,7 @@ static void part_stat_read_all(struct hd_struct *part, struct disk_stats *stat)
+ 	}
+ }
+ 
+-static unsigned int part_in_flight(struct hd_struct *part)
++unsigned int part_in_flight(struct hd_struct *part)
+ {
+ 	unsigned int inflight = 0;
+ 	int cpu;
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 58475edd65f4..e4bcb11d6202 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -29,6 +29,7 @@
+ #include <linux/pm.h>
+ #include <linux/sbitmap.h>
+ 
++extern bool precise_iostat;
+ struct module;
+ struct scsi_ioctl_command;
+ 
+diff --git a/include/linux/genhd.h b/include/linux/genhd.h
+index 05927a1c6b5b..959add98b686 100644
+--- a/include/linux/genhd.h
++++ b/include/linux/genhd.h
+@@ -304,6 +304,7 @@ extern void disk_part_iter_exit(struct disk_part_iter *piter);
+ extern bool disk_has_partitions(struct gendisk *disk);
+ 
+ /* block/genhd.c */
++extern unsigned int part_in_flight(struct hd_struct *part);
+ extern void device_add_disk(struct device *parent, struct gendisk *disk,
+ 			    const struct attribute_group **groups);
+ static inline void add_disk(struct gendisk *disk)
+-- 
+2.34.1
+
