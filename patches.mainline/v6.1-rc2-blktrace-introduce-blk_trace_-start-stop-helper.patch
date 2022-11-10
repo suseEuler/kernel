@@ -1,0 +1,130 @@
+From 60a9bb9048f9e95029df10a9bc346f6b066c593c Mon Sep 17 00:00:00 2001
+From: Ye Bin <yebin10@huawei.com>
+Date: Wed, 19 Oct 2022 11:36:00 +0800
+Subject: [PATCH] blktrace: introduce 'blk_trace_{start,stop}' helper
+Git-commit: 60a9bb9048f9e95029df10a9bc346f6b066c593c
+Patch-mainline: v6.1-rc2
+References: bsn#12
+Modified-by-SEL: No
+
+
+Introduce 'blk_trace_{start,stop}' helper. No functional changed.
+
+Signed-off-by: Ye Bin <yebin10@huawei.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Link: https://lore.kernel.org/r/20221019033602.752383-2-yebin@huaweicloud.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/trace/blktrace.c | 74 ++++++++++++++++++++---------------------
+ 1 file changed, 36 insertions(+), 38 deletions(-)
+
+diff --git a/kernel/trace/blktrace.c b/kernel/trace/blktrace.c
+index 7f5eb295fe19..50b6f241b5f7 100644
+--- a/kernel/trace/blktrace.c
++++ b/kernel/trace/blktrace.c
+@@ -346,6 +346,37 @@ static void put_probe_ref(void)
+ 	mutex_unlock(&blk_probe_mutex);
+ }
+ 
++static int blk_trace_start(struct blk_trace *bt)
++{
++	if (bt->trace_state != Blktrace_setup &&
++	    bt->trace_state != Blktrace_stopped)
++		return -EINVAL;
++
++	blktrace_seq++;
++	smp_mb();
++	bt->trace_state = Blktrace_running;
++	raw_spin_lock_irq(&running_trace_lock);
++	list_add(&bt->running_list, &running_trace_list);
++	raw_spin_unlock_irq(&running_trace_lock);
++	trace_note_time(bt);
++
++	return 0;
++}
++
++static int blk_trace_stop(struct blk_trace *bt)
++{
++	if (bt->trace_state != Blktrace_running)
++		return -EINVAL;
++
++	bt->trace_state = Blktrace_stopped;
++	raw_spin_lock_irq(&running_trace_lock);
++	list_del_init(&bt->running_list);
++	raw_spin_unlock_irq(&running_trace_lock);
++	relay_flush(bt->rchan);
++
++	return 0;
++}
++
+ static void blk_trace_cleanup(struct request_queue *q, struct blk_trace *bt)
+ {
+ 	synchronize_rcu();
+@@ -658,7 +689,6 @@ static int compat_blk_trace_setup(struct request_queue *q, char *name,
+ 
+ static int __blk_trace_startstop(struct request_queue *q, int start)
+ {
+-	int ret;
+ 	struct blk_trace *bt;
+ 
+ 	bt = rcu_dereference_protected(q->blk_trace,
+@@ -666,36 +696,10 @@ static int __blk_trace_startstop(struct request_queue *q, int start)
+ 	if (bt == NULL)
+ 		return -EINVAL;
+ 
+-	/*
+-	 * For starting a trace, we can transition from a setup or stopped
+-	 * trace. For stopping a trace, the state must be running
+-	 */
+-	ret = -EINVAL;
+-	if (start) {
+-		if (bt->trace_state == Blktrace_setup ||
+-		    bt->trace_state == Blktrace_stopped) {
+-			blktrace_seq++;
+-			smp_mb();
+-			bt->trace_state = Blktrace_running;
+-			raw_spin_lock_irq(&running_trace_lock);
+-			list_add(&bt->running_list, &running_trace_list);
+-			raw_spin_unlock_irq(&running_trace_lock);
+-
+-			trace_note_time(bt);
+-			ret = 0;
+-		}
+-	} else {
+-		if (bt->trace_state == Blktrace_running) {
+-			bt->trace_state = Blktrace_stopped;
+-			raw_spin_lock_irq(&running_trace_lock);
+-			list_del_init(&bt->running_list);
+-			raw_spin_unlock_irq(&running_trace_lock);
+-			relay_flush(bt->rchan);
+-			ret = 0;
+-		}
+-	}
+-
+-	return ret;
++	if (start)
++		return blk_trace_start(bt);
++	else
++		return blk_trace_stop(bt);
+ }
+ 
+ int blk_trace_startstop(struct request_queue *q, int start)
+@@ -1614,13 +1618,7 @@ static int blk_trace_remove_queue(struct request_queue *q)
+ 	if (bt == NULL)
+ 		return -EINVAL;
+ 
+-	if (bt->trace_state == Blktrace_running) {
+-		bt->trace_state = Blktrace_stopped;
+-		raw_spin_lock_irq(&running_trace_lock);
+-		list_del_init(&bt->running_list);
+-		raw_spin_unlock_irq(&running_trace_lock);
+-		relay_flush(bt->rchan);
+-	}
++	blk_trace_stop(bt);
+ 
+ 	put_probe_ref();
+ 	synchronize_rcu();
+-- 
+2.34.1
+

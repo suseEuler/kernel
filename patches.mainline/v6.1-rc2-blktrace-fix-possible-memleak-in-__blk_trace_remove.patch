@@ -1,0 +1,98 @@
+From dcd1a59c62dc49da75539213611156d6db50ab5d Mon Sep 17 00:00:00 2001
+From: Ye Bin <yebin10@huawei.com>
+Date: Wed, 19 Oct 2022 11:36:01 +0800
+Subject: [PATCH] blktrace: fix possible memleak in '__blk_trace_remove'
+Git-commit: dcd1a59c62dc49da75539213611156d6db50ab5d
+Patch-mainline: v6.1-rc2
+References: bsn#12
+Modified-by-SEL: No
+
+
+When test as follows:
+step1: ioctl(sda, BLKTRACESETUP, &arg)
+step2: ioctl(sda, BLKTRACESTART, NULL)
+step3: ioctl(sda, BLKTRACETEARDOWN, NULL)
+step4: ioctl(sda, BLKTRACESETUP, &arg)
+Got issue as follows:
+debugfs: File 'dropped' in directory 'sda' already present!
+debugfs: File 'msg' in directory 'sda' already present!
+debugfs: File 'trace0' in directory 'sda' already present!
+
+And also find syzkaller report issue like "KASAN: use-after-free Read in relay_switch_subbuf"
+"https://syzkaller.appspot.com/bug?id=13849f0d9b1b818b087341691be6cc3ac6a6bfb7"
+
+If remove block trace without stop(BLKTRACESTOP) block trace, '__blk_trace_remove'
+will just set 'q->blk_trace' with NULL. However, debugfs file isn't removed, so
+will report file already present when call BLKTRACESETUP.
+static int __blk_trace_remove(struct request_queue *q)
+{
+        struct blk_trace *bt;
+
+        bt = rcu_replace_pointer(q->blk_trace, NULL,
+                                 lockdep_is_held(&q->debugfs_mutex));
+        if (!bt)
+                return -EINVAL;
+
+	if (bt->trace_state != Blktrace_running)
+        	blk_trace_cleanup(q, bt);
+
+        return 0;
+}
+
+If do test as follows:
+step1: ioctl(sda, BLKTRACESETUP, &arg)
+step2: ioctl(sda, BLKTRACESTART, NULL)
+step3: ioctl(sda, BLKTRACETEARDOWN, NULL)
+step4: remove sda
+
+There will remove debugfs directory which will remove recursively all file
+under directory.
+>> blk_release_queue
+>>	debugfs_remove_recursive(q->debugfs_dir)
+So all files which created in 'do_blk_trace_setup' are removed, and
+'dentry->d_inode' is NULL. But 'q->blk_trace' is still in 'running_trace_lock',
+'trace_note_tsk' will traverse 'running_trace_lock' all nodes.
+>>trace_note_tsk
+>>  trace_note
+>>    relay_reserve
+>>       relay_switch_subbuf
+>>        d_inode(buf->dentry)->i_size
+
+To solve above issues, reference commit '5afedf670caf', call 'blk_trace_cleanup'
+unconditionally in '__blk_trace_remove' and first stop block trace in
+'blk_trace_cleanup'.
+
+Signed-off-by: Ye Bin <yebin10@huawei.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Link: https://lore.kernel.org/r/20221019033602.752383-3-yebin@huaweicloud.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/trace/blktrace.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/trace/blktrace.c b/kernel/trace/blktrace.c
+index 50b6f241b5f7..e17bba027a2c 100644
+--- a/kernel/trace/blktrace.c
++++ b/kernel/trace/blktrace.c
+@@ -379,6 +379,7 @@ static int blk_trace_stop(struct blk_trace *bt)
+ 
+ static void blk_trace_cleanup(struct request_queue *q, struct blk_trace *bt)
+ {
++	blk_trace_stop(bt);
+ 	synchronize_rcu();
+ 	blk_trace_free(q, bt);
+ 	put_probe_ref();
+@@ -393,8 +394,7 @@ static int __blk_trace_remove(struct request_queue *q)
+ 	if (!bt)
+ 		return -EINVAL;
+ 
+-	if (bt->trace_state != Blktrace_running)
+-		blk_trace_cleanup(q, bt);
++	blk_trace_cleanup(q, bt);
+ 
+ 	return 0;
+ }
+-- 
+2.34.1
+

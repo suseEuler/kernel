@@ -1,0 +1,78 @@
+From 431d21134d63a80c948d5be7cd6bddd9be3dac00 Mon Sep 17 00:00:00 2001
+From: Jie Zhan <zhanjie9@hisilicon.com>
+Date: Mon, 7 Nov 2022 20:51:56 +0800
+Subject: [PATCH] irqdomain: Fix driver re-inserting failures when IRQs not
+ being freed
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 431d21134d63a80c948d5be7cd6bddd9be3dac00
+Modified-by-SEL: No
+
+
+driver inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5GNIE
+
+------------------------------------------------------------------------
+
+Since commit 4615fbc3788d ("genirq/irqdomain: Don't try to free an
+interrupt that has no mapping"), we have found failures when
+re-inserting some specific drivers:
+
+[root@localhost ~]# rmmod hisi_sas_v3_hw
+[root@localhost ~]# modprobe hisi_sas_v3_hw
+[ 1295.622525] hisi_sas_v3_hw: probe of 0000:30:04.0 failed with error -2
+
+A relevant discussion can be found at:
+https://lore.kernel.org/lkml/3d3d0155e66429968cb4f6b4feeae4b3@kernel.org/
+
+This is because IRQs from a low-level domain are not freed together,
+leaving some leaked. Thus, the next driver insertion fails to allocate
+the same number of IRQs.
+
+Free a contiguous group of IRQs in one go to fix this issue.
+
+Fixes: 4615fbc3788d ("genirq/irqdomain: Don't try to free an interrupt
+that has no mapping")
+Signed-off-by: Jie Zhan <zhanjie9@hisilicon.com>
+Reviewed-by: Liao Chang <liaochang1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/irq/irqdomain.c | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/irq/irqdomain.c b/kernel/irq/irqdomain.c
+index c6b419db68ef..ed2fb45e8cae 100644
+--- a/kernel/irq/irqdomain.c
++++ b/kernel/irq/irqdomain.c
+@@ -1374,13 +1374,24 @@ static void irq_domain_free_irqs_hierarchy(struct irq_domain *domain,
+ 					   unsigned int nr_irqs)
+ {
+ 	unsigned int i;
++	int n;
+ 
+ 	if (!domain->ops->free)
+ 		return;
+ 
+ 	for (i = 0; i < nr_irqs; i++) {
+-		if (irq_domain_get_irq_data(domain, irq_base + i))
+-			domain->ops->free(domain, irq_base + i, 1);
++		/* Find the largest possible span of IRQs to free in one go */
++		for (n = 0;
++			((i + n) < nr_irqs) &&
++			 (irq_domain_get_irq_data(domain, irq_base + i + n));
++			n++)
++			;
++
++		if (!n)
++			continue;
++
++		domain->ops->free(domain, irq_base + i, n);
++		i += n;
+ 	}
+ }
+ 
+-- 
+2.34.1
+
