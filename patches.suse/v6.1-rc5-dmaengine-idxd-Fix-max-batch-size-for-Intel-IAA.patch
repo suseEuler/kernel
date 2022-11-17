@@ -1,0 +1,142 @@
+From e8dbd6445dd6b38c4c50410a86f13158486ee99a Mon Sep 17 00:00:00 2001
+From: Xiaochen Shen <xiaochen.shen@intel.com>
+Date: Sat, 1 Oct 2022 04:15:27 +0800
+Subject: [PATCH] dmaengine: idxd: Fix max batch size for Intel IAA
+Git-commit: e8dbd6445dd6b38c4c50410a86f13158486ee99a
+Patch-mainline: v6.1-rc5
+References: git-fix
+Modified-by-SEL: Yes, refreshed due to different context
+
+
+>From Intel IAA spec [1], Intel IAA does not support batch processing.
+
+Two batch related default values for IAA are incorrect in current code:
+(1) The max batch size of device is set during device initialization,
+    that indicates batch is supported. It should be always 0 on IAA.
+(2) The max batch size of work queue is set to WQ_DEFAULT_MAX_BATCH (32)
+    as the default value regardless of Intel DSA or IAA device during
+    work queue setup and cleanup. It should be always 0 on IAA.
+
+Fix the issues by setting the max batch size of device and max batch
+size of work queue to 0 on IAA device, that means batch is not
+supported.
+
+[1]: https://cdrdv2.intel.com/v1/dl/getContent/721858
+
+Fixes: 23084545dbb0 ("dmaengine: idxd: set max_xfer and max_batch for RO device")
+Fixes: 92452a72ebdf ("dmaengine: idxd: set defaults for wq configs")
+Fixes: bfe1d56091c1 ("dmaengine: idxd: Init and probe for Intel data accelerators")
+Signed-off-by: Xiaochen Shen <xiaochen.shen@intel.com>
+Reviewed-by: Dave Jiang <dave.jiang@intel.com>
+Reviewed-by: Fenghua Yu <fenghua.yu@intel.com>
+Link: https://lore.kernel.org/r/20220930201528.18621-2-xiaochen.shen@intel.com
+Signed-off-by: Vinod Koul <vkoul@kernel.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/dma/idxd/device.c |    6 +++---
+ drivers/dma/idxd/idxd.h   |   32 ++++++++++++++++++++++++++++++++
+ drivers/dma/idxd/init.c   |    4 ++--
+ drivers/dma/idxd/sysfs.c  |    2 +-
+ 4 files changed, 38 insertions(+), 6 deletions(-)
+
+--- a/drivers/dma/idxd/device.c
++++ b/drivers/dma/idxd/device.c
+@@ -388,7 +388,7 @@ static void idxd_wq_disable_cleanup(stru
+ 	clear_bit(WQ_FLAG_BLOCK_ON_FAULT, &wq->flags);
+ 	memset(wq->name, 0, WQ_NAME_SIZE);
+ 	wq->max_xfer_bytes = WQ_DEFAULT_MAX_XFER;
+-	wq->max_batch_size = WQ_DEFAULT_MAX_BATCH;
++	idxd_wq_set_max_batch_size(idxd->data->type, wq, WQ_DEFAULT_MAX_BATCH);
+ 	if (wq->opcap_bmap)
+ 		bitmap_copy(wq->opcap_bmap, idxd->opcap_bmap, IDXD_MAX_OPCAP_BITS);
+ }
+@@ -865,7 +865,7 @@ static int idxd_wq_config_write(struct i
+ 
+ 	/* bytes 12-15 */
+ 	wq->wqcfg->max_xfer_shift = ilog2(wq->max_xfer_bytes);
+-	wq->wqcfg->max_batch_shift = ilog2(wq->max_batch_size);
++	idxd_wqcfg_set_max_batch_shift(idxd->data->type, wq->wqcfg, ilog2(wq->max_batch_size));
+ 
+ 	/* bytes 32-63 */
+ 	if (idxd->hw.wq_cap.op_config && wq->opcap_bmap) {
+@@ -1044,7 +1044,7 @@ static int idxd_wq_load_config(struct id
+ 	wq->priority = wq->wqcfg->priority;
+ 
+ 	wq->max_xfer_bytes = 1ULL << wq->wqcfg->max_xfer_shift;
+-	wq->max_batch_size = 1ULL << wq->wqcfg->max_batch_shift;
++	idxd_wq_set_max_batch_size(idxd->data->type, wq, 1U << wq->wqcfg->max_batch_shift);
+ 
+ 	for (i = 0; i < WQCFG_STRIDES(idxd); i++) {
+ 		wqcfg_offset = WQCFG_OFFSET(idxd, wq->id, i);
+--- a/drivers/dma/idxd/idxd.h
++++ b/drivers/dma/idxd/idxd.h
+@@ -542,6 +542,38 @@ static inline int idxd_wq_refcount(struc
+ 	return wq->client_count;
+ };
+ 
++/*
++ * Intel IAA does not support batch processing.
++ * The max batch size of device, max batch size of wq and
++ * max batch shift of wqcfg should be always 0 on IAA.
++ */
++static inline void idxd_set_max_batch_size(int idxd_type, struct idxd_device *idxd,
++					   u32 max_batch_size)
++{
++	if (idxd_type == IDXD_TYPE_IAX)
++		idxd->max_batch_size = 0;
++	else
++		idxd->max_batch_size = max_batch_size;
++}
++
++static inline void idxd_wq_set_max_batch_size(int idxd_type, struct idxd_wq *wq,
++					      u32 max_batch_size)
++{
++	if (idxd_type == IDXD_TYPE_IAX)
++		wq->max_batch_size = 0;
++	else
++		wq->max_batch_size = max_batch_size;
++}
++
++static inline void idxd_wqcfg_set_max_batch_shift(int idxd_type, union wqcfg *wqcfg,
++						  u32 max_batch_shift)
++{
++	if (idxd_type == IDXD_TYPE_IAX)
++		wqcfg->max_batch_shift = 0;
++	else
++		wqcfg->max_batch_shift = max_batch_shift;
++}
++
+ int __must_check __idxd_driver_register(struct idxd_device_driver *idxd_drv,
+ 					struct module *module, const char *mod_name);
+ #define idxd_driver_register(driver) \
+--- a/drivers/dma/idxd/init.c
++++ b/drivers/dma/idxd/init.c
+@@ -177,7 +177,7 @@ static int idxd_setup_wqs(struct idxd_de
+ 		init_completion(&wq->wq_dead);
+ 		init_completion(&wq->wq_resurrect);
+ 		wq->max_xfer_bytes = WQ_DEFAULT_MAX_XFER;
+-		wq->max_batch_size = WQ_DEFAULT_MAX_BATCH;
++		idxd_wq_set_max_batch_size(idxd->data->type, wq, WQ_DEFAULT_MAX_BATCH);
+ 		wq->enqcmds_retries = IDXD_ENQCMDS_RETRIES;
+ 		wq->wqcfg = kzalloc_node(idxd->wqcfg_size, GFP_KERNEL, dev_to_node(dev));
+ 		if (!wq->wqcfg) {
+@@ -399,7 +399,7 @@ static void idxd_read_caps(struct idxd_d
+ 
+ 	idxd->max_xfer_bytes = 1ULL << idxd->hw.gen_cap.max_xfer_shift;
+ 	dev_dbg(dev, "max xfer size: %llu bytes\n", idxd->max_xfer_bytes);
+-	idxd->max_batch_size = 1U << idxd->hw.gen_cap.max_batch_shift;
++	idxd_set_max_batch_size(idxd->data->type, idxd, 1U << idxd->hw.gen_cap.max_batch_shift);
+ 	dev_dbg(dev, "max batch size: %u\n", idxd->max_batch_size);
+ 	if (idxd->hw.gen_cap.config_en)
+ 		set_bit(IDXD_FLAG_CONFIGURABLE, &idxd->flags);
+--- a/drivers/dma/idxd/sysfs.c
++++ b/drivers/dma/idxd/sysfs.c
+@@ -961,7 +961,7 @@ static ssize_t wq_max_batch_size_store(s
+ 	if (batch_size > idxd->max_batch_size)
+ 		return -EINVAL;
+ 
+-	wq->max_batch_size = (u32)batch_size;
++	idxd_wq_set_max_batch_size(idxd->data->type, wq, (u32)batch_size);
+ 
+ 	return count;
+ }
