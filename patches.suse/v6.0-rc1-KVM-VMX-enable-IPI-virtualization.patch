@@ -1,0 +1,361 @@
+From d588bb9be1da6aa750aa64875fe57369db983d8b Mon Sep 17 00:00:00 2001
+From: Chao Gao <chao.gao@intel.com>
+Date: Tue, 19 Apr 2022 23:45:10 +0800
+Subject: [PATCH] KVM: VMX: enable IPI virtualization
+Git-commit: d588bb9be1da6aa750aa64875fe57369db983d8b
+Patch-mainline: v6.0-rc1
+References: bsn#121
+Modified-by-SEL: Yes, modified per openEuler commit c52cf141
+
+
+With IPI virtualization enabled, the processor emulates writes to
+APIC registers that would send IPIs. The processor sets the bit
+corresponding to the vector in target vCPU's PIR and may send a
+notification (IPI) specified by NDST and NV fields in target vCPU's
+Posted-Interrupt Descriptor (PID). It is similar to what IOMMU
+engine does when dealing with posted interrupt from devices.
+
+A PID-pointer table is used by the processor to locate the PID of a
+vCPU with the vCPU's APIC ID. The table size depends on maximum APIC
+ID assigned for current VM session from userspace. Allocating memory
+for PID-pointer table is deferred to vCPU creation, because irqchip
+mode and VM-scope maximum APIC ID is settled at that point. KVM can
+skip PID-pointer table allocation if !irqchip_in_kernel().
+
+Like VT-d PI, if a vCPU goes to blocked state, VMM needs to switch its
+notification vector to wakeup vector. This can ensure that when an IPI
+for blocked vCPUs arrives, VMM can get control and wake up blocked
+vCPUs. And if a VCPU is preempted, its posted interrupt notification
+is suppressed.
+
+Note that IPI virtualization can only virualize physical-addressing,
+flat mode, unicast IPIs. Sending other IPIs would still cause a
+trap-like APIC-write VM-exit and need to be handled by VMM.
+
+Signed-off-by: Chao Gao <chao.gao@intel.com>
+Signed-off-by: Zeng Guang <guang.zeng@intel.com>
+Message-Id: <20220419154510.11938-1-guang.zeng@intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/include/asm/kvm_host.h    |    1 
+ arch/x86/include/asm/vmx.h         |    8 +++
+ arch/x86/include/asm/vmxfeatures.h |    2 
+ arch/x86/kvm/vmx/capabilities.h    |    6 ++
+ arch/x86/kvm/vmx/posted_intr.c     |    4 -
+ arch/x86/kvm/vmx/posted_intr.h     |    2 
+ arch/x86/kvm/vmx/vmx.c             |   82 ++++++++++++++++++++++++++++++++++---
+ arch/x86/kvm/vmx/vmx.h             |    7 +++
+ arch/x86/kvm/x86.c                 |    2 
+ 9 files changed, 106 insertions(+), 8 deletions(-)
+
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1130,6 +1130,7 @@ struct kvm_x86_ops {
+ 	void (*vm_destroy)(struct kvm *kvm);
+ 
+ 	/* Create, but do not attach this VCPU */
++	int (*vcpu_precreate)(struct kvm *kvm);
+ 	int (*vcpu_create)(struct kvm_vcpu *vcpu);
+ 	void (*vcpu_free)(struct kvm_vcpu *vcpu);
+ 	void (*vcpu_reset)(struct kvm_vcpu *vcpu, bool init_event);
+--- a/arch/x86/include/asm/vmx.h
++++ b/arch/x86/include/asm/vmx.h
+@@ -76,6 +76,11 @@
+ #define SECONDARY_EXEC_ENABLE_USR_WAIT_PAUSE	VMCS_CONTROL_BIT(USR_WAIT_PAUSE)
+ #define SECONDARY_EXEC_BUS_LOCK_DETECTION	VMCS_CONTROL_BIT(BUS_LOCK_DETECTION)
+ 
++/*
++ * Definitions of Tertiary Processor-Based VM-Execution Controls.
++ */
++#define TERTIARY_EXEC_IPI_VIRT			VMCS_CONTROL_BIT(IPI_VIRT)
++
+ #define PIN_BASED_EXT_INTR_MASK                 VMCS_CONTROL_BIT(INTR_EXITING)
+ #define PIN_BASED_NMI_EXITING                   VMCS_CONTROL_BIT(NMI_EXITING)
+ #define PIN_BASED_VIRTUAL_NMIS                  VMCS_CONTROL_BIT(VIRTUAL_NMIS)
+@@ -158,6 +163,7 @@ static inline int vmx_misc_mseg_revid(u6
+ enum vmcs_field {
+ 	VIRTUAL_PROCESSOR_ID            = 0x00000000,
+ 	POSTED_INTR_NV                  = 0x00000002,
++	LAST_PID_POINTER_INDEX		= 0x00000008,
+ 	GUEST_ES_SELECTOR               = 0x00000800,
+ 	GUEST_CS_SELECTOR               = 0x00000802,
+ 	GUEST_SS_SELECTOR               = 0x00000804,
+@@ -223,6 +229,8 @@ enum vmcs_field {
+ 	TSC_MULTIPLIER_HIGH             = 0x00002033,
+ 	TERTIARY_VM_EXEC_CONTROL	= 0x00002034,
+ 	TERTIARY_VM_EXEC_CONTROL_HIGH	= 0x00002035,
++	PID_POINTER_TABLE		= 0x00002042,
++	PID_POINTER_TABLE_HIGH		= 0x00002043,
+ 	GUEST_PHYSICAL_ADDRESS          = 0x00002400,
+ 	GUEST_PHYSICAL_ADDRESS_HIGH     = 0x00002401,
+ 	VMCS_LINK_POINTER               = 0x00002800,
+--- a/arch/x86/include/asm/vmxfeatures.h
++++ b/arch/x86/include/asm/vmxfeatures.h
+@@ -86,4 +86,6 @@
+ #define VMX_FEATURE_ENCLV_EXITING	( 2*32+ 28) /* "" VM-Exit on ENCLV (leaf dependent) */
+ #define VMX_FEATURE_BUS_LOCK_DETECTION	( 2*32+ 30) /* "" VM-Exit when bus lock caused */
+ 
++/* Tertiary Processor-Based VM-Execution Controls, word 3 */
++#define VMX_FEATURE_IPI_VIRT		( 3*32+  4) /* Enable IPI virtualization */
+ #endif /* _ASM_X86_VMXFEATURES_H */
+--- a/arch/x86/kvm/vmx/capabilities.h
++++ b/arch/x86/kvm/vmx/capabilities.h
+@@ -13,6 +13,7 @@ extern bool __read_mostly enable_unrestr
+ extern bool __read_mostly enable_ept_ad_bits;
+ extern bool __read_mostly enable_pml;
+ extern bool __read_mostly enable_apicv;
++extern bool __read_mostly enable_ipiv;
+ extern int __read_mostly pt_mode;
+ 
+ #define PT_MODE_SYSTEM		0
+@@ -285,6 +286,11 @@ static inline bool cpu_has_vmx_apicv(voi
+ 		cpu_has_vmx_posted_intr();
+ }
+ 
++static inline bool cpu_has_vmx_ipiv(void)
++{
++	return vmcs_config.cpu_based_3rd_exec_ctrl & TERTIARY_EXEC_IPI_VIRT;
++}
++
+ static inline bool cpu_has_vmx_flexpriority(void)
+ {
+ 	return cpu_has_vmx_tpr_shadow() &&
+--- a/arch/x86/kvm/vmx/posted_intr.c
++++ b/arch/x86/kvm/vmx/posted_intr.c
+@@ -89,7 +89,7 @@ void vmx_vcpu_pi_put(struct kvm_vcpu *vc
+ {
+ 	struct pi_desc *pi_desc = vcpu_to_pi_desc(vcpu);
+ 
+-	if (!vmx_can_use_vtd_pi(vcpu->kvm))
++	if (!(vmx_can_use_ipiv(vcpu) || vmx_can_use_vtd_pi(vcpu->kvm)))
+ 		return;
+ 
+ 	/* Set SN when the vCPU is preempted */
+@@ -147,7 +147,7 @@ int pi_pre_block(struct kvm_vcpu *vcpu)
+ 	struct pi_desc old, new;
+ 	struct pi_desc *pi_desc = vcpu_to_pi_desc(vcpu);
+ 
+-	if (!vmx_can_use_vtd_pi(vcpu->kvm))
++	if (!(vmx_can_use_ipiv(vcpu) || vmx_can_use_vtd_pi(vcpu->kvm)))
+ 		return 0;
+ 
+ 	WARN_ON(irqs_disabled());
+--- a/arch/x86/kvm/vmx/posted_intr.h
++++ b/arch/x86/kvm/vmx/posted_intr.h
+@@ -5,6 +5,8 @@
+ #define POSTED_INTR_ON  0
+ #define POSTED_INTR_SN  1
+ 
++#define PID_TABLE_ENTRY_VALID 1
++
+ /* Posted-Interrupt Descriptor */
+ struct pi_desc {
+ 	u32 pir[8];     /* Posted interrupt requested */
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -105,6 +105,9 @@ module_param(fasteoi, bool, S_IRUGO);
+ bool __read_mostly enable_apicv = 1;
+ module_param(enable_apicv, bool, S_IRUGO);
+ 
++bool __read_mostly enable_ipiv = true;
++module_param(enable_ipiv, bool, 0444);
++
+ /*
+  * If nested=1, nested virtualization is supported, i.e., guests may use
+  * VMX and be a hypervisor for its own guests. If nested=0, guests may not
+@@ -2725,7 +2728,7 @@ static __init int setup_vmcs_config(stru
+ 	}
+ 
+ 	if (_cpu_based_exec_control & CPU_BASED_ACTIVATE_TERTIARY_CONTROLS) {
+-		u64 opt3 = 0;
++		u64 opt3 = TERTIARY_EXEC_IPI_VIRT;
+ 
+ 		_cpu_based_3rd_exec_control = adjust_vmx_controls64(opt3,
+ 					      MSR_IA32_VMX_PROCBASED_CTLS3);
+@@ -4103,6 +4106,8 @@ static void vmx_update_msr_bitmap_x2apic
+ 		vmx_enable_intercept_for_msr(vcpu, X2APIC_MSR(APIC_TMCCT), MSR_TYPE_RW);
+ 		vmx_disable_intercept_for_msr(vcpu, X2APIC_MSR(APIC_EOI), MSR_TYPE_W);
+ 		vmx_disable_intercept_for_msr(vcpu, X2APIC_MSR(APIC_SELF_IPI), MSR_TYPE_W);
++		if (enable_ipiv)
++			vmx_disable_intercept_for_msr(vcpu, X2APIC_MSR(APIC_ICR), MSR_TYPE_RW);
+ 	}
+ }
+ 
+@@ -4370,14 +4375,19 @@ static void vmx_refresh_apicv_exec_ctrl(
+ 
+ 	pin_controls_set(vmx, vmx_pin_based_exec_ctrl(vmx));
+ 
+-	if (kvm_vcpu_apicv_active(vcpu))
++	if (kvm_vcpu_apicv_active(vcpu)) {
+ 		secondary_exec_controls_setbit(vmx,
+ 					       SECONDARY_EXEC_APIC_REGISTER_VIRT |
+ 					       SECONDARY_EXEC_VIRTUAL_INTR_DELIVERY);
+-	else
++		if (enable_ipiv)
++			tertiary_exec_controls_setbit(vmx, TERTIARY_EXEC_IPI_VIRT);
++	} else {
+ 		secondary_exec_controls_clearbit(vmx,
+ 						 SECONDARY_EXEC_APIC_REGISTER_VIRT |
+ 						 SECONDARY_EXEC_VIRTUAL_INTR_DELIVERY);
++		if (enable_ipiv)
++			tertiary_exec_controls_clearbit(vmx, TERTIARY_EXEC_IPI_VIRT);
++	}
+ 
+ 	if (cpu_has_vmx_msr_bitmap())
+ 		vmx_update_msr_bitmap(vcpu);
+@@ -4411,7 +4421,16 @@ u32 vmx_exec_control(struct vcpu_vmx *vm
+ 
+ static u64 vmx_tertiary_exec_control(struct vcpu_vmx *vmx)
+ {
+-	return vmcs_config.cpu_based_3rd_exec_ctrl;
++	u64 exec_control = vmcs_config.cpu_based_3rd_exec_ctrl;
++
++	/*
++	 * IPI virtualization relies on APICv. Disable IPI virtualization if
++	 * APICv is inhibited.
++	 */
++	if (!enable_ipiv || !kvm_vcpu_apicv_active(&vmx->vcpu))
++		exec_control &= ~TERTIARY_EXEC_IPI_VIRT;
++
++	return exec_control;
+ }
+ 
+ /*
+@@ -4557,6 +4576,35 @@ static void ept_set_mmio_spte_mask(void)
+ 	kvm_mmu_set_mmio_spte_mask(VMX_EPT_MISCONFIG_WX_VALUE, 0);
+ }
+ 
++static inline int vmx_get_pid_table_order(struct kvm *kvm)
++{
++	return get_order(kvm->arch.max_vcpu_ids * sizeof(*to_kvm_vmx(kvm)->pid_table));
++}
++
++static int vmx_alloc_ipiv_pid_table(struct kvm *kvm)
++{
++	struct page *pages;
++	struct kvm_vmx *kvm_vmx = to_kvm_vmx(kvm);
++
++	if (!irqchip_in_kernel(kvm) || !enable_ipiv)
++		return 0;
++
++	if (kvm_vmx->pid_table)
++		return 0;
++
++	pages = alloc_pages(GFP_KERNEL | __GFP_ZERO, vmx_get_pid_table_order(kvm));
++	if (!pages)
++		return -ENOMEM;
++
++	kvm_vmx->pid_table = (void *)page_address(pages);
++	return 0;
++}
++
++static int vmx_vcpu_precreate(struct kvm *kvm)
++{
++	return vmx_alloc_ipiv_pid_table(kvm);
++}
++
+ #define VMX_XSS_EXIT_BITMAP 0
+ 
+ /*
+@@ -4565,6 +4613,9 @@ static void ept_set_mmio_spte_mask(void)
+  */
+ static void init_vmcs(struct vcpu_vmx *vmx)
+ {
++	struct kvm *kvm = vmx->vcpu.kvm;
++	struct kvm_vmx *kvm_vmx = to_kvm_vmx(kvm);
++
+ 	if (nested)
+ 		nested_vmx_set_vmcs_shadowing_bitmap();
+ 
+@@ -4598,7 +4649,12 @@ static void init_vmcs(struct vcpu_vmx *v
+ 		vmcs_write64(POSTED_INTR_DESC_ADDR, __pa((&vmx->pi_desc)));
+ 	}
+ 
+-	if (!kvm_pause_in_guest(vmx->vcpu.kvm)) {
++	if (vmx_can_use_ipiv(&vmx->vcpu)) {
++		vmcs_write64(PID_POINTER_TABLE, __pa(kvm_vmx->pid_table));
++		vmcs_write16(LAST_PID_POINTER_INDEX, kvm->arch.max_vcpu_ids - 1);
++	}
++
++	if (!kvm_pause_in_guest(kvm)) {
+ 		vmcs_write32(PLE_GAP, ple_gap);
+ 		vmx->ple_window = ple_window;
+ 		vmx->ple_window_dirty = true;
+@@ -7351,6 +7407,10 @@ static int vmx_create_vcpu(struct kvm_vc
+ 
+ 	vmx->ept_pointer = INVALID_PAGE;
+ 
++	if (vmx_can_use_ipiv(vcpu))
++		WRITE_ONCE(to_kvm_vmx(vcpu->kvm)->pid_table[vcpu->vcpu_id],
++			   __pa(&vmx->pi_desc) | PID_TABLE_ENTRY_VALID);
++
+ 	return 0;
+ 
+ free_vmcs:
+@@ -8019,6 +8079,13 @@ static bool vmx_check_apicv_inhibit_reas
+ 	return supported & BIT(bit);
+ }
+ 
++static void vmx_vm_destroy(struct kvm *kvm)
++{
++	struct kvm_vmx *kvm_vmx = to_kvm_vmx(kvm);
++
++	free_pages((unsigned long)kvm_vmx->pid_table, vmx_get_pid_table_order(kvm));
++}
++
+ static struct kvm_x86_ops vmx_x86_ops __initdata = {
+ 	.hardware_unsetup = hardware_unsetup,
+ 
+@@ -8029,7 +8096,9 @@ static struct kvm_x86_ops vmx_x86_ops __
+ 
+ 	.vm_size = sizeof(struct kvm_vmx),
+ 	.vm_init = vmx_vm_init,
++	.vm_destroy = vmx_vm_destroy,
+ 
++	.vcpu_precreate = vmx_vcpu_precreate,
+ 	.vcpu_create = vmx_create_vcpu,
+ 	.vcpu_free = vmx_free_vcpu,
+ 	.vcpu_reset = vmx_vcpu_reset,
+@@ -8232,6 +8301,9 @@ static __init int hardware_setup(void)
+ 		vmx_x86_ops.sync_pir_to_irr = NULL;
+ 	}
+ 
++	if (!enable_apicv || !cpu_has_vmx_ipiv())
++		enable_ipiv = false;
++
+ 	if (cpu_has_vmx_tsc_scaling()) {
+ 		kvm_has_tsc_control = true;
+ 		kvm_max_tsc_scaling_ratio = KVM_VMX_TSC_MULTIPLIER_MAX;
+--- a/arch/x86/kvm/vmx/vmx.h
++++ b/arch/x86/kvm/vmx/vmx.h
+@@ -358,6 +358,8 @@ struct kvm_vmx {
+ 
+ 	enum ept_pointers_status ept_pointers_match;
+ 	spinlock_t ept_pointer_lock;
++	/* Posted Interrupt Descriptor (PID) table for IPI virtualization */
++	u64 *pid_table;
+ };
+ 
+ bool nested_vmx_allowed(struct kvm_vcpu *vcpu);
+@@ -558,4 +560,9 @@ static inline bool vmx_guest_state_valid
+ 
+ void dump_vmcs(void);
+ 
++static inline bool vmx_can_use_ipiv(struct kvm_vcpu *vcpu)
++{
++	return  lapic_in_kernel(vcpu) && enable_ipiv;
++}
++
+ #endif /* __KVM_X86_VMX_H */
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -10224,7 +10224,7 @@ int kvm_arch_vcpu_precreate(struct kvm *
+ 	if (id >= kvm->arch.max_vcpu_ids)
+ 		return -EINVAL;
+ 
+-	return 0;
++	return kvm_x86_ops.vcpu_precreate ? kvm_x86_ops.vcpu_precreate(kvm) : 0;
+ }
+ 
+ int kvm_arch_vcpu_create(struct kvm_vcpu *vcpu)

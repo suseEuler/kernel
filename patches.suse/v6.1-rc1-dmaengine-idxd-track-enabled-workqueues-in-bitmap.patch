@@ -1,0 +1,123 @@
+From de5819b994893197c71c86d21af10f85f50d6499 Mon Sep 17 00:00:00 2001
+From: Jerry Snitselaar <jsnitsel@redhat.com>
+Date: Wed, 28 Sep 2022 08:48:56 -0700
+Subject: [PATCH] dmaengine: idxd: track enabled workqueues in bitmap
+Git-commit: de5819b994893197c71c86d21af10f85f50d6499
+Patch-mainline: v6.1-rc1
+References: bsn#121
+Modified-by-SEL: No
+
+
+Now that idxd_wq_disable_cleanup() sets the workqueue state to
+IDXD_WQ_DISABLED, use a bitmap to track which workqueues have been
+enabled. This will then be used to determine which workqueues
+should be re-enabled when attempting a software reset to recover
+from a device halt state.
+
+Cc: Fenghua Yu <fenghua.yu@intel.com>
+Cc: Dave Jiang <dave.jiang@intel.com>
+Cc: Vinod Koul <vkoul@kernel.org>
+Signed-off-by: Jerry Snitselaar <jsnitsel@redhat.com>
+Reviewed-by: Dave Jiang <dave.jiang@intel.com>
+Link: https://lore.kernel.org/r/20220928154856.623545-3-jsnitsel@redhat.com
+Signed-off-by: Vinod Koul <vkoul@kernel.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/dma/idxd/device.c | 2 ++
+ drivers/dma/idxd/idxd.h   | 2 ++
+ drivers/dma/idxd/init.c   | 6 ++++++
+ drivers/dma/idxd/irq.c    | 5 +++--
+ drivers/dma/idxd/sysfs.c  | 1 +
+ 5 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/dma/idxd/device.c b/drivers/dma/idxd/device.c
+index 31911e255ac1..f0c7d6d348e3 100644
+--- a/drivers/dma/idxd/device.c
++++ b/drivers/dma/idxd/device.c
+@@ -196,6 +196,7 @@ int idxd_wq_enable(struct idxd_wq *wq)
+ 	}
+ 
+ 	wq->state = IDXD_WQ_ENABLED;
++	set_bit(wq->id, idxd->wq_enable_map);
+ 	dev_dbg(dev, "WQ %d enabled\n", wq->id);
+ 	return 0;
+ }
+@@ -223,6 +224,7 @@ int idxd_wq_disable(struct idxd_wq *wq, bool reset_config)
+ 
+ 	if (reset_config)
+ 		idxd_wq_disable_cleanup(wq);
++	clear_bit(wq->id, idxd->wq_enable_map);
+ 	wq->state = IDXD_WQ_DISABLED;
+ 	dev_dbg(dev, "WQ %d disabled\n", wq->id);
+ 	return 0;
+diff --git a/drivers/dma/idxd/idxd.h b/drivers/dma/idxd/idxd.h
+index fed0dfc1eaa8..f527a7f88b92 100644
+--- a/drivers/dma/idxd/idxd.h
++++ b/drivers/dma/idxd/idxd.h
+@@ -11,6 +11,7 @@
+ #include <linux/idr.h>
+ #include <linux/pci.h>
+ #include <linux/ioasid.h>
++#include <linux/bitmap.h>
+ #include <linux/perf_event.h>
+ #include <uapi/linux/idxd.h>
+ #include "registers.h"
+@@ -299,6 +300,7 @@ struct idxd_device {
+ 	int rdbuf_limit;
+ 	int nr_rdbufs;		/* non-reserved read buffers */
+ 	unsigned int wqcfg_size;
++	unsigned long *wq_enable_map;
+ 
+ 	union sw_err_reg sw_err;
+ 	wait_queue_head_t cmd_waitq;
+diff --git a/drivers/dma/idxd/init.c b/drivers/dma/idxd/init.c
+index aa3478257ddb..7e27e69ff741 100644
+--- a/drivers/dma/idxd/init.c
++++ b/drivers/dma/idxd/init.c
+@@ -151,6 +151,12 @@ static int idxd_setup_wqs(struct idxd_device *idxd)
+ 	if (!idxd->wqs)
+ 		return -ENOMEM;
+ 
++	idxd->wq_enable_map = bitmap_zalloc_node(idxd->max_wqs, GFP_KERNEL, dev_to_node(dev));
++	if (!idxd->wq_enable_map) {
++		kfree(idxd->wqs);
++		return -ENOMEM;
++	}
++
+ 	for (i = 0; i < idxd->max_wqs; i++) {
+ 		wq = kzalloc_node(sizeof(*wq), GFP_KERNEL, dev_to_node(dev));
+ 		if (!wq) {
+diff --git a/drivers/dma/idxd/irq.c b/drivers/dma/idxd/irq.c
+index 5b9921475be6..5927d371493c 100644
+--- a/drivers/dma/idxd/irq.c
++++ b/drivers/dma/idxd/irq.c
+@@ -49,11 +49,12 @@ static void idxd_device_reinit(struct work_struct *work)
+ 		goto out;
+ 
+ 	for (i = 0; i < idxd->max_wqs; i++) {
+-		struct idxd_wq *wq = idxd->wqs[i];
++		if (test_bit(i, idxd->wq_enable_map)) {
++			struct idxd_wq *wq = idxd->wqs[i];
+ 
+-		if (wq->state == IDXD_WQ_ENABLED) {
+ 			rc = idxd_wq_enable(wq);
+ 			if (rc < 0) {
++				clear_bit(i, idxd->wq_enable_map);
+ 				dev_warn(dev, "Unable to re-enable wq %s\n",
+ 					 dev_name(wq_confdev(wq)));
+ 			}
+diff --git a/drivers/dma/idxd/sysfs.c b/drivers/dma/idxd/sysfs.c
+index 3f262a57441b..3325b16ed959 100644
+--- a/drivers/dma/idxd/sysfs.c
++++ b/drivers/dma/idxd/sysfs.c
+@@ -1405,6 +1405,7 @@ static void idxd_conf_device_release(struct device *dev)
+ 	struct idxd_device *idxd = confdev_to_idxd(dev);
+ 
+ 	kfree(idxd->groups);
++	bitmap_free(idxd->wq_enable_map);
+ 	kfree(idxd->wqs);
+ 	kfree(idxd->engines);
+ 	ida_free(&idxd_ida, idxd->id);
+-- 
+2.33.0
+

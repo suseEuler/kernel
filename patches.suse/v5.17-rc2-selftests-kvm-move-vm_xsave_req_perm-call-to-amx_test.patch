@@ -1,0 +1,112 @@
+From dd4516aee365fc9c944c9d6036b6b87363398680 Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Wed, 26 Jan 2022 07:44:34 -0500
+Subject: [PATCH] selftests: kvm: move vm_xsave_req_perm call to amx_test
+Git-commit: dd4516aee365fc9c944c9d6036b6b87363398680
+Patch-mainline: v5.17-rc2
+References: bsn#121
+Modified-by-SEL: Yes, modified per openEuler commit 7390fb33b
+
+
+There is no need for tests other than amx_test to enable dynamic xsave
+states.  Remove the call to vm_xsave_req_perm from generic code,
+and move it inside the test.  While at it, allow customizing the bit
+that is requested, so that future tests can use it differently.
+
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ tools/testing/selftests/kvm/include/kvm_util.h  |  1 -
+ .../selftests/kvm/include/x86_64/processor.h    |  2 ++
+ .../selftests/kvm/lib/x86_64/processor.c        | 17 ++++++-----------
+ tools/testing/selftests/kvm/x86_64/amx_test.c   |  2 ++
+ 4 files changed, 10 insertions(+), 12 deletions(-)
+
+diff --git a/tools/testing/selftests/kvm/include/kvm_util.h b/tools/testing/selftests/kvm/include/kvm_util.h
+index 40021f85033e..85b621383fa1 100644
+--- a/tools/testing/selftests/kvm/include/kvm_util.h
++++ b/tools/testing/selftests/kvm/include/kvm_util.h
+@@ -256,7 +256,6 @@ struct kvm_vm *vm_create_default(uint32_t vcpuid, uint64_t extra_mem_pages,
+  *   guest_code - The vCPU's entry point
+  */
+ void vm_vcpu_add_default(struct kvm_vm *vm, uint32_t vcpuid, void *guest_code);
+-void vm_xsave_req_perm(void);
+ 
+ bool vm_is_unrestricted_guest(struct kvm_vm *vm);
+ 
+diff --git a/tools/testing/selftests/kvm/include/x86_64/processor.h b/tools/testing/selftests/kvm/include/x86_64/processor.h
+index ebd86c326e02..55c69d982c3b 100644
+--- a/tools/testing/selftests/kvm/include/x86_64/processor.h
++++ b/tools/testing/selftests/kvm/include/x86_64/processor.h
+@@ -391,6 +391,8 @@ bool set_cpuid(struct kvm_cpuid2 *cpuid, struct kvm_cpuid_entry2 *ent);
+ uint64_t kvm_hypercall(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2,
+ 		       uint64_t a3);
+ 
++void vm_xsave_req_perm(int bit);
++
+ /*
+  * Basic CPU control in CR0
+  */
+diff --git a/tools/testing/selftests/kvm/lib/x86_64/processor.c b/tools/testing/selftests/kvm/lib/x86_64/processor.c
+index 82e9e5b1369c..107a2dfc663d 100644
+--- a/tools/testing/selftests/kvm/lib/x86_64/processor.c
++++ b/tools/testing/selftests/kvm/lib/x86_64/processor.c
+@@ -595,16 +595,16 @@ static bool is_xfd_supported(void)
+ 	return !!(eax & CPUID_XFD_BIT);
+ }
+ 
+-void vm_xsave_req_perm(void)
++void vm_xsave_req_perm(int bit)
+ {
+-	unsigned long bitmask;
++	u64 bitmask;
+ 	long rc;
+ 
+ 	if (!is_xfd_supported())
+-		return;
++		exit(KSFT_SKIP);
++
++	rc = syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_GUEST_PERM, bit);
+ 
+-	rc = syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_GUEST_PERM,
+-		     XSTATE_XTILE_DATA_BIT);
+ 	/*
+ 	 * The older kernel version(<5.15) can't support
+ 	 * ARCH_REQ_XCOMP_GUEST_PERM and directly return.
+@@ -614,7 +614,7 @@ void vm_xsave_req_perm(void)
+ 
+ 	rc = syscall(SYS_arch_prctl, ARCH_GET_XCOMP_GUEST_PERM, &bitmask);
+ 	TEST_ASSERT(rc == 0, "prctl(ARCH_GET_XCOMP_GUEST_PERM) error: %ld", rc);
+-	TEST_ASSERT(bitmask & XFEATURE_XTILE_MASK,
++	TEST_ASSERT(bitmask & (1ULL << bit),
+ 		    "prctl(ARCH_REQ_XCOMP_GUEST_PERM) failure bitmask=0x%lx",
+ 		    bitmask);
+ }
+@@ -627,11 +627,6 @@ void vm_vcpu_add_default(struct kvm_vm *vm, uint32_t vcpuid, void *guest_code)
+ 	stack_vaddr = vm_vaddr_alloc(vm, DEFAULT_STACK_PGS * getpagesize(),
+ 				     DEFAULT_GUEST_STACK_VADDR_MIN, 0, 0);
+ 
+-	/*
+-	 * Permission needs to be requested before KVM_SET_CPUID2.
+-	 */
+-	vm_xsave_req_perm();
+-
+ 	/* Create VCPU */
+ 	vm_vcpu_add(vm, vcpuid);
+ 	vcpu_setup(vm, vcpuid, 0, 0);
+diff --git a/tools/testing/selftests/kvm/x86_64/amx_test.c b/tools/testing/selftests/kvm/x86_64/amx_test.c
+index 90021e429b28..3a23edfdb70d 100644
+--- a/tools/testing/selftests/kvm/x86_64/amx_test.c
++++ b/tools/testing/selftests/kvm/x86_64/amx_test.c
+@@ -342,6 +342,8 @@ int main(int argc, char *argv[])
+ 	u32 amx_offset;
+ 	int stage, ret;
+ 
++	vm_xsave_req_perm(XSTATE_XTILE_DATA_BIT);
++
+ 	/* Create VM */
+ 	vm = vm_create_default(VCPU_ID, 0, guest_code);
+ 
+-- 
+2.35.3
+

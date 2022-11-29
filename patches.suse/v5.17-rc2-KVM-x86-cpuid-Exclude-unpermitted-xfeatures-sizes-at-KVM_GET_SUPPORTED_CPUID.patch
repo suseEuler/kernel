@@ -1,0 +1,91 @@
+From 1ffce0924a8c86cf0590c039cd5f5c9375d32e9b Mon Sep 17 00:00:00 2001
+From: Like Xu <likexu@tencent.com>
+Date: Tue, 25 Jan 2022 19:52:23 +0800
+Subject: [PATCH] KVM: x86/cpuid: Exclude unpermitted xfeatures sizes at
+ KVM_GET_SUPPORTED_CPUID
+Git-commit: 1ffce0924a8c86cf0590c039cd5f5c9375d32e9b
+Patch-mainline: v5.17-rc2
+References: bsn#121
+Modified-by-SEL: No
+
+
+With the help of xstate_get_guest_group_perm(), KVM can exclude unpermitted
+xfeatures in cpuid.0xd.0.eax, in which case the corresponding xfeatures
+sizes should also be matched to the permitted xfeatures.
+
+To fix this inconsistency, the permitted_xcr0 and permitted_xss are defined
+consistently, which implies 'supported' plus certain permissions for this
+task, and it also fixes cpuid.0xd.1.ebx and later leaf-by-leaf queries.
+
+Fixes: 445ecdf79be0 ("kvm: x86: Exclude unpermitted xfeatures at KVM_GET_SUPPORTED_CPUID")
+Signed-off-by: Like Xu <likexu@tencent.com>
+Message-Id: <20220125115223.33707-1-likexu@tencent.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/kvm/cpuid.c | 25 +++++++++++++------------
+ 1 file changed, 13 insertions(+), 12 deletions(-)
+
+diff --git a/arch/x86/kvm/cpuid.c b/arch/x86/kvm/cpuid.c
+index 89d7822a8f5b..8e2704b50e47 100644
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@ -899,13 +899,14 @@ static inline int __do_cpuid_func(struct kvm_cpuid_array *array, u32 function)
+ 		}
+ 		break;
+ 	case 0xd: {
+-		u64 guest_perm = xstate_get_guest_group_perm();
++		u64 permitted_xcr0 = supported_xcr0 & xstate_get_guest_group_perm();
++		u64 permitted_xss = supported_xss;
+ 
+-		entry->eax &= supported_xcr0 & guest_perm;
+-		entry->ebx = xstate_required_size(supported_xcr0, false);
++		entry->eax &= permitted_xcr0;
++		entry->ebx = xstate_required_size(permitted_xcr0, false);
+ 		entry->ecx = entry->ebx;
+-		entry->edx &= (supported_xcr0 & guest_perm) >> 32;
+-		if (!supported_xcr0)
++		entry->edx &= permitted_xcr0 >> 32;
++		if (!permitted_xcr0)
+ 			break;
+ 
+ 		entry = do_host_cpuid(array, function, 1);
+@@ -914,20 +915,20 @@ static inline int __do_cpuid_func(struct kvm_cpuid_array *array, u32 function)
+ 
+ 		cpuid_entry_override(entry, CPUID_D_1_EAX);
+ 		if (entry->eax & (F(XSAVES)|F(XSAVEC)))
+-			entry->ebx = xstate_required_size(supported_xcr0 | supported_xss,
++			entry->ebx = xstate_required_size(permitted_xcr0 | permitted_xss,
+ 							  true);
+ 		else {
+-			WARN_ON_ONCE(supported_xss != 0);
++			WARN_ON_ONCE(permitted_xss != 0);
+ 			entry->ebx = 0;
+ 		}
+-		entry->ecx &= supported_xss;
+-		entry->edx &= supported_xss >> 32;
++		entry->ecx &= permitted_xss;
++		entry->edx &= permitted_xss >> 32;
+ 
+ 		for (i = 2; i < 64; ++i) {
+ 			bool s_state;
+-			if (supported_xcr0 & BIT_ULL(i))
++			if (permitted_xcr0 & BIT_ULL(i))
+ 				s_state = false;
+-			else if (supported_xss & BIT_ULL(i))
++			else if (permitted_xss & BIT_ULL(i))
+ 				s_state = true;
+ 			else
+ 				continue;
+@@ -941,7 +942,7 @@ static inline int __do_cpuid_func(struct kvm_cpuid_array *array, u32 function)
+ 			 * invalid sub-leafs.  Only valid sub-leafs should
+ 			 * reach this point, and they should have a non-zero
+ 			 * save state size.  Furthermore, check whether the
+-			 * processor agrees with supported_xcr0/supported_xss
++			 * processor agrees with permitted_xcr0/permitted_xss
+ 			 * on whether this is an XCR0- or IA32_XSS-managed area.
+ 			 */
+ 			if (WARN_ON_ONCE(!entry->eax || (entry->ecx & 0x1) != s_state)) {
+-- 
+2.33.0
+

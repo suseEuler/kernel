@@ -1,0 +1,292 @@
+From 415a3c33e847349c0f76575b3ebfdfae2f5a681a Mon Sep 17 00:00:00 2001
+From: Wei Wang <wei.w.wang@intel.com>
+Date: Wed, 5 Jan 2022 04:35:30 -0800
+Subject: [PATCH] kvm: selftests: Add support for KVM_CAP_XSAVE2
+Git-commit: 415a3c33e847349c0f76575b3ebfdfae2f5a681a
+Patch-mainline: v5.17-rc1
+References: bsn#121
+Modified-by-SEL: Yes, modified per openEuler commit e2b78c666e7
+
+
+When KVM_CAP_XSAVE2 is supported, userspace is expected to allocate
+buffer for KVM_GET_XSAVE2 and KVM_SET_XSAVE using the size returned
+by KVM_CHECK_EXTENSION(KVM_CAP_XSAVE2).
+
+Signed-off-by: Wei Wang <wei.w.wang@intel.com>
+Signed-off-by: Guang Zeng <guang.zeng@intel.com>
+Signed-off-by: Jing Liu <jing2.liu@intel.com>
+Signed-off-by: Yang Zhong <yang.zhong@intel.com>
+Message-Id: <20220105123532.12586-20-yang.zhong@intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ tools/arch/x86/include/uapi/asm/kvm.h                          |   16 ++
+ tools/include/uapi/linux/kvm.h                                 |    3 
+ tools/testing/selftests/kvm/include/kvm_util.h                 |    1 
+ tools/testing/selftests/kvm/include/x86_64/processor.h         |   10 +
+ tools/testing/selftests/kvm/lib/x86_64/processor.c             |   72 +++++++++-
+ tools/testing/selftests/kvm/x86_64/evmcs_test.c                |    2 
+ tools/testing/selftests/kvm/x86_64/smm_test.c                  |    2 
+ tools/testing/selftests/kvm/x86_64/state_test.c                |    2 
+ tools/testing/selftests/kvm/x86_64/vmx_preemption_timer_test.c |    2 
+ 9 files changed, 102 insertions(+), 8 deletions(-)
+
+--- a/tools/arch/x86/include/uapi/asm/kvm.h
++++ b/tools/arch/x86/include/uapi/asm/kvm.h
+@@ -358,9 +358,23 @@ struct kvm_debugregs {
+ 	__u64 reserved[9];
+ };
+ 
+-/* for KVM_CAP_XSAVE */
++/* for KVM_CAP_XSAVE and KVM_CAP_XSAVE2 */
+ struct kvm_xsave {
++	/*
++	 * KVM_GET_XSAVE2 and KVM_SET_XSAVE write and read as many bytes
++	 * as are returned by KVM_CHECK_EXTENSION(KVM_CAP_XSAVE2)
++	 * respectively, when invoked on the vm file descriptor.
++	 *
++	 * The size value returned by KVM_CHECK_EXTENSION(KVM_CAP_XSAVE2)
++	 * will always be at least 4096. Currently, it is only greater
++	 * than 4096 if a dynamic feature has been enabled with
++	 * ``arch_prctl()``, but this may change in the future.
++	 *
++	 * The offsets of the state save areas in struct kvm_xsave follow
++	 * the contents of CPUID leaf 0xD on the host.
++	 */
+ 	__u32 region[1024];
++	__u32 extra[0];
+ };
+ 
+ #define KVM_MAX_XCRS	16
+--- a/tools/include/uapi/linux/kvm.h
++++ b/tools/include/uapi/linux/kvm.h
+@@ -1053,6 +1053,7 @@ struct kvm_ppc_resize_hpt {
+ #define KVM_CAP_X86_USER_SPACE_MSR 188
+ #define KVM_CAP_X86_MSR_FILTER 189
+ #define KVM_CAP_ENFORCE_PV_FEATURE_CPUID 190
++#define KVM_CAP_XSAVE2 207
+ 
+ #ifdef KVM_CAP_IRQ_ROUTING
+ 
+@@ -1462,6 +1463,8 @@ struct kvm_s390_ucas_mapping {
+ /* Available with KVM_CAP_XSAVE */
+ #define KVM_GET_XSAVE		  _IOR(KVMIO,  0xa4, struct kvm_xsave)
+ #define KVM_SET_XSAVE		  _IOW(KVMIO,  0xa5, struct kvm_xsave)
++/* Available with KVM_CAP_XSAVE2 */
++#define KVM_GET_XSAVE2		  _IOR(KVMIO,  0xcf, struct kvm_xsave)
+ /* Available with KVM_CAP_XCRS */
+ #define KVM_GET_XCRS		  _IOR(KVMIO,  0xa6, struct kvm_xcrs)
+ #define KVM_SET_XCRS		  _IOW(KVMIO,  0xa7, struct kvm_xcrs)
+--- a/tools/testing/selftests/kvm/include/kvm_util.h
++++ b/tools/testing/selftests/kvm/include/kvm_util.h
+@@ -255,6 +255,7 @@ struct kvm_vm *vm_create_default(uint32_
+  *   guest_code - The vCPU's entry point
+  */
+ void vm_vcpu_add_default(struct kvm_vm *vm, uint32_t vcpuid, void *guest_code);
++void vm_xsave_req_perm(void);
+ 
+ bool vm_is_unrestricted_guest(struct kvm_vm *vm);
+ 
+--- a/tools/testing/selftests/kvm/include/x86_64/processor.h
++++ b/tools/testing/selftests/kvm/include/x86_64/processor.h
+@@ -10,8 +10,10 @@
+ 
+ #include <assert.h>
+ #include <stdint.h>
++#include <syscall.h>
+ 
+ #include <asm/msr-index.h>
++#include <asm/prctl.h>
+ 
+ #define X86_EFLAGS_FIXED	 (1u << 1)
+ 
+@@ -319,6 +321,7 @@ struct kvm_x86_state;
+ struct kvm_x86_state *vcpu_save_state(struct kvm_vm *vm, uint32_t vcpuid);
+ void vcpu_load_state(struct kvm_vm *vm, uint32_t vcpuid,
+ 		     struct kvm_x86_state *state);
++void kvm_x86_state_cleanup(struct kvm_x86_state *state);
+ 
+ struct kvm_msr_list *kvm_get_msr_index_list(void);
+ 
+@@ -419,4 +422,11 @@ uint64_t kvm_hypercall(uint64_t nr, uint
+ /* VMX_EPT_VPID_CAP bits */
+ #define VMX_EPT_VPID_CAP_AD_BITS       (1ULL << 21)
+ 
++#define XSTATE_XTILE_CFG_BIT		17
++#define XSTATE_XTILE_DATA_BIT		18
++
++#define XSTATE_XTILE_CFG_MASK		(1ULL << XSTATE_XTILE_CFG_BIT)
++#define XSTATE_XTILE_DATA_MASK		(1ULL << XSTATE_XTILE_DATA_BIT)
++#define XFEATURE_XTILE_MASK		(XSTATE_XTILE_CFG_MASK | \
++					XSTATE_XTILE_DATA_MASK)
+ #endif /* SELFTEST_KVM_PROCESSOR_H */
+--- a/tools/testing/selftests/kvm/lib/x86_64/processor.c
++++ b/tools/testing/selftests/kvm/lib/x86_64/processor.c
+@@ -580,6 +580,45 @@ static void vcpu_setup(struct kvm_vm *vm
+ 	vcpu_sregs_set(vm, vcpuid, &sregs);
+ }
+ 
++#define CPUID_XFD_BIT (1 << 4)
++static bool is_xfd_supported(void)
++{
++	int eax, ebx, ecx, edx;
++	const int leaf = 0xd, subleaf = 0x1;
++
++	__asm__ __volatile__(
++		"cpuid"
++		: /* output */ "=a"(eax), "=b"(ebx),
++		  "=c"(ecx), "=d"(edx)
++		: /* input */ "0"(leaf), "2"(subleaf));
++
++	return !!(eax & CPUID_XFD_BIT);
++}
++
++void vm_xsave_req_perm(void)
++{
++	unsigned long bitmask;
++	long rc;
++
++	if (!is_xfd_supported())
++		return;
++
++	rc = syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_GUEST_PERM,
++		     XSTATE_XTILE_DATA_BIT);
++	/*
++	 * The older kernel version(<5.15) can't support
++	 * ARCH_REQ_XCOMP_GUEST_PERM and directly return.
++	 */
++	if (rc)
++		return;
++
++	rc = syscall(SYS_arch_prctl, ARCH_GET_XCOMP_GUEST_PERM, &bitmask);
++	TEST_ASSERT(rc == 0, "prctl(ARCH_GET_XCOMP_GUEST_PERM) error: %ld", rc);
++	TEST_ASSERT(bitmask & XFEATURE_XTILE_MASK,
++		    "prctl(ARCH_REQ_XCOMP_GUEST_PERM) failure bitmask=0x%lx",
++		    bitmask);
++}
++
+ void vm_vcpu_add_default(struct kvm_vm *vm, uint32_t vcpuid, void *guest_code)
+ {
+ 	struct kvm_mp_state mp_state;
+@@ -588,6 +627,11 @@ void vm_vcpu_add_default(struct kvm_vm *
+ 	stack_vaddr = vm_vaddr_alloc(vm, DEFAULT_STACK_PGS * getpagesize(),
+ 				     DEFAULT_GUEST_STACK_VADDR_MIN, 0, 0);
+ 
++	/*
++	 * Permission needs to be requested before KVM_SET_CPUID2.
++	 */
++	vm_xsave_req_perm();
++
+ 	/* Create VCPU */
+ 	vm_vcpu_add(vm, vcpuid);
+ 	vcpu_setup(vm, vcpuid, 0, 0);
+@@ -904,10 +948,10 @@ void vcpu_dump(FILE *stream, struct kvm_
+ }
+ 
+ struct kvm_x86_state {
++	struct kvm_xsave *xsave;
+ 	struct kvm_vcpu_events events;
+ 	struct kvm_mp_state mp_state;
+ 	struct kvm_regs regs;
+-	struct kvm_xsave xsave;
+ 	struct kvm_xcrs xcrs;
+ 	struct kvm_sregs sregs;
+ 	struct kvm_debugregs debugregs;
+@@ -957,6 +1001,22 @@ struct kvm_msr_list *kvm_get_msr_index_l
+ 	return list;
+ }
+ 
++static int vcpu_save_xsave_state(struct kvm_vm *vm, struct vcpu *vcpu,
++				 struct kvm_x86_state *state)
++{
++	int size;
++
++	size = vm_check_cap(vm, KVM_CAP_XSAVE2);
++	if (!size)
++		size = sizeof(struct kvm_xsave);
++
++	state->xsave = malloc(size);
++	if (size == sizeof(struct kvm_xsave))
++		return ioctl(vcpu->fd, KVM_GET_XSAVE, state->xsave);
++	else
++		return ioctl(vcpu->fd, KVM_GET_XSAVE2, state->xsave);
++}
++
+ struct kvm_x86_state *vcpu_save_state(struct kvm_vm *vm, uint32_t vcpuid)
+ {
+ 	struct vcpu *vcpu = vcpu_find(vm, vcpuid);
+@@ -1000,7 +1060,7 @@ struct kvm_x86_state *vcpu_save_state(st
+         TEST_ASSERT(r == 0, "Unexpected result from KVM_GET_REGS, r: %i",
+                 r);
+ 
+-	r = ioctl(vcpu->fd, KVM_GET_XSAVE, &state->xsave);
++	r = vcpu_save_xsave_state(vm, vcpu, state);
+         TEST_ASSERT(r == 0, "Unexpected result from KVM_GET_XSAVE, r: %i",
+                 r);
+ 
+@@ -1045,7 +1105,7 @@ void vcpu_load_state(struct kvm_vm *vm,
+ 	struct vcpu *vcpu = vcpu_find(vm, vcpuid);
+ 	int r;
+ 
+-	r = ioctl(vcpu->fd, KVM_SET_XSAVE, &state->xsave);
++	r = ioctl(vcpu->fd, KVM_SET_XSAVE, state->xsave);
+         TEST_ASSERT(r == 0, "Unexpected result from KVM_SET_XSAVE, r: %i",
+                 r);
+ 
+@@ -1086,6 +1146,12 @@ void vcpu_load_state(struct kvm_vm *vm,
+ 	}
+ }
+ 
++void kvm_x86_state_cleanup(struct kvm_x86_state *state)
++{
++	free(state->xsave);
++	free(state);
++}
++
+ bool is_intel_cpu(void)
+ {
+ 	int eax, ebx, ecx, edx;
+--- a/tools/testing/selftests/kvm/x86_64/evmcs_test.c
++++ b/tools/testing/selftests/kvm/x86_64/evmcs_test.c
+@@ -148,7 +148,7 @@ int main(int argc, char *argv[])
+ 		vcpu_enable_evmcs(vm, VCPU_ID);
+ 		vcpu_load_state(vm, VCPU_ID, state);
+ 		run = vcpu_state(vm, VCPU_ID);
+-		free(state);
++		kvm_x86_state_cleanup(state);
+ 
+ 		memset(&regs2, 0, sizeof(regs2));
+ 		vcpu_regs_get(vm, VCPU_ID, &regs2);
+--- a/tools/testing/selftests/kvm/x86_64/smm_test.c
++++ b/tools/testing/selftests/kvm/x86_64/smm_test.c
+@@ -156,7 +156,7 @@ int main(int argc, char *argv[])
+ 		vcpu_set_cpuid(vm, VCPU_ID, kvm_get_supported_cpuid());
+ 		vcpu_load_state(vm, VCPU_ID, state);
+ 		run = vcpu_state(vm, VCPU_ID);
+-		free(state);
++		kvm_x86_state_cleanup(state);
+ 	}
+ 
+ done:
+--- a/tools/testing/selftests/kvm/x86_64/state_test.c
++++ b/tools/testing/selftests/kvm/x86_64/state_test.c
+@@ -219,7 +219,7 @@ int main(int argc, char *argv[])
+ 		vcpu_set_cpuid(vm, VCPU_ID, kvm_get_supported_cpuid());
+ 		vcpu_load_state(vm, VCPU_ID, state);
+ 		run = vcpu_state(vm, VCPU_ID);
+-		free(state);
++		kvm_x86_state_cleanup(state);
+ 
+ 		memset(&regs2, 0, sizeof(regs2));
+ 		vcpu_regs_get(vm, VCPU_ID, &regs2);
+--- a/tools/testing/selftests/kvm/x86_64/vmx_preemption_timer_test.c
++++ b/tools/testing/selftests/kvm/x86_64/vmx_preemption_timer_test.c
+@@ -245,7 +245,7 @@ int main(int argc, char *argv[])
+ 		vcpu_set_cpuid(vm, VCPU_ID, kvm_get_supported_cpuid());
+ 		vcpu_load_state(vm, VCPU_ID, state);
+ 		run = vcpu_state(vm, VCPU_ID);
+-		free(state);
++		kvm_x86_state_cleanup(state);
+ 
+ 		memset(&regs2, 0, sizeof(regs2));
+ 		vcpu_regs_get(vm, VCPU_ID, &regs2);

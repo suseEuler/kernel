@@ -1,0 +1,88 @@
+From 1d5e740d518e02cea46325b3d37135bf9c08982a Mon Sep 17 00:00:00 2001
+From: Zeng Guang <guang.zeng@intel.com>
+Date: Tue, 19 Apr 2022 23:44:09 +0800
+Subject: [PATCH] KVM: Move kvm_arch_vcpu_precreate() under kvm->lock
+Git-commit: 1d5e740d518e02cea46325b3d37135bf9c08982a
+Patch-mainline: v6.0-rc1
+References: bsn#121
+Modified-by-SEL: Yes, modified per openEuler commit c8477db6
+
+
+kvm_arch_vcpu_precreate() targets to handle arch specific VM resource
+to be prepared prior to the actual creation of vCPU. For example, x86
+platform may need do per-VM allocation based on max_vcpu_ids at the
+first vCPU creation. It probably leads to concurrency control on this
+allocation as multiple vCPU creation could happen simultaneously. From
+the architectual point of view, it's necessary to execute
+kvm_arch_vcpu_precreate() under protect of kvm->lock.
+
+Currently only arm64, x86 and s390 have non-nop implementations at the
+stage of vCPU pre-creation. Remove the lock acquiring in s390's design
+and make sure all architecture can run kvm_arch_vcpu_precreate() safely
+under kvm->lock without recrusive lock issue.
+
+Suggested-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Zeng Guang <guang.zeng@intel.com>
+Message-Id: <20220419154409.11842-1-guang.zeng@intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/s390/kvm/kvm-s390.c |  2 --
+ arch/x86/kvm/x86.c       |  2 +-
+ virt/kvm/kvm_main.c      | 10 ++++++----
+ 3 files changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/arch/s390/kvm/kvm-s390.c b/arch/s390/kvm/kvm-s390.c
+index d8e9239c24ff..8b35774d3319 100644
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@ -2944,9 +2944,7 @@ static int sca_can_add_vcpu(struct kvm *kvm, unsigned int id)
+ 	if (!sclp.has_esca || !sclp.has_64bscao)
+ 		return false;
+ 
+-	mutex_lock(&kvm->lock);
+ 	rc = kvm->arch.use_esca ? 0 : sca_switch_to_extended(kvm);
+-	mutex_unlock(&kvm->lock);
+ 
+ 	return rc == 0 && id < KVM_S390_ESCA_CPU_SLOTS;
+ }
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 3ca342670e64..0a9841075751 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -10102,7 +10102,7 @@ static void fx_init(struct kvm_vcpu *vcpu)
+ 
+ int kvm_arch_vcpu_precreate(struct kvm *kvm, unsigned int id)
+ {
+-	if (kvm_check_tsc_unstable() && atomic_read(&kvm->online_vcpus) != 0)
++	if (kvm_check_tsc_unstable() && kvm->created_vcpus)
+ 		pr_warn_once("kvm: SMP vm created on host with unstable TSC; "
+ 			     "guest TSC will not be reliable\n");
+ 
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index a5c107bbf022..93cd86267eba 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -3180,13 +3180,15 @@ static int kvm_vm_ioctl_create_vcpu(struct kvm *kvm, u32 id)
+ 		return -EINVAL;
+ 	}
+ 
++	r = kvm_arch_vcpu_precreate(kvm, id);
++	if (r) {
++		mutex_unlock(&kvm->lock);
++		return r;
++	}
++
+ 	kvm->created_vcpus++;
+ 	mutex_unlock(&kvm->lock);
+ 
+-	r = kvm_arch_vcpu_precreate(kvm, id);
+-	if (r)
+-		goto vcpu_decrement;
+-
+ 	vcpu = kmem_cache_zalloc(kvm_vcpu_cache, GFP_KERNEL);
+ 	if (!vcpu) {
+ 		r = -ENOMEM;
+-- 
+2.35.3
+

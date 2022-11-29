@@ -1,0 +1,75 @@
+From 5413bcba7ed57206178d60ee03dd5bb3a460e645 Mon Sep 17 00:00:00 2001
+From: Zeng Guang <guang.zeng@intel.com>
+Date: Tue, 19 Apr 2022 23:35:16 +0800
+Subject: [PATCH] KVM: x86: Add support for vICR APIC-write VM-Exits in x2APIC
+ mode
+Git-commit: 5413bcba7ed57206178d60ee03dd5bb3a460e645
+Patch-mainline: v6.0-rc1
+References: bsn#121
+Modified-by-SEL: Yes, modified per openEuler commit 54838a4f
+
+
+Upcoming Intel CPUs will support virtual x2APIC MSR writes to the vICR,
+i.e. will trap and generate an APIC-write VM-Exit instead of intercepting
+the WRMSR.  Add support for handling "nodecode" x2APIC writes, which
+were previously impossible.
+
+Note, x2APIC MSR writes are 64 bits wide.
+
+Signed-off-by: Zeng Guang <guang.zeng@intel.com>
+Message-Id: <20220419153516.11739-1-guang.zeng@intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/kvm/lapic.c | 12 +++++++++---
+ arch/x86/kvm/lapic.h |  5 +++++
+ 2 files changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 28248e312efa..4ea8119b5010 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -2174,15 +2174,21 @@ EXPORT_SYMBOL_GPL(kvm_lapic_set_eoi);
+ /* emulate APIC access in a trap manner */
+ void kvm_apic_write_nodecode(struct kvm_vcpu *vcpu, u32 offset)
+ {
+-	u32 val = 0;
++	struct kvm_lapic *apic = vcpu->arch.apic;
++	u64 val = 0;
+ 
+ 	/* hw has done the conditional check and inst decode */
+ 	offset &= 0xff0;
+ 
+-	kvm_lapic_reg_read(vcpu->arch.apic, offset, 4, &val);
++	/* exception dealing with 64bit data on vICR in x2apic mode */
++	if ((offset == APIC_ICR) && apic_x2apic_mode(apic)) {
++		val = kvm_lapic_get_reg64(apic, offset);
++		kvm_lapic_reg_write(apic, APIC_ICR2, (u32)(val>>32));
++	} else
++		kvm_lapic_reg_read(apic, offset, 4, &val);
+ 
+ 	/* TODO: optimize to just emulate side effect w/o one more write */
+-	kvm_lapic_reg_write(vcpu->arch.apic, offset, val);
++	kvm_lapic_reg_write(apic, offset, (u32)val);
+ }
+ EXPORT_SYMBOL_GPL(kvm_apic_write_nodecode);
+ 
+diff --git a/arch/x86/kvm/lapic.h b/arch/x86/kvm/lapic.h
+index 4fb86e3a9dd3..49e85dea5e3f 100644
+--- a/arch/x86/kvm/lapic.h
++++ b/arch/x86/kvm/lapic.h
+@@ -162,6 +162,11 @@ static inline u32 kvm_lapic_get_reg(struct kvm_lapic *apic, int reg_off)
+ 	return *((u32 *) (apic->regs + reg_off));
+ }
+ 
++static inline u64 kvm_lapic_get_reg64(struct kvm_lapic *apic, int reg_off)
++{
++	return *((u64 *) (apic->regs + reg_off));
++}
++
+ static inline void __kvm_lapic_set_reg(char *regs, int reg_off, u32 val)
+ {
+ 	*((u32 *) (regs + reg_off)) = val;
+-- 
+2.35.3
+

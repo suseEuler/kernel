@@ -1,0 +1,113 @@
+From 35875316384b71d23dc2a45a969732fc8cab16af Mon Sep 17 00:00:00 2001
+From: Zeng Guang <guang.zeng@intel.com>
+Date: Tue, 19 Apr 2022 23:44:44 +0800
+Subject: [PATCH] KVM: x86: Allow userspace to set maximum VCPU id for VM
+Git-commit: 35875316384b71d23dc2a45a969732fc8cab16af
+Patch-mainline: v6.0-rc1
+References: bsn#121
+Modified-by-SEL: Yes, modified per openEuler commit 59461b8c
+
+
+Introduce new max_vcpu_ids in KVM for x86 architecture. Userspace
+can assign maximum possible vcpu id for current VM session using
+KVM_CAP_MAX_VCPU_ID of KVM_ENABLE_CAP ioctl().
+
+This is done for x86 only because the sole use case is to guide
+memory allocation for PID-pointer table, a structure needed to
+enable VMX IPI.
+
+By default, max_vcpu_ids set as KVM_MAX_VCPU_ID.
+
+Suggested-by: Sean Christopherson <seanjc@google.com>
+Reviewed-by: Maxim Levitsky <mlevitsk@redhat.com>
+Signed-off-by: Zeng Guang <guang.zeng@intel.com>
+Message-Id: <20220419154444.11888-1-guang.zeng@intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ Documentation/virt/kvm/api.rst  |   21 +++++++++++++++++++++
+ arch/x86/include/asm/kvm_host.h |    6 ++++++
+ arch/x86/kvm/x86.c              |   20 ++++++++++++++++++++
+ 3 files changed, 47 insertions(+)
+
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@ -6128,6 +6128,27 @@ default.
+ 
+ See Documentation/x86/sgx.rst for more details.
+ 
++7.23 KVM_CAP_MAX_VCPU_ID
++------------------------
++
++:Architectures: x86
++:Target: VM
++:Parameters: args[0] - maximum APIC ID value set for current VM
++:Returns: 0 on success, -EINVAL if args[0] is beyond KVM_MAX_VCPU_ID
++          supported in KVM or if it has been set.
++
++This capability allows userspace to specify maximum possible APIC ID
++assigned for current VM session prior to the creation of vCPUs, saving
++memory for data structures indexed by the APIC ID.  Userspace is able
++to calculate the limit to APIC ID values from designated
++CPU topology.
++
++The value can be changed only until KVM_ENABLE_CAP is set to a nonzero
++value or until a vCPU is created.  Upon creation of the first vCPU,
++if the value was set to zero or KVM_ENABLE_CAP was not invoked, KVM
++uses the return value of KVM_CHECK_EXTENSION(KVM_CAP_MAX_VCPU_ID) as
++the maximum APIC ID.
++
+ 8. Other capabilities.
+ ======================
+ 
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1037,6 +1037,12 @@ struct kvm_arch {
+ 	struct list_head tdp_mmu_roots;
+ 	/* List of struct tdp_mmu_pages not being used as roots */
+ 	struct list_head tdp_mmu_pages;
++	/*
++	 * VM-scope maximum vCPU ID. Used to determine the size of structures
++	 * that increase along with the maximum vCPU ID, in which case, using
++	 * the global KVM_MAX_VCPU_ID may lead to significant memory waste.
++	 */
++	u32 max_vcpu_ids;
+ };
+ 
+ struct kvm_vm_stat {
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -5453,6 +5453,20 @@ split_irqchip_unlock:
+ 		break;
+ 	}
+ #endif
++	case KVM_CAP_MAX_VCPU_ID:
++		r = -EINVAL;
++		if (cap->args[0] > KVM_MAX_VCPU_ID)
++			break;
++
++		mutex_lock(&kvm->lock);
++		if (kvm->arch.max_vcpu_ids == cap->args[0]) {
++			r = 0;
++		} else if (!kvm->arch.max_vcpu_ids) {
++			kvm->arch.max_vcpu_ids = cap->args[0];
++			r = 0;
++		}
++		mutex_unlock(&kvm->lock);
++		break;
+ 	case KVM_CAP_X86_BUS_LOCK_EXIT:
+ 		r = -EINVAL;
+ 		if (cap->args[0] & ~KVM_BUS_LOCK_DETECTION_VALID_MODE)
+@@ -10204,6 +10218,12 @@ int kvm_arch_vcpu_precreate(struct kvm *
+ 		pr_warn_once("kvm: SMP vm created on host with unstable TSC; "
+ 			     "guest TSC will not be reliable\n");
+ 
++	if (!kvm->arch.max_vcpu_ids)
++		kvm->arch.max_vcpu_ids = KVM_MAX_VCPU_ID;
++
++	if (id >= kvm->arch.max_vcpu_ids)
++		return -EINVAL;
++
+ 	return 0;
+ }
+ 

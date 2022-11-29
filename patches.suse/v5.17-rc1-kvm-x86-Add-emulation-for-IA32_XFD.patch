@@ -1,0 +1,94 @@
+From 820a6ee944e74e57255ac2e90916ecdaade57b95 Mon Sep 17 00:00:00 2001
+From: Jing Liu <jing2.liu@intel.com>
+Date: Wed, 5 Jan 2022 04:35:21 -0800
+Subject: [PATCH] kvm: x86: Add emulation for IA32_XFD
+Git-commit: 820a6ee944e74e57255ac2e90916ecdaade57b95
+Patch-mainline: v5.17-rc1
+References: bsn#121
+Modified-by-SEL: Yes, modified per openEuler commit 5910de3245
+
+
+Intel's eXtended Feature Disable (XFD) feature allows the software
+to dynamically adjust fpstate buffer size for XSAVE features which
+have large state.
+
+Because guest fpstate has been expanded for all possible dynamic
+xstates at KVM_SET_CPUID2, emulation of the IA32_XFD MSR is
+straightforward. For write just call fpu_update_guest_xfd() to
+update the guest fpu container once all the sanity checks are passed.
+For read simply return the cached value in the container.
+
+Signed-off-by: Jing Liu <jing2.liu@intel.com>
+Signed-off-by: Zeng Guang <guang.zeng@intel.com>
+Signed-off-by: Wei Wang <wei.w.wang@intel.com>
+Signed-off-by: Jing Liu <jing2.liu@intel.com>
+Signed-off-by: Yang Zhong <yang.zhong@intel.com>
+Message-Id: <20220105123532.12586-11-yang.zhong@intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/kvm/x86.c | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index a204099d2e51..125181fc1a12 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -1322,6 +1322,7 @@ static const u32 msrs_to_save_all[] = {
+ 	MSR_F15H_PERF_CTL3, MSR_F15H_PERF_CTL4, MSR_F15H_PERF_CTL5,
+ 	MSR_F15H_PERF_CTR0, MSR_F15H_PERF_CTR1, MSR_F15H_PERF_CTR2,
+ 	MSR_F15H_PERF_CTR3, MSR_F15H_PERF_CTR4, MSR_F15H_PERF_CTR5,
++	MSR_IA32_XFD,
+ };
+ 
+ static u32 msrs_to_save[ARRAY_SIZE(msrs_to_save_all)];
+@@ -3415,6 +3416,19 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 			return 1;
+ 		vcpu->arch.msr_misc_features_enables = data;
+ 		break;
++#ifdef CONFIG_X86_64
++	case MSR_IA32_XFD:
++		if (!msr_info->host_initiated &&
++		    !guest_cpuid_has(vcpu, X86_FEATURE_XFD))
++			return 1;
++
++		if (data & ~(XFEATURE_MASK_USER_DYNAMIC &
++			     vcpu->arch.guest_supported_xcr0))
++			return 1;
++
++		fpu_update_guest_xfd(&vcpu->arch.guest_fpu, data);
++		break;
++#endif
+ 	default:
+ 		if (msr && (msr == vcpu->kvm->arch.xen_hvm_config.msr))
+ 			return xen_hvm_config(vcpu, data);
+@@ -3724,6 +3738,15 @@ int kvm_get_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 	case MSR_K7_HWCR:
+ 		msr_info->data = vcpu->arch.msr_hwcr;
+ 		break;
++#ifdef CONFIG_X86_64
++	case MSR_IA32_XFD:
++		if (!msr_info->host_initiated &&
++		    !guest_cpuid_has(vcpu, X86_FEATURE_XFD))
++			return 1;
++
++		msr_info->data = vcpu->arch.guest_fpu.fpstate->xfd;
++		break;
++#endif
+ 	default:
+ 		if (kvm_pmu_is_valid_msr(vcpu, msr_info->index))
+ 			return kvm_pmu_get_msr(vcpu, msr_info);
+@@ -5923,6 +5946,10 @@ static void kvm_init_msr_list(void)
+ 			    min(INTEL_PMC_MAX_GENERIC, x86_pmu.num_counters_gp))
+ 				continue;
+ 			break;
++		case MSR_IA32_XFD:
++			if (!kvm_cpu_cap_has(X86_FEATURE_XFD))
++				continue;
++			break;
+ 		default:
+ 			break;
+ 		}
+-- 
+2.35.3
+

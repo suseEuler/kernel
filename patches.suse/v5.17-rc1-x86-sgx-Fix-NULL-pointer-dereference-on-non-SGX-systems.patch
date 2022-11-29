@@ -1,0 +1,162 @@
+From 2056e2989bf47ad7274ecc5e9dda2add53c112f9 Mon Sep 17 00:00:00 2001
+From: Dave Hansen <dave.hansen@linux.intel.com>
+Date: Tue, 4 Jan 2022 09:15:27 -0800
+Subject: [PATCH] x86/sgx: Fix NULL pointer dereference on non-SGX systems
+Git-commit: 2056e2989bf47ad7274ecc5e9dda2add53c112f9
+Patch-mainline: v5.17-rc1
+References: bsn#121
+Modified-by-SEL: No
+
+
+== Problem ==
+
+Nathan Chancellor reported an oops when aceessing the
+'sgx_total_bytes' sysfs file:
+
+	https://lore.kernel.org/all/YbzhBrimHGGpddDM@archlinux-ax161/
+
+The sysfs output code accesses the sgx_numa_nodes[] array
+unconditionally.  However, this array is allocated during SGX
+initialization, which only occurs on systems where SGX is
+supported.
+
+If the sysfs file is accessed on systems without SGX support,
+sgx_numa_nodes[] is NULL and an oops occurs.
+
+== Solution ==
+
+To fix this, hide the entire nodeX/x86/ attribute group on
+systems without SGX support using the ->is_visible attribute
+group callback.
+
+Unfortunately, SGX is initialized via a device_initcall() which
+occurs _after_ the ->is_visible() callback.  Instead of moving
+SGX initialization earlier, call sysfs_update_group() during
+SGX initialization to update the group visiblility.
+
+This update requires moving the SGX sysfs code earlier in
+sgx/main.c.  There are no code changes other than the addition of
+arch_update_sysfs_visibility() and a minor whitespace fixup to
+arch_node_attr_is_visible() which checkpatch caught.
+
+CC: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: linux-sgx@vger.kernel.org
+Cc: x86@kernel.org
+Fixes: 50468e431335 ("x86/sgx: Add an attribute for the amount of SGX memory in a NUMA node")
+Reported-by: Nathan Chancellor <nathan@kernel.org>
+Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Reviewed-by: Jarkko Sakkinen <jarkko@kernel.org>
+Tested-by: Nathan Chancellor <nathan@kernel.org>
+Tested-by: Jarkko Sakkinen <jarkko@kernel.org>
+Link: https://lkml.kernel.org/r/20220104171527.5E8416A8@davehans-spike.ostc.intel.com
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/kernel/cpu/sgx/main.c | 65 ++++++++++++++++++++++++----------
+ 1 file changed, 47 insertions(+), 18 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/sgx/main.c b/arch/x86/kernel/cpu/sgx/main.c
+index 2857a49f2335..4b41efc9e367 100644
+--- a/arch/x86/kernel/cpu/sgx/main.c
++++ b/arch/x86/kernel/cpu/sgx/main.c
+@@ -6,11 +6,13 @@
+ #include <linux/highmem.h>
+ #include <linux/kthread.h>
+ #include <linux/miscdevice.h>
++#include <linux/node.h>
+ #include <linux/pagemap.h>
+ #include <linux/ratelimit.h>
+ #include <linux/sched/mm.h>
+ #include <linux/sched/signal.h>
+ #include <linux/slab.h>
++#include <linux/sysfs.h>
+ #include <asm/sgx.h>
+ #include "driver.h"
+ #include "encl.h"
+@@ -780,6 +782,48 @@ static inline u64 __init sgx_calc_section_metric(u64 low, u64 high)
+ 	       ((high & GENMASK_ULL(19, 0)) << 32);
+ }
+ 
++#ifdef CONFIG_NUMA
++static ssize_t sgx_total_bytes_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%lu\n", sgx_numa_nodes[dev->id].size);
++}
++static DEVICE_ATTR_RO(sgx_total_bytes);
++
++static umode_t arch_node_attr_is_visible(struct kobject *kobj,
++		struct attribute *attr, int idx)
++{
++	/* Make all x86/ attributes invisible when SGX is not initialized: */
++	if (nodes_empty(sgx_numa_mask))
++		return 0;
++
++	return attr->mode;
++}
++
++static struct attribute *arch_node_dev_attrs[] = {
++	&dev_attr_sgx_total_bytes.attr,
++	NULL,
++};
++
++const struct attribute_group arch_node_dev_group = {
++	.name = "x86",
++	.attrs = arch_node_dev_attrs,
++	.is_visible = arch_node_attr_is_visible,
++};
++
++static void __init arch_update_sysfs_visibility(int nid)
++{
++	struct node *node = node_devices[nid];
++	int ret;
++
++	ret = sysfs_update_group(&node->dev.kobj, &arch_node_dev_group);
++
++	if (ret)
++		pr_err("sysfs update failed (%d), files may be invisible", ret);
++}
++#else /* !CONFIG_NUMA */
++static void __init arch_update_sysfs_visibility(int nid) {}
++#endif
++
+ static bool __init sgx_page_cache_init(void)
+ {
+ 	u32 eax, ebx, ecx, edx, type;
+@@ -826,6 +870,9 @@ static bool __init sgx_page_cache_init(void)
+ 			INIT_LIST_HEAD(&sgx_numa_nodes[nid].sgx_poison_page_list);
+ 			node_set(nid, sgx_numa_mask);
+ 			sgx_numa_nodes[nid].size = 0;
++
++			/* Make SGX-specific node sysfs files visible: */
++			arch_update_sysfs_visibility(nid);
+ 		}
+ 
+ 		sgx_epc_sections[i].node =  &sgx_numa_nodes[nid];
+@@ -903,24 +950,6 @@ int sgx_set_attribute(unsigned long *allowed_attributes,
+ }
+ EXPORT_SYMBOL_GPL(sgx_set_attribute);
+ 
+-#ifdef CONFIG_NUMA
+-static ssize_t sgx_total_bytes_show(struct device *dev, struct device_attribute *attr, char *buf)
+-{
+-	return sysfs_emit(buf, "%lu\n", sgx_numa_nodes[dev->id].size);
+-}
+-static DEVICE_ATTR_RO(sgx_total_bytes);
+-
+-static struct attribute *arch_node_dev_attrs[] = {
+-	&dev_attr_sgx_total_bytes.attr,
+-	NULL,
+-};
+-
+-const struct attribute_group arch_node_dev_group = {
+-	.name = "x86",
+-	.attrs = arch_node_dev_attrs,
+-};
+-#endif /* CONFIG_NUMA */
+-
+ static int __init sgx_init(void)
+ {
+ 	int ret;
+-- 
+2.33.0
+

@@ -1,0 +1,150 @@
+From dd6e631220181162478984d2d46dd979e04d8e75 Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Wed, 26 Jan 2022 07:49:45 -0500
+Subject: [PATCH] KVM: x86: add system attribute to retrieve full set of
+ supported xsave states
+Git-commit: dd6e631220181162478984d2d46dd979e04d8e75
+Patch-mainline: v5.17-rc2
+References: bsn#121
+Modified-by-SEL: Yes, modified per openEuler commit 953b514a0
+
+
+Because KVM_GET_SUPPORTED_CPUID is meant to be passed (by simple-minded
+VMMs) to KVM_SET_CPUID2, it cannot include any dynamic xsave states that
+have not been enabled.  Probing those, for example so that they can be
+passed to ARCH_REQ_XCOMP_GUEST_PERM, requires a new ioctl or arch_prctl.
+The latter is in fact worse, even though that is what the rest of the
+API uses, because it would require supported_xcr0 to be moved from the
+KVM module to the kernel just for this use.  In addition, the value
+would be nonsensical (or an error would have to be returned) until
+the KVM module is loaded in.
+
+Therefore, to limit the growth of system ioctls, add a /dev/kvm
+variant of KVM_{GET,HAS}_DEVICE_ATTR, and implement it in x86
+with just one group (0) and attribute (KVM_X86_XCOMP_GUEST_SUPP).
+
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ Documentation/virt/kvm/api.rst  |    4 ++-
+ arch/x86/include/uapi/asm/kvm.h |    3 ++
+ arch/x86/kvm/x86.c              |   51 ++++++++++++++++++++++++++++++++++++++++
+ include/uapi/linux/kvm.h        |    1 
+ 4 files changed, 58 insertions(+), 1 deletion(-)
+
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@ -3031,6 +3031,7 @@ number.
+ 
+ :Capability: KVM_CAP_DEVICE_CTRL, KVM_CAP_VM_ATTRIBUTES for vm device,
+              KVM_CAP_VCPU_ATTRIBUTES for vcpu device
++             KVM_CAP_SYS_ATTRIBUTES for system (/dev/kvm) device (no set)
+ :Type: device ioctl, vm ioctl, vcpu ioctl
+ :Parameters: struct kvm_device_attr
+ :Returns: 0 on success, -1 on error
+@@ -3065,7 +3066,8 @@ transferred is defined by the particular
+ ------------------------
+ 
+ :Capability: KVM_CAP_DEVICE_CTRL, KVM_CAP_VM_ATTRIBUTES for vm device,
+-	     KVM_CAP_VCPU_ATTRIBUTES for vcpu device
++             KVM_CAP_VCPU_ATTRIBUTES for vcpu device
++             KVM_CAP_SYS_ATTRIBUTES for system (/dev/kvm) device
+ :Type: device ioctl, vm ioctl, vcpu ioctl
+ :Parameters: struct kvm_device_attr
+ :Returns: 0 on success, -1 on error
+--- a/arch/x86/include/uapi/asm/kvm.h
++++ b/arch/x86/include/uapi/asm/kvm.h
+@@ -437,6 +437,9 @@ struct kvm_sync_regs {
+ 
+ #define KVM_STATE_VMX_PREEMPTION_TIMER_DEADLINE	0x00000001
+ 
++/* attributes for system fd (group 0) */
++#define KVM_X86_XCOMP_GUEST_SUPP	0
++
+ struct kvm_vmx_nested_state_data {
+ 	__u8 vmcs12[KVM_STATE_NESTED_VMX_VMCS_SIZE];
+ 	__u8 shadow_vmcs12[KVM_STATE_NESTED_VMX_VMCS_SIZE];
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -3866,6 +3866,7 @@ int kvm_vm_ioctl_check_extension(struct
+ #ifdef CONFIG_X86_SGX_KVM
+ 	case KVM_CAP_SGX_ATTRIBUTE:
+ #endif
++	case KVM_CAP_SYS_ATTRIBUTES:
+ 		r = 1;
+ 		break;
+ 	case KVM_CAP_SYNC_REGS:
+@@ -3964,6 +3965,40 @@ static inline void __user *kvm_get_attr_
+ 	return uaddr;
+ }
+ 
++static int kvm_x86_dev_get_attr(struct kvm_device_attr *attr)
++{
++	u64 __user *uaddr = kvm_get_attr_addr(attr);
++
++	if (attr->group)
++		return -ENXIO;
++
++	if (IS_ERR(uaddr))
++		return PTR_ERR(uaddr);
++
++	switch (attr->attr) {
++	case KVM_X86_XCOMP_GUEST_SUPP:
++		if (put_user(supported_xcr0, uaddr))
++			return -EFAULT;
++		return 0;
++	default:
++		return -ENXIO;
++		break;
++	}
++}
++
++static int kvm_x86_dev_has_attr(struct kvm_device_attr *attr)
++{
++	if (attr->group)
++		return -ENXIO;
++
++	switch (attr->attr) {
++	case KVM_X86_XCOMP_GUEST_SUPP:
++		return 0;
++	default:
++		return -ENXIO;
++	}
++}
++
+ long kvm_arch_dev_ioctl(struct file *filp,
+ 			unsigned int ioctl, unsigned long arg)
+ {
+@@ -4049,6 +4084,22 @@ long kvm_arch_dev_ioctl(struct file *fil
+ 	case KVM_GET_MSRS:
+ 		r = msr_io(NULL, argp, do_get_msr_feature, 1);
+ 		break;
++	case KVM_GET_DEVICE_ATTR: {
++		struct kvm_device_attr attr;
++		r = -EFAULT;
++		if (copy_from_user(&attr, (void __user *)arg, sizeof(attr)))
++			break;
++		r = kvm_x86_dev_get_attr(&attr);
++		break;
++	}
++	case KVM_HAS_DEVICE_ATTR: {
++		struct kvm_device_attr attr;
++		r = -EFAULT;
++		if (copy_from_user(&attr, (void __user *)arg, sizeof(attr)))
++			break;
++		r = kvm_x86_dev_has_attr(&attr);
++		break;
++	}
+ 	default:
+ 		r = -EINVAL;
+ 		break;
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@ -1057,6 +1057,7 @@ struct kvm_ppc_resize_hpt {
+ #define KVM_CAP_X86_BUS_LOCK_EXIT 193
+ #define KVM_CAP_SGX_ATTRIBUTE 196
+ #define KVM_CAP_XSAVE2 208
++#define KVM_CAP_SYS_ATTRIBUTES 209
+ 
+ #ifdef KVM_CAP_IRQ_ROUTING
+ 

@@ -1,0 +1,269 @@
+From be50b2065dfa3d88428fdfdc340d154d96bf6848 Mon Sep 17 00:00:00 2001
+From: Guang Zeng <guang.zeng@intel.com>
+Date: Wed, 5 Jan 2022 04:35:29 -0800
+Subject: [PATCH] kvm: x86: Add support for getting/setting expanded xstate
+ buffer
+Git-commit: be50b2065dfa3d88428fdfdc340d154d96bf6848
+Patch-mainline: v5.17-rc1
+References: bsn#121
+Modified-by-SEL: Yes, modified per openEuler commit 0d9e57e18
+
+
+With KVM_CAP_XSAVE, userspace uses a hardcoded 4KB buffer to get/set
+xstate data from/to KVM. This doesn't work when dynamic xfeatures
+(e.g. AMX) are exposed to the guest as they require a larger buffer
+size.
+
+Introduce a new capability (KVM_CAP_XSAVE2). Userspace VMM gets the
+required xstate buffer size via KVM_CHECK_EXTENSION(KVM_CAP_XSAVE2).
+KVM_SET_XSAVE is extended to work with both legacy and new capabilities
+by doing properly-sized memdup_user() based on the guest fpu container.
+KVM_GET_XSAVE is kept for backward-compatible reason. Instead,
+KVM_GET_XSAVE2 is introduced under KVM_CAP_XSAVE2 as the preferred
+interface for getting xstate buffer (4KB or larger size) from KVM
+(Link: https://lkml.org/lkml/2021/12/15/510)
+
+Also, update the api doc with the new KVM_GET_XSAVE2 ioctl.
+
+Signed-off-by: Guang Zeng <guang.zeng@intel.com>
+Signed-off-by: Wei Wang <wei.w.wang@intel.com>
+Signed-off-by: Jing Liu <jing2.liu@intel.com>
+Signed-off-by: Kevin Tian <kevin.tian@intel.com>
+Signed-off-by: Yang Zhong <yang.zhong@intel.com>
+Message-Id: <20220105123532.12586-19-yang.zhong@intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ Documentation/virt/kvm/api.rst  |   42 +++++++++++++++++++++++++++++++++++--
+ arch/x86/include/uapi/asm/kvm.h |   16 +++++++++++++-
+ arch/x86/kvm/cpuid.c            |    2 -
+ arch/x86/kvm/cpuid.h            |    2 +
+ arch/x86/kvm/x86.c              |   45 +++++++++++++++++++++++++++++++++++++++-
+ include/uapi/linux/kvm.h        |    4 +++
+ 6 files changed, 106 insertions(+), 5 deletions(-)
+
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@ -1488,6 +1488,7 @@ is vcpu 0.
+ 
+   struct kvm_xsave {
+ 	__u32 region[1024];
++	__u32 extra[0];
+   };
+ 
+ This ioctl would copy current vcpu's xsave struct to the userspace.
+@@ -1496,7 +1497,7 @@ This ioctl would copy current vcpu's xsa
+ 4.43 KVM_SET_XSAVE
+ ------------------
+ 
+-:Capability: KVM_CAP_XSAVE
++:Capability: KVM_CAP_XSAVE and KVM_CAP_XSAVE2
+ :Architectures: x86
+ :Type: vcpu ioctl
+ :Parameters: struct kvm_xsave (in)
+@@ -1507,9 +1508,18 @@ This ioctl would copy current vcpu's xsa
+ 
+   struct kvm_xsave {
+ 	__u32 region[1024];
++	__u32 extra[0];
+   };
+ 
+-This ioctl would copy userspace's xsave struct to the kernel.
++This ioctl would copy userspace's xsave struct to the kernel. It copies
++as many bytes as are returned by KVM_CHECK_EXTENSION(KVM_CAP_XSAVE2),
++when invoked on the vm file descriptor. The size value returned by
++KVM_CHECK_EXTENSION(KVM_CAP_XSAVE2) will always be at least 4096.
++Currently, it is only greater than 4096 if a dynamic feature has been
++enabled with ``arch_prctl()``, but this may change in the future.
++
++The offsets of the state save areas in struct kvm_xsave follow the
++contents of CPUID leaf 0xD on the host.
+ 
+ 
+ 4.44 KVM_GET_XCRS
+@@ -4820,6 +4830,34 @@ filter, e.g. MSRs with identical setting
+ have deterministic behavior.
+ 
+ 
++4.42 KVM_GET_XSAVE2
++------------------
++
++:Capability: KVM_CAP_XSAVE2
++:Architectures: x86
++:Type: vcpu ioctl
++:Parameters: struct kvm_xsave (out)
++:Returns: 0 on success, -1 on error
++
++
++::
++
++  struct kvm_xsave {
++	__u32 region[1024];
++	__u32 extra[0];
++  };
++
++This ioctl would copy current vcpu's xsave struct to the userspace. It
++copies as many bytes as are returned by KVM_CHECK_EXTENSION(KVM_CAP_XSAVE2)
++when invoked on the vm file descriptor. The size value returned by
++KVM_CHECK_EXTENSION(KVM_CAP_XSAVE2) will always be at least 4096.
++Currently, it is only greater than 4096 if a dynamic feature has been
++enabled with ``arch_prctl()``, but this may change in the future.
++
++The offsets of the state save areas in struct kvm_xsave follow the contents
++of CPUID leaf 0xD on the host.
++
++
+ 5. The kvm_run structure
+ ========================
+ 
+--- a/arch/x86/include/uapi/asm/kvm.h
++++ b/arch/x86/include/uapi/asm/kvm.h
+@@ -358,9 +358,23 @@ struct kvm_debugregs {
+ 	__u64 reserved[9];
+ };
+ 
+-/* for KVM_CAP_XSAVE */
++/* for KVM_CAP_XSAVE and KVM_CAP_XSAVE2 */
+ struct kvm_xsave {
++	/*
++	 * KVM_GET_XSAVE2 and KVM_SET_XSAVE write and read as many bytes
++	 * as are returned by KVM_CHECK_EXTENSION(KVM_CAP_XSAVE2)
++	 * respectively, when invoked on the vm file descriptor.
++	 *
++	 * The size value returned by KVM_CHECK_EXTENSION(KVM_CAP_XSAVE2)
++	 * will always be at least 4096. Currently, it is only greater
++	 * than 4096 if a dynamic feature has been enabled with
++	 * ``arch_prctl()``, but this may change in the future.
++	 *
++	 * The offsets of the state save areas in struct kvm_xsave follow
++	 * the contents of CPUID leaf 0xD on the host.
++	 */
+ 	__u32 region[1024];
++	__u32 extra[0];
+ };
+ 
+ #define KVM_MAX_XCRS	16
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@ -32,7 +32,7 @@
+ u32 kvm_cpu_caps[NR_KVM_CPU_CAPS] __read_mostly;
+ EXPORT_SYMBOL_GPL(kvm_cpu_caps);
+ 
+-static u32 xstate_required_size(u64 xstate_bv, bool compacted)
++u32 xstate_required_size(u64 xstate_bv, bool compacted)
+ {
+ 	int feature_bit = 0;
+ 	u32 ret = XSAVE_HDR_SIZE + XSAVE_HDR_OFFSET;
+--- a/arch/x86/kvm/cpuid.h
++++ b/arch/x86/kvm/cpuid.h
+@@ -47,6 +47,8 @@ int kvm_vcpu_ioctl_get_cpuid2(struct kvm
+ bool kvm_cpuid(struct kvm_vcpu *vcpu, u32 *eax, u32 *ebx,
+ 	       u32 *ecx, u32 *edx, bool exact_only);
+ 
++u32 xstate_required_size(u64 xstate_bv, bool compacted);
++
+ int cpuid_query_maxphyaddr(struct kvm_vcpu *vcpu);
+ 
+ static inline int cpuid_maxphyaddr(struct kvm_vcpu *vcpu)
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -3941,6 +3941,14 @@ int kvm_vm_ioctl_check_extension(struct
+ 		else
+ 			r = 0;
+ 		break;
++	case KVM_CAP_XSAVE2: {
++		u64 guest_perm = xstate_get_guest_group_perm();
++
++		r = xstate_required_size(supported_xcr0 & guest_perm, false);
++		if (r < sizeof(struct kvm_xsave))
++			r = sizeof(struct kvm_xsave);
++		break;
++	}
+ 	default:
+ 		break;
+ 	}
+@@ -4552,6 +4560,16 @@ static void kvm_vcpu_ioctl_x86_get_xsave
+ 				       vcpu->arch.pkru);
+ }
+ 
++static void kvm_vcpu_ioctl_x86_get_xsave2(struct kvm_vcpu *vcpu,
++					  u8 *state, unsigned int size)
++{
++	if (fpstate_is_confidential(&vcpu->arch.guest_fpu))
++		return;
++
++	fpu_copy_guest_fpstate_to_uabi(&vcpu->arch.guest_fpu,
++				       state, size, vcpu->arch.pkru);
++}
++
+ static int kvm_vcpu_ioctl_x86_set_xsave(struct kvm_vcpu *vcpu,
+ 					struct kvm_xsave *guest_xsave)
+ {
+@@ -4874,6 +4892,10 @@ long kvm_arch_vcpu_ioctl(struct file *fi
+ 		break;
+ 	}
+ 	case KVM_GET_XSAVE: {
++		r = -EINVAL;
++		if (vcpu->arch.guest_fpu.uabi_size > sizeof(struct kvm_xsave))
++			break;
++
+ 		u.xsave = kzalloc(sizeof(struct kvm_xsave), GFP_KERNEL_ACCOUNT);
+ 		r = -ENOMEM;
+ 		if (!u.xsave)
+@@ -4888,7 +4910,9 @@ long kvm_arch_vcpu_ioctl(struct file *fi
+ 		break;
+ 	}
+ 	case KVM_SET_XSAVE: {
+-		u.xsave = memdup_user(argp, sizeof(*u.xsave));
++		int size = vcpu->arch.guest_fpu.uabi_size;
++
++		u.xsave = memdup_user(argp, size);
+ 		if (IS_ERR(u.xsave)) {
+ 			r = PTR_ERR(u.xsave);
+ 			goto out_nofree;
+@@ -4897,6 +4921,25 @@ long kvm_arch_vcpu_ioctl(struct file *fi
+ 		r = kvm_vcpu_ioctl_x86_set_xsave(vcpu, u.xsave);
+ 		break;
+ 	}
++
++	case KVM_GET_XSAVE2: {
++		int size = vcpu->arch.guest_fpu.uabi_size;
++
++		u.xsave = kzalloc(size, GFP_KERNEL_ACCOUNT);
++		r = -ENOMEM;
++		if (!u.xsave)
++			break;
++
++		kvm_vcpu_ioctl_x86_get_xsave2(vcpu, u.buffer, size);
++
++		r = -EFAULT;
++		if (copy_to_user(argp, u.xsave, size))
++			break;
++
++		r = 0;
++		break;
++	}
++
+ 	case KVM_GET_XCRS: {
+ 		u.xcrs = kzalloc(sizeof(struct kvm_xcrs), GFP_KERNEL_ACCOUNT);
+ 		r = -ENOMEM;
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@ -1056,6 +1056,7 @@ struct kvm_ppc_resize_hpt {
+ #define KVM_CAP_ENFORCE_PV_FEATURE_CPUID 190
+ #define KVM_CAP_X86_BUS_LOCK_EXIT 193
+ #define KVM_CAP_SGX_ATTRIBUTE 196
++#define KVM_CAP_XSAVE2 208
+ 
+ #ifdef KVM_CAP_IRQ_ROUTING
+ 
+@@ -1524,6 +1525,9 @@ struct kvm_enc_region {
+ #define KVM_S390_NORMAL_RESET	_IO(KVMIO,   0xc3)
+ #define KVM_S390_CLEAR_RESET	_IO(KVMIO,   0xc4)
+ 
++/* Available with KVM_CAP_XSAVE2 */
++#define KVM_GET_XSAVE2		  _IOR(KVMIO,  0xcf, struct kvm_xsave)
++
+ struct kvm_s390_pv_sec_parm {
+ 	__u64 origin;
+ 	__u64 length;
