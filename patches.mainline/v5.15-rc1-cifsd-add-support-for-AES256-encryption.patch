@@ -1,0 +1,314 @@
+From 5a0ca7700591a5275875920cf0c3113435e4b6f7 Mon Sep 17 00:00:00 2001
+From: Namjae Jeon <namjae.jeon@samsung.com>
+Date: Thu, 6 May 2021 11:43:37 +0900
+Subject: [PATCH] cifsd: add support for AES256 encryption
+Git-commit: 5a0ca7700591a5275875920cf0c3113435e4b6f7
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+Now that 256 bit encryption can be negotiated, update
+names of the nonces to match the updated official protocol
+documentation (e.g. AES_GCM_NONCE instead of AES_128GCM_NONCE)
+since they apply to both 128 bit and 256 bit encryption.
+update smb encryption code to set 32 byte key length and to
+set gcm256/ccm256 when requested on mount.
+
+Signed-off-by: Namjae Jeon <namjae.jeon@samsung.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/cifsd/auth.c              | 53 +++++++++++++++++++++++++-----------
+ fs/cifsd/crypto_ctx.c        |  8 +++---
+ fs/cifsd/crypto_ctx.h        |  8 +++---
+ fs/cifsd/mgmt/user_session.h |  4 +--
+ fs/cifsd/smb2pdu.c           | 11 +++++---
+ fs/cifsd/smb2pdu.h           | 18 +++++++++---
+ 6 files changed, 68 insertions(+), 34 deletions(-)
+
+diff --git a/fs/cifsd/auth.c b/fs/cifsd/auth.c
+index 437e58a0826d..6b90aac86fcc 100644
+--- a/fs/cifsd/auth.c
++++ b/fs/cifsd/auth.c
+@@ -835,7 +835,8 @@ static int generate_key(struct ksmbd_session *sess, struct kvec label,
+ {
+ 	unsigned char zero = 0x0;
+ 	__u8 i[4] = {0, 0, 0, 1};
+-	__u8 L[4] = {0, 0, 0, 128};
++	__u8 L128[4] = {0, 0, 0, 128};
++	__u8 L256[4] = {0, 0, 1, 0};
+ 	int rc = -EINVAL;
+ 	unsigned char prfhash[SMB2_HMACSHA256_SIZE];
+ 	unsigned char *hashptr = prfhash;
+@@ -890,7 +891,11 @@ static int generate_key(struct ksmbd_session *sess, struct kvec label,
+ 		goto smb3signkey_ret;
+ 	}
+ 
+-	rc = crypto_shash_update(CRYPTO_HMACSHA256(ctx), L, 4);
++	if (sess->conn->cipher_type == SMB2_ENCRYPTION_AES256_CCM ||
++	    sess->conn->cipher_type == SMB2_ENCRYPTION_AES256_GCM)
++		rc = crypto_shash_update(CRYPTO_HMACSHA256(ctx), L256, 4);
++	else
++		rc = crypto_shash_update(CRYPTO_HMACSHA256(ctx), L128, 4);
+ 	if (rc) {
+ 		ksmbd_debug(AUTH, "could not update with L\n");
+ 		goto smb3signkey_ret;
+@@ -981,24 +986,33 @@ static int generate_smb3encryptionkey(struct ksmbd_session *sess,
+ 
+ 	rc = generate_key(sess, ptwin->encryption.label,
+ 			ptwin->encryption.context, sess->smb3encryptionkey,
+-			SMB3_SIGN_KEY_SIZE);
++			SMB3_ENC_DEC_KEY_SIZE);
+ 	if (rc)
+ 		return rc;
+ 
+ 	rc = generate_key(sess, ptwin->decryption.label,
+ 			ptwin->decryption.context,
+-			sess->smb3decryptionkey, SMB3_SIGN_KEY_SIZE);
++			sess->smb3decryptionkey, SMB3_ENC_DEC_KEY_SIZE);
+ 	if (rc)
+ 		return rc;
+ 
+ 	ksmbd_debug(AUTH, "dumping generated AES encryption keys\n");
++	ksmbd_debug(AUTH, "Cipher type   %d\n", sess->conn->cipher_type);
+ 	ksmbd_debug(AUTH, "Session Id    %llu\n", sess->id);
+ 	ksmbd_debug(AUTH, "Session Key   %*ph\n",
+ 			SMB2_NTLMV2_SESSKEY_SIZE, sess->sess_key);
+-	ksmbd_debug(AUTH, "ServerIn Key  %*ph\n",
+-			SMB3_SIGN_KEY_SIZE, sess->smb3encryptionkey);
+-	ksmbd_debug(AUTH, "ServerOut Key %*ph\n",
+-			SMB3_SIGN_KEY_SIZE, sess->smb3decryptionkey);
++	if (sess->conn->cipher_type == SMB2_ENCRYPTION_AES256_CCM ||
++	    sess->conn->cipher_type == SMB2_ENCRYPTION_AES256_GCM) {
++		ksmbd_debug(AUTH, "ServerIn Key  %*ph\n",
++			SMB3_GCM256_CRYPTKEY_SIZE, sess->smb3encryptionkey);
++		ksmbd_debug(AUTH, "ServerOut Key %*ph\n",
++			SMB3_GCM256_CRYPTKEY_SIZE, sess->smb3decryptionkey);
++	} else {
++		ksmbd_debug(AUTH, "ServerIn Key  %*ph\n",
++			SMB3_GCM128_CRYPTKEY_SIZE, sess->smb3encryptionkey);
++		ksmbd_debug(AUTH, "ServerOut Key %*ph\n",
++			SMB3_GCM128_CRYPTKEY_SIZE, sess->smb3decryptionkey);
++	}
+ 	return rc;
+ }
+ 
+@@ -1136,7 +1150,7 @@ static int ksmbd_get_encryption_key(struct ksmbd_conn *conn, __u64 ses_id,
+ 
+ 	ses_enc_key = enc ? sess->smb3encryptionkey :
+ 		sess->smb3decryptionkey;
+-	memcpy(key, ses_enc_key, SMB3_SIGN_KEY_SIZE);
++	memcpy(key, ses_enc_key, SMB3_ENC_DEC_KEY_SIZE);
+ 
+ 	return 0;
+ }
+@@ -1224,7 +1238,7 @@ int ksmbd_crypt_message(struct ksmbd_conn *conn, struct kvec *iov,
+ 	int rc = 0;
+ 	struct scatterlist *sg;
+ 	u8 sign[SMB2_SIGNATURE_SIZE] = {};
+-	u8 key[SMB3_SIGN_KEY_SIZE];
++	u8 key[SMB3_ENC_DEC_KEY_SIZE];
+ 	struct aead_request *req;
+ 	char *iv;
+ 	unsigned int iv_len;
+@@ -1241,7 +1255,8 @@ int ksmbd_crypt_message(struct ksmbd_conn *conn, struct kvec *iov,
+ 		return 0;
+ 	}
+ 
+-	if (conn->cipher_type == SMB2_ENCRYPTION_AES128_GCM)
++	if (conn->cipher_type == SMB2_ENCRYPTION_AES128_GCM ||
++	    conn->cipher_type == SMB2_ENCRYPTION_AES256_GCM)
+ 		ctx = ksmbd_crypto_ctx_find_gcm();
+ 	else
+ 		ctx = ksmbd_crypto_ctx_find_ccm();
+@@ -1250,12 +1265,17 @@ int ksmbd_crypt_message(struct ksmbd_conn *conn, struct kvec *iov,
+ 		return -EINVAL;
+ 	}
+ 
+-	if (conn->cipher_type == SMB2_ENCRYPTION_AES128_GCM)
++	if (conn->cipher_type == SMB2_ENCRYPTION_AES128_GCM ||
++	    conn->cipher_type == SMB2_ENCRYPTION_AES256_GCM)
+ 		tfm = CRYPTO_GCM(ctx);
+ 	else
+ 		tfm = CRYPTO_CCM(ctx);
+ 
+-	rc = crypto_aead_setkey(tfm, key, SMB3_SIGN_KEY_SIZE);
++	if (conn->cipher_type == SMB2_ENCRYPTION_AES256_CCM ||
++	    conn->cipher_type == SMB2_ENCRYPTION_AES256_GCM)
++		rc = crypto_aead_setkey(tfm, key, SMB3_GCM256_CRYPTKEY_SIZE);
++	else
++		rc = crypto_aead_setkey(tfm, key, SMB3_GCM128_CRYPTKEY_SIZE);
+ 	if (rc) {
+ 		ksmbd_err("Failed to set aead key %d\n", rc);
+ 		goto free_ctx;
+@@ -1294,11 +1314,12 @@ int ksmbd_crypt_message(struct ksmbd_conn *conn, struct kvec *iov,
+ 		goto free_sg;
+ 	}
+ 
+-	if (conn->cipher_type == SMB2_ENCRYPTION_AES128_GCM) {
+-		memcpy(iv, (char *)tr_hdr->Nonce, SMB3_AES128GCM_NONCE);
++	if (conn->cipher_type == SMB2_ENCRYPTION_AES128_GCM ||
++	    conn->cipher_type == SMB2_ENCRYPTION_AES256_GCM) {
++		memcpy(iv, (char *)tr_hdr->Nonce, SMB3_AES_GCM_NONCE);
+ 	} else {
+ 		iv[0] = 3;
+-		memcpy(iv + 1, (char *)tr_hdr->Nonce, SMB3_AES128CCM_NONCE);
++		memcpy(iv + 1, (char *)tr_hdr->Nonce, SMB3_AES_CCM_NONCE);
+ 	}
+ 
+ 	aead_request_set_crypt(req, sg, sg, crypt_len, iv);
+diff --git a/fs/cifsd/crypto_ctx.c b/fs/cifsd/crypto_ctx.c
+index 8322b0f7a7fc..1830ae1b5ed3 100644
+--- a/fs/cifsd/crypto_ctx.c
++++ b/fs/cifsd/crypto_ctx.c
+@@ -42,10 +42,10 @@ static struct crypto_aead *alloc_aead(int id)
+ 	struct crypto_aead *tfm = NULL;
+ 
+ 	switch (id) {
+-	case CRYPTO_AEAD_AES128_GCM:
++	case CRYPTO_AEAD_AES_GCM:
+ 		tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
+ 		break;
+-	case CRYPTO_AEAD_AES128_CCM:
++	case CRYPTO_AEAD_AES_CCM:
+ 		tfm = crypto_alloc_aead("ccm(aes)", 0, 0);
+ 		break;
+ 	default:
+@@ -248,12 +248,12 @@ static struct ksmbd_crypto_ctx *____crypto_aead_ctx_find(int id)
+ 
+ struct ksmbd_crypto_ctx *ksmbd_crypto_ctx_find_gcm(void)
+ {
+-	return ____crypto_aead_ctx_find(CRYPTO_AEAD_AES128_GCM);
++	return ____crypto_aead_ctx_find(CRYPTO_AEAD_AES_GCM);
+ }
+ 
+ struct ksmbd_crypto_ctx *ksmbd_crypto_ctx_find_ccm(void)
+ {
+-	return ____crypto_aead_ctx_find(CRYPTO_AEAD_AES128_CCM);
++	return ____crypto_aead_ctx_find(CRYPTO_AEAD_AES_CCM);
+ }
+ 
+ void ksmbd_crypto_destroy(void)
+diff --git a/fs/cifsd/crypto_ctx.h b/fs/cifsd/crypto_ctx.h
+index 64a11dfd6c83..b0d3cd650485 100644
+--- a/fs/cifsd/crypto_ctx.h
++++ b/fs/cifsd/crypto_ctx.h
+@@ -21,8 +21,8 @@ enum {
+ };
+ 
+ enum {
+-	CRYPTO_AEAD_AES128_GCM = 16,
+-	CRYPTO_AEAD_AES128_CCM,
++	CRYPTO_AEAD_AES_GCM = 16,
++	CRYPTO_AEAD_AES_CCM,
+ 	CRYPTO_AEAD_MAX,
+ };
+ 
+@@ -55,8 +55,8 @@ struct ksmbd_crypto_ctx {
+ #define CRYPTO_MD4_TFM(c)	((c)->desc[CRYPTO_SHASH_MD4]->tfm)
+ #define CRYPTO_MD5_TFM(c)	((c)->desc[CRYPTO_SHASH_MD5]->tfm)
+ 
+-#define CRYPTO_GCM(c)		((c)->ccmaes[CRYPTO_AEAD_AES128_GCM])
+-#define CRYPTO_CCM(c)		((c)->ccmaes[CRYPTO_AEAD_AES128_CCM])
++#define CRYPTO_GCM(c)		((c)->ccmaes[CRYPTO_AEAD_AES_GCM])
++#define CRYPTO_CCM(c)		((c)->ccmaes[CRYPTO_AEAD_AES_CCM])
+ 
+ void ksmbd_release_crypto_ctx(struct ksmbd_crypto_ctx *ctx);
+ 
+diff --git a/fs/cifsd/mgmt/user_session.h b/fs/cifsd/mgmt/user_session.h
+index 72b40348bdc4..1709563d718b 100644
+--- a/fs/cifsd/mgmt/user_session.h
++++ b/fs/cifsd/mgmt/user_session.h
+@@ -56,8 +56,8 @@ struct ksmbd_session {
+ 
+ 
+ 
+-	__u8				smb3encryptionkey[SMB3_SIGN_KEY_SIZE];
+-	__u8				smb3decryptionkey[SMB3_SIGN_KEY_SIZE];
++	__u8				smb3encryptionkey[SMB3_ENC_DEC_KEY_SIZE];
++	__u8				smb3decryptionkey[SMB3_ENC_DEC_KEY_SIZE];
+ 	__u8				smb3signingkey[SMB3_SIGN_KEY_SIZE];
+ 
+ 	struct list_head		sessions_entry;
+diff --git a/fs/cifsd/smb2pdu.c b/fs/cifsd/smb2pdu.c
+index ebae992f88a0..d07d7c45f899 100644
+--- a/fs/cifsd/smb2pdu.c
++++ b/fs/cifsd/smb2pdu.c
+@@ -904,7 +904,9 @@ static int decode_encrypt_ctxt(struct ksmbd_conn *conn,
+ 
+ 	for (i = 0; i < cph_cnt; i++) {
+ 		if (pneg_ctxt->Ciphers[i] == SMB2_ENCRYPTION_AES128_GCM ||
+-		    pneg_ctxt->Ciphers[i] == SMB2_ENCRYPTION_AES128_CCM) {
++		    pneg_ctxt->Ciphers[i] == SMB2_ENCRYPTION_AES128_CCM ||
++		    pneg_ctxt->Ciphers[i] == SMB2_ENCRYPTION_AES256_CCM ||
++		    pneg_ctxt->Ciphers[i] == SMB2_ENCRYPTION_AES256_GCM) {
+ 			ksmbd_debug(SMB, "Cipher ID = 0x%x\n",
+ 				pneg_ctxt->Ciphers[i]);
+ 			conn->cipher_type = pneg_ctxt->Ciphers[i];
+@@ -7979,10 +7981,11 @@ static void fill_transform_hdr(struct smb2_transform_hdr *tr_hdr, char *old_buf,
+ 	tr_hdr->ProtocolId = SMB2_TRANSFORM_PROTO_NUM;
+ 	tr_hdr->OriginalMessageSize = cpu_to_le32(orig_len);
+ 	tr_hdr->Flags = cpu_to_le16(0x01);
+-	if (cipher_type == SMB2_ENCRYPTION_AES128_GCM)
+-		get_random_bytes(&tr_hdr->Nonce, SMB3_AES128GCM_NONCE);
++	if (cipher_type == SMB2_ENCRYPTION_AES128_GCM ||
++	    cipher_type == SMB2_ENCRYPTION_AES256_GCM)
++		get_random_bytes(&tr_hdr->Nonce, SMB3_AES_GCM_NONCE);
+ 	else
+-		get_random_bytes(&tr_hdr->Nonce, SMB3_AES128CCM_NONCE);
++		get_random_bytes(&tr_hdr->Nonce, SMB3_AES_CCM_NONCE);
+ 	memcpy(&tr_hdr->SessionId, &hdr->SessionId, 8);
+ 	inc_rfc1001_len(tr_hdr, sizeof(struct smb2_transform_hdr) - 4);
+ 	inc_rfc1001_len(tr_hdr, orig_len);
+diff --git a/fs/cifsd/smb2pdu.h b/fs/cifsd/smb2pdu.h
+index 156ff6a2968b..c5c32610aafe 100644
+--- a/fs/cifsd/smb2pdu.h
++++ b/fs/cifsd/smb2pdu.h
+@@ -77,6 +77,13 @@
+ #define SMB2_SIGNATURE_SIZE		16
+ #define SMB2_HMACSHA256_SIZE		32
+ #define SMB2_CMACAES_SIZE		16
++#define SMB3_GCM128_CRYPTKEY_SIZE	16
++#define SMB3_GCM256_CRYPTKEY_SIZE	32
++
++/*
++ * Size of the smb3 encryption/decryption keys
++ */
++#define SMB3_ENC_DEC_KEY_SIZE		32
+ 
+ /*
+  * Size of the smb3 signing key
+@@ -151,8 +158,8 @@ struct smb2_pdu {
+ 	__le16 StructureSize2; /* size of wct area (varies, request specific) */
+ } __packed;
+ 
+-#define SMB3_AES128CCM_NONCE 11
+-#define SMB3_AES128GCM_NONCE 12
++#define SMB3_AES_CCM_NONCE 11
++#define SMB3_AES_GCM_NONCE 12
+ 
+ struct smb2_transform_hdr {
+ 	__be32 smb2_buf_length; /* big endian on wire */
+@@ -283,13 +290,16 @@ struct smb2_preauth_neg_context {
+ /* Encryption Algorithms Ciphers */
+ #define SMB2_ENCRYPTION_AES128_CCM	cpu_to_le16(0x0001)
+ #define SMB2_ENCRYPTION_AES128_GCM	cpu_to_le16(0x0002)
++#define SMB2_ENCRYPTION_AES256_CCM	cpu_to_le16(0x0003)
++#define SMB2_ENCRYPTION_AES256_GCM	cpu_to_le16(0x0004)
+ 
+ struct smb2_encryption_neg_context {
+ 	__le16	ContextType; /* 2 */
+ 	__le16	DataLength;
+ 	__le32	Reserved;
+-	__le16	CipherCount; /* AES-128-GCM and AES-128-CCM */
+-	__le16	Ciphers[1]; /* Ciphers[0] since only one used now */
++	/* CipherCount usally 2, but can be 3 when AES256-GCM enabled */
++	__le16	CipherCount; /* AES-128-GCM and AES-128-CCM by default */
++	__le16	Ciphers[1];
+ } __packed;
+ 
+ #define SMB3_COMPRESS_NONE	cpu_to_le16(0x0000)
+-- 
+2.33.0
+

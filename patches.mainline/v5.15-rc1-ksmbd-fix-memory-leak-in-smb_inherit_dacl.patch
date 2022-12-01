@@ -1,0 +1,86 @@
+From a9071e3c8659d777eb6527e1d377021381d1b5ec Mon Sep 17 00:00:00 2001
+From: Namjae Jeon <namjae.jeon@samsung.com>
+Date: Wed, 7 Jul 2021 15:01:21 +0900
+Subject: [PATCH] ksmbd: fix memory leak in smb_inherit_dacl()
+Git-commit: a9071e3c8659d777eb6527e1d377021381d1b5ec
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified per openEuler commit 8a1cd329d
+
+
+Add two labels to fix memory leak in smb_inherit_dacl().
+
+Reported-by: Coverity Scan <scan-admin@coverity.com>
+Signed-off-by: Namjae Jeon <namjae.jeon@samsung.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/ksmbd/smbacl.c | 23 ++++++++++++++---------
+ 1 file changed, 14 insertions(+), 9 deletions(-)
+
+diff --git a/fs/ksmbd/smbacl.c b/fs/ksmbd/smbacl.c
+index b1e9473a732a..f6019f0dc8fd 100644
+--- a/fs/ksmbd/smbacl.c
++++ b/fs/ksmbd/smbacl.c
+@@ -952,24 +952,28 @@ int smb_inherit_dacl(struct ksmbd_conn *conn,
+ 	struct smb_sid owner_sid, group_sid;
+ 	struct dentry *parent = path->dentry->d_parent;
+ 	int inherited_flags = 0, flags = 0, i, ace_cnt = 0, nt_size = 0;
+-	int rc = -ENOENT, num_aces, dacloffset, pntsd_type, acl_len;
++	int rc = 0, num_aces, dacloffset, pntsd_type, acl_len;
+ 	char *aces_base;
+ 	bool is_dir = S_ISDIR(d_inode(path->dentry)->i_mode);
+ 
+ 	acl_len = ksmbd_vfs_get_sd_xattr(conn, parent, &parent_pntsd);
+ 	if (acl_len <= 0)
+-		return rc;
++		return -ENOENT;
+ 	dacloffset = le32_to_cpu(parent_pntsd->dacloffset);
+-	if (!dacloffset)
+-		goto out;
++	if (!dacloffset) {
++		rc = -EINVAL;
++		goto free_parent_pntsd;
++	}
+ 
+ 	parent_pdacl = (struct smb_acl *)((char *)parent_pntsd + dacloffset);
+ 	num_aces = le32_to_cpu(parent_pdacl->num_aces);
+ 	pntsd_type = le16_to_cpu(parent_pntsd->type);
+ 
+ 	aces_base = kmalloc(sizeof(struct smb_ace) * num_aces * 2, GFP_KERNEL);
+-	if (!aces_base)
+-		goto out;
++	if (!aces_base) {
++		rc = -ENOMEM;
++		goto free_parent_pntsd;
++	}
+ 
+ 	aces = (struct smb_ace *)aces_base;
+ 	parent_aces = (struct smb_ace *)((char *)parent_pdacl +
+@@ -1049,7 +1053,7 @@ int smb_inherit_dacl(struct ksmbd_conn *conn,
+ 				nt_size, GFP_KERNEL);
+ 		if (!pntsd) {
+ 			rc = -ENOMEM;
+-			goto out;
++			goto free_aces_base;
+ 		}
+ 
+ 		pntsd->revision = cpu_to_le16(1);
+@@ -1089,11 +1093,12 @@ int smb_inherit_dacl(struct ksmbd_conn *conn,
+ 
+ 		ksmbd_vfs_set_sd_xattr(conn, path->dentry, pntsd, pntsd_size);
+ 		kfree(pntsd);
+-		rc = 0;
+ 	}
+ 
++free_aces_base:
+ 	kfree(aces_base);
+-out:
++free_parent_pntsd:
++	kfree(parent_pntsd);
+ 	return rc;
+ }
+ 
+-- 
+2.33.0
+

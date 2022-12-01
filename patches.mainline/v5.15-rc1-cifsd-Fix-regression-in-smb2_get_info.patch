@@ -1,0 +1,57 @@
+From ced2b26a76cd1db0b6ccb39e0bc873177c9bda21 Mon Sep 17 00:00:00 2001
+From: Sebastian Gottschall <s.gottschall@dd-wrt.com>
+Date: Tue, 27 Apr 2021 15:33:54 +0900
+Subject: [PATCH] cifsd: Fix regression in smb2_get_info
+Git-commit: ced2b26a76cd1db0b6ccb39e0bc873177c9bda21
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+a Windows 10 client isn't able to store files from ksmbd servers due
+unknown local permission problems (code 0x8007003A) if smb3 encryption
+is enabled. Windows 10 is requesting for ATTRIBUTE_SECINFO (mask 0x20)
+which is not yet handled by ksmbd, this leads to a invalid response.
+For now we just reintroduce the old check to avoid processing of unhandled
+flags until ATTRIBUTE_SECINFO is properly handled.
+
+Signed-off-by: Sebastian Gottschall <s.gottschall@dd-wrt.com>
+Signed-off-by: Namjae Jeon <namjae.jeon@samsung.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/cifsd/smb2pdu.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/fs/cifsd/smb2pdu.c b/fs/cifsd/smb2pdu.c
+index eeb3f09e8765..3b8da5dfd4a1 100644
+--- a/fs/cifsd/smb2pdu.c
++++ b/fs/cifsd/smb2pdu.c
+@@ -4791,6 +4791,24 @@ static int smb2_get_info_sec(struct ksmbd_work *work,
+ 	int addition_info = le32_to_cpu(req->AdditionalInformation);
+ 	int rc;
+ 
++	if (addition_info & ~(OWNER_SECINFO | GROUP_SECINFO | DACL_SECINFO)) {
++		ksmbd_debug(SMB, "Unsupported addition info: 0x%x)\n",
++			addition_info);
++
++		pntsd->revision = cpu_to_le16(1);
++		pntsd->type = cpu_to_le16(SELF_RELATIVE | DACL_PROTECTED);
++		pntsd->osidoffset = 0;
++		pntsd->gsidoffset = 0;
++		pntsd->sacloffset = 0;
++		pntsd->dacloffset = 0;
++
++		secdesclen = sizeof(struct smb_ntsd);
++		rsp->OutputBufferLength = cpu_to_le32(secdesclen);
++		inc_rfc1001_len(rsp_org, secdesclen);
++
++		return 0;
++	}
++
+ 	if (work->next_smb2_rcv_hdr_off) {
+ 		if (!HAS_FILE_ID(le64_to_cpu(req->VolatileFileId))) {
+ 			ksmbd_debug(SMB, "Compound request set FID = %u\n",
+-- 
+2.33.0
+

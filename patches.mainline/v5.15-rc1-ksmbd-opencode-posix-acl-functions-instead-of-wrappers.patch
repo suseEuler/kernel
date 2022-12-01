@@ -1,0 +1,202 @@
+From 67d1c432994cbf30f63ec35abba493b027f0c910 Mon Sep 17 00:00:00 2001
+From: Namjae Jeon <namjae.jeon@samsung.com>
+Date: Tue, 22 Jun 2021 11:42:29 +0900
+Subject: [PATCH] ksmbd: opencode posix acl functions instead of wrappers
+Git-commit: 67d1c432994cbf30f63ec35abba493b027f0c910
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified per openEuler commit 9ffc7fa65
+
+
+Add select FS_POSIX_ACL in Kconfig and then opencode posix acl functions
+instead of wrappers
+
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Namjae Jeon <namjae.jeon@samsung.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/cifsd/smb2pdu.c |  4 ++--
+ fs/cifsd/smbacl.c  | 14 +++++++-------
+ fs/cifsd/vfs.c     | 44 +++++++++-----------------------------------
+ fs/cifsd/vfs.h     |  4 ----
+ 4 files changed, 18 insertions(+), 48 deletions(-)
+
+diff --git a/fs/cifsd/smb2pdu.c b/fs/cifsd/smb2pdu.c
+index 96a0cb512882..0d004c6d1c63 100644
+--- a/fs/cifsd/smb2pdu.c
++++ b/fs/cifsd/smb2pdu.c
+@@ -2327,9 +2327,9 @@ static void ksmbd_acls_fattr(struct smb_fattr *fattr, struct inode *inode)
+ 	fattr->cf_mode = inode->i_mode;
+ 	fattr->cf_dacls = NULL;
+ 
+-	fattr->cf_acls = ksmbd_vfs_get_acl(inode, ACL_TYPE_ACCESS);
++	fattr->cf_acls = get_acl(inode, ACL_TYPE_ACCESS);
+ 	if (S_ISDIR(inode->i_mode))
+-		fattr->cf_dacls = ksmbd_vfs_get_acl(inode, ACL_TYPE_DEFAULT);
++		fattr->cf_dacls = get_acl(inode, ACL_TYPE_DEFAULT);
+ }
+ 
+ /**
+diff --git a/fs/cifsd/smbacl.c b/fs/cifsd/smbacl.c
+index 23c952612db4..958937a548a1 100644
+--- a/fs/cifsd/smbacl.c
++++ b/fs/cifsd/smbacl.c
+@@ -532,7 +532,7 @@ static void parse_dacl(struct smb_acl *pdacl, char *end_of_acl,
+ 
+ 	if (acl_state.users->n || acl_state.groups->n) {
+ 		acl_state.mask.allow = 0x07;
+-		fattr->cf_acls = ksmbd_vfs_posix_acl_alloc(acl_state.users->n +
++		fattr->cf_acls = posix_acl_alloc(acl_state.users->n +
+ 			acl_state.groups->n + 4, GFP_KERNEL);
+ 		if (fattr->cf_acls) {
+ 			cf_pace = fattr->cf_acls->a_entries;
+@@ -543,7 +543,7 @@ static void parse_dacl(struct smb_acl *pdacl, char *end_of_acl,
+ 	if (default_acl_state.users->n || default_acl_state.groups->n) {
+ 		default_acl_state.mask.allow = 0x07;
+ 		fattr->cf_dacls =
+-			ksmbd_vfs_posix_acl_alloc(default_acl_state.users->n +
++			posix_acl_alloc(default_acl_state.users->n +
+ 			default_acl_state.groups->n + 4, GFP_KERNEL);
+ 		if (fattr->cf_dacls) {
+ 			cf_pdace = fattr->cf_dacls->a_entries;
+@@ -1202,7 +1202,7 @@ int smb_check_perm_dacl(struct ksmbd_conn *conn, struct dentry *dentry,
+ 			granted = GENERIC_ALL_FLAGS;
+ 	}
+ 
+-	posix_acls = ksmbd_vfs_get_acl(d_inode(dentry), ACL_TYPE_ACCESS);
++	posix_acls = get_acl(d_inode(dentry), ACL_TYPE_ACCESS);
+ 	if (posix_acls && !found) {
+ 		unsigned int id = -1;
+ 
+@@ -1287,11 +1287,11 @@ int set_info_sec(struct ksmbd_conn *conn, struct ksmbd_tree_connect *tcon,
+ 	ksmbd_vfs_remove_acl_xattrs(dentry);
+ 	/* Update posix acls */
+ 	if (fattr.cf_dacls) {
+-		rc = ksmbd_vfs_set_posix_acl(inode, ACL_TYPE_ACCESS,
+-					     fattr.cf_acls);
++		rc = set_posix_acl(&init_user_ns, inode, ACL_TYPE_ACCESS,
++				   fattr.cf_acls);
+ 		if (S_ISDIR(inode->i_mode) && fattr.cf_dacls)
+-			rc = ksmbd_vfs_set_posix_acl(inode, ACL_TYPE_DEFAULT,
+-						     fattr.cf_dacls);
++			rc = set_posix_acl(&init_user_ns, inode,
++					   ACL_TYPE_DEFAULT, fattr.cf_dacls);
+ 	}
+ 
+ 	/* Check it only calling from SD BUFFER context */
+diff --git a/fs/cifsd/vfs.c b/fs/cifsd/vfs.c
+index ca4c6c020a8e..e34e536dc9ce 100644
+--- a/fs/cifsd/vfs.c
++++ b/fs/cifsd/vfs.c
+@@ -1407,7 +1407,7 @@ static struct xattr_smb_acl *ksmbd_vfs_make_xattr_posix_acl(struct inode *inode,
+ 	struct xattr_acl_entry *xa_entry;
+ 	int i;
+ 
+-	posix_acls = ksmbd_vfs_get_acl(inode, acl_type);
++	posix_acls = get_acl(inode, acl_type);
+ 	if (!posix_acls)
+ 		return NULL;
+ 
+@@ -1630,34 +1630,6 @@ int ksmbd_vfs_get_dos_attrib_xattr(struct dentry *dentry,
+ 	return err;
+ }
+ 
+-struct posix_acl *ksmbd_vfs_posix_acl_alloc(int count, gfp_t flags)
+-{
+-#if IS_ENABLED(CONFIG_FS_POSIX_ACL)
+-	return posix_acl_alloc(count, flags);
+-#else
+-	return NULL;
+-#endif
+-}
+-
+-struct posix_acl *ksmbd_vfs_get_acl(struct inode *inode, int type)
+-{
+-#if IS_ENABLED(CONFIG_FS_POSIX_ACL)
+-	return get_acl(inode, type);
+-#else
+-	return NULL;
+-#endif
+-}
+-
+-int ksmbd_vfs_set_posix_acl(struct inode *inode, int type,
+-			    struct posix_acl *acl)
+-{
+-#if IS_ENABLED(CONFIG_FS_POSIX_ACL)
+-	return set_posix_acl(&init_user_ns, inode, type, acl);
+-#else
+-	return -EOPNOTSUPP;
+-#endif
+-}
+-
+ /**
+  * ksmbd_vfs_init_kstat() - convert unix stat information to smb stat format
+  * @p:          destination buffer
+@@ -1895,19 +1867,20 @@ int ksmbd_vfs_set_init_posix_acl(struct inode *inode)
+ 		acl_state.group.allow;
+ 	acl_state.mask.allow = 0x07;
+ 
+-	acls = ksmbd_vfs_posix_acl_alloc(6, GFP_KERNEL);
++	acls = posix_acl_alloc(6, GFP_KERNEL);
+ 	if (!acls) {
+ 		free_acl_state(&acl_state);
+ 		return -ENOMEM;
+ 	}
+ 	posix_state_to_acl(&acl_state, acls->a_entries);
+-	rc = ksmbd_vfs_set_posix_acl(inode, ACL_TYPE_ACCESS, acls);
++	rc = set_posix_acl(&init_user_ns, inode, ACL_TYPE_ACCESS, acls);
+ 	if (rc < 0)
+ 		ksmbd_debug(SMB, "Set posix acl(ACL_TYPE_ACCESS) failed, rc : %d\n",
+ 			    rc);
+ 	else if (S_ISDIR(inode->i_mode)) {
+ 		posix_state_to_acl(&acl_state, acls->a_entries);
+-		rc = ksmbd_vfs_set_posix_acl(inode, ACL_TYPE_DEFAULT, acls);
++		rc = set_posix_acl(&init_user_ns, inode, ACL_TYPE_DEFAULT,
++				   acls);
+ 		if (rc < 0)
+ 			ksmbd_debug(SMB, "Set posix acl(ACL_TYPE_DEFAULT) failed, rc : %d\n",
+ 				    rc);
+@@ -1923,7 +1896,7 @@ int ksmbd_vfs_inherit_posix_acl(struct inode *inode, struct inode *parent_inode)
+ 	struct posix_acl_entry *pace;
+ 	int rc, i;
+ 
+-	acls = ksmbd_vfs_get_acl(parent_inode, ACL_TYPE_DEFAULT);
++	acls = get_acl(parent_inode, ACL_TYPE_DEFAULT);
+ 	if (!acls)
+ 		return -ENOENT;
+ 	pace = acls->a_entries;
+@@ -1935,12 +1908,13 @@ int ksmbd_vfs_inherit_posix_acl(struct inode *inode, struct inode *parent_inode)
+ 		}
+ 	}
+ 
+-	rc = ksmbd_vfs_set_posix_acl(inode, ACL_TYPE_ACCESS, acls);
++	rc = set_posix_acl(&init_user_ns, inode, ACL_TYPE_ACCESS, acls);
+ 	if (rc < 0)
+ 		ksmbd_debug(SMB, "Set posix acl(ACL_TYPE_ACCESS) failed, rc : %d\n",
+ 			    rc);
+ 	if (S_ISDIR(inode->i_mode)) {
+-		rc = ksmbd_vfs_set_posix_acl(inode, ACL_TYPE_DEFAULT, acls);
++		rc = set_posix_acl(&init_user_ns, inode, ACL_TYPE_DEFAULT,
++				   acls);
+ 		if (rc < 0)
+ 			ksmbd_debug(SMB, "Set posix acl(ACL_TYPE_DEFAULT) failed, rc : %d\n",
+ 				    rc);
+diff --git a/fs/cifsd/vfs.h b/fs/cifsd/vfs.h
+index e1021f579f37..29352c227028 100644
+--- a/fs/cifsd/vfs.h
++++ b/fs/cifsd/vfs.h
+@@ -258,10 +258,6 @@ int ksmbd_vfs_set_dos_attrib_xattr(struct dentry *dentry,
+ 				   struct xattr_dos_attrib *da);
+ int ksmbd_vfs_get_dos_attrib_xattr(struct dentry *dentry,
+ 				   struct xattr_dos_attrib *da);
+-struct posix_acl *ksmbd_vfs_posix_acl_alloc(int count, gfp_t flags);
+-struct posix_acl *ksmbd_vfs_get_acl(struct inode *inode, int type);
+-int ksmbd_vfs_set_posix_acl(struct inode *inode, int type,
+-			    struct posix_acl *acl);
+ int ksmbd_vfs_set_init_posix_acl(struct inode *inode);
+ int ksmbd_vfs_inherit_posix_acl(struct inode *inode,
+ 				struct inode *parent_inode);
+-- 
+2.33.0
+

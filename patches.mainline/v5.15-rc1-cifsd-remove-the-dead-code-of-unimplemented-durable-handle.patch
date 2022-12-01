@@ -1,0 +1,525 @@
+From 73f9dad511e8c5d53a6565192eb0b3a213863563 Mon Sep 17 00:00:00 2001
+From: Namjae Jeon <namjae.jeon@samsung.com>
+Date: Fri, 16 Apr 2021 14:12:06 +0900
+Subject: [PATCH] cifsd: remove the dead code of unimplemented durable handle
+Git-commit: 73f9dad511e8c5d53a6565192eb0b3a213863563
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+Remove the dead code of unimplemented durable handle.
+
+Signed-off-by: Namjae Jeon <namjae.jeon@samsung.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/cifsd/ksmbd_server.h |   1 -
+ fs/cifsd/oplock.c       |   2 -
+ fs/cifsd/smb2pdu.c      | 246 +---------------------------------------
+ fs/cifsd/smb_common.c   |   5 -
+ fs/cifsd/vfs_cache.c    | 100 +---------------
+ fs/cifsd/vfs_cache.h    |   6 -
+ 6 files changed, 2 insertions(+), 358 deletions(-)
+
+diff --git a/fs/cifsd/ksmbd_server.h b/fs/cifsd/ksmbd_server.h
+index e46be4084087..442077a1e77b 100644
+--- a/fs/cifsd/ksmbd_server.h
++++ b/fs/cifsd/ksmbd_server.h
+@@ -33,7 +33,6 @@ struct ksmbd_heartbeat {
+ #define KSMBD_GLOBAL_FLAG_CACHE_TBUF		BIT(1)
+ #define KSMBD_GLOBAL_FLAG_CACHE_RBUF		BIT(2)
+ #define KSMBD_GLOBAL_FLAG_SMB2_ENCRYPTION	BIT(3)
+-#define KSMBD_GLOBAL_FLAG_DURABLE_HANDLE	BIT(4)
+ 
+ struct ksmbd_startup_request {
+ 	__u32	flags;
+diff --git a/fs/cifsd/oplock.c b/fs/cifsd/oplock.c
+index 4ff23aee69fa..e77f1385a8c1 100644
+--- a/fs/cifsd/oplock.c
++++ b/fs/cifsd/oplock.c
+@@ -1482,8 +1482,6 @@ void create_durable_v2_rsp_buf(char *cc, struct ksmbd_file *fp)
+ 	buf->Name[3] = 'Q';
+ 
+ 	buf->Timeout = cpu_to_le32(fp->durable_timeout);
+-	if (fp->is_persistent)
+-		buf->Flags = SMB2_FLAGS_REPLAY_OPERATIONS;
+ }
+ 
+ /**
+diff --git a/fs/cifsd/smb2pdu.c b/fs/cifsd/smb2pdu.c
+index 7d6013ea23e7..343e96ccdd4c 100644
+--- a/fs/cifsd/smb2pdu.c
++++ b/fs/cifsd/smb2pdu.c
+@@ -1946,173 +1946,6 @@ static noinline int create_smb2_pipe(struct ksmbd_work *work)
+ 	return err;
+ }
+ 
+-#define DURABLE_RECONN_V2	1
+-#define DURABLE_RECONN		2
+-#define DURABLE_REQ_V2		3
+-#define DURABLE_REQ		4
+-#define APP_INSTANCE_ID		5
+-
+-struct durable_info {
+-	struct ksmbd_file *fp;
+-	int type;
+-	int reconnected;
+-	int persistent;
+-	int timeout;
+-	char *CreateGuid;
+-	char *app_id;
+-};
+-
+-static int parse_durable_handle_context(struct ksmbd_work *work,
+-		struct smb2_create_req *req, struct lease_ctx_info *lc,
+-		struct durable_info *d_info)
+-{
+-	struct ksmbd_conn *conn = work->conn;
+-	struct create_context *context;
+-	int i, err = 0;
+-	u64 persistent_id = 0;
+-	int req_op_level;
+-	static const char * const durable_arr[] = {"DH2C", "DHnC", "DH2Q",
+-		"DHnQ", SMB2_CREATE_APP_INSTANCE_ID};
+-
+-	req_op_level = req->RequestedOplockLevel;
+-	for (i = 1; i <= 5; i++) {
+-		context = smb2_find_context_vals(req, durable_arr[i - 1]);
+-		if (IS_ERR(context)) {
+-			err = PTR_ERR(context);
+-			if (err == -EINVAL) {
+-				ksmbd_err("bad name length\n");
+-				goto out;
+-			}
+-			err = 0;
+-			continue;
+-		}
+-
+-		switch (i) {
+-		case DURABLE_RECONN_V2:
+-		{
+-			struct create_durable_reconn_v2_req *recon_v2;
+-
+-			recon_v2 =
+-				(struct create_durable_reconn_v2_req *)context;
+-			persistent_id = le64_to_cpu(recon_v2->Fid.PersistentFileId);
+-			d_info->fp = ksmbd_lookup_durable_fd(persistent_id);
+-			if (!d_info->fp) {
+-				ksmbd_err("Failed to get Durable handle state\n");
+-				err = -EBADF;
+-				goto out;
+-			}
+-
+-			if (memcmp(d_info->fp->create_guid, recon_v2->CreateGuid,
+-				   SMB2_CREATE_GUID_SIZE)) {
+-				err = -EBADF;
+-				goto out;
+-			}
+-			d_info->type = i;
+-			d_info->reconnected = 1;
+-			ksmbd_debug(SMB,
+-				"reconnect v2 Persistent-id from reconnect = %llu\n",
+-					persistent_id);
+-			break;
+-		}
+-		case DURABLE_RECONN:
+-		{
+-			struct create_durable_reconn_req *recon;
+-
+-			if (d_info->type == DURABLE_RECONN_V2 ||
+-			    d_info->type == DURABLE_REQ_V2) {
+-				err = -EINVAL;
+-				goto out;
+-			}
+-
+-			recon =
+-				(struct create_durable_reconn_req *)context;
+-			persistent_id = le64_to_cpu(recon->Data.Fid.PersistentFileId);
+-			d_info->fp = ksmbd_lookup_durable_fd(persistent_id);
+-			if (!d_info->fp) {
+-				ksmbd_err("Failed to get Durable handle state\n");
+-				err = -EBADF;
+-				goto out;
+-			}
+-			d_info->type = i;
+-			d_info->reconnected = 1;
+-			ksmbd_debug(SMB,
+-				"reconnect Persistent-id from reconnect = %llu\n",
+-					persistent_id);
+-			break;
+-		}
+-		case DURABLE_REQ_V2:
+-		{
+-			struct create_durable_req_v2 *durable_v2_blob;
+-
+-			if (d_info->type == DURABLE_RECONN ||
+-			    d_info->type == DURABLE_RECONN_V2) {
+-				err = -EINVAL;
+-				goto out;
+-			}
+-
+-			durable_v2_blob =
+-				(struct create_durable_req_v2 *)context;
+-			ksmbd_debug(SMB, "Request for durable v2 open\n");
+-			d_info->fp = ksmbd_lookup_fd_cguid(durable_v2_blob->CreateGuid);
+-			if (d_info->fp) {
+-				if (!memcmp(conn->ClientGUID, d_info->fp->client_guid,
+-					    SMB2_CLIENT_GUID_SIZE)) {
+-					if (!(req->hdr.Flags & SMB2_FLAGS_REPLAY_OPERATIONS)) {
+-						err = -ENOEXEC;
+-						goto out;
+-					}
+-
+-					d_info->fp->conn = conn;
+-					d_info->reconnected = 1;
+-					goto out;
+-				}
+-			}
+-			if (((lc && (lc->req_state & SMB2_LEASE_HANDLE_CACHING_LE)) ||
+-			     req_op_level == SMB2_OPLOCK_LEVEL_BATCH)) {
+-				d_info->CreateGuid =
+-					durable_v2_blob->CreateGuid;
+-				d_info->persistent =
+-					le32_to_cpu(durable_v2_blob->Flags);
+-				d_info->timeout =
+-					le32_to_cpu(durable_v2_blob->Timeout);
+-				d_info->type = i;
+-			}
+-			break;
+-		}
+-		case DURABLE_REQ:
+-			if (d_info->type == DURABLE_RECONN)
+-				goto out;
+-			if (d_info->type == DURABLE_RECONN_V2 ||
+-			    d_info->type == DURABLE_REQ_V2) {
+-				err = -EINVAL;
+-				goto out;
+-			}
+-
+-			if (((lc && (lc->req_state & SMB2_LEASE_HANDLE_CACHING_LE)) ||
+-			     req_op_level == SMB2_OPLOCK_LEVEL_BATCH)) {
+-				ksmbd_debug(SMB, "Request for durable open\n");
+-				d_info->type = i;
+-			}
+-			break;
+-		case APP_INSTANCE_ID:
+-		{
+-			struct create_app_inst_id *inst_id;
+-
+-			inst_id = (struct create_app_inst_id *)context;
+-			ksmbd_close_fd_app_id(work, inst_id->AppInstanceId);
+-			d_info->app_id = inst_id->AppInstanceId;
+-			break;
+-		}
+-		default:
+-			break;
+-		}
+-	}
+-
+-out:
+-
+-	return err;
+-}
+-
+ /**
+  * smb2_set_ea() - handler for setting extended attributes using set
+  *		info command
+@@ -2431,7 +2264,6 @@ int smb2_open(struct ksmbd_work *work)
+ 	char *name = NULL;
+ 	char *stream_name = NULL;
+ 	bool file_present = false, created = false, already_permitted = false;
+-	struct durable_info d_info;
+ 	int share_ret, need_truncate = 0;
+ 	u64 time;
+ 	umode_t posix_mode = 0;
+@@ -2509,36 +2341,8 @@ int smb2_open(struct ksmbd_work *work)
+ 	}
+ 
+ 	req_op_level = req->RequestedOplockLevel;
+-	memset(&d_info, 0, sizeof(struct durable_info));
+-	if (server_conf.flags & KSMBD_GLOBAL_FLAG_DURABLE_HANDLE &&
+-	    req->CreateContextsOffset) {
++	if (req_op_level == SMB2_OPLOCK_LEVEL_LEASE)
+ 		lc = parse_lease_state(req);
+-		rc = parse_durable_handle_context(work, req, lc, &d_info);
+-		if (rc) {
+-			ksmbd_err("error parsing durable handle context\n");
+-			goto err_out1;
+-		}
+-
+-		if (d_info.reconnected) {
+-			fp = d_info.fp;
+-			rc = smb2_check_durable_oplock(d_info.fp, lc, name);
+-			if (rc)
+-				goto err_out1;
+-			rc = ksmbd_reopen_durable_fd(work, d_info.fp);
+-			if (rc)
+-				goto err_out1;
+-			if (ksmbd_override_fsids(work)) {
+-				rc = -ENOMEM;
+-				goto err_out1;
+-			}
+-			file_info = FILE_OPENED;
+-			fp = d_info.fp;
+-			goto reconnected;
+-		}
+-	} else {
+-		if (req_op_level == SMB2_OPLOCK_LEVEL_LEASE)
+-			lc = parse_lease_state(req);
+-	}
+ 
+ 	if (le32_to_cpu(req->ImpersonationLevel) > le32_to_cpu(IL_DELEGATE_LE)) {
+ 		ksmbd_err("Invalid impersonationlevel : 0x%x\n",
+@@ -3083,25 +2887,6 @@ int smb2_open(struct ksmbd_work *work)
+ 
+ 	memcpy(fp->client_guid, conn->ClientGUID, SMB2_CLIENT_GUID_SIZE);
+ 
+-	if (d_info.type) {
+-		if (d_info.type == DURABLE_REQ_V2 && d_info.persistent)
+-			fp->is_persistent = 1;
+-		else
+-			fp->is_durable = 1;
+-
+-		if (d_info.type == DURABLE_REQ_V2) {
+-			memcpy(fp->create_guid, d_info.CreateGuid,
+-				SMB2_CREATE_GUID_SIZE);
+-			if (d_info.timeout)
+-				fp->durable_timeout = d_info.timeout;
+-			else
+-				fp->durable_timeout = 1600;
+-			if (d_info.app_id)
+-				memcpy(fp->app_instance_id, d_info.app_id, 16);
+-		}
+-	}
+-
+-reconnected:
+ 	generic_fillattr(&init_user_ns, FP_INODE(fp), &stat);
+ 
+ 	rsp->StructureSize = cpu_to_le16(89);
+@@ -3150,35 +2935,6 @@ int smb2_open(struct ksmbd_work *work)
+ 		next_off = conn->vals->create_lease_size;
+ 	}
+ 
+-	if (d_info.type == DURABLE_REQ || d_info.type == DURABLE_REQ_V2) {
+-		struct create_context *durable_ccontext;
+-
+-		durable_ccontext = (struct create_context *)(rsp->Buffer +
+-				le32_to_cpu(rsp->CreateContextsLength));
+-		contxt_cnt++;
+-		if (d_info.type == DURABLE_REQ) {
+-			create_durable_rsp_buf(rsp->Buffer +
+-				le32_to_cpu(rsp->CreateContextsLength));
+-			le32_add_cpu(&rsp->CreateContextsLength,
+-				     conn->vals->create_durable_size);
+-			inc_rfc1001_len(rsp_org,
+-				conn->vals->create_durable_size);
+-		} else {
+-			create_durable_v2_rsp_buf(rsp->Buffer +
+-					le32_to_cpu(rsp->CreateContextsLength),
+-					fp);
+-			le32_add_cpu(&rsp->CreateContextsLength,
+-				     conn->vals->create_durable_v2_size);
+-			inc_rfc1001_len(rsp_org,
+-				conn->vals->create_durable_v2_size);
+-		}
+-
+-		if (next_ptr)
+-			*next_ptr = cpu_to_le32(next_off);
+-		next_ptr = &durable_ccontext->Next;
+-		next_off = conn->vals->create_durable_size;
+-	}
+-
+ 	if (maximal_access_ctxt) {
+ 		struct create_context *mxac_ccontext;
+ 
+diff --git a/fs/cifsd/smb_common.c b/fs/cifsd/smb_common.c
+index b0510213eb6d..985171cbf192 100644
+--- a/fs/cifsd/smb_common.c
++++ b/fs/cifsd/smb_common.c
+@@ -497,11 +497,6 @@ int ksmbd_smb_check_shared_mode(struct file *filp, struct ksmbd_file *curr_fp)
+ 			if (strcmp(prev_fp->stream.name, curr_fp->stream.name))
+ 				continue;
+ 
+-		if (prev_fp->is_durable) {
+-			prev_fp->is_durable = 0;
+-			continue;
+-		}
+-
+ 		if (prev_fp->attrib_only != curr_fp->attrib_only)
+ 			continue;
+ 
+diff --git a/fs/cifsd/vfs_cache.c b/fs/cifsd/vfs_cache.c
+index 3ab06e0b723c..3286e74e2a56 100644
+--- a/fs/cifsd/vfs_cache.c
++++ b/fs/cifsd/vfs_cache.c
+@@ -449,30 +449,6 @@ struct ksmbd_file *ksmbd_lookup_durable_fd(unsigned long long id)
+ 	return __ksmbd_lookup_fd(&global_ft, id);
+ }
+ 
+-int ksmbd_close_fd_app_id(struct ksmbd_work *work, char *app_id)
+-{
+-	struct ksmbd_file	*fp = NULL;
+-	unsigned int		id;
+-
+-	read_lock(&global_ft.lock);
+-	idr_for_each_entry(global_ft.idr, fp, id) {
+-		if (!memcmp(fp->app_instance_id,
+-			    app_id,
+-			    SMB2_CREATE_GUID_SIZE)) {
+-			if (!atomic_dec_and_test(&fp->refcount))
+-				fp = NULL;
+-			break;
+-		}
+-	}
+-	read_unlock(&global_ft.lock);
+-
+-	if (!fp)
+-		return -EINVAL;
+-
+-	__put_fd_final(work, fp);
+-	return 0;
+-}
+-
+ struct ksmbd_file *ksmbd_lookup_fd_cguid(char *cguid)
+ {
+ 	struct ksmbd_file	*fp = NULL;
+@@ -492,23 +468,6 @@ struct ksmbd_file *ksmbd_lookup_fd_cguid(char *cguid)
+ 	return fp;
+ }
+ 
+-struct ksmbd_file *ksmbd_lookup_fd_filename(struct ksmbd_work *work, char *filename)
+-{
+-	struct ksmbd_file	*fp = NULL;
+-	unsigned int		id;
+-
+-	read_lock(&work->sess->file_table.lock);
+-	idr_for_each_entry(work->sess->file_table.idr, fp, id) {
+-		if (!strcmp(fp->filename, filename)) {
+-			fp = ksmbd_fp_get(fp);
+-			break;
+-		}
+-	}
+-	read_unlock(&work->sess->file_table.lock);
+-
+-	return fp;
+-}
+-
+ struct ksmbd_file *ksmbd_lookup_fd_inode(struct inode *inode)
+ {
+ 	struct ksmbd_file	*lfp;
+@@ -617,32 +576,6 @@ struct ksmbd_file *ksmbd_open_fd(struct ksmbd_work *work, struct file *filp)
+ 	return fp;
+ }
+ 
+-static inline bool is_reconnectable(struct ksmbd_file *fp)
+-{
+-	struct oplock_info *opinfo = opinfo_get(fp);
+-	bool reconn = false;
+-
+-	if (!opinfo)
+-		return false;
+-
+-	if (opinfo->op_state != OPLOCK_STATE_NONE) {
+-		opinfo_put(opinfo);
+-		return false;
+-	}
+-
+-	if (fp->is_resilient || fp->is_persistent)
+-		reconn = true;
+-	else if (fp->is_durable && opinfo->is_lease &&
+-		 opinfo->o_lease->state & SMB2_LEASE_HANDLE_CACHING_LE)
+-		reconn = true;
+-
+-	else if (fp->is_durable && opinfo->level == SMB2_OPLOCK_LEVEL_BATCH)
+-		reconn = true;
+-
+-	opinfo_put(opinfo);
+-	return reconn;
+-}
+-
+ static int
+ __close_file_table_ids(struct ksmbd_file_table *ft, struct ksmbd_tree_connect *tcon,
+ 		bool (*skip)(struct ksmbd_tree_connect *tcon, struct ksmbd_file *fp))
+@@ -672,13 +605,7 @@ static bool tree_conn_fd_check(struct ksmbd_tree_connect *tcon, struct ksmbd_fil
+ 
+ static bool session_fd_check(struct ksmbd_tree_connect *tcon, struct ksmbd_file *fp)
+ {
+-	if (!is_reconnectable(fp))
+-		return false;
+-
+-	fp->conn = NULL;
+-	fp->tcon = NULL;
+-	fp->volatile_id = KSMBD_NO_FID;
+-	return true;
++	return false;
+ }
+ 
+ void ksmbd_close_tree_conn_fds(struct ksmbd_work *work)
+@@ -717,31 +644,6 @@ void ksmbd_free_global_file_table(void)
+ 	ksmbd_destroy_file_table(&global_ft);
+ }
+ 
+-int ksmbd_reopen_durable_fd(struct ksmbd_work *work, struct ksmbd_file *fp)
+-{
+-	if (!fp->is_durable || fp->conn || fp->tcon) {
+-		ksmbd_err("Invalid durable fd [%p:%p]\n",
+-				fp->conn, fp->tcon);
+-		return -EBADF;
+-	}
+-
+-	if (HAS_FILE_ID(fp->volatile_id)) {
+-		ksmbd_err("Still in use durable fd: %u\n", fp->volatile_id);
+-		return -EBADF;
+-	}
+-
+-	fp->conn = work->sess->conn;
+-	fp->tcon = work->tcon;
+-
+-	__open_id(&work->sess->file_table, fp, OPEN_ID_TYPE_VOLATILE_ID);
+-	if (!HAS_FILE_ID(fp->volatile_id)) {
+-		fp->conn = NULL;
+-		fp->tcon = NULL;
+-		return -EBADF;
+-	}
+-	return 0;
+-}
+-
+ int ksmbd_file_table_flush(struct ksmbd_work *work)
+ {
+ 	struct ksmbd_file	*fp = NULL;
+diff --git a/fs/cifsd/vfs_cache.h b/fs/cifsd/vfs_cache.h
+index ce2047dda36a..5638641dd0cf 100644
+--- a/fs/cifsd/vfs_cache.h
++++ b/fs/cifsd/vfs_cache.h
+@@ -90,9 +90,6 @@ struct ksmbd_file {
+ 	__u64				create_time;
+ 	__u64				itime;
+ 
+-	bool				is_durable;
+-	bool				is_resilient;
+-	bool				is_persistent;
+ 	bool				is_nt_open;
+ 	bool				attrib_only;
+ 
+@@ -154,17 +151,14 @@ struct ksmbd_file *ksmbd_lookup_foreign_fd(struct ksmbd_work *work, unsigned int
+ struct ksmbd_file *ksmbd_lookup_fd_slow(struct ksmbd_work *work, unsigned int id,
+ 		unsigned int pid);
+ void ksmbd_fd_put(struct ksmbd_work *work, struct ksmbd_file *fp);
+-int ksmbd_close_fd_app_id(struct ksmbd_work *work, char *app_id);
+ struct ksmbd_file *ksmbd_lookup_durable_fd(unsigned long long id);
+ struct ksmbd_file *ksmbd_lookup_fd_cguid(char *cguid);
+-struct ksmbd_file *ksmbd_lookup_fd_filename(struct ksmbd_work *work, char *filename);
+ struct ksmbd_file *ksmbd_lookup_fd_inode(struct inode *inode);
+ unsigned int ksmbd_open_durable_fd(struct ksmbd_file *fp);
+ struct ksmbd_file *ksmbd_open_fd(struct ksmbd_work *work, struct file *filp);
+ void ksmbd_close_tree_conn_fds(struct ksmbd_work *work);
+ void ksmbd_close_session_fds(struct ksmbd_work *work);
+ int ksmbd_close_inode_fds(struct ksmbd_work *work, struct inode *inode);
+-int ksmbd_reopen_durable_fd(struct ksmbd_work *work, struct ksmbd_file *fp);
+ int ksmbd_init_global_file_table(void);
+ void ksmbd_free_global_file_table(void);
+ int ksmbd_file_table_flush(struct ksmbd_work *work);
+-- 
+2.33.0
+

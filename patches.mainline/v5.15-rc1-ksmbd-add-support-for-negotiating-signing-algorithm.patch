@@ -1,0 +1,203 @@
+From 378087cd17eea71c4e78e6053597e38429ccee0f Mon Sep 17 00:00:00 2001
+From: Namjae Jeon <namjae.jeon@samsung.com>
+Date: Wed, 21 Jul 2021 10:05:53 +0900
+Subject: [PATCH] ksmbd: add support for negotiating signing algorithm
+Git-commit: 378087cd17eea71c4e78e6053597e38429ccee0f
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+Support for faster packet signing (using GMAC instead of CMAC) can
+now be negotiated to some newer servers, including Windows.
+See MS-SMB2 section 2.2.3.17.
+
+This patch adds support for sending the new negotiate context with two
+supported signing algorithms(AES-CMAC, HMAC-SHA256).
+If client add support for AES_GMAC, Server will be supported later
+depend on it.
+
+Signed-off-by: Namjae Jeon <namjae.jeon@samsung.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/ksmbd/connection.h |  2 ++
+ fs/ksmbd/smb2ops.c    |  4 +++
+ fs/ksmbd/smb2pdu.c    | 58 +++++++++++++++++++++++++++++++++++++++++++
+ fs/ksmbd/smb2pdu.h    | 14 +++++++++++
+ 4 files changed, 78 insertions(+)
+
+diff --git a/fs/ksmbd/connection.h b/fs/ksmbd/connection.h
+index 487c2024b0d5..e5403c587a58 100644
+--- a/fs/ksmbd/connection.h
++++ b/fs/ksmbd/connection.h
+@@ -109,6 +109,8 @@ struct ksmbd_conn {
+ 	__le16				cipher_type;
+ 	__le16				compress_algorithm;
+ 	bool				posix_ext_supported;
++	bool				signing_negotiated;
++	__le16				signing_algorithm;
+ 	bool				binding;
+ };
+ 
+diff --git a/fs/ksmbd/smb2ops.c b/fs/ksmbd/smb2ops.c
+index 8262908e467c..197473871aa4 100644
+--- a/fs/ksmbd/smb2ops.c
++++ b/fs/ksmbd/smb2ops.c
+@@ -204,6 +204,7 @@ void init_smb2_1_server(struct ksmbd_conn *conn)
+ 	conn->cmds = smb2_0_server_cmds;
+ 	conn->max_cmds = ARRAY_SIZE(smb2_0_server_cmds);
+ 	conn->max_credits = SMB2_MAX_CREDITS;
++	conn->signing_algorithm = SIGNING_ALG_HMAC_SHA256;
+ 
+ 	if (server_conf.flags & KSMBD_GLOBAL_FLAG_SMB2_LEASES)
+ 		conn->vals->capabilities |= SMB2_GLOBAL_CAP_LEASING;
+@@ -221,6 +222,7 @@ void init_smb3_0_server(struct ksmbd_conn *conn)
+ 	conn->cmds = smb2_0_server_cmds;
+ 	conn->max_cmds = ARRAY_SIZE(smb2_0_server_cmds);
+ 	conn->max_credits = SMB2_MAX_CREDITS;
++	conn->signing_algorithm = SIGNING_ALG_AES_CMAC;
+ 
+ 	if (server_conf.flags & KSMBD_GLOBAL_FLAG_SMB2_LEASES)
+ 		conn->vals->capabilities |= SMB2_GLOBAL_CAP_LEASING;
+@@ -245,6 +247,7 @@ void init_smb3_02_server(struct ksmbd_conn *conn)
+ 	conn->cmds = smb2_0_server_cmds;
+ 	conn->max_cmds = ARRAY_SIZE(smb2_0_server_cmds);
+ 	conn->max_credits = SMB2_MAX_CREDITS;
++	conn->signing_algorithm = SIGNING_ALG_AES_CMAC;
+ 
+ 	if (server_conf.flags & KSMBD_GLOBAL_FLAG_SMB2_LEASES)
+ 		conn->vals->capabilities |= SMB2_GLOBAL_CAP_LEASING;
+@@ -269,6 +272,7 @@ int init_smb3_11_server(struct ksmbd_conn *conn)
+ 	conn->cmds = smb2_0_server_cmds;
+ 	conn->max_cmds = ARRAY_SIZE(smb2_0_server_cmds);
+ 	conn->max_credits = SMB2_MAX_CREDITS;
++	conn->signing_algorithm = SIGNING_ALG_AES_CMAC;
+ 
+ 	if (server_conf.flags & KSMBD_GLOBAL_FLAG_SMB2_LEASES)
+ 		conn->vals->capabilities |= SMB2_GLOBAL_CAP_LEASING;
+diff --git a/fs/ksmbd/smb2pdu.c b/fs/ksmbd/smb2pdu.c
+index 64a4d66997a3..7e6e3d8c20e8 100644
+--- a/fs/ksmbd/smb2pdu.c
++++ b/fs/ksmbd/smb2pdu.c
+@@ -786,6 +786,18 @@ static void build_compression_ctxt(struct smb2_compression_ctx *pneg_ctxt,
+ 	pneg_ctxt->CompressionAlgorithms[0] = comp_algo;
+ }
+ 
++static void build_sign_cap_ctxt(struct smb2_signing_capabilities *pneg_ctxt,
++				__le16 sign_algo)
++{
++	pneg_ctxt->ContextType = SMB2_SIGNING_CAPABILITIES;
++	pneg_ctxt->DataLength =
++		cpu_to_le16((sizeof(struct smb2_signing_capabilities) + 2)
++			- sizeof(struct smb2_neg_context));
++	pneg_ctxt->Reserved = cpu_to_le32(0);
++	pneg_ctxt->SigningAlgorithmCount = cpu_to_le16(1);
++	pneg_ctxt->SigningAlgorithms[0] = sign_algo;
++}
++
+ static void build_posix_ctxt(struct smb2_posix_neg_context *pneg_ctxt)
+ {
+ 	pneg_ctxt->ContextType = SMB2_POSIX_EXTENSIONS_AVAILABLE;
+@@ -863,6 +875,18 @@ static void assemble_neg_contexts(struct ksmbd_conn *conn,
+ 		build_posix_ctxt((struct smb2_posix_neg_context *)pneg_ctxt);
+ 		rsp->NegotiateContextCount = cpu_to_le16(++neg_ctxt_cnt);
+ 		ctxt_size += sizeof(struct smb2_posix_neg_context);
++		/* Round to 8 byte boundary */
++		pneg_ctxt += round_up(sizeof(struct smb2_posix_neg_context), 8);
++	}
++
++	if (conn->signing_negotiated) {
++		ctxt_size = round_up(ctxt_size, 8);
++		ksmbd_debug(SMB,
++			    "assemble SMB2_SIGNING_CAPABILITIES context\n");
++		build_sign_cap_ctxt((struct smb2_signing_capabilities *)pneg_ctxt,
++				    conn->signing_algorithm);
++		rsp->NegotiateContextCount = cpu_to_le16(++neg_ctxt_cnt);
++		ctxt_size += sizeof(struct smb2_signing_capabilities) + 2;
+ 	}
+ 
+ 	inc_rfc1001_len(rsp, ctxt_size);
+@@ -919,6 +943,34 @@ static void decode_compress_ctxt(struct ksmbd_conn *conn,
+ 	conn->compress_algorithm = SMB3_COMPRESS_NONE;
+ }
+ 
++static void decode_sign_cap_ctxt(struct ksmbd_conn *conn,
++				 struct smb2_signing_capabilities *pneg_ctxt,
++				 int len_of_ctxts)
++{
++	int sign_algo_cnt = le16_to_cpu(pneg_ctxt->SigningAlgorithmCount);
++	int i, sign_alos_size = sign_algo_cnt * sizeof(__le16);
++
++	conn->signing_negotiated = false;
++
++	if (sizeof(struct smb2_signing_capabilities) + sign_alos_size >
++	    len_of_ctxts) {
++		pr_err("Invalid signing algorithm count(%d)\n", sign_algo_cnt);
++		return;
++	}
++
++	for (i = 0; i < sign_algo_cnt; i++) {
++		if (pneg_ctxt->SigningAlgorithms[i] == SIGNING_ALG_HMAC_SHA256 ||
++		    pneg_ctxt->SigningAlgorithms[i] == SIGNING_ALG_AES_CMAC) {
++			ksmbd_debug(SMB, "Signing Algorithm ID = 0x%x\n",
++				    pneg_ctxt->SigningAlgorithms[i]);
++			conn->signing_negotiated = true;
++			conn->signing_algorithm =
++				pneg_ctxt->SigningAlgorithms[i];
++			break;
++		}
++	}
++}
++
+ static __le32 deassemble_neg_contexts(struct ksmbd_conn *conn,
+ 				      struct smb2_negotiate_req *req)
+ {
+@@ -987,6 +1039,12 @@ static __le32 deassemble_neg_contexts(struct ksmbd_conn *conn,
+ 			ksmbd_debug(SMB,
+ 				    "deassemble SMB2_POSIX_EXTENSIONS_AVAILABLE context\n");
+ 			conn->posix_ext_supported = true;
++		} else if (pctx->ContextType == SMB2_SIGNING_CAPABILITIES) {
++			ksmbd_debug(SMB,
++				    "deassemble SMB2_SIGNING_CAPABILITIES context\n");
++			decode_sign_cap_ctxt(conn,
++					     (struct smb2_signing_capabilities *)pctx,
++					     len_of_ctxts);
+ 		}
+ 
+ 		/* offsets must be 8 byte aligned */
+diff --git a/fs/ksmbd/smb2pdu.h b/fs/ksmbd/smb2pdu.h
+index 21cb93e771f7..89019f67234c 100644
+--- a/fs/ksmbd/smb2pdu.h
++++ b/fs/ksmbd/smb2pdu.h
+@@ -268,6 +268,7 @@ struct preauth_integrity_info {
+ #define SMB2_ENCRYPTION_CAPABILITIES		cpu_to_le16(2)
+ #define SMB2_COMPRESSION_CAPABILITIES		cpu_to_le16(3)
+ #define SMB2_NETNAME_NEGOTIATE_CONTEXT_ID	cpu_to_le16(5)
++#define SMB2_SIGNING_CAPABILITIES		cpu_to_le16(8)
+ #define SMB2_POSIX_EXTENSIONS_AVAILABLE		cpu_to_le16(0x100)
+ 
+ struct smb2_neg_context {
+@@ -332,6 +333,19 @@ struct smb2_netname_neg_context {
+ 	__le16	NetName[]; /* hostname of target converted to UCS-2 */
+ } __packed;
+ 
++/* Signing algorithms */
++#define SIGNING_ALG_HMAC_SHA256		cpu_to_le16(0)
++#define SIGNING_ALG_AES_CMAC		cpu_to_le16(1)
++#define SIGNING_ALG_AES_GMAC		cpu_to_le16(2)
++
++struct smb2_signing_capabilities {
++	__le16	ContextType; /* 8 */
++	__le16	DataLength;
++	__le32	Reserved;
++	__le16	SigningAlgorithmCount;
++	__le16	SigningAlgorithms[];
++} __packed;
++
+ struct smb2_negotiate_rsp {
+ 	struct smb2_hdr hdr;
+ 	__le16 StructureSize;	/* Must be 65 */
+-- 
+2.33.0
+

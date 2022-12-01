@@ -1,0 +1,169 @@
+From 849f59e1a18adecf0617afc82efbfc5d126c49f8 Mon Sep 17 00:00:00 2001
+From: Dan Carpenter <dan.carpenter@oracle.com>
+Date: Tue, 23 Mar 2021 16:27:04 +0300
+Subject: [PATCH] cifsd: fix error handling in ksmbd_server_init()
+Git-commit: 849f59e1a18adecf0617afc82efbfc5d126c49f8
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+The error handling in ksmbd_server_init() uses "one function to free
+everything style" which is impossible to audit and leads to several
+canonical bugs.  When we free something that wasn't allocated it may be
+uninitialized, an error pointer, freed in a different function or we
+try freeing "foo->bar" when "foo" is a NULL pointer.  And since the
+code is impossible to audit then it leads to memory leaks.
+
+In the ksmbd_server_init() function, every goto will lead to a crash
+because we have not allocated the work queue but we call
+ksmbd_workqueue_destroy() which tries to flush a NULL work queue.
+Another bug is if ksmbd_init_buffer_pools() fails then it leads to a
+double free because we free "work_cache" twice.  A third type of bug is
+that we forgot to call ksmbd_release_inode_hash() so that is a resource
+leak.
+
+A better way to write error handling is for every function to clean up
+after itself and never leave things partially allocated.  Then we can
+use "free the last successfully allocated resource" style.  That way
+when someone is reading the code they can just track the last resource
+in their head and verify that the goto matches what they expect.
+
+In this patch I modified ksmbd_ipc_init() to clean up after itself and
+then I converted ksmbd_server_init() to use gotos to clean up.
+
+Fixes: cabcebc31de4 ("cifsd: introduce SMB3 kernel server")
+Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+Signed-off-by: Namjae Jeon <namjae.jeon@samsung.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/cifsd/server.c        | 33 +++++++++++++++++++++++----------
+ fs/cifsd/transport_ipc.c | 14 +++++++++++---
+ fs/cifsd/vfs_cache.c     |  2 +-
+ fs/cifsd/vfs_cache.h     |  2 +-
+ 4 files changed, 36 insertions(+), 15 deletions(-)
+
+diff --git a/fs/cifsd/server.c b/fs/cifsd/server.c
+index 85862c3ea7c0..31e454cb3ce2 100644
+--- a/fs/cifsd/server.c
++++ b/fs/cifsd/server.c
+@@ -567,39 +567,52 @@ static int __init ksmbd_server_init(void)
+ 
+ 	ret = server_conf_init();
+ 	if (ret)
+-		return ret;
++		goto err_unregister;
+ 
+ 	ret = ksmbd_init_buffer_pools();
+ 	if (ret)
+-		return ret;
++		goto err_unregister;
+ 
+ 	ret = ksmbd_init_session_table();
+ 	if (ret)
+-		goto error;
++		goto err_destroy_pools;
+ 
+ 	ret = ksmbd_ipc_init();
+ 	if (ret)
+-		goto error;
++		goto err_free_session_table;
+ 
+ 	ret = ksmbd_init_global_file_table();
+ 	if (ret)
+-		goto error;
++		goto err_ipc_release;
+ 
+ 	ret = ksmbd_inode_hash_init();
+ 	if (ret)
+-		goto error;
++		goto err_destroy_file_table;
+ 
+ 	ret = ksmbd_crypto_create();
+ 	if (ret)
+-		goto error;
++		goto err_release_inode_hash;
+ 
+ 	ret = ksmbd_workqueue_init();
+ 	if (ret)
+-		goto error;
++		goto err_crypto_destroy;
+ 	return 0;
+ 
+-error:
+-	ksmbd_server_shutdown();
++err_crypto_destroy:
++	ksmbd_crypto_destroy();
++err_release_inode_hash:
++	ksmbd_release_inode_hash();
++err_destroy_file_table:
++	ksmbd_free_global_file_table();
++err_ipc_release:
++	ksmbd_ipc_release();
++err_free_session_table:
++	ksmbd_free_session_table();
++err_destroy_pools:
++	ksmbd_destroy_buffer_pools();
++err_unregister:
++	class_unregister(&ksmbd_control_class);
++
+ 	return ret;
+ }
+ 
+diff --git a/fs/cifsd/transport_ipc.c b/fs/cifsd/transport_ipc.c
+index c49e46fda9b1..e5f4d97b2924 100644
+--- a/fs/cifsd/transport_ipc.c
++++ b/fs/cifsd/transport_ipc.c
+@@ -887,11 +887,19 @@ int ksmbd_ipc_init(void)
+ 	if (ret) {
+ 		ksmbd_err("Failed to register KSMBD netlink interface %d\n",
+ 				ret);
+-		return ret;
++		goto cancel_work;
+ 	}
+ 
+ 	ida = ksmbd_ida_alloc();
+-	if (!ida)
+-		return -ENOMEM;
++	if (!ida) {
++		ret = -ENOMEM;
++		goto unregister;
++	}
+ 	return 0;
++
++unregister:
++	genl_unregister_family(&ksmbd_genl_family);
++cancel_work:
++	cancel_delayed_work_sync(&ipc_timer_work);
++	return ret;
+ }
+diff --git a/fs/cifsd/vfs_cache.c b/fs/cifsd/vfs_cache.c
+index af92fab5b7ae..34e045f27230 100644
+--- a/fs/cifsd/vfs_cache.c
++++ b/fs/cifsd/vfs_cache.c
+@@ -236,7 +236,7 @@ int __init ksmbd_inode_hash_init(void)
+ 	return 0;
+ }
+ 
+-void __exit ksmbd_release_inode_hash(void)
++void ksmbd_release_inode_hash(void)
+ {
+ 	vfree(inode_hashtable);
+ }
+diff --git a/fs/cifsd/vfs_cache.h b/fs/cifsd/vfs_cache.h
+index 7d23657c86c6..04ab5967a9ae 100644
+--- a/fs/cifsd/vfs_cache.h
++++ b/fs/cifsd/vfs_cache.h
+@@ -194,7 +194,7 @@ void ksmbd_set_fd_limit(unsigned long limit);
+  */
+ 
+ int __init ksmbd_inode_hash_init(void);
+-void __exit ksmbd_release_inode_hash(void);
++void ksmbd_release_inode_hash(void);
+ 
+ enum KSMBD_INODE_STATUS {
+ 	KSMBD_INODE_STATUS_OK,
+-- 
+2.33.0
+

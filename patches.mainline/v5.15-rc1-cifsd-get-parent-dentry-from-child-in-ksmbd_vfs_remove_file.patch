@@ -1,0 +1,98 @@
+From 7c3d3e99ca29f0abd5443353fe018a1368f08c43 Mon Sep 17 00:00:00 2001
+From: Namjae Jeon <namjae.jeon@samsung.com>
+Date: Tue, 13 Apr 2021 13:20:52 +0900
+Subject: [PATCH] cifsd: get parent dentry from child in
+ ksmbd_vfs_remove_file()
+Git-commit: 7c3d3e99ca29f0abd5443353fe018a1368f08c43
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+To remove the file, We have parsed full pathname to divide parent path and
+filename. It is a better way to get parent dentry from child dentry that
+obtained by lookup with given pathname.
+
+Signed-off-by: Namjae Jeon <namjae.jeon@samsung.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/cifsd/vfs.c | 31 ++++++++++++++-----------------
+ 1 file changed, 14 insertions(+), 17 deletions(-)
+
+diff --git a/fs/cifsd/vfs.c b/fs/cifsd/vfs.c
+index f818aeff244f..010dfddb6240 100644
+--- a/fs/cifsd/vfs.c
++++ b/fs/cifsd/vfs.c
+@@ -578,31 +578,28 @@ int ksmbd_vfs_fsync(struct ksmbd_work *work, u64 fid, u64 p_id)
+  */
+ int ksmbd_vfs_remove_file(struct ksmbd_work *work, char *name)
+ {
+-	struct path parent;
+-	struct dentry *dentry;
+-	char *last;
++	struct path path;
++	struct dentry *dentry, *parent;
+ 	int err;
+ 
+-	last = extract_last_component(name);
+-	if (!last)
+-		return -EINVAL;
+-
+ 	if (ksmbd_override_fsids(work))
+ 		return -ENOMEM;
+ 
+-	err = kern_path(name, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &parent);
++	err = kern_path(name, LOOKUP_FOLLOW, &path);
+ 	if (err) {
+ 		ksmbd_debug(VFS, "can't get %s, err %d\n", name, err);
+ 		ksmbd_revert_fsids(work);
+-		rollback_path_modification(last);
+ 		return err;
+ 	}
+ 
+-	inode_lock_nested(d_inode(parent.dentry), I_MUTEX_PARENT);
+-	dentry = lookup_one_len(last, parent.dentry, strlen(last));
++	parent = dget_parent(path.dentry);
++	inode_lock_nested(d_inode(parent), I_MUTEX_PARENT);
++	dentry = lookup_one_len(path.dentry->d_name.name, parent,
++			strlen(path.dentry->d_name.name));
+ 	if (IS_ERR(dentry)) {
+ 		err = PTR_ERR(dentry);
+-		ksmbd_debug(VFS, "%s: lookup failed, err %d\n", last, err);
++		ksmbd_debug(VFS, "%s: lookup failed, err %d\n",
++				path.dentry->d_name.name, err);
+ 		goto out_err;
+ 	}
+ 
+@@ -613,12 +610,12 @@ int ksmbd_vfs_remove_file(struct ksmbd_work *work, char *name)
+ 	}
+ 
+ 	if (S_ISDIR(d_inode(dentry)->i_mode)) {
+-		err = vfs_rmdir(&init_user_ns, d_inode(parent.dentry), dentry);
++		err = vfs_rmdir(&init_user_ns, d_inode(parent), dentry);
+ 		if (err && err != -ENOTEMPTY)
+ 			ksmbd_debug(VFS, "%s: rmdir failed, err %d\n", name,
+ 				err);
+ 	} else {
+-		err = vfs_unlink(&init_user_ns, d_inode(parent.dentry), dentry, NULL);
++		err = vfs_unlink(&init_user_ns, d_inode(parent), dentry, NULL);
+ 		if (err)
+ 			ksmbd_debug(VFS, "%s: unlink failed, err %d\n", name,
+ 				err);
+@@ -626,9 +623,9 @@ int ksmbd_vfs_remove_file(struct ksmbd_work *work, char *name)
+ 
+ 	dput(dentry);
+ out_err:
+-	inode_unlock(d_inode(parent.dentry));
+-	rollback_path_modification(last);
+-	path_put(&parent);
++	inode_unlock(d_inode(parent));
++	dput(parent);
++	path_put(&path);
+ 	ksmbd_revert_fsids(work);
+ 	return err;
+ }
+-- 
+2.33.0
+

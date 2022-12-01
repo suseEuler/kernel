@@ -1,0 +1,624 @@
+From 79f6b11a104f3a32f4f4a6f7808a02c301c19710 Mon Sep 17 00:00:00 2001
+From: Namjae Jeon <namjae.jeon@samsung.com>
+Date: Fri, 2 Apr 2021 12:47:14 +0900
+Subject: [PATCH] cifsd: remove wrappers of kvmalloc/kvfree
+Git-commit: 79f6b11a104f3a32f4f4a6f7808a02c301c19710
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+Do directly call kvmalloc/kvfree().
+
+Signed-off-by: Namjae Jeon <namjae.jeon@samsung.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/cifsd/auth.c              |  2 +-
+ fs/cifsd/buffer_pool.c       | 36 +++-------------------------------
+ fs/cifsd/buffer_pool.h       |  8 --------
+ fs/cifsd/connection.c        |  6 +++---
+ fs/cifsd/crypto_ctx.c        |  4 ++--
+ fs/cifsd/ksmbd_work.c        |  8 ++++----
+ fs/cifsd/mgmt/share_config.c |  3 ++-
+ fs/cifsd/mgmt/tree_connect.c | 10 +++++-----
+ fs/cifsd/mgmt/user_config.c  |  3 ++-
+ fs/cifsd/mgmt/user_session.c |  4 ++--
+ fs/cifsd/smb2pdu.c           | 38 ++++++++++++++++++------------------
+ fs/cifsd/transport_ipc.c     |  6 +++---
+ fs/cifsd/vfs.c               | 23 +++++++++-------------
+ fs/cifsd/vfs.h               |  1 -
+ 14 files changed, 55 insertions(+), 97 deletions(-)
+
+diff --git a/fs/cifsd/auth.c b/fs/cifsd/auth.c
+index b9fd62f77e1c..437e58a0826d 100644
+--- a/fs/cifsd/auth.c
++++ b/fs/cifsd/auth.c
+@@ -709,7 +709,7 @@ int ksmbd_krb5_authenticate(struct ksmbd_session *sess, char *in_blob,
+ 	*out_len = resp->spnego_blob_len;
+ 	retval = 0;
+ out:
+-	ksmbd_free(resp);
++	kvfree(resp);
+ 	return retval;
+ }
+ #else
+diff --git a/fs/cifsd/buffer_pool.c b/fs/cifsd/buffer_pool.c
+index a9ef3e703232..caf22c190634 100644
+--- a/fs/cifsd/buffer_pool.c
++++ b/fs/cifsd/buffer_pool.c
+@@ -37,16 +37,6 @@ struct wm_list {
+ static LIST_HEAD(wm_lists);
+ static DEFINE_RWLOCK(wm_lists_lock);
+ 
+-void *ksmbd_alloc(size_t size)
+-{
+-	return kvmalloc(size, GFP_KERNEL | __GFP_ZERO);
+-}
+-
+-void ksmbd_free(void *ptr)
+-{
+-	kvfree(ptr);
+-}
+-
+ static struct wm *wm_alloc(size_t sz, gfp_t flags)
+ {
+ 	struct wm *wm;
+@@ -169,7 +159,7 @@ static void release_wm(struct wm *wm, struct wm_list *wm_list)
+ 
+ 	wm_list->avail_wm--;
+ 	spin_unlock(&wm_list->wm_lock);
+-	ksmbd_free(wm);
++	kvfree(wm);
+ }
+ 
+ static void wm_list_free(struct wm_list *l)
+@@ -195,26 +185,6 @@ static void wm_lists_destroy(void)
+ 	}
+ }
+ 
+-void ksmbd_free_request(void *addr)
+-{
+-	kvfree(addr);
+-}
+-
+-void *ksmbd_alloc_request(size_t size)
+-{
+-	return kvmalloc(size, GFP_KERNEL);
+-}
+-
+-void ksmbd_free_response(void *buffer)
+-{
+-	kvfree(buffer);
+-}
+-
+-void *ksmbd_alloc_response(size_t size)
+-{
+-	return kvmalloc(size, GFP_KERNEL | __GFP_ZERO);
+-}
+-
+ void *ksmbd_find_buffer(size_t size)
+ {
+ 	struct wm *wm;
+@@ -247,11 +217,11 @@ void *ksmbd_realloc_response(void *ptr, size_t old_sz, size_t new_sz)
+ 	size_t sz = min(old_sz, new_sz);
+ 	void *nptr;
+ 
+-	nptr = ksmbd_alloc_response(new_sz);
++	nptr = kvmalloc(new_sz, GFP_KERNEL | __GFP_ZERO);
+ 	if (!nptr)
+ 		return ptr;
+ 	memcpy(nptr, ptr, sz);
+-	ksmbd_free_response(ptr);
++	kvfree(ptr);
+ 	return nptr;
+ }
+ 
+diff --git a/fs/cifsd/buffer_pool.h b/fs/cifsd/buffer_pool.h
+index 2b3d03afcf27..f7157144a92f 100644
+--- a/fs/cifsd/buffer_pool.h
++++ b/fs/cifsd/buffer_pool.h
+@@ -9,14 +9,6 @@
+ void *ksmbd_find_buffer(size_t size);
+ void ksmbd_release_buffer(void *buffer);
+ 
+-void *ksmbd_alloc(size_t size);
+-void ksmbd_free(void *ptr);
+-
+-void ksmbd_free_request(void *addr);
+-void *ksmbd_alloc_request(size_t size);
+-void ksmbd_free_response(void *buffer);
+-void *ksmbd_alloc_response(size_t size);
+-
+ void *ksmbd_realloc_response(void *ptr, size_t old_sz, size_t new_sz);
+ 
+ void ksmbd_free_file_struct(void *filp);
+diff --git a/fs/cifsd/connection.c b/fs/cifsd/connection.c
+index df56e347b709..e1814492fb58 100644
+--- a/fs/cifsd/connection.c
++++ b/fs/cifsd/connection.c
+@@ -37,7 +37,7 @@ void ksmbd_conn_free(struct ksmbd_conn *conn)
+ 	list_del(&conn->conns_list);
+ 	write_unlock(&conn_list_lock);
+ 
+-	ksmbd_free_request(conn->request_buf);
++	kvfree(conn->request_buf);
+ 	ksmbd_ida_free(conn->async_ida);
+ 	kfree(conn->preauth_info);
+ 	kfree(conn);
+@@ -284,7 +284,7 @@ int ksmbd_conn_handler_loop(void *p)
+ 		if (try_to_freeze())
+ 			continue;
+ 
+-		ksmbd_free_request(conn->request_buf);
++		kvfree(conn->request_buf);
+ 		conn->request_buf = NULL;
+ 
+ 		size = t->ops->read(t, hdr_buf, sizeof(hdr_buf));
+@@ -303,7 +303,7 @@ int ksmbd_conn_handler_loop(void *p)
+ 
+ 		/* 4 for rfc1002 length field */
+ 		size = pdu_size + 4;
+-		conn->request_buf = ksmbd_alloc_request(size);
++		conn->request_buf = kvmalloc(size, GFP_KERNEL);
+ 		if (!conn->request_buf)
+ 			continue;
+ 
+diff --git a/fs/cifsd/crypto_ctx.c b/fs/cifsd/crypto_ctx.c
+index 15d7e2f7c3d7..2c31e8b32de7 100644
+--- a/fs/cifsd/crypto_ctx.c
++++ b/fs/cifsd/crypto_ctx.c
+@@ -105,7 +105,7 @@ static struct shash_desc *alloc_shash_desc(int id)
+ 
+ static struct ksmbd_crypto_ctx *ctx_alloc(void)
+ {
+-	return ksmbd_alloc(sizeof(struct ksmbd_crypto_ctx));
++	return kzalloc(sizeof(struct ksmbd_crypto_ctx), GFP_KERNEL);
+ }
+ 
+ static void ctx_free(struct ksmbd_crypto_ctx *ctx)
+@@ -116,7 +116,7 @@ static void ctx_free(struct ksmbd_crypto_ctx *ctx)
+ 		free_shash(ctx->desc[i]);
+ 	for (i = 0; i < CRYPTO_AEAD_MAX; i++)
+ 		free_aead(ctx->ccmaes[i]);
+-	ksmbd_free(ctx);
++	kfree(ctx);
+ }
+ 
+ static struct ksmbd_crypto_ctx *ksmbd_find_crypto_ctx(void)
+diff --git a/fs/cifsd/ksmbd_work.c b/fs/cifsd/ksmbd_work.c
+index 505e59df3071..33ee52c1829f 100644
+--- a/fs/cifsd/ksmbd_work.c
++++ b/fs/cifsd/ksmbd_work.c
+@@ -42,16 +42,16 @@ void ksmbd_free_work_struct(struct ksmbd_work *work)
+ 			work->set_trans_buf)
+ 		ksmbd_release_buffer(work->response_buf);
+ 	else
+-		ksmbd_free_response(work->response_buf);
++		kvfree(work->response_buf);
+ 
+ 	if (server_conf.flags & KSMBD_GLOBAL_FLAG_CACHE_RBUF &&
+ 			work->set_read_buf)
+ 		ksmbd_release_buffer(work->aux_payload_buf);
+ 	else
+-		ksmbd_free_response(work->aux_payload_buf);
++		kvfree(work->aux_payload_buf);
+ 
+-	ksmbd_free_response(work->tr_buf);
+-	ksmbd_free_request(work->request_buf);
++	kfree(work->tr_buf);
++	kvfree(work->request_buf);
+ 	if (work->async_id)
+ 		ksmbd_release_id(work->conn->async_ida, work->async_id);
+ 	kmem_cache_free(work_cache, work);
+diff --git a/fs/cifsd/mgmt/share_config.c b/fs/cifsd/mgmt/share_config.c
+index 11abdbc8a533..910d03516b73 100644
+--- a/fs/cifsd/mgmt/share_config.c
++++ b/fs/cifsd/mgmt/share_config.c
+@@ -10,6 +10,7 @@
+ #include <linux/parser.h>
+ #include <linux/namei.h>
+ #include <linux/sched.h>
++#include <linux/mm.h>
+ 
+ #include "share_config.h"
+ #include "user_config.h"
+@@ -182,7 +183,7 @@ static struct ksmbd_share_config *share_config_request(char *name)
+ 	up_write(&shares_table_lock);
+ 
+ out:
+-	ksmbd_free(resp);
++	kvfree(resp);
+ 	return share;
+ }
+ 
+diff --git a/fs/cifsd/mgmt/tree_connect.c b/fs/cifsd/mgmt/tree_connect.c
+index 0c8374e8240f..d3f28b10db4b 100644
+--- a/fs/cifsd/mgmt/tree_connect.c
++++ b/fs/cifsd/mgmt/tree_connect.c
+@@ -31,7 +31,7 @@ ksmbd_tree_conn_connect(struct ksmbd_session *sess, char *share_name)
+ 	if (!sc)
+ 		return status;
+ 
+-	tree_conn = ksmbd_alloc(sizeof(struct ksmbd_tree_connect));
++	tree_conn = kzalloc(sizeof(struct ksmbd_tree_connect), GFP_KERNEL);
+ 	if (!tree_conn) {
+ 		status.ret = -ENOMEM;
+ 		goto out_error;
+@@ -68,15 +68,15 @@ ksmbd_tree_conn_connect(struct ksmbd_session *sess, char *share_name)
+ 		status.ret = -ENOMEM;
+ 		goto out_error;
+ 	}
+-	ksmbd_free(resp);
++	kvfree(resp);
+ 	return status;
+ 
+ out_error:
+ 	if (tree_conn)
+ 		ksmbd_release_tree_conn_id(sess, tree_conn->id);
+ 	ksmbd_share_config_put(sc);
+-	ksmbd_free(tree_conn);
+-	ksmbd_free(resp);
++	kfree(tree_conn);
++	kvfree(resp);
+ 	return status;
+ }
+ 
+@@ -89,7 +89,7 @@ int ksmbd_tree_conn_disconnect(struct ksmbd_session *sess,
+ 	ksmbd_release_tree_conn_id(sess, tree_conn->id);
+ 	xa_erase(&sess->tree_conns, tree_conn->id);
+ 	ksmbd_share_config_put(tree_conn->share_conf);
+-	ksmbd_free(tree_conn);
++	kfree(tree_conn);
+ 	return ret;
+ }
+ 
+diff --git a/fs/cifsd/mgmt/user_config.c b/fs/cifsd/mgmt/user_config.c
+index c31e2c4d2d6f..7f898c5bda25 100644
+--- a/fs/cifsd/mgmt/user_config.c
++++ b/fs/cifsd/mgmt/user_config.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include <linux/slab.h>
++#include <linux/mm.h>
+ 
+ #include "user_config.h"
+ #include "../buffer_pool.h"
+@@ -23,7 +24,7 @@ struct ksmbd_user *ksmbd_login_user(const char *account)
+ 
+ 	user = ksmbd_alloc_user(resp);
+ out:
+-	ksmbd_free(resp);
++	kvfree(resp);
+ 	return user;
+ }
+ 
+diff --git a/fs/cifsd/mgmt/user_session.c b/fs/cifsd/mgmt/user_session.c
+index 9dfe222e51ab..bd5789b7e08e 100644
+--- a/fs/cifsd/mgmt/user_session.c
++++ b/fs/cifsd/mgmt/user_session.c
+@@ -53,7 +53,7 @@ static void __session_rpc_close(struct ksmbd_session *sess,
+ 	if (!resp)
+ 		pr_err("Unable to close RPC pipe %d\n", entry->id);
+ 
+-	ksmbd_free(resp);
++	kvfree(resp);
+ 	ksmbd_rpc_id_free(entry->id);
+ 	kfree(entry);
+ }
+@@ -117,7 +117,7 @@ int ksmbd_session_rpc_open(struct ksmbd_session *sess, char *rpc_name)
+ 	if (!resp)
+ 		goto error;
+ 
+-	ksmbd_free(resp);
++	kvfree(resp);
+ 	return entry->id;
+ error:
+ 	list_del(&entry->list);
+diff --git a/fs/cifsd/smb2pdu.c b/fs/cifsd/smb2pdu.c
+index e6cdc3b89d85..c1f6361603b9 100644
+--- a/fs/cifsd/smb2pdu.c
++++ b/fs/cifsd/smb2pdu.c
+@@ -563,7 +563,7 @@ int smb2_allocate_rsp_buf(struct ksmbd_work *work)
+ 			work->set_trans_buf)
+ 		work->response_buf = ksmbd_find_buffer(sz);
+ 	else
+-		work->response_buf = ksmbd_alloc_response(sz);
++		work->response_buf = kvmalloc(sz, GFP_KERNEL | __GFP_ZERO);
+ 
+ 	if (!work->response_buf) {
+ 		ksmbd_err("Failed to allocate %zu bytes buffer\n", sz);
+@@ -2283,7 +2283,7 @@ static int smb2_remove_smb_xattrs(struct dentry *dentry)
+ 			ksmbd_debug(SMB, "remove xattr failed : %s\n", name);
+ 	}
+ out:
+-	ksmbd_vfs_xattr_free(xattr_list);
++	kvfree(xattr_list);
+ 	return err;
+ }
+ 
+@@ -4190,12 +4190,12 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
+ 
+ 		buf_free_len -= value_len;
+ 		if (buf_free_len < 0) {
+-			ksmbd_free(buf);
++			kfree(buf);
+ 			break;
+ 		}
+ 
+ 		memcpy(ptr, buf, value_len);
+-		ksmbd_free(buf);
++		kfree(buf);
+ 
+ 		ptr += value_len;
+ 		eainfo->Flags = 0;
+@@ -4240,7 +4240,7 @@ static int smb2_get_ea(struct ksmbd_work *work, struct ksmbd_file *fp,
+ 	rsp->OutputBufferLength = cpu_to_le32(rsp_data_cnt);
+ 	inc_rfc1001_len(rsp_org, rsp_data_cnt);
+ out:
+-	ksmbd_vfs_xattr_free(xattr_list);
++	kvfree(xattr_list);
+ 	return rc;
+ }
+ 
+@@ -4510,7 +4510,7 @@ static void get_file_stream_info(struct ksmbd_work *work,
+ 	/* last entry offset should be 0 */
+ 	file_info->NextEntryOffset = 0;
+ out:
+-	ksmbd_vfs_xattr_free(xattr_list);
++	kvfree(xattr_list);
+ 
+ 	rsp->OutputBufferLength = cpu_to_le32(nbytes);
+ 	inc_rfc1001_len(rsp_org, nbytes);
+@@ -5976,7 +5976,7 @@ static noinline int smb2_read_pipe(struct ksmbd_work *work)
+ 		}
+ 
+ 		work->aux_payload_buf =
+-			ksmbd_alloc_response(rpc_resp->payload_sz);
++			kvmalloc(rpc_resp->payload_sz, GFP_KERNEL | __GFP_ZERO);
+ 		if (!work->aux_payload_buf) {
+ 			err = -ENOMEM;
+ 			goto out;
+@@ -5988,7 +5988,7 @@ static noinline int smb2_read_pipe(struct ksmbd_work *work)
+ 		nbytes = rpc_resp->payload_sz;
+ 		work->resp_hdr_sz = get_rfc1002_len(rsp) + 4;
+ 		work->aux_payload_sz = nbytes;
+-		ksmbd_free(rpc_resp);
++		kvfree(rpc_resp);
+ 	}
+ 
+ 	rsp->StructureSize = cpu_to_le16(17);
+@@ -6003,7 +6003,7 @@ static noinline int smb2_read_pipe(struct ksmbd_work *work)
+ out:
+ 	rsp->hdr.Status = STATUS_UNEXPECTED_IO_ERROR;
+ 	smb2_set_err_rsp(work);
+-	ksmbd_free(rpc_resp);
++	kvfree(rpc_resp);
+ 	return err;
+ }
+ 
+@@ -6094,7 +6094,7 @@ int smb2_read(struct ksmbd_work *work)
+ 			ksmbd_find_buffer(conn->vals->max_read_size);
+ 		work->set_read_buf = true;
+ 	} else {
+-		work->aux_payload_buf = ksmbd_alloc_response(length);
++		work->aux_payload_buf = kvmalloc(length, GFP_KERNEL | __GFP_ZERO);
+ 	}
+ 	if (!work->aux_payload_buf) {
+ 		err = -ENOMEM;
+@@ -6111,7 +6111,7 @@ int smb2_read(struct ksmbd_work *work)
+ 		if (server_conf.flags & KSMBD_GLOBAL_FLAG_CACHE_RBUF)
+ 			ksmbd_release_buffer(work->aux_payload_buf);
+ 		else
+-			ksmbd_free_response(work->aux_payload_buf);
++			kvfree(work->aux_payload_buf);
+ 		work->aux_payload_buf = NULL;
+ 		rsp->hdr.Status = STATUS_END_OF_FILE;
+ 		smb2_set_err_rsp(work);
+@@ -6130,7 +6130,7 @@ int smb2_read(struct ksmbd_work *work)
+ 		if (server_conf.flags & KSMBD_GLOBAL_FLAG_CACHE_RBUF)
+ 			ksmbd_release_buffer(work->aux_payload_buf);
+ 		else
+-			ksmbd_free_response(work->aux_payload_buf);
++			kvfree(work->aux_payload_buf);
+ 		work->aux_payload_buf = NULL;
+ 
+ 		nbytes = 0;
+@@ -6215,17 +6215,17 @@ static noinline int smb2_write_pipe(struct ksmbd_work *work)
+ 	if (rpc_resp) {
+ 		if (rpc_resp->flags == KSMBD_RPC_ENOTIMPLEMENTED) {
+ 			rsp->hdr.Status = STATUS_NOT_SUPPORTED;
+-			ksmbd_free(rpc_resp);
++			kvfree(rpc_resp);
+ 			smb2_set_err_rsp(work);
+ 			return -EOPNOTSUPP;
+ 		}
+ 		if (rpc_resp->flags != KSMBD_RPC_OK) {
+ 			rsp->hdr.Status = STATUS_INVALID_HANDLE;
+ 			smb2_set_err_rsp(work);
+-			ksmbd_free(rpc_resp);
++			kvfree(rpc_resp);
+ 			return ret;
+ 		}
+-		ksmbd_free(rpc_resp);
++		kvfree(rpc_resp);
+ 	}
+ 
+ 	rsp->StructureSize = cpu_to_le16(17);
+@@ -6271,7 +6271,7 @@ static ssize_t smb2_write_rdma_channel(struct ksmbd_work *work,
+ 		(req->Channel == SMB2_CHANNEL_RDMA_V1_INVALIDATE);
+ 	work->remote_key = le32_to_cpu(desc->token);
+ 
+-	data_buf = ksmbd_alloc_response(length);
++	data_buf = kvmalloc(length, GFP_KERNEL | __GFP_ZERO);
+ 	if (!data_buf)
+ 		return -ENOMEM;
+ 
+@@ -6280,12 +6280,12 @@ static ssize_t smb2_write_rdma_channel(struct ksmbd_work *work,
+ 				le64_to_cpu(desc->offset),
+ 				le32_to_cpu(desc->length));
+ 	if (ret < 0) {
+-		ksmbd_free_response(data_buf);
++		kvfree(data_buf);
+ 		return ret;
+ 	}
+ 
+ 	ret = ksmbd_vfs_write(work, fp, data_buf, length, &offset, sync, &nbytes);
+-	ksmbd_free_response(data_buf);
++	kvfree(data_buf);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -7307,7 +7307,7 @@ static int fsctl_pipe_transceive(struct ksmbd_work *work, u64 id,
+ 		memcpy((char *)rsp->Buffer, rpc_resp->payload, nbytes);
+ 	}
+ out:
+-	ksmbd_free(rpc_resp);
++	kvfree(rpc_resp);
+ 	return nbytes;
+ }
+ 
+diff --git a/fs/cifsd/transport_ipc.c b/fs/cifsd/transport_ipc.c
+index 1bbff53436b3..60c0289402c1 100644
+--- a/fs/cifsd/transport_ipc.c
++++ b/fs/cifsd/transport_ipc.c
+@@ -233,7 +233,7 @@ static struct ksmbd_ipc_msg *ipc_msg_alloc(size_t sz)
+ 	struct ksmbd_ipc_msg *msg;
+ 	size_t msg_sz = sz + sizeof(struct ksmbd_ipc_msg);
+ 
+-	msg = ksmbd_alloc(msg_sz);
++	msg = kvmalloc(msg_sz, GFP_KERNEL | __GFP_ZERO);
+ 	if (msg)
+ 		msg->sz = sz;
+ 	return msg;
+@@ -241,7 +241,7 @@ static struct ksmbd_ipc_msg *ipc_msg_alloc(size_t sz)
+ 
+ static void ipc_msg_free(struct ksmbd_ipc_msg *msg)
+ {
+-	ksmbd_free(msg);
++	kvfree(msg);
+ }
+ 
+ static void ipc_msg_handle_free(int handle)
+@@ -272,7 +272,7 @@ static int handle_response(int type, void *payload, size_t sz)
+ 				entry->type + 1, type);
+ 		}
+ 
+-		entry->response = ksmbd_alloc(sz);
++		entry->response = kvmalloc(sz, GFP_KERNEL | __GFP_ZERO);
+ 		if (!entry->response) {
+ 			ret = -ENOMEM;
+ 			break;
+diff --git a/fs/cifsd/vfs.c b/fs/cifsd/vfs.c
+index ef823679f6be..d3882208a259 100644
+--- a/fs/cifsd/vfs.c
++++ b/fs/cifsd/vfs.c
+@@ -244,7 +244,7 @@ static ssize_t ksmbd_vfs_getcasexattr(struct dentry *dentry, char *attr_name,
+ 	}
+ 
+ out:
+-	ksmbd_vfs_xattr_free(xattr_list);
++	kvfree(xattr_list);
+ 	return value_len;
+ }
+ 
+@@ -401,7 +401,7 @@ static int ksmbd_vfs_stream_write(struct ksmbd_file *fp, char *buf, loff_t *pos,
+ 	}
+ 
+ 	if (v_len < size) {
+-		wbuf = ksmbd_alloc(size);
++		wbuf = kvmalloc(size, GFP_KERNEL | __GFP_ZERO);
+ 		if (!wbuf) {
+ 			err = -ENOMEM;
+ 			goto out;
+@@ -425,7 +425,7 @@ static int ksmbd_vfs_stream_write(struct ksmbd_file *fp, char *buf, loff_t *pos,
+ 	fp->filp->f_pos = *pos;
+ 	err = 0;
+ out:
+-	ksmbd_free(stream_buf);
++	kvfree(stream_buf);
+ 	return err;
+ }
+ 
+@@ -844,7 +844,7 @@ ssize_t ksmbd_vfs_listxattr(struct dentry *dentry, char **list)
+ 	if (size <= 0)
+ 		return size;
+ 
+-	vlist = ksmbd_alloc(size);
++	vlist = kvmalloc(size, GFP_KERNEL | __GFP_ZERO);
+ 	if (!vlist)
+ 		return -ENOMEM;
+ 
+@@ -852,7 +852,7 @@ ssize_t ksmbd_vfs_listxattr(struct dentry *dentry, char **list)
+ 	size = vfs_listxattr(dentry, vlist, size);
+ 	if (size < 0) {
+ 		ksmbd_debug(VFS, "listxattr failed\n");
+-		ksmbd_vfs_xattr_free(vlist);
++		kvfree(vlist);
+ 		*list = NULL;
+ 	}
+ 
+@@ -1049,11 +1049,6 @@ int ksmbd_vfs_remove_xattr(struct dentry *dentry, char *attr_name)
+ 	return vfs_removexattr(&init_user_ns, dentry, attr_name);
+ }
+ 
+-void ksmbd_vfs_xattr_free(char *xattr)
+-{
+-	ksmbd_free(xattr);
+-}
+-
+ int ksmbd_vfs_unlink(struct dentry *dir, struct dentry *dentry)
+ {
+ 	int err = 0;
+@@ -1297,7 +1292,7 @@ int ksmbd_vfs_remove_acl_xattrs(struct dentry *dentry)
+ 		}
+ 	}
+ out:
+-	ksmbd_vfs_xattr_free(xattr_list);
++	kvfree(xattr_list);
+ 	return err;
+ }
+ 
+@@ -1326,7 +1321,7 @@ int ksmbd_vfs_remove_sd_xattrs(struct dentry *dentry)
+ 		}
+ 	}
+ out:
+-	ksmbd_vfs_xattr_free(xattr_list);
++	kvfree(xattr_list);
+ 	return err;
+ }
+ 
+@@ -1558,7 +1553,7 @@ int ksmbd_vfs_get_dos_attrib_xattr(struct dentry *dentry,
+ 		n.length = err;
+ 		if (ndr_decode_dos_attr(&n, da))
+ 			err = -EINVAL;
+-		ksmbd_free(n.data);
++		kfree(n.data);
+ 	} else {
+ 		ksmbd_debug(SMB, "failed to load dos attribute in xattr\n");
+ 	}
+@@ -1683,7 +1678,7 @@ ssize_t ksmbd_vfs_casexattr_len(struct dentry *dentry, char *attr_name,
+ 	}
+ 
+ out:
+-	ksmbd_vfs_xattr_free(xattr_list);
++	kvfree(xattr_list);
+ 	return value_len;
+ }
+ 
+diff --git a/fs/cifsd/vfs.h b/fs/cifsd/vfs.h
+index b41b23d40636..0163be4297de 100644
+--- a/fs/cifsd/vfs.h
++++ b/fs/cifsd/vfs.h
+@@ -229,7 +229,6 @@ int ksmbd_vfs_setxattr(struct dentry *dentry, const char *attr_name,
+ int ksmbd_vfs_xattr_stream_name(char *stream_name, char **xattr_stream_name,
+ 		size_t *xattr_stream_name_size, int s_type);
+ int ksmbd_vfs_remove_xattr(struct dentry *dentry, char *attr_name);
+-void ksmbd_vfs_xattr_free(char *xattr);
+ int ksmbd_vfs_kern_path(char *name, unsigned int flags, struct path *path,
+ 		bool caseless);
+ int ksmbd_vfs_empty_dir(struct ksmbd_file *fp);
+-- 
+2.33.0
+

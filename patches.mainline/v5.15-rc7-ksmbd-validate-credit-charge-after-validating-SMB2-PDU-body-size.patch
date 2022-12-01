@@ -1,0 +1,82 @@
+From 7a33488705008b5bb5f8d95d05326dcc64fc55f4 Mon Sep 17 00:00:00 2001
+From: Ralph Boehme <slow@samba.org>
+Date: Fri, 15 Oct 2021 12:52:58 +0900
+Subject: [PATCH] ksmbd: validate credit charge after validating SMB2 PDU body
+ size
+Git-commit: 7a33488705008b5bb5f8d95d05326dcc64fc55f4
+Patch-mainline: v5.15-rc7
+References: bsn#12
+Modified-by-SEL: No
+
+
+smb2_validate_credit_charge() accesses fields in the SMB2 PDU body,
+but until smb2_calc_size() is called the PDU has not yet been verified
+to be large enough to access the PDU dynamic part length field.
+
+Acked-by: Namjae Jeon <linkinjeon@kernel.org>
+Signed-off-by: Ralph Boehme <slow@samba.org>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/ksmbd/smb2misc.c | 19 ++++++++++---------
+ 1 file changed, 10 insertions(+), 9 deletions(-)
+
+diff --git a/fs/ksmbd/smb2misc.c b/fs/ksmbd/smb2misc.c
+index e7e441c8f050..030ca57c3784 100644
+--- a/fs/ksmbd/smb2misc.c
++++ b/fs/ksmbd/smb2misc.c
+@@ -400,26 +400,20 @@ int ksmbd_smb2_check_message(struct ksmbd_work *work)
+ 		}
+ 	}
+ 
+-	if ((work->conn->vals->capabilities & SMB2_GLOBAL_CAP_LARGE_MTU) &&
+-	    smb2_validate_credit_charge(work->conn, hdr)) {
+-		work->conn->ops->set_rsp_status(work, STATUS_INVALID_PARAMETER);
+-		return 1;
+-	}
+-
+ 	if (smb2_calc_size(hdr, &clc_len))
+ 		return 1;
+ 
+ 	if (len != clc_len) {
+ 		/* client can return one byte more due to implied bcc[0] */
+ 		if (clc_len == len + 1)
+-			return 0;
++			goto validate_credit;
+ 
+ 		/*
+ 		 * Some windows servers (win2016) will pad also the final
+ 		 * PDU in a compound to 8 bytes.
+ 		 */
+ 		if (ALIGN(clc_len, 8) == len)
+-			return 0;
++			goto validate_credit;
+ 
+ 		/*
+ 		 * windows client also pad up to 8 bytes when compounding.
+@@ -432,7 +426,7 @@ int ksmbd_smb2_check_message(struct ksmbd_work *work)
+ 				    "cli req padded more than expected. Length %d not %d for cmd:%d mid:%llu\n",
+ 				    len, clc_len, command,
+ 				    le64_to_cpu(hdr->MessageId));
+-			return 0;
++			goto validate_credit;
+ 		}
+ 
+ 		ksmbd_debug(SMB,
+@@ -443,6 +437,13 @@ int ksmbd_smb2_check_message(struct ksmbd_work *work)
+ 		return 1;
+ 	}
+ 
++validate_credit:
++	if ((work->conn->vals->capabilities & SMB2_GLOBAL_CAP_LARGE_MTU) &&
++	    smb2_validate_credit_charge(work->conn, hdr)) {
++		work->conn->ops->set_rsp_status(work, STATUS_INVALID_PARAMETER);
++		return 1;
++	}
++
+ 	return 0;
+ }
+ 
+-- 
+2.33.0
+

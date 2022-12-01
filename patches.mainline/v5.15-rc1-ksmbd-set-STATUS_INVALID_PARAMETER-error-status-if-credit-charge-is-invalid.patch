@@ -1,0 +1,120 @@
+From 67307023d02b1339e0b930b742fe5a9cd81284ca Mon Sep 17 00:00:00 2001
+From: Namjae Jeon <namjae.jeon@samsung.com>
+Date: Fri, 16 Jul 2021 14:52:46 +0900
+Subject: [PATCH] ksmbd: set STATUS_INVALID_PARAMETER error status if credit
+ charge is invalid
+Git-commit: 67307023d02b1339e0b930b742fe5a9cd81284ca
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+MS-SMB2 specification describe :
+ If the calculated credit number is greater than the CreditCharge,
+ the server MUST fail the request with the error code
+ STATUS_INVALID_PARAMETER.
+
+Signed-off-by: Namjae Jeon <namjae.jeon@samsung.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/ksmbd/server.c   | 20 ++++++++++----------
+ fs/ksmbd/smb2misc.c |  9 +++++++--
+ 2 files changed, 17 insertions(+), 12 deletions(-)
+
+diff --git a/fs/ksmbd/server.c b/fs/ksmbd/server.c
+index a8c59e96a2f7..e6a9f6aa47eb 100644
+--- a/fs/ksmbd/server.c
++++ b/fs/ksmbd/server.c
+@@ -101,8 +101,8 @@ static inline int check_conn_state(struct ksmbd_work *work)
+ 	return 0;
+ }
+ 
+-#define TCP_HANDLER_CONTINUE	0
+-#define TCP_HANDLER_ABORT	1
++#define SERVER_HANDLER_CONTINUE		0
++#define SERVER_HANDLER_ABORT		1
+ 
+ static int __process_request(struct ksmbd_work *work, struct ksmbd_conn *conn,
+ 			     u16 *cmd)
+@@ -112,10 +112,10 @@ static int __process_request(struct ksmbd_work *work, struct ksmbd_conn *conn,
+ 	int ret;
+ 
+ 	if (check_conn_state(work))
+-		return TCP_HANDLER_CONTINUE;
++		return SERVER_HANDLER_CONTINUE;
+ 
+ 	if (ksmbd_verify_smb_message(work))
+-		return TCP_HANDLER_ABORT;
++		return SERVER_HANDLER_ABORT;
+ 
+ 	command = conn->ops->get_cmd_val(work);
+ 	*cmd = command;
+@@ -123,21 +123,21 @@ static int __process_request(struct ksmbd_work *work, struct ksmbd_conn *conn,
+ andx_again:
+ 	if (command >= conn->max_cmds) {
+ 		conn->ops->set_rsp_status(work, STATUS_INVALID_PARAMETER);
+-		return TCP_HANDLER_CONTINUE;
++		return SERVER_HANDLER_CONTINUE;
+ 	}
+ 
+ 	cmds = &conn->cmds[command];
+ 	if (!cmds->proc) {
+ 		ksmbd_debug(SMB, "*** not implemented yet cmd = %x\n", command);
+ 		conn->ops->set_rsp_status(work, STATUS_NOT_IMPLEMENTED);
+-		return TCP_HANDLER_CONTINUE;
++		return SERVER_HANDLER_CONTINUE;
+ 	}
+ 
+ 	if (work->sess && conn->ops->is_sign_req(work, command)) {
+ 		ret = conn->ops->check_sign_req(work);
+ 		if (!ret) {
+ 			conn->ops->set_rsp_status(work, STATUS_ACCESS_DENIED);
+-			return TCP_HANDLER_CONTINUE;
++			return SERVER_HANDLER_CONTINUE;
+ 		}
+ 	}
+ 
+@@ -153,8 +153,8 @@ static int __process_request(struct ksmbd_work *work, struct ksmbd_conn *conn,
+ 	}
+ 
+ 	if (work->send_no_response)
+-		return TCP_HANDLER_ABORT;
+-	return TCP_HANDLER_CONTINUE;
++		return SERVER_HANDLER_ABORT;
++	return SERVER_HANDLER_CONTINUE;
+ }
+ 
+ static void __handle_ksmbd_work(struct ksmbd_work *work,
+@@ -203,7 +203,7 @@ static void __handle_ksmbd_work(struct ksmbd_work *work,
+ 
+ 	do {
+ 		rc = __process_request(work, conn, &command);
+-		if (rc == TCP_HANDLER_ABORT)
++		if (rc == SERVER_HANDLER_ABORT)
+ 			break;
+ 
+ 		/*
+diff --git a/fs/ksmbd/smb2misc.c b/fs/ksmbd/smb2misc.c
+index 4508631c5706..e68aa7d718ed 100644
+--- a/fs/ksmbd/smb2misc.c
++++ b/fs/ksmbd/smb2misc.c
+@@ -423,8 +423,13 @@ int ksmbd_smb2_check_message(struct ksmbd_work *work)
+ 		return 1;
+ 	}
+ 
+-	return work->conn->vals->capabilities & SMB2_GLOBAL_CAP_LARGE_MTU ?
+-		smb2_validate_credit_charge(hdr) : 0;
++	if ((work->conn->vals->capabilities & SMB2_GLOBAL_CAP_LARGE_MTU) &&
++	    smb2_validate_credit_charge(hdr)) {
++		work->conn->ops->set_rsp_status(work, STATUS_INVALID_PARAMETER);
++		return 1;
++	}
++
++	return 0;
+ }
+ 
+ int smb2_negotiate_request(struct ksmbd_work *work)
+-- 
+2.33.0
+

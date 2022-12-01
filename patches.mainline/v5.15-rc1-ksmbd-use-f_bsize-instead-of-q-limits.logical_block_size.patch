@@ -1,0 +1,157 @@
+From ee81cae1a6323fa4489313dfd9de436da7ff8519 Mon Sep 17 00:00:00 2001
+From: Namjae Jeon <namjae.jeon@samsung.com>
+Date: Sat, 26 Jun 2021 22:32:34 +0900
+Subject: [PATCH] ksmbd: use f_bsize instead of q->limits.logical_block_size
+Git-commit: ee81cae1a6323fa4489313dfd9de436da7ff8519
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+Use f_bsize instead of q->limits.logical_block_size.
+
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Namjae Jeon <namjae.jeon@samsung.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/cifsd/smb2pdu.c | 25 +++++++------------------
+ fs/cifsd/vfs.c     | 23 -----------------------
+ fs/cifsd/vfs.h     |  1 -
+ 3 files changed, 7 insertions(+), 42 deletions(-)
+
+diff --git a/fs/cifsd/smb2pdu.c b/fs/cifsd/smb2pdu.c
+index 0d004c6d1c63..341d51e711a5 100644
+--- a/fs/cifsd/smb2pdu.c
++++ b/fs/cifsd/smb2pdu.c
+@@ -4739,16 +4739,12 @@ static int smb2_get_info_filesystem(struct ksmbd_work *work,
+ 	case FS_SIZE_INFORMATION:
+ 	{
+ 		struct filesystem_info *info;
+-		unsigned short logical_sector_size;
+ 
+ 		info = (struct filesystem_info *)(rsp->Buffer);
+-		logical_sector_size =
+-			ksmbd_vfs_logical_sector_size(d_inode(path.dentry));
+-
+ 		info->TotalAllocationUnits = cpu_to_le64(stfs.f_blocks);
+ 		info->FreeAllocationUnits = cpu_to_le64(stfs.f_bfree);
+-		info->SectorsPerAllocationUnit = cpu_to_le32(stfs.f_bsize >> 9);
+-		info->BytesPerSector = cpu_to_le32(logical_sector_size);
++		info->SectorsPerAllocationUnit = cpu_to_le32(1);
++		info->BytesPerSector = cpu_to_le32(stfs.f_bsize);
+ 		rsp->OutputBufferLength = cpu_to_le32(24);
+ 		inc_rfc1001_len(rsp_org, 24);
+ 		fs_infoclass_size = FS_SIZE_INFORMATION_SIZE;
+@@ -4757,19 +4753,15 @@ static int smb2_get_info_filesystem(struct ksmbd_work *work,
+ 	case FS_FULL_SIZE_INFORMATION:
+ 	{
+ 		struct smb2_fs_full_size_info *info;
+-		unsigned short logical_sector_size;
+ 
+ 		info = (struct smb2_fs_full_size_info *)(rsp->Buffer);
+-		logical_sector_size =
+-			ksmbd_vfs_logical_sector_size(d_inode(path.dentry));
+-
+ 		info->TotalAllocationUnits = cpu_to_le64(stfs.f_blocks);
+ 		info->CallerAvailableAllocationUnits =
+ 					cpu_to_le64(stfs.f_bavail);
+ 		info->ActualAvailableAllocationUnits =
+ 					cpu_to_le64(stfs.f_bfree);
+-		info->SectorsPerAllocationUnit = cpu_to_le32(stfs.f_bsize >> 9);
+-		info->BytesPerSector = cpu_to_le32(logical_sector_size);
++		info->SectorsPerAllocationUnit = cpu_to_le32(1);
++		info->BytesPerSector = cpu_to_le32(stfs.f_bsize);
+ 		rsp->OutputBufferLength = cpu_to_le32(32);
+ 		inc_rfc1001_len(rsp_org, 32);
+ 		fs_infoclass_size = FS_FULL_SIZE_INFORMATION_SIZE;
+@@ -4846,16 +4838,13 @@ static int smb2_get_info_filesystem(struct ksmbd_work *work,
+ 	case FS_POSIX_INFORMATION:
+ 	{
+ 		struct filesystem_posix_info *info;
+-		unsigned short logical_sector_size;
+ 
+ 		if (!work->tcon->posix_extensions) {
+ 			pr_err("client doesn't negotiate with SMB3.1.1 POSIX Extensions\n");
+ 			rc = -EOPNOTSUPP;
+ 		} else {
+ 			info = (struct filesystem_posix_info *)(rsp->Buffer);
+-			logical_sector_size =
+-				ksmbd_vfs_logical_sector_size(d_inode(path.dentry));
+-			info->OptimalTransferSize = cpu_to_le32(logical_sector_size);
++			info->OptimalTransferSize = cpu_to_le32(stfs.f_bsize);
+ 			info->BlockSize = cpu_to_le32(stfs.f_bsize);
+ 			info->TotalBlocks = cpu_to_le64(stfs.f_blocks);
+ 			info->BlocksAvail = cpu_to_le64(stfs.f_bfree);
+@@ -5588,13 +5577,13 @@ static int set_file_position_info(struct ksmbd_file *fp, char *buf)
+ {
+ 	struct smb2_file_pos_info *file_info;
+ 	loff_t current_byte_offset;
+-	unsigned short sector_size;
++	unsigned long sector_size;
+ 	struct inode *inode;
+ 
+ 	inode = file_inode(fp->filp);
+ 	file_info = (struct smb2_file_pos_info *)buf;
+ 	current_byte_offset = le64_to_cpu(file_info->CurrentByteOffset);
+-	sector_size = ksmbd_vfs_logical_sector_size(inode);
++	sector_size = inode->i_sb->s_blocksize;
+ 
+ 	if (current_byte_offset < 0 ||
+ 	    (fp->coption == FILE_NO_INTERMEDIATE_BUFFERING_LE &&
+diff --git a/fs/cifsd/vfs.c b/fs/cifsd/vfs.c
+index e34e536dc9ce..9c594e88b2c7 100644
+--- a/fs/cifsd/vfs.c
++++ b/fs/cifsd/vfs.c
+@@ -12,7 +12,6 @@
+ #include <linux/xattr.h>
+ #include <linux/falloc.h>
+ #include <linux/genhd.h>
+-#include <linux/blkdev.h>
+ #include <linux/fsnotify.h>
+ #include <linux/dcache.h>
+ #include <linux/slab.h>
+@@ -1119,28 +1118,6 @@ int ksmbd_vfs_unlink(struct dentry *dir, struct dentry *dentry)
+ 	return err;
+ }
+ 
+-/*
+- * ksmbd_vfs_get_logical_sector_size() - get logical sector size from inode
+- * @inode: inode
+- *
+- * Return: logical sector size
+- */
+-unsigned short ksmbd_vfs_logical_sector_size(struct inode *inode)
+-{
+-	struct request_queue *q;
+-	unsigned short ret_val = 512;
+-
+-	if (!inode->i_sb->s_bdev)
+-		return ret_val;
+-
+-	q = inode->i_sb->s_bdev->bd_disk->queue;
+-
+-	if (q && q->limits.logical_block_size)
+-		ret_val = q->limits.logical_block_size;
+-
+-	return ret_val;
+-}
+-
+ /*
+  * ksmbd_vfs_get_smb2_sector_size() - get fs sector sizes
+  * @inode: inode
+diff --git a/fs/cifsd/vfs.h b/fs/cifsd/vfs.h
+index a9c14c5dee8d..751bb6ea6e12 100644
+--- a/fs/cifsd/vfs.h
++++ b/fs/cifsd/vfs.h
+@@ -247,7 +247,6 @@ int ksmbd_vfs_fqar_lseek(struct ksmbd_file *fp, loff_t start, loff_t length,
+ 			 struct file_allocated_range_buffer *ranges,
+ 			 int in_count, int *out_count);
+ int ksmbd_vfs_unlink(struct dentry *dir, struct dentry *dentry);
+-unsigned short ksmbd_vfs_logical_sector_size(struct inode *inode);
+ void ksmbd_vfs_smb2_sector_size(struct inode *inode,
+ 				struct ksmbd_fs_sector_size *fs_ss);
+ void *ksmbd_vfs_init_kstat(char **p, struct ksmbd_kstat *ksmbd_kstat);
+-- 
+2.33.0
+

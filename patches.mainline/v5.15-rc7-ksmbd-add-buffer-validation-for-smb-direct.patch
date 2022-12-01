@@ -1,0 +1,72 @@
+From 2ea086e35c3d726a3bacd0a971c1f02a50e98206 Mon Sep 17 00:00:00 2001
+From: Hyunchul Lee <hyc.lee@gmail.com>
+Date: Fri, 15 Oct 2021 06:02:50 +0900
+Subject: [PATCH] ksmbd: add buffer validation for smb direct
+Git-commit: 2ea086e35c3d726a3bacd0a971c1f02a50e98206
+Patch-mainline: v5.15-rc7
+References: bsn#12
+Modified-by-SEL: No
+
+
+Add buffer validation for smb direct.
+
+Acked-by: Namjae Jeon <linkinjeon@kernel.org>
+Signed-off-by: Hyunchul Lee <hyc.lee@gmail.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/ksmbd/transport_rdma.c | 21 +++++++++++++++++++--
+ 1 file changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/fs/ksmbd/transport_rdma.c b/fs/ksmbd/transport_rdma.c
+index 3a7fa23ba850..a2fd5a4d4cd5 100644
+--- a/fs/ksmbd/transport_rdma.c
++++ b/fs/ksmbd/transport_rdma.c
+@@ -549,6 +549,10 @@ static void recv_done(struct ib_cq *cq, struct ib_wc *wc)
+ 
+ 	switch (recvmsg->type) {
+ 	case SMB_DIRECT_MSG_NEGOTIATE_REQ:
++		if (wc->byte_len < sizeof(struct smb_direct_negotiate_req)) {
++			put_empty_recvmsg(t, recvmsg);
++			return;
++		}
+ 		t->negotiation_requested = true;
+ 		t->full_packet_received = true;
+ 		wake_up_interruptible(&t->wait_status);
+@@ -556,10 +560,23 @@ static void recv_done(struct ib_cq *cq, struct ib_wc *wc)
+ 	case SMB_DIRECT_MSG_DATA_TRANSFER: {
+ 		struct smb_direct_data_transfer *data_transfer =
+ 			(struct smb_direct_data_transfer *)recvmsg->packet;
+-		int data_length = le32_to_cpu(data_transfer->data_length);
++		unsigned int data_length;
+ 		int avail_recvmsg_count, receive_credits;
+ 
++		if (wc->byte_len <
++		    offsetof(struct smb_direct_data_transfer, padding)) {
++			put_empty_recvmsg(t, recvmsg);
++			return;
++		}
++
++		data_length = le32_to_cpu(data_transfer->data_length);
+ 		if (data_length) {
++			if (wc->byte_len < sizeof(struct smb_direct_data_transfer) +
++			    (u64)data_length) {
++				put_empty_recvmsg(t, recvmsg);
++				return;
++			}
++
+ 			if (t->full_packet_received)
+ 				recvmsg->first_segment = true;
+ 
+@@ -568,7 +585,7 @@ static void recv_done(struct ib_cq *cq, struct ib_wc *wc)
+ 			else
+ 				t->full_packet_received = true;
+ 
+-			enqueue_reassembly(t, recvmsg, data_length);
++			enqueue_reassembly(t, recvmsg, (int)data_length);
+ 			wake_up_interruptible(&t->wait_reassembly_queue);
+ 
+ 			spin_lock(&t->receive_credit_lock);
+-- 
+2.33.0
+

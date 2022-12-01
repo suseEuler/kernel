@@ -1,0 +1,199 @@
+From 5626518ecaa50ffa5797e516a47a0b1392db1aa9 Mon Sep 17 00:00:00 2001
+From: Namjae Jeon <namjae.jeon@samsung.com>
+Date: Wed, 14 Apr 2021 09:24:11 +0900
+Subject: [PATCH] cifsd: move nt time functions to misc.c
+Git-commit: 5626518ecaa50ffa5797e516a47a0b1392db1aa9
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+Move nt time functions in netmisc.c to misc.c to remove netmisc.c file.
+
+Signed-off-by: Namjae Jeon <namjae.jeon@samsung.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/cifsd/Makefile     |  2 +-
+ fs/cifsd/misc.c       | 46 ++++++++++++++++++++++++++++++++++
+ fs/cifsd/misc.h       |  6 +++++
+ fs/cifsd/netmisc.c    | 58 -------------------------------------------
+ fs/cifsd/smb_common.h |  6 -----
+ fs/cifsd/vfs.c        |  1 +
+ 6 files changed, 54 insertions(+), 65 deletions(-)
+ delete mode 100644 fs/cifsd/netmisc.c
+
+diff --git a/fs/cifsd/Makefile b/fs/cifsd/Makefile
+index a6c03c4ba51e..75ce0c6f0862 100644
+--- a/fs/cifsd/Makefile
++++ b/fs/cifsd/Makefile
+@@ -9,5 +9,5 @@ ksmbd-y :=	unicode.o auth.o vfs.o vfs_cache.o server.o buffer_pool.o \
+ 		mgmt/ksmbd_ida.o mgmt/user_config.o mgmt/share_config.o \
+ 		mgmt/tree_connect.o mgmt/user_session.o smb_common.o \
+ 		transport_tcp.o transport_ipc.o smbacl.o smb2pdu.o \
+-		smb2ops.o smb2misc.o asn1.o netmisc.o ndr.o
++		smb2ops.o smb2misc.o asn1.o ndr.o
+ ksmbd-$(CONFIG_SMB_SERVER_SMBDIRECT) += transport_rdma.o
+diff --git a/fs/cifsd/misc.c b/fs/cifsd/misc.c
+index cbaaecf2eca1..7fa6649fadfd 100644
+--- a/fs/cifsd/misc.c
++++ b/fs/cifsd/misc.c
+@@ -292,3 +292,49 @@ char *ksmbd_convert_dir_info_name(struct ksmbd_dir_info *d_info,
+ 	conv[*conv_len + 1] = 0x00;
+ 	return conv;
+ }
++
++/*
++ * Convert the NT UTC (based 1601-01-01, in hundred nanosecond units)
++ * into Unix UTC (based 1970-01-01, in seconds).
++ */
++struct timespec64 ksmbd_NTtimeToUnix(__le64 ntutc)
++{
++	struct timespec64 ts;
++
++	/* Subtract the NTFS time offset, then convert to 1s intervals. */
++	s64 t = le64_to_cpu(ntutc) - NTFS_TIME_OFFSET;
++	u64 abs_t;
++
++	/*
++	 * Unfortunately can not use normal 64 bit division on 32 bit arch, but
++	 * the alternative, do_div, does not work with negative numbers so have
++	 * to special case them
++	 */
++	if (t < 0) {
++		abs_t = -t;
++		ts.tv_nsec = do_div(abs_t, 10000000) * 100;
++		ts.tv_nsec = -ts.tv_nsec;
++		ts.tv_sec = -abs_t;
++	} else {
++		abs_t = t;
++		ts.tv_nsec = do_div(abs_t, 10000000) * 100;
++		ts.tv_sec = abs_t;
++	}
++
++	return ts;
++}
++
++/* Convert the Unix UTC into NT UTC. */
++inline u64 ksmbd_UnixTimeToNT(struct timespec64 t)
++{
++	/* Convert to 100ns intervals and then add the NTFS time offset. */
++	return (u64)t.tv_sec * 10000000 + t.tv_nsec / 100 + NTFS_TIME_OFFSET;
++}
++
++inline long long ksmbd_systime(void)
++{
++	struct timespec64	ts;
++
++	ktime_get_real_ts64(&ts);
++	return ksmbd_UnixTimeToNT(ts);
++}
+diff --git a/fs/cifsd/misc.h b/fs/cifsd/misc.h
+index 73b21709b6c9..e4bd02a8d45f 100644
+--- a/fs/cifsd/misc.h
++++ b/fs/cifsd/misc.h
+@@ -35,4 +35,10 @@ struct ksmbd_dir_info;
+ char *ksmbd_convert_dir_info_name(struct ksmbd_dir_info *d_info,
+ 				  const struct nls_table *local_nls,
+ 				  int *conv_len);
++
++#define NTFS_TIME_OFFSET	((u64)(369 * 365 + 89) * 24 * 3600 * 10000000)
++
++struct timespec64 ksmbd_NTtimeToUnix(__le64 ntutc);
++u64 ksmbd_UnixTimeToNT(struct timespec64 t);
++long long ksmbd_systime(void);
+ #endif /* __KSMBD_MISC_H__ */
+diff --git a/fs/cifsd/netmisc.c b/fs/cifsd/netmisc.c
+deleted file mode 100644
+index 8f052434b64c..000000000000
+--- a/fs/cifsd/netmisc.c
++++ /dev/null
+@@ -1,58 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0-or-later
+-/*
+- *   Copyright (c) International Business Machines  Corp., 2002,2008
+- *   Author(s): Steve French (sfrench@us.ibm.com)
+- *
+- *   Error mapping routines from Samba libsmb/errormap.c
+- *   Copyright (C) Andrew Tridgell 2001
+- */
+-
+-#include "glob.h"
+-#include "nterr.h"
+-#include "smb_common.h"
+-
+-/*
+- * Convert the NT UTC (based 1601-01-01, in hundred nanosecond units)
+- * into Unix UTC (based 1970-01-01, in seconds).
+- */
+-struct timespec64 ksmbd_NTtimeToUnix(__le64 ntutc)
+-{
+-	struct timespec64 ts;
+-
+-	/* Subtract the NTFS time offset, then convert to 1s intervals. */
+-	s64 t = le64_to_cpu(ntutc) - NTFS_TIME_OFFSET;
+-	u64 abs_t;
+-
+-	/*
+-	 * Unfortunately can not use normal 64 bit division on 32 bit arch, but
+-	 * the alternative, do_div, does not work with negative numbers so have
+-	 * to special case them
+-	 */
+-	if (t < 0) {
+-		abs_t = -t;
+-		ts.tv_nsec = do_div(abs_t, 10000000) * 100;
+-		ts.tv_nsec = -ts.tv_nsec;
+-		ts.tv_sec = -abs_t;
+-	} else {
+-		abs_t = t;
+-		ts.tv_nsec = do_div(abs_t, 10000000) * 100;
+-		ts.tv_sec = abs_t;
+-	}
+-
+-	return ts;
+-}
+-
+-/* Convert the Unix UTC into NT UTC. */
+-inline u64 ksmbd_UnixTimeToNT(struct timespec64 t)
+-{
+-	/* Convert to 100ns intervals and then add the NTFS time offset. */
+-	return (u64)t.tv_sec * 10000000 + t.tv_nsec / 100 + NTFS_TIME_OFFSET;
+-}
+-
+-inline long long ksmbd_systime(void)
+-{
+-	struct timespec64	ts;
+-
+-	ktime_get_real_ts64(&ts);
+-	return ksmbd_UnixTimeToNT(ts);
+-}
+diff --git a/fs/cifsd/smb_common.h b/fs/cifsd/smb_common.h
+index 2e171c9002b2..2d7b1c693ff4 100644
+--- a/fs/cifsd/smb_common.h
++++ b/fs/cifsd/smb_common.h
+@@ -541,10 +541,4 @@ static inline void inc_rfc1001_len(void *buf, int count)
+ {
+ 	be32_add_cpu((__be32 *)buf, count);
+ }
+-
+-#define NTFS_TIME_OFFSET	((u64)(369 * 365 + 89) * 24 * 3600 * 10000000)
+-
+-struct timespec64 ksmbd_NTtimeToUnix(__le64 ntutc);
+-u64 ksmbd_UnixTimeToNT(struct timespec64 t);
+-long long ksmbd_systime(void);
+ #endif /* __SMB_COMMON_H__ */
+diff --git a/fs/cifsd/vfs.c b/fs/cifsd/vfs.c
+index d8259ca2493e..7c8ab19ab014 100644
+--- a/fs/cifsd/vfs.c
++++ b/fs/cifsd/vfs.c
+@@ -29,6 +29,7 @@
+ #include "smbacl.h"
+ #include "ndr.h"
+ #include "auth.h"
++#include "misc.h"
+ 
+ #include "smb_common.h"
+ #include "mgmt/share_config.h"
+-- 
+2.33.0
+

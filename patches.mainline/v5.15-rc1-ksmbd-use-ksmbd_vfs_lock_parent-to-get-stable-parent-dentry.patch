@@ -1,0 +1,98 @@
+From 12202c0594b18218e1645fd0fad92cf77a1f3145 Mon Sep 17 00:00:00 2001
+From: Namjae Jeon <namjae.jeon@samsung.com>
+Date: Tue, 29 Jun 2021 09:23:56 +0900
+Subject: [PATCH] ksmbd: use ksmbd_vfs_lock_parent to get stable parent dentry
+Git-commit: 12202c0594b18218e1645fd0fad92cf77a1f3145
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+Use ksmbd_vfs_lock_parent to get stable parent dentry and remove
+PARENT_INODE macro.
+
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Namjae Jeon <namjae.jeon@samsung.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/ksmbd/smb2pdu.c   | 15 ++++++++++++++-
+ fs/ksmbd/vfs.c       |  2 +-
+ fs/ksmbd/vfs.h       |  1 +
+ fs/ksmbd/vfs_cache.h |  2 --
+ 4 files changed, 16 insertions(+), 4 deletions(-)
+
+diff --git a/fs/ksmbd/smb2pdu.c b/fs/ksmbd/smb2pdu.c
+index 2d515e44d48e..bf798ee65b25 100644
+--- a/fs/ksmbd/smb2pdu.c
++++ b/fs/ksmbd/smb2pdu.c
+@@ -5538,6 +5538,9 @@ static int set_rename_info(struct ksmbd_work *work, struct ksmbd_file *fp,
+ 			   char *buf)
+ {
+ 	struct ksmbd_file *parent_fp;
++	struct dentry *parent;
++	struct dentry *dentry = fp->filp->f_path.dentry;
++	int ret;
+ 
+ 	if (!(fp->daccess & FILE_DELETE_LE)) {
+ 		pr_err("no right to delete : 0x%x\n", fp->daccess);
+@@ -5547,7 +5550,17 @@ static int set_rename_info(struct ksmbd_work *work, struct ksmbd_file *fp,
+ 	if (ksmbd_stream_fd(fp))
+ 		goto next;
+ 
+-	parent_fp = ksmbd_lookup_fd_inode(PARENT_INODE(fp));
++	parent = dget_parent(dentry);
++	ret = ksmbd_vfs_lock_parent(parent, dentry);
++	if (ret) {
++		dput(parent);
++		return ret;
++	}
++
++	parent_fp = ksmbd_lookup_fd_inode(d_inode(parent));
++	inode_unlock(d_inode(parent));
++	dput(parent);
++
+ 	if (parent_fp) {
+ 		if (parent_fp->daccess & FILE_DELETE_LE) {
+ 			pr_err("parent dir is opened with delete access\n");
+diff --git a/fs/ksmbd/vfs.c b/fs/ksmbd/vfs.c
+index 40783bb414d6..702166266f91 100644
+--- a/fs/ksmbd/vfs.c
++++ b/fs/ksmbd/vfs.c
+@@ -69,7 +69,7 @@ static void ksmbd_vfs_inherit_owner(struct ksmbd_work *work,
+  *
+  * the reference count of @parent isn't incremented.
+  */
+-static int ksmbd_vfs_lock_parent(struct dentry *parent, struct dentry *child)
++int ksmbd_vfs_lock_parent(struct dentry *parent, struct dentry *child)
+ {
+ 	struct dentry *dentry;
+ 	int ret = 0;
+diff --git a/fs/ksmbd/vfs.h b/fs/ksmbd/vfs.h
+index ae8eff1f0315..ba12fea004b5 100644
+--- a/fs/ksmbd/vfs.h
++++ b/fs/ksmbd/vfs.h
+@@ -192,6 +192,7 @@ struct ksmbd_kstat {
+ 	__le32			file_attributes;
+ };
+ 
++int ksmbd_vfs_lock_parent(struct dentry *parent, struct dentry *child);
+ int ksmbd_vfs_may_delete(struct dentry *dentry);
+ int ksmbd_vfs_query_maximal_access(struct dentry *dentry, __le32 *daccess);
+ int ksmbd_vfs_create(struct ksmbd_work *work, const char *name, umode_t mode);
+diff --git a/fs/ksmbd/vfs_cache.h b/fs/ksmbd/vfs_cache.h
+index b01192ebd86b..752cbdab3522 100644
+--- a/fs/ksmbd/vfs_cache.h
++++ b/fs/ksmbd/vfs_cache.h
+@@ -25,8 +25,6 @@
+ #define KSMBD_NO_FID		(UINT_MAX)
+ #define SMB2_NO_FID		(0xFFFFFFFFFFFFFFFFULL)
+ 
+-#define PARENT_INODE(fp)	d_inode((fp)->filp->f_path.dentry->d_parent)
+-
+ #define ATTR_FP(fp) ((fp)->attrib_only && \
+ 		     ((fp)->cdoption != FILE_OVERWRITE_IF_LE && \
+ 		      (fp)->cdoption != FILE_OVERWRITE_LE && \
+-- 
+2.33.0
+

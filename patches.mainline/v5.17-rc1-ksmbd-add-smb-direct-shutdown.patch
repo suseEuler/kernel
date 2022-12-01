@@ -1,0 +1,98 @@
+From 136dff3a6b71dc16c30b35cc390feb0bfc32ed50 Mon Sep 17 00:00:00 2001
+From: Yufan Chen <wiz.chen@gmail.com>
+Date: Sun, 9 Jan 2022 11:34:16 +0900
+Subject: [PATCH] ksmbd: add smb-direct shutdown
+Git-commit: 136dff3a6b71dc16c30b35cc390feb0bfc32ed50
+Patch-mainline: v5.17-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+When killing ksmbd server after connecting rdma, ksmbd threads does not
+terminate properly because the rdma connection is still alive.
+This patch add shutdown operation to disconnect rdma connection while
+ksmbd threads terminate.
+
+Signed-off-by: Yufan Chen <wiz.chen@gmail.com>
+Signed-off-by: Namjae Jeon <linkinjeon@kernel.org>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/ksmbd/connection.c     |  9 ++++++++-
+ fs/ksmbd/connection.h     |  1 +
+ fs/ksmbd/transport_rdma.c | 10 ++++++++++
+ 3 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/fs/ksmbd/connection.c b/fs/ksmbd/connection.c
+index d1d0105be5b1..208d2cff7bd3 100644
+--- a/fs/ksmbd/connection.c
++++ b/fs/ksmbd/connection.c
+@@ -387,17 +387,24 @@ int ksmbd_conn_transport_init(void)
+ static void stop_sessions(void)
+ {
+ 	struct ksmbd_conn *conn;
++	struct ksmbd_transport *t;
+ 
+ again:
+ 	read_lock(&conn_list_lock);
+ 	list_for_each_entry(conn, &conn_list, conns_list) {
+ 		struct task_struct *task;
+ 
+-		task = conn->transport->handler;
++		t = conn->transport;
++		task = t->handler;
+ 		if (task)
+ 			ksmbd_debug(CONN, "Stop session handler %s/%d\n",
+ 				    task->comm, task_pid_nr(task));
+ 		conn->status = KSMBD_SESS_EXITING;
++		if (t->ops->shutdown) {
++			read_unlock(&conn_list_lock);
++			t->ops->shutdown(t);
++			read_lock(&conn_list_lock);
++		}
+ 	}
+ 	read_unlock(&conn_list_lock);
+ 
+diff --git a/fs/ksmbd/connection.h b/fs/ksmbd/connection.h
+index 7e0730a262da..7a59aacb5daa 100644
+--- a/fs/ksmbd/connection.h
++++ b/fs/ksmbd/connection.h
+@@ -117,6 +117,7 @@ struct ksmbd_conn_ops {
+ struct ksmbd_transport_ops {
+ 	int (*prepare)(struct ksmbd_transport *t);
+ 	void (*disconnect)(struct ksmbd_transport *t);
++	void (*shutdown)(struct ksmbd_transport *t);
+ 	int (*read)(struct ksmbd_transport *t, char *buf, unsigned int size);
+ 	int (*writev)(struct ksmbd_transport *t, struct kvec *iovs, int niov,
+ 		      int size, bool need_invalidate_rkey,
+diff --git a/fs/ksmbd/transport_rdma.c b/fs/ksmbd/transport_rdma.c
+index 86fd64511512..3c1ec1ac0b27 100644
+--- a/fs/ksmbd/transport_rdma.c
++++ b/fs/ksmbd/transport_rdma.c
+@@ -1453,6 +1453,15 @@ static void smb_direct_disconnect(struct ksmbd_transport *t)
+ 	free_transport(st);
+ }
+ 
++static void smb_direct_shutdown(struct ksmbd_transport *t)
++{
++	struct smb_direct_transport *st = smb_trans_direct_transfort(t);
++
++	ksmbd_debug(RDMA, "smb-direct shutdown cm_id=%p\n", st->cm_id);
++
++	smb_direct_disconnect_rdma_work(&st->disconnect_work);
++}
++
+ static int smb_direct_cm_handler(struct rdma_cm_id *cm_id,
+ 				 struct rdma_cm_event *event)
+ {
+@@ -2201,6 +2210,7 @@ bool ksmbd_rdma_capable_netdev(struct net_device *netdev)
+ static struct ksmbd_transport_ops ksmbd_smb_direct_transport_ops = {
+ 	.prepare	= smb_direct_prepare,
+ 	.disconnect	= smb_direct_disconnect,
++	.shutdown	= smb_direct_shutdown,
+ 	.writev		= smb_direct_writev,
+ 	.read		= smb_direct_read,
+ 	.rdma_read	= smb_direct_rdma_read,
+-- 
+2.33.0
+

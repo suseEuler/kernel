@@ -1,0 +1,65 @@
+From 1637023594c1fd11fa4d77dd0c9493a864aa0d17 Mon Sep 17 00:00:00 2001
+From: Hyunchul Lee <hyc.lee@gmail.com>
+Date: Thu, 1 Apr 2021 17:32:24 +0900
+Subject: [PATCH] cifsd: handle unhashed dentry in ksmbd_vfs_mkdir
+Git-commit: 1637023594c1fd11fa4d77dd0c9493a864aa0d17
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+vfs_mkdir could return the dentry left unhashed negative on success.
+
+Signed-off-by: Hyunchul Lee <hyc.lee@gmail.com>
+Signed-off-by: Namjae Jeon <namjae.jeon@samsung.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/cifsd/vfs.c | 28 +++++++++++++++++++++++-----
+ 1 file changed, 23 insertions(+), 5 deletions(-)
+
+diff --git a/fs/cifsd/vfs.c b/fs/cifsd/vfs.c
+index b509c90d911f..bdc30a7b6d52 100644
+--- a/fs/cifsd/vfs.c
++++ b/fs/cifsd/vfs.c
+@@ -190,14 +190,32 @@ int ksmbd_vfs_mkdir(struct ksmbd_work *work, const char *name, umode_t mode)
+ 
+ 	mode |= S_IFDIR;
+ 	err = vfs_mkdir(&init_user_ns, d_inode(path.dentry), dentry, mode);
+-	if (!err) {
++	if (err)
++		goto out;
++	else if (d_unhashed(dentry)) {
++		struct dentry *d;
++
++		d = lookup_one_len(dentry->d_name.name,
++			       dentry->d_parent,
++			       dentry->d_name.len);
++		if (IS_ERR(d)) {
++			err = PTR_ERR(d);
++			goto out;
++		}
++		if (unlikely(d_is_negative(d))) {
++			dput(d);
++			err = -ENOENT;
++			goto out;
++		}
++
+ 		ksmbd_vfs_inherit_owner(work, d_inode(path.dentry),
+-			d_inode(dentry));
+-	} else {
+-		ksmbd_err("mkdir(%s): creation failed (err:%d)\n", name, err);
++			d_inode(d));
++		dput(d);
+ 	}
+-
++out:
+ 	done_path_create(&path, dentry);
++	if (err)
++		ksmbd_err("mkdir(%s): creation failed (err:%d)\n", name, err);
+ 	return err;
+ }
+ 
+-- 
+2.33.0
+

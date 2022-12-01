@@ -1,0 +1,192 @@
+From 6c5e36d13e2a338ed611d2bcc6c615dd0550b17d Mon Sep 17 00:00:00 2001
+From: Hyunchul Lee <hyc.lee@gmail.com>
+Date: Wed, 23 Jun 2021 13:48:24 +0900
+Subject: [PATCH] ksmbd: set MAY_* flags together with open flags
+Git-commit: 6c5e36d13e2a338ed611d2bcc6c615dd0550b17d
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+set MAY_* flags together with open flags and
+remove ksmbd_vfs_inode_permission().
+
+Signed-off-by: Hyunchul Lee <hyc.lee@gmail.com>
+Signed-off-by: Namjae Jeon <namjae.jeon@samsung.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/ksmbd/smb2pdu.c | 38 ++++++++++++++++++++++++--------------
+ fs/ksmbd/vfs.c     | 42 +++++++++++++-----------------------------
+ fs/ksmbd/vfs.h     |  3 +--
+ 3 files changed, 38 insertions(+), 45 deletions(-)
+
+diff --git a/fs/ksmbd/smb2pdu.c b/fs/ksmbd/smb2pdu.c
+index 1327ae806b17..25715d57c2bb 100644
+--- a/fs/ksmbd/smb2pdu.c
++++ b/fs/ksmbd/smb2pdu.c
+@@ -1836,21 +1836,27 @@ int smb2_tree_connect(struct ksmbd_work *work)
+  * @file_present:	is file already present
+  * @access:		file access flags
+  * @disposition:	file disposition flags
++ * @may_flags:		set with MAY_ flags
+  *
+  * Return:      file open flags
+  */
+ static int smb2_create_open_flags(bool file_present, __le32 access,
+-				  __le32 disposition)
++				  __le32 disposition,
++				  int *may_flags)
+ {
+ 	int oflags = O_NONBLOCK | O_LARGEFILE;
+ 
+ 	if (access & FILE_READ_DESIRED_ACCESS_LE &&
+-	    access & FILE_WRITE_DESIRE_ACCESS_LE)
++	    access & FILE_WRITE_DESIRE_ACCESS_LE) {
+ 		oflags |= O_RDWR;
+-	else if (access & FILE_WRITE_DESIRE_ACCESS_LE)
++		*may_flags = MAY_OPEN | MAY_READ | MAY_WRITE;
++	} else if (access & FILE_WRITE_DESIRE_ACCESS_LE) {
+ 		oflags |= O_WRONLY;
+-	else
++		*may_flags = MAY_OPEN | MAY_WRITE;
++	} else {
+ 		oflags |= O_RDONLY;
++		*may_flags = MAY_OPEN | MAY_READ;
++	}
+ 
+ 	if (access == FILE_READ_ATTRIBUTES_LE)
+ 		oflags |= O_PATH;
+@@ -1884,6 +1890,7 @@ static int smb2_create_open_flags(bool file_present, __le32 access,
+ 			break;
+ 		}
+ 	}
++
+ 	return oflags;
+ }
+ 
+@@ -2355,7 +2362,7 @@ int smb2_open(struct ksmbd_work *work)
+ 	struct create_ea_buf_req *ea_buf = NULL;
+ 	struct oplock_info *opinfo;
+ 	__le32 *next_ptr = NULL;
+-	int req_op_level = 0, open_flags = 0, file_info = 0;
++	int req_op_level = 0, open_flags = 0, may_flags = 0, file_info = 0;
+ 	int rc = 0, len = 0;
+ 	int contxt_cnt = 0, query_disk_id = 0;
+ 	int maximal_access_ctxt = 0, posix_ctxt = 0;
+@@ -2696,7 +2703,8 @@ int smb2_open(struct ksmbd_work *work)
+ 	}
+ 
+ 	open_flags = smb2_create_open_flags(file_present, daccess,
+-					    req->CreateDisposition);
++					    req->CreateDisposition,
++					    &may_flags);
+ 
+ 	if (!test_tree_conn_flag(tcon, KSMBD_TREE_CONN_FLAG_WRITABLE)) {
+ 		if (open_flags & O_CREAT) {
+@@ -2723,21 +2731,23 @@ int smb2_open(struct ksmbd_work *work)
+ 				goto err_out;
+ 		}
+ 	} else if (!already_permitted) {
+-		bool may_delete;
+-
+-		may_delete = daccess & FILE_DELETE_LE ||
+-			req->CreateOptions & FILE_DELETE_ON_CLOSE_LE;
+-
+ 		/* FILE_READ_ATTRIBUTE is allowed without inode_permission,
+ 		 * because execute(search) permission on a parent directory,
+ 		 * is already granted.
+ 		 */
+ 		if (daccess & ~(FILE_READ_ATTRIBUTES_LE | FILE_READ_CONTROL_LE)) {
+-			rc = ksmbd_vfs_inode_permission(path.dentry,
+-							open_flags & O_ACCMODE,
+-							may_delete);
++			rc = inode_permission(&init_user_ns,
++					      d_inode(path.dentry),
++					      may_flags);
+ 			if (rc)
+ 				goto err_out;
++
++			if ((daccess & FILE_DELETE_LE) ||
++			    (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)) {
++				rc = ksmbd_vfs_may_delete(path.dentry);
++				if (rc)
++					goto err_out;
++			}
+ 		}
+ 	}
+ 
+diff --git a/fs/ksmbd/vfs.c b/fs/ksmbd/vfs.c
+index e64eab7a58a8..6181a58e8a33 100644
+--- a/fs/ksmbd/vfs.c
++++ b/fs/ksmbd/vfs.c
+@@ -95,39 +95,23 @@ static int ksmbd_vfs_lock_parent(struct dentry *parent, struct dentry *child)
+ 	return ret;
+ }
+ 
+-int ksmbd_vfs_inode_permission(struct dentry *dentry, int acc_mode, bool delete)
++int ksmbd_vfs_may_delete(struct dentry *dentry)
+ {
+-	int mask, ret = 0;
+-
+-	mask = 0;
+-	acc_mode &= O_ACCMODE;
+-
+-	if (acc_mode == O_RDONLY)
+-		mask = MAY_READ;
+-	else if (acc_mode == O_WRONLY)
+-		mask = MAY_WRITE;
+-	else if (acc_mode == O_RDWR)
+-		mask = MAY_READ | MAY_WRITE;
+-
+-	if (inode_permission(&init_user_ns, d_inode(dentry), mask | MAY_OPEN))
+-		return -EACCES;
+-
+-	if (delete) {
+-		struct dentry *parent;
+-
+-		parent = dget_parent(dentry);
+-		ret = ksmbd_vfs_lock_parent(parent, dentry);
+-		if (ret) {
+-			dput(parent);
+-			return ret;
+-		}
+-
+-		if (inode_permission(&init_user_ns, d_inode(parent), MAY_EXEC | MAY_WRITE))
+-			ret = -EACCES;
++	struct dentry *parent;
++	int ret;
+ 
+-		inode_unlock(d_inode(parent));
++	parent = dget_parent(dentry);
++	ret = ksmbd_vfs_lock_parent(parent, dentry);
++	if (ret) {
+ 		dput(parent);
++		return ret;
+ 	}
++
++	ret = inode_permission(&init_user_ns, d_inode(parent),
++			       MAY_EXEC | MAY_WRITE);
++
++	inode_unlock(d_inode(parent));
++	dput(parent);
+ 	return ret;
+ }
+ 
+diff --git a/fs/ksmbd/vfs.h b/fs/ksmbd/vfs.h
+index 49f0558ace32..ae8eff1f0315 100644
+--- a/fs/ksmbd/vfs.h
++++ b/fs/ksmbd/vfs.h
+@@ -192,8 +192,7 @@ struct ksmbd_kstat {
+ 	__le32			file_attributes;
+ };
+ 
+-int ksmbd_vfs_inode_permission(struct dentry *dentry, int acc_mode,
+-			       bool delete);
++int ksmbd_vfs_may_delete(struct dentry *dentry);
+ int ksmbd_vfs_query_maximal_access(struct dentry *dentry, __le32 *daccess);
+ int ksmbd_vfs_create(struct ksmbd_work *work, const char *name, umode_t mode);
+ int ksmbd_vfs_mkdir(struct ksmbd_work *work, const char *name, umode_t mode);
+-- 
+2.33.0
+

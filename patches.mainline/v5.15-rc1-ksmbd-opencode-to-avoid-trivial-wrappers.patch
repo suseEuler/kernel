@@ -1,0 +1,164 @@
+From e8c061917133dd77410239bfc0fae151b1955af2 Mon Sep 17 00:00:00 2001
+From: Namjae Jeon <namjae.jeon@samsung.com>
+Date: Tue, 22 Jun 2021 11:06:11 +0900
+Subject: [PATCH] ksmbd: opencode to avoid trivial wrappers
+Git-commit: e8c061917133dd77410239bfc0fae151b1955af2
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+Opencode to avoid trivial wrappers that just make the code hard to
+follow.
+
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Namjae Jeon <namjae.jeon@samsung.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/cifsd/smb2pdu.c | 19 ++++++++++++-------
+ fs/cifsd/vfs.c     | 30 ++----------------------------
+ fs/cifsd/vfs.h     |  4 ----
+ 3 files changed, 14 insertions(+), 39 deletions(-)
+
+diff --git a/fs/cifsd/smb2pdu.c b/fs/cifsd/smb2pdu.c
+index 84f4cd7f545f..96a0cb512882 100644
+--- a/fs/cifsd/smb2pdu.c
++++ b/fs/cifsd/smb2pdu.c
+@@ -10,6 +10,7 @@
+ #include <linux/namei.h>
+ #include <linux/statfs.h>
+ #include <linux/ethtool.h>
++#include <linux/falloc.h>
+ 
+ #include "glob.h"
+ #include "smb2pdu.h"
+@@ -2948,10 +2949,12 @@ int smb2_open(struct ksmbd_work *work)
+ 			ksmbd_debug(SMB,
+ 				    "request smb2 create allocate size : %llu\n",
+ 				    alloc_size);
+-			err = ksmbd_vfs_alloc_size(work, fp, alloc_size);
++			smb_break_all_levII_oplock(work, fp, 1);
++			err = vfs_fallocate(fp->filp, FALLOC_FL_KEEP_SIZE, 0,
++					    alloc_size);
+ 			if (err < 0)
+ 				ksmbd_debug(SMB,
+-					    "ksmbd_vfs_alloc_size is failed : %d\n",
++					    "vfs_fallocate is failed : %d\n",
+ 					    err);
+ 		}
+ 
+@@ -3762,7 +3765,7 @@ int smb2_query_dir(struct ksmbd_work *work)
+ 	dir_fp->readdir_data.private		= &query_dir_private;
+ 	set_ctx_actor(&dir_fp->readdir_data.ctx, __query_dir);
+ 
+-	rc = ksmbd_vfs_readdir(dir_fp->filp, &dir_fp->readdir_data);
++	rc = iterate_dir(dir_fp->filp, &dir_fp->readdir_data.ctx);
+ 	if (rc == 0)
+ 		restart_ctx(&dir_fp->readdir_data.ctx);
+ 	if (rc == -ENOSPC)
+@@ -5465,9 +5468,11 @@ static int set_file_allocation_info(struct ksmbd_work *work,
+ 	inode = file_inode(fp->filp);
+ 
+ 	if (alloc_blks > inode->i_blocks) {
+-		rc = ksmbd_vfs_alloc_size(work, fp, alloc_blks * 512);
++		smb_break_all_levII_oplock(work, fp, 1);
++		rc = vfs_fallocate(fp->filp, FALLOC_FL_KEEP_SIZE, 0,
++				   alloc_blks * 512);
+ 		if (rc && rc != -EOPNOTSUPP) {
+-			pr_err("ksmbd_vfs_alloc_size is failed : %d\n", rc);
++			pr_err("vfs_fallocate is failed : %d\n", rc);
+ 			return rc;
+ 		}
+ 	} else if (alloc_blks < inode->i_blocks) {
+@@ -6672,7 +6677,7 @@ int smb2_lock(struct ksmbd_work *work)
+ 		flock = smb_lock->fl;
+ 		list_del(&smb_lock->llist);
+ retry:
+-		err = ksmbd_vfs_lock(filp, smb_lock->cmd, flock);
++		err = vfs_lock_file(filp, smb_lock->cmd, flock, NULL);
+ skip:
+ 		if (flags & SMB2_LOCKFLAG_UNLOCK) {
+ 			if (!err) {
+@@ -6785,7 +6790,7 @@ int smb2_lock(struct ksmbd_work *work)
+ 		rlock->fl_start = smb_lock->start;
+ 		rlock->fl_end = smb_lock->end;
+ 
+-		err = ksmbd_vfs_lock(filp, 0, rlock);
++		err = vfs_lock_file(filp, 0, rlock, NULL);
+ 		if (err)
+ 			pr_err("rollback unlock fail : %d\n", err);
+ 		list_del(&smb_lock->llist);
+diff --git a/fs/cifsd/vfs.c b/fs/cifsd/vfs.c
+index ad08bad8df4e..1ba3fd95ba6b 100644
+--- a/fs/cifsd/vfs.c
++++ b/fs/cifsd/vfs.c
+@@ -1000,32 +1000,6 @@ void ksmbd_vfs_set_fadvise(struct file *filp, __le32 option)
+ 	}
+ }
+ 
+-/**
+- * ksmbd_vfs_lock() - vfs helper for smb file locking
+- * @filp:	the file to apply the lock to
+- * @cmd:	type of locking operation (F_SETLK, F_GETLK, etc.)
+- * @flock:	The lock to be applied
+- *
+- * Return:	0 on success, otherwise error
+- */
+-int ksmbd_vfs_lock(struct file *filp, int cmd, struct file_lock *flock)
+-{
+-	ksmbd_debug(VFS, "calling vfs_lock_file\n");
+-	return vfs_lock_file(filp, cmd, flock, NULL);
+-}
+-
+-int ksmbd_vfs_readdir(struct file *file, struct ksmbd_readdir_data *rdata)
+-{
+-	return iterate_dir(file, &rdata->ctx);
+-}
+-
+-int ksmbd_vfs_alloc_size(struct ksmbd_work *work, struct ksmbd_file *fp,
+-			 loff_t len)
+-{
+-	smb_break_all_levII_oplock(work, fp, 1);
+-	return vfs_fallocate(fp->filp, FALLOC_FL_KEEP_SIZE, 0, len);
+-}
+-
+ int ksmbd_vfs_zero_data(struct ksmbd_work *work, struct ksmbd_file *fp,
+ 			loff_t off, loff_t len)
+ {
+@@ -1216,7 +1190,7 @@ int ksmbd_vfs_empty_dir(struct ksmbd_file *fp)
+ 	set_ctx_actor(&readdir_data.ctx, __dir_empty);
+ 	readdir_data.dirent_count = 0;
+ 
+-	err = ksmbd_vfs_readdir(fp->filp, &readdir_data);
++	err = iterate_dir(fp->filp, &readdir_data.ctx);
+ 	if (readdir_data.dirent_count > 2)
+ 		err = -ENOTEMPTY;
+ 	else
+@@ -1266,7 +1240,7 @@ static int ksmbd_vfs_lookup_in_dir(struct path *dir, char *name, size_t namelen)
+ 	if (IS_ERR(dfilp))
+ 		return PTR_ERR(dfilp);
+ 
+-	ret = ksmbd_vfs_readdir(dfilp, &readdir_data);
++	ret = iterate_dir(dfilp, &readdir_data.ctx);
+ 	if (readdir_data.dirent_count > 0)
+ 		ret = 0;
+ 	fput(dfilp);
+diff --git a/fs/cifsd/vfs.h b/fs/cifsd/vfs.h
+index 03b877e6520b..e1021f579f37 100644
+--- a/fs/cifsd/vfs.h
++++ b/fs/cifsd/vfs.h
+@@ -232,10 +232,6 @@ int ksmbd_vfs_kern_path(char *name, unsigned int flags, struct path *path,
+ 			bool caseless);
+ int ksmbd_vfs_empty_dir(struct ksmbd_file *fp);
+ void ksmbd_vfs_set_fadvise(struct file *filp, __le32 option);
+-int ksmbd_vfs_lock(struct file *filp, int cmd, struct file_lock *flock);
+-int ksmbd_vfs_readdir(struct file *file, struct ksmbd_readdir_data *rdata);
+-int ksmbd_vfs_alloc_size(struct ksmbd_work *work, struct ksmbd_file *fp,
+-			 loff_t len);
+ int ksmbd_vfs_zero_data(struct ksmbd_work *work, struct ksmbd_file *fp,
+ 			loff_t off, loff_t len);
+ struct file_allocated_range_buffer;
+-- 
+2.33.0
+

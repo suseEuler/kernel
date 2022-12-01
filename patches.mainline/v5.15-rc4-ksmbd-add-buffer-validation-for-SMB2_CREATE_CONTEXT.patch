@@ -1,0 +1,203 @@
+From 8f77150c15f87796570125a43509f9a81a3d9e49 Mon Sep 17 00:00:00 2001
+From: Hyunchul Lee <hyc.lee@gmail.com>
+Date: Fri, 24 Sep 2021 22:22:22 +0900
+Subject: [PATCH] ksmbd: add buffer validation for SMB2_CREATE_CONTEXT
+Git-commit: 8f77150c15f87796570125a43509f9a81a3d9e49
+Patch-mainline: v5.15-rc4
+References: bsn#12
+Modified-by-SEL: No
+
+
+Add buffer validation for SMB2_CREATE_CONTEXT.
+
+Cc: Ronnie Sahlberg <ronniesahlberg@gmail.com>
+Reviewed-by: Ralph Boehme <slow@samba.org>
+Signed-off-by: Hyunchul Lee <hyc.lee@gmail.com>
+Signed-off-by: Namjae Jeon <linkinjeon@kernel.org>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/ksmbd/oplock.c  | 41 +++++++++++++++++++++++++++++++----------
+ fs/ksmbd/smb2pdu.c | 25 ++++++++++++++++++++++++-
+ fs/ksmbd/smbacl.c  | 21 +++++++++++++++++++--
+ 3 files changed, 74 insertions(+), 13 deletions(-)
+
+diff --git a/fs/ksmbd/oplock.c b/fs/ksmbd/oplock.c
+index 16b6236d1bd2..f9dae6ef2115 100644
+--- a/fs/ksmbd/oplock.c
++++ b/fs/ksmbd/oplock.c
+@@ -1451,26 +1451,47 @@ struct lease_ctx_info *parse_lease_state(void *open_req)
+  */
+ struct create_context *smb2_find_context_vals(void *open_req, const char *tag)
+ {
+-	char *data_offset;
+ 	struct create_context *cc;
+ 	unsigned int next = 0;
+ 	char *name;
+ 	struct smb2_create_req *req = (struct smb2_create_req *)open_req;
++	unsigned int remain_len, name_off, name_len, value_off, value_len,
++		     cc_len;
+ 
+-	data_offset = (char *)req + 4 + le32_to_cpu(req->CreateContextsOffset);
+-	cc = (struct create_context *)data_offset;
++	/*
++	 * CreateContextsOffset and CreateContextsLength are guaranteed to
++	 * be valid because of ksmbd_smb2_check_message().
++	 */
++	cc = (struct create_context *)((char *)req + 4 +
++				       le32_to_cpu(req->CreateContextsOffset));
++	remain_len = le32_to_cpu(req->CreateContextsLength);
+ 	do {
+-		int val;
+-
+ 		cc = (struct create_context *)((char *)cc + next);
+-		name = le16_to_cpu(cc->NameOffset) + (char *)cc;
+-		val = le16_to_cpu(cc->NameLength);
+-		if (val < 4)
++		if (remain_len < offsetof(struct create_context, Buffer))
+ 			return ERR_PTR(-EINVAL);
+ 
+-		if (memcmp(name, tag, val) == 0)
+-			return cc;
+ 		next = le32_to_cpu(cc->Next);
++		name_off = le16_to_cpu(cc->NameOffset);
++		name_len = le16_to_cpu(cc->NameLength);
++		value_off = le16_to_cpu(cc->DataOffset);
++		value_len = le32_to_cpu(cc->DataLength);
++		cc_len = next ? next : remain_len;
++
++		if ((next & 0x7) != 0 ||
++		    next > remain_len ||
++		    name_off != offsetof(struct create_context, Buffer) ||
++		    name_len < 4 ||
++		    name_off + name_len > cc_len ||
++		    (value_off & 0x7) != 0 ||
++		    (value_off && (value_off < name_off + name_len)) ||
++		    ((u64)value_off + value_len > cc_len))
++			return ERR_PTR(-EINVAL);
++
++		name = (char *)cc + name_off;
++		if (memcmp(name, tag, name_len) == 0)
++			return cc;
++
++		remain_len -= next;
+ 	} while (next != 0);
+ 
+ 	return NULL;
+diff --git a/fs/ksmbd/smb2pdu.c b/fs/ksmbd/smb2pdu.c
+index 40882fd47feb..99c6349a44fa 100644
+--- a/fs/ksmbd/smb2pdu.c
++++ b/fs/ksmbd/smb2pdu.c
+@@ -2427,6 +2427,10 @@ static int smb2_create_sd_buffer(struct ksmbd_work *work,
+ 	ksmbd_debug(SMB,
+ 		    "Set ACLs using SMB2_CREATE_SD_BUFFER context\n");
+ 	sd_buf = (struct create_sd_buf_req *)context;
++	if (le16_to_cpu(context->DataOffset) +
++	    le32_to_cpu(context->DataLength) <
++	    sizeof(struct create_sd_buf_req))
++		return -EINVAL;
+ 	return set_info_sec(work->conn, work->tcon, path, &sd_buf->ntsd,
+ 			    le32_to_cpu(sd_buf->ccontext.DataLength), true);
+ }
+@@ -2621,6 +2625,12 @@ int smb2_open(struct ksmbd_work *work)
+ 			goto err_out1;
+ 		} else if (context) {
+ 			ea_buf = (struct create_ea_buf_req *)context;
++			if (le16_to_cpu(context->DataOffset) +
++			    le32_to_cpu(context->DataLength) <
++			    sizeof(struct create_ea_buf_req)) {
++				rc = -EINVAL;
++				goto err_out1;
++			}
+ 			if (req->CreateOptions & FILE_NO_EA_KNOWLEDGE_LE) {
+ 				rsp->hdr.Status = STATUS_ACCESS_DENIED;
+ 				rc = -EACCES;
+@@ -2659,6 +2669,12 @@ int smb2_open(struct ksmbd_work *work)
+ 			} else if (context) {
+ 				struct create_posix *posix =
+ 					(struct create_posix *)context;
++				if (le16_to_cpu(context->DataOffset) +
++				    le32_to_cpu(context->DataLength) <
++				    sizeof(struct create_posix)) {
++					rc = -EINVAL;
++					goto err_out1;
++				}
+ 				ksmbd_debug(SMB, "get posix context\n");
+ 
+ 				posix_mode = le32_to_cpu(posix->Mode);
+@@ -3049,9 +3065,16 @@ int smb2_open(struct ksmbd_work *work)
+ 			rc = PTR_ERR(az_req);
+ 			goto err_out;
+ 		} else if (az_req) {
+-			loff_t alloc_size = le64_to_cpu(az_req->AllocationSize);
++			loff_t alloc_size;
+ 			int err;
+ 
++			if (le16_to_cpu(az_req->ccontext.DataOffset) +
++			    le32_to_cpu(az_req->ccontext.DataLength) <
++			    sizeof(struct create_alloc_size_req)) {
++				rc = -EINVAL;
++				goto err_out;
++			}
++			alloc_size = le64_to_cpu(az_req->AllocationSize);
+ 			ksmbd_debug(SMB,
+ 				    "request smb2 create allocate size : %llu\n",
+ 				    alloc_size);
+diff --git a/fs/ksmbd/smbacl.c b/fs/ksmbd/smbacl.c
+index 0a95cdec8c80..bd792db32623 100644
+--- a/fs/ksmbd/smbacl.c
++++ b/fs/ksmbd/smbacl.c
+@@ -380,7 +380,7 @@ static void parse_dacl(struct user_namespace *user_ns,
+ {
+ 	int i, ret;
+ 	int num_aces = 0;
+-	int acl_size;
++	unsigned int acl_size;
+ 	char *acl_base;
+ 	struct smb_ace **ppace;
+ 	struct posix_acl_entry *cf_pace, *cf_pdace;
+@@ -392,7 +392,7 @@ static void parse_dacl(struct user_namespace *user_ns,
+ 		return;
+ 
+ 	/* validate that we do not go past end of acl */
+-	if (end_of_acl <= (char *)pdacl ||
++	if (end_of_acl < (char *)pdacl + sizeof(struct smb_acl) ||
+ 	    end_of_acl < (char *)pdacl + le16_to_cpu(pdacl->size)) {
+ 		pr_err("ACL too small to parse DACL\n");
+ 		return;
+@@ -431,8 +431,22 @@ static void parse_dacl(struct user_namespace *user_ns,
+ 	 * user/group/other have no permissions
+ 	 */
+ 	for (i = 0; i < num_aces; ++i) {
++		if (end_of_acl - acl_base < acl_size)
++			break;
++
+ 		ppace[i] = (struct smb_ace *)(acl_base + acl_size);
+ 		acl_base = (char *)ppace[i];
++		acl_size = offsetof(struct smb_ace, sid) +
++			offsetof(struct smb_sid, sub_auth);
++
++		if (end_of_acl - acl_base < acl_size ||
++		    ppace[i]->sid.num_subauth > SID_MAX_SUB_AUTHORITIES ||
++		    (end_of_acl - acl_base <
++		     acl_size + sizeof(__le32) * ppace[i]->sid.num_subauth) ||
++		    (le16_to_cpu(ppace[i]->size) <
++		     acl_size + sizeof(__le32) * ppace[i]->sid.num_subauth))
++			break;
++
+ 		acl_size = le16_to_cpu(ppace[i]->size);
+ 		ppace[i]->access_req =
+ 			smb_map_generic_desired_access(ppace[i]->access_req);
+@@ -807,6 +821,9 @@ int parse_sec_desc(struct user_namespace *user_ns, struct smb_ntsd *pntsd,
+ 	if (!pntsd)
+ 		return -EIO;
+ 
++	if (acl_len < sizeof(struct smb_ntsd))
++		return -EINVAL;
++
+ 	owner_sid_ptr = (struct smb_sid *)((char *)pntsd +
+ 			le32_to_cpu(pntsd->osidoffset));
+ 	group_sid_ptr = (struct smb_sid *)((char *)pntsd +
+-- 
+2.33.0
+

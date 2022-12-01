@@ -1,0 +1,144 @@
+From 493fa2fbe4597db474e43d38fb8805cbaef654ac Mon Sep 17 00:00:00 2001
+From: Namjae Jeon <namjae.jeon@samsung.com>
+Date: Tue, 29 Jun 2021 09:22:16 +0900
+Subject: [PATCH] ksmbd: fix dentry racy with rename()
+Git-commit: 493fa2fbe4597db474e43d38fb8805cbaef654ac
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+Using ->d_name can be broken due to races with rename().
+So use %pd with ->d_name to print filename and In other cases,
+use it under ->d_lock.
+
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Namjae Jeon <namjae.jeon@samsung.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/ksmbd/smb2pdu.c   | 19 ++++++++++---------
+ fs/ksmbd/vfs.c       | 14 ++++++++------
+ fs/ksmbd/vfs_cache.h |  1 -
+ 3 files changed, 18 insertions(+), 16 deletions(-)
+
+diff --git a/fs/ksmbd/smb2pdu.c b/fs/ksmbd/smb2pdu.c
+index 7d8bec07630b..70e6d6e3e84b 100644
+--- a/fs/ksmbd/smb2pdu.c
++++ b/fs/ksmbd/smb2pdu.c
+@@ -3711,8 +3711,8 @@ int smb2_query_dir(struct ksmbd_work *work)
+ 	if (!(dir_fp->daccess & FILE_LIST_DIRECTORY_LE) ||
+ 	    inode_permission(&init_user_ns, file_inode(dir_fp->filp),
+ 			     MAY_READ | MAY_EXEC)) {
+-		pr_err("no right to enumerate directory (%s)\n",
+-		       FP_FILENAME(dir_fp));
++		pr_err("no right to enumerate directory (%pd)\n",
++		       dir_fp->filp->f_path.dentry);
+ 		rc = -EACCES;
+ 		goto err_out2;
+ 	}
+@@ -4266,14 +4266,15 @@ static void get_file_alternate_info(struct ksmbd_work *work,
+ {
+ 	struct ksmbd_conn *conn = work->conn;
+ 	struct smb2_file_alt_name_info *file_info;
++	struct dentry *dentry = fp->filp->f_path.dentry;
+ 	int conv_len;
+-	char *filename;
+ 
+-	filename = (char *)FP_FILENAME(fp);
++	spin_lock(&dentry->d_lock);
+ 	file_info = (struct smb2_file_alt_name_info *)rsp->Buffer;
+ 	conv_len = ksmbd_extract_shortname(conn,
+-					   filename,
++					   dentry->d_name.name,
+ 					   file_info->FileName);
++	spin_unlock(&dentry->d_lock);
+ 	file_info->FileNameLength = cpu_to_le32(conv_len);
+ 	rsp->OutputBufferLength =
+ 		cpu_to_le32(sizeof(struct smb2_file_alt_name_info) + conv_len);
+@@ -5938,8 +5939,8 @@ int smb2_read(struct ksmbd_work *work)
+ 		goto out;
+ 	}
+ 
+-	ksmbd_debug(SMB, "filename %s, offset %lld, len %zu\n", FP_FILENAME(fp),
+-		    offset, length);
++	ksmbd_debug(SMB, "filename %pd, offset %lld, len %zu\n",
++		    fp->filp->f_path.dentry, offset, length);
+ 
+ 	work->aux_payload_buf = kvmalloc(length, GFP_KERNEL | __GFP_ZERO);
+ 	if (!work->aux_payload_buf) {
+@@ -6216,8 +6217,8 @@ int smb2_write(struct ksmbd_work *work)
+ 		if (le32_to_cpu(req->Flags) & SMB2_WRITEFLAG_WRITE_THROUGH)
+ 			writethrough = true;
+ 
+-		ksmbd_debug(SMB, "filename %s, offset %lld, len %zu\n",
+-			    FP_FILENAME(fp), offset, length);
++		ksmbd_debug(SMB, "filename %pd, offset %lld, len %zu\n",
++			    fp->filp->f_path.dentry, offset, length);
+ 		err = ksmbd_vfs_write(work, fp, data_buf, length, &offset,
+ 				      writethrough, &nbytes);
+ 		if (err < 0)
+diff --git a/fs/ksmbd/vfs.c b/fs/ksmbd/vfs.c
+index 6181a58e8a33..ed1c0626e205 100644
+--- a/fs/ksmbd/vfs.c
++++ b/fs/ksmbd/vfs.c
+@@ -365,7 +365,8 @@ int ksmbd_vfs_read(struct ksmbd_work *work, struct ksmbd_file *fp, size_t count,
+ 
+ 	if (work->conn->connection_type) {
+ 		if (!(fp->daccess & (FILE_READ_DATA_LE | FILE_EXECUTE_LE))) {
+-			pr_err("no right to read(%s)\n", FP_FILENAME(fp));
++			pr_err("no right to read(%pd)\n",
++			       fp->filp->f_path.dentry);
+ 			return -EACCES;
+ 		}
+ 	}
+@@ -473,7 +474,8 @@ int ksmbd_vfs_write(struct ksmbd_work *work, struct ksmbd_file *fp,
+ 
+ 	if (sess->conn->connection_type) {
+ 		if (!(fp->daccess & FILE_WRITE_DATA_LE)) {
+-			pr_err("no right to write(%s)\n", FP_FILENAME(fp));
++			pr_err("no right to write(%pd)\n",
++			       fp->filp->f_path.dentry);
+ 			err = -EACCES;
+ 			goto out;
+ 		}
+@@ -512,8 +514,8 @@ int ksmbd_vfs_write(struct ksmbd_work *work, struct ksmbd_file *fp,
+ 	if (sync) {
+ 		err = vfs_fsync_range(filp, offset, offset + *written, 0);
+ 		if (err < 0)
+-			pr_err("fsync failed for filename = %s, err = %d\n",
+-			       FP_FILENAME(fp), err);
++			pr_err("fsync failed for filename = %pd, err = %d\n",
++			       fp->filp->f_path.dentry, err);
+ 	}
+ 
+ out:
+@@ -1707,11 +1709,11 @@ int ksmbd_vfs_copy_file_ranges(struct ksmbd_work *work,
+ 	*total_size_written = 0;
+ 
+ 	if (!(src_fp->daccess & (FILE_READ_DATA_LE | FILE_EXECUTE_LE))) {
+-		pr_err("no right to read(%s)\n", FP_FILENAME(src_fp));
++		pr_err("no right to read(%pd)\n", src_fp->filp->f_path.dentry);
+ 		return -EACCES;
+ 	}
+ 	if (!(dst_fp->daccess & (FILE_WRITE_DATA_LE | FILE_APPEND_DATA_LE))) {
+-		pr_err("no right to write(%s)\n", FP_FILENAME(dst_fp));
++		pr_err("no right to write(%pd)\n", dst_fp->filp->f_path.dentry);
+ 		return -EACCES;
+ 	}
+ 
+diff --git a/fs/ksmbd/vfs_cache.h b/fs/ksmbd/vfs_cache.h
+index 745855367106..03c36906cab0 100644
+--- a/fs/ksmbd/vfs_cache.h
++++ b/fs/ksmbd/vfs_cache.h
+@@ -25,7 +25,6 @@
+ #define KSMBD_NO_FID		(UINT_MAX)
+ #define SMB2_NO_FID		(0xFFFFFFFFFFFFFFFFULL)
+ 
+-#define FP_FILENAME(fp)		((fp)->filp->f_path.dentry->d_name.name)
+ #define FP_INODE(fp)		d_inode((fp)->filp->f_path.dentry)
+ #define PARENT_INODE(fp)	d_inode((fp)->filp->f_path.dentry->d_parent)
+ 
+-- 
+2.33.0
+

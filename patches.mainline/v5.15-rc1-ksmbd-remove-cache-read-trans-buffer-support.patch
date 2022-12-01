@@ -1,0 +1,793 @@
+From c30f4eb84badf7476824c38f874542a2e653b46b Mon Sep 17 00:00:00 2001
+From: Namjae Jeon <namjae.jeon@samsung.com>
+Date: Fri, 18 Jun 2021 10:17:37 +0900
+Subject: [PATCH] ksmbd: remove cache read/trans buffer support
+Git-commit: c30f4eb84badf7476824c38f874542a2e653b46b
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified per openEuler commit 040665dc5
+
+
+As vmalloc performance improvement patch for big allocation is merged into
+linux kernel, This feature is no longer not needed.
+
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Namjae Jeon <namjae.jeon@samsung.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/cifsd/auth.c              |   1 -
+ fs/cifsd/buffer_pool.c       | 265 -----------------------------------
+ fs/cifsd/buffer_pool.h       |  17 ---
+ fs/cifsd/connection.c        |   1 -
+ fs/cifsd/crypto_ctx.c        |   1 -
+ fs/cifsd/ksmbd_server.h      |   6 +-
+ fs/cifsd/ksmbd_work.c        |  14 +-
+ fs/cifsd/ksmbd_work.h        |   2 -
+ fs/cifsd/mgmt/share_config.c |   1 -
+ fs/cifsd/mgmt/tree_connect.c |   1 -
+ fs/cifsd/mgmt/user_config.c  |   1 -
+ fs/cifsd/mgmt/user_session.c |   1 -
+ fs/cifsd/oplock.c            |   1 -
+ fs/cifsd/server.c            |  18 ++-
+ fs/cifsd/smb2pdu.c           |  34 +----
+ fs/cifsd/transport_ipc.c     |   1 -
+ fs/cifsd/transport_rdma.c    |   1 -
+ fs/cifsd/transport_tcp.c     |   1 -
+ fs/cifsd/vfs.c               |   1 -
+ fs/cifsd/vfs_cache.c         |  34 ++++-
+ fs/cifsd/vfs_cache.h         |   2 +
+ 21 files changed, 51 insertions(+), 353 deletions(-)
+ delete mode 100644 fs/cifsd/buffer_pool.c
+ delete mode 100644 fs/cifsd/buffer_pool.h
+
+diff --git a/fs/cifsd/auth.c b/fs/cifsd/auth.c
+index 1ba03a7c3201..daf31c9f0880 100644
+--- a/fs/cifsd/auth.c
++++ b/fs/cifsd/auth.c
+@@ -29,7 +29,6 @@
+ #include "mgmt/user_config.h"
+ #include "crypto_ctx.h"
+ #include "transport_ipc.h"
+-#include "buffer_pool.h"
+ 
+ /*
+  * Fixed format data defining GSS header and fixed string
+diff --git a/fs/cifsd/buffer_pool.c b/fs/cifsd/buffer_pool.c
+deleted file mode 100644
+index ea7d2d1a056a..000000000000
+--- a/fs/cifsd/buffer_pool.c
++++ /dev/null
+@@ -1,265 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0-or-later
+-/*
+- *   Copyright (C) 2018 Samsung Electronics Co., Ltd.
+- */
+-
+-#include <linux/kernel.h>
+-#include <linux/wait.h>
+-#include <linux/sched.h>
+-#include <linux/mm.h>
+-#include <linux/slab.h>
+-#include <linux/vmalloc.h>
+-#include <linux/rwlock.h>
+-
+-#include "glob.h"
+-#include "buffer_pool.h"
+-#include "connection.h"
+-#include "mgmt/ksmbd_ida.h"
+-
+-static struct kmem_cache *filp_cache;
+-
+-struct wm {
+-	struct list_head	list;
+-	unsigned int		sz;
+-	char			buffer[0];
+-};
+-
+-struct wm_list {
+-	struct list_head	list;
+-	unsigned int		sz;
+-
+-	spinlock_t		wm_lock;
+-	int			avail_wm;
+-	struct list_head	idle_wm;
+-	wait_queue_head_t	wm_wait;
+-};
+-
+-static LIST_HEAD(wm_lists);
+-static DEFINE_RWLOCK(wm_lists_lock);
+-
+-static struct wm *wm_alloc(size_t sz, gfp_t flags)
+-{
+-	struct wm *wm;
+-	size_t alloc_sz = sz + sizeof(struct wm);
+-
+-	if (sz > SIZE_MAX - sizeof(struct wm))
+-		return NULL;
+-
+-	wm = kvmalloc(alloc_sz, flags);
+-	if (!wm)
+-		return NULL;
+-	wm->sz = sz;
+-	return wm;
+-}
+-
+-static int register_wm_size_class(size_t sz)
+-{
+-	struct wm_list *l, *nl;
+-
+-	nl = kmalloc(sizeof(struct wm_list), GFP_KERNEL);
+-	if (!nl)
+-		return -ENOMEM;
+-
+-	nl->sz = sz;
+-	spin_lock_init(&nl->wm_lock);
+-	INIT_LIST_HEAD(&nl->idle_wm);
+-	INIT_LIST_HEAD(&nl->list);
+-	init_waitqueue_head(&nl->wm_wait);
+-	nl->avail_wm = 0;
+-
+-	write_lock(&wm_lists_lock);
+-	list_for_each_entry(l, &wm_lists, list) {
+-		if (l->sz == sz) {
+-			write_unlock(&wm_lists_lock);
+-			kfree(nl);
+-			return 0;
+-		}
+-	}
+-
+-	list_add(&nl->list, &wm_lists);
+-	write_unlock(&wm_lists_lock);
+-	return 0;
+-}
+-
+-static struct wm_list *match_wm_list(size_t size)
+-{
+-	struct wm_list *l, *rl = NULL;
+-
+-	read_lock(&wm_lists_lock);
+-	list_for_each_entry(l, &wm_lists, list) {
+-		if (l->sz == size) {
+-			rl = l;
+-			break;
+-		}
+-	}
+-	read_unlock(&wm_lists_lock);
+-	return rl;
+-}
+-
+-static struct wm *find_wm(size_t size)
+-{
+-	struct wm_list *wm_list;
+-	struct wm *wm;
+-
+-	wm_list = match_wm_list(size);
+-	if (!wm_list) {
+-		if (register_wm_size_class(size))
+-			return NULL;
+-		wm_list = match_wm_list(size);
+-	}
+-
+-	if (!wm_list)
+-		return NULL;
+-
+-	while (1) {
+-		spin_lock(&wm_list->wm_lock);
+-		if (!list_empty(&wm_list->idle_wm)) {
+-			wm = list_entry(wm_list->idle_wm.next,
+-					struct wm,
+-					list);
+-			list_del(&wm->list);
+-			spin_unlock(&wm_list->wm_lock);
+-			return wm;
+-		}
+-
+-		if (wm_list->avail_wm > num_online_cpus()) {
+-			spin_unlock(&wm_list->wm_lock);
+-			wait_event(wm_list->wm_wait,
+-				   !list_empty(&wm_list->idle_wm));
+-			continue;
+-		}
+-
+-		wm_list->avail_wm++;
+-		spin_unlock(&wm_list->wm_lock);
+-
+-		wm = wm_alloc(size, GFP_KERNEL);
+-		if (!wm) {
+-			spin_lock(&wm_list->wm_lock);
+-			wm_list->avail_wm--;
+-			spin_unlock(&wm_list->wm_lock);
+-			wait_event(wm_list->wm_wait,
+-				   !list_empty(&wm_list->idle_wm));
+-			continue;
+-		}
+-		break;
+-	}
+-
+-	return wm;
+-}
+-
+-static void release_wm(struct wm *wm, struct wm_list *wm_list)
+-{
+-	if (!wm)
+-		return;
+-
+-	spin_lock(&wm_list->wm_lock);
+-	if (wm_list->avail_wm <= num_online_cpus()) {
+-		list_add(&wm->list, &wm_list->idle_wm);
+-		spin_unlock(&wm_list->wm_lock);
+-		wake_up(&wm_list->wm_wait);
+-		return;
+-	}
+-
+-	wm_list->avail_wm--;
+-	spin_unlock(&wm_list->wm_lock);
+-	kvfree(wm);
+-}
+-
+-static void wm_list_free(struct wm_list *l)
+-{
+-	struct wm *wm;
+-
+-	while (!list_empty(&l->idle_wm)) {
+-		wm = list_entry(l->idle_wm.next, struct wm, list);
+-		list_del(&wm->list);
+-		kvfree(wm);
+-	}
+-	kfree(l);
+-}
+-
+-static void wm_lists_destroy(void)
+-{
+-	struct wm_list *l;
+-
+-	while (!list_empty(&wm_lists)) {
+-		l = list_entry(wm_lists.next, struct wm_list, list);
+-		list_del(&l->list);
+-		wm_list_free(l);
+-	}
+-}
+-
+-void *ksmbd_find_buffer(size_t size)
+-{
+-	struct wm *wm;
+-
+-	wm = find_wm(size);
+-
+-	WARN_ON(!wm);
+-	if (wm)
+-		return wm->buffer;
+-	return NULL;
+-}
+-
+-void ksmbd_release_buffer(void *buffer)
+-{
+-	struct wm_list *wm_list;
+-	struct wm *wm;
+-
+-	if (!buffer)
+-		return;
+-
+-	wm = container_of(buffer, struct wm, buffer);
+-	wm_list = match_wm_list(wm->sz);
+-	WARN_ON(!wm_list);
+-	if (wm_list)
+-		release_wm(wm, wm_list);
+-}
+-
+-void *ksmbd_realloc_response(void *ptr, size_t old_sz, size_t new_sz)
+-{
+-	size_t sz = min(old_sz, new_sz);
+-	void *nptr;
+-
+-	nptr = kvmalloc(new_sz, GFP_KERNEL | __GFP_ZERO);
+-	if (!nptr)
+-		return ptr;
+-	memcpy(nptr, ptr, sz);
+-	kvfree(ptr);
+-	return nptr;
+-}
+-
+-void ksmbd_free_file_struct(void *filp)
+-{
+-	kmem_cache_free(filp_cache, filp);
+-}
+-
+-void *ksmbd_alloc_file_struct(void)
+-{
+-	return kmem_cache_zalloc(filp_cache, GFP_KERNEL);
+-}
+-
+-void ksmbd_destroy_buffer_pools(void)
+-{
+-	wm_lists_destroy();
+-	ksmbd_work_pool_destroy();
+-	kmem_cache_destroy(filp_cache);
+-}
+-
+-int ksmbd_init_buffer_pools(void)
+-{
+-	if (ksmbd_work_pool_init())
+-		goto out;
+-
+-	filp_cache = kmem_cache_create("ksmbd_file_cache",
+-				       sizeof(struct ksmbd_file), 0,
+-				       SLAB_HWCACHE_ALIGN, NULL);
+-	if (!filp_cache)
+-		goto out;
+-
+-	return 0;
+-
+-out:
+-	ksmbd_err("failed to allocate memory\n");
+-	ksmbd_destroy_buffer_pools();
+-	return -ENOMEM;
+-}
+diff --git a/fs/cifsd/buffer_pool.h b/fs/cifsd/buffer_pool.h
+deleted file mode 100644
+index 088aa07ba09b..000000000000
+--- a/fs/cifsd/buffer_pool.h
++++ /dev/null
+@@ -1,17 +0,0 @@
+-/* SPDX-License-Identifier: GPL-2.0-or-later */
+-/*
+- *   Copyright (C) 2018 Samsung Electronics Co., Ltd.
+- */
+-
+-#ifndef __KSMBD_BUFFER_POOL_H__
+-#define __KSMBD_BUFFER_POOL_H__
+-
+-void *ksmbd_find_buffer(size_t size);
+-void ksmbd_release_buffer(void *buffer);
+-void *ksmbd_realloc_response(void *ptr, size_t old_sz, size_t new_sz);
+-void ksmbd_free_file_struct(void *filp);
+-void *ksmbd_alloc_file_struct(void);
+-void ksmbd_destroy_buffer_pools(void);
+-int ksmbd_init_buffer_pools(void);
+-
+-#endif /* __KSMBD_BUFFER_POOL_H__ */
+diff --git a/fs/cifsd/connection.c b/fs/cifsd/connection.c
+index 06c42309be72..a0d15093dd6f 100644
+--- a/fs/cifsd/connection.c
++++ b/fs/cifsd/connection.c
+@@ -9,7 +9,6 @@
+ #include <linux/module.h>
+ 
+ #include "server.h"
+-#include "buffer_pool.h"
+ #include "smb_common.h"
+ #include "mgmt/ksmbd_ida.h"
+ #include "connection.h"
+diff --git a/fs/cifsd/crypto_ctx.c b/fs/cifsd/crypto_ctx.c
+index cfea4c4db30f..7b727fe141a6 100644
+--- a/fs/cifsd/crypto_ctx.c
++++ b/fs/cifsd/crypto_ctx.c
+@@ -12,7 +12,6 @@
+ 
+ #include "glob.h"
+ #include "crypto_ctx.h"
+-#include "buffer_pool.h"
+ 
+ struct crypto_ctx_list {
+ 	spinlock_t		ctx_lock;
+diff --git a/fs/cifsd/ksmbd_server.h b/fs/cifsd/ksmbd_server.h
+index 5ae3fe91bfb4..c2467a709144 100644
+--- a/fs/cifsd/ksmbd_server.h
++++ b/fs/cifsd/ksmbd_server.h
+@@ -30,10 +30,8 @@ struct ksmbd_heartbeat {
+  */
+ #define KSMBD_GLOBAL_FLAG_INVALID		(0)
+ #define KSMBD_GLOBAL_FLAG_SMB2_LEASES		BIT(0)
+-#define KSMBD_GLOBAL_FLAG_CACHE_TBUF		BIT(1)
+-#define KSMBD_GLOBAL_FLAG_CACHE_RBUF		BIT(2)
+-#define KSMBD_GLOBAL_FLAG_SMB2_ENCRYPTION	BIT(3)
+-#define KSMBD_GLOBAL_FLAG_SMB3_MULTICHANNEL	BIT(4)
++#define KSMBD_GLOBAL_FLAG_SMB2_ENCRYPTION	BIT(1)
++#define KSMBD_GLOBAL_FLAG_SMB3_MULTICHANNEL	BIT(2)
+ 
+ struct ksmbd_startup_request {
+ 	__u32	flags;
+diff --git a/fs/cifsd/ksmbd_work.c b/fs/cifsd/ksmbd_work.c
+index f284a2a803d6..a88c25965012 100644
+--- a/fs/cifsd/ksmbd_work.c
++++ b/fs/cifsd/ksmbd_work.c
+@@ -11,7 +11,6 @@
+ #include "server.h"
+ #include "connection.h"
+ #include "ksmbd_work.h"
+-#include "buffer_pool.h"
+ #include "mgmt/ksmbd_ida.h"
+ 
+ /* @FIXME */
+@@ -38,18 +37,9 @@ struct ksmbd_work *ksmbd_alloc_work_struct(void)
+ void ksmbd_free_work_struct(struct ksmbd_work *work)
+ {
+ 	WARN_ON(work->saved_cred != NULL);
+-	if (server_conf.flags & KSMBD_GLOBAL_FLAG_CACHE_TBUF &&
+-	    work->set_trans_buf)
+-		ksmbd_release_buffer(work->response_buf);
+-	else
+-		kvfree(work->response_buf);
+-
+-	if (server_conf.flags & KSMBD_GLOBAL_FLAG_CACHE_RBUF &&
+-	    work->set_read_buf)
+-		ksmbd_release_buffer(work->aux_payload_buf);
+-	else
+-		kvfree(work->aux_payload_buf);
+ 
++	kvfree(work->response_buf);
++	kvfree(work->aux_payload_buf);
+ 	kfree(work->tr_buf);
+ 	kvfree(work->request_buf);
+ 	if (work->async_id)
+diff --git a/fs/cifsd/ksmbd_work.h b/fs/cifsd/ksmbd_work.h
+index 28a1692ed37f..0e2d4f3fc49f 100644
+--- a/fs/cifsd/ksmbd_work.h
++++ b/fs/cifsd/ksmbd_work.h
+@@ -70,8 +70,6 @@ struct ksmbd_work {
+ 	/* Is this SYNC or ASYNC ksmbd_work */
+ 	bool                            syncronous:1;
+ 	bool                            need_invalidate_rkey:1;
+-	bool                            set_trans_buf:1;
+-	bool                            set_read_buf:1;
+ 
+ 	unsigned int                    remote_key;
+ 	/* cancel works */
+diff --git a/fs/cifsd/mgmt/share_config.c b/fs/cifsd/mgmt/share_config.c
+index bcc4ae4381b9..fac6034b97a9 100644
+--- a/fs/cifsd/mgmt/share_config.c
++++ b/fs/cifsd/mgmt/share_config.c
+@@ -15,7 +15,6 @@
+ #include "share_config.h"
+ #include "user_config.h"
+ #include "user_session.h"
+-#include "../buffer_pool.h"
+ #include "../transport_ipc.h"
+ 
+ #define SHARE_HASH_BITS		3
+diff --git a/fs/cifsd/mgmt/tree_connect.c b/fs/cifsd/mgmt/tree_connect.c
+index 029a9e81e844..0d28e723a28c 100644
+--- a/fs/cifsd/mgmt/tree_connect.c
++++ b/fs/cifsd/mgmt/tree_connect.c
+@@ -7,7 +7,6 @@
+ #include <linux/slab.h>
+ #include <linux/xarray.h>
+ 
+-#include "../buffer_pool.h"
+ #include "../transport_ipc.h"
+ #include "../connection.h"
+ 
+diff --git a/fs/cifsd/mgmt/user_config.c b/fs/cifsd/mgmt/user_config.c
+index 7f898c5bda25..d21629ae5c89 100644
+--- a/fs/cifsd/mgmt/user_config.c
++++ b/fs/cifsd/mgmt/user_config.c
+@@ -7,7 +7,6 @@
+ #include <linux/mm.h>
+ 
+ #include "user_config.h"
+-#include "../buffer_pool.h"
+ #include "../transport_ipc.h"
+ 
+ struct ksmbd_user *ksmbd_login_user(const char *account)
+diff --git a/fs/cifsd/mgmt/user_session.c b/fs/cifsd/mgmt/user_session.c
+index c3487b1a004c..77bdf3642f72 100644
+--- a/fs/cifsd/mgmt/user_session.c
++++ b/fs/cifsd/mgmt/user_session.c
+@@ -14,7 +14,6 @@
+ #include "tree_connect.h"
+ #include "../transport_ipc.h"
+ #include "../connection.h"
+-#include "../buffer_pool.h"
+ #include "../vfs_cache.h"
+ 
+ static DEFINE_IDA(session_ida);
+diff --git a/fs/cifsd/oplock.c b/fs/cifsd/oplock.c
+index 5868cdca7187..1ef2acbea2bb 100644
+--- a/fs/cifsd/oplock.c
++++ b/fs/cifsd/oplock.c
+@@ -11,7 +11,6 @@
+ 
+ #include "smb_common.h"
+ #include "smbstatus.h"
+-#include "buffer_pool.h"
+ #include "connection.h"
+ #include "mgmt/user_session.h"
+ #include "mgmt/share_config.h"
+diff --git a/fs/cifsd/server.c b/fs/cifsd/server.c
+index a71fafa176b3..93402c56b8ff 100644
+--- a/fs/cifsd/server.c
++++ b/fs/cifsd/server.c
+@@ -16,7 +16,6 @@
+ #include "server.h"
+ #include "smb_common.h"
+ #include "smbstatus.h"
+-#include "buffer_pool.h"
+ #include "connection.h"
+ #include "transport_ipc.h"
+ #include "mgmt/user_session.h"
+@@ -536,7 +535,8 @@ static int ksmbd_server_shutdown(void)
+ 	ksmbd_crypto_destroy();
+ 	ksmbd_free_global_file_table();
+ 	destroy_lease_table(NULL);
+-	ksmbd_destroy_buffer_pools();
++	ksmbd_work_pool_destroy();
++	ksmbd_exit_file_cache();
+ 	server_conf_free();
+ 	return 0;
+ }
+@@ -557,13 +557,17 @@ static int __init ksmbd_server_init(void)
+ 	if (ret)
+ 		goto err_unregister;
+ 
+-	ret = ksmbd_init_buffer_pools();
++	ret = ksmbd_work_pool_init();
+ 	if (ret)
+ 		goto err_unregister;
+ 
++	ret = ksmbd_init_file_cache();
++	if (ret)
++		goto err_destroy_work_pools;
++
+ 	ret = ksmbd_ipc_init();
+ 	if (ret)
+-		goto err_free_session_table;
++		goto err_exit_file_cache;
+ 
+ 	ret = ksmbd_init_global_file_table();
+ 	if (ret)
+@@ -590,8 +594,10 @@ static int __init ksmbd_server_init(void)
+ 	ksmbd_free_global_file_table();
+ err_ipc_release:
+ 	ksmbd_ipc_release();
+-err_free_session_table:
+-	ksmbd_destroy_buffer_pools();
++err_exit_file_cache:
++	ksmbd_exit_file_cache();
++err_destroy_work_pools:
++	ksmbd_work_pool_destroy();
+ err_unregister:
+ 	class_unregister(&ksmbd_control_class);
+ 
+diff --git a/fs/cifsd/smb2pdu.c b/fs/cifsd/smb2pdu.c
+index 12c954dac51a..345c4c75da9a 100644
+--- a/fs/cifsd/smb2pdu.c
++++ b/fs/cifsd/smb2pdu.c
+@@ -19,7 +19,6 @@
+ 
+ #include "auth.h"
+ #include "asn1.h"
+-#include "buffer_pool.h"
+ #include "connection.h"
+ #include "transport_ipc.h"
+ #include "vfs.h"
+@@ -538,10 +537,8 @@ int smb2_allocate_rsp_buf(struct ksmbd_work *work)
+ 	size_t sz = small_sz;
+ 	int cmd = le16_to_cpu(hdr->Command);
+ 
+-	if (cmd == SMB2_IOCTL_HE || cmd == SMB2_QUERY_DIRECTORY_HE) {
++	if (cmd == SMB2_IOCTL_HE || cmd == SMB2_QUERY_DIRECTORY_HE)
+ 		sz = large_sz;
+-		work->set_trans_buf = true;
+-	}
+ 
+ 	if (cmd == SMB2_QUERY_INFO_HE) {
+ 		struct smb2_query_info_req *req;
+@@ -549,22 +546,15 @@ int smb2_allocate_rsp_buf(struct ksmbd_work *work)
+ 		req = work->request_buf;
+ 		if (req->InfoType == SMB2_O_INFO_FILE &&
+ 		    (req->FileInfoClass == FILE_FULL_EA_INFORMATION ||
+-		     req->FileInfoClass == FILE_ALL_INFORMATION)) {
++		     req->FileInfoClass == FILE_ALL_INFORMATION))
+ 			sz = large_sz;
+-			work->set_trans_buf = true;
+-		}
+ 	}
+ 
+ 	/* allocate large response buf for chained commands */
+ 	if (le32_to_cpu(hdr->NextCommand) > 0)
+ 		sz = large_sz;
+ 
+-	if (server_conf.flags & KSMBD_GLOBAL_FLAG_CACHE_TBUF &&
+-	    work->set_trans_buf)
+-		work->response_buf = ksmbd_find_buffer(sz);
+-	else
+-		work->response_buf = kvmalloc(sz, GFP_KERNEL | __GFP_ZERO);
+-
++	work->response_buf = kvmalloc(sz, GFP_KERNEL | __GFP_ZERO);
+ 	if (!work->response_buf)
+ 		return -ENOMEM;
+ 
+@@ -5950,13 +5940,7 @@ int smb2_read(struct ksmbd_work *work)
+ 	ksmbd_debug(SMB, "filename %s, offset %lld, len %zu\n", FP_FILENAME(fp),
+ 		    offset, length);
+ 
+-	if (server_conf.flags & KSMBD_GLOBAL_FLAG_CACHE_RBUF) {
+-		work->aux_payload_buf =
+-			ksmbd_find_buffer(conn->vals->max_read_size);
+-		work->set_read_buf = true;
+-	} else {
+-		work->aux_payload_buf = kvmalloc(length, GFP_KERNEL | __GFP_ZERO);
+-	}
++	work->aux_payload_buf = kvmalloc(length, GFP_KERNEL | __GFP_ZERO);
+ 	if (!work->aux_payload_buf) {
+ 		err = -ENOMEM;
+ 		goto out;
+@@ -5969,10 +5953,7 @@ int smb2_read(struct ksmbd_work *work)
+ 	}
+ 
+ 	if ((nbytes == 0 && length != 0) || nbytes < mincount) {
+-		if (server_conf.flags & KSMBD_GLOBAL_FLAG_CACHE_RBUF)
+-			ksmbd_release_buffer(work->aux_payload_buf);
+-		else
+-			kvfree(work->aux_payload_buf);
++		kvfree(work->aux_payload_buf);
+ 		work->aux_payload_buf = NULL;
+ 		rsp->hdr.Status = STATUS_END_OF_FILE;
+ 		smb2_set_err_rsp(work);
+@@ -5989,10 +5970,7 @@ int smb2_read(struct ksmbd_work *work)
+ 		remain_bytes = smb2_read_rdma_channel(work, req,
+ 						      work->aux_payload_buf,
+ 						      nbytes);
+-		if (server_conf.flags & KSMBD_GLOBAL_FLAG_CACHE_RBUF)
+-			ksmbd_release_buffer(work->aux_payload_buf);
+-		else
+-			kvfree(work->aux_payload_buf);
++		kvfree(work->aux_payload_buf);
+ 		work->aux_payload_buf = NULL;
+ 
+ 		nbytes = 0;
+diff --git a/fs/cifsd/transport_ipc.c b/fs/cifsd/transport_ipc.c
+index b09df832431f..2bcc1cad6037 100644
+--- a/fs/cifsd/transport_ipc.c
++++ b/fs/cifsd/transport_ipc.c
+@@ -16,7 +16,6 @@
+ 
+ #include "vfs_cache.h"
+ #include "transport_ipc.h"
+-#include "buffer_pool.h"
+ #include "server.h"
+ #include "smb_common.h"
+ 
+diff --git a/fs/cifsd/transport_rdma.c b/fs/cifsd/transport_rdma.c
+index efaa9776841f..52237f023b66 100644
+--- a/fs/cifsd/transport_rdma.c
++++ b/fs/cifsd/transport_rdma.c
+@@ -33,7 +33,6 @@
+ #include "connection.h"
+ #include "smb_common.h"
+ #include "smbstatus.h"
+-#include "buffer_pool.h"
+ #include "transport_rdma.h"
+ 
+ #define SMB_DIRECT_PORT	5445
+diff --git a/fs/cifsd/transport_tcp.c b/fs/cifsd/transport_tcp.c
+index d6d5c0038dea..16702b7874f4 100644
+--- a/fs/cifsd/transport_tcp.c
++++ b/fs/cifsd/transport_tcp.c
+@@ -9,7 +9,6 @@
+ #include "smb_common.h"
+ #include "server.h"
+ #include "auth.h"
+-#include "buffer_pool.h"
+ #include "connection.h"
+ #include "transport_tcp.h"
+ 
+diff --git a/fs/cifsd/vfs.c b/fs/cifsd/vfs.c
+index 9111b485d611..fb31c1ccb1bd 100644
+--- a/fs/cifsd/vfs.c
++++ b/fs/cifsd/vfs.c
+@@ -23,7 +23,6 @@
+ #include "glob.h"
+ #include "oplock.h"
+ #include "connection.h"
+-#include "buffer_pool.h"
+ #include "vfs.h"
+ #include "vfs_cache.h"
+ #include "smbacl.h"
+diff --git a/fs/cifsd/vfs_cache.c b/fs/cifsd/vfs_cache.c
+index 6ea09fe82814..dcac1f0a29e4 100644
+--- a/fs/cifsd/vfs_cache.c
++++ b/fs/cifsd/vfs_cache.c
+@@ -10,7 +10,6 @@
+ 
+ #include "glob.h"
+ #include "vfs_cache.h"
+-#include "buffer_pool.h"
+ #include "oplock.h"
+ #include "vfs.h"
+ #include "connection.h"
+@@ -29,6 +28,7 @@ static DEFINE_RWLOCK(inode_hash_lock);
+ 
+ static struct ksmbd_file_table global_ft;
+ static atomic_long_t fd_limit;
++static struct kmem_cache *filp_cache;
+ 
+ void ksmbd_set_fd_limit(unsigned long limit)
+ {
+@@ -315,7 +315,7 @@ static void __ksmbd_close_fd(struct ksmbd_file_table *ft, struct ksmbd_file *fp)
+ 	kfree(fp->filename);
+ 	if (ksmbd_stream_fd(fp))
+ 		kfree(fp->stream.name);
+-	ksmbd_free_file_struct(fp);
++	kmem_cache_free(filp_cache, fp);
+ }
+ 
+ static struct ksmbd_file *ksmbd_fp_get(struct ksmbd_file *fp)
+@@ -539,10 +539,10 @@ unsigned int ksmbd_open_durable_fd(struct ksmbd_file *fp)
+ 
+ struct ksmbd_file *ksmbd_open_fd(struct ksmbd_work *work, struct file *filp)
+ {
+-	struct ksmbd_file	*fp;
++	struct ksmbd_file *fp;
+ 	int ret;
+ 
+-	fp = ksmbd_alloc_file_struct();
++	fp = kmem_cache_zalloc(filp_cache, GFP_KERNEL);
+ 	if (!fp) {
+ 		ksmbd_err("Failed to allocate memory\n");
+ 		return ERR_PTR(-ENOMEM);
+@@ -561,14 +561,14 @@ struct ksmbd_file *ksmbd_open_fd(struct ksmbd_work *work, struct file *filp)
+ 	fp->f_ci		= ksmbd_inode_get(fp);
+ 
+ 	if (!fp->f_ci) {
+-		ksmbd_free_file_struct(fp);
++		kmem_cache_free(filp_cache, fp);
+ 		return ERR_PTR(-ENOMEM);
+ 	}
+ 
+ 	ret = __open_id(&work->sess->file_table, fp, OPEN_ID_TYPE_VOLATILE_ID);
+ 	if (ret) {
+ 		ksmbd_inode_put(fp->f_ci);
+-		ksmbd_free_file_struct(fp);
++		kmem_cache_free(filp_cache, fp);
+ 		return ERR_PTR(ret);
+ 	}
+ 
+@@ -640,7 +640,7 @@ void ksmbd_free_global_file_table(void)
+ 
+ 	idr_for_each_entry(global_ft.idr, fp, id) {
+ 		__ksmbd_remove_durable_fd(fp);
+-		ksmbd_free_file_struct(fp);
++		kmem_cache_free(filp_cache, fp);
+ 	}
+ 
+ 	ksmbd_destroy_file_table(&global_ft);
+@@ -683,3 +683,23 @@ void ksmbd_destroy_file_table(struct ksmbd_file_table *ft)
+ 	kfree(ft->idr);
+ 	ft->idr = NULL;
+ }
++
++int ksmbd_init_file_cache(void)
++{
++	filp_cache = kmem_cache_create("ksmbd_file_cache",
++				       sizeof(struct ksmbd_file), 0,
++				       SLAB_HWCACHE_ALIGN, NULL);
++	if (!filp_cache)
++		goto out;
++
++	return 0;
++
++out:
++	ksmbd_err("failed to allocate file cache\n");
++	return -ENOMEM;
++}
++
++void ksmbd_exit_file_cache(void)
++{
++	kmem_cache_destroy(filp_cache);
++}
+diff --git a/fs/cifsd/vfs_cache.h b/fs/cifsd/vfs_cache.h
+index 635eedbd497c..745855367106 100644
+--- a/fs/cifsd/vfs_cache.h
++++ b/fs/cifsd/vfs_cache.h
+@@ -182,4 +182,6 @@ void ksmbd_set_inode_pending_delete(struct ksmbd_file *fp);
+ void ksmbd_clear_inode_pending_delete(struct ksmbd_file *fp);
+ void ksmbd_fd_set_delete_on_close(struct ksmbd_file *fp,
+ 				  int file_info);
++int ksmbd_init_file_cache(void);
++void ksmbd_exit_file_cache(void);
+ #endif /* __VFS_CACHE_H__ */
+-- 
+2.33.0
+

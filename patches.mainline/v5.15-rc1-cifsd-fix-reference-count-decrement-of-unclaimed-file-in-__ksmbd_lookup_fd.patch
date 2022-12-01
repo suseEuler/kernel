@@ -1,0 +1,126 @@
+From 24b626967d9574a477acf2ab94f55c847d04939a Mon Sep 17 00:00:00 2001
+From: Hyunchul Lee <hyc.lee@gmail.com>
+Date: Tue, 13 Apr 2021 13:24:43 +0900
+Subject: [PATCH] cifsd: fix reference count decrement of unclaimed file in
+ __ksmbd_lookup_fd
+Git-commit: 24b626967d9574a477acf2ab94f55c847d04939a
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+__ksmbd_lookup_fd could decrement the reference count of
+unclaimed ksmbd_file to 0 but not release this ksmbd_file.
+
+ksmbd_file cannot be unclaimed except ksmbd_close_inode_fds(),
+because ksmbd_file is only removed from the m_fp_list list
+after the reference count of ksmbd_file becomes 0. And if the
+count is 0, __ksmbd_lookup_fd does not use ksmbd_file found
+from idr due to atomic_inc_not_zero.
+
+Signed-off-by: Hyunchul Lee <hyc.lee@gmail.com>
+Signed-off-by: Namjae Jeon <namjae.jeon@samsung.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/cifsd/smb2pdu.c   |  5 -----
+ fs/cifsd/vfs_cache.c | 53 --------------------------------------------
+ 2 files changed, 58 deletions(-)
+
+diff --git a/fs/cifsd/smb2pdu.c b/fs/cifsd/smb2pdu.c
+index 3fbd8e4925bb..08b06ec97e22 100644
+--- a/fs/cifsd/smb2pdu.c
++++ b/fs/cifsd/smb2pdu.c
+@@ -2779,11 +2779,6 @@ int smb2_open(struct ksmbd_work *work)
+ 		goto err_out;
+ 	}
+ 
+-	if (server_conf.flags & KSMBD_GLOBAL_FLAG_DURABLE_HANDLE &&
+-	    file_present)
+-		file_present = ksmbd_close_inode_fds(work,
+-						     d_inode(path.dentry));
+-
+ 	daccess = smb_map_generic_desired_access(req->DesiredAccess);
+ 
+ 	if (file_present && !(req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)) {
+diff --git a/fs/cifsd/vfs_cache.c b/fs/cifsd/vfs_cache.c
+index f2a863542dc7..3ab06e0b723c 100644
+--- a/fs/cifsd/vfs_cache.c
++++ b/fs/cifsd/vfs_cache.c
+@@ -328,25 +328,13 @@ static struct ksmbd_file *ksmbd_fp_get(struct ksmbd_file *fp)
+ static struct ksmbd_file *__ksmbd_lookup_fd(struct ksmbd_file_table *ft,
+ 		unsigned int id)
+ {
+-	bool unclaimed = true;
+ 	struct ksmbd_file *fp;
+ 
+ 	read_lock(&ft->lock);
+ 	fp = idr_find(ft->idr, id);
+ 	if (fp)
+ 		fp = ksmbd_fp_get(fp);
+-
+-	if (fp && fp->f_ci) {
+-		read_lock(&fp->f_ci->m_lock);
+-		unclaimed = list_empty(&fp->node);
+-		read_unlock(&fp->f_ci->m_lock);
+-	}
+ 	read_unlock(&ft->lock);
+-
+-	if (fp && unclaimed) {
+-		atomic_dec(&fp->refcount);
+-		return NULL;
+-	}
+ 	return fp;
+ }
+ 
+@@ -754,47 +742,6 @@ int ksmbd_reopen_durable_fd(struct ksmbd_work *work, struct ksmbd_file *fp)
+ 	return 0;
+ }
+ 
+-static void close_fd_list(struct ksmbd_work *work, struct list_head *head)
+-{
+-	while (!list_empty(head)) {
+-		struct ksmbd_file *fp;
+-
+-		fp = list_first_entry(head, struct ksmbd_file, node);
+-		list_del_init(&fp->node);
+-
+-		__ksmbd_close_fd(&work->sess->file_table, fp);
+-	}
+-}
+-
+-int ksmbd_close_inode_fds(struct ksmbd_work *work, struct inode *inode)
+-{
+-	struct ksmbd_inode *ci;
+-	bool unlinked = true;
+-	struct ksmbd_file *fp, *fptmp;
+-	LIST_HEAD(dispose);
+-
+-	ci = ksmbd_inode_lookup_by_vfsinode(inode);
+-	if (!ci)
+-		return true;
+-
+-	if (ci->m_flags & (S_DEL_ON_CLS | S_DEL_PENDING))
+-		unlinked = false;
+-
+-	write_lock(&ci->m_lock);
+-	list_for_each_entry_safe(fp, fptmp, &ci->m_fp_list, node) {
+-		if (fp->conn)
+-			continue;
+-
+-		list_del(&fp->node);
+-		list_add(&fp->node, &dispose);
+-	}
+-	atomic_dec(&ci->m_count);
+-	write_unlock(&ci->m_lock);
+-
+-	close_fd_list(work, &dispose);
+-	return unlinked;
+-}
+-
+ int ksmbd_file_table_flush(struct ksmbd_work *work)
+ {
+ 	struct ksmbd_file	*fp = NULL;
+-- 
+2.33.0
+

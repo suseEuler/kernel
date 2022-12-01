@@ -1,0 +1,291 @@
+From ade62d8b429fe49325593785316bdee3cabaec44 Mon Sep 17 00:00:00 2001
+From: Namjae Jeon <namjae.jeon@samsung.com>
+Date: Mon, 7 Jun 2021 09:22:22 +0900
+Subject: [PATCH] cifsd: set epoch in smb2_lease_break response
+Git-commit: ade62d8b429fe49325593785316bdee3cabaec44
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+When running generic/591 after smb2 leases is enable, all smb2 lease ack
+requests failed in ksmbd. because cifs client seems to support only smb2
+v2 lease. So cifs doesn't update lease state in ack request if epoch is
+not set in smb2 lease break request from ksmbd. epoch is used for smb2
+v2 leases. So this patch add smb2 create v2 lease context and set
+increased epoch in smb2 lease break response.
+
+Signed-off-by: Namjae Jeon <namjae.jeon@samsung.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/cifsd/oplock.c  | 95 +++++++++++++++++++++++++++++++++-------------
+ fs/cifsd/oplock.h  | 15 +++++---
+ fs/cifsd/smb2ops.c |  6 +--
+ fs/cifsd/smb2pdu.h | 21 +++++++++-
+ 4 files changed, 102 insertions(+), 35 deletions(-)
+
+diff --git a/fs/cifsd/oplock.c b/fs/cifsd/oplock.c
+index f76de7861e7b..5868cdca7187 100644
+--- a/fs/cifsd/oplock.c
++++ b/fs/cifsd/oplock.c
+@@ -102,6 +102,9 @@ static int alloc_lease(struct oplock_info *opinfo, struct lease_ctx_info *lctx)
+ 	lease->new_state = 0;
+ 	lease->flags = lctx->flags;
+ 	lease->duration = lctx->duration;
++	memcpy(lease->parent_lease_key, lctx->parent_lease_key, SMB2_LEASE_KEY_SIZE);
++	lease->version = lctx->version;
++	lease->epoch = 0;
+ 	INIT_LIST_HEAD(&opinfo->lease_entry);
+ 	opinfo->o_lease = lease;
+ 
+@@ -750,7 +753,7 @@ static void __smb2_lease_break_noti(struct work_struct *wk)
+ 
+ 	rsp = work->response_buf;
+ 	rsp->StructureSize = cpu_to_le16(44);
+-	rsp->Reserved = 0;
++	rsp->Epoch = br_info->epoch;
+ 	rsp->Flags = 0;
+ 
+ 	if (br_info->curr_state & (SMB2_LEASE_WRITE_CACHING_LE |
+@@ -798,6 +801,10 @@ static int smb2_lease_break_noti(struct oplock_info *opinfo)
+ 
+ 	br_info->curr_state = lease->state;
+ 	br_info->new_state = lease->new_state;
++	if (lease->version == 2)
++		br_info->epoch = cpu_to_le16(++lease->epoch);
++	else
++		br_info->epoch = 0;
+ 	memcpy(br_info->lease_key, lease->lease_key, SMB2_LEASE_KEY_SIZE);
+ 
+ 	work->request_buf = (char *)br_info;
+@@ -1084,11 +1091,8 @@ int smb_grant_oplock(struct ksmbd_work *work, int req_op_level, u64 pid,
+ 	__le32 prev_op_state = 0;
+ 
+ 	/* not support directory lease */
+-	if (S_ISDIR(file_inode(fp->filp)->i_mode)) {
+-		if (lctx)
+-			lctx->dlease = 1;
++	if (S_ISDIR(file_inode(fp->filp)->i_mode))
+ 		return 0;
+-	}
+ 
+ 	opinfo = alloc_opinfo(work, pid, tid);
+ 	if (!opinfo)
+@@ -1328,24 +1332,48 @@ __u8 smb2_map_lease_to_oplock(__le32 lease_state)
+  */
+ void create_lease_buf(u8 *rbuf, struct lease *lease)
+ {
+-	struct create_lease *buf = (struct create_lease *)rbuf;
+ 	char *LeaseKey = (char *)&lease->lease_key;
+ 
+-	memset(buf, 0, sizeof(struct create_lease));
+-	buf->lcontext.LeaseKeyLow = *((__le64 *)LeaseKey);
+-	buf->lcontext.LeaseKeyHigh = *((__le64 *)(LeaseKey + 8));
+-	buf->lcontext.LeaseFlags = lease->flags;
+-	buf->lcontext.LeaseState = lease->state;
+-	buf->ccontext.DataOffset = cpu_to_le16(offsetof
+-					(struct create_lease, lcontext));
+-	buf->ccontext.DataLength = cpu_to_le32(sizeof(struct lease_context));
+-	buf->ccontext.NameOffset = cpu_to_le16(offsetof
++	if (lease->version == 2) {
++		struct create_lease_v2 *buf = (struct create_lease_v2 *)rbuf;
++		char *ParentLeaseKey = (char *)&lease->parent_lease_key;
++
++		memset(buf, 0, sizeof(struct create_lease_v2));
++		buf->lcontext.LeaseKeyLow = *((__le64 *)LeaseKey);
++		buf->lcontext.LeaseKeyHigh = *((__le64 *)(LeaseKey + 8));
++		buf->lcontext.LeaseFlags = lease->flags;
++		buf->lcontext.LeaseState = lease->state;
++		buf->lcontext.ParentLeaseKeyLow = *((__le64 *)ParentLeaseKey);
++		buf->lcontext.ParentLeaseKeyHigh = *((__le64 *)(ParentLeaseKey + 8));
++		buf->ccontext.DataOffset = cpu_to_le16(offsetof
++				(struct create_lease_v2, lcontext));
++		buf->ccontext.DataLength = cpu_to_le32(sizeof(struct lease_context_v2));
++		buf->ccontext.NameOffset = cpu_to_le16(offsetof
++				(struct create_lease_v2, Name));
++		buf->ccontext.NameLength = cpu_to_le16(4);
++		buf->Name[0] = 'R';
++		buf->Name[1] = 'q';
++		buf->Name[2] = 'L';
++		buf->Name[3] = 's';
++	} else {
++		struct create_lease *buf = (struct create_lease *)rbuf;
++
++		memset(buf, 0, sizeof(struct create_lease));
++		buf->lcontext.LeaseKeyLow = *((__le64 *)LeaseKey);
++		buf->lcontext.LeaseKeyHigh = *((__le64 *)(LeaseKey + 8));
++		buf->lcontext.LeaseFlags = lease->flags;
++		buf->lcontext.LeaseState = lease->state;
++		buf->ccontext.DataOffset = cpu_to_le16(offsetof
++				(struct create_lease, lcontext));
++		buf->ccontext.DataLength = cpu_to_le32(sizeof(struct lease_context));
++		buf->ccontext.NameOffset = cpu_to_le16(offsetof
+ 				(struct create_lease, Name));
+-	buf->ccontext.NameLength = cpu_to_le16(4);
+-	buf->Name[0] = 'R';
+-	buf->Name[1] = 'q';
+-	buf->Name[2] = 'L';
+-	buf->Name[3] = 's';
++		buf->ccontext.NameLength = cpu_to_le16(4);
++		buf->Name[0] = 'R';
++		buf->Name[1] = 'q';
++		buf->Name[2] = 'L';
++		buf->Name[3] = 's';
++	}
+ }
+ 
+ /**
+@@ -1382,12 +1410,27 @@ struct lease_ctx_info *parse_lease_state(void *open_req)
+ 	} while (next != 0);
+ 
+ 	if (found) {
+-		struct create_lease *lc = (struct create_lease *)cc;
+-		*((__le64 *)lreq->lease_key) = lc->lcontext.LeaseKeyLow;
+-		*((__le64 *)(lreq->lease_key + 8)) = lc->lcontext.LeaseKeyHigh;
+-		lreq->req_state = lc->lcontext.LeaseState;
+-		lreq->flags = lc->lcontext.LeaseFlags;
+-		lreq->duration = lc->lcontext.LeaseDuration;
++		if (sizeof(struct lease_context_v2) == le32_to_cpu(cc->DataLength)) {
++			struct create_lease_v2 *lc = (struct create_lease_v2 *)cc;
++
++			*((__le64 *)lreq->lease_key) = lc->lcontext.LeaseKeyLow;
++			*((__le64 *)(lreq->lease_key + 8)) = lc->lcontext.LeaseKeyHigh;
++			lreq->req_state = lc->lcontext.LeaseState;
++			lreq->flags = lc->lcontext.LeaseFlags;
++			lreq->duration = lc->lcontext.LeaseDuration;
++			*((__le64 *)lreq->parent_lease_key) = lc->lcontext.ParentLeaseKeyLow;
++			*((__le64 *)(lreq->parent_lease_key + 8)) = lc->lcontext.ParentLeaseKeyHigh;
++			lreq->version = 2;
++		} else {
++			struct create_lease *lc = (struct create_lease *)cc;
++
++			*((__le64 *)lreq->lease_key) = lc->lcontext.LeaseKeyLow;
++			*((__le64 *)(lreq->lease_key + 8)) = lc->lcontext.LeaseKeyHigh;
++			lreq->req_state = lc->lcontext.LeaseState;
++			lreq->flags = lc->lcontext.LeaseFlags;
++			lreq->duration = lc->lcontext.LeaseDuration;
++			lreq->version = 1;
++		}
+ 		return lreq;
+ 	}
+ 
+diff --git a/fs/cifsd/oplock.h b/fs/cifsd/oplock.h
+index 0abd26123f6d..9fb7ea74e86c 100644
+--- a/fs/cifsd/oplock.h
++++ b/fs/cifsd/oplock.h
+@@ -37,11 +37,12 @@
+ #define SMB2_LEASE_KEY_SIZE		16
+ 
+ struct lease_ctx_info {
+-	__u8	lease_key[SMB2_LEASE_KEY_SIZE];
+-	__le32	req_state;
+-	__le32	flags;
+-	__le64	duration;
+-	int dlease;
++	__u8			lease_key[SMB2_LEASE_KEY_SIZE];
++	__le32			req_state;
++	__le32			flags;
++	__le64			duration;
++	__u8			parent_lease_key[SMB2_LEASE_KEY_SIZE];
++	int			version;
+ };
+ 
+ struct lease_table {
+@@ -57,6 +58,9 @@ struct lease {
+ 	__le32			new_state;
+ 	__le32			flags;
+ 	__le64			duration;
++	__u8			parent_lease_key[SMB2_LEASE_KEY_SIZE];
++	int			version;
++	unsigned short		epoch;
+ 	struct lease_table	*l_lb;
+ };
+ 
+@@ -86,6 +90,7 @@ struct oplock_info {
+ struct lease_break_info {
+ 	__le32			curr_state;
+ 	__le32			new_state;
++	__le16			epoch;
+ 	char			lease_key[SMB2_LEASE_KEY_SIZE];
+ };
+ 
+diff --git a/fs/cifsd/smb2ops.c b/fs/cifsd/smb2ops.c
+index c47d60bce9d4..8999c3faf4fc 100644
+--- a/fs/cifsd/smb2ops.c
++++ b/fs/cifsd/smb2ops.c
+@@ -57,7 +57,7 @@ static struct smb_version_values smb30_server_values = {
+ 	.cap_unix = 0,
+ 	.cap_nt_find = SMB2_NT_FIND,
+ 	.cap_large_files = SMB2_LARGE_FILES,
+-	.create_lease_size = sizeof(struct create_lease),
++	.create_lease_size = sizeof(struct create_lease_v2),
+ 	.create_durable_size = sizeof(struct create_durable_rsp),
+ 	.create_durable_v2_size = sizeof(struct create_durable_v2_rsp),
+ 	.create_mxac_size = sizeof(struct create_mxac_rsp),
+@@ -83,7 +83,7 @@ static struct smb_version_values smb302_server_values = {
+ 	.cap_unix = 0,
+ 	.cap_nt_find = SMB2_NT_FIND,
+ 	.cap_large_files = SMB2_LARGE_FILES,
+-	.create_lease_size = sizeof(struct create_lease),
++	.create_lease_size = sizeof(struct create_lease_v2),
+ 	.create_durable_size = sizeof(struct create_durable_rsp),
+ 	.create_durable_v2_size = sizeof(struct create_durable_v2_rsp),
+ 	.create_mxac_size = sizeof(struct create_mxac_rsp),
+@@ -109,7 +109,7 @@ static struct smb_version_values smb311_server_values = {
+ 	.cap_unix = 0,
+ 	.cap_nt_find = SMB2_NT_FIND,
+ 	.cap_large_files = SMB2_LARGE_FILES,
+-	.create_lease_size = sizeof(struct create_lease),
++	.create_lease_size = sizeof(struct create_lease_v2),
+ 	.create_durable_size = sizeof(struct create_durable_rsp),
+ 	.create_durable_v2_size = sizeof(struct create_durable_v2_rsp),
+ 	.create_mxac_size = sizeof(struct create_mxac_rsp),
+diff --git a/fs/cifsd/smb2pdu.h b/fs/cifsd/smb2pdu.h
+index b3d3365d7070..0d5349e75dd9 100644
+--- a/fs/cifsd/smb2pdu.h
++++ b/fs/cifsd/smb2pdu.h
+@@ -735,12 +735,31 @@ struct lease_context {
+ 	__le64 LeaseDuration;
+ } __packed;
+ 
++struct lease_context_v2 {
++	__le64 LeaseKeyLow;
++	__le64 LeaseKeyHigh;
++	__le32 LeaseState;
++	__le32 LeaseFlags;
++	__le64 LeaseDuration;
++	__le64 ParentLeaseKeyLow;
++	__le64 ParentLeaseKeyHigh;
++	__le16 Epoch;
++	__le16 Reserved;
++} __packed;
++
+ struct create_lease {
+ 	struct create_context ccontext;
+ 	__u8   Name[8];
+ 	struct lease_context lcontext;
+ } __packed;
+ 
++struct create_lease_v2 {
++	struct create_context ccontext;
++	__u8   Name[8];
++	struct lease_context_v2 lcontext;
++	__u8   Pad[4];
++} __packed;
++
+ /* Currently defined values for close flags */
+ #define SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB	cpu_to_le16(0x0001)
+ struct smb2_close_req {
+@@ -1249,7 +1268,7 @@ struct smb2_oplock_break {
+ struct smb2_lease_break {
+ 	struct smb2_hdr hdr;
+ 	__le16 StructureSize; /* Must be 44 */
+-	__le16 Reserved;
++	__le16 Epoch;
+ 	__le32 Flags;
+ 	__u8   LeaseKey[16];
+ 	__le32 CurrentLeaseState;
+-- 
+2.33.0
+

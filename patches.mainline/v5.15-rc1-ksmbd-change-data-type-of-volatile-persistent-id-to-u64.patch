@@ -1,0 +1,344 @@
+From 3867369ef8f760155da684e10d29e0bf9b733b48 Mon Sep 17 00:00:00 2001
+From: Namjae Jeon <namjae.jeon@samsung.com>
+Date: Thu, 8 Jul 2021 12:32:27 +0900
+Subject: [PATCH] ksmbd: change data type of volatile/persistent id to u64
+Git-commit: 3867369ef8f760155da684e10d29e0bf9b733b48
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+This patch change data type of volatile/persistent id to u64 to make
+issue from idr_find and idr_remove(). !HAS_FILE_ID check will protect
+integer overflow issue from idr_find and idr_remove().
+
+Reported-by: Dan Carpenter <dan.carpenter@oracle.com>
+Signed-off-by: Namjae Jeon <namjae.jeon@samsung.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/ksmbd/ksmbd_work.h |  6 +++---
+ fs/ksmbd/smb2pdu.c    | 37 +++++++++++++++++++------------------
+ fs/ksmbd/vfs_cache.c  | 32 ++++++++++++++++----------------
+ fs/ksmbd/vfs_cache.h  | 20 +++++++++-----------
+ 4 files changed, 47 insertions(+), 48 deletions(-)
+
+diff --git a/fs/ksmbd/ksmbd_work.h b/fs/ksmbd/ksmbd_work.h
+index c655bf371ce5..f7156bc50049 100644
+--- a/fs/ksmbd/ksmbd_work.h
++++ b/fs/ksmbd/ksmbd_work.h
+@@ -43,9 +43,9 @@ struct ksmbd_work {
+ 	 * Current Local FID assigned compound response if SMB2 CREATE
+ 	 * command is present in compound request
+ 	 */
+-	unsigned int                    compound_fid;
+-	unsigned int                    compound_pfid;
+-	unsigned int                    compound_sid;
++	u64				compound_fid;
++	u64				compound_pfid;
++	u64				compound_sid;
+ 
+ 	const struct cred		*saved_cred;
+ 
+diff --git a/fs/ksmbd/smb2pdu.c b/fs/ksmbd/smb2pdu.c
+index ea406ff1a8c1..18e275abc68f 100644
+--- a/fs/ksmbd/smb2pdu.c
++++ b/fs/ksmbd/smb2pdu.c
+@@ -2809,7 +2809,7 @@ int smb2_open(struct ksmbd_work *work)
+ 
+ 	/* Get Persistent-ID */
+ 	ksmbd_open_durable_fd(fp);
+-	if (!HAS_FILE_ID(fp->persistent_id)) {
++	if (!has_file_id(fp->persistent_id)) {
+ 		rc = -ENOMEM;
+ 		goto err_out;
+ 	}
+@@ -4577,15 +4577,15 @@ static int smb2_get_info_file(struct ksmbd_work *work,
+ 	}
+ 
+ 	if (work->next_smb2_rcv_hdr_off) {
+-		if (!HAS_FILE_ID(le64_to_cpu(req->VolatileFileId))) {
+-			ksmbd_debug(SMB, "Compound request set FID = %u\n",
++		if (!has_file_id(le64_to_cpu(req->VolatileFileId))) {
++			ksmbd_debug(SMB, "Compound request set FID = %llu\n",
+ 				    work->compound_fid);
+ 			id = work->compound_fid;
+ 			pid = work->compound_pfid;
+ 		}
+ 	}
+ 
+-	if (!HAS_FILE_ID(id)) {
++	if (!has_file_id(id)) {
+ 		id = le64_to_cpu(req->VolatileFileId);
+ 		pid = le64_to_cpu(req->PersistentFileId);
+ 	}
+@@ -4949,15 +4949,15 @@ static int smb2_get_info_sec(struct ksmbd_work *work,
+ 	}
+ 
+ 	if (work->next_smb2_rcv_hdr_off) {
+-		if (!HAS_FILE_ID(le64_to_cpu(req->VolatileFileId))) {
+-			ksmbd_debug(SMB, "Compound request set FID = %u\n",
++		if (!has_file_id(le64_to_cpu(req->VolatileFileId))) {
++			ksmbd_debug(SMB, "Compound request set FID = %llu\n",
+ 				    work->compound_fid);
+ 			id = work->compound_fid;
+ 			pid = work->compound_pfid;
+ 		}
+ 	}
+ 
+-	if (!HAS_FILE_ID(id)) {
++	if (!has_file_id(id)) {
+ 		id = le64_to_cpu(req->VolatileFileId);
+ 		pid = le64_to_cpu(req->PersistentFileId);
+ 	}
+@@ -5083,7 +5083,7 @@ static noinline int smb2_close_pipe(struct ksmbd_work *work)
+  */
+ int smb2_close(struct ksmbd_work *work)
+ {
+-	unsigned int volatile_id = KSMBD_NO_FID;
++	u64 volatile_id = KSMBD_NO_FID;
+ 	u64 sess_id;
+ 	struct smb2_close_req *req;
+ 	struct smb2_close_rsp *rsp;
+@@ -5119,15 +5119,16 @@ int smb2_close(struct ksmbd_work *work)
+ 	}
+ 
+ 	if (work->next_smb2_rcv_hdr_off &&
+-	    !HAS_FILE_ID(le64_to_cpu(req->VolatileFileId))) {
+-		if (!HAS_FILE_ID(work->compound_fid)) {
++	    !has_file_id(le64_to_cpu(req->VolatileFileId))) {
++		if (!has_file_id(work->compound_fid)) {
+ 			/* file already closed, return FILE_CLOSED */
+ 			ksmbd_debug(SMB, "file already closed\n");
+ 			rsp->hdr.Status = STATUS_FILE_CLOSED;
+ 			err = -EBADF;
+ 			goto out;
+ 		} else {
+-			ksmbd_debug(SMB, "Compound request set FID = %u:%u\n",
++			ksmbd_debug(SMB,
++				    "Compound request set FID = %llu:%llu\n",
+ 				    work->compound_fid,
+ 				    work->compound_pfid);
+ 			volatile_id = work->compound_fid;
+@@ -5139,7 +5140,7 @@ int smb2_close(struct ksmbd_work *work)
+ 	} else {
+ 		volatile_id = le64_to_cpu(req->VolatileFileId);
+ 	}
+-	ksmbd_debug(SMB, "volatile_id = %u\n", volatile_id);
++	ksmbd_debug(SMB, "volatile_id = %llu\n", volatile_id);
+ 
+ 	rsp->StructureSize = cpu_to_le16(60);
+ 	rsp->Reserved = 0;
+@@ -5789,8 +5790,8 @@ int smb2_set_info(struct ksmbd_work *work)
+ 	if (work->next_smb2_rcv_hdr_off) {
+ 		req = ksmbd_req_buf_next(work);
+ 		rsp = ksmbd_resp_buf_next(work);
+-		if (!HAS_FILE_ID(le64_to_cpu(req->VolatileFileId))) {
+-			ksmbd_debug(SMB, "Compound request set FID = %u\n",
++		if (!has_file_id(le64_to_cpu(req->VolatileFileId))) {
++			ksmbd_debug(SMB, "Compound request set FID = %llu\n",
+ 				    work->compound_fid);
+ 			id = work->compound_fid;
+ 			pid = work->compound_pfid;
+@@ -5800,7 +5801,7 @@ int smb2_set_info(struct ksmbd_work *work)
+ 		rsp = work->response_buf;
+ 	}
+ 
+-	if (!HAS_FILE_ID(id)) {
++	if (!has_file_id(id)) {
+ 		id = le64_to_cpu(req->VolatileFileId);
+ 		pid = le64_to_cpu(req->PersistentFileId);
+ 	}
+@@ -7287,8 +7288,8 @@ int smb2_ioctl(struct ksmbd_work *work)
+ 	if (work->next_smb2_rcv_hdr_off) {
+ 		req = ksmbd_req_buf_next(work);
+ 		rsp = ksmbd_resp_buf_next(work);
+-		if (!HAS_FILE_ID(le64_to_cpu(req->VolatileFileId))) {
+-			ksmbd_debug(SMB, "Compound request set FID = %u\n",
++		if (!has_file_id(le64_to_cpu(req->VolatileFileId))) {
++			ksmbd_debug(SMB, "Compound request set FID = %llu\n",
+ 				    work->compound_fid);
+ 			id = work->compound_fid;
+ 		}
+@@ -7297,7 +7298,7 @@ int smb2_ioctl(struct ksmbd_work *work)
+ 		rsp = work->response_buf;
+ 	}
+ 
+-	if (!HAS_FILE_ID(id))
++	if (!has_file_id(id))
+ 		id = le64_to_cpu(req->VolatileFileId);
+ 
+ 	if (req->Flags != cpu_to_le32(SMB2_0_IOCTL_IS_FSCTL)) {
+diff --git a/fs/ksmbd/vfs_cache.c b/fs/ksmbd/vfs_cache.c
+index 1941ad3f5aa5..c54c605637a0 100644
+--- a/fs/ksmbd/vfs_cache.c
++++ b/fs/ksmbd/vfs_cache.c
+@@ -277,7 +277,7 @@ static void __ksmbd_inode_close(struct ksmbd_file *fp)
+ 
+ static void __ksmbd_remove_durable_fd(struct ksmbd_file *fp)
+ {
+-	if (!HAS_FILE_ID(fp->persistent_id))
++	if (!has_file_id(fp->persistent_id))
+ 		return;
+ 
+ 	write_lock(&global_ft.lock);
+@@ -287,7 +287,7 @@ static void __ksmbd_remove_durable_fd(struct ksmbd_file *fp)
+ 
+ static void __ksmbd_remove_fd(struct ksmbd_file_table *ft, struct ksmbd_file *fp)
+ {
+-	if (!HAS_FILE_ID(fp->volatile_id))
++	if (!has_file_id(fp->volatile_id))
+ 		return;
+ 
+ 	write_lock(&fp->f_ci->m_lock);
+@@ -327,10 +327,13 @@ static struct ksmbd_file *ksmbd_fp_get(struct ksmbd_file *fp)
+ }
+ 
+ static struct ksmbd_file *__ksmbd_lookup_fd(struct ksmbd_file_table *ft,
+-					    unsigned int id)
++					    u64 id)
+ {
+ 	struct ksmbd_file *fp;
+ 
++	if (!has_file_id(id))
++		return NULL;
++
+ 	read_lock(&ft->lock);
+ 	fp = idr_find(ft->idr, id);
+ 	if (fp)
+@@ -359,12 +362,12 @@ static void set_close_state_blocked_works(struct ksmbd_file *fp)
+ 	spin_unlock(&fp->f_lock);
+ }
+ 
+-int ksmbd_close_fd(struct ksmbd_work *work, unsigned int id)
++int ksmbd_close_fd(struct ksmbd_work *work, u64 id)
+ {
+ 	struct ksmbd_file	*fp;
+ 	struct ksmbd_file_table	*ft;
+ 
+-	if (!HAS_FILE_ID(id))
++	if (!has_file_id(id))
+ 		return 0;
+ 
+ 	ft = &work->sess->file_table;
+@@ -404,12 +407,12 @@ static bool __sanity_check(struct ksmbd_tree_connect *tcon, struct ksmbd_file *f
+ 	return true;
+ }
+ 
+-struct ksmbd_file *ksmbd_lookup_foreign_fd(struct ksmbd_work *work, unsigned int id)
++struct ksmbd_file *ksmbd_lookup_foreign_fd(struct ksmbd_work *work, u64 id)
+ {
+ 	return __ksmbd_lookup_fd(&work->sess->file_table, id);
+ }
+ 
+-struct ksmbd_file *ksmbd_lookup_fd_fast(struct ksmbd_work *work, unsigned int id)
++struct ksmbd_file *ksmbd_lookup_fd_fast(struct ksmbd_work *work, u64 id)
+ {
+ 	struct ksmbd_file *fp = __ksmbd_lookup_fd(&work->sess->file_table, id);
+ 
+@@ -420,19 +423,16 @@ struct ksmbd_file *ksmbd_lookup_fd_fast(struct ksmbd_work *work, unsigned int id
+ 	return NULL;
+ }
+ 
+-struct ksmbd_file *ksmbd_lookup_fd_slow(struct ksmbd_work *work, unsigned int id,
+-					unsigned int pid)
++struct ksmbd_file *ksmbd_lookup_fd_slow(struct ksmbd_work *work, u64 id,
++					u64 pid)
+ {
+ 	struct ksmbd_file *fp;
+ 
+-	if (!HAS_FILE_ID(id)) {
++	if (!has_file_id(id)) {
+ 		id = work->compound_fid;
+ 		pid = work->compound_pfid;
+ 	}
+ 
+-	if (!HAS_FILE_ID(id))
+-		return NULL;
+-
+ 	fp = __ksmbd_lookup_fd(&work->sess->file_table, id);
+ 	if (!__sanity_check(work->tcon, fp)) {
+ 		ksmbd_fd_put(work, fp);
+@@ -494,7 +494,7 @@ struct ksmbd_file *ksmbd_lookup_fd_inode(struct inode *inode)
+ #define OPEN_ID_TYPE_VOLATILE_ID	(0)
+ #define OPEN_ID_TYPE_PERSISTENT_ID	(1)
+ 
+-static void __open_id_set(struct ksmbd_file *fp, unsigned int id, int type)
++static void __open_id_set(struct ksmbd_file *fp, u64 id, int type)
+ {
+ 	if (type == OPEN_ID_TYPE_VOLATILE_ID)
+ 		fp->volatile_id = id;
+@@ -505,7 +505,7 @@ static void __open_id_set(struct ksmbd_file *fp, unsigned int id, int type)
+ static int __open_id(struct ksmbd_file_table *ft, struct ksmbd_file *fp,
+ 		     int type)
+ {
+-	unsigned int		id = 0;
++	u64			id = 0;
+ 	int			ret;
+ 
+ 	if (type == OPEN_ID_TYPE_VOLATILE_ID && fd_limit_depleted()) {
+@@ -515,7 +515,7 @@ static int __open_id(struct ksmbd_file_table *ft, struct ksmbd_file *fp,
+ 
+ 	idr_preload(GFP_KERNEL);
+ 	write_lock(&ft->lock);
+-	ret = idr_alloc_cyclic(ft->idr, fp, 0, INT_MAX, GFP_NOWAIT);
++	ret = idr_alloc_cyclic(ft->idr, fp, 0, INT_MAX - 1, GFP_NOWAIT);
+ 	if (ret >= 0) {
+ 		id = ret;
+ 		ret = 0;
+diff --git a/fs/ksmbd/vfs_cache.h b/fs/ksmbd/vfs_cache.h
+index 543494f664cb..70e987293564 100644
+--- a/fs/ksmbd/vfs_cache.h
++++ b/fs/ksmbd/vfs_cache.h
+@@ -22,7 +22,7 @@
+ #define	FILE_GENERIC_EXECUTE	0X1200a0
+ 
+ #define KSMBD_START_FID		0
+-#define KSMBD_NO_FID		(UINT_MAX)
++#define KSMBD_NO_FID		(INT_MAX)
+ #define SMB2_NO_FID		(0xFFFFFFFFFFFFFFFFULL)
+ 
+ struct ksmbd_conn;
+@@ -62,8 +62,8 @@ struct ksmbd_inode {
+ struct ksmbd_file {
+ 	struct file			*filp;
+ 	char				*filename;
+-	unsigned int			persistent_id;
+-	unsigned int			volatile_id;
++	u64				persistent_id;
++	u64				volatile_id;
+ 
+ 	spinlock_t			f_lock;
+ 
+@@ -122,10 +122,8 @@ struct ksmbd_file_table {
+ 	struct idr		*idr;
+ };
+ 
+-static inline bool HAS_FILE_ID(unsigned long long req)
++static inline bool has_file_id(u64 id)
+ {
+-	unsigned int id = (unsigned int)req;
+-
+ 	return id < KSMBD_NO_FID;
+ }
+ 
+@@ -136,11 +134,11 @@ static inline bool ksmbd_stream_fd(struct ksmbd_file *fp)
+ 
+ int ksmbd_init_file_table(struct ksmbd_file_table *ft);
+ void ksmbd_destroy_file_table(struct ksmbd_file_table *ft);
+-int ksmbd_close_fd(struct ksmbd_work *work, unsigned int id);
+-struct ksmbd_file *ksmbd_lookup_fd_fast(struct ksmbd_work *work, unsigned int id);
+-struct ksmbd_file *ksmbd_lookup_foreign_fd(struct ksmbd_work *work, unsigned int id);
+-struct ksmbd_file *ksmbd_lookup_fd_slow(struct ksmbd_work *work, unsigned int id,
+-					unsigned int pid);
++int ksmbd_close_fd(struct ksmbd_work *work, u64 id);
++struct ksmbd_file *ksmbd_lookup_fd_fast(struct ksmbd_work *work, u64 id);
++struct ksmbd_file *ksmbd_lookup_foreign_fd(struct ksmbd_work *work, u64 id);
++struct ksmbd_file *ksmbd_lookup_fd_slow(struct ksmbd_work *work, u64 id,
++					u64 pid);
+ void ksmbd_fd_put(struct ksmbd_work *work, struct ksmbd_file *fp);
+ struct ksmbd_file *ksmbd_lookup_durable_fd(unsigned long long id);
+ struct ksmbd_file *ksmbd_lookup_fd_cguid(char *cguid);
+-- 
+2.33.0
+

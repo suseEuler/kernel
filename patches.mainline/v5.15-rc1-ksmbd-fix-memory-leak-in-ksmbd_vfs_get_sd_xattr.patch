@@ -1,0 +1,142 @@
+From 78ad2c277af4cf503f985fd506fbb1f8576460f2 Mon Sep 17 00:00:00 2001
+From: Namjae Jeon <namjae.jeon@samsung.com>
+Date: Tue, 13 Jul 2021 17:12:41 +0900
+Subject: [PATCH] ksmbd: fix memory leak in ksmbd_vfs_get_sd_xattr()
+Git-commit: 78ad2c277af4cf503f985fd506fbb1f8576460f2
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified per openEuler commit 8cb983ee
+
+
+Add free acl.sd_buf and n.data on error handling in
+ksmbd_vfs_get_sd_xattr().
+
+Reported-by: Coverity Scan <scan-admin@coverity.com>
+Signed-off-by: Namjae Jeon <namjae.jeon@samsung.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/ksmbd/vfs.c | 99 ++++++++++++++++++++++++++------------------------
+ 1 file changed, 52 insertions(+), 47 deletions(-)
+
+diff --git a/fs/ksmbd/vfs.c b/fs/ksmbd/vfs.c
+index 53fbcb95f3b3..f10dfdb596e4 100644
+--- a/fs/ksmbd/vfs.c
++++ b/fs/ksmbd/vfs.c
+@@ -1458,61 +1458,66 @@ int ksmbd_vfs_get_sd_xattr(struct ksmbd_conn *conn, struct dentry *dentry,
+ {
+ 	int rc;
+ 	struct ndr n;
++	struct inode *inode = d_inode(dentry);
++	struct ndr acl_ndr = {0};
++	struct xattr_ntacl acl;
++	struct xattr_smb_acl *smb_acl = NULL, *def_smb_acl = NULL;
++	__u8 cmp_hash[XATTR_SD_HASH_SIZE] = {0};
+ 
+ 	rc = ksmbd_vfs_getxattr(dentry, XATTR_NAME_SD, &n.data);
+-	if (rc > 0) {
+-		struct inode *inode = d_inode(dentry);
+-		struct ndr acl_ndr = {0};
+-		struct xattr_ntacl acl;
+-		struct xattr_smb_acl *smb_acl = NULL, *def_smb_acl = NULL;
+-		__u8 cmp_hash[XATTR_SD_HASH_SIZE] = {0};
+-
+-		n.length = rc;
+-		rc = ndr_decode_v4_ntacl(&n, &acl);
+-		if (rc)
+-			return rc;
+-
+-		smb_acl = ksmbd_vfs_make_xattr_posix_acl(inode,
+-							 ACL_TYPE_ACCESS);
+-		if (S_ISDIR(inode->i_mode))
+-			def_smb_acl = ksmbd_vfs_make_xattr_posix_acl(inode,
+-								     ACL_TYPE_DEFAULT);
+-
+-		rc = ndr_encode_posix_acl(&acl_ndr, inode, smb_acl, def_smb_acl);
+-		if (rc) {
+-			pr_err("failed to encode ndr to posix acl\n");
+-			goto out;
+-		}
++	if (rc <= 0)
++		return rc;
+ 
+-		rc = ksmbd_gen_sd_hash(conn, acl_ndr.data, acl_ndr.offset,
+-				       cmp_hash);
+-		if (rc) {
+-			pr_err("failed to generate hash for ndr acl\n");
+-			goto out;
+-		}
++	n.length = rc;
++	rc = ndr_decode_v4_ntacl(&n, &acl);
++	if (rc)
++		goto free_n_data;
+ 
+-		if (memcmp(cmp_hash, acl.posix_acl_hash, XATTR_SD_HASH_SIZE)) {
+-			pr_err("hash value diff\n");
+-			rc = -EINVAL;
+-			goto out;
+-		}
++	smb_acl = ksmbd_vfs_make_xattr_posix_acl(inode,
++						 ACL_TYPE_ACCESS);
++	if (S_ISDIR(inode->i_mode))
++		def_smb_acl = ksmbd_vfs_make_xattr_posix_acl(inode,
++							     ACL_TYPE_DEFAULT);
++
++	rc = ndr_encode_posix_acl(&acl_ndr, inode, smb_acl, def_smb_acl);
++	if (rc) {
++		pr_err("failed to encode ndr to posix acl\n");
++		goto out_free;
++	}
+ 
+-		*pntsd = acl.sd_buf;
+-		(*pntsd)->osidoffset =
+-			cpu_to_le32(le32_to_cpu((*pntsd)->osidoffset) - NDR_NTSD_OFFSETOF);
+-		(*pntsd)->gsidoffset =
+-			cpu_to_le32(le32_to_cpu((*pntsd)->gsidoffset) - NDR_NTSD_OFFSETOF);
+-		(*pntsd)->dacloffset =
+-			cpu_to_le32(le32_to_cpu((*pntsd)->dacloffset) - NDR_NTSD_OFFSETOF);
++	rc = ksmbd_gen_sd_hash(conn, acl_ndr.data, acl_ndr.offset,
++				cmp_hash);
++	if (rc) {
++		pr_err("failed to generate hash for ndr acl\n");
++		goto out_free;
++	}
+ 
+-		rc = acl.sd_size;
+-out:
+-		kfree(n.data);
+-		kfree(acl_ndr.data);
+-		kfree(smb_acl);
+-		kfree(def_smb_acl);
++	if (memcmp(cmp_hash, acl.posix_acl_hash, XATTR_SD_HASH_SIZE)) {
++		pr_err("hash value diff\n");
++		rc = -EINVAL;
++		goto out_free;
+ 	}
+ 
++	*pntsd = acl.sd_buf;
++	(*pntsd)->osidoffset =
++		cpu_to_le32(le32_to_cpu((*pntsd)->osidoffset) - NDR_NTSD_OFFSETOF);
++	(*pntsd)->gsidoffset =
++		cpu_to_le32(le32_to_cpu((*pntsd)->gsidoffset) - NDR_NTSD_OFFSETOF);
++	(*pntsd)->dacloffset =
++		cpu_to_le32(le32_to_cpu((*pntsd)->dacloffset) - NDR_NTSD_OFFSETOF);
++
++	rc = acl.sd_size;
++out_free:
++	kfree(acl_ndr.data);
++	kfree(smb_acl);
++	kfree(def_smb_acl);
++	if (rc < 0) {
++		kfree(acl.sd_buf);
++		*pntsd = NULL;
++	}
++
++free_n_data:
++	kfree(n.data);
+ 	return rc;
+ }
+ 
+-- 
+2.33.0
+

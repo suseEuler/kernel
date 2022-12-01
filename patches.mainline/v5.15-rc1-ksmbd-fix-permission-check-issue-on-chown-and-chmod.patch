@@ -1,0 +1,88 @@
+From e70e392fa768d46ca59f2f8c0e7374099c980622 Mon Sep 17 00:00:00 2001
+From: Namjae Jeon <namjae.jeon@samsung.com>
+Date: Sat, 21 Aug 2021 23:26:01 +0900
+Subject: [PATCH] ksmbd: fix permission check issue on chown and chmod
+Git-commit: e70e392fa768d46ca59f2f8c0e7374099c980622
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified per openEuler commit c4bab648f
+
+
+When commanding chmod and chown on cifs&ksmbd, ksmbd allows it without file
+permissions check. There is code to check it in settattr_prepare.
+Instead of setting the inode directly, update the mode and uid/gid
+through notify_change.
+
+Signed-off-by: Namjae Jeon <namjae.jeon@samsung.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/ksmbd/smb2pdu.c |  5 +++++
+ fs/ksmbd/smbacl.c  | 24 ++++++++++++++++++------
+ 2 files changed, 23 insertions(+), 6 deletions(-)
+
+diff --git a/fs/ksmbd/smb2pdu.c b/fs/ksmbd/smb2pdu.c
+index adab4a138648..ecfa8264e926 100644
+--- a/fs/ksmbd/smb2pdu.c
++++ b/fs/ksmbd/smb2pdu.c
+@@ -5815,10 +5815,15 @@ int smb2_set_info(struct ksmbd_work *work)
+ 		break;
+ 	case SMB2_O_INFO_SECURITY:
+ 		ksmbd_debug(SMB, "GOT SMB2_O_INFO_SECURITY\n");
++		if (ksmbd_override_fsids(work)) {
++			rc = -ENOMEM;
++			goto err_out;
++		}
+ 		rc = smb2_set_info_sec(fp,
+ 				       le32_to_cpu(req->AdditionalInformation),
+ 				       req->Buffer,
+ 				       le32_to_cpu(req->BufferLength));
++		ksmbd_revert_fsids(work);
+ 		break;
+ 	default:
+ 		rc = -EOPNOTSUPP;
+diff --git a/fs/ksmbd/smbacl.c b/fs/ksmbd/smbacl.c
+index 49411e791b08..321676a74b48 100644
+--- a/fs/ksmbd/smbacl.c
++++ b/fs/ksmbd/smbacl.c
+@@ -1271,6 +1271,7 @@ int set_info_sec(struct ksmbd_conn *conn, struct ksmbd_tree_connect *tcon,
+ 	int rc;
+ 	struct smb_fattr fattr = {{0}};
+ 	struct inode *inode = d_inode(path->dentry);
++	struct iattr newattrs;
+ 
+ 	fattr.cf_uid = INVALID_UID;
+ 	fattr.cf_gid = INVALID_GID;
+@@ -1280,12 +1281,23 @@ int set_info_sec(struct ksmbd_conn *conn, struct ksmbd_tree_connect *tcon,
+ 	if (rc)
+ 		goto out;
+ 
+-	inode->i_mode = (inode->i_mode & ~0777) | (fattr.cf_mode & 0777);
+-	if (!uid_eq(fattr.cf_uid, INVALID_UID))
+-		inode->i_uid = fattr.cf_uid;
+-	if (!gid_eq(fattr.cf_gid, INVALID_GID))
+-		inode->i_gid = fattr.cf_gid;
+-	mark_inode_dirty(inode);
++	newattrs.ia_valid = ATTR_CTIME;
++	if (!uid_eq(fattr.cf_uid, INVALID_UID)) {
++		newattrs.ia_valid |= ATTR_UID;
++		newattrs.ia_uid = fattr.cf_uid;
++	}
++	if (!gid_eq(fattr.cf_gid, INVALID_GID)) {
++		newattrs.ia_valid |= ATTR_GID;
++		newattrs.ia_gid = fattr.cf_gid;
++	}
++	newattrs.ia_valid |= ATTR_MODE;
++	newattrs.ia_mode = (inode->i_mode & ~0777) | (fattr.cf_mode & 0777);
++
++	inode_lock(inode);
++	rc = notify_change(path->dentry, &newattrs, NULL);
++	inode_unlock(inode);
++	if (rc)
++		goto out;
+ 
+ 	ksmbd_vfs_remove_acl_xattrs(path->dentry);
+ 	/* Update posix acls */
+-- 
+2.33.0
+

@@ -1,0 +1,400 @@
+From d63528eb0d43c4796c42aad56889dec12cf4e122 Mon Sep 17 00:00:00 2001
+From: Hyunchul Lee <hyc.lee@gmail.com>
+Date: Sat, 10 Jul 2021 16:22:41 +0900
+Subject: [PATCH] ksmbd: free ksmbd_lock when file is closed
+Git-commit: d63528eb0d43c4796c42aad56889dec12cf4e122
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+Append ksmbd_lock into the connection's
+lock list and the ksmbd_file's lock list.
+And when a file is closed, detach ksmbd_lock
+from these lists and free it.
+
+Signed-off-by: Hyunchul Lee <hyc.lee@gmail.com>
+Signed-off-by: Namjae Jeon <namjae.jeon@samsung.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/ksmbd/connection.c |   7 +-
+ fs/ksmbd/connection.h |   6 ++
+ fs/ksmbd/smb2pdu.c    | 154 ++++++++++++++++++++++++++----------------
+ fs/ksmbd/smb_common.c |   2 -
+ fs/ksmbd/smb_common.h |   2 -
+ fs/ksmbd/vfs_cache.c  |  16 +++++
+ fs/ksmbd/vfs_cache.h  |   4 +-
+ 7 files changed, 125 insertions(+), 66 deletions(-)
+
+diff --git a/fs/ksmbd/connection.c b/fs/ksmbd/connection.c
+index 6e51e08addee..8430848bea45 100644
+--- a/fs/ksmbd/connection.c
++++ b/fs/ksmbd/connection.c
+@@ -19,8 +19,8 @@ static DEFINE_MUTEX(init_lock);
+ 
+ static struct ksmbd_conn_ops default_conn_ops;
+ 
+-static LIST_HEAD(conn_list);
+-static DEFINE_RWLOCK(conn_list_lock);
++LIST_HEAD(conn_list);
++DEFINE_RWLOCK(conn_list_lock);
+ 
+ /**
+  * ksmbd_conn_free() - free resources of the connection instance
+@@ -70,6 +70,9 @@ struct ksmbd_conn *ksmbd_conn_alloc(void)
+ 	spin_lock_init(&conn->credits_lock);
+ 	ida_init(&conn->async_ida);
+ 
++	spin_lock_init(&conn->llist_lock);
++	INIT_LIST_HEAD(&conn->lock_list);
++
+ 	write_lock(&conn_list_lock);
+ 	list_add(&conn->conns_list, &conn_list);
+ 	write_unlock(&conn_list_lock);
+diff --git a/fs/ksmbd/connection.h b/fs/ksmbd/connection.h
+index 98108b41f739..487c2024b0d5 100644
+--- a/fs/ksmbd/connection.h
++++ b/fs/ksmbd/connection.h
+@@ -79,6 +79,9 @@ struct ksmbd_conn {
+ 		char			*ntlmssp_cryptkey;
+ 	};
+ 
++	spinlock_t			llist_lock;
++	struct list_head		lock_list;
++
+ 	struct preauth_integrity_info	*preauth_info;
+ 
+ 	bool				need_neg;
+@@ -138,6 +141,9 @@ struct ksmbd_transport {
+ #define KSMBD_TCP_SEND_TIMEOUT	(5 * HZ)
+ #define KSMBD_TCP_PEER_SOCKADDR(c)	((struct sockaddr *)&((c)->peer_addr))
+ 
++extern struct list_head conn_list;
++extern rwlock_t conn_list_lock;
++
+ bool ksmbd_conn_alive(struct ksmbd_conn *conn);
+ void ksmbd_conn_wait_idle(struct ksmbd_conn *conn);
+ struct ksmbd_conn *ksmbd_conn_alloc(void);
+diff --git a/fs/ksmbd/smb2pdu.c b/fs/ksmbd/smb2pdu.c
+index d81768431249..99e2368ae672 100644
+--- a/fs/ksmbd/smb2pdu.c
++++ b/fs/ksmbd/smb2pdu.c
+@@ -6513,8 +6513,9 @@ static struct ksmbd_lock *smb2_lock_init(struct file_lock *flock,
+ 	lock->flags = flags;
+ 	if (lock->start == lock->end)
+ 		lock->zero_len = 1;
++	INIT_LIST_HEAD(&lock->clist);
++	INIT_LIST_HEAD(&lock->flist);
+ 	INIT_LIST_HEAD(&lock->llist);
+-	INIT_LIST_HEAD(&lock->glist);
+ 	list_add_tail(&lock->llist, lock_list);
+ 
+ 	return lock;
+@@ -6553,7 +6554,8 @@ int smb2_lock(struct ksmbd_work *work)
+ 	int cmd = 0;
+ 	int err = 0, i;
+ 	u64 lock_start, lock_length;
+-	struct ksmbd_lock *smb_lock = NULL, *cmp_lock, *tmp;
++	struct ksmbd_lock *smb_lock = NULL, *cmp_lock, *tmp, *tmp2;
++	struct ksmbd_conn *conn;
+ 	int nolock = 0;
+ 	LIST_HEAD(lock_list);
+ 	LIST_HEAD(rollback_list);
+@@ -6662,72 +6664,89 @@ int smb2_lock(struct ksmbd_work *work)
+ 
+ 		if (!(smb_lock->flags & SMB2_LOCKFLAG_UNLOCK) &&
+ 		    !(smb_lock->flags & SMB2_LOCKFLAG_FAIL_IMMEDIATELY))
+-			goto no_check_gl;
++			goto no_check_cl;
+ 
+ 		nolock = 1;
+-		/* check locks in global list */
+-		list_for_each_entry(cmp_lock, &global_lock_list, glist) {
+-			if (file_inode(cmp_lock->fl->fl_file) !=
+-			    file_inode(smb_lock->fl->fl_file))
+-				continue;
++		/* check locks in connection list */
++		read_lock(&conn_list_lock);
++		list_for_each_entry(conn, &conn_list, conns_list) {
++			spin_lock(&conn->llist_lock);
++			list_for_each_entry_safe(cmp_lock, tmp2, &conn->lock_list, clist) {
++				if (file_inode(cmp_lock->fl->fl_file) !=
++				    file_inode(smb_lock->fl->fl_file))
++					continue;
+ 
+-			if (smb_lock->fl->fl_type == F_UNLCK) {
+-				if (cmp_lock->fl->fl_file == smb_lock->fl->fl_file &&
+-				    cmp_lock->start == smb_lock->start &&
+-				    cmp_lock->end == smb_lock->end &&
+-				    !lock_defer_pending(cmp_lock->fl)) {
+-					nolock = 0;
+-					locks_free_lock(cmp_lock->fl);
+-					list_del(&cmp_lock->glist);
+-					kfree(cmp_lock);
+-					break;
++				if (smb_lock->fl->fl_type == F_UNLCK) {
++					if (cmp_lock->fl->fl_file == smb_lock->fl->fl_file &&
++					    cmp_lock->start == smb_lock->start &&
++					    cmp_lock->end == smb_lock->end &&
++					    !lock_defer_pending(cmp_lock->fl)) {
++						nolock = 0;
++						list_del(&cmp_lock->flist);
++						list_del(&cmp_lock->clist);
++						spin_unlock(&conn->llist_lock);
++						read_unlock(&conn_list_lock);
++
++						locks_free_lock(cmp_lock->fl);
++						kfree(cmp_lock);
++						goto out_check_cl;
++					}
++					continue;
+ 				}
+-				continue;
+-			}
+ 
+-			if (cmp_lock->fl->fl_file == smb_lock->fl->fl_file) {
+-				if (smb_lock->flags & SMB2_LOCKFLAG_SHARED)
+-					continue;
+-			} else {
+-				if (cmp_lock->flags & SMB2_LOCKFLAG_SHARED)
+-					continue;
+-			}
++				if (cmp_lock->fl->fl_file == smb_lock->fl->fl_file) {
++					if (smb_lock->flags & SMB2_LOCKFLAG_SHARED)
++						continue;
++				} else {
++					if (cmp_lock->flags & SMB2_LOCKFLAG_SHARED)
++						continue;
++				}
+ 
+-			/* check zero byte lock range */
+-			if (cmp_lock->zero_len && !smb_lock->zero_len &&
+-			    cmp_lock->start > smb_lock->start &&
+-			    cmp_lock->start < smb_lock->end) {
+-				pr_err("previous lock conflict with zero byte lock range\n");
+-				rsp->hdr.Status = STATUS_LOCK_NOT_GRANTED;
+-				goto out;
+-			}
++				/* check zero byte lock range */
++				if (cmp_lock->zero_len && !smb_lock->zero_len &&
++				    cmp_lock->start > smb_lock->start &&
++				    cmp_lock->start < smb_lock->end) {
++					spin_unlock(&conn->llist_lock);
++					read_unlock(&conn_list_lock);
++					pr_err("previous lock conflict with zero byte lock range\n");
++					rsp->hdr.Status = STATUS_LOCK_NOT_GRANTED;
++						goto out;
++				}
+ 
+-			if (smb_lock->zero_len && !cmp_lock->zero_len &&
+-			    smb_lock->start > cmp_lock->start &&
+-			    smb_lock->start < cmp_lock->end) {
+-				pr_err("current lock conflict with zero byte lock range\n");
+-				rsp->hdr.Status = STATUS_LOCK_NOT_GRANTED;
+-				goto out;
+-			}
++				if (smb_lock->zero_len && !cmp_lock->zero_len &&
++				    smb_lock->start > cmp_lock->start &&
++				    smb_lock->start < cmp_lock->end) {
++					spin_unlock(&conn->llist_lock);
++					read_unlock(&conn_list_lock);
++					pr_err("current lock conflict with zero byte lock range\n");
++					rsp->hdr.Status = STATUS_LOCK_NOT_GRANTED;
++						goto out;
++				}
+ 
+-			if (((cmp_lock->start <= smb_lock->start &&
+-			      cmp_lock->end > smb_lock->start) ||
+-			     (cmp_lock->start < smb_lock->end && cmp_lock->end >= smb_lock->end)) &&
+-			    !cmp_lock->zero_len && !smb_lock->zero_len) {
+-				pr_err("Not allow lock operation on exclusive lock range\n");
+-				rsp->hdr.Status =
+-					STATUS_LOCK_NOT_GRANTED;
+-				goto out;
++				if (((cmp_lock->start <= smb_lock->start &&
++				      cmp_lock->end > smb_lock->start) ||
++				     (cmp_lock->start < smb_lock->end &&
++				      cmp_lock->end >= smb_lock->end)) &&
++				    !cmp_lock->zero_len && !smb_lock->zero_len) {
++					spin_unlock(&conn->llist_lock);
++					read_unlock(&conn_list_lock);
++					pr_err("Not allow lock operation on exclusive lock range\n");
++					rsp->hdr.Status =
++						STATUS_LOCK_NOT_GRANTED;
++					goto out;
++				}
+ 			}
++			spin_unlock(&conn->llist_lock);
+ 		}
+-
++		read_unlock(&conn_list_lock);
++out_check_cl:
+ 		if (smb_lock->fl->fl_type == F_UNLCK && nolock) {
+ 			pr_err("Try to unlock nolocked range\n");
+ 			rsp->hdr.Status = STATUS_RANGE_NOT_LOCKED;
+ 			goto out;
+ 		}
+ 
+-no_check_gl:
++no_check_cl:
+ 		if (smb_lock->zero_len) {
+ 			err = 0;
+ 			goto skip;
+@@ -6753,8 +6772,10 @@ int smb2_lock(struct ksmbd_work *work)
+ 
+ 				ksmbd_debug(SMB,
+ 					    "would have to wait for getting lock\n");
+-				list_add_tail(&smb_lock->glist,
+-					      &global_lock_list);
++				spin_lock(&work->conn->llist_lock);
++				list_add_tail(&smb_lock->clist,
++					      &work->conn->lock_list);
++				spin_unlock(&work->conn->llist_lock);
+ 				list_add(&smb_lock->llist, &rollback_list);
+ 
+ 				argv = kmalloc(sizeof(void *), GFP_KERNEL);
+@@ -6782,7 +6803,9 @@ int smb2_lock(struct ksmbd_work *work)
+ 
+ 				if (work->state != KSMBD_WORK_ACTIVE) {
+ 					list_del(&smb_lock->llist);
+-					list_del(&smb_lock->glist);
++					spin_lock(&work->conn->llist_lock);
++					list_del(&smb_lock->clist);
++					spin_unlock(&work->conn->llist_lock);
+ 					locks_free_lock(flock);
+ 
+ 					if (work->state == KSMBD_WORK_CANCELLED) {
+@@ -6806,14 +6829,21 @@ int smb2_lock(struct ksmbd_work *work)
+ 				}
+ 
+ 				list_del(&smb_lock->llist);
+-				list_del(&smb_lock->glist);
++				spin_lock(&work->conn->llist_lock);
++				list_del(&smb_lock->clist);
++				spin_unlock(&work->conn->llist_lock);
++
+ 				spin_lock(&fp->f_lock);
+ 				list_del(&work->fp_entry);
+ 				spin_unlock(&fp->f_lock);
+ 				goto retry;
+ 			} else if (!err) {
+-				list_add_tail(&smb_lock->glist,
+-					      &global_lock_list);
++				spin_lock(&work->conn->llist_lock);
++				list_add_tail(&smb_lock->clist,
++					      &work->conn->lock_list);
++				list_add_tail(&smb_lock->flist,
++					      &fp->lock_list);
++				spin_unlock(&work->conn->llist_lock);
+ 				list_add(&smb_lock->llist, &rollback_list);
+ 				ksmbd_debug(SMB, "successful in taking lock\n");
+ 			} else {
+@@ -6852,8 +6882,14 @@ int smb2_lock(struct ksmbd_work *work)
+ 		err = vfs_lock_file(filp, 0, rlock, NULL);
+ 		if (err)
+ 			pr_err("rollback unlock fail : %d\n", err);
++
+ 		list_del(&smb_lock->llist);
+-		list_del(&smb_lock->glist);
++		spin_lock(&work->conn->llist_lock);
++		if (!list_empty(&smb_lock->flist))
++			list_del(&smb_lock->flist);
++		list_del(&smb_lock->clist);
++		spin_unlock(&work->conn->llist_lock);
++
+ 		locks_free_lock(smb_lock->fl);
+ 		locks_free_lock(rlock);
+ 		kfree(smb_lock);
+diff --git a/fs/ksmbd/smb_common.c b/fs/ksmbd/smb_common.c
+index 38026d9bb704..24c6bb476f6e 100644
+--- a/fs/ksmbd/smb_common.c
++++ b/fs/ksmbd/smb_common.c
+@@ -23,8 +23,6 @@ static const char basechars[43] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_-!@#$%";
+ #define mangle(V) ((char)(basechars[(V) % MANGLE_BASE]))
+ #define KSMBD_MIN_SUPPORTED_HEADER_SIZE	(sizeof(struct smb2_hdr))
+ 
+-LIST_HEAD(global_lock_list);
+-
+ struct smb_protocol {
+ 	int		index;
+ 	char		*name;
+diff --git a/fs/ksmbd/smb_common.h b/fs/ksmbd/smb_common.h
+index 6ab28aa33024..b8c350725905 100644
+--- a/fs/ksmbd/smb_common.h
++++ b/fs/ksmbd/smb_common.h
+@@ -48,8 +48,6 @@
+ #define CIFS_DEFAULT_IOSIZE	(64 * 1024)
+ #define MAX_CIFS_SMALL_BUFFER_SIZE 448 /* big enough for most */
+ 
+-extern struct list_head global_lock_list;
+-
+ /* RFC 1002 session packet types */
+ #define RFC1002_SESSION_MESSAGE			0x00
+ #define RFC1002_SESSION_REQUEST			0x81
+diff --git a/fs/ksmbd/vfs_cache.c b/fs/ksmbd/vfs_cache.c
+index c54c605637a0..92d8c61ffd2a 100644
+--- a/fs/ksmbd/vfs_cache.c
++++ b/fs/ksmbd/vfs_cache.c
+@@ -302,6 +302,7 @@ static void __ksmbd_remove_fd(struct ksmbd_file_table *ft, struct ksmbd_file *fp
+ static void __ksmbd_close_fd(struct ksmbd_file_table *ft, struct ksmbd_file *fp)
+ {
+ 	struct file *filp;
++	struct ksmbd_lock *smb_lock, *tmp_lock;
+ 
+ 	fd_limit_close();
+ 	__ksmbd_remove_durable_fd(fp);
+@@ -313,6 +314,20 @@ static void __ksmbd_close_fd(struct ksmbd_file_table *ft, struct ksmbd_file *fp)
+ 	__ksmbd_inode_close(fp);
+ 	if (!IS_ERR_OR_NULL(filp))
+ 		fput(filp);
++
++	/* because the reference count of fp is 0, it is guaranteed that
++	 * there are not accesses to fp->lock_list.
++	 */
++	list_for_each_entry_safe(smb_lock, tmp_lock, &fp->lock_list, flist) {
++		spin_lock(&fp->conn->llist_lock);
++		list_del(&smb_lock->clist);
++		spin_unlock(&fp->conn->llist_lock);
++
++		list_del(&smb_lock->flist);
++		locks_free_lock(smb_lock->fl);
++		kfree(smb_lock);
++	}
++
+ 	kfree(fp->filename);
+ 	if (ksmbd_stream_fd(fp))
+ 		kfree(fp->stream.name);
+@@ -549,6 +564,7 @@ struct ksmbd_file *ksmbd_open_fd(struct ksmbd_work *work, struct file *filp)
+ 
+ 	INIT_LIST_HEAD(&fp->blocked_works);
+ 	INIT_LIST_HEAD(&fp->node);
++	INIT_LIST_HEAD(&fp->lock_list);
+ 	spin_lock_init(&fp->f_lock);
+ 	atomic_set(&fp->refcount, 1);
+ 
+diff --git a/fs/ksmbd/vfs_cache.h b/fs/ksmbd/vfs_cache.h
+index 70e987293564..70dfe6a99f13 100644
+--- a/fs/ksmbd/vfs_cache.h
++++ b/fs/ksmbd/vfs_cache.h
+@@ -30,7 +30,8 @@ struct ksmbd_session;
+ 
+ struct ksmbd_lock {
+ 	struct file_lock *fl;
+-	struct list_head glist;
++	struct list_head clist;
++	struct list_head flist;
+ 	struct list_head llist;
+ 	unsigned int flags;
+ 	int cmd;
+@@ -91,6 +92,7 @@ struct ksmbd_file {
+ 	struct stream			stream;
+ 	struct list_head		node;
+ 	struct list_head		blocked_works;
++	struct list_head		lock_list;
+ 
+ 	int				durable_timeout;
+ 
+-- 
+2.33.0
+
