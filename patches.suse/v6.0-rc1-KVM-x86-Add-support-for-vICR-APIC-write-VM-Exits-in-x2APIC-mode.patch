@@ -5,8 +5,8 @@ Subject: [PATCH] KVM: x86: Add support for vICR APIC-write VM-Exits in x2APIC
  mode
 Git-commit: 5413bcba7ed57206178d60ee03dd5bb3a460e645
 Patch-mainline: v6.0-rc1
-References: bsn#121
-Modified-by-SEL: Yes, modified per openEuler commit 54838a4f
+References: bsn#121 git-fix
+Modified-by-SEL: Yes, refreshed due to different context
 
 
 Upcoming Intel CPUs will support virtual x2APIC MSR writes to the vICR,
@@ -21,55 +21,47 @@ Message-Id: <20220419153516.11739-1-guang.zeng@intel.com>
 Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
 Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
 ---
- arch/x86/kvm/lapic.c | 12 +++++++++---
- arch/x86/kvm/lapic.h |  5 +++++
- 2 files changed, 14 insertions(+), 3 deletions(-)
+ arch/x86/kvm/lapic.c |   24 +++++++++++++++++++++---
+ 1 file changed, 21 insertions(+), 3 deletions(-)
 
-diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
-index 28248e312efa..4ea8119b5010 100644
 --- a/arch/x86/kvm/lapic.c
 +++ b/arch/x86/kvm/lapic.c
-@@ -2174,15 +2174,21 @@ EXPORT_SYMBOL_GPL(kvm_lapic_set_eoi);
+@@ -67,6 +67,7 @@ static bool lapic_timer_advance_dynamic
+ #define LAPIC_TIMER_ADVANCE_NS_MAX     5000
+ /* step-by-step approximation to mitigate fluctuation */
+ #define LAPIC_TIMER_ADVANCE_ADJUST_STEP 8
++static int kvm_lapic_msr_read(struct kvm_lapic *apic, u32 reg, u64 *data);
+ 
+ static inline int apic_test_vector(int vec, void *bitmap)
+ {
+@@ -2178,10 +2179,27 @@ EXPORT_SYMBOL_GPL(kvm_lapic_set_eoi);
  /* emulate APIC access in a trap manner */
  void kvm_apic_write_nodecode(struct kvm_vcpu *vcpu, u32 offset)
  {
--	u32 val = 0;
+-	u32 val = kvm_lapic_get_reg(vcpu->arch.apic, offset);
 +	struct kvm_lapic *apic = vcpu->arch.apic;
-+	u64 val = 0;
++	u64 val;
++
++	if (apic_x2apic_mode(apic)) {
++		/*
++		 * When guest APIC is in x2APIC mode and IPI virtualization
++		 * is enabled, accessing APIC_ICR may cause trap-like VM-exit
++		 * on Intel hardware. Other offsets are not possible.
++		 */
++		if (WARN_ON_ONCE(offset != APIC_ICR))
++			return;
  
- 	/* hw has done the conditional check and inst decode */
- 	offset &= 0xff0;
- 
--	kvm_lapic_reg_read(vcpu->arch.apic, offset, 4, &val);
-+	/* exception dealing with 64bit data on vICR in x2apic mode */
-+	if ((offset == APIC_ICR) && apic_x2apic_mode(apic)) {
-+		val = kvm_lapic_get_reg64(apic, offset);
-+		kvm_lapic_reg_write(apic, APIC_ICR2, (u32)(val>>32));
-+	} else
-+		kvm_lapic_reg_read(apic, offset, 4, &val);
- 
- 	/* TODO: optimize to just emulate side effect w/o one more write */
+-	/* TODO: optimize to just emulate side effect w/o one more write */
 -	kvm_lapic_reg_write(vcpu->arch.apic, offset, val);
-+	kvm_lapic_reg_write(apic, offset, (u32)val);
++		kvm_lapic_msr_read(apic, offset, &val);
++		kvm_apic_send_ipi(apic, (u32)val, (u32)(val >> 32));
++		trace_kvm_apic_write(APIC_ICR, val);
++	} else {
++		val = kvm_lapic_get_reg(apic, offset);
++
++		/* TODO: optimize to just emulate side effect w/o one more write */
++		kvm_lapic_reg_write(apic, offset, (u32)val);
++	}
  }
  EXPORT_SYMBOL_GPL(kvm_apic_write_nodecode);
  
-diff --git a/arch/x86/kvm/lapic.h b/arch/x86/kvm/lapic.h
-index 4fb86e3a9dd3..49e85dea5e3f 100644
---- a/arch/x86/kvm/lapic.h
-+++ b/arch/x86/kvm/lapic.h
-@@ -162,6 +162,11 @@ static inline u32 kvm_lapic_get_reg(struct kvm_lapic *apic, int reg_off)
- 	return *((u32 *) (apic->regs + reg_off));
- }
- 
-+static inline u64 kvm_lapic_get_reg64(struct kvm_lapic *apic, int reg_off)
-+{
-+	return *((u64 *) (apic->regs + reg_off));
-+}
-+
- static inline void __kvm_lapic_set_reg(char *regs, int reg_off, u32 val)
- {
- 	*((u32 *) (regs + reg_off)) = val;
--- 
-2.35.3
-

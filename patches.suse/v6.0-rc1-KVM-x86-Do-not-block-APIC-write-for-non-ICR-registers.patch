@@ -1,0 +1,71 @@
+From 1bd9dfec9fd419920572b057e2c98d9877190b06 Mon Sep 17 00:00:00 2001
+From: Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+Date: Mon, 25 Jul 2022 00:33:56 -0500
+Subject: [PATCH] KVM: x86: Do not block APIC write for non ICR registers
+Git-commit: 1bd9dfec9fd419920572b057e2c98d9877190b06
+Patch-mainline: v6.0-rc1
+References: git-fix
+Modified-by-SEL: Yes, refreshed due to different context
+
+
+The commit 5413bcba7ed5 ("KVM: x86: Add support for vICR APIC-write
+VM-Exits in x2APIC mode") introduces logic to prevent APIC write
+for offset other than ICR in kvm_apic_write_nodecode() function.
+This breaks x2AVIC support, which requires KVM to trap and emulate
+x2APIC MSR writes.
+
+Therefore, removes the warning and modify to logic to allow MSR write.
+
+Fixes: 5413bcba7ed5 ("KVM: x86: Add support for vICR APIC-write VM-Exits in x2APIC mode")
+Cc: Zeng Guang <guang.zeng@intel.com>
+Suggested-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+Message-Id: <20220725053356.4275-1-suravee.suthikulpanit@amd.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/kvm/lapic.c |   22 +++++++++++-----------
+ 1 file changed, 11 insertions(+), 11 deletions(-)
+
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -68,6 +68,7 @@ static bool lapic_timer_advance_dynamic
+ /* step-by-step approximation to mitigate fluctuation */
+ #define LAPIC_TIMER_ADVANCE_ADJUST_STEP 8
+ static int kvm_lapic_msr_read(struct kvm_lapic *apic, u32 reg, u64 *data);
++static int kvm_lapic_msr_write(struct kvm_lapic *apic, u32 reg, u64 data);
+ 
+ static inline int apic_test_vector(int vec, void *bitmap)
+ {
+@@ -2182,21 +2183,20 @@ void kvm_apic_write_nodecode(struct kvm_
+ 	struct kvm_lapic *apic = vcpu->arch.apic;
+ 	u64 val;
+ 
+-	if (apic_x2apic_mode(apic)) {
+-		/*
+-		 * When guest APIC is in x2APIC mode and IPI virtualization
+-		 * is enabled, accessing APIC_ICR may cause trap-like VM-exit
+-		 * on Intel hardware. Other offsets are not possible.
+-		 */
+-		if (WARN_ON_ONCE(offset != APIC_ICR))
+-			return;
+-
++	if (apic_x2apic_mode(apic))
+ 		kvm_lapic_msr_read(apic, offset, &val);
++	else
++		val = kvm_lapic_get_reg(apic, offset);
++
++	/*
++	 * ICR is a single 64-bit register when x2APIC is enabled.  For legacy
++	 * xAPIC, ICR writes need to go down the common (slightly slower) path
++	 * to get the upper half from ICR2.
++	 */
++	if (apic_x2apic_mode(apic) && offset == APIC_ICR) {
+ 		kvm_apic_send_ipi(apic, (u32)val, (u32)(val >> 32));
+ 		trace_kvm_apic_write(APIC_ICR, val);
+ 	} else {
+-		val = kvm_lapic_get_reg(apic, offset);
+-
+ 		/* TODO: optimize to just emulate side effect w/o one more write */
+ 		kvm_lapic_reg_write(apic, offset, (u32)val);
+ 	}
