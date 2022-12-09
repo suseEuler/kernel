@@ -1,0 +1,109 @@
+From 4d7bf939df08218e682f7a42952eee3bad4dceb7 Mon Sep 17 00:00:00 2001
+From: Qing Zhang <zhangqing@loongson.cn>
+Date: Sat, 6 Aug 2022 16:10:05 +0800
+Subject: [PATCH] LoongArch: Add USER_STACKTRACE support
+Git-commit: 4d7bf939df08218e682f7a42952eee3bad4dceb7
+Patch-mainline: v6.0-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified per openEuler commit 4af7a169
+
+
+To get the best stacktrace output, you can compile your userspace
+programs with frame pointers (at least glibc + the app you are tracing).
+
+1, export "CC = gcc -fno-omit-frame-pointer";
+2, compile your programs with "CC";
+3, use uprobe to get stacktrace output.
+
+...
+     echo 'p:malloc /usr/lib64/libc.so.6:0x0a4704 size=%r4:u64' > uprobe_events
+     echo 'p:free /usr/lib64/libc.so.6:0x0a4d50 ptr=%r4:x64' >> uprobe_events
+     echo 'comm == "demo"' > ./events/uprobes/malloc/filter
+     echo 'comm == "demo"' > ./events/uprobes/free/filter
+     echo 1 > ./options/userstacktrace
+     echo 1 > ./options/sym-userobj
+...
+
+Signed-off-by: Qing Zhang <zhangqing@loongson.cn>
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/loongarch/include/asm/stacktrace.h |  5 +++
+ arch/loongarch/kernel/stacktrace.c      | 41 +++++++++++++++++++++++++
+ 2 files changed, 46 insertions(+)
+
+diff --git a/arch/loongarch/include/asm/stacktrace.h b/arch/loongarch/include/asm/stacktrace.h
+index 5820a0cabe3a..f23adb15f418 100644
+--- a/arch/loongarch/include/asm/stacktrace.h
++++ b/arch/loongarch/include/asm/stacktrace.h
+@@ -21,6 +21,11 @@ struct stack_info {
+ 	unsigned long begin, end, next_sp;
+ };
+ 
++struct stack_frame {
++	unsigned long	fp;
++	unsigned long	ra;
++};
++
+ bool in_irq_stack(unsigned long stack, struct stack_info *info);
+ bool in_task_stack(unsigned long stack, struct task_struct *task, struct stack_info *info);
+ int get_stack_info(unsigned long stack, struct task_struct *task, struct stack_info *info);
+diff --git a/arch/loongarch/kernel/stacktrace.c b/arch/loongarch/kernel/stacktrace.c
+index e690c1c769f2..3a690f96f00c 100644
+--- a/arch/loongarch/kernel/stacktrace.c
++++ b/arch/loongarch/kernel/stacktrace.c
+@@ -6,6 +6,7 @@
+  */
+ #include <linux/sched.h>
+ #include <linux/stacktrace.h>
++#include <linux/uaccess.h>
+ 
+ #include <asm/stacktrace.h>
+ #include <asm/unwind.h>
+@@ -35,3 +36,43 @@ void arch_stack_walk(stack_trace_consume_fn consume_entry, void *cookie,
+ 			break;
+ 	}
+ }
++
++static int
++copy_stack_frame(unsigned long fp, struct stack_frame *frame)
++{
++	int ret = 1;
++	unsigned long err;
++	unsigned long __user *user_frame_tail;
++
++	user_frame_tail = (unsigned long *)(fp - sizeof(struct stack_frame));
++	if (!access_ok(user_frame_tail, sizeof(*frame)))
++		return 0;
++
++	pagefault_disable();
++	err = (__copy_from_user_inatomic(frame, user_frame_tail, sizeof(*frame)));
++	if (err || (unsigned long)user_frame_tail >= frame->fp)
++		ret = 0;
++	pagefault_enable();
++
++	return ret;
++}
++
++void arch_stack_walk_user(stack_trace_consume_fn consume_entry, void *cookie,
++			  const struct pt_regs *regs)
++{
++	unsigned long fp = regs->regs[22];
++
++	while (fp && !((unsigned long)fp & 0xf)) {
++		struct stack_frame frame;
++
++		frame.fp = 0;
++		frame.ra = 0;
++		if (!copy_stack_frame(fp, &frame))
++			break;
++		if (!frame.ra)
++			break;
++		if (!consume_entry(cookie, frame.ra))
++			break;
++		fp = frame.fp;
++	}
++}
+-- 
+2.33.0
+

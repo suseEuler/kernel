@@ -1,0 +1,112 @@
+From da64f49ac615bb49b14651ac545a3950ca0375cf Mon Sep 17 00:00:00 2001
+From: GUO Zihua <guozihua@huawei.com>
+Date: Wed, 7 Dec 2022 18:39:36 +0800
+Subject: [PATCH] mpi: Fix length check in mpi_key_length()
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: da64f49ac615bb49b14651ac545a3950ca0375cf
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I62DVN
+CVE: NA
+
+--------------------------------
+
+Syzkaller reported a UAF in mpi_key_length().
+
+BUG: KASAN: use-after-free in mpi_key_length+0x34/0xb0
+Read of size 2 at addr ffff888005737e14 by task syz-executor.15/6236
+
+CPU: 1 PID: 6236 Comm: syz-executor.15 Kdump: loaded Tainted: GF          OE     5.10.0.kasan.x86_64 #1
+Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.12.1-0-ga5cab58-20220525_182517-szxrtosci10000 04/01/2014
+Call Trace:
+ dump_stack+0x9c/0xd3
+ print_address_description.constprop.0+0x19/0x170
+ __kasan_report.cold+0x6c/0x84
+ kasan_report+0x3a/0x50
+ check_memory_region+0xfd/0x1f0
+ mpi_key_length+0x34/0xb0
+ pgp_calc_pkey_keyid.isra.0+0x100/0x5a0
+ pgp_generate_fingerprint+0x159/0x330
+ pgp_process_public_key+0x1c5/0x330
+ pgp_parse_packets+0xf4/0x200
+ pgp_key_parse+0xb6/0x340
+ asymmetric_key_preparse+0x8a/0x120
+ key_create_or_update+0x31f/0x8c0
+ __se_sys_add_key+0x23e/0x400
+ do_syscall_64+0x30/0x40
+ entry_SYSCALL_64_after_hwframe+0x61/0xc6
+
+The root cause of the issue is that pgp_calc_pkey_keyid() would call
+mpi_key_length() and get the length of the public key. The length was
+then ducted from keylen, which is an unsigned value. However, the
+returnd byte count is not checked for legitimacy in mpi_key_length(),
+resulting in an inverted keylen, hence the read overflow.
+
+It turns out that the byte count check was mistakenly placed in
+mpi_read_from_buffer() while commit 94479061ec5b ("mpi: introduce
+mpi_key_length()") tries to extract mpi_key_length() out of
+mpi_read_from_buffer(). This patch moves the check into
+mpi_key_length().
+
+Fixes: commit 94479061ec5b ("mpi: introduce mpi_key_length()")
+Signed-off-by: GUO Zihua <guozihua@huawei.com>
+Reviewed-by: Roberto Sassu <roberto.sassu@huawei.com>
+Reviewed-by: Wang Weiyang <wangweiyang2@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ lib/mpi/mpicoder.c | 17 +++++++++--------
+ 1 file changed, 9 insertions(+), 8 deletions(-)
+
+diff --git a/lib/mpi/mpicoder.c b/lib/mpi/mpicoder.c
+index 51a8fc758021..19b8ce9aa5e3 100644
+--- a/lib/mpi/mpicoder.c
++++ b/lib/mpi/mpicoder.c
+@@ -83,7 +83,7 @@ int mpi_key_length(const void *xbuffer, unsigned int ret_nread,
+ 		   unsigned int *nbits_arg, unsigned int *nbytes_arg)
+ {
+ 	const uint8_t *buffer = xbuffer;
+-	unsigned int nbits;
++	unsigned int nbits, nbytes;
+ 
+ 	if (ret_nread < 2)
+ 		return -EINVAL;
+@@ -94,10 +94,17 @@ int mpi_key_length(const void *xbuffer, unsigned int ret_nread,
+ 		return -EINVAL;
+ 	}
+ 
++	nbytes = DIV_ROUND_UP(nbits, 8);
++	if (nbytes + 2 > ret_nread) {
++		pr_info("MPI: mpi larger than buffer nbytes=%u ret_nread=%u\n",
++				nbytes, ret_nread);
++		return -EINVAL;
++	}
++
+ 	if (nbits_arg)
+ 		*nbits_arg = nbits;
+ 	if (nbytes_arg)
+-		*nbytes_arg = DIV_ROUND_UP(nbits, 8);
++		*nbytes_arg = nbytes;
+ 
+ 	return 0;
+ }
+@@ -114,12 +121,6 @@ MPI mpi_read_from_buffer(const void *xbuffer, unsigned *ret_nread)
+ 	if (ret < 0)
+ 		return ERR_PTR(ret);
+ 
+-	if (nbytes + 2 > *ret_nread) {
+-		pr_info("MPI: mpi larger than buffer nbytes=%u ret_nread=%u\n",
+-				nbytes, *ret_nread);
+-		return ERR_PTR(-EINVAL);
+-	}
+-
+ 	val = mpi_read_raw_data(buffer + 2, nbytes);
+ 	if (!val)
+ 		return ERR_PTR(-ENOMEM);
+-- 
+2.33.0
+

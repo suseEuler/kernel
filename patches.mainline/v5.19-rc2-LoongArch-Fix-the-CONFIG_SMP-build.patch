@@ -1,0 +1,239 @@
+From 255b4658c809e194bc10236ac24a722ec14a83d6 Mon Sep 17 00:00:00 2001
+From: Huacai Chen <chenhuacai@loongson.cn>
+Date: Sun, 5 Jun 2022 16:19:53 +0800
+Subject: [PATCH] LoongArch: Fix the !CONFIG_SMP build
+Git-commit: 255b4658c809e194bc10236ac24a722ec14a83d6
+Patch-mainline: v5.19-rc2
+References: bsn#12
+Modified-by-SEL: No
+
+
+1, We assume arch/loongarch/include/asm/smp.h be included in include/
+   linux/smp.h is valid and the reverse inclusion isn't. So remove the
+   <linux/smp.h> in arch/loongarch/include/asm/smp.h.
+2, arch/loongarch/include/asm/smp.h is only needed when CONFIG_SMP,
+   and setup.c include it only because it need plat_smp_setup(). So,
+   reorganize setup.c & smp.h, and then remove <asm/smp.h> in setup.c.
+3, Fix cacheinfo.c and percpu.h build error by adding the missing header
+   files when !CONFIG_SMP.
+4, Fix acpi.c build error by adding CONFIG_SMP guards.
+5, Move irq_stat definition from smp.c to irq.c and fix its declaration.
+6, Select CONFIG_SMP for CONFIG_NUMA, similar as other architectures do.
+
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/loongarch/Kconfig               |  1 +
+ arch/loongarch/include/asm/hardirq.h |  2 +-
+ arch/loongarch/include/asm/percpu.h  |  1 +
+ arch/loongarch/include/asm/smp.h     | 23 +++++++----------------
+ arch/loongarch/kernel/acpi.c         |  4 ++++
+ arch/loongarch/kernel/cacheinfo.c    |  1 +
+ arch/loongarch/kernel/irq.c          |  7 ++++++-
+ arch/loongarch/kernel/setup.c        |  5 ++---
+ arch/loongarch/kernel/smp.c          |  2 --
+ 9 files changed, 23 insertions(+), 23 deletions(-)
+
+diff --git a/arch/loongarch/Kconfig b/arch/loongarch/Kconfig
+index 80657bf83b05..1920d52653b4 100644
+--- a/arch/loongarch/Kconfig
++++ b/arch/loongarch/Kconfig
+@@ -343,6 +343,7 @@ config NR_CPUS
+ 
+ config NUMA
+ 	bool "NUMA Support"
++	select SMP
+ 	select ACPI_NUMA if ACPI
+ 	help
+ 	  Say Y to compile the kernel with NUMA (Non-Uniform Memory Access)
+diff --git a/arch/loongarch/include/asm/hardirq.h b/arch/loongarch/include/asm/hardirq.h
+index befe8184aa08..0ef3b18f8980 100644
+--- a/arch/loongarch/include/asm/hardirq.h
++++ b/arch/loongarch/include/asm/hardirq.h
+@@ -19,7 +19,7 @@ typedef struct {
+ 	unsigned int __softirq_pending;
+ } ____cacheline_aligned irq_cpustat_t;
+ 
+-DECLARE_PER_CPU_ALIGNED(irq_cpustat_t, irq_stat);
++DECLARE_PER_CPU_SHARED_ALIGNED(irq_cpustat_t, irq_stat);
+ 
+ #define __ARCH_IRQ_STAT
+ 
+diff --git a/arch/loongarch/include/asm/percpu.h b/arch/loongarch/include/asm/percpu.h
+index 34f15a6fb1e7..e6569f18c6dd 100644
+--- a/arch/loongarch/include/asm/percpu.h
++++ b/arch/loongarch/include/asm/percpu.h
+@@ -6,6 +6,7 @@
+ #define __ASM_PERCPU_H
+ 
+ #include <asm/cmpxchg.h>
++#include <asm/loongarch.h>
+ 
+ /* Use r21 for fast access */
+ register unsigned long __my_cpu_offset __asm__("$r21");
+diff --git a/arch/loongarch/include/asm/smp.h b/arch/loongarch/include/asm/smp.h
+index 551e1f37c705..71189b28bfb2 100644
+--- a/arch/loongarch/include/asm/smp.h
++++ b/arch/loongarch/include/asm/smp.h
+@@ -9,10 +9,16 @@
+ #include <linux/atomic.h>
+ #include <linux/bitops.h>
+ #include <linux/linkage.h>
+-#include <linux/smp.h>
+ #include <linux/threads.h>
+ #include <linux/cpumask.h>
+ 
++extern int smp_num_siblings;
++extern int num_processors;
++extern int disabled_cpus;
++extern cpumask_t cpu_sibling_map[];
++extern cpumask_t cpu_core_map[];
++extern cpumask_t cpu_foreign_map[];
++
+ void loongson3_smp_setup(void);
+ void loongson3_prepare_cpus(unsigned int max_cpus);
+ void loongson3_boot_secondary(int cpu, struct task_struct *idle);
+@@ -25,26 +31,11 @@ int loongson3_cpu_disable(void);
+ void loongson3_cpu_die(unsigned int cpu);
+ #endif
+ 
+-#ifdef CONFIG_SMP
+-
+ static inline void plat_smp_setup(void)
+ {
+ 	loongson3_smp_setup();
+ }
+ 
+-#else /* !CONFIG_SMP */
+-
+-static inline void plat_smp_setup(void) { }
+-
+-#endif /* !CONFIG_SMP */
+-
+-extern int smp_num_siblings;
+-extern int num_processors;
+-extern int disabled_cpus;
+-extern cpumask_t cpu_sibling_map[];
+-extern cpumask_t cpu_core_map[];
+-extern cpumask_t cpu_foreign_map[];
+-
+ static inline int raw_smp_processor_id(void)
+ {
+ #if defined(__VDSO__)
+diff --git a/arch/loongarch/kernel/acpi.c b/arch/loongarch/kernel/acpi.c
+index b16c3dea5eeb..bb729ee8a237 100644
+--- a/arch/loongarch/kernel/acpi.c
++++ b/arch/loongarch/kernel/acpi.c
+@@ -138,6 +138,7 @@ void __init acpi_boot_table_init(void)
+ 	}
+ }
+ 
++#ifdef CONFIG_SMP
+ static int set_processor_mask(u32 id, u32 flags)
+ {
+ 
+@@ -166,15 +167,18 @@ static int set_processor_mask(u32 id, u32 flags)
+ 
+ 	return cpu;
+ }
++#endif
+ 
+ static void __init acpi_process_madt(void)
+ {
++#ifdef CONFIG_SMP
+ 	int i;
+ 
+ 	for (i = 0; i < NR_CPUS; i++) {
+ 		__cpu_number_map[i] = -1;
+ 		__cpu_logical_map[i] = -1;
+ 	}
++#endif
+ 
+ 	loongson_sysconf.nr_cpus = num_processors;
+ }
+diff --git a/arch/loongarch/kernel/cacheinfo.c b/arch/loongarch/kernel/cacheinfo.c
+index 8c9fe29e98f0..b38f5489d094 100644
+--- a/arch/loongarch/kernel/cacheinfo.c
++++ b/arch/loongarch/kernel/cacheinfo.c
+@@ -4,6 +4,7 @@
+  *
+  * Copyright (C) 2020-2022 Loongson Technology Corporation Limited
+  */
++#include <asm/cpu-info.h>
+ #include <linux/cacheinfo.h>
+ 
+ /* Populates leaf and increments to next leaf */
+diff --git a/arch/loongarch/kernel/irq.c b/arch/loongarch/kernel/irq.c
+index 4b671d305ede..b34b8d792aa4 100644
+--- a/arch/loongarch/kernel/irq.c
++++ b/arch/loongarch/kernel/irq.c
+@@ -22,6 +22,8 @@
+ #include <asm/setup.h>
+ 
+ DEFINE_PER_CPU(unsigned long, irq_stack);
++DEFINE_PER_CPU_SHARED_ALIGNED(irq_cpustat_t, irq_stat);
++EXPORT_PER_CPU_SYMBOL(irq_stat);
+ 
+ struct irq_domain *cpu_domain;
+ struct irq_domain *liointc_domain;
+@@ -56,8 +58,11 @@ int arch_show_interrupts(struct seq_file *p, int prec)
+ 
+ void __init init_IRQ(void)
+ {
+-	int i, r, ipi_irq;
++	int i;
++#ifdef CONFIG_SMP
++	int r, ipi_irq;
+ 	static int ipi_dummy_dev;
++#endif
+ 	unsigned int order = get_order(IRQ_STACK_SIZE);
+ 	struct page *page;
+ 
+diff --git a/arch/loongarch/kernel/setup.c b/arch/loongarch/kernel/setup.c
+index 185e4035811a..c74860b53375 100644
+--- a/arch/loongarch/kernel/setup.c
++++ b/arch/loongarch/kernel/setup.c
+@@ -39,7 +39,6 @@
+ #include <asm/pgalloc.h>
+ #include <asm/sections.h>
+ #include <asm/setup.h>
+-#include <asm/smp.h>
+ #include <asm/time.h>
+ 
+ #define SMBIOS_BIOSSIZE_OFFSET		0x09
+@@ -349,8 +348,6 @@ static void __init prefill_possible_map(void)
+ 
+ 	nr_cpu_ids = possible;
+ }
+-#else
+-static inline void prefill_possible_map(void) {}
+ #endif
+ 
+ void __init setup_arch(char **cmdline_p)
+@@ -367,8 +364,10 @@ void __init setup_arch(char **cmdline_p)
+ 	arch_mem_init(cmdline_p);
+ 
+ 	resource_init();
++#ifdef CONFIG_SMP
+ 	plat_smp_setup();
+ 	prefill_possible_map();
++#endif
+ 
+ 	paging_init();
+ }
+diff --git a/arch/loongarch/kernel/smp.c b/arch/loongarch/kernel/smp.c
+index b8c53b755a25..73cec62504fb 100644
+--- a/arch/loongarch/kernel/smp.c
++++ b/arch/loongarch/kernel/smp.c
+@@ -66,8 +66,6 @@ static cpumask_t cpu_core_setup_map;
+ 
+ struct secondary_data cpuboot_data;
+ static DEFINE_PER_CPU(int, cpu_state);
+-DEFINE_PER_CPU_SHARED_ALIGNED(irq_cpustat_t, irq_stat);
+-EXPORT_PER_CPU_SYMBOL(irq_stat);
+ 
+ enum ipi_msg_type {
+ 	IPI_RESCHEDULE,
+-- 
+2.33.0
+

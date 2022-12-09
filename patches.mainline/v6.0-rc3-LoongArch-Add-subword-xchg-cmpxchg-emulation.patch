@@ -1,0 +1,205 @@
+From 720dc7ab252bbdf404cab7b909e26b31e602bf7e Mon Sep 17 00:00:00 2001
+From: Huacai Chen <chenhuacai@loongson.cn>
+Date: Thu, 25 Aug 2022 19:34:59 +0800
+Subject: [PATCH] LoongArch: Add subword xchg/cmpxchg emulation
+Git-commit: 720dc7ab252bbdf404cab7b909e26b31e602bf7e
+Patch-mainline: v6.0-rc3
+References: bsn#12
+Modified-by-SEL: No
+
+
+LoongArch only support 32-bit/64-bit xchg/cmpxchg in native. But percpu
+operation, qspinlock and some drivers need 8-bit/16-bit xchg/cmpxchg. We
+add subword xchg/cmpxchg emulation in this patch because the emulation
+has better performance than the generic implementation (on NUMA system),
+and it can fix some build errors meanwhile [1].
+
+LoongArch's guarantee for forward progress (avoid many ll/sc happening
+at the same time and no one succeeds):
+
+We have the "exclusive access (with timeout) of ll" feature to avoid
+simultaneous ll (which also blocks other memory load/store on the same
+address), and the "random delay of sc" feature to avoid simultaneous
+sc. It is a mandatory requirement for multi-core LoongArch processors
+to implement such features, only except those single-core and dual-core
+processors (they also don't support multi-chip interconnection).
+
+Feature bits are introduced in CPUCFG3, bit 3 and bit 4 [2].
+
+[1] https://lore.kernel.org/loongarch/CAAhV-H6vvkuOzy8OemWdYK3taj5Jn3bFX0ZTwE=twM8ywpBUYA@mail.gmail.com/T/#t
+[2] https://loongson.github.io/LoongArch-Documentation/LoongArch-Vol1-EN.html#_cpucfg
+
+Reported-by: Sudip Mukherjee (Codethink) <sudipm.mukherjee@gmail.com>
+Suggested-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Rui Wang <wangrui@loongson.cn>
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/loongarch/include/asm/cmpxchg.h | 98 +++++++++++++++++++++++++++-
+ arch/loongarch/include/asm/percpu.h  |  8 +++
+ 2 files changed, 105 insertions(+), 1 deletion(-)
+
+diff --git a/arch/loongarch/include/asm/cmpxchg.h b/arch/loongarch/include/asm/cmpxchg.h
+index 0a9b0fac1eee..ae19e33c7754 100644
+--- a/arch/loongarch/include/asm/cmpxchg.h
++++ b/arch/loongarch/include/asm/cmpxchg.h
+@@ -5,8 +5,9 @@
+ #ifndef __ASM_CMPXCHG_H
+ #define __ASM_CMPXCHG_H
+ 
+-#include <asm/barrier.h>
++#include <linux/bits.h>
+ #include <linux/build_bug.h>
++#include <asm/barrier.h>
+ 
+ #define __xchg_asm(amswap_db, m, val)		\
+ ({						\
+@@ -21,10 +22,53 @@
+ 		__ret;				\
+ })
+ 
++static inline unsigned int __xchg_small(volatile void *ptr, unsigned int val,
++					unsigned int size)
++{
++	unsigned int shift;
++	u32 old32, mask, temp;
++	volatile u32 *ptr32;
++
++	/* Mask value to the correct size. */
++	mask = GENMASK((size * BITS_PER_BYTE) - 1, 0);
++	val &= mask;
++
++	/*
++	 * Calculate a shift & mask that correspond to the value we wish to
++	 * exchange within the naturally aligned 4 byte integerthat includes
++	 * it.
++	 */
++	shift = (unsigned long)ptr & 0x3;
++	shift *= BITS_PER_BYTE;
++	mask <<= shift;
++
++	/*
++	 * Calculate a pointer to the naturally aligned 4 byte integer that
++	 * includes our byte of interest, and load its value.
++	 */
++	ptr32 = (volatile u32 *)((unsigned long)ptr & ~0x3);
++
++	asm volatile (
++	"1:	ll.w		%0, %3		\n"
++	"	andn		%1, %0, %z4	\n"
++	"	or		%1, %1, %z5	\n"
++	"	sc.w		%1, %2		\n"
++	"	beqz		%1, 1b		\n"
++	: "=&r" (old32), "=&r" (temp), "=ZC" (*ptr32)
++	: "ZC" (*ptr32), "Jr" (mask), "Jr" (val << shift)
++	: "memory");
++
++	return (old32 & mask) >> shift;
++}
++
+ static inline unsigned long __xchg(volatile void *ptr, unsigned long x,
+ 				   int size)
+ {
+ 	switch (size) {
++	case 1:
++	case 2:
++		return __xchg_small(ptr, x, size);
++
+ 	case 4:
+ 		return __xchg_asm("amswap_db.w", (volatile u32 *)ptr, (u32)x);
+ 
+@@ -67,10 +111,62 @@ static inline unsigned long __xchg(volatile void *ptr, unsigned long x,
+ 	__ret;								\
+ })
+ 
++static inline unsigned int __cmpxchg_small(volatile void *ptr, unsigned int old,
++					   unsigned int new, unsigned int size)
++{
++	unsigned int shift;
++	u32 old32, mask, temp;
++	volatile u32 *ptr32;
++
++	/* Mask inputs to the correct size. */
++	mask = GENMASK((size * BITS_PER_BYTE) - 1, 0);
++	old &= mask;
++	new &= mask;
++
++	/*
++	 * Calculate a shift & mask that correspond to the value we wish to
++	 * compare & exchange within the naturally aligned 4 byte integer
++	 * that includes it.
++	 */
++	shift = (unsigned long)ptr & 0x3;
++	shift *= BITS_PER_BYTE;
++	old <<= shift;
++	new <<= shift;
++	mask <<= shift;
++
++	/*
++	 * Calculate a pointer to the naturally aligned 4 byte integer that
++	 * includes our byte of interest, and load its value.
++	 */
++	ptr32 = (volatile u32 *)((unsigned long)ptr & ~0x3);
++
++	asm volatile (
++	"1:	ll.w		%0, %3		\n"
++	"	and		%1, %0, %z4	\n"
++	"	bne		%1, %z5, 2f	\n"
++	"	andn		%1, %0, %z4	\n"
++	"	or		%1, %1, %z6	\n"
++	"	sc.w		%1, %2		\n"
++	"	beqz		%1, 1b		\n"
++	"	b		3f		\n"
++	"2:					\n"
++	__WEAK_LLSC_MB
++	"3:					\n"
++	: "=&r" (old32), "=&r" (temp), "=ZC" (*ptr32)
++	: "ZC" (*ptr32), "Jr" (mask), "Jr" (old), "Jr" (new)
++	: "memory");
++
++	return (old32 & mask) >> shift;
++}
++
+ static inline unsigned long __cmpxchg(volatile void *ptr, unsigned long old,
+ 				      unsigned long new, unsigned int size)
+ {
+ 	switch (size) {
++	case 1:
++	case 2:
++		return __cmpxchg_small(ptr, old, new, size);
++
+ 	case 4:
+ 		return __cmpxchg_asm("ll.w", "sc.w", (volatile u32 *)ptr,
+ 				     (u32)old, new);
+diff --git a/arch/loongarch/include/asm/percpu.h b/arch/loongarch/include/asm/percpu.h
+index e6569f18c6dd..0bd6b0110198 100644
+--- a/arch/loongarch/include/asm/percpu.h
++++ b/arch/loongarch/include/asm/percpu.h
+@@ -123,6 +123,10 @@ static inline unsigned long __percpu_xchg(void *ptr, unsigned long val,
+ 						int size)
+ {
+ 	switch (size) {
++	case 1:
++	case 2:
++		return __xchg_small((volatile void *)ptr, val, size);
++
+ 	case 4:
+ 		return __xchg_asm("amswap.w", (volatile u32 *)ptr, (u32)val);
+ 
+@@ -204,9 +208,13 @@ do {									\
+ #define this_cpu_write_4(pcp, val) _percpu_write(pcp, val)
+ #define this_cpu_write_8(pcp, val) _percpu_write(pcp, val)
+ 
++#define this_cpu_xchg_1(pcp, val) _percpu_xchg(pcp, val)
++#define this_cpu_xchg_2(pcp, val) _percpu_xchg(pcp, val)
+ #define this_cpu_xchg_4(pcp, val) _percpu_xchg(pcp, val)
+ #define this_cpu_xchg_8(pcp, val) _percpu_xchg(pcp, val)
+ 
++#define this_cpu_cmpxchg_1(ptr, o, n) _protect_cmpxchg_local(ptr, o, n)
++#define this_cpu_cmpxchg_2(ptr, o, n) _protect_cmpxchg_local(ptr, o, n)
+ #define this_cpu_cmpxchg_4(ptr, o, n) _protect_cmpxchg_local(ptr, o, n)
+ #define this_cpu_cmpxchg_8(ptr, o, n) _protect_cmpxchg_local(ptr, o, n)
+ 
+-- 
+2.33.0
+

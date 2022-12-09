@@ -1,0 +1,295 @@
+From b2d3e3354e2a0d0e912308618ea33d0337f405c3 Mon Sep 17 00:00:00 2001
+From: Huacai Chen <chenhuacai@loongson.cn>
+Date: Wed, 20 Jul 2022 18:51:31 +0800
+Subject: [PATCH] irqchip: Add LoongArch CPU interrupt controller support
+Git-commit: b2d3e3354e2a0d0e912308618ea33d0337f405c3
+Patch-mainline: v6.0-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+LoongArch CPUINTC stands for CSR.ECFG/CSR.ESTAT and related interrupt
+controller that described in Section 7.4 of "LoongArch Reference Manual,
+Vol 1". For more information please refer Documentation/loongarch/irq-
+chip-model.rst.
+
+LoongArch CPUINTC has 13 interrupt sources: SWI0~1, HWI0~7, IPI, TI
+(Timer) and PCOV (PMC). IRQ mappings of HWI0~7 are configurable (can be
+created from DT/ACPI), but IPI, TI (Timer) and PCOV (PMC) are hardcoded
+bits, so we expose the fwnode_handle to map them, and get mapped irq
+by irq_create_mapping when using them.
+
+Co-developed-by: Jianmin Lv <lvjianmin@loongson.cn>
+Signed-off-by: Jianmin Lv <lvjianmin@loongson.cn>
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+Signed-off-by: Marc Zyngier <maz@kernel.org>
+Link: https://lore.kernel.org/r/1658314292-35346-13-git-send-email-lvjianmin@loongson.cn
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/loongarch/include/asm/irq.h    |   7 +-
+ arch/loongarch/kernel/irq.c         |  16 +++-
+ arch/loongarch/kernel/time.c        |  14 +++-
+ drivers/irqchip/Kconfig             |  10 +++
+ drivers/irqchip/Makefile            |   1 +
+ drivers/irqchip/irq-loongarch-cpu.c | 111 ++++++++++++++++++++++++++++
+ 6 files changed, 149 insertions(+), 10 deletions(-)
+ create mode 100644 drivers/irqchip/irq-loongarch-cpu.c
+
+diff --git a/arch/loongarch/include/asm/irq.h b/arch/loongarch/include/asm/irq.h
+index 67ebcc5495b8..149b2123e7f4 100644
+--- a/arch/loongarch/include/asm/irq.h
++++ b/arch/loongarch/include/asm/irq.h
+@@ -35,9 +35,6 @@ static inline bool on_irq_stack(int cpu, unsigned long sp)
+ 	return (low <= sp && sp <= high);
+ }
+ 
+-int get_ipi_irq(void);
+-int get_pmc_irq(void);
+-int get_timer_irq(void);
+ void spurious_interrupt(void);
+ 
+ #define NR_IRQS_LEGACY 16
+@@ -94,8 +91,6 @@ struct acpi_madt_bio_pic;
+ struct acpi_madt_msi_pic;
+ struct acpi_madt_lpc_pic;
+ 
+-struct irq_domain *loongarch_cpu_irq_init(void);
+-
+ int liointc_acpi_init(struct irq_domain *parent,
+ 					struct acpi_madt_lio_pic *acpi_liointc);
+ int eiointc_acpi_init(struct irq_domain *parent,
+@@ -128,7 +123,7 @@ extern struct acpi_madt_lpc_pic *acpi_pchlpc;
+ extern struct acpi_madt_msi_pic *acpi_pchmsi[MAX_IO_PICS];
+ extern struct acpi_madt_bio_pic *acpi_pchpic[MAX_IO_PICS];
+ 
+-extern struct irq_domain *cpu_domain;
++extern struct fwnode_handle *cpuintc_handle;
+ extern struct fwnode_handle *liointc_handle;
+ extern struct fwnode_handle *pch_lpc_handle;
+ extern struct fwnode_handle *pch_pic_handle[MAX_IO_PICS];
+diff --git a/arch/loongarch/kernel/irq.c b/arch/loongarch/kernel/irq.c
+index da131f51225a..1ba19c76563e 100644
+--- a/arch/loongarch/kernel/irq.c
++++ b/arch/loongarch/kernel/irq.c
+@@ -25,8 +25,6 @@ DEFINE_PER_CPU(unsigned long, irq_stack);
+ DEFINE_PER_CPU_SHARED_ALIGNED(irq_cpustat_t, irq_stat);
+ EXPORT_PER_CPU_SYMBOL(irq_stat);
+ 
+-struct irq_domain *cpu_domain;
+-
+ struct acpi_vector_group pch_group[MAX_IO_PICS];
+ struct acpi_vector_group msi_group[MAX_IO_PICS];
+ /*
+@@ -89,6 +87,16 @@ static void __init init_vec_parent_group(void)
+ 	acpi_table_parse(ACPI_SIG_MCFG, early_pci_mcfg_parse);
+ }
+ 
++static int __init get_ipi_irq(void)
++{
++	struct irq_domain *d = irq_find_matching_fwnode(cpuintc_handle, DOMAIN_BUS_ANY);
++
++	if (d)
++		return irq_create_mapping(d, EXCCODE_IPI - EXCCODE_INT_START);
++
++	return -EINVAL;
++}
++
+ void __init init_IRQ(void)
+ {
+ 	int i;
+@@ -105,7 +113,9 @@ void __init init_IRQ(void)
+ 	init_vec_parent_group();
+ 	irqchip_init();
+ #ifdef CONFIG_SMP
+-	ipi_irq = EXCCODE_IPI - EXCCODE_INT_START;
++	ipi_irq = get_ipi_irq();
++	if (ipi_irq < 0)
++		panic("IPI IRQ mapping failed\n");
+ 	irq_set_percpu_devid(ipi_irq);
+ 	r = request_percpu_irq(ipi_irq, loongson3_ipi_interrupt, "IPI", &ipi_dummy_dev);
+ 	if (r < 0)
+diff --git a/arch/loongarch/kernel/time.c b/arch/loongarch/kernel/time.c
+index fe6823875895..79dc5eddf504 100644
+--- a/arch/loongarch/kernel/time.c
++++ b/arch/loongarch/kernel/time.c
+@@ -123,6 +123,16 @@ void sync_counter(void)
+ 	csr_write64(-init_timeval, LOONGARCH_CSR_CNTC);
+ }
+ 
++static int get_timer_irq(void)
++{
++	struct irq_domain *d = irq_find_matching_fwnode(cpuintc_handle, DOMAIN_BUS_ANY);
++
++	if (d)
++		return irq_create_mapping(d, EXCCODE_TIMER - EXCCODE_INT_START);
++
++	return -EINVAL;
++}
++
+ int constant_clockevent_init(void)
+ {
+ 	unsigned int irq;
+@@ -132,7 +142,9 @@ int constant_clockevent_init(void)
+ 	struct clock_event_device *cd;
+ 	static int timer_irq_installed = 0;
+ 
+-	irq = EXCCODE_TIMER - EXCCODE_INT_START;
++	irq = get_timer_irq();
++	if (irq < 0)
++		pr_err("Failed to map irq %d (timer)\n", irq);
+ 
+ 	cd = &per_cpu(constant_clockevent_device, cpu);
+ 
+diff --git a/drivers/irqchip/Kconfig b/drivers/irqchip/Kconfig
+index 8f077d353e67..f53164ccdc9f 100644
+--- a/drivers/irqchip/Kconfig
++++ b/drivers/irqchip/Kconfig
+@@ -546,6 +546,16 @@ config EXYNOS_IRQ_COMBINER
+ 	  Say yes here to add support for the IRQ combiner devices embedded
+ 	  in Samsung Exynos chips.
+ 
++config IRQ_LOONGARCH_CPU
++	bool
++	select GENERIC_IRQ_CHIP
++	select IRQ_DOMAIN
++	select GENERIC_IRQ_EFFECTIVE_AFF_MASK
++	help
++	  Support for the LoongArch CPU Interrupt Controller. For details of
++	  irq chip hierarchy on LoongArch platforms please read the document
++	  Documentation/loongarch/irq-chip-model.rst.
++
+ config LOONGSON_LIOINTC
+ 	bool "Loongson Local I/O Interrupt Controller"
+ 	depends on MACH_LOONGSON64
+diff --git a/drivers/irqchip/Makefile b/drivers/irqchip/Makefile
+index 0cfd4f046751..e559007bec73 100644
+--- a/drivers/irqchip/Makefile
++++ b/drivers/irqchip/Makefile
+@@ -103,6 +103,7 @@ obj-$(CONFIG_LS1X_IRQ)			+= irq-ls1x.o
+ obj-$(CONFIG_TI_SCI_INTR_IRQCHIP)	+= irq-ti-sci-intr.o
+ obj-$(CONFIG_TI_SCI_INTA_IRQCHIP)	+= irq-ti-sci-inta.o
+ obj-$(CONFIG_TI_PRUSS_INTC)		+= irq-pruss-intc.o
++obj-$(CONFIG_IRQ_LOONGARCH_CPU)		+= irq-loongarch-cpu.o
+ obj-$(CONFIG_LOONGSON_LIOINTC)		+= irq-loongson-liointc.o
+ obj-$(CONFIG_LOONGSON_EIOINTC)		+= irq-loongson-eiointc.o
+ obj-$(CONFIG_LOONGSON_HTPIC)		+= irq-loongson-htpic.o
+diff --git a/drivers/irqchip/irq-loongarch-cpu.c b/drivers/irqchip/irq-loongarch-cpu.c
+new file mode 100644
+index 000000000000..28ddc60c8608
+--- /dev/null
++++ b/drivers/irqchip/irq-loongarch-cpu.c
+@@ -0,0 +1,111 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2020-2022 Loongson Technology Corporation Limited
++ */
++
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/interrupt.h>
++#include <linux/irq.h>
++#include <linux/irqchip.h>
++#include <linux/irqdomain.h>
++
++#include <asm/loongarch.h>
++#include <asm/setup.h>
++
++static struct irq_domain *irq_domain;
++struct fwnode_handle *cpuintc_handle;
++
++static void mask_loongarch_irq(struct irq_data *d)
++{
++	clear_csr_ecfg(ECFGF(d->hwirq));
++}
++
++static void unmask_loongarch_irq(struct irq_data *d)
++{
++	set_csr_ecfg(ECFGF(d->hwirq));
++}
++
++static struct irq_chip cpu_irq_controller = {
++	.name		= "CPUINTC",
++	.irq_mask	= mask_loongarch_irq,
++	.irq_unmask	= unmask_loongarch_irq,
++};
++
++static void handle_cpu_irq(struct pt_regs *regs)
++{
++	int hwirq;
++	unsigned int estat = read_csr_estat() & CSR_ESTAT_IS;
++
++	while ((hwirq = ffs(estat))) {
++		estat &= ~BIT(hwirq - 1);
++		generic_handle_domain_irq(irq_domain, hwirq - 1);
++	}
++}
++
++static int loongarch_cpu_intc_map(struct irq_domain *d, unsigned int irq,
++			     irq_hw_number_t hwirq)
++{
++	irq_set_noprobe(irq);
++	irq_set_chip_and_handler(irq, &cpu_irq_controller, handle_percpu_irq);
++
++	return 0;
++}
++
++static const struct irq_domain_ops loongarch_cpu_intc_irq_domain_ops = {
++	.map = loongarch_cpu_intc_map,
++	.xlate = irq_domain_xlate_onecell,
++};
++
++static int __init
++liointc_parse_madt(union acpi_subtable_headers *header,
++		       const unsigned long end)
++{
++	struct acpi_madt_lio_pic *liointc_entry = (struct acpi_madt_lio_pic *)header;
++
++	return liointc_acpi_init(irq_domain, liointc_entry);
++}
++
++static int __init
++eiointc_parse_madt(union acpi_subtable_headers *header,
++		       const unsigned long end)
++{
++	struct acpi_madt_eio_pic *eiointc_entry = (struct acpi_madt_eio_pic *)header;
++
++	return eiointc_acpi_init(irq_domain, eiointc_entry);
++}
++
++static int __init acpi_cascade_irqdomain_init(void)
++{
++	acpi_table_parse_madt(ACPI_MADT_TYPE_LIO_PIC,
++			      liointc_parse_madt, 0);
++	acpi_table_parse_madt(ACPI_MADT_TYPE_EIO_PIC,
++			      eiointc_parse_madt, 0);
++	return 0;
++}
++
++static int __init cpuintc_acpi_init(union acpi_subtable_headers *header,
++				   const unsigned long end)
++{
++	if (irq_domain)
++		return 0;
++
++	/* Mask interrupts. */
++	clear_csr_ecfg(ECFG0_IM);
++	clear_csr_estat(ESTATF_IP);
++
++	cpuintc_handle = irq_domain_alloc_fwnode(NULL);
++	irq_domain = irq_domain_create_linear(cpuintc_handle, EXCCODE_INT_NUM,
++					&loongarch_cpu_intc_irq_domain_ops, NULL);
++
++	if (!irq_domain)
++		panic("Failed to add irqdomain for LoongArch CPU");
++
++	set_handle_irq(&handle_cpu_irq);
++	acpi_cascade_irqdomain_init();
++
++	return 0;
++}
++
++IRQCHIP_ACPI_DECLARE(cpuintc_v1, ACPI_MADT_TYPE_CORE_PIC,
++		NULL, ACPI_MADT_CORE_PIC_VERSION_V1, cpuintc_acpi_init);
+-- 
+2.33.0
+

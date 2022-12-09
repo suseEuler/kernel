@@ -1,0 +1,133 @@
+From 02092a2f034fdeabab524ae39c2de86ba9ffa15a Mon Sep 17 00:00:00 2001
+From: Chandan Babu R <chandanrlinux@gmail.com>
+Date: Fri, 22 Jan 2021 16:48:13 -0800
+Subject: [PATCH] xfs: Check for extent overflow when renaming dir entries
+Git-commit: 02092a2f034fdeabab524ae39c2de86ba9ffa15a
+Patch-mainline: v5.12-rc2
+References: bsn#12
+Modified-by-SEL: No
+
+
+A rename operation is essentially a directory entry remove operation
+from the perspective of parent directory (i.e. src_dp) of rename's
+source. Hence the only place where we check for extent count overflow
+for src_dp is in xfs_bmap_del_extent_real(). xfs_bmap_del_extent_real()
+returns -ENOSPC when it detects a possible extent count overflow and in
+response, the higher layers of directory handling code do the following:
+1. Data/Free blocks: XFS lets these blocks linger until a future remove
+   operation removes them.
+2. Dabtree blocks: XFS swaps the blocks with the last block in the Leaf
+   space and unmaps the last block.
+
+For target_dp, there are two cases depending on whether the destination
+directory entry exists or not.
+
+When destination directory entry does not exist (i.e. target_ip ==
+NULL), extent count overflow check is performed only when transaction
+has a non-zero sized space reservation associated with it.  With a
+zero-sized space reservation, XFS allows a rename operation to continue
+only when the directory has sufficient free space in its data/leaf/free
+space blocks to hold the new entry.
+
+When destination directory entry exists (i.e. target_ip != NULL), all
+we need to do is change the inode number associated with the already
+existing entry. Hence there is no need to perform an extent count
+overflow check.
+
+Signed-off-by: Chandan Babu R <chandanrlinux@gmail.com>
+Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/xfs/libxfs/xfs_bmap.c |  3 +++
+ fs/xfs/xfs_inode.c       | 44 +++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 46 insertions(+), 1 deletion(-)
+
+diff --git a/fs/xfs/libxfs/xfs_bmap.c b/fs/xfs/libxfs/xfs_bmap.c
+index 6c8f17a0e247..8ebe5f13279c 100644
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@ -5160,6 +5160,9 @@ xfs_bmap_del_extent_real(
+ 		 * until a future remove operation. Dabtree blocks would be
+ 		 * swapped with the last block in the leaf space and then the
+ 		 * new last block will be unmapped.
++		 *
++		 * The above logic also applies to the source directory entry of
++		 * a rename operation.
+ 		 */
+ 		error = xfs_iext_count_may_overflow(ip, whichfork, 1);
+ 		if (error) {
+diff --git a/fs/xfs/xfs_inode.c b/fs/xfs/xfs_inode.c
+index 3cb41b5d5a26..8ebd9c64aa48 100644
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@ -3116,6 +3116,35 @@ xfs_rename(
+ 	/*
+ 	 * Check for expected errors before we dirty the transaction
+ 	 * so we can return an error without a transaction abort.
++	 *
++	 * Extent count overflow check:
++	 *
++	 * From the perspective of src_dp, a rename operation is essentially a
++	 * directory entry remove operation. Hence the only place where we check
++	 * for extent count overflow for src_dp is in
++	 * xfs_bmap_del_extent_real(). xfs_bmap_del_extent_real() returns
++	 * -ENOSPC when it detects a possible extent count overflow and in
++	 * response, the higher layers of directory handling code do the
++	 * following:
++	 * 1. Data/Free blocks: XFS lets these blocks linger until a
++	 *    future remove operation removes them.
++	 * 2. Dabtree blocks: XFS swaps the blocks with the last block in the
++	 *    Leaf space and unmaps the last block.
++	 *
++	 * For target_dp, there are two cases depending on whether the
++	 * destination directory entry exists or not.
++	 *
++	 * When destination directory entry does not exist (i.e. target_ip ==
++	 * NULL), extent count overflow check is performed only when transaction
++	 * has a non-zero sized space reservation associated with it.  With a
++	 * zero-sized space reservation, XFS allows a rename operation to
++	 * continue only when the directory has sufficient free space in its
++	 * data/leaf/free space blocks to hold the new entry.
++	 *
++	 * When destination directory entry exists (i.e. target_ip != NULL), all
++	 * we need to do is change the inode number associated with the already
++	 * existing entry. Hence there is no need to perform an extent count
++	 * overflow check.
+ 	 */
+ 	if (target_ip == NULL) {
+ 		/*
+@@ -3126,6 +3155,12 @@ xfs_rename(
+ 			error = xfs_dir_canenter(tp, target_dp, target_name);
+ 			if (error)
+ 				goto out_trans_cancel;
++		} else {
++			error = xfs_iext_count_may_overflow(target_dp,
++					XFS_DATA_FORK,
++					XFS_IEXT_DIR_MANIP_CNT(mp));
++			if (error)
++				goto out_trans_cancel;
+ 		}
+ 	} else {
+ 		/*
+@@ -3291,9 +3326,16 @@ xfs_rename(
+ 	if (wip) {
+ 		error = xfs_dir_replace(tp, src_dp, src_name, wip->i_ino,
+ 					spaceres);
+-	} else
++	} else {
++		/*
++		 * NOTE: We don't need to check for extent count overflow here
++		 * because the dir remove name code will leave the dir block in
++		 * place if the extent count would overflow.
++		 */
+ 		error = xfs_dir_removename(tp, src_dp, src_name, src_ip->i_ino,
+ 					   spaceres);
++	}
++
+ 	if (error)
+ 		goto out_trans_cancel;
+ 
+-- 
+2.33.0
+

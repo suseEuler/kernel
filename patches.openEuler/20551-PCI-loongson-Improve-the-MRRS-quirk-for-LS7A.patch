@@ -1,0 +1,136 @@
+From 7830f105b28d597653a8c701da6765596ef0eaf1 Mon Sep 17 00:00:00 2001
+From: Huacai Chen <chenhuacai@loongson.cn>
+Date: Thu, 2 Jun 2022 13:03:10 +0800
+Subject: [PATCH] PCI: loongson: Improve the MRRS quirk for LS7A
+Patch-mainline: NO, OTHERS
+References: openEuler-22.03-LTS
+Modified-by-SEL: No
+
+
+LoongArch inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5OHOB
+
+--------------------------------
+
+In new revision of LS7A, some PCIe ports support larger value than 256,
+but their maximum supported MRRS values are not detectable. Moreover,
+the current loongson_mrrs_quirk() cannot avoid devices increasing its
+MRRS after pci_enable_device(), and some devices (e.g. Realtek 8169)
+will actually set a big value in its driver. So the only possible way
+is configure MRRS of all devices in BIOS, and add a pci host bridge bit
+flag (i.e., no_inc_mrrs) to stop the increasing MRRS operations.
+
+However, according to PCIe Spec, it is legal for an OS to program any
+value for MRRS, and it is also legal for an endpoint to generate a Read
+Request with any size up to its MRRS. As the hardware engineers say, the
+root cause here is LS7A doesn't break up large read requests. In detail,
+LS7A PCIe port reports CA (Completer Abort) if it receives a Memory Read
+request with a size that's "too big" ("too big" means larger than the
+PCIe ports can handle, which means 256 for some ports and 4096 for the
+others, and of course this is a problem in the LS7A's hardware design).
+
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/pci/controller/pci-loongson.c | 44 +++++++++------------------
+ drivers/pci/pci.c                     |  6 ++++
+ include/linux/pci.h                   |  1 +
+ 3 files changed, 22 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/pci/controller/pci-loongson.c b/drivers/pci/controller/pci-loongson.c
+index c41ac2f1c805..c6fbcf99dc1b 100644
+--- a/drivers/pci/controller/pci-loongson.c
++++ b/drivers/pci/controller/pci-loongson.c
+@@ -75,37 +75,23 @@ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_LOONGSON,
+ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_LOONGSON,
+ 			DEV_LS7A_LPC, system_bus_quirk);
+ 
+-static void loongson_mrrs_quirk(struct pci_dev *dev)
++static void loongson_mrrs_quirk(struct pci_dev *pdev)
+ {
+-	struct pci_bus *bus = dev->bus;
+-	struct pci_dev *bridge;
+-	static const struct pci_device_id bridge_devids[] = {
+-		{ PCI_VDEVICE(LOONGSON, DEV_PCIE_PORT_0) },
+-		{ PCI_VDEVICE(LOONGSON, DEV_PCIE_PORT_1) },
+-		{ PCI_VDEVICE(LOONGSON, DEV_PCIE_PORT_2) },
+-		{ 0, },
+-	};
+-
+-	/* look for the matching bridge */
+-	while (!pci_is_root_bus(bus)) {
+-		bridge = bus->self;
+-		bus = bus->parent;
+-		/*
+-		 * Some Loongson PCIe ports have a h/w limitation of
+-		 * 256 bytes maximum read request size. They can't handle
+-		 * anything larger than this. So force this limit on
+-		 * any devices attached under these ports.
+-		 */
+-		if (pci_match_id(bridge_devids, bridge)) {
+-			if (pcie_get_readrq(dev) > 256) {
+-				pci_info(dev, "limiting MRRS to 256\n");
+-				pcie_set_readrq(dev, 256);
+-			}
+-			break;
+-		}
+-	}
++	/*
++	 * Some Loongson PCIe ports have h/w limitations of maximum read
++	 * request size. They can't handle anything larger than this. So
++	 * force this limit on any devices attached under these ports.
++	 */
++	struct pci_host_bridge *bridge = pci_find_host_bridge(pdev->bus);
++
++	bridge->no_inc_mrrs = 1;
+ }
+-DECLARE_PCI_FIXUP_ENABLE(PCI_ANY_ID, PCI_ANY_ID, loongson_mrrs_quirk);
++DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_LOONGSON,
++			DEV_PCIE_PORT_0, loongson_mrrs_quirk);
++DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_LOONGSON,
++			DEV_PCIE_PORT_1, loongson_mrrs_quirk);
++DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_LOONGSON,
++			DEV_PCIE_PORT_2, loongson_mrrs_quirk);
+ 
+ static void loongson_pci_pin_quirk(struct pci_dev *pdev)
+ {
+diff --git a/drivers/pci/pci.c b/drivers/pci/pci.c
+index 1c3336910419..458a52d6fd2f 100644
+--- a/drivers/pci/pci.c
++++ b/drivers/pci/pci.c
+@@ -5742,6 +5742,7 @@ int pcie_set_readrq(struct pci_dev *dev, int rq)
+ {
+ 	u16 v;
+ 	int ret;
++	struct pci_host_bridge *bridge = pci_find_host_bridge(dev->bus);
+ 
+ 	if (rq < 128 || rq > 4096 || !is_power_of_2(rq))
+ 		return -EINVAL;
+@@ -5760,6 +5761,11 @@ int pcie_set_readrq(struct pci_dev *dev, int rq)
+ 
+ 	v = (ffs(rq) - 8) << 12;
+ 
++	if (bridge->no_inc_mrrs) {
++		if (rq > pcie_get_readrq(dev))
++			return -EINVAL;
++	}
++
+ 	ret = pcie_capability_clear_and_set_word(dev, PCI_EXP_DEVCTL,
+ 						  PCI_EXP_DEVCTL_READRQ, v);
+ 
+diff --git a/include/linux/pci.h b/include/linux/pci.h
+index 0f2696b5a3fd..c05a2cc63c8a 100644
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@ -574,6 +574,7 @@ struct pci_host_bridge {
+ 	struct msi_controller *msi;
+ 	unsigned int	ignore_reset_delay:1;	/* For entire hierarchy */
+ 	unsigned int	no_ext_tags:1;		/* No Extended Tags */
++	unsigned int	no_inc_mrrs:1;		/* No Increase MRRS */
+ 	unsigned int	native_aer:1;		/* OS may use PCIe AER */
+ 	unsigned int	native_pcie_hotplug:1;	/* OS may use PCIe hotplug */
+ 	unsigned int	native_shpc_hotplug:1;	/* OS may use SHPC hotplug */
+-- 
+2.33.0
+

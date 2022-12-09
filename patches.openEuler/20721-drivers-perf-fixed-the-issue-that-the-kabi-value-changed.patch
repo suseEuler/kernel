@@ -1,0 +1,201 @@
+From fbd117f4a177a8517ce5ae566415b18bdfe36b84 Mon Sep 17 00:00:00 2001
+From: Junhao He <hejunhao3@huawei.com>
+Date: Wed, 7 Dec 2022 18:39:48 +0800
+Subject: [PATCH] drivers/perf: fixed the issue that the kabi value changed
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: fbd117f4a177a8517ce5ae566415b18bdfe36b84
+Modified-by-SEL: No
+
+
+driver inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5KAX7
+
+--------------------------------------------------------------------------
+
+Fixed the issue that the kabi value changed when the HiSilicon PMU driver
+added the enum variable in "enum cpuhp_state{}".
+
+The hisi_pcie_pmu and hisi_cpa_pmu drivers to replace the explicit specify
+hotplug events with dynamic allocation hotplug events(CPUHP_AP_ONLINE_DYN).
+The states between *CPUHP_AP_ONLINE_DYN* and *CPUHP_AP_ONLINE_DYN_END* are
+reserved for the dynamic allocation.
+
+Signed-off-by: Junhao He <hejunhao3@huawei.com>
+Reviewed-by: Yicong Yang <yangyicong@huawei.com>
+Reviewed-by: Yang Jihong <yangjihong1@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/perf/hisilicon/hisi_pcie_pmu.c       |   22 ++++++++++++----------
+ drivers/perf/hisilicon/hisi_uncore_cpa_pmu.c |   23 ++++++++++++-----------
+ include/linux/cpuhotplug.h                   |    2 --
+ 3 files changed, 24 insertions(+), 23 deletions(-)
+
+--- a/drivers/perf/hisilicon/hisi_pcie_pmu.c
++++ b/drivers/perf/hisilicon/hisi_pcie_pmu.c
+@@ -19,6 +19,9 @@
+ #include <linux/pci.h>
+ #include <linux/perf_event.h>
+ 
++/* Dynamic CPU hotplug state used by PCIe PMU */
++static enum cpuhp_state hisi_pcie_pmu_online;
++
+ #define DRV_NAME "hisi_pcie_pmu"
+ /* Define registers */
+ #define HISI_PCIE_GLOBAL_CTRL		0x00
+@@ -815,7 +818,7 @@ static int hisi_pcie_init_pmu(struct pci
+ 	if (ret)
+ 		goto err_iounmap;
+ 
+-	ret = cpuhp_state_add_instance(CPUHP_AP_PERF_ARM_HISI_PCIE_PMU_ONLINE, &pcie_pmu->node);
++	ret = cpuhp_state_add_instance(hisi_pcie_pmu_online, &pcie_pmu->node);
+ 	if (ret) {
+ 		pci_err(pdev, "Failed to register hotplug: %d\n", ret);
+ 		goto err_irq_unregister;
+@@ -830,8 +833,7 @@ static int hisi_pcie_init_pmu(struct pci
+ 	return ret;
+ 
+ err_hotplug_unregister:
+-	cpuhp_state_remove_instance_nocalls(
+-		CPUHP_AP_PERF_ARM_HISI_PCIE_PMU_ONLINE, &pcie_pmu->node);
++	cpuhp_state_remove_instance_nocalls(hisi_pcie_pmu_online, &pcie_pmu->node);
+ 
+ err_irq_unregister:
+ 	hisi_pcie_pmu_irq_unregister(pdev, pcie_pmu);
+@@ -847,8 +849,7 @@ static void hisi_pcie_uninit_pmu(struct
+ 	struct hisi_pcie_pmu *pcie_pmu = pci_get_drvdata(pdev);
+ 
+ 	perf_pmu_unregister(&pcie_pmu->pmu);
+-	cpuhp_state_remove_instance_nocalls(
+-		CPUHP_AP_PERF_ARM_HISI_PCIE_PMU_ONLINE, &pcie_pmu->node);
++	cpuhp_state_remove_instance_nocalls(hisi_pcie_pmu_online, &pcie_pmu->node);
+ 	hisi_pcie_pmu_irq_unregister(pdev, pcie_pmu);
+ 	iounmap(pcie_pmu->base);
+ }
+@@ -919,18 +920,19 @@ static int __init hisi_pcie_module_init(
+ {
+ 	int ret;
+ 
+-	ret = cpuhp_setup_state_multi(CPUHP_AP_PERF_ARM_HISI_PCIE_PMU_ONLINE,
+-				      "AP_PERF_ARM_HISI_PCIE_PMU_ONLINE",
++	ret = cpuhp_setup_state_multi(CPUHP_AP_ONLINE_DYN,
++				      "perf/hisi/pcie:online",
+ 				      hisi_pcie_pmu_online_cpu,
+ 				      hisi_pcie_pmu_offline_cpu);
+-	if (ret) {
++	if (ret < 0) {
+ 		pr_err("Failed to setup PCIe PMU hotplug: %d\n", ret);
+ 		return ret;
+ 	}
++	hisi_pcie_pmu_online = ret;
+ 
+ 	ret = pci_register_driver(&hisi_pcie_pmu_driver);
+ 	if (ret)
+-		cpuhp_remove_multi_state(CPUHP_AP_PERF_ARM_HISI_PCIE_PMU_ONLINE);
++		cpuhp_remove_multi_state(hisi_pcie_pmu_online);
+ 
+ 	return ret;
+ }
+@@ -939,7 +941,7 @@ module_init(hisi_pcie_module_init);
+ static void __exit hisi_pcie_module_exit(void)
+ {
+ 	pci_unregister_driver(&hisi_pcie_pmu_driver);
+-	cpuhp_remove_multi_state(CPUHP_AP_PERF_ARM_HISI_PCIE_PMU_ONLINE);
++	cpuhp_remove_multi_state(hisi_pcie_pmu_online);
+ }
+ module_exit(hisi_pcie_module_exit);
+ 
+--- a/drivers/perf/hisilicon/hisi_uncore_cpa_pmu.c
++++ b/drivers/perf/hisilicon/hisi_uncore_cpa_pmu.c
+@@ -19,6 +19,9 @@
+ 
+ #include "hisi_uncore_pmu.h"
+ 
++/* Dynamic CPU hotplug state used by CPA PMU */
++static enum cpuhp_state hisi_cpa_pmu_online;
++
+ /* CPA register definition */
+ #define CPA_PERF_CTRL		0x1c00
+ #define CPA_EVENT_CTRL		0x1c04
+@@ -334,8 +337,7 @@ static int hisi_cpa_pmu_probe(struct pla
+ 
+ 	/* Power Management should be disabled before using CPA PMU. */
+ 	hisi_cpa_pmu_disable_pm(cpa_pmu);
+-	ret = cpuhp_state_add_instance(CPUHP_AP_PERF_ARM_HISI_CPA_ONLINE,
+-				       &cpa_pmu->node);
++	ret = cpuhp_state_add_instance(hisi_cpa_pmu_online, &cpa_pmu->node);
+ 	if (ret) {
+ 		dev_err(&pdev->dev, "Error %d registering hotplug\n", ret);
+ 		hisi_cpa_pmu_enable_pm(cpa_pmu);
+@@ -345,8 +347,7 @@ static int hisi_cpa_pmu_probe(struct pla
+ 	ret = perf_pmu_register(&cpa_pmu->pmu, name, -1);
+ 	if (ret) {
+ 		dev_err(cpa_pmu->dev, "PMU register failed\n");
+-		cpuhp_state_remove_instance_nocalls(
+-			CPUHP_AP_PERF_ARM_HISI_CPA_ONLINE, &cpa_pmu->node);
++		cpuhp_state_remove_instance_nocalls(hisi_cpa_pmu_online, &cpa_pmu->node);
+ 		hisi_cpa_pmu_enable_pm(cpa_pmu);
+ 		return ret;
+ 	}
+@@ -360,8 +361,7 @@ static int hisi_cpa_pmu_remove(struct pl
+ 	struct hisi_pmu *cpa_pmu = platform_get_drvdata(pdev);
+ 
+ 	perf_pmu_unregister(&cpa_pmu->pmu);
+-	cpuhp_state_remove_instance_nocalls(CPUHP_AP_PERF_ARM_HISI_CPA_ONLINE,
+-					    &cpa_pmu->node);
++	cpuhp_state_remove_instance_nocalls(hisi_cpa_pmu_online, &cpa_pmu->node);
+ 	hisi_cpa_pmu_enable_pm(cpa_pmu);
+ 	return 0;
+ }
+@@ -380,18 +380,19 @@ static int __init hisi_cpa_pmu_module_in
+ {
+ 	int ret;
+ 
+-	ret = cpuhp_setup_state_multi(CPUHP_AP_PERF_ARM_HISI_CPA_ONLINE,
+-				      "AP_PERF_ARM_HISI_CPA_ONLINE",
++	ret = cpuhp_setup_state_multi(CPUHP_AP_ONLINE_DYN,
++				      "pmu/hisi/cpa:online",
+ 				      hisi_uncore_pmu_online_cpu,
+ 				      hisi_uncore_pmu_offline_cpu);
+-	if (ret) {
++	if (ret < 0) {
+ 		pr_err("setup hotplug failed: %d\n", ret);
+ 		return ret;
+ 	}
++	hisi_cpa_pmu_online = ret;
+ 
+ 	ret = platform_driver_register(&hisi_cpa_pmu_driver);
+ 	if (ret)
+-		cpuhp_remove_multi_state(CPUHP_AP_PERF_ARM_HISI_CPA_ONLINE);
++		cpuhp_remove_multi_state(hisi_cpa_pmu_online);
+ 
+ 	return ret;
+ }
+@@ -400,7 +401,7 @@ module_init(hisi_cpa_pmu_module_init);
+ static void __exit hisi_cpa_pmu_module_exit(void)
+ {
+ 	platform_driver_unregister(&hisi_cpa_pmu_driver);
+-	cpuhp_remove_multi_state(CPUHP_AP_PERF_ARM_HISI_CPA_ONLINE);
++	cpuhp_remove_multi_state(hisi_cpa_pmu_online);
+ }
+ module_exit(hisi_cpa_pmu_module_exit);
+ 
+--- a/include/linux/cpuhotplug.h
++++ b/include/linux/cpuhotplug.h
+@@ -177,13 +177,11 @@ enum cpuhp_state {
+ 	CPUHP_AP_PERF_S390_SF_ONLINE,
+ 	CPUHP_AP_PERF_ARM_CCI_ONLINE,
+ 	CPUHP_AP_PERF_ARM_CCN_ONLINE,
+-	CPUHP_AP_PERF_ARM_HISI_CPA_ONLINE,
+ 	CPUHP_AP_PERF_ARM_HISI_DDRC_ONLINE,
+ 	CPUHP_AP_PERF_ARM_HISI_HHA_ONLINE,
+ 	CPUHP_AP_PERF_ARM_HISI_L3_ONLINE,
+ 	CPUHP_AP_PERF_ARM_HISI_PA_ONLINE,
+ 	CPUHP_AP_PERF_ARM_HISI_SLLC_ONLINE,
+-	CPUHP_AP_PERF_ARM_HISI_PCIE_PMU_ONLINE,
+ 	CPUHP_AP_PERF_ARM_L2X0_ONLINE,
+ 	CPUHP_AP_PERF_ARM_QCOM_L2_ONLINE,
+ 	CPUHP_AP_PERF_ARM_QCOM_L3_ONLINE,

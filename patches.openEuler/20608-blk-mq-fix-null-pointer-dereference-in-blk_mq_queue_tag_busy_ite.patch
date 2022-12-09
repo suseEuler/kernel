@@ -1,0 +1,70 @@
+From 232b46639f4e40248d78b2f71ec4c73f6e794189 Mon Sep 17 00:00:00 2001
+From: Li Nan <linan122@huawei.com>
+Date: Wed, 7 Dec 2022 18:37:55 +0800
+Subject: [PATCH] blk-mq: fix null pointer dereference in
+ blk_mq_queue_tag_busy_ite
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 232b46639f4e40248d78b2f71ec4c73f6e794189
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I617GN
+CVE: NA
+
+--------------------------------
+
+The q->tag_set can be NULL in blk_mq_queue_tag_busy_ite() while queue
+has not been initialized:
+
+	CPU0					CPU1
+dm_mq_init_request_queue
+  md->tag_set = kzalloc_node
+    blk_mq_init_allocated_queue
+      q->mq_ops = set->ops;
+					diskstats_show
+					  part_get_stat_info
+					    if(q->mq_ops)
+					      blk_mq_in_flight_with_stat
+						blk_mq_queue_tag_busy_ite
+						  if (blk_mq_is_shared_tags(q->tag_set->flags))
+						  //q->tag_set is null here
+      q->tag_set = set
+blk_register_queue
+  blk_queue_flag_set(QUEUE_FLAG_REGISTERED, q)
+
+There is same bug when cat /sys/block/[device]/inflight. Fix it by checking
+the flag 'QUEUE_FLAG_REGISTERED'. Althrough this may cause some io not to
+be counted temporarily, it doesn't hurt in real user case.
+
+Signed-off-by: Li Nan <linan122@huawei.com>
+Reviewed-by: Jason Yan <yanaijie@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ block/blk-mq-tag.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/block/blk-mq-tag.c b/block/blk-mq-tag.c
+index 24b48a2f7fba..87bb146c7d44 100644
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@ -515,6 +515,13 @@ EXPORT_SYMBOL(blk_mq_tagset_wait_completed_request);
+ void blk_mq_queue_tag_busy_iter(struct request_queue *q, busy_iter_fn *fn,
+ 		void *priv)
+ {
++	/*
++	 * For dm, it can run here after register_disk, but the queue has not
++	 * been initialized yet. Check QUEUE_FLAG_REGISTERED prevent null point
++	 * access.
++	 */
++	if (!blk_queue_registered(q))
++		return;
+ 	/*
+ 	 * __blk_mq_update_nr_hw_queues() updates nr_hw_queues and queue_hw_ctx
+ 	 * while the queue is frozen. So we can use q_usage_counter to avoid
+-- 
+2.33.0
+

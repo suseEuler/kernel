@@ -1,0 +1,122 @@
+From 2dfded47da329a0dd619144a6bb43aefc13a77ba Mon Sep 17 00:00:00 2001
+From: Jianmin Lv <lvjianmin@loongson.cn>
+Date: Wed, 20 Jul 2022 18:51:25 +0800
+Subject: [PATCH] LoongArch: Prepare to support multiple pch-pic and pch-msi
+ irqdomain
+Git-commit: 2dfded47da329a0dd619144a6bb43aefc13a77ba
+Patch-mainline: v6.0-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+For systems with two chipsets, there are two related pch-pic and
+pch-msi irqdomains, each of which has the same node id as its
+parent irqdomain. So we use a structure to mantain the relation
+of node and it's parent irqdomain as pch irqdomin, the 'pci_segment'
+field is only used to match the pci segment of a pci device when
+setting msi irqdomain for the device.
+
+struct acpi_vector_group {
+        int node;
+        int pci_segment;
+        struct irq_domain *parent;
+};
+
+The field 'pci_segment' and 'node' are initialized from MCFG, and
+the parent irqdomain driver will set field 'parent' by matching same
+'node'.
+
+Signed-off-by: Jianmin Lv <lvjianmin@loongson.cn>
+Signed-off-by: Marc Zyngier <maz@kernel.org>
+Link: https://lore.kernel.org/r/1658314292-35346-7-git-send-email-lvjianmin@loongson.cn
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/loongarch/include/asm/irq.h |  8 +++++++
+ arch/loongarch/kernel/irq.c      | 38 ++++++++++++++++++++++++++++++++
+ 2 files changed, 46 insertions(+)
+
+diff --git a/arch/loongarch/include/asm/irq.h b/arch/loongarch/include/asm/irq.h
+index ace3ea6da72e..a2540d7c533d 100644
+--- a/arch/loongarch/include/asm/irq.h
++++ b/arch/loongarch/include/asm/irq.h
+@@ -48,6 +48,14 @@ void arch_trigger_cpumask_backtrace(const struct cpumask *mask, bool exclude_sel
+ #define MAX_IO_PICS 2
+ #define NR_IRQS	(64 + (256 * MAX_IO_PICS))
+ 
++struct acpi_vector_group {
++	int node;
++	int pci_segment;
++	struct irq_domain *parent;
++};
++extern struct acpi_vector_group pch_group[MAX_IO_PICS];
++extern struct acpi_vector_group msi_group[MAX_IO_PICS];
++
+ #define CORES_PER_EIO_NODE	4
+ 
+ #define LOONGSON_CPU_UART0_VEC		10 /* CPU UART0 */
+diff --git a/arch/loongarch/kernel/irq.c b/arch/loongarch/kernel/irq.c
+index b34b8d792aa4..37dd2dca8221 100644
+--- a/arch/loongarch/kernel/irq.c
++++ b/arch/loongarch/kernel/irq.c
+@@ -31,6 +31,8 @@ struct irq_domain *pch_lpc_domain;
+ struct irq_domain *pch_msi_domain[MAX_IO_PICS];
+ struct irq_domain *pch_pic_domain[MAX_IO_PICS];
+ 
++struct acpi_vector_group pch_group[MAX_IO_PICS];
++struct acpi_vector_group msi_group[MAX_IO_PICS];
+ /*
+  * 'what should we do if we get a hw irq event on an illegal vector'.
+  * each architecture has to answer this themselves.
+@@ -56,6 +58,41 @@ int arch_show_interrupts(struct seq_file *p, int prec)
+ 	return 0;
+ }
+ 
++static int __init early_pci_mcfg_parse(struct acpi_table_header *header)
++{
++	struct acpi_table_mcfg *mcfg;
++	struct acpi_mcfg_allocation *mptr;
++	int i, n;
++
++	if (header->length < sizeof(struct acpi_table_mcfg))
++		return -EINVAL;
++
++	n = (header->length - sizeof(struct acpi_table_mcfg)) /
++					sizeof(struct acpi_mcfg_allocation);
++	mcfg = (struct acpi_table_mcfg *)header;
++	mptr = (struct acpi_mcfg_allocation *) &mcfg[1];
++
++	for (i = 0; i < n; i++, mptr++) {
++		msi_group[i].pci_segment = mptr->pci_segment;
++		pch_group[i].node = msi_group[i].node = (mptr->address >> 44) & 0xf;
++	}
++
++	return 0;
++}
++
++static void __init init_vec_parent_group(void)
++{
++	int i;
++
++	for (i = 0; i < MAX_IO_PICS; i++) {
++		msi_group[i].pci_segment = -1;
++		msi_group[i].node = -1;
++		pch_group[i].node = -1;
++	}
++
++	acpi_table_parse(ACPI_SIG_MCFG, early_pci_mcfg_parse);
++}
++
+ void __init init_IRQ(void)
+ {
+ 	int i;
+@@ -69,6 +106,7 @@ void __init init_IRQ(void)
+ 	clear_csr_ecfg(ECFG0_IM);
+ 	clear_csr_estat(ESTATF_IP);
+ 
++	init_vec_parent_group();
+ 	irqchip_init();
+ #ifdef CONFIG_SMP
+ 	ipi_irq = EXCCODE_IPI - EXCCODE_INT_START;
+-- 
+2.33.0
+

@@ -1,0 +1,114 @@
+From e8bba72b396cef7c919c73710f3c5884521adb4e Mon Sep 17 00:00:00 2001
+From: Jianmin Lv <lvjianmin@loongson.cn>
+Date: Wed, 20 Jul 2022 18:51:32 +0800
+Subject: [PATCH] irqchip / ACPI: Introduce ACPI_IRQ_MODEL_LPIC for LoongArch
+Git-commit: e8bba72b396cef7c919c73710f3c5884521adb4e
+Patch-mainline: v6.0-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified per openEuler commit fb9d8132
+
+
+For LoongArch, ACPI_IRQ_MODEL_LPIC is introduced, and then the
+callback acpi_get_gsi_domain_id and acpi_gsi_to_irq_fallback are
+implemented.
+
+The acpi_get_gsi_domain_id callback returns related fwnode handle
+of irqdomain for different GSI range.
+
+The acpi_gsi_to_irq_fallback will create new mapping for gsi when
+the mapping of it is not found.
+
+Signed-off-by: Jianmin Lv <lvjianmin@loongson.cn>
+Signed-off-by: Marc Zyngier <maz@kernel.org>
+Link: https://lore.kernel.org/r/1658314292-35346-14-git-send-email-lvjianmin@loongson.cn
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/acpi/bus.c                  |  3 +++
+ drivers/irqchip/irq-loongarch-cpu.c | 37 +++++++++++++++++++++++++++++
+ include/linux/acpi.h                |  1 +
+ 3 files changed, 41 insertions(+)
+
+diff --git a/drivers/acpi/bus.c b/drivers/acpi/bus.c
+index 5e14288fcabe..4ee50f4f6f01 100644
+--- a/drivers/acpi/bus.c
++++ b/drivers/acpi/bus.c
+@@ -994,6 +994,9 @@ static int __init acpi_bus_init_irq(void)
+ 	case ACPI_IRQ_MODEL_PLATFORM:
+ 		message = "platform specific model";
+ 		break;
++	case ACPI_IRQ_MODEL_LPIC:
++		message = "LPIC";
++		break;
+ 	default:
+ 		printk(KERN_WARNING PREFIX "Unknown interrupt routing model\n");
+ 		return -ENODEV;
+diff --git a/drivers/irqchip/irq-loongarch-cpu.c b/drivers/irqchip/irq-loongarch-cpu.c
+index aed345410d09..2b3394a52c85 100644
+--- a/drivers/irqchip/irq-loongarch-cpu.c
++++ b/drivers/irqchip/irq-loongarch-cpu.c
+@@ -16,6 +16,41 @@
+ static struct irq_domain *irq_domain;
+ struct fwnode_handle *cpuintc_handle;
+ 
++static u32 lpic_gsi_to_irq(u32 gsi)
++{
++	/* Only pch irqdomain transferring is required for LoongArch. */
++	if (gsi >= GSI_MIN_PCH_IRQ && gsi <= GSI_MAX_PCH_IRQ)
++		return acpi_register_gsi(NULL, gsi, ACPI_LEVEL_SENSITIVE, ACPI_ACTIVE_HIGH);
++
++	return 0;
++}
++
++static struct fwnode_handle *lpic_get_gsi_domain_id(u32 gsi)
++{
++	int id;
++	struct fwnode_handle *domain_handle = NULL;
++
++	switch (gsi) {
++	case GSI_MIN_CPU_IRQ ... GSI_MAX_CPU_IRQ:
++		if (liointc_handle)
++			domain_handle = liointc_handle;
++		break;
++
++	case GSI_MIN_LPC_IRQ ... GSI_MAX_LPC_IRQ:
++		if (pch_lpc_handle)
++			domain_handle = pch_lpc_handle;
++		break;
++
++	case GSI_MIN_PCH_IRQ ... GSI_MAX_PCH_IRQ:
++		id = find_pch_pic(gsi);
++		if (id >= 0 && pch_pic_handle[id])
++			domain_handle = pch_pic_handle[id];
++		break;
++	}
++
++	return domain_handle;
++}
++
+ static void mask_loongarch_irq(struct irq_data *d)
+ {
+ 	clear_csr_ecfg(ECFGF(d->hwirq));
+@@ -102,6 +137,8 @@ static int __init cpuintc_acpi_init(union acpi_subtable_headers *header,
+ 		panic("Failed to add irqdomain for LoongArch CPU");
+ 
+ 	set_handle_irq(&handle_cpu_irq);
++	acpi_set_irq_model(ACPI_IRQ_MODEL_LPIC, lpic_get_gsi_domain_id);
++	acpi_set_gsi_to_irq_fallback(lpic_gsi_to_irq);
+ 	acpi_cascade_irqdomain_init();
+ 
+ 	return 0;
+diff --git a/include/linux/acpi.h b/include/linux/acpi.h
+index 9f7f9a0d724f..b598dd608e7b 100644
+--- a/include/linux/acpi.h
++++ b/include/linux/acpi.h
+@@ -105,6 +105,7 @@ enum acpi_irq_model_id {
+ 	ACPI_IRQ_MODEL_IOSAPIC,
+ 	ACPI_IRQ_MODEL_PLATFORM,
+ 	ACPI_IRQ_MODEL_GIC,
++	ACPI_IRQ_MODEL_LPIC,
+ 	ACPI_IRQ_MODEL_COUNT
+ };
+ 
+-- 
+2.33.0
+

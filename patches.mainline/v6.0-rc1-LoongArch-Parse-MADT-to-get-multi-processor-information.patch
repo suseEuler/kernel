@@ -1,0 +1,126 @@
+From e9e7ff16d7f098f6fa9394e9d2b191c01ba0d5f6 Mon Sep 17 00:00:00 2001
+From: Huacai Chen <chenhuacai@loongson.cn>
+Date: Tue, 19 Jul 2022 10:53:13 +0800
+Subject: [PATCH] LoongArch: Parse MADT to get multi-processor information
+Git-commit: e9e7ff16d7f098f6fa9394e9d2b191c01ba0d5f6
+Patch-mainline: v6.0-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+Parse MADT to get multi-processor information, in order to fix the boot
+problem and cpu-hotplug problem for SMP platform.
+
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/loongarch/include/asm/bootinfo.h |  2 +-
+ arch/loongarch/include/asm/irq.h      |  2 --
+ arch/loongarch/kernel/acpi.c          | 38 +++++++++++++++++++++++++++
+ arch/loongarch/kernel/smp.c           |  5 +---
+ 4 files changed, 40 insertions(+), 7 deletions(-)
+
+diff --git a/arch/loongarch/include/asm/bootinfo.h b/arch/loongarch/include/asm/bootinfo.h
+index 9b8d49d9e61b..e02ac4af7f6e 100644
+--- a/arch/loongarch/include/asm/bootinfo.h
++++ b/arch/loongarch/include/asm/bootinfo.h
+@@ -28,10 +28,10 @@ struct loongson_board_info {
+ struct loongson_system_configuration {
+ 	int nr_cpus;
+ 	int nr_nodes;
+-	int nr_io_pics;
+ 	int boot_cpu_id;
+ 	int cores_per_node;
+ 	int cores_per_package;
++	unsigned long cores_io_master;
+ 	const char *cpuname;
+ };
+ 
+diff --git a/arch/loongarch/include/asm/irq.h b/arch/loongarch/include/asm/irq.h
+index 149b2123e7f4..f6c2455b4584 100644
+--- a/arch/loongarch/include/asm/irq.h
++++ b/arch/loongarch/include/asm/irq.h
+@@ -82,8 +82,6 @@ extern struct acpi_vector_group msi_group[MAX_IO_PICS];
+ #define GSI_MAX_PCH_IRQ		(LOONGSON_PCH_IRQ_BASE + 256 - 1)
+ 
+ extern int find_pch_pic(u32 gsi);
+-extern int eiointc_get_node(int id);
+-
+ struct acpi_madt_lio_pic;
+ struct acpi_madt_eio_pic;
+ struct acpi_madt_ht_pic;
+diff --git a/arch/loongarch/kernel/acpi.c b/arch/loongarch/kernel/acpi.c
+index 03aa14581d0a..f1c928648a4a 100644
+--- a/arch/loongarch/kernel/acpi.c
++++ b/arch/loongarch/kernel/acpi.c
+@@ -104,6 +104,39 @@ static int set_processor_mask(u32 id, u32 flags)
+ }
+ #endif
+ 
++static int __init
++acpi_parse_processor(union acpi_subtable_headers *header, const unsigned long end)
++{
++	struct acpi_madt_core_pic *processor = NULL;
++
++	processor = (struct acpi_madt_core_pic *)header;
++	if (BAD_MADT_ENTRY(processor, end))
++		return -EINVAL;
++
++	acpi_table_print_madt_entry(&header->common);
++#ifdef CONFIG_SMP
++	set_processor_mask(processor->core_id, processor->flags);
++#endif
++
++	return 0;
++}
++
++static int __init
++acpi_parse_eio_master(union acpi_subtable_headers *header, const unsigned long end)
++{
++	static int core = 0;
++	struct acpi_madt_eio_pic *eiointc = NULL;
++
++	eiointc = (struct acpi_madt_eio_pic *)header;
++	if (BAD_MADT_ENTRY(eiointc, end))
++		return -EINVAL;
++
++	core = eiointc->node * CORES_PER_EIO_NODE;
++	set_bit(core, &(loongson_sysconf.cores_io_master));
++
++	return 0;
++}
++
+ static void __init acpi_process_madt(void)
+ {
+ #ifdef CONFIG_SMP
+@@ -114,6 +147,11 @@ static void __init acpi_process_madt(void)
+ 		__cpu_logical_map[i] = -1;
+ 	}
+ #endif
++	acpi_table_parse_madt(ACPI_MADT_TYPE_CORE_PIC,
++			acpi_parse_processor, MAX_CORE_PIC);
++
++	acpi_table_parse_madt(ACPI_MADT_TYPE_EIO_PIC,
++			acpi_parse_eio_master, MAX_IO_PICS);
+ 
+ 	loongson_sysconf.nr_cpus = num_processors;
+ }
+diff --git a/arch/loongarch/kernel/smp.c b/arch/loongarch/kernel/smp.c
+index 09743103d9b3..b5fab308dcf2 100644
+--- a/arch/loongarch/kernel/smp.c
++++ b/arch/loongarch/kernel/smp.c
+@@ -242,10 +242,7 @@ void loongson3_smp_finish(void)
+ 
+ static bool io_master(int cpu)
+ {
+-	if (cpu == 0)
+-		return true;
+-
+-	return false;
++	return test_bit(cpu, &loongson_sysconf.cores_io_master);
+ }
+ 
+ int loongson3_cpu_disable(void)
+-- 
+2.33.0
+

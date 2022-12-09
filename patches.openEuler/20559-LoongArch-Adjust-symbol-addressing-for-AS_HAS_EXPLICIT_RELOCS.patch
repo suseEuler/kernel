@@ -1,0 +1,153 @@
+From 663c2b31a5452015031016268d7a78541830556c Mon Sep 17 00:00:00 2001
+From: Xi Ruoyao <xry111@xry111.site>
+Date: Tue, 30 Aug 2022 18:48:03 +0800
+Subject: [PATCH] LoongArch: Adjust symbol addressing for
+ AS_HAS_EXPLICIT_RELOCS
+Patch-mainline: NO, OTHERS
+References: openEuler-22.03-LTS
+Modified-by-SEL: No
+
+
+LoongArch inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5OHOB
+
+--------------------------------
+
+If explicit relocation hints are used by the toolchain, -Wa,-mla-*
+options will be useless for the C code. So only use them for the
+!CONFIG_AS_HAS_EXPLICIT_RELOCS case.
+
+Replace "la" with "la.pcrel" in head.S to keep the semantic consistent
+with new and old toolchains for the low level startup code.
+
+For per-CPU variables, the "address" of the symbol is actually an offset
+from $r21. The value is near the loading address of main kernel image,
+but far from the loading address of modules. So we use model("extreme")
+attibute to tell the compiler that a PC-relative addressing with 32-bit
+offset is not sufficient for local per-CPU variables.
+
+The behavior with different assemblers and compilers are summarized in
+the following table:
+
+AS has            CC has
+explicit relocs   explicit relocs * Behavior
+==============================================================
+No                No                Use la.* macros.
+                                    No change from Linux 6.0.
+--------------------------------------------------------------
+No                Yes               Disable explicit relocs.
+                                    No change from Linux 6.0.
+--------------------------------------------------------------
+Yes               No                Not supported.
+--------------------------------------------------------------
+Yes               Yes               Enable explicit relocs.
+                                    No -Wa,-mla* options used.
+==============================================================
+*: We assume CC must have model attribute if it has explicit relocs.
+   Both features are added in GCC 13 development cycle, so any GCC
+   release >= 13 should be OK. Using early GCC 13 development snapshots
+   may produce modules with unsupported relocations.
+
+Link: https://sourceware.org/git/?p=binutils-gdb.git;a=commit;h=f09482a
+Link: https://gcc.gnu.org/r13-1834
+Link: https://gcc.gnu.org/r13-2199
+Signed-off-by: Xi Ruoyao <xry111@xry111.site>
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/loongarch/Makefile             | 17 +++++++++++++++++
+ arch/loongarch/include/asm/percpu.h |  9 +++++++++
+ arch/loongarch/kernel/head.S        | 10 +++++-----
+ 3 files changed, 31 insertions(+), 5 deletions(-)
+
+diff --git a/arch/loongarch/Makefile b/arch/loongarch/Makefile
+index fa2689a7da73..3ab3625946a9 100644
+--- a/arch/loongarch/Makefile
++++ b/arch/loongarch/Makefile
+@@ -40,10 +40,27 @@ endif
+ 
+ cflags-y			+= -G0 -pipe -msoft-float
+ LDFLAGS_vmlinux			+= -G0 -static -n -nostdlib
++
++# When the assembler supports explicit relocation hint, we must use it.
++# GCC may have -mexplicit-relocs off by default if it was built with an old
++# assembler, so we force it via an option.
++#
++# When the assembler does not supports explicit relocation hint, we can't use
++# it.  Disable it if the compiler supports it.
++#
++# If you've seen "unknown reloc hint" message building the kernel and you are
++# now wondering why "-mexplicit-relocs" is not wrapped with cc-option: the
++# combination of a "new" assembler and "old" compiler is not supported.  Either
++# upgrade the compiler or downgrade the assembler.
++ifdef CONFIG_AS_HAS_EXPLICIT_RELOCS
++cflags-y			+= -mexplicit-relocs
++else
++cflags-y			+= $(call cc-option,-mno-explicit-relocs)
+ KBUILD_AFLAGS_KERNEL		+= -Wa,-mla-global-with-pcrel
+ KBUILD_CFLAGS_KERNEL		+= -Wa,-mla-global-with-pcrel
+ KBUILD_AFLAGS_MODULE		+= -Wa,-mla-global-with-abs
+ KBUILD_CFLAGS_MODULE		+= -fplt -Wa,-mla-global-with-abs,-mla-local-with-abs
++endif
+ 
+ cflags-y += -ffreestanding
+ cflags-y += $(call cc-option, -mno-check-zero-division)
+diff --git a/arch/loongarch/include/asm/percpu.h b/arch/loongarch/include/asm/percpu.h
+index 0bd6b0110198..ad8d88494554 100644
+--- a/arch/loongarch/include/asm/percpu.h
++++ b/arch/loongarch/include/asm/percpu.h
+@@ -8,6 +8,15 @@
+ #include <asm/cmpxchg.h>
+ #include <asm/loongarch.h>
+ 
++/*
++ * The "address" (in fact, offset from $r21) of a per-CPU variable is close to
++ * the loading address of main kernel image, but far from where the modules are
++ * loaded. Tell the compiler this fact when using explicit relocs.
++ */
++#if defined(MODULE) && defined(CONFIG_AS_HAS_EXPLICIT_RELOCS)
++#define PER_CPU_ATTRIBUTES    __attribute__((model("extreme")))
++#endif
++
+ /* Use r21 for fast access */
+ register unsigned long __my_cpu_offset __asm__("$r21");
+ 
+diff --git a/arch/loongarch/kernel/head.S b/arch/loongarch/kernel/head.S
+index 01bac62a6442..eb3f641d5915 100644
+--- a/arch/loongarch/kernel/head.S
++++ b/arch/loongarch/kernel/head.S
+@@ -55,17 +55,17 @@ SYM_CODE_START(kernel_entry)			# kernel entry point
+ 	li.w		t0, 0x00		# FPE=0, SXE=0, ASXE=0, BTE=0
+ 	csrwr		t0, LOONGARCH_CSR_EUEN
+ 
+-	la		t0, __bss_start		# clear .bss
++	la.pcrel	t0, __bss_start		# clear .bss
+ 	st.d		zero, t0, 0
+-	la		t1, __bss_stop - LONGSIZE
++	la.pcrel	t1, __bss_stop - LONGSIZE
+ 1:
+ 	addi.d		t0, t0, LONGSIZE
+ 	st.d		zero, t0, 0
+ 	bne		t0, t1, 1b
+ 
+-	la		t0, fw_arg0
++	la.pcrel	t0, fw_arg0
+ 	st.d		a0, t0, 0		# firmware arguments
+-	la		t0, fw_arg1
++	la.pcrel	t0, fw_arg1
+ 	st.d		a1, t0, 0
+ 
+ 	/* KSave3 used for percpu base, initialized as 0 */
+@@ -73,7 +73,7 @@ SYM_CODE_START(kernel_entry)			# kernel entry point
+ 	/* GPR21 used for percpu base (runtime), initialized as 0 */
+ 	move		u0, zero
+ 
+-	la		tp, init_thread_union
++	la.pcrel	tp, init_thread_union
+ 	/* Set the SP after an empty pt_regs.  */
+ 	PTR_LI		sp, (_THREAD_SIZE - 32 - PT_SIZE)
+ 	PTR_ADD		sp, sp, tp
+-- 
+2.33.0
+

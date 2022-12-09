@@ -1,0 +1,103 @@
+From 7e4fd7a1a6fdf23d069eeb0ae0e8e46b9fb40723 Mon Sep 17 00:00:00 2001
+From: Marc Zyngier <maz@kernel.org>
+Date: Mon, 8 Aug 2022 11:50:20 +0100
+Subject: [PATCH] irqchip/loongarch: Fix irq_domain_alloc_fwnode() abuse
+Git-commit: 7e4fd7a1a6fdf23d069eeb0ae0e8e46b9fb40723
+Patch-mainline: v6.0-rc2
+References: bsn#12
+Modified-by-SEL: No
+
+
+The recently merged LoongArch drivers paper over the lack of
+topology information by creating a bunch of fwnodes for the
+irqchips. So far, so good.
+
+However, irq_domain_alloc_fwnode() is supposed to take a PA, and
+not a kernel VA blindly cast as a PA, potentially disclosing
+kernel VAs to userspace. In some other cases, even NULL is used
+as the PA, which is entertaining.
+
+Fix this by using the actual PA of the block when available,
+and switch to a named fwnode in the other cases.
+
+Signed-off-by: Marc Zyngier <maz@kernel.org>
+Reviewed-by: Jianmin Lv <lvjianmin@loongson.cn>
+Link: https://lore.kernel.org/r/20220808105020.2689757-1-maz@kernel.org
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/irqchip/irq-loongarch-cpu.c    | 2 +-
+ drivers/irqchip/irq-loongson-eiointc.c | 3 ++-
+ drivers/irqchip/irq-loongson-liointc.c | 2 +-
+ drivers/irqchip/irq-loongson-pch-msi.c | 2 +-
+ drivers/irqchip/irq-loongson-pch-pic.c | 2 +-
+ 5 files changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/irqchip/irq-loongarch-cpu.c b/drivers/irqchip/irq-loongarch-cpu.c
+index 327f3ab62c03..741612ba6a52 100644
+--- a/drivers/irqchip/irq-loongarch-cpu.c
++++ b/drivers/irqchip/irq-loongarch-cpu.c
+@@ -129,7 +129,7 @@ static int __init cpuintc_acpi_init(union acpi_subtable_headers *header,
+ 	clear_csr_ecfg(ECFG0_IM);
+ 	clear_csr_estat(ESTATF_IP);
+ 
+-	cpuintc_handle = irq_domain_alloc_fwnode(NULL);
++	cpuintc_handle = irq_domain_alloc_named_fwnode("CPUINTC");
+ 	irq_domain = irq_domain_create_linear(cpuintc_handle, EXCCODE_INT_NUM,
+ 					&loongarch_cpu_intc_irq_domain_ops, NULL);
+ 
+diff --git a/drivers/irqchip/irq-loongson-eiointc.c b/drivers/irqchip/irq-loongson-eiointc.c
+index bffb7b3128e8..16e9af8d8b1e 100644
+--- a/drivers/irqchip/irq-loongson-eiointc.c
++++ b/drivers/irqchip/irq-loongson-eiointc.c
+@@ -348,7 +348,8 @@ int __init eiointc_acpi_init(struct irq_domain *parent,
+ 	if (!priv)
+ 		return -ENOMEM;
+ 
+-	priv->domain_handle = irq_domain_alloc_fwnode((phys_addr_t *)acpi_eiointc);
++	priv->domain_handle = irq_domain_alloc_named_id_fwnode("EIOPIC",
++							       acpi_eiointc->node);
+ 	if (!priv->domain_handle) {
+ 		pr_err("Unable to allocate domain handle\n");
+ 		goto out_free_priv;
+diff --git a/drivers/irqchip/irq-loongson-liointc.c b/drivers/irqchip/irq-loongson-liointc.c
+index c4f3c886ad61..acd1a4b897df 100644
+--- a/drivers/irqchip/irq-loongson-liointc.c
++++ b/drivers/irqchip/irq-loongson-liointc.c
+@@ -360,7 +360,7 @@ int __init liointc_acpi_init(struct irq_domain *parent, struct acpi_madt_lio_pic
+ 	parent_irq[0] = irq_create_mapping(parent, acpi_liointc->cascade[0]);
+ 	parent_irq[1] = irq_create_mapping(parent, acpi_liointc->cascade[1]);
+ 
+-	domain_handle = irq_domain_alloc_fwnode((phys_addr_t *)acpi_liointc);
++	domain_handle = irq_domain_alloc_fwnode(&acpi_liointc->address);
+ 	if (!domain_handle) {
+ 		pr_err("Unable to allocate domain handle\n");
+ 		return -ENOMEM;
+diff --git a/drivers/irqchip/irq-loongson-pch-msi.c b/drivers/irqchip/irq-loongson-pch-msi.c
+index d0e8551bebfa..a72ede90ffc6 100644
+--- a/drivers/irqchip/irq-loongson-pch-msi.c
++++ b/drivers/irqchip/irq-loongson-pch-msi.c
+@@ -282,7 +282,7 @@ int __init pch_msi_acpi_init(struct irq_domain *parent,
+ 	int ret;
+ 	struct fwnode_handle *domain_handle;
+ 
+-	domain_handle = irq_domain_alloc_fwnode((phys_addr_t *)acpi_pchmsi);
++	domain_handle = irq_domain_alloc_fwnode(&acpi_pchmsi->msg_address);
+ 	ret = pch_msi_init(acpi_pchmsi->msg_address, acpi_pchmsi->start,
+ 				acpi_pchmsi->count, parent, domain_handle);
+ 	if (ret < 0)
+diff --git a/drivers/irqchip/irq-loongson-pch-pic.c b/drivers/irqchip/irq-loongson-pch-pic.c
+index b987b6517d59..c01b9c257005 100644
+--- a/drivers/irqchip/irq-loongson-pch-pic.c
++++ b/drivers/irqchip/irq-loongson-pch-pic.c
+@@ -349,7 +349,7 @@ int __init pch_pic_acpi_init(struct irq_domain *parent,
+ 
+ 	vec_base = acpi_pchpic->gsi_base - GSI_MIN_PCH_IRQ;
+ 
+-	domain_handle = irq_domain_alloc_fwnode((phys_addr_t *)acpi_pchpic);
++	domain_handle = irq_domain_alloc_fwnode(&acpi_pchpic->address);
+ 	if (!domain_handle) {
+ 		pr_err("Unable to allocate domain handle\n");
+ 		return -ENOMEM;
+-- 
+2.33.0
+

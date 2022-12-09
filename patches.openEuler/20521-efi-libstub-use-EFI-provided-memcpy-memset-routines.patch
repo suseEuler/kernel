@@ -1,0 +1,183 @@
+From 88c26d7d2bd8175f97ad14cf2c79f199e7307efc Mon Sep 17 00:00:00 2001
+From: Ard Biesheuvel <ardb@kernel.org>
+Date: Tue, 9 Aug 2022 16:45:17 +0200
+Subject: [PATCH] efi/libstub: use EFI provided memcpy/memset routines
+Patch-mainline: NO, OTHERS
+References: openEuler-22.03-LTS
+Modified-by-SEL: No
+
+
+LoongArch inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5OHOB
+
+--------------------------------
+
+The stub is used in different execution environments, but on arm64,
+RISC-V and LoongArch, we still use the core kernel's implementation of
+memcpy and memset, as they are just a branch instruction away, and can
+generally be reused even from code such as the EFI stub that runs in a
+completely different address space.
+
+KAsan complicates this slightly, resulting in the need for some hacks to
+expose the uninstrumented, __ prefixed versions as the normal ones, as
+the latter are instrumented to include the KAsan checks, which only work
+in the core kernel.
+
+Unfortunately, #define'ing memcpy to __memcpy when building C code does
+not guarantee that no explicit memcpy() calls will be emitted. And with
+the upcoming zboot support, which consists of a separate binary which
+therefore needs its own implementation of memcpy/memset anyway, it's
+better to provide one explicitly instead of linking to the existing one.
+
+Given that EFI exposes implementations of memmove() and memset() via the
+boot services table, let's wire those up in the appropriate way, and
+drop the references to the core kernel ones.
+
+Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/kernel/image-vars.h            |  9 -------
+ arch/loongarch/kernel/image-vars.h        |  3 ---
+ arch/riscv/kernel/image-vars.h            |  9 -------
+ drivers/firmware/efi/libstub/Makefile     |  2 +-
+ drivers/firmware/efi/libstub/efistub.h    |  4 +--
+ drivers/firmware/efi/libstub/intrinsics.c | 30 +++++++++++++++++++++++
+ 6 files changed, 33 insertions(+), 24 deletions(-)
+ create mode 100644 drivers/firmware/efi/libstub/intrinsics.c
+
+diff --git a/arch/arm64/kernel/image-vars.h b/arch/arm64/kernel/image-vars.h
+index 7ea4b84f1518..8d3fede89ae1 100644
+--- a/arch/arm64/kernel/image-vars.h
++++ b/arch/arm64/kernel/image-vars.h
+@@ -27,9 +27,6 @@ __efistub_primary_entry_offset	= primary_entry - _text;
+  */
+ __efistub_memcmp		= __pi_memcmp;
+ __efistub_memchr		= __pi_memchr;
+-__efistub_memcpy		= __pi_memcpy;
+-__efistub_memmove		= __pi_memmove;
+-__efistub_memset		= __pi_memset;
+ __efistub_strlen		= __pi_strlen;
+ __efistub_strnlen		= __pi_strnlen;
+ __efistub_strcmp		= __pi_strcmp;
+@@ -38,12 +35,6 @@ __efistub_strrchr		= __pi_strrchr;
+ __efistub_strchr		= __pi_strchr;
+ __efistub___clean_dcache_area_poc = __pi___clean_dcache_area_poc;
+ 
+-#ifdef CONFIG_KASAN
+-__efistub___memcpy		= __pi_memcpy;
+-__efistub___memmove		= __pi_memmove;
+-__efistub___memset		= __pi_memset;
+-#endif
+-
+ __efistub__text			= _text;
+ __efistub__end			= _end;
+ __efistub__edata		= _edata;
+diff --git a/arch/loongarch/kernel/image-vars.h b/arch/loongarch/kernel/image-vars.h
+index c901ebb903f2..88f5d81702df 100644
+--- a/arch/loongarch/kernel/image-vars.h
++++ b/arch/loongarch/kernel/image-vars.h
+@@ -9,9 +9,6 @@
+ 
+ __efistub_memcmp		= memcmp;
+ __efistub_memchr		= memchr;
+-__efistub_memcpy		= memcpy;
+-__efistub_memmove		= memmove;
+-__efistub_memset		= memset;
+ __efistub_strcat		= strcat;
+ __efistub_strcmp		= strcmp;
+ __efistub_strlen		= strlen;
+diff --git a/arch/riscv/kernel/image-vars.h b/arch/riscv/kernel/image-vars.h
+index 8c212efb37a6..bf1c73b5a5b9 100644
+--- a/arch/riscv/kernel/image-vars.h
++++ b/arch/riscv/kernel/image-vars.h
+@@ -25,21 +25,12 @@
+  */
+ __efistub_memcmp		= memcmp;
+ __efistub_memchr		= memchr;
+-__efistub_memcpy		= memcpy;
+-__efistub_memmove		= memmove;
+-__efistub_memset		= memset;
+ __efistub_strlen		= strlen;
+ __efistub_strnlen		= strnlen;
+ __efistub_strcmp		= strcmp;
+ __efistub_strncmp		= strncmp;
+ __efistub_strrchr		= strrchr;
+ 
+-#ifdef CONFIG_KASAN
+-__efistub___memcpy		= memcpy;
+-__efistub___memmove		= memmove;
+-__efistub___memset		= memset;
+-#endif
+-
+ __efistub__start		= _start;
+ __efistub__start_kernel		= _start_kernel;
+ __efistub__end			= _end;
+diff --git a/drivers/firmware/efi/libstub/Makefile b/drivers/firmware/efi/libstub/Makefile
+index 97c7c5deeb8a..5b5ae50d805a 100644
+--- a/drivers/firmware/efi/libstub/Makefile
++++ b/drivers/firmware/efi/libstub/Makefile
+@@ -63,7 +63,7 @@ efi-deps-y := fdt_rw.c fdt_ro.c fdt_wip.c fdt.c fdt_empty_tree.c fdt_sw.c
+ $(obj)/lib-%.o: $(srctree)/lib/%.c FORCE
+ 	$(call if_changed_rule,cc_o_c)
+ 
+-lib-$(CONFIG_EFI_GENERIC_STUB)	+= efi-stub.o fdt.o string.o \
++lib-$(CONFIG_EFI_GENERIC_STUB)	+= efi-stub.o fdt.o string.o intrinsics.o \
+ 				   $(patsubst %.c,lib-%.o,$(efi-deps-y))
+ 
+ lib-$(CONFIG_ARM)		+= arm32-stub.o
+diff --git a/drivers/firmware/efi/libstub/efistub.h b/drivers/firmware/efi/libstub/efistub.h
+index 969d964d08af..db009721f543 100644
+--- a/drivers/firmware/efi/libstub/efistub.h
++++ b/drivers/firmware/efi/libstub/efistub.h
+@@ -298,8 +298,8 @@ union efi_boot_services {
+ 		efi_status_t (__efiapi *install_multiple_protocol_interfaces)(efi_handle_t *, ...);
+ 		efi_status_t (__efiapi *uninstall_multiple_protocol_interfaces)(efi_handle_t, ...);
+ 		void *calculate_crc32;
+-		void *copy_mem;
+-		void *set_mem;
++		void (__efiapi *copy_mem)(void *, const void *, unsigned long);
++		void (__efiapi *set_mem)(void *, unsigned long, unsigned char);
+ 		void *create_event_ex;
+ 	};
+ 	struct {
+diff --git a/drivers/firmware/efi/libstub/intrinsics.c b/drivers/firmware/efi/libstub/intrinsics.c
+new file mode 100644
+index 000000000000..a04ab39292b6
+--- /dev/null
++++ b/drivers/firmware/efi/libstub/intrinsics.c
+@@ -0,0 +1,30 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include <linux/efi.h>
++#include <asm/efi.h>
++#include <asm/string.h>
++
++#include "efistub.h"
++
++#ifdef CONFIG_KASAN
++#undef memcpy
++#undef memmove
++#undef memset
++void *__memcpy(void *__dest, const void *__src, size_t __n) __alias(memcpy);
++void *__memmove(void *__dest, const void *__src, size_t count) __alias(memmove);
++void *__memset(void *s, int c, size_t count) __alias(memset);
++#endif
++
++void *memcpy(void *dst, const void *src, size_t len)
++{
++	efi_bs_call(copy_mem, dst, src, len);
++	return dst;
++}
++
++extern void *memmove(void *dst, const void *src, size_t len) __alias(memcpy);
++
++void *memset(void *dst, int c, size_t len)
++{
++	efi_bs_call(set_mem, dst, len, c & U8_MAX);
++	return dst;
++}
+-- 
+2.33.0
+

@@ -1,0 +1,99 @@
+From 85ef08b5a667615bc7be5058259753dc42a7adcd Mon Sep 17 00:00:00 2001
+From: Chandan Babu R <chandanrlinux@gmail.com>
+Date: Fri, 22 Jan 2021 16:48:11 -0800
+Subject: [PATCH] xfs: Check for extent overflow when punching a hole
+Git-commit: 85ef08b5a667615bc7be5058259753dc42a7adcd
+Patch-mainline: v5.12-rc2
+References: bsn#12
+Modified-by-SEL: Yes, modified per openEuler commit 65efdd8c
+
+
+The extent mapping the file offset at which a hole has to be
+inserted will be split into two extents causing extent count to
+increase by 1.
+
+Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Allison Henderson <allison.henderson@oracle.com>
+Signed-off-by: Chandan Babu R <chandanrlinux@gmail.com>
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/xfs/libxfs/xfs_inode_fork.h |    7 +++++++
+ fs/xfs/xfs_bmap_item.c         |   15 +++++++++------
+ fs/xfs/xfs_bmap_util.c         |   10 ++++++++++
+ 3 files changed, 26 insertions(+), 6 deletions(-)
+
+--- a/fs/xfs/libxfs/xfs_inode_fork.h
++++ b/fs/xfs/libxfs/xfs_inode_fork.h
+@@ -41,6 +41,13 @@ struct xfs_ifork {
+ #define XFS_IEXT_ADD_NOSPLIT_CNT	(1)
+ 
+ /*
++ * Punching out an extent from the middle of an existing extent can cause the
++ * extent count to increase by 1.
++ * i.e. | Old extent | Hole | Old extent |
++ */
++#define XFS_IEXT_PUNCH_HOLE_CNT		(1)
++
++/*
+  * Fork handling.
+  */
+ 
+--- a/fs/xfs/xfs_bmap_item.c
++++ b/fs/xfs/xfs_bmap_item.c
+@@ -439,6 +439,7 @@ xfs_bui_item_recover(
+ 	xfs_exntst_t			state;
+ 	unsigned int			bui_type;
+ 	int				whichfork;
++	int				iext_delta;
+ 	int				error = 0;
+ 
+ 	/* Only one mapping operation per BUI... */
+@@ -497,12 +498,14 @@ xfs_bui_item_recover(
+ 	xfs_ilock(ip, XFS_ILOCK_EXCL);
+ 	xfs_trans_ijoin(tp, ip, 0);
+ 
+-	if (bui_type == XFS_BMAP_MAP) {
+-		error = xfs_iext_count_may_overflow(ip, whichfork,
+-				XFS_IEXT_ADD_NOSPLIT_CNT);
+-		if (error)
+-			goto err_cancel;
+-	}
++	if (bui_type == XFS_BMAP_MAP)
++		iext_delta = XFS_IEXT_ADD_NOSPLIT_CNT;
++	else
++		iext_delta = XFS_IEXT_PUNCH_HOLE_CNT;
++
++	error = xfs_iext_count_may_overflow(ip, whichfork, iext_delta);
++	if (error)
++		goto err_cancel;
+ 
+ 	count = bmap->me_len;
+ 	error = xfs_trans_log_finish_bmap_update(tp, budp, bui_type, ip,
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@ -891,6 +891,11 @@ xfs_unmap_extent(
+ 
+ 	xfs_trans_ijoin(tp, ip, 0);
+ 
++	error = xfs_iext_count_may_overflow(ip, XFS_DATA_FORK,
++			XFS_IEXT_PUNCH_HOLE_CNT);
++	if (error)
++		goto out_trans_cancel;
++
+ 	error = xfs_bunmapi(tp, ip, startoffset_fsb, len_fsb, 0, 2, done);
+ 	if (error)
+ 		goto out_trans_cancel;
+@@ -1168,6 +1173,11 @@ xfs_insert_file_space(
+ 	xfs_ilock(ip, XFS_ILOCK_EXCL);
+ 	xfs_trans_ijoin(tp, ip, 0);
+ 
++	error = xfs_iext_count_may_overflow(ip, XFS_DATA_FORK,
++			XFS_IEXT_PUNCH_HOLE_CNT);
++	if (error)
++		goto out_trans_cancel;
++
+ 	/*
+ 	 * The extent shifting code works on extent granularity. So, if stop_fsb
+ 	 * is not the starting block of extent, we need to split the extent at
