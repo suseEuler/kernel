@@ -1,0 +1,69 @@
+Git-commit: 5f2f775605917aa5087ee5c6f3339da94c100679
+From: Ming Lei <ming.lei@redhat.com>
+Date: Mon, 5 Dec 2022 21:27:39 +0800
+Subject: [PATCH] block: unhash blkdev part inode when the part is deleted
+References: bsn#19
+Patch-mainline: v5.10.158
+
+v5.11 changes the blkdev lookup mechanism completely since commit
+22ae8ce8b892 ("block: simplify bdev/disk lookup in blkdev_get"),
+and small part of the change is to unhash part bdev inode when
+deleting partition. Turns out this kind of change does fix one
+nasty issue in case of BLOCK_EXT_MAJOR:
+
+1) when one partition is deleted & closed, disk_put_part() is always
+called before bdput(bdev), see blkdev_put(); so the part's devt can
+be freed & re-used before the inode is dropped
+
+2) then new partition with same devt can be created just before the
+inode in 1) is dropped, then the old inode/bdev structurein 1) is
+re-used for this new partition, this way causes use-after-free and
+kernel panic.
+
+It isn't possible to backport the whole big patchset of "merge struct
+block_device and struct hd_struct v4" for addressing this issue.
+
+https://lore.kernel.org/linux-block/20201128161510.347752-1-hch@lst.de/
+
+So fixes it by unhashing part bdev in delete_partition(), and this way
+is actually aligned with v5.11+'s behavior.
+
+Reported-by: Shiwei Cui <cuishw@inspur.com>
+Tested-by: Shiwei Cui <cuishw@inspur.com>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: Jan Kara <jack@suse.cz>
+Signed-off-by: Ming Lei <ming.lei@redhat.com>
+Acked-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ block/partitions/core.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/block/partitions/core.c b/block/partitions/core.c
+index a02e22411594..e3d61ec4a5a6 100644
+--- a/block/partitions/core.c
++++ b/block/partitions/core.c
+@@ -329,6 +329,7 @@ void delete_partition(struct hd_struct *part)
+ 	struct gendisk *disk = part_to_disk(part);
+ 	struct disk_part_tbl *ptbl =
+ 		rcu_dereference_protected(disk->part_tbl, 1);
++	struct block_device *bdev;
+ 
+ 	/*
+ 	 * ->part_tbl is referenced in this part's release handler, so
+@@ -346,6 +347,12 @@ void delete_partition(struct hd_struct *part)
+ 	 * "in-use" until we really free the gendisk.
+ 	 */
+ 	blk_invalidate_devt(part_devt(part));
++
++	bdev = bdget_part(part);
++	if (bdev) {
++		remove_inode_hash(bdev->bd_inode);
++		bdput(bdev);
++	}
+ 	percpu_ref_kill(&part->ref);
+ }
+ 
+-- 
+2.35.3
+
