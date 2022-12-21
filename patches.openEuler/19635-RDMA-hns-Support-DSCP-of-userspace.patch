@@ -1,0 +1,271 @@
+From 11ef2ec6aa7c23bf89498f279fff1bf01899df05 Mon Sep 17 00:00:00 2001
+From: Yixing Liu <liuyixing1@huawei.com>
+Date: Tue, 1 Nov 2022 23:04:34 +0800
+Subject: [PATCH] RDMA/hns: Support DSCP of userspace
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 11ef2ec6aa7c23bf89498f279fff1bf01899df05
+Modified-by-SEL: No
+
+
+driver inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5XYHV
+
+----------------------------------------------------------
+
+This patch add support to config dscp map to tc by
+nic interface get_dscp_prio. Driver will convert
+mapping relationship from dscp-prio to dscp-tc.
+
+The dependency patch is as follows:
+7a1313b356de ("net: hns3: add support config dscp map to tc")
+
+Signed-off-by: Yixing Liu <liuyixing1@huawei.com>
+Reviewed-by: Yangyang Li <liyangyang20@huawei.com>
+Reviewed-by: Yue Haibing <yuehaibing@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/infiniband/hw/hns/hns_roce_ah.c     | 26 +++++++-
+ drivers/infiniband/hw/hns/hns_roce_device.h |  4 ++
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.c  | 69 ++++++++++++++++++---
+ drivers/infiniband/hw/hns/hns_roce_qp.c     | 13 ++++
+ include/uapi/rdma/hns-abi.h                 | 12 ++++
+ 5 files changed, 112 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/infiniband/hw/hns/hns_roce_ah.c b/drivers/infiniband/hw/hns/hns_roce_ah.c
+index 492b122d0521..cea402b28c44 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_ah.c
++++ b/drivers/infiniband/hw/hns/hns_roce_ah.c
+@@ -33,7 +33,9 @@
+ #include <linux/pci.h>
+ #include <rdma/ib_addr.h>
+ #include <rdma/ib_cache.h>
++#include "hnae3.h"
+ #include "hns_roce_device.h"
++#include "hns_roce_hw_v2.h"
+ 
+ static inline u16 get_ah_udp_sport(const struct rdma_ah_attr *ah_attr)
+ {
+@@ -57,8 +59,11 @@ int hns_roce_create_ah(struct ib_ah *ibah, struct rdma_ah_init_attr *init_attr,
+ 	struct rdma_ah_attr *ah_attr = init_attr->ah_attr;
+ 	const struct ib_global_route *grh = rdma_ah_read_grh(ah_attr);
+ 	struct hns_roce_dev *hr_dev = to_hr_dev(ibah->device);
++	struct hns_roce_ib_create_ah_resp resp = {};
+ 	struct hns_roce_ah *ah = to_hr_ah(ibah);
+-	int ret = 0;
++	u8 priority;
++	u8 tc_mode;
++	int ret;
+ 
+ 	if (hr_dev->pci_dev->revision == PCI_REVISION_ID_HIP08 && udata)
+ 		return -EOPNOTSUPP;
+@@ -72,9 +77,19 @@ int hns_roce_create_ah(struct ib_ah *ibah, struct rdma_ah_init_attr *init_attr,
+ 	ah->av.hop_limit = grh->hop_limit;
+ 	ah->av.flowlabel = grh->flow_label;
+ 	ah->av.udp_sport = get_ah_udp_sport(ah_attr);
+-	ah->av.sl = rdma_ah_get_sl(ah_attr);
+ 	ah->av.tclass = get_tclass(grh);
+ 
++	ret = hr_dev->hw->get_dscp(hr_dev, get_tclass(grh), &tc_mode,
++				   &priority);
++	if (ret && ret != -EOPNOTSUPP)
++		return ret;
++
++	if (tc_mode == HNAE3_TC_MAP_MODE_DSCP &&
++	    grh->sgid_attr->gid_type == IB_GID_TYPE_ROCE_UDP_ENCAP)
++		ah->av.sl = priority;
++	else
++		ah->av.sl = rdma_ah_get_sl(ah_attr);
++
+ 	memcpy(ah->av.dgid, grh->dgid.raw, HNS_ROCE_GID_SIZE);
+ 	memcpy(ah->av.mac, ah_attr->roce.dmac, ETH_ALEN);
+ 
+@@ -88,6 +103,13 @@ int hns_roce_create_ah(struct ib_ah *ibah, struct rdma_ah_init_attr *init_attr,
+ 		ah->av.vlan_en = ah->av.vlan_id < VLAN_N_VID;
+ 	}
+ 
++	if (udata) {
++		resp.priority = ah->av.sl;
++		resp.tc_mode = tc_mode;
++		ret = ib_copy_to_udata(udata, &resp,
++				       min(udata->outlen, sizeof(resp)));
++	}
++
+ 	return ret;
+ }
+ 
+diff --git a/drivers/infiniband/hw/hns/hns_roce_device.h b/drivers/infiniband/hw/hns/hns_roce_device.h
+index 54c17dcab4a8..7a945cefd5a0 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_device.h
++++ b/drivers/infiniband/hw/hns/hns_roce_device.h
+@@ -631,6 +631,8 @@ struct hns_roce_qp {
+ 	struct list_head	sq_node; /* all send qps are on a list */
+ 	struct hns_user_mmap_entry *dwqe_mmap_entry;
+ 	u32			config;
++	u8			tc_mode;
++	u8			priority;
+ };
+ 
+ struct hns_roce_ib_iboe {
+@@ -891,6 +893,8 @@ struct hns_roce_hw {
+ 	int (*query_cqc)(struct hns_roce_dev *hr_dev, u32 cqn, void *buffer);
+ 	int (*query_qpc)(struct hns_roce_dev *hr_dev, u32 qpn, void *buffer);
+ 	int (*query_mpt)(struct hns_roce_dev *hr_dev, u32 key, void *buffer);
++	int (*get_dscp)(struct hns_roce_dev *hr_dev, u8 dscp,
++			u8 *tc_mode, u8 *priority);
+ 	const struct ib_device_ops *hns_roce_dev_ops;
+ 	const struct ib_device_ops *hns_roce_dev_srq_ops;
+ };
+diff --git a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+index f7962c96745b..450b7ac4333c 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+@@ -4922,6 +4922,61 @@ static int fill_cong_field(struct ib_qp *ibqp, const struct ib_qp_attr *attr,
+ 	return 0;
+ }
+ 
++int hns_roce_hw_v2_get_dscp(struct hns_roce_dev *hr_dev, u8 dscp,
++			    u8 *tc_mode, u8 *priority)
++{
++	struct hns_roce_v2_priv *priv = hr_dev->priv;
++	struct hnae3_handle *handle = priv->handle;
++	const struct hnae3_ae_ops *ops = handle->ae_algo->ops;
++	int ret;
++
++	if (!ops->get_dscp_prio)
++		return -EOPNOTSUPP;
++
++	ret = ops->get_dscp_prio(handle, dscp, tc_mode, priority);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++static int hns_roce_set_sl(struct ib_qp *ibqp,
++			   const struct ib_qp_attr *attr,
++			   struct hns_roce_v2_qp_context *context,
++			   struct hns_roce_v2_qp_context *qpc_mask)
++{
++	const struct ib_global_route *grh = rdma_ah_read_grh(&attr->ah_attr);
++	struct hns_roce_dev *hr_dev = to_hr_dev(ibqp->device);
++	struct hns_roce_qp *hr_qp = to_hr_qp(ibqp);
++	struct ib_device *ibdev = &hr_dev->ib_dev;
++	int ret;
++
++	ret = hns_roce_hw_v2_get_dscp(hr_dev, get_tclass(&attr->ah_attr.grh),
++				      &hr_qp->tc_mode, &hr_qp->priority);
++	if (ret && ret != -EOPNOTSUPP) {
++		ibdev_err(ibdev, "failed to get dscp, ret = %d.\n", ret);
++		return ret;
++	}
++
++	if (hr_qp->tc_mode == HNAE3_TC_MAP_MODE_DSCP &&
++	    grh->sgid_attr->gid_type == IB_GID_TYPE_ROCE_UDP_ENCAP)
++		hr_qp->sl = hr_qp->priority;
++	else
++		hr_qp->sl = rdma_ah_get_sl(&attr->ah_attr);
++
++	if (unlikely(hr_qp->sl > MAX_SERVICE_LEVEL)) {
++		ibdev_err(ibdev,
++			  "failed to fill QPC, sl (%u) shouldn't be larger than %d.\n",
++			  hr_qp->sl, MAX_SERVICE_LEVEL);
++		return -EINVAL;
++	}
++
++	hr_reg_write(context, QPC_SL, hr_qp->sl);
++	hr_reg_clear(qpc_mask, QPC_SL);
++
++	return 0;
++}
++
+ static int hns_roce_v2_set_path(struct ib_qp *ibqp,
+ 				const struct ib_qp_attr *attr,
+ 				int attr_mask,
+@@ -5015,16 +5070,9 @@ static int hns_roce_v2_set_path(struct ib_qp *ibqp,
+ 	memcpy(context->dgid, grh->dgid.raw, sizeof(grh->dgid.raw));
+ 	memset(qpc_mask->dgid, 0, sizeof(grh->dgid.raw));
+ 
+-	hr_qp->sl = rdma_ah_get_sl(&attr->ah_attr);
+-	if (unlikely(hr_qp->sl > MAX_SERVICE_LEVEL)) {
+-		ibdev_err(ibdev,
+-			  "failed to fill QPC, sl (%u) shouldn't be larger than %d.\n",
+-			  hr_qp->sl, MAX_SERVICE_LEVEL);
+-		return -EINVAL;
+-	}
+-
+-	hr_reg_write(context, QPC_SL, hr_qp->sl);
+-	hr_reg_clear(qpc_mask, QPC_SL);
++	ret = hns_roce_set_sl(ibqp, attr, context, qpc_mask);
++	if (ret)
++		return ret;
+ 
+ 	return 0;
+ }
+@@ -6730,6 +6778,7 @@ static const struct hns_roce_hw hns_roce_hw_v2 = {
+ 	.query_cqc = hns_roce_v2_query_cqc,
+ 	.query_qpc = hns_roce_v2_query_qpc,
+ 	.query_mpt = hns_roce_v2_query_mpt,
++	.get_dscp = hns_roce_hw_v2_get_dscp,
+ 	.hns_roce_dev_ops = &hns_roce_v2_dev_ops,
+ 	.hns_roce_dev_srq_ops = &hns_roce_v2_dev_srq_ops,
+ };
+diff --git a/drivers/infiniband/hw/hns/hns_roce_qp.c b/drivers/infiniband/hw/hns/hns_roce_qp.c
+index 50177c47b247..cbe7d37430c7 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_qp.c
++++ b/drivers/infiniband/hw/hns/hns_roce_qp.c
+@@ -1338,6 +1338,7 @@ int hns_roce_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
+ {
+ 	struct hns_roce_dev *hr_dev = to_hr_dev(ibqp->device);
+ 	struct hns_roce_qp *hr_qp = to_hr_qp(ibqp);
++	struct hns_roce_ib_modify_qp_resp resp = {};
+ 	enum ib_qp_state cur_state, new_state;
+ 	int ret = -EINVAL;
+ 
+@@ -1378,6 +1379,18 @@ int hns_roce_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
+ 
+ 	ret = hr_dev->hw->modify_qp(ibqp, attr, attr_mask, cur_state,
+ 				    new_state, udata);
++	if (ret)
++		goto out;
++
++	if (udata && udata->outlen) {
++		resp.tc_mode = hr_qp->tc_mode;
++		resp.priority = hr_qp->priority;
++		ret = ib_copy_to_udata(udata, &resp,
++				       min(udata->outlen, sizeof(resp)));
++		if (ret)
++			ibdev_err(&hr_dev->ib_dev,
++				  "failed to copy modify qp resp.\n");
++	}
+ 
+ out:
+ 	mutex_unlock(&hr_qp->mutex);
+diff --git a/include/uapi/rdma/hns-abi.h b/include/uapi/rdma/hns-abi.h
+index cd334ee5804c..b8a5d65333aa 100644
+--- a/include/uapi/rdma/hns-abi.h
++++ b/include/uapi/rdma/hns-abi.h
+@@ -85,6 +85,18 @@ struct hns_roce_ib_create_qp_resp {
+ 	__aligned_u64 dwqe_mmap_key;
+ };
+ 
++struct hns_roce_ib_create_ah_resp {
++	__u8    priority;
++	__u8    tc_mode;
++	__u8    reserved[6];
++};
++
++struct hns_roce_ib_modify_qp_resp {
++	__u8	tc_mode;
++	__u8	priority;
++	__u8	reserved[6];
++};
++
+ enum {
+ 	HNS_ROCE_EXSGE_FLAGS = 1 << 0,
+ 	HNS_ROCE_RQ_INLINE_FLAGS = 1 << 1,
+-- 
+2.33.0
+

@@ -1,0 +1,247 @@
+From 9a8c09fcadb2d225a4222df7d308a23cf78591ad Mon Sep 17 00:00:00 2001
+From: He Sheng <hesheng@wxiat.com>
+Date: Wed, 17 Aug 2022 10:05:26 +0800
+Subject: [PATCH] sw64: ensure IRQs are off when switch/load/activate mm
+ context
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 9a8c09fcadb2d225a4222df7d308a23cf78591ad
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5PNEN
+
+--------------------------------
+
+This is because of commit f98db6013c55 ("sched/core: Add switch_mm_irqs_off()
+and use it in the scheduler") in which switch_mm_irqs_off() is called by the
+scheduler, vs switch_mm() which is used by use_mm().
+
+This patch mirrors the x86 code, ie. it disables interrupt in switch_mm(), and
+optimises the scheduler case by defining switch_mm_irqs_off(). After that, the
+asn_lock and need_new_asn in cpu_data are no longer needed.
+
+This patch also moves __load_new_mm_context() into flush_tlb_current() and make
+sure IRQs are off over it.
+
+Signed-off-by: He Sheng <hesheng@wxiat.com>
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/include/asm/hw_init.h     |  2 --
+ arch/sw_64/include/asm/mmu_context.h | 48 ++++++++--------------------
+ arch/sw_64/include/asm/switch_to.h   |  1 -
+ arch/sw_64/include/asm/tlbflush.h    | 21 +++++++++---
+ arch/sw_64/kernel/setup.c            |  2 --
+ arch/sw_64/kernel/smp.c              |  2 --
+ arch/sw_64/mm/fault.c                | 16 ----------
+ 7 files changed, 31 insertions(+), 61 deletions(-)
+
+diff --git a/arch/sw_64/include/asm/hw_init.h b/arch/sw_64/include/asm/hw_init.h
+index 545e9a99a49c..a36c811839ea 100644
+--- a/arch/sw_64/include/asm/hw_init.h
++++ b/arch/sw_64/include/asm/hw_init.h
+@@ -20,8 +20,6 @@ struct cache_desc {
+ struct cpuinfo_sw64 {
+ 	unsigned long loops_per_jiffy;
+ 	unsigned long last_asn;
+-	int need_new_asn;
+-	int asn_lock;
+ 	unsigned long ipi_count;
+ 	struct cache_desc icache; /* Primary I-cache */
+ 	struct cache_desc dcache; /* Primary D or combined I/D cache */
+diff --git a/arch/sw_64/include/asm/mmu_context.h b/arch/sw_64/include/asm/mmu_context.h
+index 10199db1d637..84e84048a3ba 100644
+--- a/arch/sw_64/include/asm/mmu_context.h
++++ b/arch/sw_64/include/asm/mmu_context.h
+@@ -13,10 +13,9 @@
+ #include <asm/io.h>
+ 
+ /*
+- * Force a context reload. This is needed when we change the page
+- * table pointer or when we update the ASID of the current process.
++ * Load a mm context. This is needed when we change the page
++ * table pointer(CSR:PTBR) or when we update the ASID.
+  *
+- * CSR:UPN holds ASID and CSR:PTBR holds page table pointer.
+  */
+ #define load_asn_ptbr   load_mm
+ 
+@@ -69,17 +68,13 @@ __get_new_mm_context(struct mm_struct *mm, long cpu)
+ }
+ 
+ static inline void
+-switch_mm(struct mm_struct *prev_mm, struct mm_struct *next_mm,
+-	  struct task_struct *next)
++switch_mm_irqs_off(struct mm_struct *prev_mm, struct mm_struct *next_mm,
++		   struct task_struct *next)
+ {
+ 	/* Check if our ASN is of an older version, and thus invalid. */
+ 	unsigned long asn, mmc, ptbr;
+ 	long cpu = smp_processor_id();
+ 
+-#ifdef CONFIG_SMP
+-	cpu_data[cpu].asn_lock = 1;
+-	barrier();
+-#endif
+ 	asn = cpu_last_asn(cpu);
+ 	mmc = next_mm->context.asid[cpu];
+ 	if ((mmc ^ asn) & ~HARDWARE_ASN_MASK) {
+@@ -87,10 +82,6 @@ switch_mm(struct mm_struct *prev_mm, struct mm_struct *next_mm,
+ 		mmc = __get_new_mm_context(next_mm, cpu);
+ 		next_mm->context.asid[cpu] = mmc;
+ 	}
+-#ifdef CONFIG_SMP
+-	else
+-		cpu_data[cpu].need_new_asn = 1;
+-#endif
+ 
+ 	/*
+ 	 * Update CSR:UPN and CSR:PTBR. Another thread may have allocated
+@@ -102,31 +93,20 @@ switch_mm(struct mm_struct *prev_mm, struct mm_struct *next_mm,
+ 	load_asn_ptbr(asn, ptbr);
+ }
+ 
+-extern void __load_new_mm_context(struct mm_struct *);
+-
+-#ifdef CONFIG_SMP
+-#define check_mmu_context()					\
+-do {								\
+-	int cpu = smp_processor_id();				\
+-	cpu_data[cpu].asn_lock = 0;				\
+-	barrier();						\
+-	if (cpu_data[cpu].need_new_asn) {			\
+-		struct mm_struct *mm = current->active_mm;	\
+-		cpu_data[cpu].need_new_asn = 0;			\
+-		if (!mm->context.asid[cpu])			\
+-			__load_new_mm_context(mm);		\
+-	}							\
+-} while (0)
+-#else
+-#define check_mmu_context()  do { } while (0)
+-#endif
++#define switch_mm_irqs_off switch_mm_irqs_off
+ 
+-static inline void activate_mm(struct mm_struct *prev_mm,
+-			       struct mm_struct *next_mm)
++static inline void
++switch_mm(struct mm_struct *prev_mm, struct mm_struct *next_mm,
++	  struct task_struct *tsk)
+ {
+-	__load_new_mm_context(next_mm);
++	unsigned long flags;
++
++	local_irq_save(flags);
++	switch_mm_irqs_off(prev_mm, next_mm, tsk);
++	local_irq_restore(flags);
+ }
+ 
++#define activate_mm(prev, next) switch_mm(prev, next, current)
+ #define deactivate_mm(tsk, mm)	do { } while (0)
+ 
+ static inline int init_new_context(struct task_struct *tsk,
+diff --git a/arch/sw_64/include/asm/switch_to.h b/arch/sw_64/include/asm/switch_to.h
+index 967fe1d680da..e5596a735b2d 100644
+--- a/arch/sw_64/include/asm/switch_to.h
++++ b/arch/sw_64/include/asm/switch_to.h
+@@ -48,7 +48,6 @@ do {									\
+ 	struct task_struct *__next = (next);				\
+ 	__switch_to_aux(__prev, __next);				\
+ 	(last) = __switch_to(__prev, __next);				\
+-	check_mmu_context();						\
+ } while (0)
+ 
+ 
+diff --git a/arch/sw_64/include/asm/tlbflush.h b/arch/sw_64/include/asm/tlbflush.h
+index e508a4d66d37..b35af83e6ec2 100644
+--- a/arch/sw_64/include/asm/tlbflush.h
++++ b/arch/sw_64/include/asm/tlbflush.h
+@@ -8,13 +8,26 @@
+ #include <asm/pgalloc.h>
+ #include <asm/hw_init.h>
+ #include <asm/hmcall.h>
+-
+-extern void __load_new_mm_context(struct mm_struct *);
+-
++#include <asm/mmu_context.h>
+ 
+ static inline void flush_tlb_current(struct mm_struct *mm)
+ {
+-	__load_new_mm_context(mm);
++	unsigned long mmc, asn, ptbr, flags;
++
++	local_irq_save(flags);
++
++	mmc = __get_new_mm_context(mm, smp_processor_id());
++	mm->context.asid[smp_processor_id()] = mmc;
++
++	/*
++	 * Force a new ASN for a task. Note that there is no way to
++	 * write UPN only now, so call load_asn_ptbr here.
++	 */
++	asn = mmc & HARDWARE_ASN_MASK;
++	ptbr = virt_to_pfn(mm->pgd);
++	load_asn_ptbr(asn, ptbr);
++
++	local_irq_restore(flags);
+ }
+ 
+ /*
+diff --git a/arch/sw_64/kernel/setup.c b/arch/sw_64/kernel/setup.c
+index 39103e4edee4..cb04aaa0cb97 100644
+--- a/arch/sw_64/kernel/setup.c
++++ b/arch/sw_64/kernel/setup.c
+@@ -145,8 +145,6 @@ void store_cpu_data(int cpu)
+ {
+ 	cpu_data[cpu].loops_per_jiffy = loops_per_jiffy;
+ 	cpu_data[cpu].last_asn = ASN_FIRST_VERSION;
+-	cpu_data[cpu].need_new_asn = 0;
+-	cpu_data[cpu].asn_lock = 0;
+ }
+ 
+ #ifdef CONFIG_KEXEC
+diff --git a/arch/sw_64/kernel/smp.c b/arch/sw_64/kernel/smp.c
+index 8f752c604db0..b66608c4934b 100644
+--- a/arch/sw_64/kernel/smp.c
++++ b/arch/sw_64/kernel/smp.c
+@@ -499,8 +499,6 @@ void flush_tlb_all(void)
+ 	on_each_cpu(ipi_flush_tlb_all, NULL, 1);
+ }
+ 
+-#define asn_locked() (cpu_data[smp_processor_id()].asn_lock)
+-
+ static void ipi_flush_tlb_mm(void *x)
+ {
+ 	struct mm_struct *mm = (struct mm_struct *) x;
+diff --git a/arch/sw_64/mm/fault.c b/arch/sw_64/mm/fault.c
+index 126752771b11..574fe7930aac 100644
+--- a/arch/sw_64/mm/fault.c
++++ b/arch/sw_64/mm/fault.c
+@@ -61,22 +61,6 @@ void show_all_vma(void)
+ 	}
+ }
+ 
+-/*
+- * Force a new ASN for a task.
+- */
+-void __load_new_mm_context(struct mm_struct *next_mm)
+-{
+-	unsigned long mmc, asn, ptbr;
+-
+-	mmc = __get_new_mm_context(next_mm, smp_processor_id());
+-	next_mm->context.asid[smp_processor_id()] = mmc;
+-
+-	asn = mmc & HARDWARE_ASN_MASK;
+-	ptbr = virt_to_pfn(next_mm->pgd);
+-
+-	load_asn_ptbr(asn, ptbr);
+-}
+-
+ /*
+  * This routine handles page faults.  It determines the address,
+  * and the problem, and then passes it off to handle_mm_fault().
+-- 
+2.33.0
+

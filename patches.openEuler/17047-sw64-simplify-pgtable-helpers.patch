@@ -1,0 +1,338 @@
+From 5c841330a078634752deca6aaf3fd749f092a0eb Mon Sep 17 00:00:00 2001
+From: He Sheng <hesheng@wxiat.com>
+Date: Tue, 17 May 2022 15:05:15 +0800
+Subject: [PATCH] sw64: simplify pgtable helpers
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 5c841330a078634752deca6aaf3fd749f092a0eb
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56OLG
+
+--------------------------------
+
+This patch:
+  - Remove unused macros.
+  - Rename some variables and macros to make them shorter.
+  - Add pfn_to_virt and virt_to_pfn to make code cleaner.
+  - Map vaddr by __va().
+  - Redefine mk_pte with pfn_to_pte.
+  - Fix some wrong usages, like pgd_offset
+
+Signed-off-by: He Sheng <hesheng@wxiat.com>
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/include/asm/mmu_context.h |  8 +--
+ arch/sw_64/include/asm/mmzone.h      | 23 -------
+ arch/sw_64/include/asm/page.h        |  3 +
+ arch/sw_64/include/asm/pgalloc.h     |  2 +-
+ arch/sw_64/include/asm/pgtable.h     | 91 +++++++++-------------------
+ arch/sw_64/mm/fault.c                |  6 +-
+ arch/sw_64/mm/init.c                 |  2 +-
+ 7 files changed, 40 insertions(+), 95 deletions(-)
+
+diff --git a/arch/sw_64/include/asm/mmu_context.h b/arch/sw_64/include/asm/mmu_context.h
+index e3d7ae7c873e..d6cd01d55712 100644
+--- a/arch/sw_64/include/asm/mmu_context.h
++++ b/arch/sw_64/include/asm/mmu_context.h
+@@ -131,7 +131,7 @@ switch_mm(struct mm_struct *prev_mm, struct mm_struct *next_mm,
+ 	 * Always update the PCB PTBR. If next is kernel thread, it must
+ 	 * update PTBR. If next is user process, it's ok to update PTBR.
+ 	 */
+-	task_thread_info(next)->pcb.ptbr = (__pa(next_mm->pgd)) >> PAGE_SHIFT;
++	task_thread_info(next)->pcb.ptbr = virt_to_pfn(next_mm->pgd);
+ 	load_asn_ptbr(task_thread_info(next)->pcb.asn, task_thread_info(next)->pcb.ptbr);
+ }
+ 
+@@ -170,8 +170,7 @@ static inline int init_new_context(struct task_struct *tsk,
+ 	for_each_possible_cpu(i)
+ 		mm->context.asid[i] = 0;
+ 	if (tsk != current)
+-		task_thread_info(tsk)->pcb.ptbr
+-			= (__pa(mm->pgd)) >> PAGE_SHIFT;
++		task_thread_info(tsk)->pcb.ptbr = virt_to_pfn(mm->pgd);
+ 	return 0;
+ }
+ 
+@@ -183,8 +182,7 @@ static inline void destroy_context(struct mm_struct *mm)
+ static inline void enter_lazy_tlb(struct mm_struct *mm,
+ 				  struct task_struct *tsk)
+ {
+-	task_thread_info(tsk)->pcb.ptbr
+-		= (__pa(mm->pgd)) >> PAGE_SHIFT;
++	task_thread_info(tsk)->pcb.ptbr = virt_to_pfn(mm->pgd);
+ }
+ 
+ static inline int arch_dup_mmap(struct mm_struct *oldmm,
+diff --git a/arch/sw_64/include/asm/mmzone.h b/arch/sw_64/include/asm/mmzone.h
+index 924e33f6d326..4219015c5cfc 100644
+--- a/arch/sw_64/include/asm/mmzone.h
++++ b/arch/sw_64/include/asm/mmzone.h
+@@ -18,29 +18,6 @@ extern pg_data_t *node_data[];
+ extern int pa_to_nid(unsigned long pa);
+ extern int pfn_valid(unsigned long pfn);
+ 
+-#define mk_pte(page, pgprot)							\
+-({										\
+-	pte_t pte;								\
+-	unsigned long pfn;							\
+-										\
+-	pfn = page_to_pfn(page) << _PTE_FLAGS_BITS;				\
+-	pte_val(pte) = pfn | pgprot_val(pgprot);				\
+-										\
+-	pte;									\
+-})
+-
+-#define pte_page(x)								\
+-({										\
+-	unsigned long kvirt;							\
+-	struct page *__xx;							\
+-										\
+-	kvirt = (unsigned long)__va(pte_val(x) >> (_PTE_FLAGS_BITS-PAGE_SHIFT));\
+-	__xx = virt_to_page(kvirt);						\
+-										\
+-	__xx;									\
+-})
+-
+-#define page_to_pa(page)	(page_to_pfn(page) << PAGE_SHIFT)
+ #define pfn_to_nid(pfn)		pa_to_nid(((u64)(pfn) << PAGE_SHIFT))
+ #endif /* CONFIG_DISCONTIGMEM */
+ 
+diff --git a/arch/sw_64/include/asm/page.h b/arch/sw_64/include/asm/page.h
+index 363785c9f082..dc6a89c37231 100644
+--- a/arch/sw_64/include/asm/page.h
++++ b/arch/sw_64/include/asm/page.h
+@@ -50,6 +50,9 @@ extern unsigned long __phys_addr(unsigned long);
+ #define virt_to_page(kaddr)	pfn_to_page(__pa(kaddr) >> PAGE_SHIFT)
+ #define virt_addr_valid(kaddr)	pfn_valid(__pa(kaddr) >> PAGE_SHIFT)
+ 
++#define virt_to_pfn(vaddr)	(PHYS_PFN(__pa(vaddr)))
++#define pfn_to_virt(pfn)	(__va(PFN_PHYS(pfn)))
++
+ #ifdef CONFIG_FLATMEM
+ #define pfn_valid(pfn)		((pfn) < max_mapnr)
+ #endif /* CONFIG_FLATMEM */
+diff --git a/arch/sw_64/include/asm/pgalloc.h b/arch/sw_64/include/asm/pgalloc.h
+index 3cfdcbef7ef8..9572b4709ff4 100644
+--- a/arch/sw_64/include/asm/pgalloc.h
++++ b/arch/sw_64/include/asm/pgalloc.h
+@@ -15,7 +15,7 @@
+ static inline void
+ pmd_populate(struct mm_struct *mm, pmd_t *pmd, pgtable_t pte)
+ {
+-	pmd_set(pmd, (pte_t *)(page_to_pa(pte) + PAGE_OFFSET));
++	pmd_set(pmd, (pte_t *)__va(page_to_pa(pte)));
+ }
+ #define pmd_pgtable(pmd) pmd_page(pmd)
+ 
+diff --git a/arch/sw_64/include/asm/pgtable.h b/arch/sw_64/include/asm/pgtable.h
+index 590f15508e28..67637b4ddf1d 100644
+--- a/arch/sw_64/include/asm/pgtable.h
++++ b/arch/sw_64/include/asm/pgtable.h
+@@ -119,9 +119,8 @@ static inline void set_pmd_at(struct mm_struct *mm, unsigned long addr,
+ #define __ACCESS_BITS	(_PAGE_ACCESSED | _PAGE_KRE | _PAGE_URE)
+ 
+ 
+-#define _PFN_MASK	0xFFFFFFFFF0000000UL
+-#define _PFN_BITS	36
+-#define _PTE_FLAGS_BITS	(64 - _PFN_BITS)
++#define _PFN_SHIFT	28
++#define _PFN_MASK	((-1UL) << _PFN_SHIFT)
+ 
+ #define _PAGE_TABLE	(_PAGE_VALID | __DIRTY_BITS | __ACCESS_BITS)
+ #define _PAGE_CHG_MASK	(_PFN_MASK | __DIRTY_BITS | __ACCESS_BITS | _PAGE_SPECIAL)
+@@ -181,53 +180,19 @@ static inline void set_pmd_at(struct mm_struct *mm, unsigned long addr,
+ extern struct page *empty_zero_page;
+ #define ZERO_PAGE(vaddr)		(empty_zero_page)
+ 
+-/* number of bits that fit into a memory pointer */
+-#define BITS_PER_PTR			(8 * sizeof(unsigned long))
+-
+-/* to align the pointer to a pointer address */
+-#define PTR_MASK			(~(sizeof(void *) - 1))
+-
+-/* sizeof(void*)==1<<SIZEOF_PTR_LOG2 */
+-#define SIZEOF_PTR_LOG2			3
+-
+-/* to find an entry in a page-table */
+-#define PAGE_PTR(address) \
+-	((unsigned long)(address) >> (PAGE_SHIFT - SIZEOF_PTR_LOG2) & PTR_MASK & ~PAGE_MASK)
+-
+-#define PHYS_TWIDDLE(pfn)		(pfn)
+-
+-/*
+- * Conversion functions:  convert a page and protection to a page entry,
+- * and a page entry and page directory to the page they refer to.
+- */
+-#define page_to_pa(page)		(page_to_pfn(page) << PAGE_SHIFT)
+-
+-#define pmd_pfn(pmd)			(pmd_val(pmd) >> _PTE_FLAGS_BITS)
+-#define pte_pfn(pte)			(pte_val(pte) >> _PTE_FLAGS_BITS)
+-#ifndef CONFIG_DISCONTIGMEM
+-#define pte_page(pte)			pfn_to_page(pte_pfn(pte))
+-#define mk_pte(page, pgprot)						\
+-({									\
+-	pte_t pte;							\
+-									\
+-	pte_val(pte) = (page_to_pfn(page) << _PTE_FLAGS_BITS) | pgprot_val(pgprot);	\
+-	pte;								\
+-})
+-#endif
+-
+-static inline pte_t pfn_pte(unsigned long physpfn, pgprot_t pgprot)
++static inline pte_t pfn_pte(unsigned long pfn, pgprot_t prot)
+ {
+ 	pte_t pte;
+ 
+-	pte_val(pte) = (PHYS_TWIDDLE(physpfn) << _PTE_FLAGS_BITS) | pgprot_val(pgprot);
++	pte_val(pte) = (pfn << _PFN_SHIFT) | pgprot_val(prot);
+ 	return pte;
+ }
+ 
+-static inline pmd_t pfn_pmd(unsigned long physpfn, pgprot_t pgprot)
++static inline pmd_t pfn_pmd(unsigned long pfn, pgprot_t prot)
+ {
+ 	pmd_t pmd;
+ 
+-	pmd_val(pmd) = (PHYS_TWIDDLE(physpfn) << _PTE_FLAGS_BITS) | pgprot_val(pgprot);
++	pmd_val(pmd) = (pfn << _PFN_SHIFT) | pgprot_val(prot);
+ 	return pmd;
+ }
+ 
+@@ -245,37 +210,48 @@ static inline pmd_t pmd_modify(pmd_t pmd, pgprot_t newprot)
+ 
+ static inline void pmd_set(pmd_t *pmdp, pte_t *ptep)
+ {
+-	pmd_val(*pmdp) = _PAGE_TABLE | (__pa(ptep) << (_PTE_FLAGS_BITS - PAGE_SHIFT));
++	pmd_val(*pmdp) = _PAGE_TABLE | (virt_to_pfn(ptep) << _PFN_SHIFT);
+ }
+ 
+ static inline void pud_set(pud_t *pudp, pmd_t *pmdp)
+ {
+-	pud_val(*pudp) = _PAGE_TABLE | (__pa(pmdp) << (_PTE_FLAGS_BITS - PAGE_SHIFT));
++	pud_val(*pudp) = _PAGE_TABLE | (virt_to_pfn(pmdp) << _PFN_SHIFT);
+ }
+ 
+ static inline void p4d_set(p4d_t *p4dp, pud_t *pudp)
+ {
+-	p4d_val(*p4dp) = _PAGE_TABLE | (__pa(pudp) << (_PTE_FLAGS_BITS - PAGE_SHIFT));
++	p4d_val(*p4dp) = _PAGE_TABLE | (virt_to_pfn(pudp) << _PFN_SHIFT);
+ }
+ 
+-static inline unsigned long
+-pmd_page_vaddr(pmd_t pmd)
++static inline unsigned long pmd_page_vaddr(pmd_t pmd)
+ {
+-	return ((pmd_val(pmd) & _PFN_MASK) >> (_PTE_FLAGS_BITS-PAGE_SHIFT)) + PAGE_OFFSET;
++	return (unsigned long)pfn_to_virt(pmd_val(pmd) >> _PFN_SHIFT);
+ }
+ 
+-#define pmd_page(pmd)		(pfn_to_page(pmd_val(pmd) >> _PTE_FLAGS_BITS))
+-#define pud_page(pud)		(pfn_to_page(pud_val(pud) >> _PTE_FLAGS_BITS))
+-#define p4d_page(p4d)		(pfn_to_page(p4d_val(p4d) >> _PTE_FLAGS_BITS))
++/*
++ * Conversion functions:  convert a page and protection to a page entry,
++ * and a page entry and page directory to the page they refer to.
++ */
++#define page_to_pa(page)	(page_to_pfn(page) << PAGE_SHIFT)
++
++#define pmd_pfn(pmd)		(pmd_val(pmd) >> _PFN_SHIFT)
++#define pte_pfn(pte)		(pte_val(pte) >> _PFN_SHIFT)
++
++#define pte_page(pte)		pfn_to_page(pte_pfn(pte))
++#define mk_pte(page, prot)	pfn_pte(page_to_pfn(page), prot)
++
++#define pmd_page(pmd)		(pfn_to_page(pmd_val(pmd) >> _PFN_SHIFT))
++#define pud_page(pud)		(pfn_to_page(pud_val(pud) >> _PFN_SHIFT))
++#define p4d_page(p4d)		(pfn_to_page(p4d_val(p4d) >> _PFN_SHIFT))
+ 
+ static inline pud_t *p4d_pgtable(p4d_t p4d)
+ {
+-	return (pud_t *)(PAGE_OFFSET + ((p4d_val(p4d) & _PFN_MASK) >> (_PTE_FLAGS_BITS-PAGE_SHIFT)));
++	return (pud_t *)pfn_to_virt(p4d_val(p4d) >> _PFN_SHIFT);
+ }
+ 
+ static inline pmd_t *pud_pgtable(pud_t pud)
+ {
+-	return (pmd_t *)(PAGE_OFFSET + ((pud_val(pud) & _PFN_MASK) >> (_PTE_FLAGS_BITS-PAGE_SHIFT)));
++	return (pmd_t *)pfn_to_virt(pud_val(pud) >> _PFN_SHIFT);
+ }
+ 
+ static inline int pte_none(pte_t pte)
+@@ -566,7 +542,7 @@ static inline void pmdp_set_wrprotect(struct mm_struct *mm,
+ 	set_bit(_PAGE_BIT_FOW, (unsigned long *)pmdp);
+ }
+ 
+-#define mk_pmd(page, pgprot)   pfn_pmd(page_to_pfn(page), (pgprot))
++#define mk_pmd(page, prot)	pfn_pmd(page_to_pfn(page), (prot))
+ 
+ #define  __HAVE_ARCH_PMDP_SET_ACCESS_FLAGS
+ extern int pmdp_set_access_flags(struct vm_area_struct *vma,
+@@ -586,15 +562,6 @@ extern int pmdp_clear_flush_young(struct vm_area_struct *vma,
+ extern void pmdp_splitting_flush(struct vm_area_struct *vma,
+ 				 unsigned long addr, pmd_t *pmdp);
+ 
+-#define PAGE_DIR_OFFSET(tsk, address) pgd_offset((tsk), (address))
+-
+-/* to find an entry in a kernel page-table-directory */
+-#define pgd_offset_k(address) pgd_offset(&init_mm, (address))
+-
+-/* to find an entry in a page-table-directory. */
+-#define pgd_index(address)	(((address) >> PGDIR_SHIFT) & (PTRS_PER_PGD - 1))
+-#define pgd_offset(mm, address)	((mm)->pgd+pgd_index(address))
+-
+ extern pgd_t swapper_pg_dir[1024];
+ 
+ /*
+diff --git a/arch/sw_64/mm/fault.c b/arch/sw_64/mm/fault.c
+index 9b0ad9eb5a3a..d596fc50772d 100644
+--- a/arch/sw_64/mm/fault.c
++++ b/arch/sw_64/mm/fault.c
+@@ -80,7 +80,7 @@ __load_new_mm_context(struct mm_struct *next_mm)
+ 
+ 	pcb = &current_thread_info()->pcb;
+ 	pcb->asn = mmc & HARDWARE_ASN_MASK;
+-	pcb->ptbr = ((unsigned long) next_mm->pgd - PAGE_OFFSET) >> PAGE_SHIFT;
++	pcb->ptbr = virt_to_pfn(next_mm->pgd);
+ 
+ 	__reload_thread(pcb);
+ }
+@@ -122,7 +122,7 @@ unsigned long show_va_to_pa(struct mm_struct *mm, unsigned long addr)
+ 		pr_debug("addr = %#lx, pgd = %#lx\n", addr, pgd_val(*pgd));
+ 		goto out;
+ 	}
+-	p4d = pgd_offset(pgd, addr);
++	p4d = p4d_offset(pgd, addr);
+ 	if (p4d_none(*p4d)) {
+ 		ret = 0;
+ 		pr_debug("addr = %#lx, pgd = %#lx, p4d = %#lx\n",
+@@ -146,7 +146,7 @@ unsigned long show_va_to_pa(struct mm_struct *mm, unsigned long addr)
+ 	}
+ 	pte = pte_offset_map(pmd, addr);
+ 	if (pte_present(*pte)) {
+-		ret = ((unsigned long)__va(((pte_val(*pte) >> 32)) << PAGE_SHIFT));
++		ret = (unsigned long)pfn_to_virt(pte_val(*pte) >> _PFN_SHIFT);
+ 		pr_debug("addr = %#lx, pgd = %#lx, pud = %#lx, pmd = %#lx, pte = %#lx, ret = %#lx\n",
+ 				addr, *(unsigned long *)pgd, *(unsigned long *)pud,
+ 				*(unsigned long *)pmd, *(unsigned long *)pte, ret);
+diff --git a/arch/sw_64/mm/init.c b/arch/sw_64/mm/init.c
+index 3593e4b13319..cd3c0551b8f8 100644
+--- a/arch/sw_64/mm/init.c
++++ b/arch/sw_64/mm/init.c
+@@ -87,7 +87,7 @@ switch_to_system_map(void)
+ 	 * the last slot of the L1 page table.
+ 	 */
+ 	memset(swapper_pg_dir, 0, PAGE_SIZE);
+-	newptbr = __pa(swapper_pg_dir) >> PAGE_SHIFT;
++	newptbr = virt_to_pfn(swapper_pg_dir);
+ 
+ 	/* Also set up the real kernel PCB while we're at it.  */
+ 	init_thread_info.pcb.ptbr = newptbr;
+-- 
+2.33.0
+

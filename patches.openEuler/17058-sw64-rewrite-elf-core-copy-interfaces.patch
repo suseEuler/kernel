@@ -1,0 +1,178 @@
+From 9941c328d6527b408479f70e782a40c706c277d1 Mon Sep 17 00:00:00 2001
+From: He Sheng <hesheng@wxiat.com>
+Date: Fri, 27 May 2022 10:09:44 +0800
+Subject: [PATCH] sw64: rewrite elf core copy interfaces
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 9941c328d6527b408479f70e782a40c706c277d1
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56OLG
+
+--------------------------------
+
+For gpreg, simplify dump method to make it easier to maintain.
+
+For fpreg, redefine elf_fpregset_t with struct user_fpsimd_state and
+add a arch-specific dump_fpu() method.
+
+Signed-off-by: He Sheng <hesheng@wxiat.com>
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/include/asm/elf.h | 34 +++++--------------
+ arch/sw_64/kernel/process.c  | 66 ++++++++----------------------------
+ 2 files changed, 23 insertions(+), 77 deletions(-)
+
+diff --git a/arch/sw_64/include/asm/elf.h b/arch/sw_64/include/asm/elf.h
+index abecc5653eba..8c858cff5573 100644
+--- a/arch/sw_64/include/asm/elf.h
++++ b/arch/sw_64/include/asm/elf.h
+@@ -55,23 +55,18 @@
+ #define EF_SW64_32BIT		1	/* All addresses are below 2GB */
+ 
+ /*
+- * ELF register definitions..
+- */
+-
+-/*
+- * The legacy version of <sys/procfs.h> makes gregset_t 46 entries long.
+- * I have no idea why that is so.  For now, we just leave it at 33
+- * (32 general regs + processor status word).
++ * ELF register definitions.
++ *
++ * For now, we just leave it at 33 (32 general regs + processor status word).
+  */
+ #define ELF_NGREG	33
+-#define ELF_NFPREG	32
+-
+ 
+ typedef unsigned long elf_greg_t;
+ typedef elf_greg_t elf_gregset_t[ELF_NGREG];
+ 
+-typedef double elf_fpreg_t;
+-typedef elf_fpreg_t elf_fpregset_t[ELF_NFPREG];
++/* Same with user_fpsimd_state */
++#include <uapi/asm/ptrace.h>
++typedef struct user_fpsimd_state elf_fpregset_t;
+ 
+ /*
+  * This is used to ensure we don't load something for the wrong architecture.
+@@ -121,22 +116,9 @@ extern int arch_setup_additional_pages(struct linux_binprm *bprm,
+ 
+ #ifdef __KERNEL__
+ struct pt_regs;
+-struct thread_info;
+ struct task_struct;
+-extern void dump_elf_thread(elf_greg_t *dest, struct pt_regs *pt,
+-			    struct thread_info *ti);
+-#define ELF_CORE_COPY_REGS(DEST, REGS) \
+-	dump_elf_thread(DEST, REGS, current_thread_info());
+-
+-/* Similar, but for a thread other than current.  */
+-
+-extern int dump_elf_task(elf_greg_t *dest, struct task_struct *task);
+-#define ELF_CORE_COPY_TASK_REGS(TASK, DEST) dump_elf_task(*(DEST), TASK)
+-
+-/* Similar, but for the FP registers.  */
+-
+-extern int dump_elf_task_fp(elf_fpreg_t *dest, struct task_struct *task);
+-#define ELF_CORE_COPY_FPREGS(TASK, DEST) dump_elf_task_fp(*(DEST), TASK)
++extern void sw64_elf_core_copy_regs(elf_greg_t *dest, struct pt_regs *pt);
++#define ELF_CORE_COPY_REGS(DEST, REGS) sw64_elf_core_copy_regs(DEST, REGS);
+ 
+ /*
+  * This yields a mask that user programs can use to figure out what
+diff --git a/arch/sw_64/kernel/process.c b/arch/sw_64/kernel/process.c
+index 308675d29c04..7a7578d530c6 100644
+--- a/arch/sw_64/kernel/process.c
++++ b/arch/sw_64/kernel/process.c
+@@ -200,66 +200,30 @@ copy_thread(unsigned long clone_flags, unsigned long usp,
+ 
+ /*
+  * Fill in the user structure for a ELF core dump.
++ * @regs: should be signal_pt_regs() or task_pt_reg(task)
+  */
+-void
+-dump_elf_thread(elf_greg_t *dest, struct pt_regs *pt, struct thread_info *ti)
++void sw64_elf_core_copy_regs(elf_greg_t *dest, struct pt_regs *regs)
+ {
+-	dest[0] = pt->r0;
+-	dest[1] = pt->r1;
+-	dest[2] = pt->r2;
+-	dest[3] = pt->r3;
+-	dest[4] = pt->r4;
+-	dest[5] = pt->r5;
+-	dest[6] = pt->r6;
+-	dest[7] = pt->r7;
+-	dest[8] = pt->r8;
+-	dest[9] = pt->r9;
+-	dest[10] = pt->r10;
+-	dest[11] = pt->r11;
+-	dest[12] = pt->r12;
+-	dest[13] = pt->r13;
+-	dest[14] = pt->r14;
+-	dest[15] = pt->r15;
+-	dest[16] = pt->r16;
+-	dest[17] = pt->r17;
+-	dest[18] = pt->r18;
+-	dest[19] = pt->r19;
+-	dest[20] = pt->r20;
+-	dest[21] = pt->r21;
+-	dest[22] = pt->r22;
+-	dest[23] = pt->r23;
+-	dest[24] = pt->r24;
+-	dest[25] = pt->r25;
+-	dest[26] = pt->r26;
+-	dest[27] = pt->r27;
+-	dest[28] = pt->r28;
+-	dest[29] = pt->gp;
+-	dest[30] = ti == current_thread_info() ? rdusp() : ti->pcb.usp;
+-	dest[31] = pt->pc;
++	int i;
++	struct thread_info *ti;
+ 
+-	/* Once upon a time this was the PS value.  Which is stupid
+-	 * since that is always 8 for usermode.  Usurped for the more
+-	 * useful value of the thread's UNIQUE field.
+-	 */
+-	dest[32] = ti->pcb.unique;
+-}
+-EXPORT_SYMBOL(dump_elf_thread);
++	ti = (void *)((__u64)regs & ~(THREAD_SIZE - 1));
+ 
+-int
+-dump_elf_task(elf_greg_t *dest, struct task_struct *task)
+-{
+-	dump_elf_thread(dest, task_pt_regs(task), task_thread_info(task));
+-	return 1;
++	for (i = 0; i < 30; i++)
++		dest[i] = *(__u64 *)((void *)regs + regoffsets[i]);
++	dest[30] = ti == current_thread_info() ? rdusp() : ti->pcb.usp;
++	dest[31] = regs->pc;
++	dest[32] = ti->pcb.unique;
+ }
+-EXPORT_SYMBOL(dump_elf_task);
++EXPORT_SYMBOL(sw64_elf_core_copy_regs);
+ 
+-int
+-dump_elf_task_fp(elf_fpreg_t *dest, struct task_struct *task)
++/* Fill in the fpu structure for a core dump.  */
++int dump_fpu(struct pt_regs *regs, elf_fpregset_t *fpu)
+ {
+-	memcpy(dest, &task->thread.fpstate, 32 * 8);
++	memcpy(fpu, &current->thread.fpstate, sizeof(*fpu));
+ 	return 1;
+ }
+-EXPORT_SYMBOL(dump_elf_task_fp);
++EXPORT_SYMBOL(dump_fpu);
+ 
+ /*
+  * Under heavy swap load I've seen this lose in an ugly way.  So do
+-- 
+2.33.0
+

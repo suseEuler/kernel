@@ -1,0 +1,380 @@
+From 4a1bc3498955d37aaa6ca7f5d17daeffb74128ae Mon Sep 17 00:00:00 2001
+From: He Sheng <hesheng@wxiat.com>
+Date: Mon, 7 Nov 2022 17:12:03 +0800
+Subject: [PATCH] sw64: ftrace: fix function graph tracing support
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 4a1bc3498955d37aaa6ca7f5d17daeffb74128ae
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I645S9
+
+--------------------------------
+
+Rewrite ftrace_graph_caller to support function graph tracing for
+ftrace_regs_caller, ftrace_caller and _mcount. To enable function
+graph tracing, the nop instruction at ftrace_graph_call is replaced
+with "call $26, ($27)" instruction. To disable tracing, replace the
+nop instruction back.
+
+Signed-off-by: He Sheng <hesheng@wxiat.com>
+Reviewed-by: Cui Wei <cuiwei@wxiat.com>
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/kernel/entry-ftrace.S | 230 ++++++++++++++++++-------------
+ arch/sw_64/kernel/ftrace.c       |  10 +-
+ 2 files changed, 135 insertions(+), 105 deletions(-)
+
+diff --git a/arch/sw_64/kernel/entry-ftrace.S b/arch/sw_64/kernel/entry-ftrace.S
+index 6e659bff5775..26bcc71b9db1 100644
+--- a/arch/sw_64/kernel/entry-ftrace.S
++++ b/arch/sw_64/kernel/entry-ftrace.S
+@@ -24,7 +24,9 @@
+ 	stl	$17, 0x8($sp)
+ 	stl	$18, 0x10($sp)
+ 	stl	$26, 0x18($sp)
+-	stl	$27, 0x20($sp)
++#ifdef CONFIG_FUNCTION_GRAPH_TRACER
++	stl	$9, 0x20($sp)
++#endif
+ 	stl	$28, 0x28($sp)
+ 	stl	$29, 0x30($sp)
+ 	stl	$19, 0x38($sp)
+@@ -37,7 +39,9 @@
+ 	ldl	$17, 0x8($sp)
+ 	ldl	$18, 0x10($sp)
+ 	ldl	$26, 0x18($sp)
+-	ldl	$27, 0x20($sp)
++#ifdef CONFIG_FUNCTION_GRAPH_TRACER
++	ldl	$9, 0x20($sp)
++#endif
+ 	ldl	$28, 0x28($sp)
+ 	ldl	$29, 0x30($sp)
+ 	ldl	$19, 0x38($sp)
+@@ -46,6 +50,14 @@
+ 	addl	$sp, FTRACE_SP_OFF, $sp
+ 	.endm
+ 
++	.macro RESTORE_GRAPH_ARGS
++	ldi	$16, 0x18($sp)			/* &ra */
++	bis	$31, $9, $17			/* pc */
++ #ifdef HAVE_FUNCTION_GRAPH_FP_TEST
++	bis	$31, $15, $18			/* fp */
++ #endif
++	.endm
++
+ 	.macro SAVE_PT_REGS
+ 	ldi	$sp, -PT_REGS_SIZE($sp)
+ 	stl	$0, PT_REGS_R0($sp)
+@@ -112,6 +124,84 @@
+ 	ldi	$sp, PT_REGS_SIZE($sp)
+ 	.endm
+ 
++	.macro RESTORE_GRAPH_REG_ARGS
++	ldi	$16, PT_REGS_R26($sp)
++	bis	$31, $9, $17
++#ifdef HAVE_FUNCTION_GRAPH_FP_TEST
++	bis	$31, $15, $18
++#endif
++         .endm
++
++	/* save return value regs*/
++	.macro save_return_regs
++	subl	$sp, 0x8, $sp
++	stl	$0, 0x0($sp)
++	.endm
++
++	/* restore return value regs*/
++	.macro restore_return_regs
++	ldl	$0, 0x0($sp)
++	addl	$sp, 0x8, $sp
++	.endm
++
++
++#ifdef CONFIG_FUNCTION_GRAPH_TRACER
++/*
++ * void ftrace_graph_caller(void)
++ *
++ * Called from ftrace_caller() or ftrace_regs_caller() when function_graph
++ * tracer is selected.
++ * This function prepare_ftrace_return() fakes ra's value on the call
++ * stack in order to intercept instrumented function's return path and
++ * run return_to_handler() later on its exit.
++ */
++
++ENTRY(ftrace_graph_caller)
++	ldgp	$29, 0($27)
++	ldi	$sp, -16($sp)
++	stl	$26, 0($sp)
++	stl	$15, 8($sp)
++	bis	$31, $sp, $15
++
++	ldi	$27, prepare_ftrace_return
++ftrace_graph_call:
++	.global ftrace_graph_call
++	/*
++	 * Calling ftrace_enable/disable_ftrace_graph_caller would overwrite
++	 * the nop below.
++	 */
++	nop	/* nop, or call prepare_ftrace_return() */
++
++	ldl	$26, 0($sp)
++	ldl	$15, 8($sp)
++	ldi	$sp, 16($sp)
++	ret	$31, ($26), 1
++ENDPROC(ftrace_graph_caller)
++
++/*
++ * void return_to_handler(void)
++ *
++ * Run ftrace_return_to_handler() before going back to parent.
++ * @fp is checked against the value passed by ftrace_graph_caller()
++ * only when HAVE_FUNCTION_GRAPH_FP_TEST is enabled.
++ *
++ * It is run by "ret" instruction which does not modify $27, so it
++ * has to recaculate $27 before ldgp.
++ */
++ENTRY(return_to_handler)
++	br	$27, 1f
++1:	ldgp	$29, 0($27)
++	save_return_regs
++	bis	$31, $15, $16	/* parent's fp */
++	ldi	$27, ftrace_return_to_handler
++	call	$26, ($27)
++	bis	$31, $0, $26
++	restore_return_regs
++	ret	$31, ($26), 1
++END(return_to_handler)
++
++#endif
++
+ #ifdef CONFIG_DYNAMIC_FTRACE
+ 	.global _mcount
+ 	.ent _mcount
+@@ -124,27 +214,31 @@ _mcount:
+ 	.ent ftrace_caller
+ ftrace_caller:
+ 	mcount_enter
+-
+-	br	$27, 2f
+-2:	ldgp	$29, 0($27)
++	br	$27, 1f
++1:	ldgp	$29, 0($27)
+ 
+ 	subl	$28, MCOUNT_INSN_SIZE, $16
+ 	bis	$26, $31, $17
+ 	ldl	$18, function_trace_op
+ 
++#ifdef CONFIG_FUNCTION_GRAPH_TRACER
++	/*
++	 * the graph tracer (specifically, prepare_ftrace_return) needs these
++	 * arguments but for now the function tracer occupies the regs, so we
++	 * save them in callee-saved regs to recover later.
++	 */
++	bis	$31, $16, $9
++#endif
+ 	ldi	$4, current_tracer
+ 	ldl	$27, 0($4)
+ 
+ 	.global ftrace_call
+-ftrace_call:					/* tracer(pc, lr); call 26, 27 , 1 */
++ftrace_call:					/* tracer(pc, ra); */
+ 	nop
+ 
+ #ifdef CONFIG_FUNCTION_GRAPH_TRACER
+-	ldi	 $27, prepare_ftrace_return	/* prepare_ftrace_return(&lr, pc, fp) */
+-	.global ftrace_graph_call
+-ftrace_graph_call:				/* ftrace_graph_caller(); */
+-	nop					/* If enabled, this will be replaced */
+-						/* "br ftrace_graph_caller" */
++	RESTORE_GRAPH_ARGS
++	call    ftrace_graph_caller
+ #endif
+ 	mcount_end
+ 	ret	$31, ($28), 1
+@@ -155,36 +249,34 @@ ftrace_graph_call:				/* ftrace_graph_caller(); */
+ 	.ent _mcount
+ _mcount:
+ 	mcount_enter
+-
+ 	br	$27, 1f
+ 1:	ldgp	$29, 0($27)
+ 
+-	ldi	$4, ftrace_trace_function
+-	ldl	$27, 0($4)
+-	ldi	$5, ftrace_stub
+-	cmpeq	$4, $5, $6
++	ldl	$27, ftrace_trace_function	// if (ftrace_trace_function
++	ldi	$5, ftrace_stub			//	!= ftrace_stub)
++	cmpeq	$27, $5, $6			//
+ 	bne	$6, skip_ftrace
+ 
+-	subl	$28, MCOUNT_INSN_SIZE, $16
+-	bis	$26, $31, $17
+-	call	$26, ($27), 1
++	subl	$28, MCOUNT_INSN_SIZE, $16	// function's pc
++#ifdef CONFIG_FUNCTION_GRAPH_TRACER
++	bis	$31, $16, $9
++#endif
++	bis	$26, $31, $17		// function's ra (parent's pc)
++	call	$26, ($27)		// (*ftrace_trace_function)(pc, ra);
+ 
+ skip_ftrace:
+ #ifdef CONFIG_FUNCTION_GRAPH_TRACER
+-	ldi	$4, ftrace_graph_return
+-	ldl	$4, 0($4)
+-	ldi	$5, ftrace_stub
++	ldl	$4, ftrace_graph_return		// if ((ftrace_graph_return
++	cmpeq	$4, $5, $6			//	!= ftrace_stub)
++	beq	$6, 2f
++	ldl	$4, ftrace_graph_entry		// || (ftrace_graph_entry
++	ldi     $5, ftrace_graph_entry_stub	//	!= ftrace_graph_entry_stub))
+ 	cmpeq	$4, $5, $6
+-	beq	$6, ftrace_graph_caller
+-
+-
+-	ldi	$4, ftrace_graph_entry
+-	ldl	$4, 0($4)
+-	ldi	$5, ftrace_graph_entry_stub
+-	cmpeq	$4, $5, $6
+-	beq	$6, ftrace_graph_caller
++	bne	$6, 3f
++2:	RESTORE_GRAPH_ARGS
++	call	ftrace_graph_caller		// ftrace_graph_caller();
+ #endif
+-	mcount_end
++3:	mcount_end
+ 	ret	$31, ($28), 1
+ 	.end _mcount
+ 
+@@ -195,9 +287,8 @@ skip_ftrace:
+ 	.ent ftrace_regs_caller
+ ftrace_regs_caller:
+ 	SAVE_PT_REGS
+-
+-	br	$27, 2f
+-2:	ldgp	$29, 0($27)
++	br	$27, 1f
++1:	ldgp	$29, 0($27)
+ 
+ 	subl	$28, MCOUNT_INSN_SIZE, $16
+ 	bis	$26, $31, $17
+@@ -205,6 +296,9 @@ ftrace_regs_caller:
+ 	ldl	$18, 0($4)
+ 	mov	$sp, $19
+ 
++#ifdef CONFIG_FUNCTION_GRAPH_TRACER
++	bis	$31, $16, $9
++#endif
+ 	ldi	$4, current_tracer
+ 	ldl	$27, 0($4)
+ 
+@@ -212,6 +306,10 @@ ftrace_regs_caller:
+ ftrace_regs_call:
+ 	nop
+ 
++#ifdef CONFIG_FUNCTION_GRAPH_TRACER
++	RESTORE_GRAPH_REG_ARGS
++	call    ftrace_graph_caller
++#endif
+ 	RESTORE_PT_REGS
+ 	ret $31, ($28), 1
+ 	.end ftrace_regs_caller
+@@ -222,67 +320,3 @@ ftrace_regs_call:
+ ftrace_stub:
+ 	ret	$31, ($26), 1
+ 	.end ftrace_stub
+-
+-
+-#ifdef CONFIG_FUNCTION_GRAPH_TRACER
+-	.macro RESTORE_GRAPH_ARGS
+-	ldl	$26, 0x18($sp)
+-	ldl	$28, 0x28($sp)
+-	.endm
+-
+-	/* save return value regs*/
+-	.macro save_return_regs
+-	subl	$sp, 0x8, $sp
+-	stl	$0, 0x0($sp)
+-	.endm
+-
+-	/* restore return value regs*/
+-	.macro restore_return_regs
+-	ldl	$0, 0x0($sp)
+-	addl	$sp, 0x8, $sp
+-	.endm
+-
+-
+-/*
+- * void ftrace_graph_caller(void)
+- *
+- * Called from _mcount() or ftrace_caller() when function_graph tracer is
+- * selected.
+- * This function w/ prepare_ftrace_return() fakes link register's value on
+- * the call stack in order to intercept instrumented function's return path
+- * and run return_to_handler() later on its exit.
+- */
+-	.global ftrace_graph_caller
+-	.ent ftrace_graph_caller
+-ftrace_graph_caller:
+-	memb			/* need memb, otherwise it'll  go wrong */
+-	RESTORE_GRAPH_ARGS
+-	addl	$sp, 0x18, $16
+-	subl	$28, MCOUNT_INSN_SIZE, $17
+-	bis	$15, $31, $18	/* parent's fp */
+-
+-	call	$26, ($27)	/* prepare_ftrace_return() */
+-
+-	mcount_end
+-	ret	$31, ($28), 1
+-	.end ftrace_graph_caller
+-
+-/*
+- * void return_to_handler(void)
+- *
+- * Run ftrace_return_to_handler() before going back to parent.
+- * @fp is checked against the value passed by ftrace_graph_caller()
+- * only when HAVE_FUNCTION_GRAPH_FP_TEST is enabled.
+- */
+-ENTRY(return_to_handler)
+-	save_return_regs
+-	br	$27, 3f
+-3:	ldgp	$29, 0($27)
+-	ldi	$27, ftrace_return_to_handler
+-	call	$26, ($27)
+-	bis	$0, $31, $26
+-	restore_return_regs
+-	ret	$31, ($26), 1
+-END(return_to_handler)
+-
+-#endif
+diff --git a/arch/sw_64/kernel/ftrace.c b/arch/sw_64/kernel/ftrace.c
+index 4bd89c709ad5..3d99f723dced 100644
+--- a/arch/sw_64/kernel/ftrace.c
++++ b/arch/sw_64/kernel/ftrace.c
+@@ -154,15 +154,11 @@ void prepare_ftrace_return(unsigned long *parent, unsigned long self_addr,
+ static int ftrace_modify_graph_caller(bool enable)
+ {
+ 	unsigned long pc = (unsigned long)&ftrace_graph_call;
+-	u32 branch, nop;
+-
+-	branch = sw64_insn_br(R31, pc, (unsigned long)ftrace_graph_caller);
+-	nop = sw64_insn_nop();
++	u32 new = SW64_NOP;
+ 
+ 	if (enable)
+-		return ftrace_modify_code(pc, branch);
+-	else
+-		return ftrace_modify_code(pc, nop);
++		new = SW64_CALL(R26, R27, 0);
++	return ftrace_modify_code(pc, new);
+ }
+ 
+ int ftrace_enable_ftrace_graph_caller(void)
+-- 
+2.33.0
+

@@ -1,0 +1,82 @@
+From 41283328f8d908ec434c97878cd3f76f2f1e311c Mon Sep 17 00:00:00 2001
+From: Luo Meng <luomeng12@huawei.com>
+Date: Wed, 30 Nov 2022 18:23:47 +0800
+Subject: [PATCH] dm: fix null pointer dereference in dev_create()
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 41283328f8d908ec434c97878cd3f76f2f1e311c
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I62762
+CVE: NA
+
+--------------------------------
+
+A crash as follows:
+ BUG: KASAN: null-ptr-deref in dev_create.cold+0x12/0x77
+ Read of size 8 at addr 0000000000000020 by task dmsetup/683
+
+ CPU: 4 PID: 683 Comm: dmsetup Not tainted 5.10.0-01524-g884de6e91114-dirty #11
+ Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS ?-20190727_073836-buildvm-ppc64le-16.ppc.fedoraproject.org-3.fc31 04/01/2014
+ Call Trace:
+  ? dump_stack+0xdd/0x126
+  ? kasan_report.cold+0xd1/0xdb
+  ? dev_create.cold+0x12/0x77
+  ? __asan_load8+0xae/0x110
+  ? dev_create.cold+0x12/0x77
+  ? dev_rename+0x720/0x720
+  ? cap_capable+0xcf/0x130
+  ? ctl_ioctl+0x2f5/0x750
+  ? dev_rename+0x720/0x720
+  ? free_params+0x50/0x50
+  ? unmerge_queues+0x176/0x1b0
+  ? __blkcg_punt_bio_submit+0x110/0x110
+  ? mem_cgroup_handle_over_high+0x33/0x5e0
+  ? dm_ctl_ioctl+0x12/0x20
+  ? __se_sys_ioctl+0xc5/0x120
+  ? __x64_sys_ioctl+0x46/0x60
+  ? do_syscall_64+0x45/0x70
+  ? entry_SYSCALL_64_after_hwframe+0x61/0xc6
+
+This can be easily reproduced using:
+  dmsetup create xxx --table "0 1000 linear /dev/sda 0"
+  dmsetup remove xxx
+
+Fix this by adding hass_lock in dev_create().
+
+Fixes: a5100d0798e6 ("dm ioctl: add DMINFO() to track dm device create/remove")
+
+Signed-off-by: Luo Meng <luomeng12@huawei.com>
+Reviewed-by: Hou Tao <houtao1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/md/dm-ioctl.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/md/dm-ioctl.c b/drivers/md/dm-ioctl.c
+index 2186a3a4e48b..1a3e40be81c6 100644
+--- a/drivers/md/dm-ioctl.c
++++ b/drivers/md/dm-ioctl.c
+@@ -800,9 +800,13 @@ static int dev_create(struct file *filp, struct dm_ioctl *param, size_t param_si
+ 
+ 	__dev_status(md, param);
+ 
++	mutex_lock(&dm_hash_cells_mutex);
+ 	hc = dm_get_mdptr(md);
+-	DMINFO("%s[%i]: %s (%s) is created successfully",
+-		current->comm, current->pid, md->disk->disk_name, hc->name);
++	if (hc)
++		DMINFO("%s[%i]: %s (%s) is created successfully",
++			current->comm, current->pid, md->disk->disk_name, hc->name);
++
++	mutex_unlock(&dm_hash_cells_mutex);
+ 	dm_put(md);
+ 
+ 	return 0;
+-- 
+2.33.0
+

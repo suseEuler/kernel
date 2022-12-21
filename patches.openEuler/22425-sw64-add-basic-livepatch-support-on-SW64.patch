@@ -1,0 +1,355 @@
+From 4c655b2b486e760187251bb7a80564202fe1a2c5 Mon Sep 17 00:00:00 2001
+From: Gu Zitao <guzitao@wxiat.com>
+Date: Wed, 2 Nov 2022 14:18:00 +0800
+Subject: [PATCH] sw64: add basic livepatch support on SW64
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 4c655b2b486e760187251bb7a80564202fe1a2c5
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I645PM
+
+--------------------------------
+
+This patch adds livepatch support on SW64. It requires support from
+DYNAMIC_FTRACE_WITH_REGS option. Livepatch is handled by a special
+ftrace handler ftrace_regs_caller(). The livepatch handler modifies
+the regs->r28 so as to make ftrace_regs_caller() return to the new
+patched function.
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Reviewed-by: He Sheng <hesheng@wxiat.com>
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/Kconfig                   |  5 ++
+ arch/sw_64/include/asm/ftrace.h      |  2 +
+ arch/sw_64/include/asm/livepatch.h   | 22 +++++++
+ arch/sw_64/include/asm/thread_info.h |  4 ++
+ arch/sw_64/kernel/entry-ftrace.S     | 94 ++++++++++++++++++++++++++++
+ arch/sw_64/kernel/ftrace.c           | 33 +++++++++-
+ arch/sw_64/kernel/stacktrace.c       |  8 +++
+ 7 files changed, 165 insertions(+), 3 deletions(-)
+ create mode 100644 arch/sw_64/include/asm/livepatch.h
+
+diff --git a/arch/sw_64/Kconfig b/arch/sw_64/Kconfig
+index b37a4f4e093e..47dc877c03f3 100644
+--- a/arch/sw_64/Kconfig
++++ b/arch/sw_64/Kconfig
+@@ -70,6 +70,7 @@ config SW64
+ 	select HAVE_C_RECORDMCOUNT
+ 	select HAVE_DEBUG_BUGVERBOSE
+ 	select HAVE_DYNAMIC_FTRACE
++	select HAVE_DYNAMIC_FTRACE_WITH_REGS
+ 	select HAVE_EBPF_JIT
+ 	select HAVE_FAST_GUP
+ 	select HAVE_FTRACE_MCOUNT_RECORD
+@@ -78,6 +79,7 @@ config SW64
+ 	select HAVE_IDE
+ 	select HAVE_KPROBES
+ 	select HAVE_KRETPROBES
++	select HAVE_LIVEPATCH if HAVE_DYNAMIC_FTRACE_WITH_REGS
+ 	select HAVE_MEMBLOCK
+ 	select HAVE_MEMBLOCK_NODE_MAP
+ 	select HAVE_MOD_ARCH_SPECIFIC
+@@ -88,6 +90,7 @@ config SW64
+ 	select HAVE_PERF_REGS
+ 	select HAVE_PERF_USER_STACK_DUMP
+ 	select HAVE_REGS_AND_STACK_ACCESS_API
++	select HAVE_RELIABLE_STACKTRACE if STACKTRACE
+ 	select HAVE_SYSCALL_TRACEPOINTS
+ 	select IRQ_FORCED_THREADING
+ 	select MEMORY_HOTPLUG_SPARSE if MEMORY_HOTPLUG
+@@ -651,6 +654,8 @@ config ARCH_SPARSEMEM_ENABLE
+ 	depends on SMP
+ 	select SPARSEMEM_VMEMMAP_ENABLE
+ 
++source "kernel/livepatch/Kconfig"
++
+ config NUMA
+ 	bool "NUMA Support"
+ 	depends on SMP && !FLATMEM
+diff --git a/arch/sw_64/include/asm/ftrace.h b/arch/sw_64/include/asm/ftrace.h
+index 61933103dcd4..d211b8ce1d18 100644
+--- a/arch/sw_64/include/asm/ftrace.h
++++ b/arch/sw_64/include/asm/ftrace.h
+@@ -15,6 +15,8 @@
+ #define MCOUNT_INSN_SIZE	20	/* 5 * SW64_INSN_SIZE */
+ #define MCOUNT_LDGP_SIZE	8	/* 2 * SW64_INSN_SIZE */
+ 
++#define ARCH_SUPPORTS_FTRACE_OPS 1
++
+ #ifndef __ASSEMBLY__
+ #include <linux/compat.h>
+ #include <asm/insn.h>
+diff --git a/arch/sw_64/include/asm/livepatch.h b/arch/sw_64/include/asm/livepatch.h
+new file mode 100644
+index 000000000000..f93c2131113b
+--- /dev/null
++++ b/arch/sw_64/include/asm/livepatch.h
+@@ -0,0 +1,22 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * livepatch.h - sw64-specific Kernel Live Patching Core
++ */
++
++#ifndef _ASM_SW64_LIVEPATCH_H
++#define _ASM_SW64_LIVEPATCH_H
++
++#include <asm/ptrace.h>
++
++static inline int klp_check_compiler_support(void)
++{
++	return 0;
++}
++
++static inline void klp_arch_set_pc(struct pt_regs *regs, unsigned long ip)
++{
++	regs->r27 = ip;
++	regs->r28 = ip;
++}
++
++#endif /* _ASM_SW64_LIVEPATCH_H */
+diff --git a/arch/sw_64/include/asm/thread_info.h b/arch/sw_64/include/asm/thread_info.h
+index 7cdafaec62e4..c9637d32e1be 100644
+--- a/arch/sw_64/include/asm/thread_info.h
++++ b/arch/sw_64/include/asm/thread_info.h
+@@ -39,6 +39,9 @@ struct thread_info {
+ 	unsigned int bpt_insn[2];
+ #ifdef CONFIG_DYNAMIC_FTRACE
+ 	unsigned long		dyn_ftrace_addr;
++#ifdef CONFIG_DYNAMIC_FTRACE_WITH_REGS
++	unsigned long		dyn_ftrace_regs_addr;
++#endif
+ #endif
+ };
+ 
+@@ -84,6 +87,7 @@ register struct thread_info *__current_thread_info __asm__("$8");
+ #define TIF_NEED_RESCHED	3	/* rescheduling necessary */
+ #define TIF_SYSCALL_AUDIT	4       /* syscall audit active */
+ #define TIF_UPROBE		5       /* uprobe breakpoint or singlestep */
++#define TIF_PATCH_PENDING       6       /* pending live patching update */
+ #define TIF_DIE_IF_KERNEL	9	/* dik recursion lock */
+ #define TIF_SYSCALL_TRACEPOINT	10
+ #define TIF_SECCOMP		11	/* secure computing */
+diff --git a/arch/sw_64/kernel/entry-ftrace.S b/arch/sw_64/kernel/entry-ftrace.S
+index 07bdf5a6e35a..1b8896d1f631 100644
+--- a/arch/sw_64/kernel/entry-ftrace.S
++++ b/arch/sw_64/kernel/entry-ftrace.S
+@@ -10,6 +10,7 @@
+  *
+  */
+ #include <linux/linkage.h>
++#include <asm/asm-offsets.h>
+ #include <asm/ftrace.h>
+ 
+ 	.text
+@@ -45,6 +46,72 @@
+ 	addl	$sp, FTRACE_SP_OFF, $sp
+ 	.endm
+ 
++	.macro SAVE_PT_REGS
++	ldi	$sp, -PT_REGS_SIZE($sp)
++	stl	$0, PT_REGS_R0($sp)
++	stl	$1, PT_REGS_R1($sp)
++	stl	$2, PT_REGS_R2($sp)
++	stl	$3, PT_REGS_R3($sp)
++	stl	$4, PT_REGS_R4($sp)
++	stl	$5, PT_REGS_R5($sp)
++	stl	$6, PT_REGS_R6($sp)
++	stl	$7, PT_REGS_R7($sp)
++	stl	$8, PT_REGS_R8($sp)
++	stl	$9, PT_REGS_R9($sp)
++	stl	$10, PT_REGS_R10($sp)
++	stl	$11, PT_REGS_R11($sp)
++	stl	$12, PT_REGS_R12($sp)
++	stl	$13, PT_REGS_R13($sp)
++	stl	$14, PT_REGS_R14($sp)
++	stl	$15, PT_REGS_R15($sp)
++	stl	$16, PT_REGS_R16($sp)
++	stl	$17, PT_REGS_R17($sp)
++	stl	$18, PT_REGS_R18($sp)
++	stl	$19, PT_REGS_R19($sp)
++	stl	$20, PT_REGS_R20($sp)
++	stl	$21, PT_REGS_R21($sp)
++	stl	$22, PT_REGS_R22($sp)
++	stl	$23, PT_REGS_R23($sp)
++	stl	$24, PT_REGS_R24($sp)
++	stl	$25, PT_REGS_R25($sp)
++	stl	$26, PT_REGS_R26($sp)
++	stl	$27, PT_REGS_R27($sp)
++	stl	$28, PT_REGS_R28($sp)
++	.endm
++
++	.macro RESTORE_PT_REGS
++	ldl	$0, PT_REGS_R0($sp)
++	ldl	$1, PT_REGS_R1($sp)
++	ldl	$2, PT_REGS_R2($sp)
++	ldl	$3, PT_REGS_R3($sp)
++	ldl	$4, PT_REGS_R4($sp)
++	ldl	$5, PT_REGS_R5($sp)
++	ldl	$6, PT_REGS_R6($sp)
++	ldl	$7, PT_REGS_R7($sp)
++	ldl	$8, PT_REGS_R8($sp)
++	ldl	$9, PT_REGS_R9($sp)
++	ldl	$10, PT_REGS_R10($sp)
++	ldl	$11, PT_REGS_R11($sp)
++	ldl	$12, PT_REGS_R12($sp)
++	ldl	$13, PT_REGS_R13($sp)
++	ldl	$14, PT_REGS_R14($sp)
++	ldl	$15, PT_REGS_R15($sp)
++	ldl	$16, PT_REGS_R16($sp)
++	ldl	$17, PT_REGS_R17($sp)
++	ldl	$18, PT_REGS_R18($sp)
++	ldl	$19, PT_REGS_R19($sp)
++	ldl	$20, PT_REGS_R20($sp)
++	ldl	$21, PT_REGS_R21($sp)
++	ldl	$22, PT_REGS_R22($sp)
++	ldl	$23, PT_REGS_R23($sp)
++	ldl	$24, PT_REGS_R24($sp)
++	ldl	$25, PT_REGS_R25($sp)
++	ldl	$26, PT_REGS_R26($sp)
++	ldl	$27, PT_REGS_R27($sp)
++	ldl	$28, PT_REGS_R28($sp)
++	ldi	$sp, PT_REGS_SIZE($sp)
++	.endm
++
+ #ifdef CONFIG_DYNAMIC_FTRACE
+ 	.global _mcount
+ 	.ent _mcount
+@@ -122,6 +189,33 @@ skip_ftrace:
+ 
+ #endif /* CONFIG_DYNAMIC_FTRACE */
+ 
++#ifdef CONFIG_DYNAMIC_FTRACE_WITH_REGS
++	.global ftrace_regs_caller
++	.ent ftrace_regs_caller
++ftrace_regs_caller:
++	SAVE_PT_REGS
++
++	br	$27, 2f
++2:	ldgp	$29, 0($27)
++
++	subl	$28, MCOUNT_INSN_SIZE, $16
++	bis	$26, $31, $17
++	ldi	$4, function_trace_op
++	ldl	$18, 0($4)
++	mov	$sp, $19
++
++	ldi	$4, current_tracer
++	ldl	$27, 0($4)
++
++	.global ftrace_regs_call
++ftrace_regs_call:
++	nop
++
++	RESTORE_PT_REGS
++	ret $31, ($28), 1
++	.end ftrace_regs_caller
++#endif /* CONFIG_DYNAMIC_FTRACE_WITH_REGS */
++
+ 	.global ftrace_stub
+ 	.ent ftrace_stub
+ ftrace_stub:
+diff --git a/arch/sw_64/kernel/ftrace.c b/arch/sw_64/kernel/ftrace.c
+index cf1524c15f15..a2784feaf150 100644
+--- a/arch/sw_64/kernel/ftrace.c
++++ b/arch/sw_64/kernel/ftrace.c
+@@ -20,6 +20,8 @@ EXPORT_SYMBOL(_mcount);
+ #ifdef CONFIG_DYNAMIC_FTRACE
+ 
+ #define TI_FTRACE_ADDR	(offsetof(struct thread_info, dyn_ftrace_addr))
++#define TI_FTRACE_REGS_ADDR \
++			(offsetof(struct thread_info, dyn_ftrace_regs_addr))
+ 
+ unsigned long current_tracer = (unsigned long)ftrace_stub;
+ 
+@@ -40,12 +42,20 @@ int ftrace_update_ftrace_func(ftrace_func_t func)
+ {
+ 	unsigned long pc;
+ 	u32 new;
++	int ret;
+ 
+ 	current_tracer = (unsigned long)func;
+ 	pc = (unsigned long)&ftrace_call;
+ 	new = SW64_CALL(R26, R27, 1);
++	ret = ftrace_modify_code(pc, new);
+ 
+-	return ftrace_modify_code(pc, new);
++	if (!ret) {
++		pc = (unsigned long)&ftrace_regs_call;
++		new = SW64_CALL(R26, R27, 1);
++		ret = ftrace_modify_code(pc, new);
++	}
++
++	return ret;
+ }
+ 
+ /*
+@@ -55,10 +65,16 @@ int ftrace_make_call(struct dyn_ftrace *rec, unsigned long addr)
+ {
+ 	unsigned int insn[3];
+ 	unsigned long pc = rec->ip + MCOUNT_LDGP_SIZE;
++	unsigned long offset;
++
++	if (addr == FTRACE_ADDR)
++		offset = TI_FTRACE_ADDR;
++	else
++		offset = TI_FTRACE_REGS_ADDR;
+ 
+ 	insn[0] = SW64_NOP;
+ 	/* ldl r28,(ftrace_addr_offset)(r8) */
+-	insn[1] = (0x23U << 26) | (28U << 21) | (8U << 16) | TI_FTRACE_ADDR;
++	insn[1] = (0x23U << 26) | (28U << 21) | (8U << 16) | offset;
+ 	insn[2] = SW64_CALL(R28, R28, 1);
+ 
+ 	/* replace the 3 mcount instructions at once */
+@@ -82,14 +98,25 @@ void arch_ftrace_update_code(int command)
+ 	ftrace_modify_all_code(command);
+ }
+ 
+-/*tracer_addr must be same with syscall_ftrace*/
+ int __init ftrace_dyn_arch_init(void)
+ {
+ 	init_thread_info.dyn_ftrace_addr = FTRACE_ADDR;
++
++#ifdef CONFIG_DYNAMIC_FTRACE_WITH_REGS
++	init_thread_info.dyn_ftrace_regs_addr = FTRACE_REGS_ADDR;
++#endif
+ 	return 0;
+ }
+ #endif /* CONFIG_DYNAMIC_FTRACE */
+ 
++#ifdef CONFIG_DYNAMIC_FTRACE_WITH_REGS
++int ftrace_modify_call(struct dyn_ftrace *rec, unsigned long old_addr,
++		       unsigned long addr)
++{
++	return 0;
++}
++#endif
++
+ #ifdef CONFIG_FUNCTION_GRAPH_TRACER
+ /*
+  * function_graph tracer expects ftrace_return_to_handler() to be called
+diff --git a/arch/sw_64/kernel/stacktrace.c b/arch/sw_64/kernel/stacktrace.c
+index 70c142b11b92..71c0e5b7b3e0 100644
+--- a/arch/sw_64/kernel/stacktrace.c
++++ b/arch/sw_64/kernel/stacktrace.c
+@@ -222,3 +222,11 @@ unsigned long get_wchan(struct task_struct *tsk)
+ 
+ 	return pc;
+ }
++
++#ifdef CONFIG_HAVE_RELIABLE_STACKTRACE
++int save_stack_trace_tsk_reliable(struct task_struct *tsk,
++				  struct stack_trace *trace)
++{
++	return 0;
++}
++#endif
+-- 
+2.33.0
+

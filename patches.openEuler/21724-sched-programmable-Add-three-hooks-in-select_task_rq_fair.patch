@@ -1,0 +1,211 @@
+From 0abedfba7a86c53937d53c5f154fdc761b705f80 Mon Sep 17 00:00:00 2001
+From: Chen Hui <judy.chenhui@huawei.com>
+Date: Fri, 25 Nov 2022 11:56:28 +0800
+Subject: [PATCH] sched: programmable: Add three hooks in select_task_rq_fair()
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 0abedfba7a86c53937d53c5f154fdc761b705f80
+Modified-by-SEL: Yes, modified due to different context
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5KUFB
+CVE: NA
+
+--------------------------------
+
+Add three hooks of sched type in select_task_rq_fair(), as follows:
+'cfs_select_rq'
+	Replace the original core selection policy or
+	implement dynamic CPU affinity.
+
+'cfs_select_rq_exit'
+	Restoring the CPU affinity of the task before exiting of
+	'select_task_rq_fair'.
+
+	To be used with 'cfs_select_rq' hook to implement
+	dynamic CPU affinity.
+
+'cfs_wake_affine'
+	Determine on which CPU task can run soonest. Allow user to
+	implement deferent policies.
+
+Signed-off-by: Chen Hui <judy.chenhui@huawei.com>
+Signed-off-by: Hui Tang <tanghui20@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/sched.h           |   33 +++++++++++++++++++++
+ include/linux/sched_hook_defs.h |    3 +
+ kernel/sched/fair.c             |   61 ++++++++++++++++++++++++++++++++++++++++
+ scripts/bpf_doc.py              |    4 ++
+ 4 files changed, 101 insertions(+)
+
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -2249,6 +2249,11 @@ struct bpf_sched_cpu_stats {
+ 	/* capacity */
+ 	unsigned long capacity;
+ 	unsigned long capacity_orig;
++
++	KABI_RESERVE(1)
++	KABI_RESERVE(2)
++	KABI_RESERVE(3)
++	KABI_RESERVE(4)
+ };
+ 
+ struct cpumask_op_args {
+@@ -2274,5 +2279,33 @@ enum cpumask_op_type {
+ 	CPUMASK_CPULIST_PARSE
+ };
+ 
++struct sched_migrate_ctx {
++	struct task_struct *task;
++	struct cpumask *select_idle_mask;
++	int prev_cpu;
++	int curr_cpu;
++	int is_sync;
++	int want_affine;
++	int wake_flags;
++	int sd_flag;
++	int new_cpu;
++
++	KABI_RESERVE(1)
++	KABI_RESERVE(2)
++	KABI_RESERVE(3)
++	KABI_RESERVE(4)
++};
++
++struct sched_affine_ctx {
++	struct task_struct *task;
++	int prev_cpu;
++	int curr_cpu;
++	int is_sync;
++
++	KABI_RESERVE(1)
++	KABI_RESERVE(2)
++	KABI_RESERVE(3)
++	KABI_RESERVE(4)
++};
+ #endif
+ #endif
+--- a/include/linux/sched_hook_defs.h
++++ b/include/linux/sched_hook_defs.h
+@@ -7,3 +7,6 @@ BPF_SCHED_HOOK(int, 0, cfs_tag_pick_next
+ 	       struct sched_entity *next)
+ BPF_SCHED_HOOK(void, (void) 0, cfs_enqueue_task, struct rq *rq, struct task_struct *p)
+ BPF_SCHED_HOOK(void, (void) 0, cfs_dequeue_task, struct rq *rq, struct task_struct *p)
++BPF_SCHED_HOOK(int, -1, cfs_select_rq, struct sched_migrate_ctx *ctx)
++BPF_SCHED_HOOK(int, -1, cfs_wake_affine, struct sched_affine_ctx *ctx)
++BPF_SCHED_HOOK(int, -1, cfs_select_rq_exit, struct sched_migrate_ctx *ctx)
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -6040,6 +6040,22 @@ static int wake_affine(struct sched_doma
+ {
+ 	int target = nr_cpumask_bits;
+ 
++#ifdef CONFIG_BPF_SCHED
++	if (bpf_sched_enabled()) {
++		struct sched_affine_ctx ctx;
++		int ret;
++
++		ctx.task = p;
++		ctx.prev_cpu = prev_cpu;
++		ctx.curr_cpu = this_cpu;
++		ctx.is_sync = sync;
++
++		ret = bpf_sched_cfs_wake_affine(&ctx);
++		if (ret >= 0 && ret < nr_cpumask_bits)
++			return ret;
++	}
++#endif
++
+ 	if (sched_feat(WA_IDLE))
+ 		target = wake_affine_idle(this_cpu, prev_cpu, sync);
+ 
+@@ -6924,6 +6940,12 @@ select_task_rq_fair(struct task_struct *
+ 	int new_cpu = prev_cpu;
+ 	int want_affine = 0;
+ 	int sync = (wake_flags & WF_SYNC) && !(current->flags & PF_EXITING);
++#ifdef CONFIG_BPF_SCHED
++	struct sched_migrate_ctx ctx;
++	cpumask_t *cpus_prev = NULL;
++	cpumask_t *cpus;
++	int ret;
++#endif
+ 
+ 	time = schedstat_start_time();
+ 
+@@ -6945,6 +6967,32 @@ select_task_rq_fair(struct task_struct *
+ 	}
+ 
+ 	rcu_read_lock();
++#ifdef CONFIG_BPF_SCHED
++	if (bpf_sched_enabled()) {
++		ctx.task = p;
++		ctx.prev_cpu = prev_cpu;
++		ctx.curr_cpu = cpu;
++		ctx.is_sync = sync;
++		ctx.wake_flags = wake_flags;
++		ctx.want_affine = want_affine;
++		ctx.sd_flag = sd_flag;
++		ctx.select_idle_mask = this_cpu_cpumask_var_ptr(select_idle_mask);
++
++		ret = bpf_sched_cfs_select_rq(&ctx);
++		if (ret >= 0) {
++			rcu_read_unlock();
++			return ret;
++		} else if (ret != -1) {
++			cpus = this_cpu_cpumask_var_ptr(select_idle_mask);
++			if (cpumask_subset(cpus, p->cpus_ptr) &&
++			    !cpumask_empty(cpus)) {
++				cpus_prev = (void *)p->cpus_ptr;
++				p->cpus_ptr = cpus;
++			}
++		}
++	}
++#endif
++
+ 	for_each_domain(cpu, tmp) {
+ 		/*
+ 		 * If both 'cpu' and 'prev_cpu' are part of this domain,
+@@ -6976,6 +7024,19 @@ select_task_rq_fair(struct task_struct *
+ 		if (want_affine)
+ 			current->recent_used_cpu = cpu;
+ 	}
++
++#ifdef CONFIG_BPF_SCHED
++	if (bpf_sched_enabled()) {
++		ctx.new_cpu = new_cpu;
++		ret = bpf_sched_cfs_select_rq_exit(&ctx);
++		if (ret >= 0)
++			new_cpu = ret;
++
++		if (cpus_prev)
++			p->cpus_ptr = cpus_prev;
++	}
++#endif
++
+ 	rcu_read_unlock();
+ 	schedstat_end_time(cpu_rq(cpu), time);
+ 
+--- a/scripts/bpf_doc.py
++++ b/scripts/bpf_doc.py
+@@ -557,6 +557,8 @@ class PrinterHelpers(Printer):
+             'struct file',
+             'struct bpf_timer',
+             'struct mptcp_sock',
++            'struct sched_migrate_ctx',
++            'struct sched_affine_ctx',
+     ]
+     known_types = {
+             '...',
+@@ -614,6 +616,8 @@ class PrinterHelpers(Printer):
+             'struct file',
+             'struct bpf_timer',
+             'struct mptcp_sock',
++            'struct sched_migrate_ctx',
++            'struct sched_affine_ctx',
+     }
+     mapped_types = {
+             'u8': '__u8',

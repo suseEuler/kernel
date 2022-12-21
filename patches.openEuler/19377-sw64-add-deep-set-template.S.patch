@@ -1,0 +1,390 @@
+From 7c80a502160782902217506b5c940844fa1e282c Mon Sep 17 00:00:00 2001
+From: Mao Minkai <maominkai@wxiat.com>
+Date: Mon, 10 Oct 2022 14:26:25 +0800
+Subject: [PATCH] sw64: add deep-set-template.S
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 7c80a502160782902217506b5c940844fa1e282c
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5XTLH
+
+--------------------------------
+
+Add deep-set-template.S to rewrite memset() and optimize
+__clear_user().
+
+Signed-off-by: Mao Minkai <maominkai@wxiat.com>
+Reviewed-by: He Sheng <hesheng@wxiat.com>
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/lib/Kconfig             |   7 ++
+ arch/sw_64/lib/Makefile            |   6 +-
+ arch/sw_64/lib/deep-clear_user.S   |  48 +++++++++++
+ arch/sw_64/lib/deep-memset.S       |  94 ++------------------
+ arch/sw_64/lib/deep-set_template.S | 133 +++++++++++++++++++++++++++++
+ 5 files changed, 197 insertions(+), 91 deletions(-)
+ create mode 100644 arch/sw_64/lib/deep-clear_user.S
+ create mode 100644 arch/sw_64/lib/deep-set_template.S
+
+diff --git a/arch/sw_64/lib/Kconfig b/arch/sw_64/lib/Kconfig
+index d1e9cdd3947a..e22751a457ce 100644
+--- a/arch/sw_64/lib/Kconfig
++++ b/arch/sw_64/lib/Kconfig
+@@ -8,6 +8,13 @@ config DEEP_CLEAR_PAGE
+ 	  This option enables the use of SIMD version of clear page routine.
+ 	  Say N if you want to use the generic version.
+ 
++config DEEP_CLEAR_USER
++	bool "Clear User with SIMD optimization"
++	default y
++	help
++	  This option enables the use of SIMD version of clear user routine.
++	  Say N if you want to use the generic version.
++
+ config DEEP_COPY_PAGE
+ 	bool "Copy Page with SIMD optimization"
+ 	default y
+diff --git a/arch/sw_64/lib/Makefile b/arch/sw_64/lib/Makefile
+index bb2e9b52fedc..e4727dce3655 100644
+--- a/arch/sw_64/lib/Makefile
++++ b/arch/sw_64/lib/Makefile
+@@ -11,7 +11,6 @@ lib-y =	__divlu.o __remlu.o __divwu.o __remwu.o \
+         memmove.o \
+         checksum.o \
+         csum_partial_copy.o \
+-        clear_user.o \
+         fpreg.o \
+         strcpy.o \
+         strncpy.o \
+@@ -21,6 +20,9 @@ lib-y =	__divlu.o __remlu.o __divwu.o __remwu.o \
+ lib-clear_page-y := clear_page.o
+ lib-clear_page-$(CONFIG_DEEP_CLEAR_PAGE) := deep-clear_page.o
+ 
++lib-clear_user-y := clear_user.o
++lib-clear_user-$(CONFIG_DEEP_CLEAR_USER) := deep-clear_user.o
++
+ lib-copy_page-y := copy_page.o
+ lib-copy_page-$(CONFIG_DEEP_COPY_PAGE) := deep-copy_page.o
+ 
+@@ -33,7 +35,7 @@ lib-memcpy-$(CONFIG_DEEP_MEMCPY) := deep-memcpy.o
+ lib-memset-y := memset.o
+ lib-memset-$(CONFIG_DEEP_MEMSET) := deep-memset.o
+ 
+-lib-y += $(lib-clear_page-y) $(lib-copy_page-y) $(lib-copy_user-y) $(lib-memcpy-y) $(lib-memset-y)
++lib-y += $(lib-clear_page-y) $(lib-clear_user-y) $(lib-copy_page-y) $(lib-copy_user-y) $(lib-memcpy-y) $(lib-memset-y)
+ 
+ obj-y = iomap.o
+ obj-y += iomap_copy.o
+diff --git a/arch/sw_64/lib/deep-clear_user.S b/arch/sw_64/lib/deep-clear_user.S
+new file mode 100644
+index 000000000000..521586a7189f
+--- /dev/null
++++ b/arch/sw_64/lib/deep-clear_user.S
+@@ -0,0 +1,48 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Contributed by Mao Minkai <maominkai@wxiat.com>
++ *
++ * Zero user space, handling exceptions as we go.
++ *
++ * We have to make sure that $0 is always up-to-date and contains the
++ * right "bytes left to zero" value (and that it is updated only _after_
++ * a successful copy).  There is also some rather minor exception setup
++ * stuff.
++ *
++ */
++#include <asm/export.h>
++/* Allow an exception for an insn; exit if we get one.  */
++#define FIXUP_LDST(x,y...)			\
++	99: x,##y;			\
++	.section __ex_table,"a";	\
++	.long 99b - .;			\
++	ldi $31, $out-99b($31);	\
++	.previous
++
++/*
++ * $7:	SIMD status
++ *	0: not in simd loop
++ *	1: in simd loop
++ *	2: in simd_u loop
++ * $18:	bytes left to copy
++ *
++ */
++	.globl __clear_user
++	.ent __clear_user
++__clear_user:
++	.prologue 0
++	bis	$31, $31, $7
++	mov	$17, $18
++	bis	$31, $31, $17
++#include "deep-set_template.S"
++$out:
++	bis	$31, $18, $0
++	beq	$7, $return
++
++$restore_simd:
++	RESTORE_SIMD_REGS
++
++$return:
++	ret
++	.end __clear_user
++	EXPORT_SYMBOL(__clear_user)
+diff --git a/arch/sw_64/lib/deep-memset.S b/arch/sw_64/lib/deep-memset.S
+index 7fbd529c72a8..5d9beb1e2f53 100644
+--- a/arch/sw_64/lib/deep-memset.S
++++ b/arch/sw_64/lib/deep-memset.S
+@@ -27,7 +27,8 @@
+ 
+ #include <asm/export.h>
+ 
+-#define NC_STORE_THRESHOLD	2048
++#define FIXUP_LDST(x, y)	\
++	x, y
+ 
+ 	.set noat
+ 	.set noreorder
+@@ -53,94 +54,9 @@ ___memset:
+ 	bis	$17, $4, $17
+ 
+ __constant_c_memset:
+-	bis	$31, $16, $0	# set return value
+-	beq	$18, $out	# return if size is 0
+-	cmplt	$18, 8, $5	# size less than 8, do 1-byte loop
+-	bne	$5, $tail_loop
+-
+-/* loop until SRC is 8 bytes aligned */
+-	.align 5
+-$head_loop:
+-	and	$16, 0x7, $1
+-	beq	$1, $mod8_aligned
+-	stb	$17, 0($16)
+-	subl	$18, 1, $18
+-	beq	$18, $out
+-	addl	$16, 1, $16
+-	br	$31, $head_loop
+-
+-$mod8_aligned:
+-
+-/* set 8 bytes each time */
+-	.align 5
+-$mod8_loop:
+-	and	$16, 0x1f, $1
+-	beq	$1, $mod32_aligned
+-	subl	$18, 8, $18
+-	blt	$18, $tail
+-	stl	$17, 0($16)
+-	addl	$16, 8, $16
+-	br	$31, $mod8_loop
+-
+-/* expand data to 32 bytes */
+-$mod32_aligned:
+-	subl	$sp, 64, $sp
+-	addl	$sp, 31, $4
+-	bic	$4, 0x1f, $4
+-	vstd	$f10, 0($4)
+-	ifmovd	$17, $f10
+-	vcpyf	$f10, $f10
+-
+-	ldi	$1, NC_STORE_THRESHOLD($31)
+-	cmple	$18, $1, $1
+-	bne	$1, $mod32_loop
+-
+-/* set 64 bytes each time */
+-	.align 5
+-$mod32_loop_nc:
+-	subl	$18, 64, $18
+-	blt	$18, $mod32_tail_memb
+-	vstd_nc	$f10, 0($16)
+-	vstd_nc	$f10, 32($16)
+-	addl	$16, 64, $16
+-	br	$31, $mod32_loop_nc
+-
+-	.align 5
+-$mod32_loop:
+-	subl	$18, 64, $18
+-	blt	$18, $mod32_tail
+-	vstd	$f10, 0($16)
+-	vstd	$f10, 32($16)
+-	addl	$16, 64, $16
+-	br	$31, $mod32_loop
+-
+-$mod32_tail_memb:
+-	memb			# required for _nc store instructions
+-$mod32_tail:
+-	vldd	$f10, 0($4)
+-	addl	$sp, 64, $sp
+-	addl	$18, 64, $18
+-	.align 5
+-$mod32_tail_loop:
+-	subl	$18, 8, $18
+-	blt	$18, $tail
+-	stl	$17, 0($16)
+-	addl	$16, 8, $16
+-	br	$31, $mod32_tail_loop
+-
+-$tail:
+-	addl	$18, 8, $18
+-
+-/* set one byte each time */
+-	.align 5
+-$tail_loop:
+-	beq	$18, $out
+-	stb	$17, 0($16)
+-	subl	$18, 1, $18
+-	addl	$16, 1, $16
+-	br	$31, $tail_loop
+-
+-/* done, return */
++	bis	$31, $31, $7
++	bis	$31, $16, $0
++#include "deep-set_template.S"
+ $out:
+ 	ret
+ 
+diff --git a/arch/sw_64/lib/deep-set_template.S b/arch/sw_64/lib/deep-set_template.S
+new file mode 100644
+index 000000000000..f9073d638468
+--- /dev/null
++++ b/arch/sw_64/lib/deep-set_template.S
+@@ -0,0 +1,133 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++/*
++ * template for memcpy and copy_user with SIMD
++ *
++ * $7:	SIMD status
++ *	0: not in simd loop
++ *	1: in simd loop
++ *	2: in simd_u loop
++ * $16:	latest dest, clobbered
++ * $17:	8-byte data to set
++ * $18:	bytes left to copy
++ *
++ */
++
++#define NC_STORE_THRESHOLD	2048
++
++#define SAVE_SIMD_REGS \
++	ldi	$sp, -0x40($sp); \
++	addl	$sp, 0x1f, $23; \
++	bic	$23, 0x1f, $23; \
++	vstd	$f1, 0($23); \
++	ldi	$7, 1
++
++#define RESTORE_SIMD_REGS \
++	vldd	$f1, 0($23); \
++	ldi	$sp, 0x40($sp); \
++	bis	$31, $31, $7
++
++	ble	$18, $out
++	and	$16, 7, $1
++	beq	$1, $dest_aligned_8
++
++	.align 3
++$byte_loop_head:
++	FIXUP_LDST( stb $17, 0($16) )
++	subl	$18, 1, $18
++	addl	$16, 1, $16
++	ble	$18, $out
++	and	$16, 7, $1
++	bne	$1, $byte_loop_head
++
++$dest_aligned_8:
++	cmplt	$18, 16, $1
++	bne	$1, $quad_loop_end
++	and	$16, 31, $1
++	beq	$1, $dest_aligned_32
++	cmplt	$18, 64, $1
++	bne	$1, $simd_end
++
++	.align 3
++$quad_loop_head:
++	FIXUP_LDST( stl $17, 0($16) )
++	addl	$16, 8, $16
++	subl	$18, 8, $18
++	and	$16, 31, $1
++	beq	$1, $dest_aligned_32
++	br	$31, $quad_loop_head
++
++$dest_aligned_32:
++	cmplt	$18, 64, $1
++	bne	$1, $simd_end
++
++$prep_simd_loop:
++	SAVE_SIMD_REGS
++	ifmovd	$17, $f1
++	vcpyf	$f1, $f1
++	ldi	$1, NC_STORE_THRESHOLD($31)
++	cmple	$18, $1, $1
++	bne	$1, $simd_loop
++
++	.align 3
++$simd_loop_nc:
++	FIXUP_LDST( vstd_nc $f1, 0($16) )
++	FIXUP_LDST( vstd_nc $f1, 32($16) )
++	subl	$18, 64, $18
++	addl	$16, 64, $16
++	cmplt	$18, 64, $1
++	beq	$1, $simd_loop_nc
++	memb			# required for _nc store instructions
++	br	$31, $simd_loop_end
++
++	.align 3
++$simd_loop:
++	FIXUP_LDST( vstd $f1, 0($16) )
++	FIXUP_LDST( vstd $f1, 32($16) )
++	subl	$18, 64, $18
++	addl	$16, 64, $16
++	cmplt	$18, 64, $1
++	beq	$1, $simd_loop
++
++$simd_loop_end:
++	cmplt	$18, 32, $1
++	bne	$1, $no_more_simd
++	FIXUP_LDST( vstd $f1, 0($16) )
++	subl	$18, 32, $18
++	addl	$16, 32, $16
++
++$no_more_simd:
++	RESTORE_SIMD_REGS
++
++$simd_end:
++	ble	$18, $out
++	cmplt	$18, 16, $1
++	bne	$1, $quad_loop_end
++
++	.align 3
++$quad_loop_tail:
++	FIXUP_LDST( stl $17, 0($16) )
++	FIXUP_LDST( stl $17, 8($16) )
++	subl	$18, 16, $18
++	addl	$16, 16, $16
++	cmplt	$18, 16, $1
++	beq	$1, $quad_loop_tail
++
++$quad_loop_end:
++	ble	$18, $out
++	cmplt	$18, 8, $1
++	bne	$1, $byte_loop_tail
++
++$move_one_quad:
++	FIXUP_LDST( stl $17, 0($16) )
++	subl	$18, 8, $18
++	addl	$16, 8, $16
++	ble	$18, $out
++
++	.align 3
++$byte_loop_tail:
++	FIXUP_LDST( stb $17, 0($16) )
++	subl	$18, 1, $18
++	addl	$16, 1, $16
++	bgt	$18, $byte_loop_tail
++	br	$31, $out
+-- 
+2.33.0
+

@@ -1,0 +1,92 @@
+From aadce49276fe3cb5d65f9bd932522f5ac069564b Mon Sep 17 00:00:00 2001
+From: Zheng Chongzhen <zhengchongzhen@wxiat.com>
+Date: Wed, 15 Jun 2022 17:40:59 +0800
+Subject: [PATCH] sw64: iommu: fix iommu interrupt handler
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: aadce49276fe3cb5d65f9bd932522f5ac069564b
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56OSP
+
+--------------------------------
+
+When porting ZX200 chipset driver on SW64 platform, we meet an IOMMU
+exception show as follows:
+
+iommu_interrupt, iommu_status = 0xc8014000dffe0000, devid 0xa00, dva 0xdffe0000,
+1Unable to handle kernel paging request at virtual address 0000000000000040
+CPU 0 swapper/0(0): Oops 0
+pc = [<ffffffff81424b80>]  ra = [<ffffffff81424b24>]  ps = 0001    Not tainted
+pc is at iommu_interrupt+0x140/0x3e0
+ra is at iommu_interrupt+0xe4/0x3e0
+v0 = 0000000000000051  t0 = c8014000dffe0000  t1 = 0000000000000000
+t2 = 0000000000000000  t3 = 0000000000000000  t4 = 0000000000000001
+t5 = 0000000000000001  t6 = 0000000000000000  t7 = ffffffff82948000
+s0 = fff00003ffff0400  s1 = 0000000000000001  s2 = 0000000000000a00
+s3 = 0000000000000a00  s4 = 00000000dffe0000  s5 = fff0000100680e80
+s6 = ffffffff8294ba70
+a0 = 0000000000000001  a1 = 0000000000000001  a2 = ffffffff8294b790
+a3 = ffffffff8294b7a8  a4 = 0000000000000000  a5 = ffffffff82c5fb7a
+t8 = 0000000000000001  t9 = fffffffffffcac48  t10 = 0000000000000000
+t11= 0000000000000000  pv = ffffffff809f4f10  at = ffffffff82bff6c0
+gp = ffffffff82c1f510  sp = (____ptrval____)
+
+The root cause is that the device which raises iommu exception is not in the
+device list, then reference a null sdev will cause a page fualt. To work
+around this problem, we apply this patch by just clearing IOMMUEXCPT_STATUS
+and then go on.
+
+BTW, why the device raise IOMMU exception is not a valid device ID, it's a
+puzzling problem.
+
+Signed-off-by: Zheng Chongzhen <zhengchongzhen@wxiat.com>
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/iommu/sw64/sunway_iommu.c | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/iommu/sw64/sunway_iommu.c b/drivers/iommu/sw64/sunway_iommu.c
+index 5797adf8fbc5..b6c8f1272d28 100644
+--- a/drivers/iommu/sw64/sunway_iommu.c
++++ b/drivers/iommu/sw64/sunway_iommu.c
+@@ -648,10 +648,21 @@ irqreturn_t iommu_interrupt(int irq, void *dev)
+ 	type = (iommu_status >> 59) & 0x7;
+ 	devid = (iommu_status >> 37) & 0xffff;
+ 	dva = iommu_status & 0xffffffff;
+-	sdev = search_dev_data(devid);
+-	sdomain = sdev->domain;
+ 	pr_info("%s, iommu_status = %#lx, devid %#lx, dva %#lx, ",
+ 			__func__, iommu_status, devid, dva);
++
++	sdev = search_dev_data(devid);
++	if (sdev == NULL) {
++		pr_info("no such dev!!!\n");
++
++		iommu_status &= ~(1UL << 62);
++		write_piu_ior0(hose->node, hose->index,
++				IOMMUEXCPT_STATUS, iommu_status);
++
++		return IRQ_HANDLED;
++	}
++
++	sdomain = sdev->domain;
+ 	switch (type) {
+ 	case DTE_LEVEL1:
+ 		pr_info("invalid level1 dte, addr:%#lx, val:%#lx\n",
+@@ -674,7 +685,6 @@ irqreturn_t iommu_interrupt(int irq, void *dev)
+ 			fetch_pte(sdomain, dva, PTE_LEVEL2_VAL));
+ 
+ 		iommu_status &= ~(1UL << 62);
+-		iommu_status = iommu_status | (1UL << 63);
+ 		write_piu_ior0(hose->node, hose->index,
+ 				IOMMUEXCPT_STATUS, iommu_status);
+ 		break;
+-- 
+2.33.0
+

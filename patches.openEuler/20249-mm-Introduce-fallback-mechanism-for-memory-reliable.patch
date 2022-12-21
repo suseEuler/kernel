@@ -1,0 +1,162 @@
+From 5f0b48de238408677abf4f88d7f804314d6ebe7d Mon Sep 17 00:00:00 2001
+From: Ma Wupeng <mawupeng1@huawei.com>
+Date: Fri, 11 Nov 2022 09:32:35 +0800
+Subject: [PATCH] mm: Introduce fallback mechanism for memory reliable
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 5f0b48de238408677abf4f88d7f804314d6ebe7d
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4SK3S
+CVE: NA
+
+--------------------------------
+
+Introduce fallback mechanism for memory reliable. memory allocation will
+fallback to non-mirrored region if zone's low watermark is reached and
+kswapd will be awakened at this time.
+
+This mechanism is enabled by defalut and can be disabled by adding
+"reliable_debug=F" to the kernel parameters. This mechanism rely on
+CONFIG_MEMORY_RELIABLE and need "kernelcore=reliable" in the kernel
+parameters.
+
+Signed-off-by: Ma Wupeng <mawupeng1@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ .../admin-guide/kernel-parameters.txt         |  4 ++-
+ include/linux/mem_reliable.h                  |  7 +++++
+ mm/mem_reliable.c                             |  5 ++++
+ mm/page_alloc.c                               | 26 ++++++++++++++++++-
+ 4 files changed, 40 insertions(+), 2 deletions(-)
+
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index 15c7bceb268c..fe9f3fc856ea 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -4786,9 +4786,11 @@
+ 			See Documentation/admin-guide/cgroup-v1/cpusets.rst.
+ 
+ 	reliable_debug=	[ARM64]
+-			Format: [P]
++			Format: [F][,P]
+ 			Only works with CONFIG_MEMORY_RELIABLE and
+ 			"kernelcore=reliable" is configured.
++			F: User memory allocation(special user task, tmpfs) will
++			not allocate memory from non-mirrored region if failed.
+ 			P: Page cache does not use the reliable memory.
+ 
+ 	reserve=	[KNL,BUGS] Force kernel to ignore I/O ports or memory
+diff --git a/include/linux/mem_reliable.h b/include/linux/mem_reliable.h
+index 9b94154b383e..1cc4a9460bcf 100644
+--- a/include/linux/mem_reliable.h
++++ b/include/linux/mem_reliable.h
+@@ -16,6 +16,7 @@ DECLARE_STATIC_KEY_FALSE(mem_reliable);
+ 
+ extern bool reliable_enabled;
+ extern bool shmem_reliable;
++extern bool reliable_allow_fallback;
+ extern bool pagecache_use_reliable_mem;
+ extern struct percpu_counter pagecache_reliable_pages;
+ extern struct percpu_counter anon_reliable_pages;
+@@ -104,6 +105,11 @@ static inline bool mem_reliable_should_reclaim(void)
+ 
+ 	return false;
+ }
++
++static inline bool reliable_allow_fb_enabled(void)
++{
++	return reliable_allow_fallback;
++}
+ #else
+ #define reliable_enabled 0
+ #define pagecache_use_reliable_mem 0
+@@ -138,6 +144,7 @@ static inline void mem_reliable_out_of_memory(gfp_t gfp_mask,
+ 					      unsigned int order,
+ 					      int preferred_nid,
+ 					      nodemask_t *nodemask) {}
++static inline bool reliable_allow_fb_enabled(void) { return false; }
+ #endif
+ 
+ #endif
+diff --git a/mm/mem_reliable.c b/mm/mem_reliable.c
+index 636e51a261ee..5fdda01c708f 100644
+--- a/mm/mem_reliable.c
++++ b/mm/mem_reliable.c
+@@ -16,6 +16,7 @@ EXPORT_SYMBOL_GPL(mem_reliable);
+ 
+ bool reliable_enabled;
+ bool shmem_reliable __read_mostly = true;
++bool reliable_allow_fallback __read_mostly = true;
+ bool pagecache_use_reliable_mem __read_mostly = true;
+ struct percpu_counter pagecache_reliable_pages;
+ struct percpu_counter anon_reliable_pages;
+@@ -294,6 +295,10 @@ static int __init setup_reliable_debug(char *str)
+ 	 */
+ 	for (; *str && *str != ','; str++) {
+ 		switch (*str) {
++		case 'F':
++			reliable_allow_fallback = false;
++			pr_info("disable memory reliable fallback\n");
++			break;
+ 		case 'P':
+ 			pagecache_use_reliable_mem = false;
+ 			pr_info("disable page cache use reliable memory\n");
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 45ade2b73e1a..a8abfe6458a5 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -4668,6 +4668,28 @@ check_retry_cpuset(int cpuset_mems_cookie, struct alloc_context *ac)
+ 	return false;
+ }
+ 
++#ifdef CONFIG_MEMORY_RELIABLE
++static inline void mem_reliable_fallback_slowpath(gfp_t gfp_mask,
++						  struct alloc_context *ac)
++{
++	if (!reliable_allow_fb_enabled())
++		return;
++
++	if (gfp_mask & __GFP_NOFAIL)
++		return;
++
++	if ((ac->highest_zoneidx == ZONE_NORMAL) && (gfp_mask & GFP_RELIABLE)) {
++		ac->highest_zoneidx = gfp_zone(gfp_mask & ~GFP_RELIABLE);
++		ac->preferred_zoneref = first_zones_zonelist(
++			ac->zonelist, ac->highest_zoneidx, ac->nodemask);
++		return;
++	}
++}
++#else
++static inline void mem_reliable_fallback_slowpath(gfp_t gfp_mask,
++						  struct alloc_context *ac) {}
++#endif
++
+ static inline struct page *
+ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
+ 						struct alloc_context *ac)
+@@ -4719,6 +4741,8 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
+ 	if (alloc_flags & ALLOC_KSWAPD)
+ 		wake_all_kswapds(order, gfp_mask, ac);
+ 
++	mem_reliable_fallback_slowpath(gfp_mask, ac);
++
+ 	/*
+ 	 * The adjusted alloc_flags might result in immediate success, so try
+ 	 * that first
+@@ -5232,7 +5256,7 @@ static inline bool check_after_alloc(gfp_t *gfp, unsigned int order,
+ 	*_page = NULL;
+ 
+ out_retry:
+-	if (is_global_init(current)) {
++	if (reliable_allow_fb_enabled() || is_global_init(current)) {
+ 		*gfp &= ~GFP_RELIABLE;
+ 		return true;
+ 	}
+-- 
+2.33.0
+

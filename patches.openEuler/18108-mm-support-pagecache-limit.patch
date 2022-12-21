@@ -1,0 +1,213 @@
+From ca3b6b0e0252e23818114397ea1c0d48e543e723 Mon Sep 17 00:00:00 2001
+From: Chen Wandun <chenwandun@huawei.com>
+Date: Wed, 17 Aug 2022 17:58:44 +0800
+Subject: [PATCH] mm: support pagecache limit
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: ca3b6b0e0252e23818114397ea1c0d48e543e723
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4HOXK
+CVE: NA
+
+--------------------------------
+
+Add /pros/sys/vm/cache_limit_mbytes to set page cache limit. This
+interface set the upper limit of page cache, if usage of page cache
+is over cache_limit_mbytes, it will trigger memory reclaim, the
+reclaim size and reclaim interval are decided by interfaces
+/proc/sys/vm/cache_reclaim_s and /proc/sys/vm/cache_reclaim_weight,
+these two intefaces are introduced in previous patch.
+
+Signed-off-by: Chen Wandun <chenwandun@huawei.com>
+Reviewed-by: Tong Tiangen <tongtiangen@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ Documentation/admin-guide/sysctl/vm.rst |  8 +++
+ include/linux/page_cache_limit.h        |  3 +-
+ mm/page_cache_limit.c                   | 71 ++++++++++++++++++++++++-
+ mm/vmscan.c                             |  5 +-
+ 4 files changed, 83 insertions(+), 4 deletions(-)
+
+diff --git a/Documentation/admin-guide/sysctl/vm.rst b/Documentation/admin-guide/sysctl/vm.rst
+index 02092b8de1e9..eb227015a895 100644
+--- a/Documentation/admin-guide/sysctl/vm.rst
++++ b/Documentation/admin-guide/sysctl/vm.rst
+@@ -77,6 +77,7 @@ Currently, these files are in /proc/sys/vm:
+ - cache_reclaim_s
+ - cache_reclaim_weight
+ - cache_reclaim_enable
++- cache_limit_mbytes
+ 
+ 
+ admin_reserve_kbytes
+@@ -1058,3 +1059,10 @@ cache_reclaim_enable
+ ====================
+ 
+ This is used to switch on/off periodical memory reclaim feature.
++
++
++cache_limit_mbytes
++==================
++
++This is used to set the upper limit of page cache in megabytes.
++Page cache will be reclaimed periodically if page cache is over limit.
+diff --git a/include/linux/page_cache_limit.h b/include/linux/page_cache_limit.h
+index dcfc54f88acc..64a6e7017045 100644
+--- a/include/linux/page_cache_limit.h
++++ b/include/linux/page_cache_limit.h
+@@ -2,6 +2,7 @@
+ #ifndef _LINUX_PAGE_CACHE_LIMIT_H
+ #define _LINUX_PAGE_CACHE_LIMIT_H
+ #ifdef CONFIG_PAGE_CACHE_LIMIT
+-extern unsigned long page_cache_shrink_memory(unsigned long nr_to_reclaim);
++extern unsigned long page_cache_shrink_memory(unsigned long nr_to_reclaim,
++						bool may_swap);
+ #endif /* CONFIG_PAGE_CACHE_LIMIT */
+ #endif /* _LINUX_PAGE_CACHE_LIMIT_H */
+diff --git a/mm/page_cache_limit.c b/mm/page_cache_limit.c
+index 51b298c854b4..05eb441f2bf2 100644
+--- a/mm/page_cache_limit.c
++++ b/mm/page_cache_limit.c
+@@ -8,12 +8,14 @@
+ #include <linux/swap.h>
+ #include <linux/sysctl.h>
+ #include <linux/workqueue.h>
++#include "internal.h"
+ 
+ static int vm_cache_reclaim_s __read_mostly;
+ static int vm_cache_reclaim_s_max = 43200;
+ static int vm_cache_reclaim_weight __read_mostly = 1;
+ static int vm_cache_reclaim_weight_max = 100;
+ static int vm_cache_reclaim_enable = 1;
++static unsigned long vm_cache_limit_mbytes __read_mostly;
+ 
+ static void shrink_shepherd(struct work_struct *w);
+ static DECLARE_DEFERRABLE_WORK(shepherd, shrink_shepherd);
+@@ -31,6 +33,31 @@ static unsigned long node_reclaim_num(void)
+ 	return SWAP_CLUSTER_MAX * nr_cpus_node(nid) * vm_cache_reclaim_weight;
+ }
+ 
++static bool page_cache_over_limit(void)
++{
++	unsigned long lru_file;
++	unsigned long limit;
++
++	limit = vm_cache_limit_mbytes * ((1024 * 1024UL) / PAGE_SIZE);
++	lru_file = global_node_page_state(NR_ACTIVE_FILE) +
++			global_node_page_state(NR_INACTIVE_FILE);
++	if (lru_file > limit)
++		return true;
++
++	return false;
++}
++
++static bool should_reclaim_page_cache(void)
++{
++	if (!should_periodical_reclaim())
++		return false;
++
++	if (!vm_cache_limit_mbytes)
++		return false;
++
++	return true;
++}
++
+ static int cache_reclaim_enable_handler(struct ctl_table *table, int write,
+ 			void __user *buffer, size_t *length, loff_t *ppos)
+ {
+@@ -64,6 +91,37 @@ static int cache_reclaim_sysctl_handler(struct ctl_table *table, int write,
+ 	return ret;
+ }
+ 
++static int cache_limit_mbytes_sysctl_handler(struct ctl_table *table, int write,
++		void __user *buffer, size_t *length, loff_t *ppos)
++{
++	int ret;
++	unsigned long vm_cache_limit_mbytes_max;
++	unsigned long origin_mbytes = vm_cache_limit_mbytes;
++	int nr_retries = MAX_RECLAIM_RETRIES;
++
++	vm_cache_limit_mbytes_max = totalram_pages() >> (20 - PAGE_SHIFT);
++	ret = proc_doulongvec_minmax(table, write, buffer, length, ppos);
++	if (ret || !write)
++		return ret;
++
++	if (vm_cache_limit_mbytes > vm_cache_limit_mbytes_max) {
++		vm_cache_limit_mbytes = origin_mbytes;
++		return -EINVAL;
++	}
++
++	if (write) {
++		while (should_reclaim_page_cache() && page_cache_over_limit() &&
++				nr_retries--) {
++			if (signal_pending(current))
++				return -EINTR;
++
++			page_cache_shrink_memory(node_reclaim_num(), false);
++		}
++	}
++
++	return 0;
++}
++
+ static struct ctl_table ctl_table[] = {
+ 	{
+ 		.procname       = "cache_reclaim_s",
+@@ -92,6 +150,13 @@ static struct ctl_table ctl_table[] = {
+ 		.extra1		= SYSCTL_ZERO,
+ 		.extra2		= SYSCTL_ONE,
+ 	},
++	{
++		.procname	= "cache_limit_mbytes",
++		.data		= &vm_cache_limit_mbytes,
++		.maxlen		= sizeof(vm_cache_limit_mbytes),
++		.mode		= 0644,
++		.proc_handler	= cache_limit_mbytes_sysctl_handler,
++	},
+ 	{}
+ };
+ 
+@@ -123,7 +188,11 @@ static void shrink_shepherd(struct work_struct *w)
+ 
+ static void shrink_page_work(struct work_struct *w)
+ {
+-	page_cache_shrink_memory(node_reclaim_num());
++	if (should_reclaim_page_cache()) {
++		if (page_cache_over_limit())
++			page_cache_shrink_memory(node_reclaim_num(), false);
++	} else if (should_periodical_reclaim())
++		page_cache_shrink_memory(node_reclaim_num(), true);
+ }
+ 
+ static void shrink_shepherd_timer(void)
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 3ddd6ae8a164..d96f52b2fbe0 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -4595,7 +4595,8 @@ struct page *get_page_from_vaddr(struct mm_struct *mm, unsigned long vaddr)
+ EXPORT_SYMBOL_GPL(get_page_from_vaddr);
+ 
+ #ifdef CONFIG_PAGE_CACHE_LIMIT
+-unsigned long page_cache_shrink_memory(unsigned long nr_to_reclaim)
++unsigned long page_cache_shrink_memory(unsigned long nr_to_reclaim,
++					bool may_swap)
+ {
+ 	unsigned long nr_reclaimed;
+ 	unsigned int noreclaim_flag;
+@@ -4606,7 +4607,7 @@ unsigned long page_cache_shrink_memory(unsigned long nr_to_reclaim)
+ 		.may_writepage = !laptop_mode,
+ 		.nr_to_reclaim = nr_to_reclaim / 2,
+ 		.may_unmap = 1,
+-		.may_swap = 1,
++		.may_swap = may_swap,
+ 		.priority = DEF_PRIORITY,
+ 	};
+ 
+-- 
+2.33.0
+

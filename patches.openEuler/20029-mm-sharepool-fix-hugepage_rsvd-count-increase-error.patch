@@ -1,0 +1,86 @@
+From bec70574669710bd0962f1f6807363915fc94f16 Mon Sep 17 00:00:00 2001
+From: Guo Mengqi <guomengqi3@huawei.com>
+Date: Thu, 3 Nov 2022 06:41:58 +0000
+Subject: [PATCH] mm/sharepool: fix hugepage_rsvd count increase error
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: bec70574669710bd0962f1f6807363915fc94f16
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5RO2H
+CVE: NA
+
+--------------------------------
+
+When nr_hugepages is configured, sharepool allocates hugepages first
+from hugetlb pool, then from buddy system if the pool had been used up.
+Current page release function treat the buddy system hugepages as
+hugetlb pages, which caused HugePages_Rsvd to increase improperly.
+
+Add a check in page release function:
+    if the page is temporary, do not call hugetlb_unreserve_pages.
+
+Signed-off-by: Guo Mengqi <guomengqi3@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/hugetlbfs/inode.c | 19 +++++++++++++------
+ mm/share_pool.c      |  3 +--
+ 2 files changed, 14 insertions(+), 8 deletions(-)
+
+diff --git a/fs/hugetlbfs/inode.c b/fs/hugetlbfs/inode.c
+index 8a87d1b43387..379aa008514d 100644
+--- a/fs/hugetlbfs/inode.c
++++ b/fs/hugetlbfs/inode.c
+@@ -597,11 +597,17 @@ static void remove_inode_hugepages(struct inode *inode, loff_t lstart,
+ 			 */
+ 			VM_BUG_ON(HPageRestoreReserve(page));
+ 			remove_huge_page(page);
+-			freed++;
+-			if (!truncate_op) {
+-				if (unlikely(hugetlb_unreserve_pages(inode,
+-							index, index + 1, 1)))
+-					hugetlb_fix_reserve_counts(inode);
++			/*
++			 * if the page is from buddy system, do not add to freed.
++			 * because freed is used for hugetlbfs reservation accounting.
++			 */
++			if (!HPageTemporary(page)) {
++				freed++;
++				if (!truncate_op) {
++					if (unlikely(hugetlb_unreserve_pages(inode,
++									index, index + 1, 1)))
++						hugetlb_fix_reserve_counts(inode);
++				}
+ 			}
+ 
+ 			unlock_page(page);
+@@ -1054,7 +1060,8 @@ static int hugetlbfs_error_remove_page(struct address_space *mapping,
+ 	pgoff_t index = page->index;
+ 
+ 	remove_huge_page(page);
+-	if (unlikely(hugetlb_unreserve_pages(inode, index, index + 1, 1)))
++	if (!HPageTemporary(page) &&
++			unlikely(hugetlb_unreserve_pages(inode, index, index + 1, 1)))
+ 		hugetlb_fix_reserve_counts(inode);
+ 
+ 	return 0;
+diff --git a/mm/share_pool.c b/mm/share_pool.c
+index 09e0b247bddb..42a63b9beabc 100644
+--- a/mm/share_pool.c
++++ b/mm/share_pool.c
+@@ -4224,8 +4224,7 @@ vm_fault_t sharepool_no_page(struct mm_struct *mm,
+ 
+ 		page = alloc_huge_page(vma, haddr, 0);
+ 		if (IS_ERR(page)) {
+-			page = alloc_huge_page_nodemask(hstate_file(vma->vm_file),
+-						    node_id, NULL, GFP_KERNEL);
++			page = hugetlb_alloc_hugepage(node_id, HUGETLB_ALLOC_BUDDY);
+ 			if (!page)
+ 				page = ERR_PTR(-ENOMEM);
+ 		}
+-- 
+2.33.0
+

@@ -1,0 +1,327 @@
+From 581a69b81673ae3cecd41af71338af42855964e2 Mon Sep 17 00:00:00 2001
+From: Chen Wandun <chenwandun@huawei.com>
+Date: Wed, 17 Aug 2022 17:58:43 +0800
+Subject: [PATCH] mm: support periodical memory reclaim
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 581a69b81673ae3cecd41af71338af42855964e2
+Modified-by-SEL: Yes, modified due to different context
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4HOXK
+CVE: NA
+
+--------------------------------
+
+Adding periodical memory reclaim support, there are three new
+interfaces:
+
+1) /proc/sys/vm/cache_reclaim_s --- used to set reclaim interval
+2) /proc/sys/vm/cache_reclaim_weight --- used to calculate reclaim amount
+3) /proc/sys/vm/cache_reclaim_enable --- used to switch on/off this feature
+
+Signed-off-by: Chen Wandun <chenwandun@huawei.com>
+Reviewed-by: Tong Tiangen <tongtiangen@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ Documentation/admin-guide/sysctl/vm.rst |   32 ++++++
+ include/linux/page_cache_limit.h        |    7 +
+ mm/Kconfig                              |   13 ++
+ mm/Makefile                             |    1 
+ mm/page_cache_limit.c                   |  148 ++++++++++++++++++++++++++++++++
+ mm/vmscan.c                             |   37 ++++++++
+ 6 files changed, 238 insertions(+)
+ create mode 100644 include/linux/page_cache_limit.h
+ create mode 100644 mm/page_cache_limit.c
+
+--- a/Documentation/admin-guide/sysctl/vm.rst
++++ b/Documentation/admin-guide/sysctl/vm.rst
+@@ -74,6 +74,9 @@ Currently, these files are in /proc/sys/
+ - watermark_boost_factor
+ - watermark_scale_factor
+ - zone_reclaim_mode
++- cache_reclaim_s
++- cache_reclaim_weight
++- cache_reclaim_enable
+ 
+ 
+ admin_reserve_kbytes
+@@ -1026,3 +1029,32 @@ of other processes running on other node
+ Allowing regular swap effectively restricts allocations to the local
+ node unless explicitly overridden by memory policies or cpuset
+ configurations.
++
++cache_reclaim_s
++===============
++
++Cache_reclaim_s is used to set reclaim interval in periodical memory
++reclaim. when periodical memory reclaim is enabled, it will relcaim
++memory in every cache_reclaim_s second.
++
++
++cache_reclaim_weight
++====================
++
++This is reclaim factor in every periodical reclaim. when periodical
++memory reclaim is enabled, the reclaim amount in every reclaim can
++calculate from:
++    reclaim_amount = cache_reclaim_weigh * SWAP_CLUSTER_MAX * nr_cpus_node(nid)
++
++SWAP_CLUSTER_MAX is defined in include/linux/swap.h.
++nr_cpus_node is used to obtain the number of CPUs on node nid.
++
++Memory reclaim use workqueue mechanism, it will block the execution of
++subsequent work, if memory reclaim tasks a lot of time, time sensitive
++work may be affected.
++
++
++cache_reclaim_enable
++====================
++
++This is used to switch on/off periodical memory reclaim feature.
+--- /dev/null
++++ b/include/linux/page_cache_limit.h
+@@ -0,0 +1,7 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_PAGE_CACHE_LIMIT_H
++#define _LINUX_PAGE_CACHE_LIMIT_H
++#ifdef CONFIG_PAGE_CACHE_LIMIT
++extern unsigned long page_cache_shrink_memory(unsigned long nr_to_reclaim);
++#endif /* CONFIG_PAGE_CACHE_LIMIT */
++#endif /* _LINUX_PAGE_CACHE_LIMIT_H */
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -551,6 +551,19 @@ config USERSWAP
+ 	  Support for User Swap. This is based on userfaultfd. We can implement
+ 	  our own swapout and swapin functions in usersapce.
+ 
++config PAGE_CACHE_LIMIT
++       bool "Support page cache limit"
++       depends on MMU && SYSCTL
++       default n
++       help
++	 Keeping a number of page cache can improve the performance of system,
++	 but if there is a lot fo page cache in system, that will result in
++	 short of memory, subsequent memory reclamation operations may lead
++	 to performance degradation, so add periodical memory relciam to
++	 avoid too many page cache.
++
++	 if unsure, say N to disable the PAGE_CACHE_LIMIT.
++
+ config CMA
+ 	bool "Contiguous Memory Allocator"
+ 	depends on MMU
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -132,3 +132,4 @@ obj-$(CONFIG_PIN_MEMORY) += pin_mem.o
+ obj-$(CONFIG_ASCEND_SHARE_POOL) += share_pool.o
+ obj-$(CONFIG_MEMORY_RELIABLE) += mem_reliable.o
+ obj-$(CONFIG_MEMCG_MEMFS_INFO) += memcg_memfs_info.o
++obj-$(CONFIG_PAGE_CACHE_LIMIT) += page_cache_limit.o
+--- /dev/null
++++ b/mm/page_cache_limit.c
+@@ -0,0 +1,148 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Support for periodic memory reclaim and page cache limit
++ */
++
++#include <linux/mm.h>
++#include <linux/page_cache_limit.h>
++#include <linux/swap.h>
++#include <linux/sysctl.h>
++#include <linux/workqueue.h>
++
++static int vm_cache_reclaim_s __read_mostly;
++static int vm_cache_reclaim_s_max = 43200;
++static int vm_cache_reclaim_weight __read_mostly = 1;
++static int vm_cache_reclaim_weight_max = 100;
++static int vm_cache_reclaim_enable = 1;
++
++static void shrink_shepherd(struct work_struct *w);
++static DECLARE_DEFERRABLE_WORK(shepherd, shrink_shepherd);
++static struct work_struct vmscan_works[MAX_NUMNODES];
++
++static bool should_periodical_reclaim(void)
++{
++	return vm_cache_reclaim_s && vm_cache_reclaim_enable;
++}
++
++static unsigned long node_reclaim_num(void)
++{
++	int nid = numa_node_id();
++
++	return SWAP_CLUSTER_MAX * nr_cpus_node(nid) * vm_cache_reclaim_weight;
++}
++
++static int cache_reclaim_enable_handler(struct ctl_table *table, int write,
++			void __user *buffer, size_t *length, loff_t *ppos)
++{
++	int ret;
++
++	ret = proc_dointvec_minmax(table, write, buffer, length, ppos);
++	if (ret || !write)
++		return ret;
++
++	if (should_periodical_reclaim())
++		schedule_delayed_work(&shepherd, round_jiffies_relative(
++			(unsigned long)vm_cache_reclaim_s * HZ));
++
++	return 0;
++}
++
++static int cache_reclaim_sysctl_handler(struct ctl_table *table, int write,
++		void __user *buffer, size_t *length, loff_t *ppos)
++{
++	int ret;
++
++	ret = proc_dointvec_minmax(table, write, buffer, length, ppos);
++	if (ret || !write)
++		return ret;
++
++	if (should_periodical_reclaim())
++		mod_delayed_work(system_unbound_wq, &shepherd,
++				round_jiffies_relative(
++				(unsigned long)vm_cache_reclaim_s * HZ));
++
++	return ret;
++}
++
++static struct ctl_table ctl_table[] = {
++	{
++		.procname       = "cache_reclaim_s",
++		.data           = &vm_cache_reclaim_s,
++		.maxlen         = sizeof(vm_cache_reclaim_s),
++		.mode           = 0644,
++		.proc_handler   = cache_reclaim_sysctl_handler,
++		.extra1         = SYSCTL_ZERO,
++		.extra2         = &vm_cache_reclaim_s_max,
++	},
++	{
++		.procname       = "cache_reclaim_weight",
++		.data           = &vm_cache_reclaim_weight,
++		.maxlen         = sizeof(vm_cache_reclaim_weight),
++		.mode           = 0644,
++		.proc_handler   = proc_dointvec_minmax,
++		.extra1         = SYSCTL_ONE,
++		.extra2         = &vm_cache_reclaim_weight_max,
++	},
++	{
++		.procname	= "cache_reclaim_enable",
++		.data		= &vm_cache_reclaim_enable,
++		.maxlen		= sizeof(vm_cache_reclaim_enable),
++		.mode		= 0644,
++		.proc_handler	= cache_reclaim_enable_handler,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
++	},
++	{}
++};
++
++static struct ctl_table limit_dir_table[] = {
++	{
++		.procname = "vm",
++		.maxlen = 0,
++		.mode = 0555,
++		.child = ctl_table,
++	},
++	{}
++};
++
++static void shrink_shepherd(struct work_struct *w)
++{
++	int node;
++
++	if (!should_periodical_reclaim())
++		return;
++
++	for_each_online_node(node) {
++		if (!work_pending(&vmscan_works[node]))
++			queue_work_node(node, system_unbound_wq, &vmscan_works[node]);
++	}
++
++	queue_delayed_work(system_unbound_wq, &shepherd,
++		round_jiffies_relative((unsigned long)vm_cache_reclaim_s * HZ));
++}
++
++static void shrink_page_work(struct work_struct *w)
++{
++	page_cache_shrink_memory(node_reclaim_num());
++}
++
++static void shrink_shepherd_timer(void)
++{
++	int i;
++
++	for (i = 0; i < MAX_NUMNODES; i++)
++		INIT_WORK(&vmscan_works[i], shrink_page_work);
++}
++
++static int __init shrink_page_init(void)
++{
++	if (!register_sysctl_table(limit_dir_table)) {
++		pr_err("register page cache limit sysctl failed.");
++		return -ENOMEM;
++	}
++
++	shrink_shepherd_timer();
++
++	return 0;
++}
++late_initcall(shrink_page_init)
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -59,6 +59,7 @@
+ #include <linux/swapops.h>
+ #include <linux/balloon_compaction.h>
+ 
++#include <linux/page_cache_limit.h>
+ #include "internal.h"
+ 
+ #define CREATE_TRACE_POINTS
+@@ -4619,6 +4620,42 @@ struct page *get_page_from_vaddr(struct
+ }
+ EXPORT_SYMBOL_GPL(get_page_from_vaddr);
+ 
++#ifdef CONFIG_PAGE_CACHE_LIMIT
++unsigned long page_cache_shrink_memory(unsigned long nr_to_reclaim)
++{
++	unsigned long nr_reclaimed;
++	unsigned int noreclaim_flag;
++	int nid = numa_node_id();
++	struct scan_control sc = {
++		.gfp_mask = GFP_HIGHUSER_MOVABLE,
++		.reclaim_idx = ZONE_MOVABLE,
++		.may_writepage = !laptop_mode,
++		.nr_to_reclaim = nr_to_reclaim / 2,
++		.may_unmap = 1,
++		.may_swap = 1,
++		.priority = DEF_PRIORITY,
++	};
++
++	struct zonelist *zonelist = node_zonelist(nid, sc.gfp_mask);
++	struct scan_control orig_sc = sc;
++
++	fs_reclaim_acquire(sc.gfp_mask);
++	noreclaim_flag = memalloc_noreclaim_save();
++	set_task_reclaim_state(current, &sc.reclaim_state);
++
++	nr_reclaimed = do_try_to_free_pages(zonelist, &sc);
++	sc = orig_sc;
++	sc.reclaim_idx--;
++	nr_reclaimed += do_try_to_free_pages(zonelist, &sc);
++
++	set_task_reclaim_state(current, NULL);
++	memalloc_noreclaim_restore(noreclaim_flag);
++	fs_reclaim_release(sc.gfp_mask);
++
++	return nr_reclaimed;
++}
++#endif
++
+ static int add_page_for_reclaim_swapcache(struct page *page,
+ 	struct list_head *pagelist, struct lruvec *lruvec, enum lru_list lru)
+ {

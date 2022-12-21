@@ -1,0 +1,276 @@
+From 6e6cf0d7d674254ed369515aafce94c238b9897d Mon Sep 17 00:00:00 2001
+From: Chen Wandun <chenwandun@huawei.com>
+Date: Fri, 11 Nov 2022 09:32:31 +0800
+Subject: [PATCH] mm: add "ReliableFileCache" item in /proc/meminfo
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 6e6cf0d7d674254ed369515aafce94c238b9897d
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4SK3S
+CVE: NA
+
+--------------------------------
+
+Add statistics for usage of reliable page cache, Item "ReliableFileCache"
+in /proc/meminfo show the usage of reliable page cache.
+
+Signed-off-by: Chen Wandun <chenwandun@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/mem_reliable.h | 24 +++++++++++++++
+ include/linux/mm.h           |  6 ++--
+ include/linux/mm_inline.h    |  4 +++
+ include/linux/mmzone.h       |  5 ++++
+ mm/mem_reliable.c            | 57 ++++++++++++++++++++++++++++++++++++
+ mm/vmscan.c                  |  2 ++
+ 6 files changed, 95 insertions(+), 3 deletions(-)
+
+diff --git a/include/linux/mem_reliable.h b/include/linux/mem_reliable.h
+index 857881682ea3..59108e955f48 100644
+--- a/include/linux/mem_reliable.h
++++ b/include/linux/mem_reliable.h
+@@ -15,6 +15,8 @@ DECLARE_STATIC_KEY_FALSE(mem_reliable);
+ extern bool reliable_enabled;
+ extern bool shmem_reliable;
+ extern bool pagecache_use_reliable_mem;
++extern struct percpu_counter pagecache_reliable_pages;
++extern struct percpu_counter anon_reliable_pages;
+ 
+ extern void mem_reliable_init(bool has_unmirrored_mem,
+ 			      unsigned long *zone_movable_pfn,
+@@ -23,6 +25,11 @@ extern void shmem_reliable_init(void);
+ extern void reliable_report_meminfo(struct seq_file *m);
+ extern void page_cache_prepare_alloc(gfp_t *gfp);
+ extern bool mem_reliable_status(void);
++extern void reliable_lru_add(enum lru_list lru, struct page *page,
++					int val);
++extern void reliable_lru_add_batch(int zid, enum lru_list lru,
++					      int val);
++extern bool mem_reliable_counter_initialized(void);
+ 
+ static inline bool mem_reliable_is_enabled(void)
+ {
+@@ -56,6 +63,17 @@ static inline bool shmem_reliable_is_enabled(void)
+ {
+ 	return shmem_reliable;
+ }
++
++static inline bool page_reliable(struct page *page)
++{
++	if (!mem_reliable_is_enabled())
++		return false;
++
++	if (!page)
++		return false;
++
++	return page_zonenum(page) < ZONE_MOVABLE;
++}
+ #else
+ #define reliable_enabled 0
+ #define pagecache_use_reliable_mem 0
+@@ -74,6 +92,12 @@ static inline void reliable_report_meminfo(struct seq_file *m) {}
+ static inline bool shmem_reliable_is_enabled(void) { return false; }
+ static inline void page_cache_prepare_alloc(gfp_t *gfp) {}
+ static inline bool mem_reliable_status(void) { return false; }
++static inline bool page_reliable(struct page *page) { return false; }
++static inline void reliable_lru_add(enum lru_list lru, struct page *page,
++				    int val) {}
++static inline void reliable_lru_add_batch(int zid, enum lru_list lru,
++					  int val) {}
++static inline bool mem_reliable_counter_initialized(void) { return false; }
+ #endif
+ 
+ #endif
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 839106c9f708..ed66c81cf747 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -34,9 +34,6 @@
+ #include <linux/pgtable.h>
+ #include <linux/kabi.h>
+ 
+-/* added to mm.h to avoid every caller adding new header file */
+-#include <linux/mem_reliable.h>
+-
+ struct mempolicy;
+ struct anon_vma;
+ struct anon_vma_chain;
+@@ -3313,5 +3310,8 @@ static inline int seal_check_future_write(int seals, struct vm_area_struct *vma)
+ 	return 0;
+ }
+ 
++/* added to mm.h to avoid every caller adding new header file */
++#include <linux/mem_reliable.h>
++
+ #endif /* __KERNEL__ */
+ #endif /* _LINUX_MM_H */
+diff --git a/include/linux/mm_inline.h b/include/linux/mm_inline.h
+index 8fc71e9d7bb0..36f2e8f7db9d 100644
+--- a/include/linux/mm_inline.h
++++ b/include/linux/mm_inline.h
+@@ -4,6 +4,7 @@
+ 
+ #include <linux/huge_mm.h>
+ #include <linux/swap.h>
++#include <linux/mem_reliable.h>
+ 
+ /**
+  * page_is_file_lru - should the page be on a file LRU or anon LRU?
+@@ -50,6 +51,7 @@ static __always_inline void add_page_to_lru_list(struct page *page,
+ {
+ 	update_lru_size(lruvec, lru, page_zonenum(page), thp_nr_pages(page));
+ 	list_add(&page->lru, &lruvec->lists[lru]);
++	reliable_lru_add(lru, page, thp_nr_pages(page));
+ }
+ 
+ static __always_inline void add_page_to_lru_list_tail(struct page *page,
+@@ -57,6 +59,7 @@ static __always_inline void add_page_to_lru_list_tail(struct page *page,
+ {
+ 	update_lru_size(lruvec, lru, page_zonenum(page), thp_nr_pages(page));
+ 	list_add_tail(&page->lru, &lruvec->lists[lru]);
++	reliable_lru_add(lru, page, thp_nr_pages(page));
+ }
+ 
+ static __always_inline void del_page_from_lru_list(struct page *page,
+@@ -64,6 +67,7 @@ static __always_inline void del_page_from_lru_list(struct page *page,
+ {
+ 	list_del(&page->lru);
+ 	update_lru_size(lruvec, lru, page_zonenum(page), -thp_nr_pages(page));
++	reliable_lru_add(lru, page, -thp_nr_pages(page));
+ }
+ 
+ /**
+diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+index 8719d891848f..7f25539d2fe4 100644
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -261,6 +261,11 @@ static inline bool is_file_lru(enum lru_list lru)
+ 	return (lru == LRU_INACTIVE_FILE || lru == LRU_ACTIVE_FILE);
+ }
+ 
++static inline int is_anon_lru(enum lru_list lru)
++{
++	return (lru == LRU_INACTIVE_ANON || lru == LRU_ACTIVE_ANON);
++}
++
+ static inline bool is_active_lru(enum lru_list lru)
+ {
+ 	return (lru == LRU_ACTIVE_ANON || lru == LRU_ACTIVE_FILE);
+diff --git a/mm/mem_reliable.c b/mm/mem_reliable.c
+index 6c0b931b9071..4d49da71809b 100644
+--- a/mm/mem_reliable.c
++++ b/mm/mem_reliable.c
+@@ -17,6 +17,14 @@ EXPORT_SYMBOL_GPL(mem_reliable);
+ bool reliable_enabled;
+ bool shmem_reliable __read_mostly = true;
+ bool pagecache_use_reliable_mem __read_mostly = true;
++struct percpu_counter pagecache_reliable_pages;
++struct percpu_counter anon_reliable_pages;
++
++bool mem_reliable_counter_initialized(void)
++{
++	return likely(percpu_counter_initialized(&pagecache_reliable_pages)) &&
++		likely((percpu_counter_initialized(&anon_reliable_pages)));
++}
+ 
+ bool mem_reliable_status(void)
+ {
+@@ -24,6 +32,37 @@ bool mem_reliable_status(void)
+ }
+ EXPORT_SYMBOL_GPL(mem_reliable_status);
+ 
++void reliable_lru_add_batch(int zid, enum lru_list lru,
++				       int val)
++{
++	if (!mem_reliable_is_enabled())
++		return;
++
++	if (zid < ZONE_MOVABLE) {
++		if (is_file_lru(lru))
++			percpu_counter_add(&pagecache_reliable_pages, val);
++		else if (is_anon_lru(lru))
++			percpu_counter_add(&anon_reliable_pages, val);
++	}
++}
++
++void reliable_lru_add(enum lru_list lru, struct page *page, int val)
++{
++	if (!page_reliable(page))
++		return;
++
++	if (is_file_lru(lru))
++		percpu_counter_add(&pagecache_reliable_pages, val);
++	else if (is_anon_lru(lru))
++		percpu_counter_add(&anon_reliable_pages, val);
++	else if (lru == LRU_UNEVICTABLE) {
++		if (PageAnon(page))
++			percpu_counter_add(&anon_reliable_pages, val);
++		else
++			percpu_counter_add(&pagecache_reliable_pages, val);
++	}
++}
++
+ void page_cache_prepare_alloc(gfp_t *gfp)
+ {
+ 	if (!mem_reliable_is_enabled())
+@@ -118,14 +157,32 @@ void reliable_report_meminfo(struct seq_file *m)
+ 	show_val_kb(m, "ReliableBuddyMem: ", free_reliable_pages());
+ 
+ 	if (pagecache_reliable_is_enabled()) {
++		s64 nr_pagecache_pages = 0;
+ 		unsigned long num = 0;
+ 
+ 		num += global_node_page_state(NR_LRU_BASE + LRU_ACTIVE_FILE);
+ 		num += global_node_page_state(NR_LRU_BASE + LRU_INACTIVE_FILE);
+ 		show_val_kb(m, "FileCache:        ", num);
++
++		nr_pagecache_pages =
++			percpu_counter_sum_positive(&pagecache_reliable_pages);
++		seq_printf(m, "ReliableFileCache: %8llu kB\n",
++			   nr_pagecache_pages << (PAGE_SHIFT - 10));
+ 	}
+ }
+ 
++static int __init reliable_sysctl_init(void)
++{
++	if (!mem_reliable_is_enabled())
++		return 0;
++
++	percpu_counter_init(&pagecache_reliable_pages, 0, GFP_KERNEL);
++	percpu_counter_init(&anon_reliable_pages, 0, GFP_KERNEL);
++
++	return 0;
++}
++arch_initcall(reliable_sysctl_init);
++
+ static int __init setup_reliable_debug(char *str)
+ {
+ 	if (*str++ != '=' || !*str)
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 9e76887a84d3..a98566925f9d 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -1813,6 +1813,7 @@ static __always_inline void update_lru_sizes(struct lruvec *lruvec,
+ 			continue;
+ 
+ 		update_lru_size(lruvec, lru, zid, -nr_zone_taken[zid]);
++		reliable_lru_add_batch(zid, lru, -nr_zone_taken[zid]);
+ 	}
+ 
+ }
+@@ -2082,6 +2083,7 @@ static unsigned noinline_for_stack move_pages_to_lru(struct lruvec *lruvec,
+ 
+ 		update_lru_size(lruvec, lru, page_zonenum(page), nr_pages);
+ 		list_add(&page->lru, &lruvec->lists[lru]);
++		reliable_lru_add(lru, page, nr_pages);
+ 		nr_moved += nr_pages;
+ 		if (PageActive(page))
+ 			workingset_age_nonresident(lruvec, nr_pages);
+-- 
+2.33.0
+

@@ -1,0 +1,169 @@
+From 7cdbdbf5b6c12b1bff2ffb6b4bf08910ecf1689a Mon Sep 17 00:00:00 2001
+From: Ren Zhijie <renzhijie2@huawei.com>
+Date: Fri, 25 Nov 2022 11:56:19 +0800
+Subject: [PATCH] sched: programmable: Add helpers to set tag of task or
+ task_group
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 7cdbdbf5b6c12b1bff2ffb6b4bf08910ecf1689a
+Modified-by-SEL: Yes, modified due to different context
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5KUFB
+CVE: NA
+
+--------------------------------
+
+Add helper function bpf_sched_set_tg_tag() and
+bpf_sched_set_task_tag() to set tag for task group or task.
+
+They can not be call when rq->lock has been held.
+
+The use case is that the other kernel subsystems,
+such as the network, can use it to mark key tasks.
+
+Signed-off-by: Ren Zhijie <renzhijie2@huawei.com>
+Signed-off-by: Hui Tang <tanghui20@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/uapi/linux/bpf.h       |   14 ++++++++++++
+ kernel/bpf/helpers.c           |    6 +++++
+ kernel/sched/bpf_sched.c       |   45 +++++++++++++++++++++++++++++++++++++++++
+ tools/include/uapi/linux/bpf.h |   14 ++++++++++++
+ 4 files changed, 79 insertions(+)
+
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -5070,6 +5070,18 @@ union bpf_attr {
+  *		different workloads.
+  *	Return
+  *		Task tag, if used, 0 as default tag, or a negative error in case of failure.
++ *
++ * int bpf_sched_set_tg_tag(struct task_group *tg, s64 tag)
++ *	Description
++ *		Set tag to *tg* and its descendants.
++ *	Return
++ *		0 on success, or a negative error in case of failure.
++ *
++ * int bpf_sched_set_task_tag(struct task_struct *tsk, s64 tag)
++ *	Description
++ *		Set tag to *tsk*.
++ *	Return
++ *		0 on success, or a negative error in case of failure.
+  */
+ #define __BPF_FUNC_MAPPER(FN)		\
+ 	FN(unspec),			\
+@@ -5232,6 +5244,8 @@ union bpf_attr {
+ 	FN(sk_original_addr),		\
+  	FN(sched_tg_tag_of),		\
+  	FN(sched_task_tag_of),		\
++	FN(sched_set_tg_tag),		\
++	FN(sched_set_task_tag),		\
+ 	FN(task_storage_get),		\
+ 	FN(task_storage_delete),	\
+ 	FN(get_current_task_btf),	\
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -1351,6 +1351,8 @@ const struct bpf_func_proto bpf_probe_re
+ const struct bpf_func_proto bpf_probe_read_kernel_str_proto __weak;
+ const struct bpf_func_proto bpf_sched_tg_tag_of_proto __weak;
+ const struct bpf_func_proto bpf_sched_task_tag_of_proto __weak;
++const struct bpf_func_proto bpf_sched_set_tg_tag_proto __weak;
++const struct bpf_func_proto bpf_sched_set_task_tag_proto __weak;
+ const struct bpf_func_proto bpf_task_pt_regs_proto __weak;
+ 
+ const struct bpf_func_proto *
+@@ -1419,6 +1421,10 @@ bpf_base_func_proto(enum bpf_func_id fun
+ 		return &bpf_per_cpu_ptr_proto;
+ 	case BPF_FUNC_this_cpu_ptr:
+ 		return &bpf_this_cpu_ptr_proto;
++	case BPF_FUNC_sched_set_tg_tag:
++		return &bpf_sched_set_tg_tag_proto;
++	case BPF_FUNC_sched_set_task_tag:
++		return &bpf_sched_set_task_tag_proto;
+ 	case BPF_FUNC_timer_init:
+ 		return &bpf_timer_init_proto;
+ 	case BPF_FUNC_timer_set_callback:
+--- a/kernel/sched/bpf_sched.c
++++ b/kernel/sched/bpf_sched.c
+@@ -102,3 +102,48 @@ const struct bpf_func_proto bpf_sched_ta
+ 	.arg1_type	= PTR_MAYBE_NULL | ARG_PTR_TO_BTF_ID,
+ 	.arg1_btf_id	= &btf_sched_task_ids[0],
+ };
++
++BPF_CALL_2(bpf_sched_set_tg_tag, struct task_group *, tg, s64, tag)
++{
++#if CONFIG_CGROUP_SCHED
++	if (tg == NULL || tg == &root_task_group)
++		return -EINVAL;
++
++	if (tg->tag == tag)
++		return 0;
++
++	rcu_read_lock();
++	walk_tg_tree_from(tg, tg_change_tag, tg_nop, (void *)(&tag));
++	rcu_read_unlock();
++
++	return 0;
++#endif
++	return -EPERM;
++}
++
++const struct bpf_func_proto bpf_sched_set_tg_tag_proto = {
++	.func		= bpf_sched_set_tg_tag,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= PTR_MAYBE_NULL | ARG_PTR_TO_BTF_ID,
++	.arg1_btf_id	= &btf_sched_tg_ids[0],
++	.arg2_type	= ARG_ANYTHING,
++};
++
++BPF_CALL_2(bpf_sched_set_task_tag, struct task_struct *, tsk, s64, tag)
++{
++	if (tsk == NULL)
++		return -EINVAL;
++
++	sched_settag(tsk, tag);
++	return 0;
++}
++
++const struct bpf_func_proto bpf_sched_set_task_tag_proto = {
++	.func		= bpf_sched_set_task_tag,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= PTR_MAYBE_NULL | ARG_PTR_TO_BTF_ID,
++	.arg1_btf_id	= &btf_sched_task_ids[0],
++	.arg2_type	= ARG_ANYTHING,
++};
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -5057,6 +5057,18 @@ union bpf_attr {
+  *		different workloads.
+  *	Return
+  *		Task tag, if used, 0 as default tag, or a negative error in case of failure.
++ *
++ * int bpf_sched_set_tg_tag(struct task_group *tg, s64 tag)
++ *	Description
++ *		Set tag to *tg* and its descendants.
++ *	Return
++ *		0 on success, or a negative error in case of failure.
++ *
++ * int bpf_sched_set_task_tag(struct task_struct *tsk, s64 tag)
++ *	Description
++ *		Set tag to *tsk*.
++ *	Return
++ *		0 on success, or a negative error in case of failure.
+  */
+ #define __BPF_FUNC_MAPPER(FN)		\
+ 	FN(unspec),			\
+@@ -5219,6 +5231,8 @@ union bpf_attr {
+ 	FN(sk_original_addr),		\
+  	FN(sched_tg_tag_of),		\
+  	FN(sched_task_tag_of),		\
++	FN(sched_set_tg_tag),		\
++	FN(sched_set_task_tag),		\
+ 	FN(task_storage_get),		\
+ 	FN(task_storage_delete),	\
+ 	FN(get_current_task_btf),	\

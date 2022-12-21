@@ -1,0 +1,268 @@
+From c1c6a2733267adad3a7bec645a6ce51162211db4 Mon Sep 17 00:00:00 2001
+From: Min Fanlei <minfanlei@wxiat.com>
+Date: Tue, 26 Jul 2022 09:51:52 +0000
+Subject: [PATCH] sw64: kvm: add guest live migration support
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: c1c6a2733267adad3a7bec645a6ce51162211db4
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5XTKO
+
+--------------------------------
+
+This patch adds live migration support for guest os. It requires
+hmcode of host and guest to be upgraded to activate this feature.
+
+Signed-off-by: Min Fanlei <minfanlei@wxiat.com>
+Reviewed-by: He Sheng <hesheng@wxiat.com>
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/include/asm/kvm_asm.h |  2 +
+ arch/sw_64/include/asm/vcpu.h    | 10 ++++
+ arch/sw_64/kvm/Kconfig           |  1 +
+ arch/sw_64/kvm/handle_exit.c     |  9 ++++
+ arch/sw_64/kvm/kvm-sw64.c        | 85 +++++++++++++++++++++++++++++++-
+ 5 files changed, 105 insertions(+), 2 deletions(-)
+
+diff --git a/arch/sw_64/include/asm/kvm_asm.h b/arch/sw_64/include/asm/kvm_asm.h
+index d408e90cee62..841bfa1dd0aa 100644
+--- a/arch/sw_64/include/asm/kvm_asm.h
++++ b/arch/sw_64/include/asm/kvm_asm.h
+@@ -4,6 +4,8 @@
+ 
+ #define SW64_KVM_EXIT_HOST_INTR		0
+ #define SW64_KVM_EXIT_IO		1
++#define SW64_KVM_MIGRATION_SET_DIRTY    2
++#define SW64_KVM_MIGRATION_SET_DIRTY_HM 3
+ #define SW64_KVM_EXIT_HALT		10
+ #define SW64_KVM_EXIT_SHUTDOWN		12
+ #define SW64_KVM_EXIT_TIMER		13
+diff --git a/arch/sw_64/include/asm/vcpu.h b/arch/sw_64/include/asm/vcpu.h
+index dfefb9dc8651..c43ebe72e3a1 100644
+--- a/arch/sw_64/include/asm/vcpu.h
++++ b/arch/sw_64/include/asm/vcpu.h
+@@ -41,6 +41,16 @@ struct vcpucb {
+ 	unsigned long exit_reason;
+ 	unsigned long ipaddr;
+ 	unsigned long vcpu_irq_vector;
++	unsigned long pri_base;
++	unsigned long stack_pc_dfault;
++	unsigned long guest_p20;
++	unsigned long guest_dfault_double;
++	unsigned long guest_irqs_pending;
++	unsigned long guest_hm_r30;
++	unsigned long migration_mark;
++	unsigned long guest_longtime;
++	unsigned long guest_longtime_offset;
++	unsigned long reserved[3];
+ };
+ 
+ #endif /* __ASSEMBLY__ */
+diff --git a/arch/sw_64/kvm/Kconfig b/arch/sw_64/kvm/Kconfig
+index 4b6201ff5dc8..8077ea452765 100644
+--- a/arch/sw_64/kvm/Kconfig
++++ b/arch/sw_64/kvm/Kconfig
+@@ -29,6 +29,7 @@ config KVM
+ 	select KVM_VFIO
+ 	select TUN
+ 	select GENERIC_ALLOCATOR
++	select KVM_GENERIC_DIRTYLOG_READ_PROTECT
+ 	help
+ 	  Support for hosting Guest kernels.
+ 	  We don't support KVM with 3-level page tables yet.
+diff --git a/arch/sw_64/kvm/handle_exit.c b/arch/sw_64/kvm/handle_exit.c
+index 5016bc0eddc2..52f40a4c5803 100644
+--- a/arch/sw_64/kvm/handle_exit.c
++++ b/arch/sw_64/kvm/handle_exit.c
+@@ -13,9 +13,18 @@
+ int handle_exit(struct kvm_vcpu *vcpu, struct kvm_run *run,
+ 		int exception_index, struct hcall_args *hargs)
+ {
++	gfn_t gfn;
++
+ 	switch (exception_index) {
+ 	case SW64_KVM_EXIT_IO:
+ 		return io_mem_abort(vcpu, run, hargs);
++	case SW64_KVM_MIGRATION_SET_DIRTY_HM:
++	case SW64_KVM_MIGRATION_SET_DIRTY:
++		gfn = hargs->arg2 >> 24;
++		mutex_lock(&vcpu->kvm->slots_lock);
++		kvm_vcpu_mark_page_dirty(vcpu, gfn);
++		mutex_unlock(&vcpu->kvm->slots_lock);
++		return 1;
+ 	case SW64_KVM_EXIT_HALT:
+ 		vcpu->arch.halted = 1;
+ 		kvm_vcpu_block(vcpu);
+diff --git a/arch/sw_64/kvm/kvm-sw64.c b/arch/sw_64/kvm/kvm-sw64.c
+index 6afff2257947..ffcfdee58a48 100644
+--- a/arch/sw_64/kvm/kvm-sw64.c
++++ b/arch/sw_64/kvm/kvm-sw64.c
+@@ -133,6 +133,19 @@ static void sw64_kvm_switch_vpn(struct kvm_vcpu *vcpu)
+ 	}
+ }
+ 
++static void check_vcpu_requests(struct kvm_vcpu *vcpu)
++{
++	unsigned long vpn;
++	long cpu = smp_processor_id();
++
++	if (kvm_request_pending(vcpu)) {
++		if (kvm_check_request(KVM_REQ_TLB_FLUSH, vcpu)) {
++			vpn = vcpu->arch.vpnc[cpu] & HARDWARE_VPN_MASK;
++			tbivpn(0, 0, vpn);
++		}
++	}
++}
++
+ struct kvm_stats_debugfs_item debugfs_entries[] = {
+ 	{ NULL }
+ };
+@@ -177,12 +190,47 @@ int kvm_arch_vcpu_should_kick(struct kvm_vcpu *vcpu)
+ 	return kvm_vcpu_exiting_guest_mode(vcpu) == IN_GUEST_MODE;
+ }
+ 
++/*
++ * kvm_mark_migration write the mark on every vcpucbs of the kvm, which tells
++ * the system to do migration while the mark is on, and flush all vcpu's tlbs
++ * at the beginning of the migration.
++ */
++void kvm_mark_migration(struct kvm *kvm, int mark)
++{
++	struct kvm_vcpu *vcpu;
++	int cpu;
++
++	kvm_for_each_vcpu(cpu, vcpu, kvm)
++		vcpu->arch.vcb.migration_mark = mark << 2;
++
++	kvm_flush_remote_tlbs(kvm);
++}
++
+ void kvm_arch_commit_memory_region(struct kvm *kvm,
+ 		const struct kvm_userspace_memory_region *mem,
+ 		struct kvm_memory_slot *old,
+ 		const struct kvm_memory_slot *new,
+ 		enum kvm_mr_change change)
+ {
++	/*
++	 * At this point memslot has been committed and there is an
++	 * allocated dirty_bitmap[], dirty pages will be be tracked while the
++	 * memory slot is write protected.
++	 */
++
++	/* If dirty logging has been stopped, do nothing for now. */
++	if ((change != KVM_MR_DELETE)
++			&& (old->flags & KVM_MEM_LOG_DIRTY_PAGES)
++			&& (!(new->flags & KVM_MEM_LOG_DIRTY_PAGES))) {
++		kvm_mark_migration(kvm, 0);
++		return;
++	}
++
++	/* If it's the first time dirty logging, flush all vcpu tlbs. */
++	if ((change == KVM_MR_FLAGS_ONLY)
++			&& (!(old->flags & KVM_MEM_LOG_DIRTY_PAGES))
++			&& (new->flags & KVM_MEM_LOG_DIRTY_PAGES))
++		kvm_mark_migration(kvm, 1);
+ }
+ 
+ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+@@ -193,6 +241,7 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+ 	case KVM_CAP_IRQCHIP:
+ 	case KVM_CAP_IOEVENTFD:
+ 	case KVM_CAP_SYNC_MMU:
++	case KVM_CAP_IMMEDIATE_EXIT:
+ 		r = 1;
+ 		break;
+ 	case KVM_CAP_NR_VCPUS:
+@@ -206,9 +255,10 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+ 	return r;
+ }
+ 
+-int kvm_vm_ioctl_get_dirty_log(struct kvm *kvm, struct kvm_dirty_log *log)
++void kvm_arch_mmu_enable_log_dirty_pt_masked(struct kvm *kvm,
++		struct kvm_memory_slot *slot, gfn_t gfn_offset,
++		unsigned long mask)
+ {
+-	return 0;
+ }
+ 
+ int kvm_sw64_pending_timer(struct kvm_vcpu *vcpu)
+@@ -547,6 +597,9 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
+ 	bool more;
+ 	sigset_t sigsaved;
+ 
++	if (run->immediate_exit)
++		return -EINTR;
++
+ 	/* Set guest vcb */
+ 	/* vpn will update later when vcpu is running */
+ 	if (vcpu->arch.vcb.vpcr == 0) {
+@@ -613,6 +666,7 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
+ 		vcpu->arch.halted = 0;
+ 
+ 		sw64_kvm_switch_vpn(vcpu);
++		check_vcpu_requests(vcpu);
+ 		guest_enter_irqoff();
+ 
+ 		/* Enter the guest */
+@@ -647,6 +701,7 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
+ long kvm_arch_vcpu_ioctl(struct file *filp,
+ 		unsigned int ioctl, unsigned long arg)
+ {
++	unsigned long result;
+ 	struct kvm_vcpu *vcpu = filp->private_data;
+ 	struct vcpucb *kvm_vcb;
+ 
+@@ -654,12 +709,32 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
+ 	case KVM_SW64_VCPU_INIT:
+ 		return kvm_arch_vcpu_reset(vcpu);
+ 	case KVM_SW64_GET_VCB:
++		if (vcpu->arch.vcb.migration_mark) {
++			result = sw64_io_read(0, LONG_TIME);
++			vcpu->arch.vcb.guest_longtime = result;
++			vcpu->arch.vcb.guest_irqs_pending = vcpu->arch.irqs_pending[0];
++		}
++
+ 		if (copy_to_user((void __user *)arg, &(vcpu->arch.vcb), sizeof(struct vcpucb)))
+ 			return -EINVAL;
+ 		break;
+ 	case KVM_SW64_SET_VCB:
+ 		kvm_vcb = memdup_user((void __user *)arg, sizeof(*kvm_vcb));
+ 		memcpy(&(vcpu->arch.vcb), kvm_vcb, sizeof(struct vcpucb));
++
++		if (vcpu->arch.vcb.migration_mark) {
++			/* updated vpcr needed by destination vm */
++			vcpu->arch.vcb.vpcr
++				= get_vpcr(vcpu->kvm->arch.host_phys_addr, vcpu->kvm->arch.size, 0);
++
++			result = sw64_io_read(0, LONG_TIME);
++
++			/* synchronize the longtime of source and destination */
++			vcpu->arch.vcb.guest_longtime_offset = vcpu->arch.vcb.guest_longtime - result;
++
++			set_timer(vcpu, 200000000);
++			vcpu->arch.vcb.migration_mark = 0;
++		}
+ 		break;
+ 	default:
+ 		return -EINVAL;
+@@ -702,6 +777,12 @@ void kvm_arch_sync_dirty_log(struct kvm *kvm, struct kvm_memory_slot *memslot)
+ {
+ }
+ 
++void kvm_arch_flush_remote_tlbs_memslot(struct kvm *kvm,
++					struct kvm_memory_slot *memslot)
++{
++	kvm_flush_remote_tlbs(kvm);
++}
++
+ int kvm_arch_vcpu_precreate(struct kvm *kvm, unsigned int id)
+ {
+ 	return 0;
+-- 
+2.33.0
+

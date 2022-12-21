@@ -1,0 +1,144 @@
+From ee61845bf07126bb6b90b42b07c9a21403c97faa Mon Sep 17 00:00:00 2001
+From: Roman Gushchin <guro@fb.com>
+Date: Fri, 25 Nov 2022 12:04:00 +0800
+Subject: [PATCH] sched: cfs: add bpf hooks to control wakeup and tick
+ preemption
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: ee61845bf07126bb6b90b42b07c9a21403c97faa
+Modified-by-SEL: No
+
+
+maillist inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5F6X6
+CVE: NA
+
+Reference: https://lore.kernel.org/all/20210916162451.709260-1-guro@fb.com/
+
+-------------------
+
+This patch adds 3 hooks to control wakeup and tick preemption:
+  cfs_check_preempt_tick
+  cfs_check_preempt_wakeup
+  cfs_wakeup_preempt_entity
+
+The first one allows to force or suppress a preemption from a tick
+context. An obvious usage example is to minimize the number of
+non-voluntary context switches and decrease an associated latency
+penalty by (conditionally) providing tasks or task groups an extended
+execution slice. It can be used instead of tweaking
+sysctl_sched_min_granularity.
+
+The second one is called from the wakeup preemption code and allows
+to redefine whether a newly woken task should preempt the execution
+of the current task. This is useful to minimize a number of
+preemptions of latency sensitive tasks. To some extent it's a more
+flexible analog of a sysctl_sched_wakeup_granularity.
+
+The third one is similar, but it tweaks the wakeup_preempt_entity()
+function, which is called not only from a wakeup context, but also
+from pick_next_task(), which allows to influence the decision on which
+task will be running next.
+
+It's a place for a discussion whether we need both these hooks or only
+one of them: the second is more powerful, but depends more on the
+current implementation. In any case, bpf hooks are not an ABI, so it's
+not a deal breaker.
+
+The idea of the wakeup_preempt_entity hook belongs to Rik van Riel. He
+also contributed a lot to the whole patchset by proving his ideas,
+recommendations and a feedback for earlier (non-public) versions.
+
+Signed-off-by: Roman Gushchin <guro@fb.com>
+Signed-off-by: Chen Hui <judy.chenhui@huawei.com>
+Signed-off-by: Ren Zhijie <renzhijie2@huawei.com>
+Signed-off-by: Hui Tang <tanghui20@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/sched_hook_defs.h |  5 ++++-
+ kernel/sched/fair.c             | 36 +++++++++++++++++++++++++++++++++
+ 2 files changed, 40 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/sched_hook_defs.h b/include/linux/sched_hook_defs.h
+index 14344004e335..e2f65e4b8895 100644
+--- a/include/linux/sched_hook_defs.h
++++ b/include/linux/sched_hook_defs.h
+@@ -1,2 +1,5 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
+-BPF_SCHED_HOOK(int, 0, dummy, void)
++BPF_SCHED_HOOK(int, 0, cfs_check_preempt_tick, struct sched_entity *curr, unsigned long delta_exec)
++BPF_SCHED_HOOK(int, 0, cfs_check_preempt_wakeup, struct task_struct *curr, struct task_struct *p)
++BPF_SCHED_HOOK(int, 0, cfs_wakeup_preempt_entity, struct sched_entity *curr,
++	struct sched_entity *se)
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index fe2f527c71ed..9eb9a77781d3 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -28,6 +28,7 @@
+ #include <linux/delay.h>
+ #include <linux/tracehook.h>
+ #endif
++#include <linux/bpf_sched.h>
+ 
+ /*
+  * Targeted preemption latency for CPU-bound tasks:
+@@ -4434,6 +4435,21 @@ check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+ 
+ 	ideal_runtime = sched_slice(cfs_rq, curr);
+ 	delta_exec = curr->sum_exec_runtime - curr->prev_sum_exec_runtime;
++
++#ifdef CONFIG_BPF_SCHED
++	if (bpf_sched_enabled()) {
++		int ret = bpf_sched_cfs_check_preempt_tick(curr, delta_exec);
++
++		if (ret < 0)
++			return;
++		else if (ret > 0) {
++			resched_curr(rq_of(cfs_rq));
++			clear_buddies(cfs_rq, curr);
++			return;
++		}
++	}
++#endif
++
+ 	if (delta_exec > ideal_runtime) {
+ 		resched_curr(rq_of(cfs_rq));
+ 		/*
+@@ -7015,6 +7031,15 @@ wakeup_preempt_entity(struct sched_entity *curr, struct sched_entity *se)
+ {
+ 	s64 gran, vdiff = curr->vruntime - se->vruntime;
+ 
++#ifdef CONFIG_BPF_SCHED
++	if (bpf_sched_enabled()) {
++		int ret = bpf_sched_cfs_wakeup_preempt_entity(curr, se);
++
++		if (ret)
++			return ret;
++	}
++#endif
++
+ 	if (vdiff <= 0)
+ 		return -1;
+ 
+@@ -7101,6 +7126,17 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
+ 	    likely(!task_has_idle_policy(p)))
+ 		goto preempt;
+ 
++#ifdef CONFIG_BPF_SCHED
++	if (bpf_sched_enabled()) {
++		int ret = bpf_sched_cfs_check_preempt_wakeup(current, p);
++
++		if (ret < 0)
++			return;
++		else if (ret > 0)
++			goto preempt;
++	}
++#endif
++
+ 	/*
+ 	 * Batch and idle tasks do not preempt non-idle tasks (their preemption
+ 	 * is driven by the tick):
+-- 
+2.33.0
+

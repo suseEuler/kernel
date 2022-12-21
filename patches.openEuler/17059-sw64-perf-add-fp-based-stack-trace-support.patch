@@ -1,0 +1,325 @@
+From 4c651be01d70a2c0e3c6ac2c2821eac775f85aaa Mon Sep 17 00:00:00 2001
+From: Wu Liliu <wuliliu@wxiat.com>
+Date: Tue, 31 May 2022 09:48:40 +0800
+Subject: [PATCH] sw64: perf: add fp based stack trace support
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 4c651be01d70a2c0e3c6ac2c2821eac775f85aaa
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56X48
+
+--------------------------------
+
+It used to obtain return address of function by scanning entire
+stack which lead to inaccurate result. This patch adds fp based
+stack trace support to improve efficiency and accuracy.
+
+Because toolchain is not ready yet, we take CONFIG_FRAME_POINTER
+to activate this support, and it should be disabled by default.
+
+Signed-off-by: Wu Liliu <wuliliu@wxiat.com>
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/include/asm/stacktrace.h | 72 +++++++++++++++++++++++++
+ arch/sw_64/kernel/perf_event.c      | 66 +++++++++++++++++++----
+ arch/sw_64/kernel/stacktrace.c      | 83 +++++++++++++++++++++++++++++
+ 3 files changed, 210 insertions(+), 11 deletions(-)
+ create mode 100644 arch/sw_64/include/asm/stacktrace.h
+
+diff --git a/arch/sw_64/include/asm/stacktrace.h b/arch/sw_64/include/asm/stacktrace.h
+new file mode 100644
+index 000000000000..813aa5e7a91d
+--- /dev/null
++++ b/arch/sw_64/include/asm/stacktrace.h
+@@ -0,0 +1,72 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++#ifndef _ASM_SW64_STACKTRACE_H
++#define _ASM_SW64_STACKTRACE_H
++
++#include <linux/percpu.h>
++#include <linux/sched.h>
++#include <linux/sched/task_stack.h>
++#include <asm/memory.h>
++#include <asm/ptrace.h>
++
++struct stackframe {
++	unsigned long pc;
++	unsigned long fp;
++};
++
++enum stack_type {
++	STACK_TYPE_UNKNOWN,
++	STACK_TYPE_TASK,
++};
++
++struct stack_info {
++	unsigned long low;
++	unsigned long high;
++	enum stack_type type;
++};
++
++/* The form of the top of the frame on the stack */
++struct stack_frame {
++	unsigned long return_address;
++	struct stack_frame *next_frame;
++};
++
++extern int unwind_frame(struct task_struct *tsk, struct stackframe *frame);
++extern void walk_stackframe(struct task_struct *tsk, struct stackframe *frame,
++			    int (*fn)(struct stackframe *, void *), void *data);
++
++static inline bool on_task_stack(struct task_struct *tsk, unsigned long sp,
++				struct stack_info *info)
++{
++	unsigned long low = (unsigned long)task_stack_page(tsk);
++	unsigned long high = low + THREAD_SIZE;
++
++	if (sp < low || sp >= high)
++		return false;
++
++	if (info) {
++		info->low = low;
++		info->high = high;
++		info->type = STACK_TYPE_TASK;
++	}
++
++	return true;
++}
++
++/*
++ * We can only safely access per-cpu stacks from current in a non-preemptible
++ * context.
++ */
++static inline bool on_accessible_stack(struct task_struct *tsk,
++					unsigned long sp,
++					struct stack_info *info)
++{
++	if (on_task_stack(tsk, sp, info))
++		return true;
++	if (tsk != current || preemptible())
++		return false;
++
++	return false;
++}
++
++#endif	/* _ASM_SW64_STACKTRACE_H */
+diff --git a/arch/sw_64/kernel/perf_event.c b/arch/sw_64/kernel/perf_event.c
+index 0d49224ba058..70f1f2781016 100644
+--- a/arch/sw_64/kernel/perf_event.c
++++ b/arch/sw_64/kernel/perf_event.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <linux/perf_event.h>
++#include <asm/stacktrace.h>
+ 
+ /* For tracking PMCs and the hw events they monitor on each CPU. */
+ struct cpu_hw_events {
+@@ -247,10 +248,9 @@ static const struct sw64_perf_event *core3_map_cache_event(u64 config)
+  */
+ static bool core3_raw_event_valid(u64 config)
+ {
+-	if ((config >= (PC0_RAW_BASE + PC0_MIN) && config <= (PC0_RAW_BASE + PC0_MAX)) ||
+-		(config >= (PC1_RAW_BASE + PC1_MIN) && config <= (PC1_RAW_BASE + PC1_MAX))) {
++	if ((config >= PC0_RAW_BASE && config <= (PC0_RAW_BASE + PC0_MAX)) ||
++		(config >= PC1_RAW_BASE && config <= (PC1_RAW_BASE + PC1_MAX)))
+ 		return true;
+-	}
+ 
+ 	pr_info("sw64 pmu: invalid raw event config %#llx\n", config);
+ 	return false;
+@@ -697,6 +697,36 @@ bool valid_dy_addr(unsigned long addr)
+ 	return ret;
+ }
+ 
++#ifdef CONFIG_FRAME_POINTER
++void perf_callchain_user(struct perf_callchain_entry_ctx *entry,
++		struct pt_regs *regs)
++{
++
++	struct stack_frame frame;
++	unsigned long __user *fp;
++	int err;
++
++	perf_callchain_store(entry, regs->pc);
++
++	fp = (unsigned long __user *)regs->r15;
++
++	while (entry->nr < entry->max_stack && (unsigned long)fp < current->mm->start_stack) {
++		if (!access_ok(fp, sizeof(frame)))
++			break;
++
++		pagefault_disable();
++		err =  __copy_from_user_inatomic(&frame, fp, sizeof(frame));
++		pagefault_enable();
++
++		if (err)
++			break;
++
++		if (valid_utext_addr(frame.return_address) || valid_dy_addr(frame.return_address))
++			perf_callchain_store(entry, frame.return_address);
++		fp = (void __user *)frame.next_frame;
++	}
++}
++#else /* !CONFIG_FRAME_POINTER */
+ void perf_callchain_user(struct perf_callchain_entry_ctx *entry,
+ 		struct pt_regs *regs)
+ {
+@@ -709,30 +739,44 @@ void perf_callchain_user(struct perf_callchain_entry_ctx *entry,
+ 	while (entry->nr < entry->max_stack && usp < current->mm->start_stack) {
+ 		if (!access_ok(usp, 8))
+ 			break;
++
+ 		pagefault_disable();
+ 		err = __get_user(user_addr, (unsigned long *)usp);
+ 		pagefault_enable();
++
+ 		if (err)
+ 			break;
++
+ 		if (valid_utext_addr(user_addr) || valid_dy_addr(user_addr))
+ 			perf_callchain_store(entry, user_addr);
+ 		usp = usp + 8;
+ 	}
+ }
++#endif/* CONFIG_FRAME_POINTER */
++
++/*
++ * Gets called by walk_stackframe() for every stackframe. This will be called
++ * whist unwinding the stackframe and is like a subroutine return so we use
++ * the PC.
++ */
++static int callchain_trace(struct stackframe *frame, void *data)
++{
++	struct perf_callchain_entry_ctx *entry = data;
++
++	perf_callchain_store(entry, frame->pc);
++
++	return 0;
++}
+ 
+ void perf_callchain_kernel(struct perf_callchain_entry_ctx *entry,
+ 			   struct pt_regs *regs)
+ {
+-	unsigned long *sp = (unsigned long *)current_thread_info()->pcb.ksp;
+-	unsigned long addr;
++	struct stackframe frame;
+ 
+-	perf_callchain_store(entry, regs->pc);
++	frame.fp = regs->r15;
++	frame.pc = regs->pc;
+ 
+-	while (!kstack_end(sp) && entry->nr < entry->max_stack) {
+-		addr = *sp++;
+-		if (__kernel_text_address(addr))
+-			perf_callchain_store(entry, addr);
+-	}
++	walk_stackframe(current, &frame, callchain_trace, entry);
+ }
+ 
+ /*
+diff --git a/arch/sw_64/kernel/stacktrace.c b/arch/sw_64/kernel/stacktrace.c
+index 41cdff5b4941..2671331717ba 100644
+--- a/arch/sw_64/kernel/stacktrace.c
++++ b/arch/sw_64/kernel/stacktrace.c
+@@ -8,7 +8,90 @@
+ #include <linux/stacktrace.h>
+ #include <linux/sched/task_stack.h>
+ #include <linux/sched/debug.h>
++#include <linux/ftrace.h>
++#include <linux/perf_event.h>
++#include <asm/stacktrace.h>
+ 
++/*
++ * sw_64 PCS assigns the frame pointer to r15.
++ *
++ * A simple function prologue looks like this:
++ *	ldi     sp,-xx(sp)
++ *	stl     ra,0(sp)
++ *	stl     fp,8(sp)
++ *	mov     sp,fp
++ *
++ * A simple function epilogue looks like this:
++ *	mov     fp,sp
++ *	ldl     ra,0(sp)
++ *	ldl     fp,8(sp)
++ *	ldi     sp,+xx(sp)
++ */
++
++#ifdef CONFIG_FRAME_POINTER
++
++int unwind_frame(struct task_struct *tsk, struct stackframe *frame)
++{
++	unsigned long fp = frame->fp;
++
++	if (fp & 0x7)
++		return -EINVAL;
++
++	if (!tsk)
++		tsk = current;
++
++	if (!on_accessible_stack(tsk, fp, NULL))
++		return -EINVAL;
++
++	frame->pc = READ_ONCE_NOCHECK(*(unsigned long *)(fp));
++	frame->fp = READ_ONCE_NOCHECK(*(unsigned long *)(fp + 8));
++
++	/*
++	 * Frames created upon entry from user have NULL FP and PC values, so
++	 * don't bother reporting these. Frames created by __noreturn functions
++	 * might have a valid FP even if PC is bogus, so only terminate where
++	 * both are NULL.
++	 */
++	if (!frame->fp && !frame->pc)
++		return -EINVAL;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(unwind_frame);
++
++void walk_stackframe(struct task_struct *tsk, struct stackframe *frame,
++		     int (*fn)(struct stackframe *, void *), void *data)
++{
++	while (1) {
++		int ret;
++
++		if (fn(frame, data))
++			break;
++		ret = unwind_frame(tsk, frame);
++		if (ret < 0)
++			break;
++	}
++}
++EXPORT_SYMBOL_GPL(walk_stackframe);
++
++#else /* !CONFIG_FRAME_POINTER */
++void walk_stackframe(struct task_struct *tsk, struct stackframe *frame,
++		     int (*fn)(struct stackframe *, void *), void *data)
++{
++	unsigned long *sp = (unsigned long *)current_thread_info()->pcb.ksp;
++	unsigned long addr;
++	struct perf_callchain_entry_ctx *entry = data;
++
++	perf_callchain_store(entry, frame->pc);
++	while (!kstack_end(sp) && entry->nr < entry->max_stack) {
++		addr = *sp++;
++		if (__kernel_text_address(addr))
++			perf_callchain_store(entry, addr);
++	}
++}
++EXPORT_SYMBOL_GPL(walk_stackframe);
++
++#endif/* CONFIG_FRAME_POINTER */
+ 
+ /*
+  * Save stack-backtrace addresses into a stack_trace buffer.
+-- 
+2.33.0
+

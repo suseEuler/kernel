@@ -1,0 +1,187 @@
+From 7086bdbae575d1be401f9d72767b88cf555ae014 Mon Sep 17 00:00:00 2001
+From: Xu Qiang <xuqiang36@huawei.com>
+Date: Mon, 14 Nov 2022 13:28:25 +0000
+Subject: [PATCH] mm/sharepool: Fix add group failed with errno 28
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 7086bdbae575d1be401f9d72767b88cf555ae014
+Modified-by-SEL: Yes, refreshed due to different context
+
+
+ascend inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I612UG
+CVE: NA
+
+--------------------------------
+
+We increase task->mm->mm_users by one when we add the task to a
+sharepool group. Correspondingly we should drop the mm_users count when
+the task exits. Currently we hijack the mmput function and make it
+return early and decrease mm->mm_users by one (just as mmput would do)
+if it is not called from a task's exiting process, or we decrease
+mm->mm_users by the group number the task was added to. This has two
+problems:
+1. It makes mmput and sp_group_exit hard to understand.
+2. The process of judging if the task (also its mm) is exiting and
+   decrease its mm_users count is not atomic. We use this condition:
+     mm->mm_users == master->count + MM_WOULD_FREE(1)
+   If someone else change the mm->mm_users during those two steps, the
+   mm->mm_users would be wrong and mm_struct cannot be released anymore.
+
+Suppose the following process:
+
+        proc1                                        proc2
+
+1)      mmput
+          |
+          V
+2)  enter sp_group_exit and
+    'mm->mm_users == master->count + 1' is true
+3)        |                                         mmget
+          V
+4)  decrease mm->mm_users by master->count
+          |
+          V
+5)  enter __mmput and release mm_struct
+    if mm->mm_users == 1
+6)                                                  mmput
+
+The statistical structure who has the same id of the task would get leaked
+together with mm_struct, so the next time we try to create the statistical
+structure of the same id, we get a failure.
+
+We fix this by moving sp_group_exit to do_exit() actually where the task is
+exiting. We don't need to judge if the task is exiting when someone
+calling mmput so there is no chance to change mm_users wrongly.
+
+Signed-off-by: Xu Qiang <xuqiang36@huawei.com>
+Signed-off-by: Wang Wensheng <wangwensheng4@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/share_pool.h |    4 ++--
+ kernel/exit.c              |    8 ++++++++
+ kernel/fork.c              |    3 ---
+ mm/share_pool.c            |   38 ++++++++------------------------------
+ 4 files changed, 18 insertions(+), 35 deletions(-)
+
+--- a/include/linux/share_pool.h
++++ b/include/linux/share_pool.h
+@@ -278,7 +278,7 @@ extern bool mg_is_sharepool_addr(unsigne
+ extern int mg_sp_id_of_current(void);
+ 
+ extern void sp_area_drop(struct vm_area_struct *vma);
+-extern int sp_group_exit(struct mm_struct *mm);
++extern int sp_group_exit(void);
+ extern void sp_group_post_exit(struct mm_struct *mm);
+ vm_fault_t sharepool_no_page(struct mm_struct *mm,
+ 			     struct vm_area_struct *vma,
+@@ -331,7 +331,7 @@ static inline int mg_sp_group_del_task(i
+ 	return -EPERM;
+ }
+ 
+-static inline int sp_group_exit(struct mm_struct *mm)
++static inline int sp_group_exit(void)
+ {
+ 	return 0;
+ }
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -64,6 +64,7 @@
+ #include <linux/rcuwait.h>
+ #include <linux/compat.h>
+ #include <linux/io_uring.h>
++#include <linux/share_pool.h>
+ 
+ #include <linux/uaccess.h>
+ #include <asm/unistd.h>
+@@ -795,6 +796,13 @@ void __noreturn do_exit(long code)
+ 	tsk->exit_code = code;
+ 	taskstats_exit(tsk, group_dead);
+ 
++	/*
++	 * sp_group_exit must be executed before exit_mm,
++	 * otherwise it will cause mm leakage.
++	 */
++	if (group_dead)
++		sp_group_exit();
++
+ 	exit_mm();
+ 
+ 	if (group_dead)
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1121,9 +1121,6 @@ void mmput(struct mm_struct *mm)
+ {
+ 	might_sleep();
+ 
+-	if (sp_group_exit(mm))
+-		return;
+-
+ 	if (atomic_dec_and_test(&mm->mm_users))
+ 		__mmput(mm);
+ }
+--- a/mm/share_pool.c
++++ b/mm/share_pool.c
+@@ -4276,34 +4276,13 @@ backout:
+ 	goto out;
+ }
+ 
+-#define MM_WOULD_FREE	1
+-
+ /*
+- * Recall we add mm->users by 1 deliberately in sp_group_add_task().
+- * If the mm_users == sp_group_master->count + 1, it means that the mm is ready
+- * to be freed because the last owner of this mm is in exiting procedure:
+- * do_exit() -> exit_mm() -> mmput() -> sp_group_exit -> THIS function.
++ * The caller must ensure that this function is called
++ * when the last thread in the thread group exits.
+  */
+-static bool need_free_sp_group(struct mm_struct *mm,
+-			      struct sp_group_master *master)
+-{
+-	/* thread exits but process is still alive */
+-	if ((unsigned int)atomic_read(&mm->mm_users) != master->count + MM_WOULD_FREE) {
+-		if (atomic_dec_and_test(&mm->mm_users))
+-			WARN(1, "Invalid user counting\n");
+-		return false;
+-	}
+-
+-	return true;
+-}
+-
+-/*
+- * Return:
+- * 1	- let mmput() return immediately
+- * 0	- let mmput() decrease mm_users and try __mmput()
+- */
+-int sp_group_exit(struct mm_struct *mm)
++int sp_group_exit(void)
+ {
++	struct mm_struct *mm;
+ 	struct sp_group *spg;
+ 	struct sp_group_master *master;
+ 	struct sp_group_node *spg_node, *tmp;
+@@ -4312,6 +4291,10 @@ int sp_group_exit(struct mm_struct *mm)
+ 	if (!sp_is_enabled())
+ 		return 0;
+ 
++	if (current->flags & PF_KTHREAD)
++		return 0;
++
++	mm = current->mm;
+ 	down_write(&sp_group_sem);
+ 
+ 	master = mm->sp_group_master;
+@@ -4320,11 +4303,6 @@ int sp_group_exit(struct mm_struct *mm)
+ 		return 0;
+ 	}
+ 
+-	if (!need_free_sp_group(mm, master)) {
+-		up_write(&sp_group_sem);
+-		return 1;
+-	}
+-
+ 	list_for_each_entry_safe(spg_node, tmp, &master->node_list, group_node) {
+ 		spg = spg_node->spg;
+ 

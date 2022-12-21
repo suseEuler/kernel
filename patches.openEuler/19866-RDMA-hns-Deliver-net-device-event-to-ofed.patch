@@ -1,0 +1,140 @@
+From 5d705e82752a9cfbd4ab0c3bde64b07d0b501466 Mon Sep 17 00:00:00 2001
+From: Lang Cheng <chenglang@huawei.com>
+Date: Thu, 3 Nov 2022 18:49:25 +0800
+Subject: [PATCH] RDMA/hns: Deliver net device event to ofed
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 5d705e82752a9cfbd4ab0c3bde64b07d0b501466
+Modified-by-SEL: Yes, refreshed due to different context
+
+
+driver inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5Z2DS
+
+----------------------------------------------------------
+
+Driver can notify ulp with IB event when net link down/up.
+
+Signed-off-by: Lang Cheng <chenglang@huawei.com>
+Signed-off-by: Chengchang Tang <tangchengchang@huawei.com>
+Reviewed-by: Yangyang Li <liyangyang20@huawei.com>
+Reviewed-by: Yue Haibing <yuehaibing@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/infiniband/hw/hns/hns_roce_device.h |   12 +++++++
+ drivers/infiniband/hw/hns/hns_roce_main.c   |   43 ++++++++++++++++++++--------
+ 2 files changed, 44 insertions(+), 11 deletions(-)
+
+--- a/drivers/infiniband/hw/hns/hns_roce_device.h
++++ b/drivers/infiniband/hw/hns/hns_roce_device.h
+@@ -640,6 +640,7 @@ struct hns_roce_ib_iboe {
+ 	struct net_device      *netdevs[HNS_ROCE_MAX_PORTS];
+ 	struct notifier_block	nb;
+ 	u8			phy_port[HNS_ROCE_MAX_PORTS];
++	enum ib_port_state	port_state[HNS_ROCE_MAX_PORTS];
+ };
+ 
+ struct hns_roce_ceqe {
+@@ -1095,6 +1096,17 @@ static inline u8 get_tclass(const struct
+ 	       grh->traffic_class >> DSCP_SHIFT : grh->traffic_class;
+ }
+ 
++static inline u8 to_rdma_port_num(u8 phy_port_num)
++{
++	return phy_port_num + 1;
++}
++
++static inline enum ib_port_state get_port_state(struct net_device *net_dev)
++{
++	return (netif_running(net_dev) && netif_carrier_ok(net_dev)) ?
++		IB_PORT_ACTIVE : IB_PORT_DOWN;
++}
++
+ void hns_roce_init_uar_table(struct hns_roce_dev *dev);
+ int hns_roce_uar_alloc(struct hns_roce_dev *dev, struct hns_roce_uar *uar);
+ 
+--- a/drivers/infiniband/hw/hns/hns_roce_main.c
++++ b/drivers/infiniband/hw/hns/hns_roce_main.c
+@@ -89,10 +89,13 @@ static int hns_roce_del_gid(const struct
+ }
+ 
+ static int handle_en_event(struct hns_roce_dev *hr_dev, u8 port,
+-			   unsigned long event)
++			   unsigned long dev_event)
+ {
+ 	struct device *dev = hr_dev->dev;
++	enum ib_port_state port_state;
+ 	struct net_device *netdev;
++	struct ib_event event;
++	unsigned long flags;
+ 	int ret = 0;
+ 
+ 	netdev = hr_dev->iboe.netdevs[port];
+@@ -101,20 +104,38 @@ static int handle_en_event(struct hns_ro
+ 		return -ENODEV;
+ 	}
+ 
+-	switch (event) {
+-	case NETDEV_UP:
+-	case NETDEV_CHANGE:
++	switch (dev_event) {
+ 	case NETDEV_REGISTER:
+ 	case NETDEV_CHANGEADDR:
+ 		ret = hns_roce_set_mac(hr_dev, port, netdev->dev_addr);
+ 		break;
++	case NETDEV_UP:
++	case NETDEV_CHANGE:
++		ret = hns_roce_set_mac(hr_dev, port, netdev->dev_addr);
++		if (ret)
++			return ret;
++		fallthrough;
+ 	case NETDEV_DOWN:
+-		/*
+-		 * In v1 engine, only support all ports closed together.
+-		 */
++		port_state = get_port_state(netdev);
++
++		spin_lock_irqsave(&hr_dev->iboe.lock, flags);
++		if (hr_dev->iboe.port_state[port] == port_state) {
++			spin_unlock_irqrestore(&hr_dev->iboe.lock, flags);
++			return NOTIFY_DONE;
++		}
++		hr_dev->iboe.port_state[port] = port_state;
++		spin_unlock_irqrestore(&hr_dev->iboe.lock, flags);
++
++		event.device = &hr_dev->ib_dev;
++		event.event = (port_state == IB_PORT_ACTIVE) ?
++			      IB_EVENT_PORT_ACTIVE : IB_EVENT_PORT_ERR;
++		event.element.port_num = to_rdma_port_num(port);
++		ib_dispatch_event(&event);
++		break;
++	case NETDEV_UNREGISTER:
+ 		break;
+ 	default:
+-		dev_dbg(dev, "NETDEV event = 0x%x!\n", (u32)(event));
++		dev_dbg(dev, "NETDEV event = 0x%x!\n", (u32)(dev_event));
+ 		break;
+ 	}
+ 
+@@ -151,6 +172,8 @@ static int hns_roce_setup_mtu_mac(struct
+ 	u8 i;
+ 
+ 	for (i = 0; i < hr_dev->caps.num_ports; i++) {
++		hr_dev->iboe.port_state[i] = IB_PORT_DOWN;
++
+ 		ret = hns_roce_set_mac(hr_dev, i,
+ 				       hr_dev->iboe.netdevs[i]->dev_addr);
+ 		if (ret)
+@@ -245,9 +268,7 @@ static int hns_roce_query_port(struct ib
+ 
+ 	mtu = iboe_get_mtu(net_dev->mtu);
+ 	props->active_mtu = mtu ? min(props->max_mtu, mtu) : IB_MTU_256;
+-	props->state = netif_running(net_dev) && netif_carrier_ok(net_dev) ?
+-			       IB_PORT_ACTIVE :
+-			       IB_PORT_DOWN;
++	props->state = get_port_state(net_dev);
+ 	props->phys_state = props->state == IB_PORT_ACTIVE ?
+ 				    IB_PORT_PHYS_STATE_LINK_UP :
+ 				    IB_PORT_PHYS_STATE_DISABLED;

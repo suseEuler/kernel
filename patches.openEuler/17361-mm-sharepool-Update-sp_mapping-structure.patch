@@ -1,0 +1,177 @@
+From b632bf41c09a6e1c6587db46a1b0d4419f83ee13 Mon Sep 17 00:00:00 2001
+From: Wang Wensheng <wangwensheng4@huawei.com>
+Date: Tue, 19 Jul 2022 11:36:19 +0800
+Subject: [PATCH] mm/sharepool: Update sp_mapping structure
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: b632bf41c09a6e1c6587db46a1b0d4419f83ee13
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5DS9S
+CVE: NA
+
+-------------------------------------------------
+
+1. Add a list for sp_mapping to record all the sp_groups attached to it.
+2. Initialize the sp_mapping for local_group when it is created. So when
+   we add a task to a group, we should merge the dvpp mapping of the
+   local group.
+3. Every two groups can be merged if and only if at least one of them is
+   empty. Then the empty mapping would be dropped and another mapping
+   would be attached to the two groups. This need to traverse all the
+   groups attached to the mapping.
+4. A mapping is considered empty when no spa is allocated from it and
+   its address space is default.
+
+Signed-off-by: Wang Wensheng <wangwensheng4@huawei.com>
+Reviewed-by: Weilong Chen <chenweilong@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/share_pool.h |  9 ++++--
+ mm/share_pool.c            | 65 +++++++++++++++++++++++---------------
+ 2 files changed, 47 insertions(+), 27 deletions(-)
+
+diff --git a/include/linux/share_pool.h b/include/linux/share_pool.h
+index 51710669b1a7..f002370ab5f8 100644
+--- a/include/linux/share_pool.h
++++ b/include/linux/share_pool.h
+@@ -117,6 +117,9 @@ struct sp_mapping {
+ 	struct rb_node *free_area_cache;
+ 	unsigned long cached_hole_size;
+ 	unsigned long cached_vstart;
++
++	/* list head for all groups attached to this mapping, dvpp mapping only */
++	struct list_head group_head;
+ };
+ 
+ /* Processes in the same sp_group can share memory.
+@@ -160,8 +163,10 @@ struct sp_group {
+ 	atomic_t	 use_count;
+ 	/* protect the group internal elements, except spa_list */
+ 	struct rw_semaphore	rw_lock;
+-	struct sp_mapping *dvpp;
+-	struct sp_mapping *normal;
++	/* list node for dvpp mapping */
++	struct list_head	mnode;
++	struct sp_mapping	*dvpp;
++	struct sp_mapping	*normal;
+ };
+ 
+ /* a per-process(per mm) struct which manages a sp_group_node list */
+diff --git a/mm/share_pool.c b/mm/share_pool.c
+index 75339e9d130e..e38436b25efc 100644
+--- a/mm/share_pool.c
++++ b/mm/share_pool.c
+@@ -168,6 +168,7 @@ static struct sp_mapping *sp_mapping_create(unsigned long flag)
+ 	sp_mapping_range_init(spm);
+ 	atomic_set(&spm->user, 0);
+ 	spm->area_root = RB_ROOT;
++	INIT_LIST_HEAD(&spm->group_head);
+ 
+ 	return spm;
+ }
+@@ -180,18 +181,45 @@ static void sp_mapping_destroy(struct sp_mapping *spm)
+ static void sp_mapping_attach(struct sp_group *spg, struct sp_mapping *spm)
+ {
+ 	atomic_inc(&spm->user);
+-	if (spm->flag & SP_MAPPING_DVPP)
++	if (spm->flag & SP_MAPPING_DVPP) {
+ 		spg->dvpp = spm;
+-	else if (spm->flag & SP_MAPPING_NORMAL)
++		list_add_tail(&spg->mnode, &spm->group_head);
++	} else if (spm->flag & SP_MAPPING_NORMAL)
+ 		spg->normal = spm;
+ }
+ 
+ static void sp_mapping_detach(struct sp_group *spg, struct sp_mapping *spm)
+ {
+-	if (spm && atomic_dec_and_test(&spm->user))
++	if (!spm)
++		return;
++	if (spm->flag & SP_MAPPING_DVPP)
++		list_del(&spg->mnode);
++	if (atomic_dec_and_test(&spm->user))
+ 		sp_mapping_destroy(spm);
+ }
+ 
++/* merge old mapping to new, and the old mapping would be destroyed */
++static void sp_mapping_merge(struct sp_mapping *new, struct sp_mapping *old)
++{
++	struct sp_group *spg, *tmp;
++
++	if (new == old)
++		return;
++
++	list_for_each_entry_safe(spg, tmp, &old->group_head, mnode) {
++		list_move_tail(&spg->mnode, &new->group_head);
++		spg->dvpp = new;
++	}
++
++	atomic_add(atomic_read(&old->user), &new->user);
++	sp_mapping_destroy(old);
++}
++
++static bool is_mapping_empty(struct sp_mapping *spm)
++{
++	return RB_EMPTY_ROOT(&spm->area_root);
++}
++
+ /*
+  * When you set the address space of a group, the normal address space
+  * is globally unified. When processing the DVPP address space, consider
+@@ -216,32 +244,18 @@ static int sp_mapping_group_setup(struct mm_struct *mm, struct sp_group *spg)
+ {
+ 	struct sp_group_master *master = mm->sp_group_master;
+ 	struct sp_group *local = master->local;
+-	struct sp_mapping *spm;
+ 
+ 	if (!list_empty(&spg->procs)) {
+-		/* 1 */
+-		if (local->dvpp && local->dvpp != spg->dvpp) {
+-			pr_info_ratelimited("Duplicate address space, id=%d\n",
+-					spg->id);
+-			return 0;
+-		}
+-
+-		/* 2 */
+-		if (!local->dvpp) {
+-			sp_mapping_attach(local, spg->dvpp);
+-			sp_mapping_attach(local, spg->normal);
++		if (is_mapping_empty(local->dvpp))
++			sp_mapping_merge(spg->dvpp, local->dvpp);
++		else if (is_mapping_empty(spg->dvpp))
++			sp_mapping_merge(local->dvpp, spg->dvpp);
++		else {
++			pr_info_ratelimited("Duplicate address space, id=%d\n", spg->id);
++			return -EINVAL;
+ 		}
+ 	} else {
+-		/* 4 */
+-		if (!local->dvpp) {
+-			spm = sp_mapping_create(SP_MAPPING_DVPP);
+-			if (IS_ERR(spm))
+-				return PTR_ERR(spm);
+-			sp_mapping_attach(local, spm);
+-			sp_mapping_attach(local, sp_mapping_normal);
+-		}
+-
+-		/* 3 */
++		/* the mapping of local group is always set */
+ 		sp_mapping_attach(spg, local->dvpp);
+ 		sp_mapping_attach(spg, sp_mapping_normal);
+ 	}
+@@ -1121,6 +1135,7 @@ static struct sp_group *create_spg(int spg_id)
+ 	atomic_set(&spg->use_count, 1);
+ 	INIT_LIST_HEAD(&spg->procs);
+ 	INIT_LIST_HEAD(&spg->spa_list);
++	INIT_LIST_HEAD(&spg->mnode);
+ 	init_rwsem(&spg->rw_lock);
+ 
+ 	sprintf(name, "sp_group_%d", spg_id);
+-- 
+2.33.0
+

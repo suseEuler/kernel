@@ -1,0 +1,115 @@
+From ac02c0bf87ea4b239663211a3984c8d8b3a98be0 Mon Sep 17 00:00:00 2001
+From: Guo Xuenan <guoxuenan@huawei.com>
+Date: Thu, 26 May 2022 20:36:26 +0800
+Subject: [PATCH] io_uring: fix soft lockup in io_submit_sqes()
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: ac02c0bf87ea4b239663211a3984c8d8b3a98be0
+Modified-by-SEL: No
+
+
+maillist inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5930C
+CVE: NA
+
+Reference: https://lore.kernel.org/all/d4bc3afb-02d5-1793-cffa-e15b2bdb0028@huawei.com/
+
+-------------------
+
+when set up sq ring size with IORING_MAX_ENTRIES, io_submit_sqes may
+looping ~32768 times which may trigger soft lockups. add cond_resched
+condition to avoid this bad situation.
+
+set sq ring size 32768 to perform stress test
+as follows:
+
+watchdog: BUG: soft lockup - CPU#3 stuck for 26s! [poc:691]
+Modules linked in:
+CPU: 3 PID: 691 Comm: poc Not tainted 5.18.0+ #9
+Hardware name: linux,dummy-virt (DT)
+pstate: 60000005 (nZCv daif -PAN -UAO -TCO -DIT -SSBS BTYPE=--)
+pc : arch_local_irq_enable+0xc/0x28
+lr : io_issue_sqe+0x870/0x28e8
+sp : ffff80000e0f7800
+x29: ffff80000e0f7800 x28: ffff0000cf850dd0 x27: ffff0000cf2c2000
+x26: ffff8000096f4b20 x25: ffff0000cd769c00 x24: ffff0000c12b6650
+x23: ffff800009dad958 x22: 00000006fc23ac00 x21: ffff0000cd769c08
+x20: 1ffff00001c1ef1a x19: ffff0000cd767e00 x18: 0000000000000000
+x17: ffff800008032b74 x16: ffff800008636448 x15: 0000fffff7166568
+x14: ffff80000861edf0 x13: ffff600019e58449 x12: 1fffe00019e58448
+x11: 1fffe00019e58448 x10: ffff600019e58448 x9 : dfff800000000000
+x8 : ffff0000cf2c2244 x7 : 0000000000000001 x6 : ffff600019e58449
+x5 : ffff600019e58449 x4 : ffff600019e58449 x3 : ffff8000086306c0
+x2 : 0000000000000001 x1 : ffff0000cf2c2244 x0 : 00000000000000e0
+Call trace:
+ arch_local_irq_enable+0xc/0x28
+ io_submit_sqes+0x530/0x29d8
+ __arm64_sys_io_uring_enter+0x380/0xd18
+ invoke_syscall+0x64/0x180
+ el0_svc_common.constprop.2+0x178/0x208
+ do_el0_svc+0x84/0xa0
+ el0_svc+0x48/0x1a0
+ el0t_64_sync_handler+0x90/0xb8
+ el0t_64_sync+0x180/0x184
+Kernel panic - not syncing: softlockup: hung tasks
+CPU: 3 PID: 691 Comm: poc Tainted: G             L    5.18.0+ #9
+Hardware name: linux,dummy-virt (DT)
+Call trace:
+ dump_backtrace+0x218/0x228
+ show_stack+0x20/0x68
+ dump_stack_lvl+0x68/0x84
+ dump_stack+0x1c/0x38
+ panic+0x1ec/0x3ec
+ watchdog_timer_fn+0x28c/0x300
+ __hrtimer_run_queues+0x1d8/0x498
+ hrtimer_interrupt+0x238/0x558
+ arch_timer_handler_virt+0x48/0x60
+ handle_percpu_devid_irq+0xdc/0x270
+ generic_handle_domain_irq+0x50/0x70
+ gic_handle_irq+0x8c/0x4bc
+ call_on_irq_stack+0x2c/0x38
+ do_interrupt_handler+0xc4/0xc8
+ el1_interrupt+0x48/0xb0
+ el1h_64_irq_handler+0x18/0x28
+ el1h_64_irq+0x74/0x78
+ arch_local_irq_enable+0xc/0x28
+ io_submit_sqes+0x530/0x29d8
+ __arm64_sys_io_uring_enter+0x380/0xd18
+ invoke_syscall+0x64/0x180
+ el0_svc_common.constprop.2+0x178/0x208
+ do_el0_svc+0x84/0xa0
+ el0_svc+0x48/0x1a0
+ el0t_64_sync_handler+0x90/0xb8
+ el0t_64_sync+0x180/0x184
+SMP: stopping secondary CPUs
+Kernel Offset: disabled
+CPU features: 0x110,00008f09,00001006
+Memory Limit: none
+---[ end Kernel panic - not syncing: softlockup: hung tasks ]---
+
+Signed-off-by: Guo Xuenan <guoxuenan@huawei.com>
+Reviewed-by: Zhang Yi <yi.zhang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/io_uring.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/fs/io_uring.c b/fs/io_uring.c
+index 612e6789a0dd..2ed0da75000e 100644
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -6726,6 +6726,9 @@ static int io_submit_sqes(struct io_ring_ctx *ctx, unsigned int nr)
+ 		err = io_submit_sqe(req, sqe, &link, &state.comp);
+ 		if (err)
+ 			goto fail_req;
++		/* to avoid doing too much in one submit round */
++		if (submitted > IORING_MAX_ENTRIES / 2)
++			cond_resched();
+ 	}
+ 
+ 	if (unlikely(submitted != nr)) {
+-- 
+2.33.0
+

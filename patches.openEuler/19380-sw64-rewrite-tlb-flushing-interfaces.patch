@@ -1,0 +1,561 @@
+From 6c0ddc05e1e69570d93f741c0da2dce85eebc762 Mon Sep 17 00:00:00 2001
+From: He Sheng <hesheng@wxiat.com>
+Date: Thu, 8 Sep 2022 15:55:46 +0800
+Subject: [PATCH] sw64: rewrite tlb flushing interfaces
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 6c0ddc05e1e69570d93f741c0da2dce85eebc762
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56OLG
+
+--------------------------------
+
+This patch borrows some loogarch code, ie. it rewrites following
+interfaces: flush_tlb_all(), flush_tlb_mm(), flush_tlb_page(),
+flush_tlb_range() and flush_tlb_kernel_range(), then remove
+flush_tlb() which can be achieved by flush_tlb_mm() according to
+Documentation/core-api/cachetlb.rst. To support new implementation,
+it fixes hmcall tbisasid to invalidate TLB of addr with specified
+ASID and current VPN, and adds hmcall wrasid to force update ASID.
+
+Besides, this patch adds helper cpu_asid() and asid_valid(), then
+simplify __get_new_mm_context() and its callers. That makes code
+cleaner.
+
+Signed-off-by: He Sheng <hesheng@wxiat.com>
+Reviewed-by: Cui Wei <cuiwei@wxiat.com>
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/include/asm/hmcall.h      |   8 ++
+ arch/sw_64/include/asm/mmu_context.h |  42 ++++-----
+ arch/sw_64/include/asm/tlbflush.h    | 133 ++++++++++-----------------
+ arch/sw_64/kernel/hmcall.c           |  42 ++++++++-
+ arch/sw_64/kernel/smp.c              | 108 ++++++++++------------
+ 5 files changed, 165 insertions(+), 168 deletions(-)
+
+diff --git a/arch/sw_64/include/asm/hmcall.h b/arch/sw_64/include/asm/hmcall.h
+index 5255d91e41a6..22de7d9f41a3 100644
+--- a/arch/sw_64/include/asm/hmcall.h
++++ b/arch/sw_64/include/asm/hmcall.h
+@@ -12,6 +12,7 @@
+ #define HMC_cpuid		0x03
+ #define HMC_sleepen		0x05
+ #define HMC_rdksp		0x06
++#define HMC_wrasid		0x08
+ #define HMC_rdptbr		0x0B
+ #define HMC_wrptbr		0x0C
+ #define HMC_wrksp		0x0E
+@@ -157,8 +158,15 @@ __CALL_HMC_W1(wrusp, unsigned long);
+ __CALL_HMC_R0(rdksp, unsigned long);
+ __CALL_HMC_W1(wrksp, unsigned long);
+ 
++/*
++ * Load a mm context. This is needed when we change the page
++ * table pointer(CSR:PTBR) or when we update the ASID.
++ * load_mm(asid, ptbr)
++ *
++ */
+ __CALL_HMC_W2(load_mm, unsigned long, unsigned long);
+ 
++__CALL_HMC_W1(wrasid, unsigned long);
+ __CALL_HMC_R0(rdptbr, unsigned long);
+ __CALL_HMC_W1(wrptbr, unsigned long);
+ 
+diff --git a/arch/sw_64/include/asm/mmu_context.h b/arch/sw_64/include/asm/mmu_context.h
+index 452da240ce99..5ae9d4616937 100644
+--- a/arch/sw_64/include/asm/mmu_context.h
++++ b/arch/sw_64/include/asm/mmu_context.h
+@@ -7,13 +7,6 @@
+ #include <asm/compiler.h>
+ #include <asm/io.h>
+ 
+-/*
+- * Load a mm context. This is needed when we change the page
+- * table pointer(CSR:PTBR) or when we update the ASID.
+- *
+- */
+-#define load_asid_ptbr   load_mm
+-
+ /*
+  * The maximum ASID's the processor supports.
+  */
+@@ -28,6 +21,13 @@
+ #define ASID_FIRST_VERSION	(1UL << ASID_BITS)
+ #define ASID_MASK		((1UL << ASID_BITS) - 1)
+ 
++#define cpu_asid(cpu, mm)	((mm)->context.asid[cpu] & ASID_MASK)
++
++static inline bool asid_valid(struct mm_struct *mm, unsigned int cpu)
++{
++	return !((mm->context.asid[cpu] ^ last_asid(cpu)) & ~ASID_MASK);
++}
++
+ /*
+  * NOTE! The way this is set up, the high bits of the "last_asid" (and
+  * the "mm->context.asid[cpu]") are the ASID _version_ code. A version
+@@ -39,18 +39,14 @@
+  * new asid for any other processes the next time they want to run.
+  */
+ 
+-static inline unsigned long
+-__get_new_mm_context(struct mm_struct *mm, long cpu)
++static inline void __get_new_mm_context(struct mm_struct *mm, long cpu)
+ {
+ 	unsigned long asid = last_asid(cpu);
+-	unsigned long next = asid + 1;
+ 
+-	if ((asid & ASID_MASK) >= ASID_MASK) {
++	if (!(++asid & ASID_MASK))
+ 		tbivp();
+-		next = (asid & ~ASID_MASK) + ASID_FIRST_VERSION;
+-	}
+-	last_asid(cpu) = next;
+-	return next;
++	mm->context.asid[cpu] = last_asid(cpu) = asid;
++
+ }
+ 
+ static inline void
+@@ -58,25 +54,21 @@ switch_mm_irqs_off(struct mm_struct *prev_mm, struct mm_struct *next_mm,
+ 		   struct task_struct *next)
+ {
+ 	/* Check if our ASID is of an older version, and thus invalid. */
+-	unsigned long asid, mmc, ptbr;
++	unsigned long asid, ptbr;
+ 	long cpu = smp_processor_id();
+ 
+-	asid = last_asid(cpu);
+-	mmc = next_mm->context.asid[cpu];
+-	if ((mmc ^ asid) & ~ASID_MASK) {
+-		/* Check if mmc and cpu asid is in the same version */
+-		mmc = __get_new_mm_context(next_mm, cpu);
+-		next_mm->context.asid[cpu] = mmc;
+-	}
++	if (!asid_valid(next_mm, cpu))
++		__get_new_mm_context(next_mm, cpu);
+ 
+ 	/*
+ 	 * Update CSR:UPN and CSR:PTBR. Another thread may have allocated
+ 	 * a new mm->context[asid] (via flush_tlb_mm) without the ASID serial
+ 	 * number wrapping.  We have no way to detect when this is needed.
+ 	 */
+-	asid = mmc & ASID_MASK;
++	asid = cpu_asid(cpu, next_mm);
+ 	ptbr = virt_to_pfn(next_mm->pgd);
+-	load_asid_ptbr(asid, ptbr);
++	load_mm(asid, ptbr);
++	cpumask_set_cpu(cpu, mm_cpumask(next_mm));
+ }
+ 
+ #define switch_mm_irqs_off switch_mm_irqs_off
+diff --git a/arch/sw_64/include/asm/tlbflush.h b/arch/sw_64/include/asm/tlbflush.h
+index f92a93cfe3db..53c384932eb9 100644
+--- a/arch/sw_64/include/asm/tlbflush.h
++++ b/arch/sw_64/include/asm/tlbflush.h
+@@ -10,121 +10,84 @@
+ #include <asm/hmcall.h>
+ #include <asm/mmu_context.h>
+ 
+-static inline void flush_tlb_current(struct mm_struct *mm)
++static inline void local_flush_tlb_all(void)
+ {
+-	unsigned long mmc, asid, ptbr, flags;
++	tbiv();
++}
+ 
+-	local_irq_save(flags);
++static inline void local_flush_tlb_mm(struct mm_struct *mm)
++{
++	int cpu;
++	unsigned long flags;
+ 
+-	mmc = __get_new_mm_context(mm, smp_processor_id());
+-	mm->context.asid[smp_processor_id()] = mmc;
++	local_irq_save(flags);
+ 
+-	/*
+-	 * Force a new ASID for a task. Note that there is no way to
+-	 * write UPN only now, so call load_asid_ptbr here.
+-	 */
+-	asid = mmc & ASID_MASK;
+-	ptbr = virt_to_pfn(mm->pgd);
+-	load_asid_ptbr(asid, ptbr);
++	cpu = smp_processor_id();
++	if (!asid_valid(mm, cpu)) {
++		cpumask_clear_cpu(cpu, mm_cpumask(mm));
++		goto out;
++	}
+ 
++	if (current->mm == mm) {
++		__get_new_mm_context(mm, cpu);
++		wrasid(cpu_asid(cpu, mm));
++	} else {
++		mm->context.asid[cpu] = 0;
++		cpumask_clear_cpu(cpu, mm_cpumask(mm));
++	}
++out:
+ 	local_irq_restore(flags);
+ }
+ 
+-/*
+- * Flush just one page in the current TLB set.  We need to be very
+- * careful about the icache here, there is no way to invalidate a
+- * specific icache page.
+- */
+-
+-static inline void flush_tlb_current_page(struct mm_struct *mm,
+-					  struct vm_area_struct *vma,
+-					  unsigned long addr)
+-{
+-	if (vma->vm_flags & VM_EXEC)
+-		tbis(addr);
+-	else
+-		tbisd(addr);
+-}
+-
+-
+-/* Flush current user mapping.  */
+-static inline void flush_tlb(void)
++static inline void
++local_flush_tlb_page(struct vm_area_struct *vma, unsigned long addr)
+ {
+-	flush_tlb_current(current->active_mm);
+-}
++	int cpu;
++	struct mm_struct *mm;
+ 
+-/* Flush someone else's user mapping.  */
+-static inline void flush_tlb_other(struct mm_struct *mm)
+-{
+-	unsigned long *mmc;
++	cpu = smp_processor_id();
++	mm = vma->vm_mm;
+ 
+-	if (mm) {
+-		mmc = &mm->context.asid[smp_processor_id()];
+-	/*
+-	 * Check it's not zero first to avoid cacheline ping pong
+-	 * when possible.
+-	 */
+-		if (*mmc)
+-			*mmc = 0;
+-	}
++	if (asid_valid(mm, cpu))
++		tbisasid(cpu_asid(cpu, mm), addr);
++	else
++		cpumask_clear_cpu(cpu, mm_cpumask(mm));
+ }
+ 
+-#ifndef CONFIG_SMP
+ /*
+- * Flush everything (kernel mapping may also have changed
+- * due to vmalloc/vfree).
++ * It flushes the whole user tlb now.
+  */
+-static inline void flush_tlb_all(void)
+-{
+-	tbiv();
+-}
+-
+-/* Flush a specified user mapping.  */
+ static inline void
+-flush_tlb_mm(struct mm_struct *mm)
++local_flush_tlb_range(struct vm_area_struct *vma,
++		unsigned long start, unsigned long end)
+ {
+-	if (mm == current->mm)
+-		flush_tlb_current(mm);
+-	else
+-		flush_tlb_other(mm);
+-}
+-
+-/* Page-granular tlb flush.  */
+-static inline void flush_tlb_page(struct vm_area_struct *vma,
+-				  unsigned long addr)
+-{
+-	struct mm_struct *mm = vma->vm_mm;
+-
+-	if (mm == current->mm)
+-		flush_tlb_current_page(mm, vma, addr);
+-	else
+-		flush_tlb_other(mm);
++	local_flush_tlb_mm(vma->vm_mm);
+ }
+ 
+ /*
+- * Flush a specified range of user mapping.  On the sw64 we flush
+- * the whole user tlb.
++ * There is no way to invalidate kernel pages only, so it has to
++ * inlvalidate all mapping.
+  */
+-static inline void flush_tlb_range(struct vm_area_struct *vma,
+-				   unsigned long start, unsigned long end)
++static inline void
++local_flush_tlb_kernel_range(unsigned long start, unsigned long end)
+ {
+-	flush_tlb_mm(vma->vm_mm);
++	local_flush_tlb_all();
+ }
+ 
+-#else /* CONFIG_SMP */
+-
++#ifdef CONFIG_SMP
+ extern void flush_tlb_all(void);
+ extern void flush_tlb_mm(struct mm_struct *);
+ extern void flush_tlb_page(struct vm_area_struct *, unsigned long);
+ extern void flush_tlb_range(struct vm_area_struct *, unsigned long,
+ 			    unsigned long);
++extern void flush_tlb_kernel_range(unsigned long, unsigned long);
++#else
++#define flush_tlb_all()				local_flush_tlb_all()
++#define flush_tlb_mm(mm)			local_flush_tlb_mm(mm)
++#define flush_tlb_page(vma, addr)		local_flush_tlb_page(vma, addr)
++#define flush_tlb_range(vma, start, end)	local_flush_tlb_range(vma, start, end)
++#define flush_tlb_kernel_range(start, end)	local_flush_tlb_kernel_range(start, end)
+ 
+ #endif /* CONFIG_SMP */
+ 
+-static inline void flush_tlb_kernel_range(unsigned long start,
+-					  unsigned long end)
+-{
+-	flush_tlb_all();
+-}
+-
+ #endif /* _ASM_SW64_TLBFLUSH_H */
+diff --git a/arch/sw_64/kernel/hmcall.c b/arch/sw_64/kernel/hmcall.c
+index b81d7fff1c34..3d60569a4f6f 100644
+--- a/arch/sw_64/kernel/hmcall.c
++++ b/arch/sw_64/kernel/hmcall.c
+@@ -38,11 +38,51 @@ static inline void fixup_wrtp(void)
+ 	entry[1] = 0x1ee00000;	/* pri_ret $23 */
+ }
+ 
++static inline void fixup_tbiasid(void)
++{
++	unsigned int *entry = __va(HMCALL_ENTRY(tbisasid));
++
++	entry[0] = 0x18fffe47;	/* pri_rcsr p7, CSR__DTB_PCR*/
++	entry[1] = 0x4a05c905;	/* sll r16, CSR__DTB_PCR__UPN__S, p5 */
++	entry[2] = 0xf89f03ff;  /* ldi p4, CSR__DTB_PCR__UPN__M */
++	entry[3] = 0x4885c904;	/* sll p4, CSR__DTB_PCR__UPN__S, p4 */
++	entry[4] = 0x40e40724;	/* bic p7, p4, p4 */
++	entry[5] = 0x40850745;	/* bis p4, p5, p5 */
++	entry[6] = 0x18bfff47;	/* pri_wcsr p5, CSR__DTB_PCR */
++	entry[7] = 0x1a3fff46;	/* pri_wcsr r17, CSR__DTB_IS */
++	entry[8] = 0x18ffff47;	/* pri_wcsr p7, CSR__DTB_PCR */
++	entry[9] = 0x4a04e906;	/* sll r16, CSR__UPCR_UPN__UPN__S, p6 */
++	entry[10] = 0x189ffe22;	/* pri_rcsr p4, CSR__UPCR_UPN */
++	entry[11] = 0x18dfff22; /* pri_wcsr p6, CSR__UPCR_UPN */
++	entry[12] = 0x1a3fff06; /* pri_wcsr r17, CSR__ITB_IS */
++	entry[13] = 0x1bffff15; /* pri_wcsr r31, CSR__IC_FLUSH */
++	entry[14] = 0x189fff22; /* pri_wcsr p4, CSR__UPCR_UPN */
++	entry[15] = 0x1ef00000; /* pri_ret/b p23 */
++}
++
++static inline void fixup_wrasid(void)
++{
++	unsigned int *entry = __va(HMCALL_ENTRY(wrasid));
++
++	entry[0] = 0x18fffe47;	/* pri_rcsr p7, CSR__DTB_PCR*/
++	entry[1] = 0x4a05c905;	/* sll r16, CSR__DTB_PCR__UPN__S, p5 */
++	entry[2] = 0xf89f03ff;  /* ldi p4, CSR__DTB_PCR__UPN__M */
++	entry[3] = 0x4885c904;	/* sll p4, CSR__DTB_PCR__UPN__S, p4 */
++	entry[4] = 0x40e40724;	/* bic p7, p4, p4 */
++	entry[5] = 0x40850745;	/* bis p4, p5, p5 */
++	entry[6] = 0x18bfff47;	/* pri_wcsr p5, CSR__DTB_PCR */
++	entry[7] = 0x4a04e906;	/* sll r16, CSR__UPCR_UPN__UPN__S, p6 */
++	entry[8] = 0x18dfff22;	/* pri_wcsr p4, CSR__UPCR_UPN */
++	entry[9] = 0x1ef00000;	/* pri_ret/b p23 */
++}
++
+ void __init fixup_hmcall(void)
+ {
+-#if defined(CONFIG_SUBARCH_C3A) || defined(CONFIG_SUBARCH_C3B)
++#if defined(CONFIG_SUBARCH_C3B)
+ 	fixup_rdtp();
+ 	fixup_wrtp();
++	fixup_tbiasid();
++	fixup_wrasid();
+ #endif
+ }
+ 
+diff --git a/arch/sw_64/kernel/smp.c b/arch/sw_64/kernel/smp.c
+index b467562bce9e..ecf276e9e364 100644
+--- a/arch/sw_64/kernel/smp.c
++++ b/arch/sw_64/kernel/smp.c
+@@ -478,7 +478,7 @@ void native_send_call_func_single_ipi(int cpu)
+ 
+ static void ipi_flush_tlb_all(void *ignored)
+ {
+-	tbiv();
++	local_flush_tlb_all();
+ }
+ 
+ void flush_tlb_all(void)
+@@ -491,108 +491,102 @@ void flush_tlb_all(void)
+ 
+ static void ipi_flush_tlb_mm(void *x)
+ {
+-	struct mm_struct *mm = (struct mm_struct *) x;
+-
+-	if (mm == current->mm)
+-		flush_tlb_current(mm);
+-	else
+-		flush_tlb_other(mm);
++	local_flush_tlb_mm((struct mm_struct *)x);
+ }
+ 
+ void flush_tlb_mm(struct mm_struct *mm)
+ {
+-	preempt_disable();
+ 
+ 	/* happens as a result of exit_mmap()
+ 	 * Shall we clear mm->context.asid[] here?
+ 	 */
+ 	if (atomic_read(&mm->mm_users) == 0) {
+-		preempt_enable();
+ 		return;
+ 	}
+ 
+-	if (mm == current->mm) {
+-		flush_tlb_current(mm);
+-		if (atomic_read(&mm->mm_users) == 1) {
+-			int cpu, this_cpu = smp_processor_id();
++	preempt_disable();
+ 
+-			for (cpu = 0; cpu < NR_CPUS; cpu++) {
+-				if (!cpu_online(cpu) || cpu == this_cpu)
+-					continue;
+-				if (mm->context.asid[cpu])
+-					mm->context.asid[cpu] = 0;
+-			}
+-			preempt_enable();
+-			return;
+-		}
+-	} else
+-		flush_tlb_other(mm);
++	if (atomic_read(&mm->mm_users) != 1 || mm != current->mm) {
++		on_each_cpu_mask(mm_cpumask(mm), ipi_flush_tlb_mm, mm, 1);
++	} else {
++		int cpu, this_cpu = smp_processor_id();
+ 
+-	smp_call_function(ipi_flush_tlb_mm, mm, 1);
++		for_each_online_cpu(cpu) {
++			if (cpu != this_cpu && mm->context.asid[cpu])
++				mm->context.asid[cpu] = 0;
++		}
++		local_flush_tlb_mm(mm);
++	}
+ 
+ 	preempt_enable();
+ }
+ EXPORT_SYMBOL(flush_tlb_mm);
+ 
+-struct flush_tlb_page_struct {
++struct flush_tlb_info {
+ 	struct vm_area_struct *vma;
+-	struct mm_struct *mm;
+ 	unsigned long addr;
++#define start addr
++	unsigned long end;
+ };
+ 
+ static void ipi_flush_tlb_page(void *x)
+ {
+-	struct flush_tlb_page_struct *data = (struct flush_tlb_page_struct *)x;
+-	struct mm_struct *mm = data->mm;
+-
+-	if (mm == current->mm)
+-		flush_tlb_current_page(mm, data->vma, data->addr);
+-	else
+-		flush_tlb_other(mm);
++	struct flush_tlb_info *info = x;
+ 
++	local_flush_tlb_page(info->vma, info->addr);
+ }
+ 
+ void flush_tlb_page(struct vm_area_struct *vma, unsigned long addr)
+ {
+-	struct flush_tlb_page_struct data;
+ 	struct mm_struct *mm = vma->vm_mm;
+ 
+ 	preempt_disable();
+ 
+-	if (mm == current->mm) {
+-		flush_tlb_current_page(mm, vma, addr);
+-		if (atomic_read(&mm->mm_users) == 1) {
+-			int cpu, this_cpu = smp_processor_id();
+-
+-			for (cpu = 0; cpu < NR_CPUS; cpu++) {
+-				if (!cpu_online(cpu) || cpu == this_cpu)
+-					continue;
+-				if (mm->context.asid[cpu])
+-					mm->context.asid[cpu] = 0;
+-			}
+-			preempt_enable();
+-			return;
++	if (atomic_read(&mm->mm_users) != 1 || mm != current->mm) {
++		struct flush_tlb_info info = {
++			.vma = vma,
++			.addr = addr,
++		};
++		on_each_cpu_mask(mm_cpumask(mm), ipi_flush_tlb_page, &info, 1);
++	} else {
++		int cpu, this_cpu = smp_processor_id();
++
++		for_each_online_cpu(cpu) {
++			if (cpu != this_cpu && mm->context.asid[cpu])
++				mm->context.asid[cpu] = 0;
+ 		}
+-	} else
+-		flush_tlb_other(mm);
+-
+-	data.vma = vma;
+-	data.mm = mm;
+-	data.addr = addr;
+-
+-	smp_call_function(ipi_flush_tlb_page, &data, 1);
++		local_flush_tlb_page(vma, addr);
++	}
+ 
+ 	preempt_enable();
+ }
+ EXPORT_SYMBOL(flush_tlb_page);
+ 
++/* It always flush the whole user tlb by now. To be optimized. */
+ void flush_tlb_range(struct vm_area_struct *vma, unsigned long start, unsigned long end)
+ {
+-	/* On the SW we always flush the whole user tlb.  */
+ 	flush_tlb_mm(vma->vm_mm);
+ }
+ EXPORT_SYMBOL(flush_tlb_range);
+ 
++static void ipi_flush_tlb_kernel_range(void *x)
++{
++	struct flush_tlb_info *info = x;
++
++	local_flush_tlb_kernel_range(info->start, info->end);
++}
++
++void flush_tlb_kernel_range(unsigned long start, unsigned long end)
++{
++	struct flush_tlb_info info = {
++		.start = start,
++		.end = end,
++	};
++
++	on_each_cpu(ipi_flush_tlb_kernel_range, &info, 1);
++}
++EXPORT_SYMBOL(flush_tlb_kernel_range);
++
+ int native_cpu_disable(void)
+ {
+ 	int cpu = smp_processor_id();
+-- 
+2.33.0
+

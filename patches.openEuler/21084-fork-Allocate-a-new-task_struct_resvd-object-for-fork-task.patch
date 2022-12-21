@@ -1,0 +1,124 @@
+From 5efc447b7cafd17f6314df52671819c615e9bf0a Mon Sep 17 00:00:00 2001
+From: Zheng Zucheng <zhengzucheng@huawei.com>
+Date: Mon, 21 Nov 2022 22:03:06 +0800
+Subject: [PATCH] fork: Allocate a new task_struct_resvd object for fork task
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 5efc447b7cafd17f6314df52671819c615e9bf0a
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: 187196, https://gitee.com/openeuler/kernel/issues/I612CS
+
+-------------------------------
+
+Allocate a new task_struct_resvd object for the recently cloned task
+
+Signed-off-by: Zheng Zucheng <zhengzucheng@huawei.com>
+Reviewed-by: Zhang Qiao <zhangqiao22@huawei.com>
+Reviewed-by: Zhang Qiao <zhangqiao22@huawei.com>
+Reviewed-by: Nanyong Sun <sunnanyong@huawei.com>
+Reviewed-by: Zhang Qiao <zhangqiao22@huawei.com>
+Reviewed-by: chenhui 00515652 <judy.chenhui@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/sched.h |  2 ++
+ init/init_task.c      |  5 +++++
+ kernel/fork.c         | 21 ++++++++++++++++++++-
+ 3 files changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index aeeaca7dd253..9abd00ed53b4 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -677,6 +677,8 @@ struct wake_q_node {
+ * struct task_struct_resvd - KABI extension struct
+ */
+ struct task_struct_resvd {
++	/* pointer back to the main task_struct */
++	struct task_struct	*task;
+ };
+ 
+ struct task_struct {
+diff --git a/init/init_task.c b/init/init_task.c
+index 5fa18ed59d33..891007de2eef 100644
+--- a/init/init_task.c
++++ b/init/init_task.c
+@@ -57,6 +57,10 @@ unsigned long init_shadow_call_stack[SCS_SIZE / sizeof(long)]
+ };
+ #endif
+ 
++static struct task_struct_resvd init_task_struct_resvd = {
++	.task = &init_task,
++};
++
+ /*
+  * Set up the first task table, touch at your own risk!. Base=0,
+  * limit=0x1fffff (=2MB)
+@@ -213,6 +217,7 @@ struct task_struct init_task
+ #ifdef CONFIG_SECCOMP_FILTER
+ 	.seccomp	= { .filter_count = ATOMIC_INIT(0) },
+ #endif
++	._resvd = &init_task_struct_resvd,
+ };
+ EXPORT_SYMBOL(init_task);
+ 
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 8dbb8d985e78..8a40bfda35e1 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -173,6 +173,7 @@ static inline struct task_struct *alloc_task_struct_node(int node)
+ 
+ static inline void free_task_struct(struct task_struct *tsk)
+ {
++	kfree(tsk->_resvd);
+ 	kmem_cache_free(task_struct_cachep, tsk);
+ }
+ #endif
+@@ -851,6 +852,18 @@ void set_task_stack_end_magic(struct task_struct *tsk)
+ 	*stackend = STACK_END_MAGIC;	/* for overflow detection */
+ }
+ 
++static bool dup_resvd_task_struct(struct task_struct *dst,
++				  struct task_struct *orig, int node)
++{
++	dst->_resvd = kmalloc_node(sizeof(struct task_struct_resvd),
++					  GFP_KERNEL, node);
++	if (!dst->_resvd)
++		return false;
++
++	dst->_resvd->task = dst;
++	return true;
++}
++
+ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
+ {
+ 	struct task_struct *tsk;
+@@ -863,6 +876,12 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
+ 	tsk = alloc_task_struct_node(node);
+ 	if (!tsk)
+ 		return NULL;
++	/*
++	 * before proceeding, we need to make tsk->_resvd = NULL,
++	 * otherwise the error paths below, if taken, might end up causing
++	 * a double-free for task_struct_resvd extension object.
++	 */
++	WRITE_ONCE(tsk->_resvd, NULL);
+ 
+ 	stack = alloc_thread_stack_node(tsk, node);
+ 	if (!stack)
+@@ -888,7 +907,7 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
+ 	refcount_set(&tsk->stack_refcount, 1);
+ #endif
+ 
+-	if (err)
++	if (err || !dup_resvd_task_struct(tsk, orig, node))
+ 		goto free_stack;
+ 
+ 	err = scs_prepare(tsk, node);
+-- 
+2.33.0
+

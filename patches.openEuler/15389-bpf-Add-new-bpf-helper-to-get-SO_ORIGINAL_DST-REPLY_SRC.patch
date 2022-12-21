@@ -1,0 +1,256 @@
+From 97aeb284efece2a8af5bb424d4e980905927f7bb Mon Sep 17 00:00:00 2001
+From: Liu Jian <liujian56@huawei.com>
+Date: Tue, 10 May 2022 23:05:04 +0800
+Subject: [PATCH] bpf: Add new bpf helper to get SO_ORIGINAL_DST/REPLY_SRC
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 97aeb284efece2a8af5bb424d4e980905927f7bb
+Modified-by-SEL: Yes, modified due to different context
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I545NW
+CVE: NA
+
+--------------------------------
+
+Add new optname(BPF_SO_ORIGINAL_DST 800, BPF_SO_REPLY_SRC 801)
+to get origdst/reply src for bpf progs.
+Now only support IPv4.
+
+Signed-off-by: Wang Yufen <wangyufen@huawei.com>
+Signed-off-by: Liu Jian <liujian56@huawei.com>
+Reviewed-by: Wei Yongjun <weiyongjun1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/net/netfilter/nf_conntrack.h |    4 ++
+ include/uapi/linux/bpf.h             |    7 +++
+ include/uapi/linux/netfilter_ipv4.h  |    2 +
+ net/core/filter.c                    |   49 ++++++++++++++++++++++++++
+ net/netfilter/nf_conntrack_proto.c   |   65 +++++++++++++++++++++++++++++++++++
+ tools/include/uapi/linux/bpf.h       |    7 +++
+ 6 files changed, 134 insertions(+)
+
+--- a/include/net/netfilter/nf_conntrack.h
++++ b/include/net/netfilter/nf_conntrack.h
+@@ -342,4 +342,8 @@ nf_ct_set(struct sk_buff *skb, struct nf
+ #define MODULE_ALIAS_NFCT_HELPER(helper) \
+         MODULE_ALIAS("nfct-helper-" helper)
+ 
++typedef int (*bpf_getorigdst_opt_func)(struct sock *sk, int optname,
++				       void *optval, int *optlen, int dir);
++extern bpf_getorigdst_opt_func bpf_getorigdst_opt;
++
+ #endif /* _NF_CONNTRACK_H */
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -4581,6 +4581,12 @@ union bpf_attr {
+  *             A 64-bit integer containing the current GID and UID, and
+  *             created as such: *current_gid* **<< 32 \|** *current_uid*.
+  *
++ * int bpf_sk_original_addr(void *bpf_socket, int optname, char *optval, int optlen)
++ *     Description
++ *             Get Ipv4 origdst or replysrc. Works with IPv4.
++ *     Return
++ *             0 on success, or a negative error in case of failure.
++ *
+  * void *bpf_task_storage_get(struct bpf_map *map, struct task_struct *task, void *value, u64 flags)
+  *	Description
+  *		Get a bpf_local_storage from the *task*.
+@@ -5206,6 +5212,7 @@ union bpf_attr {
+ 	FN(this_cpu_ptr),		\
+ 	FN(redirect_peer),		\
+ 	FN(get_sockops_uid_gid),	\
++	FN(sk_original_addr),		\
+ 	FN(task_storage_get),		\
+ 	FN(task_storage_delete),	\
+ 	FN(get_current_task_btf),	\
+--- a/include/uapi/linux/netfilter_ipv4.h
++++ b/include/uapi/linux/netfilter_ipv4.h
+@@ -50,6 +50,8 @@ enum nf_ip_hook_priorities {
+ /* 2.2 firewalling (+ masq) went from 64 through 76 */
+ /* 2.4 firewalling went 64 through 67. */
+ #define SO_ORIGINAL_DST 80
++#define BPF_SO_ORIGINAL_DST 800
++#define BPF_SO_REPLY_SRC 801
+ 
+ 
+ #endif /* _UAPI__LINUX_IP_NETFILTER_H */
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -5193,6 +5193,53 @@ static const struct bpf_func_proto bpf_g
+ 	.arg1_type	= ARG_PTR_TO_CTX,
+ };
+ 
++#include <net/netfilter/nf_conntrack.h>
++#include <linux/netfilter_ipv4.h>
++
++bpf_getorigdst_opt_func bpf_getorigdst_opt;
++EXPORT_SYMBOL(bpf_getorigdst_opt);
++
++BPF_CALL_4(bpf_sk_original_addr, struct bpf_sock_ops_kern *, bpf_sock,
++	   int, optname, char *, optval, int, optlen)
++{
++	struct sock *sk = bpf_sock->sk;
++	int ret = -EINVAL;
++
++	if (!sk_fullsock(sk))
++		goto err_clear;
++
++	if (optname != BPF_SO_ORIGINAL_DST && optname != BPF_SO_REPLY_SRC)
++		goto err_clear;
++
++	if (!bpf_getorigdst_opt)
++		goto err_clear;
++#if IS_ENABLED(CONFIG_NF_CONNTRACK)
++	if (optname == BPF_SO_ORIGINAL_DST)
++		ret = bpf_getorigdst_opt(sk, optname, optval, &optlen,
++					 IP_CT_DIR_ORIGINAL);
++	else if (optname == BPF_SO_REPLY_SRC)
++		ret = bpf_getorigdst_opt(sk, optname, optval, &optlen,
++					 IP_CT_DIR_REPLY);
++	if (ret < 0)
++		goto err_clear;
++
++	return 0;
++#endif
++err_clear:
++	memset(optval, 0, optlen);
++	return ret;
++}
++
++static const struct bpf_func_proto bpf_sk_original_addr_proto = {
++	.func		= bpf_sk_original_addr,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_PTR_TO_CTX,
++	.arg2_type	= ARG_ANYTHING,
++	.arg3_type	= ARG_PTR_TO_UNINIT_MEM,
++	.arg4_type	= ARG_CONST_SIZE,
++};
++
+ BPF_CALL_5(bpf_sock_addr_getsockopt, struct bpf_sock_addr_kern *, ctx,
+ 	   int, level, int, optname, char *, optval, int, optlen)
+ {
+@@ -7639,6 +7686,8 @@ sock_ops_func_proto(enum bpf_func_id fun
+ 		return &bpf_sk_storage_delete_proto;
+ 	case BPF_FUNC_get_sockops_uid_gid:
+ 		return &bpf_get_sockops_uid_gid_proto;
++	case BPF_FUNC_sk_original_addr:
++		return &bpf_sk_original_addr_proto;
+ 	case BPF_FUNC_get_netns_cookie:
+ 		return &bpf_get_netns_cookie_sock_ops_proto;
+ #ifdef CONFIG_INET
+--- a/net/netfilter/nf_conntrack_proto.c
++++ b/net/netfilter/nf_conntrack_proto.c
+@@ -292,6 +292,67 @@ getorigdst(struct sock *sk, int optval,
+ 	return -ENOENT;
+ }
+ 
++static int
++bpf_getorigdst_impl(struct sock *sk, int optval, void *user, int *len, int dir)
++{
++	const struct inet_sock *inet = inet_sk(sk);
++	const struct nf_conntrack_tuple_hash *h;
++	struct nf_conntrack_tuple tuple;
++
++	memset(&tuple, 0, sizeof(tuple));
++
++	tuple.src.u3.ip = inet->inet_rcv_saddr;
++	tuple.src.u.tcp.port = inet->inet_sport;
++	tuple.dst.u3.ip = inet->inet_daddr;
++	tuple.dst.u.tcp.port = inet->inet_dport;
++	tuple.src.l3num = PF_INET;
++	tuple.dst.protonum = sk->sk_protocol;
++
++	/* We only do TCP and SCTP at the moment: is there a better way? */
++	if (tuple.dst.protonum != IPPROTO_TCP &&
++	    tuple.dst.protonum != IPPROTO_SCTP) {
++		pr_debug("SO_ORIGINAL_DST: Not a TCP/SCTP socket\n");
++		return -ENOPROTOOPT;
++	}
++
++	if ((unsigned int)*len < sizeof(struct sockaddr_in)) {
++		pr_debug("SO_ORIGINAL_DST: len %d not %zu\n",
++			 *len, sizeof(struct sockaddr_in));
++		return -EINVAL;
++	}
++
++	h = nf_conntrack_find_get(sock_net(sk), &nf_ct_zone_dflt, &tuple);
++	if (h) {
++		struct sockaddr_in sin;
++		struct nf_conn *ct = nf_ct_tuplehash_to_ctrack(h);
++
++		sin.sin_family = AF_INET;
++		if (dir == IP_CT_DIR_REPLY) {
++			sin.sin_port = ct->tuplehash[IP_CT_DIR_REPLY]
++					.tuple.src.u.tcp.port;
++			sin.sin_addr.s_addr = ct->tuplehash[IP_CT_DIR_REPLY]
++					.tuple.src.u3.ip;
++		} else {
++			sin.sin_port = ct->tuplehash[IP_CT_DIR_ORIGINAL]
++					.tuple.dst.u.tcp.port;
++			sin.sin_addr.s_addr = ct->tuplehash[IP_CT_DIR_ORIGINAL]
++					.tuple.dst.u3.ip;
++		}
++		memset(sin.sin_zero, 0, sizeof(sin.sin_zero));
++
++		pr_debug("SO_ORIGINAL_DST: %pI4 %u\n",
++			 &sin.sin_addr.s_addr, ntohs(sin.sin_port));
++		nf_ct_put(ct);
++
++		memcpy(user, &sin, sizeof(sin));
++		return 0;
++	}
++	pr_debug("SO_ORIGINAL_DST: Can't find %pI4/%u-%pI4/%u.\n",
++		 &tuple.src.u3.ip, ntohs(tuple.src.u.tcp.port),
++		 &tuple.dst.u3.ip, ntohs(tuple.dst.u.tcp.port));
++	return -ENOENT;
++}
++
+ static struct nf_sockopt_ops so_getorigdst = {
+ 	.pf		= PF_INET,
+ 	.get_optmin	= SO_ORIGINAL_DST,
+@@ -656,6 +717,8 @@ int nf_conntrack_proto_init(void)
+ 		goto cleanup_sockopt;
+ #endif
+ 
++	bpf_getorigdst_opt = bpf_getorigdst_impl;
++
+ 	return ret;
+ 
+ #if IS_ENABLED(CONFIG_IPV6)
+@@ -667,6 +730,8 @@ cleanup_sockopt:
+ 
+ void nf_conntrack_proto_fini(void)
+ {
++	bpf_getorigdst_opt = NULL;
++
+ 	nf_unregister_sockopt(&so_getorigdst);
+ #if IS_ENABLED(CONFIG_IPV6)
+ 	nf_unregister_sockopt(&so_getorigdst6);
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -4568,6 +4568,12 @@ union bpf_attr {
+  *             A 64-bit integer containing the current GID and UID, and
+  *             created as such: *current_gid* **<< 32 \|** *current_uid*.
+  *
++ * int bpf_sk_original_addr(void *bpf_socket, int optname, char *optval, int optlen)
++ *     Description
++ *             Get Ipv4 origdst or replysrc. Works with IPv4.
++ *     Return
++ *             0 on success, or a negative error in case of failure.
++ *
+  * void *bpf_task_storage_get(struct bpf_map *map, struct task_struct *task, void *value, u64 flags)
+  *	Description
+  *		Get a bpf_local_storage from the *task*.
+@@ -5193,6 +5199,7 @@ union bpf_attr {
+ 	FN(this_cpu_ptr),		\
+ 	FN(redirect_peer),		\
+ 	FN(get_sockops_uid_gid),	\
++	FN(sk_original_addr),		\
+ 	FN(task_storage_get),		\
+ 	FN(task_storage_delete),	\
+ 	FN(get_current_task_btf),	\

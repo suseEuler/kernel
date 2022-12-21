@@ -1,0 +1,123 @@
+From 0fda5305925abe7dfb3220378085b2babc8bda3e Mon Sep 17 00:00:00 2001
+From: Mao Minkai <maominkai@wxiat.com>
+Date: Mon, 8 Aug 2022 10:04:30 +0800
+Subject: [PATCH] sw64: fix exception handling of deep-copy_user.S
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 0fda5305925abe7dfb3220378085b2babc8bda3e
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5PN9S
+
+--------------------------------
+
+If exception happened inside simd part causing the function to exit,
+pop stack to make sure everything works correctly.
+
+Signed-off-by: Mao Minkai <maominkai@wxiat.com>
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/lib/deep-copy_template.S | 16 ++++++++++++----
+ arch/sw_64/lib/deep-copy_user.S     | 21 +++++++++++++++++++++
+ 2 files changed, 33 insertions(+), 4 deletions(-)
+
+diff --git a/arch/sw_64/lib/deep-copy_template.S b/arch/sw_64/lib/deep-copy_template.S
+index aa6ab8e29f05..f2dbc8c50208 100644
+--- a/arch/sw_64/lib/deep-copy_template.S
++++ b/arch/sw_64/lib/deep-copy_template.S
+@@ -5,6 +5,10 @@
+  *
+  * $4:	8-byte misalignment of src when dest is 8-byte aligned
+  * $5:	32-byte misalignment of src when dest is 32-byte aligned
++ * $7:	SIMD status
++ *	0: not in simd loop
++ *	1: in simd loop
++ *	2: in simd_u loop
+  * $16:	latest dest, clobbered
+  * $17:	latest src, clobbered
+  * $18:	bytes left to copy
+@@ -18,14 +22,16 @@
+ 	addl	$sp, 0x1f, $23; \
+ 	bic	$23, 0x1f, $23; \
+ 	vstd	$f1, 0($23); \
+-	vstd	$f2, 0x20($23)
++	vstd	$f2, 0x20($23); \
++	ldi	$7, 1
+ 
+ #define RESTORE_SIMD_REGS \
+ 	addl	$sp, 0x1f, $23; \
+ 	bic	$23, 0x1f, $23; \
+ 	vldd	$f1, 0($23); \
+ 	vldd	$f2, 0x20($23); \
+-	ldi	$sp, 0x60($sp)
++	ldi	$sp, 0x60($sp); \
++	bis	$31, $31, $7
+ 
+ #define SAVE_SIMD_U_REGS \
+ 	ldi	$sp, -0xc0($sp); \
+@@ -35,7 +41,8 @@
+ 	vstd	$f2, 0x20($23); \
+ 	vstd	$f4, 0x40($23); \
+ 	vstd	$f5, 0x60($23); \
+-	vstd	$f3, 0x80($23)
++	vstd	$f3, 0x80($23); \
++	ldi	$7, 2
+ 
+ #define RESTORE_SIMD_U_REGS \
+ 	addl	$sp, 0x1f, $23; \
+@@ -45,7 +52,8 @@
+ 	vldd	$f4, 0x40($23); \
+ 	vldd	$f5, 0x60($23); \
+ 	vldd	$f3, 0x80($23); \
+-	ldi	$sp, 0xc0($sp)
++	ldi	$sp, 0xc0($sp); \
++	bis	$31, $31, $7
+ 
+ 	ble	$18, $out
+ 	and	$16, 7, $1
+diff --git a/arch/sw_64/lib/deep-copy_user.S b/arch/sw_64/lib/deep-copy_user.S
+index 145e1cc6ba18..327cab322765 100644
+--- a/arch/sw_64/lib/deep-copy_user.S
++++ b/arch/sw_64/lib/deep-copy_user.S
+@@ -10,13 +10,34 @@
+ 	ldi $31, $out-99b($31);		\
+ 	.previous
+ 
++/*
++ * $7:	SIMD status
++ *	0: not in simd loop
++ *	1: in simd loop
++ *	2: in simd_u loop
++ * $18:	bytes left to copy
++ *
++ */
+ 	.globl __copy_user
+ 	.ent __copy_user
+ __copy_user:
+ 	.prologue 0
++	bis	$31, $31, $7
+ #include "deep-copy_template.S"
+ $out:
+ 	bis	$31, $18, $0
++	beq	$7, $return
++	subl	$7, 1, $7
++	beq	$7, $restore_simd
++
++$restore_simd_u:
++	RESTORE_SIMD_U_REGS
++	br	$31, $return
++
++$restore_simd:
++	RESTORE_SIMD_REGS
++
++$return:
+ 	ret
+ 	.end __copy_user
+ 	EXPORT_SYMBOL(__copy_user)
+-- 
+2.33.0
+

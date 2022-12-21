@@ -1,0 +1,249 @@
+From 2d37cdf1136b3ca23d6ef59fb838132ebff5ef95 Mon Sep 17 00:00:00 2001
+From: He Sheng <hesheng@wxiat.com>
+Date: Tue, 26 Jul 2022 14:56:02 +0800
+Subject: [PATCH] sw64: simplify icache flush interfaces
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 2d37cdf1136b3ca23d6ef59fb838132ebff5ef95
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56OLG
+
+--------------------------------
+
+SW64 architecture manuals say that icache of C3A/C3B is VIVT with
+ICtag which is mapped to physical memory. That means icache doesn't
+need to be flushed when instruction pages change.
+
+Signed-off-by: He Sheng <hesheng@wxiat.com>
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/include/asm/cacheflush.h | 92 ++---------------------------
+ arch/sw_64/include/asm/hw_init.h    |  8 ---
+ arch/sw_64/include/asm/tlbflush.h   |  6 +-
+ arch/sw_64/kernel/smp.c             | 57 ------------------
+ 4 files changed, 7 insertions(+), 156 deletions(-)
+
+diff --git a/arch/sw_64/include/asm/cacheflush.h b/arch/sw_64/include/asm/cacheflush.h
+index 985161896f71..536b0b7b78bd 100644
+--- a/arch/sw_64/include/asm/cacheflush.h
++++ b/arch/sw_64/include/asm/cacheflush.h
+@@ -2,94 +2,12 @@
+ #ifndef _ASM_SW64_CACHEFLUSH_H
+ #define _ASM_SW64_CACHEFLUSH_H
+ 
+-#include <linux/mm.h>
+-#include <asm/hw_init.h>
+-
+-/* Caches aren't brain-dead on the sw64. */
+-#define flush_cache_all()			do { } while (0)
+-#define flush_cache_mm(mm)			do { } while (0)
+-#define flush_cache_dup_mm(mm)			do { } while (0)
+-#define flush_cache_range(vma, start, end)	do { } while (0)
+-#define flush_cache_page(vma, vmaddr, pfn)	do { } while (0)
+-#define ARCH_IMPLEMENTS_FLUSH_DCACHE_PAGE	0
+-#define flush_dcache_page(page)			do { } while (0)
+-#define flush_dcache_mmap_lock(mapping)		do { } while (0)
+-#define flush_dcache_mmap_unlock(mapping)	do { } while (0)
+-#define flush_cache_vmap(start, end)		do { } while (0)
+-#define flush_cache_vunmap(start, end)		do { } while (0)
+-
+-/* Note that the following two definitions are _highly_ dependent
+- * on the contexts in which they are used in the kernel.  I personally
+- * think it is criminal how loosely defined these macros are.
++/*
++ * DCache: PIPT
++ * ICache:
++ *	- C3A/B is VIVT with ICTAG, support coherence.
++ *	- C4 is VIPT
+  */
+-
+-/* We need to flush the kernel's icache after loading modules.  The
+- * only other use of this macro is in load_aout_interp which is not
+- * used on sw64.
+-
+- * Note that this definition should *not* be used for userspace
+- * icache flushing.  While functional, it is _way_ overkill.  The
+- * icache is tagged with ASNs and it suffices to allocate a new ASN
+- * for the process.
+- */
+-#ifndef CONFIG_SMP
+-static inline void
+-flush_icache_range(unsigned long start, unsigned long end)
+-{
+-	if (icache_is_vivt_no_ictag())
+-		imb();
+-}
+-#define flush_icache_range flush_icache_range
+-#else
+-extern void smp_imb(void);
+-static inline void
+-flush_icache_range(unsigned long start, unsigned long end)
+-{
+-	if (icache_is_vivt_no_ictag())
+-		smp_imb();
+-}
+-#define flush_icache_range flush_icache_range
+-#endif
+-
+-/* We need to flush the userspace icache after setting breakpoints in
+- * ptrace.
+-
+- * Instead of indiscriminately using imb, take advantage of the fact
+- * that icache entries are tagged with the ASN and load a new mm context.
+- */
+-/* ??? Ought to use this in arch/sw_64/kernel/signal.c too.  */
+-
+-#ifndef CONFIG_SMP
+-#include <linux/sched.h>
+-
+-extern void __load_new_mm_context(struct mm_struct *);
+-static inline void
+-flush_icache_user_page(struct vm_area_struct *vma, struct page *page,
+-			unsigned long addr, int len)
+-{
+-	if ((vma->vm_flags & VM_EXEC) && icache_is_vivt_no_ictag())
+-		imb();
+-}
+-#define flush_icache_user_page flush_icache_user_page
+-#else
+-extern void flush_icache_user_page(struct vm_area_struct *vma,
+-				    struct page *page,
+-				    unsigned long addr, int len);
+-#define flush_icache_user_page flush_icache_user_page
+-#endif
+-
+-/* This is used only in __do_fault and do_swap_page.  */
+-#define flush_icache_page(vma, page) \
+-	flush_icache_user_page((vma), (page), 0, 0)
+-
+-#define copy_to_user_page(vma, page, vaddr, dst, src, len) \
+-do {	\
+-	memcpy(dst, src, len); \
+-	flush_icache_user_page(vma, page, vaddr, len); \
+-} while (0)
+-#define copy_from_user_page(vma, page, vaddr, dst, src, len) \
+-	memcpy(dst, src, len)
+-
+ #include <asm-generic/cacheflush.h>
+ 
+ #endif /* _ASM_SW64_CACHEFLUSH_H */
+diff --git a/arch/sw_64/include/asm/hw_init.h b/arch/sw_64/include/asm/hw_init.h
+index de9f93f9b26e..545e9a99a49c 100644
+--- a/arch/sw_64/include/asm/hw_init.h
++++ b/arch/sw_64/include/asm/hw_init.h
+@@ -85,14 +85,6 @@ static inline unsigned long get_cpu_freq(void)
+ 	return cpu_desc.frequency;
+ }
+ 
+-static inline bool icache_is_vivt_no_ictag(void)
+-{
+-	/*
+-	 * Icache of C3B is vivt with ICtag. C4 will be vipt.
+-	 */
+-	return (cpu_desc.arch_var == 0x3 && cpu_desc.arch_rev == 0x1);
+-}
+-
+ #define EMUL_FLAG	(0x1UL << 63)
+ #define MMSIZE_MASK	(EMUL_FLAG - 1)
+ 
+diff --git a/arch/sw_64/include/asm/tlbflush.h b/arch/sw_64/include/asm/tlbflush.h
+index 1d6a0db2a054..e508a4d66d37 100644
+--- a/arch/sw_64/include/asm/tlbflush.h
++++ b/arch/sw_64/include/asm/tlbflush.h
+@@ -27,11 +27,9 @@ static inline void flush_tlb_current_page(struct mm_struct *mm,
+ 					  struct vm_area_struct *vma,
+ 					  unsigned long addr)
+ {
+-	if (vma->vm_flags & VM_EXEC) {
++	if (vma->vm_flags & VM_EXEC)
+ 		tbis(addr);
+-		if (icache_is_vivt_no_ictag())
+-			imb();
+-	} else
++	else
+ 		tbisd(addr);
+ }
+ 
+diff --git a/arch/sw_64/kernel/smp.c b/arch/sw_64/kernel/smp.c
+index 1c534b22dc26..b95873a2696d 100644
+--- a/arch/sw_64/kernel/smp.c
++++ b/arch/sw_64/kernel/smp.c
+@@ -496,19 +496,6 @@ void native_send_call_func_single_ipi(int cpu)
+ 	send_ipi_message(cpumask_of(cpu), IPI_CALL_FUNC);
+ }
+ 
+-static void
+-ipi_imb(void *ignored)
+-{
+-	imb();
+-}
+-
+-void smp_imb(void)
+-{
+-	/* Must wait other processors to flush their icache before continue. */
+-	on_each_cpu(ipi_imb, NULL, 1);
+-}
+-EXPORT_SYMBOL(smp_imb);
+-
+ static void ipi_flush_tlb_all(void *ignored)
+ {
+ 	tbiv();
+@@ -628,50 +615,6 @@ void flush_tlb_range(struct vm_area_struct *vma, unsigned long start, unsigned l
+ }
+ EXPORT_SYMBOL(flush_tlb_range);
+ 
+-static void ipi_flush_icache_page(void *x)
+-{
+-	struct mm_struct *mm = (struct mm_struct *) x;
+-
+-	if (mm == current->mm)
+-		__load_new_mm_context(mm);
+-	else
+-		flush_tlb_other(mm);
+-}
+-
+-void flush_icache_user_page(struct vm_area_struct *vma, struct page *page,
+-			unsigned long addr, int len)
+-{
+-	struct mm_struct *mm = vma->vm_mm;
+-
+-	if ((vma->vm_flags & VM_EXEC) == 0)
+-		return;
+-	if (!icache_is_vivt_no_ictag())
+-		return;
+-
+-	preempt_disable();
+-
+-	if (mm == current->mm) {
+-		__load_new_mm_context(mm);
+-		if (atomic_read(&mm->mm_users) == 1) {
+-			int cpu, this_cpu = smp_processor_id();
+-
+-			for (cpu = 0; cpu < NR_CPUS; cpu++) {
+-				if (!cpu_online(cpu) || cpu == this_cpu)
+-					continue;
+-				if (mm->context.asid[cpu])
+-					mm->context.asid[cpu] = 0;
+-			}
+-			preempt_enable();
+-			return;
+-		}
+-	} else
+-		flush_tlb_other(mm);
+-
+-	smp_call_function(ipi_flush_icache_page, mm, 1);
+-
+-	preempt_enable();
+-}
+-
+ int native_cpu_disable(void)
+ {
+ 	int cpu = smp_processor_id();
+-- 
+2.33.0
+

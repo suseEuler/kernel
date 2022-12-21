@@ -1,0 +1,228 @@
+From 28b91df0178b108df4cc6ded1dfb68b8c39f5476 Mon Sep 17 00:00:00 2001
+From: Chen Hui <judy.chenhui@huawei.com>
+Date: Fri, 25 Nov 2022 11:56:22 +0800
+Subject: [PATCH] sched: programmable: Add convenient helper functions to
+ convert sched entity
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 28b91df0178b108df4cc6ded1dfb68b8c39f5476
+Modified-by-SEL: Yes, modified due to different context
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5KUFB
+CVE: NA
+
+--------------------------------
+
+Add three helper functions:
+1) bpf_sched_entity_is_task is to check whether the sched entity
+is a task struct.
+2) bpf_sched_entity_to_task is to change the sched entity to a
+task struct.
+3) bpf_sched_entity_to_tg is to change the sched entity to a task
+group.
+
+Signed-off-by: Chen Hui <judy.chenhui@huawei.com>
+Signed-off-by: Ren Zhijie <renzhijie2@huawei.com>
+Signed-off-by: Hui Tang <tanghui20@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/uapi/linux/bpf.h       |   21 ++++++++++++
+ kernel/sched/bpf_sched.c       |   69 ++++++++++++++++++++++++++++++++++++++---
+ scripts/bpf_doc.py             |    2 +
+ tools/include/uapi/linux/bpf.h |   21 ++++++++++++
+ 4 files changed, 109 insertions(+), 4 deletions(-)
+
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -5100,6 +5100,24 @@ union bpf_attr {
+  *		Get system cpus returned in *cpus*.
+  *	Return
+  *		0 on success, or a negative error in case of failure.
++ *
++ * long bpf_sched_entity_is_task(struct sched_entity *se)
++ *	Description
++ *		Checks whether the sched entity is a task.
++ *	Return
++ *		1 if true, 0 otherwise.
++ *
++ * struct task_struct *bpf_sched_entity_to_task(struct sched_entity *se)
++ *	Description
++ *		Return task struct of *se* if se is a task.
++ *	Return
++ *		Task struct if se is a task, NULL otherwise.
++ *
++ * struct task_group *bpf_sched_entity_to_tg(struct sched_entity *se)
++ *	Description
++ *		Return task group of *se* if se is a task group.
++ *	Return
++ *		Task struct if se is a task group, NULL otherwise.
+  */
+ #define __BPF_FUNC_MAPPER(FN)		\
+ 	FN(unspec),			\
+@@ -5267,6 +5285,9 @@ union bpf_attr {
+  	FN(sched_cpu_stats_of),		\
+  	FN(init_cpu_topology),		\
+  	FN(get_cpumask_info),		\
++ 	FN(sched_entity_is_task),	\
++ 	FN(sched_entity_to_task),	\
++ 	FN(sched_entity_to_tg),		\
+ 	FN(task_storage_get),		\
+ 	FN(task_storage_delete),	\
+ 	FN(get_current_task_btf),	\
+--- a/kernel/sched/bpf_sched.c
++++ b/kernel/sched/bpf_sched.c
+@@ -116,6 +116,65 @@ static const struct bpf_func_proto bpf_s
+ 	.arg3_type	= ARG_CONST_SIZE,
+ };
+ 
++BTF_ID_LIST_SINGLE(btf_sched_entity_ids, struct, sched_entity)
++BTF_ID_LIST_SINGLE(btf_sched_task_ids, struct, task_struct)
++BTF_ID_LIST_SINGLE(btf_sched_tg_ids, struct, task_group)
++
++BPF_CALL_1(bpf_sched_entity_is_task, struct sched_entity *, se)
++{
++	return entity_is_task(se) ? 1 : 0;
++}
++
++static const struct bpf_func_proto bpf_sched_entity_is_task_proto = {
++	.func		= bpf_sched_entity_is_task,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_PTR_TO_BTF_ID,
++	.arg1_btf_id	= &btf_sched_entity_ids[0],
++};
++
++BPF_CALL_1(bpf_sched_entity_to_task, struct sched_entity *, se)
++{
++	if (entity_is_task(se)) {
++		struct task_struct *tsk = task_of(se);
++
++		return (unsigned long)tsk;
++	}
++
++	return (unsigned long)NULL;
++}
++
++static const struct bpf_func_proto bpf_sched_entity_to_task_proto = {
++	.func		= bpf_sched_entity_to_task,
++	.gpl_only	= false,
++	.ret_type	= RET_PTR_TO_BTF_ID_OR_NULL,
++	.ret_btf_id	= &btf_sched_task_ids[0],
++	.arg1_type	= ARG_PTR_TO_BTF_ID,
++	.arg1_btf_id	= &btf_sched_entity_ids[0],
++};
++
++BPF_CALL_1(bpf_sched_entity_to_tg, struct sched_entity *, se)
++{
++#if CONFIG_FAIR_GROUP_SCHED
++	if (!entity_is_task(se)) {
++		struct task_group *tg = group_cfs_rq(se)->tg;
++
++		return (unsigned long)tg;
++	}
++#endif
++
++	return (unsigned long)NULL;
++}
++
++static const struct bpf_func_proto bpf_sched_entity_to_tg_proto = {
++	.func		= bpf_sched_entity_to_tg,
++	.gpl_only	= false,
++	.ret_type	= RET_PTR_TO_BTF_ID_OR_NULL,
++	.ret_btf_id	= &btf_sched_tg_ids[0],
++	.arg1_type	= ARG_PTR_TO_BTF_ID,
++	.arg1_btf_id	= &btf_sched_entity_ids[0],
++};
++
+ static const struct bpf_func_proto *
+ bpf_sched_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+ {
+@@ -128,6 +187,12 @@ bpf_sched_func_proto(enum bpf_func_id fu
+ 		return &bpf_init_cpu_topology_proto;
+ 	case BPF_FUNC_get_cpumask_info:
+ 		return &bpf_get_cpumask_info_proto;
++	case BPF_FUNC_sched_entity_is_task:
++		return &bpf_sched_entity_is_task_proto;
++	case BPF_FUNC_sched_entity_to_task:
++		return &bpf_sched_entity_to_task_proto;
++	case BPF_FUNC_sched_entity_to_tg:
++		return &bpf_sched_entity_to_tg_proto;
+ 	default:
+ 		return bpf_base_func_proto(func_id);
+ 	}
+@@ -154,8 +219,6 @@ BPF_CALL_1(bpf_sched_tg_tag_of, struct t
+ 	return ret;
+ }
+ 
+-BTF_ID_LIST_SINGLE(btf_sched_tg_ids, struct, task_group)
+-
+ const struct bpf_func_proto bpf_sched_tg_tag_of_proto = {
+ 	.func		= bpf_sched_tg_tag_of,
+ 	.gpl_only	= false,
+@@ -171,8 +234,6 @@ BPF_CALL_1(bpf_sched_task_tag_of, struct
+ 	return tsk->tag;
+ }
+ 
+-BTF_ID_LIST_SINGLE(btf_sched_task_ids, struct, task_struct)
+-
+ const struct bpf_func_proto bpf_sched_task_tag_of_proto = {
+ 	.func		= bpf_sched_task_tag_of,
+ 	.gpl_only	= false,
+--- a/scripts/bpf_doc.py
++++ b/scripts/bpf_doc.py
+@@ -549,6 +549,7 @@ class PrinterHelpers(Printer):
+             'struct bpf_sched_cpu_stats',
+             'struct bpf_cpu_topology',
+             'struct bpf_cpumask_info',
++            'struct sched_entity',
+             'struct inode',
+             'struct socket',
+             'struct file',
+@@ -603,6 +604,7 @@ class PrinterHelpers(Printer):
+             'struct bpf_sched_cpu_stats',
+             'struct bpf_cpu_topology',
+             'struct bpf_cpumask_info',
++            'struct sched_entity',
+             'struct inode',
+             'struct socket',
+             'struct file',
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -5087,6 +5087,24 @@ union bpf_attr {
+  *		Get system cpus returned in *cpus*.
+  *	Return
+  *		0 on success, or a negative error in case of failure.
++ *
++ * long bpf_sched_entity_is_task(struct sched_entity *se)
++ *	Description
++ *		Checks whether the sched entity is a task.
++ *	Return
++ *		1 if true, 0 otherwise.
++ *
++ * struct task_struct *bpf_sched_entity_to_task(struct sched_entity *se)
++ *	Description
++ *		Return task struct of *se* if se is a task.
++ *	Return
++ *		Task struct if se is a task, NULL otherwise.
++ *
++ * struct task_group *bpf_sched_entity_to_tg(struct sched_entity *se)
++ *	Description
++ *		Return task group of *se* if se is a task group.
++ *	Return
++ *		Task struct if se is a task group, NULL otherwise.
+  */
+ #define __BPF_FUNC_MAPPER(FN)		\
+ 	FN(unspec),			\
+@@ -5254,6 +5272,9 @@ union bpf_attr {
+ 	FN(sched_cpu_stats_of),		\
+  	FN(init_cpu_topology),		\
+  	FN(get_cpumask_info),		\
++ 	FN(sched_entity_is_task),	\
++ 	FN(sched_entity_to_task),	\
++ 	FN(sched_entity_to_tg),		\
+ 	FN(task_storage_get),		\
+ 	FN(task_storage_delete),	\
+ 	FN(get_current_task_btf),	\

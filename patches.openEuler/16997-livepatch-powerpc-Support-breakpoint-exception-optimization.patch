@@ -1,0 +1,243 @@
+From 8229d1cee9189fd29c5191f6fbb4508298718f23 Mon Sep 17 00:00:00 2001
+From: Yang Jihong <yangjihong1@huawei.com>
+Date: Wed, 6 Jul 2022 18:05:25 +0800
+Subject: [PATCH] livepatch/powerpc: Support breakpoint exception optimization
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 8229d1cee9189fd29c5191f6fbb4508298718f23
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5CJ7X
+
+--------------------------------
+
+Add breakpoint exception optimization support to improve livepatch
+success rate for ppc64/ppc32.
+
+Signed-off-by: Yang Jihong <yangjihong1@huawei.com>
+Signed-off-by: Li Huafei <lihuafei1@huawei.com>
+Reviewed-by: Xu Kuohai <xukuohai@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/powerpc/include/asm/livepatch.h | 20 +++++++++
+ arch/powerpc/kernel/Makefile         |  2 +-
+ arch/powerpc/kernel/entry_64.S       | 36 +++++++++++++++
+ arch/powerpc/kernel/livepatch.c      | 67 ++++++++++++++++++++++++++++
+ arch/powerpc/kernel/traps.c          |  8 ++++
+ 5 files changed, 132 insertions(+), 1 deletion(-)
+ create mode 100644 arch/powerpc/kernel/livepatch.c
+
+diff --git a/arch/powerpc/include/asm/livepatch.h b/arch/powerpc/include/asm/livepatch.h
+index 9ddddc35d21e..052a82078bef 100644
+--- a/arch/powerpc/include/asm/livepatch.h
++++ b/arch/powerpc/include/asm/livepatch.h
+@@ -75,6 +75,7 @@ extern void livepatch_branch_stub_end(void);
+ #ifdef PPC64_ELF_ABI_v1
+ extern void livepatch_branch_trampoline(void);
+ extern void livepatch_branch_trampoline_end(void);
++extern void livepatch_brk_trampoline(void);
+ void livepatch_create_btramp(struct ppc64_klp_btramp_entry *entry, unsigned long addr);
+ #else
+ static inline void livepatch_create_btramp(struct ppc64_klp_btramp_entry *entry,
+@@ -93,6 +94,12 @@ struct arch_klp_data {
+ #else
+ 	unsigned long trampoline;
+ #endif /* PPC64_ELF_ABI_v1 */
++
++	/*
++	 * Saved opcode at the entry of the old func (which maybe replaced
++	 * with breakpoint).
++	 */
++	u32 saved_opcode;
+ };
+ 
+ #elif defined(CONFIG_PPC32)
+@@ -101,10 +108,23 @@ struct arch_klp_data {
+ #define LJMP_INSN_SIZE	4
+ struct arch_klp_data {
+ 	u32 old_insns[LJMP_INSN_SIZE];
++
++	/*
++	 * Saved opcode at the entry of the old func (which maybe replaced
++	 * with breakpoint).
++	 */
++	u32 saved_opcode;
+ };
+ 
+ #endif	/* CONFIG_PPC64 */
+ 
++#ifdef PPC64_ELF_ABI_v1
++struct klp_func_node;
++void arch_klp_set_brk_func(struct klp_func_node *func_node, void *new_func);
++#endif
++int klp_brk_handler(struct pt_regs *regs);
++int arch_klp_add_breakpoint(struct arch_klp_data *arch_data, void *old_func);
++void arch_klp_remove_breakpoint(struct arch_klp_data *arch_data, void *old_func);
+ long arch_klp_save_old_code(struct arch_klp_data *arch_data, void *old_func);
+ 
+ #endif /* CONFIG_LIVEPATCH_FTRACE */
+diff --git a/arch/powerpc/kernel/Makefile b/arch/powerpc/kernel/Makefile
+index 4b6720e81632..32c617ba6901 100644
+--- a/arch/powerpc/kernel/Makefile
++++ b/arch/powerpc/kernel/Makefile
+@@ -95,7 +95,7 @@ obj-$(CONFIG_44x)		+= cpu_setup_44x.o
+ obj-$(CONFIG_PPC_FSL_BOOK3E)	+= cpu_setup_fsl_booke.o
+ obj-$(CONFIG_PPC_DOORBELL)	+= dbell.o
+ obj-$(CONFIG_JUMP_LABEL)	+= jump_label.o
+-obj-$(CONFIG_LIVEPATCH_WO_FTRACE) += livepatch_$(BITS).o
++obj-$(CONFIG_LIVEPATCH_WO_FTRACE) += livepatch.o livepatch_$(BITS).o
+ 
+ extra-$(CONFIG_PPC64)		:= head_64.o
+ extra-$(CONFIG_PPC_BOOK3S_32)	:= head_book3s_32.o
+diff --git a/arch/powerpc/kernel/entry_64.S b/arch/powerpc/kernel/entry_64.S
+index 71ff3a4f10a6..ad3281b092be 100644
+--- a/arch/powerpc/kernel/entry_64.S
++++ b/arch/powerpc/kernel/entry_64.S
+@@ -1068,5 +1068,41 @@ _GLOBAL(livepatch_branch_trampoline)
+ 	blr
+ _GLOBAL(livepatch_branch_trampoline_end)
+ 	nop
++
++/*
++ * This function is the trampoline of livepatch brk handler.
++ *
++ * brk -> traps
++ *  - klp_brk_handler
++ *   - set R11 to new_func address
++ *   - set NIP to livepatch_brk_trampoline address
++ * see arch/powerpc/kernel/livepatch.c
++ */
++_GLOBAL(livepatch_brk_trampoline)
++	mflr	r0
++	std	r0, 16(r1)
++	std	r2, 24(r1)
++	stdu    r1, -STACK_FRAME_OVERHEAD(r1)
++
++	/* Call NEW_FUNC */
++	ld	r12, 0(r11)	/* load new func address to R12 */
++#ifdef PPC64_ELF_ABI_v1
++	ld	r2,  8(r11)	/* set up new R2 */
++#endif
++	mtctr   r12		/* load R12(new func address) to CTR */
++	bctrl			/* call new func */
++
++	/*
++	 * Now we are returning from the patched function to the original
++	 * caller A. We are free to use r11, r12 and we can use r2 until we
++	 * restore it.
++	 */
++	addi	r1, r1, STACK_FRAME_OVERHEAD
++	ld	r2, 24(r1)
++	ld	r0, 16(r1)
++	mtlr	r0
++
++	/* Return to original caller of live patched function */
++	blr
+ #endif
+ #endif /* CONFIG_LIVEPATCH_WO_FTRACE */
+diff --git a/arch/powerpc/kernel/livepatch.c b/arch/powerpc/kernel/livepatch.c
+new file mode 100644
+index 000000000000..b8afcc7b9939
+--- /dev/null
++++ b/arch/powerpc/kernel/livepatch.c
+@@ -0,0 +1,67 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * livepatch.c - powerpc-specific Kernel Live Patching Core
++ *
++ * Copyright (C) 2022  Huawei Technologies Co., Ltd.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/module.h>
++#include <linux/livepatch.h>
++#include <asm/probes.h>
++#include <asm/livepatch.h>
++#include <asm/code-patching.h>
++
++int arch_klp_add_breakpoint(struct arch_klp_data *arch_data, void *old_func)
++{
++	struct ppc_inst insn = ppc_inst_read((struct ppc_inst *)old_func);
++
++	arch_data->saved_opcode = ppc_inst_val(insn);
++	patch_instruction((struct ppc_inst *)old_func, ppc_inst(BREAKPOINT_INSTRUCTION));
++	return 0;
++}
++
++void arch_klp_remove_breakpoint(struct arch_klp_data *arch_data, void *old_func)
++{
++	patch_instruction((struct ppc_inst *)old_func, ppc_inst(arch_data->saved_opcode));
++}
++
++int klp_brk_handler(struct pt_regs *regs)
++{
++	void *brk_func = NULL;
++	unsigned long addr = regs->nip;
++
++	if (user_mode(regs))
++		return 0;
++
++	brk_func = klp_get_brk_func((void *)addr);
++	if (!brk_func)
++		return 0;
++
++#ifdef PPC64_ELF_ABI_v1
++	/*
++	 * Only static trampoline can be used here to prevent
++	 * resource release caused by rollback.
++	 */
++	regs->gpr[PT_R11] = (unsigned long)brk_func;
++	regs->nip = ppc_function_entry((void *)livepatch_brk_trampoline);
++#else
++	regs->nip = (unsigned long)brk_func;
++#endif
++
++	return 1;
++}
+diff --git a/arch/powerpc/kernel/traps.c b/arch/powerpc/kernel/traps.c
+index 069d451240fa..d2f6b2e30b6a 100644
+--- a/arch/powerpc/kernel/traps.c
++++ b/arch/powerpc/kernel/traps.c
+@@ -67,6 +67,9 @@
+ #include <asm/kprobes.h>
+ #include <asm/stacktrace.h>
+ #include <asm/nmi.h>
++#ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
++#include <asm/livepatch.h>
++#endif
+ 
+ #if defined(CONFIG_DEBUGGER) || defined(CONFIG_KEXEC_CORE)
+ int (*__debugger)(struct pt_regs *regs) __read_mostly;
+@@ -1491,6 +1494,11 @@ void program_check_exception(struct pt_regs *regs)
+ 		if (kprobe_handler(regs))
+ 			goto bail;
+ 
++#ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
++		if (klp_brk_handler(regs))
++			goto bail;
++#endif
++
+ 		/* trap exception */
+ 		if (notify_die(DIE_BPT, "breakpoint", regs, 5, 5, SIGTRAP)
+ 				== NOTIFY_STOP)
+-- 
+2.33.0
+

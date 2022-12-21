@@ -1,0 +1,125 @@
+From 003c04ed833e4e402da9e2f051bd21e7f8b686fd Mon Sep 17 00:00:00 2001
+From: Yang Jihong <yangjihong1@huawei.com>
+Date: Wed, 6 Jul 2022 18:05:36 +0800
+Subject: [PATCH] livepatch: Add klp_module_delete_safety_check
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 003c04ed833e4e402da9e2f051bd21e7f8b686fd
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5CJ7X
+
+--------------------------------
+
+Add klp_module_delete_safety_check for calltrace check during module
+deletion to avoid unsafe resource release.
+
+Signed-off-by: Yang Jihong <yangjihong1@huawei.com>
+Reviewed-by: Xu Kuohai <xukuohai@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/livepatch.h |  1 +
+ kernel/livepatch/core.c   | 36 ++++++++++++++++++++++++++++++++++++
+ kernel/module.c           |  9 +++++++++
+ 3 files changed, 46 insertions(+)
+
+diff --git a/include/linux/livepatch.h b/include/linux/livepatch.h
+index c9f3c1c12638..9301f8e9bb90 100644
+--- a/include/linux/livepatch.h
++++ b/include/linux/livepatch.h
+@@ -257,6 +257,7 @@ int klp_compare_address(unsigned long pc, unsigned long func_addr,
+ }
+ 
+ void arch_klp_init(void);
++int klp_module_delete_safety_check(struct module *mod);
+ 
+ #endif
+ 
+diff --git a/kernel/livepatch/core.c b/kernel/livepatch/core.c
+index ae116aac9b48..780a825cee8b 100644
+--- a/kernel/livepatch/core.c
++++ b/kernel/livepatch/core.c
+@@ -1426,6 +1426,11 @@ void __weak arch_klp_set_brk_func(struct klp_func_node *func_node, void *new_fun
+ 	func_node->brk_func = new_func;
+ }
+ 
++int __weak arch_klp_module_check_calltrace(void *data)
++{
++	return 0;
++}
++
+ static struct klp_func_node *func_node_alloc(struct klp_func *func)
+ {
+ 	long ret;
+@@ -2093,6 +2098,37 @@ int klp_unregister_patch(struct klp_patch *patch)
+ }
+ EXPORT_SYMBOL_GPL(klp_unregister_patch);
+ 
++/**
++ * klp_module_delete_safety_check() - safety check in livepatch scenario when delete a module
++ * @mod:	Module to be deleted
++ *
++ * Module refcnt ensures that there is no rare case between enable_patch and delete_module:
++ * 1. safety_check -> try_enable_patch -> try_release_module_ref:
++ *    try_enable_patch would increase module refcnt, which cause try_release_module_ref fails.
++ * 2. safety_check -> try_release_module_ref -> try_enable_patch:
++ *    after release module ref, try_enable_patch would fail because try_module_get fails.
++ * So the problem that release resources unsafely when enable livepatch after safety_check is
++ * passed during module deletion does not exist, complex synchronization protection is not
++ * required.
++
++ * Return: 0 on success, otherwise error
++ */
++int klp_module_delete_safety_check(struct module *mod)
++{
++	int ret;
++
++	if (!mod || !is_livepatch_module(mod))
++		return 0;
++
++	ret = stop_machine(arch_klp_module_check_calltrace, (void *)mod, NULL);
++	if (ret) {
++		pr_debug("failed to check klp module calltrace: %d\n", ret);
++		return ret;
++	}
++
++	return 0;
++}
++
+ #endif /* #ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY */
+ /*
+  * This function unpatches objects from the replaced livepatches.
+diff --git a/kernel/module.c b/kernel/module.c
+index 1acdfba63716..5fdfa29a0738 100644
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@ -57,6 +57,9 @@
+ #include <linux/bsearch.h>
+ #include <linux/dynamic_debug.h>
+ #include <linux/audit.h>
++#ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
++#include <linux/livepatch.h>
++#endif
+ #include <uapi/linux/module.h>
+ #include "module-internal.h"
+ 
+@@ -1027,6 +1030,12 @@ SYSCALL_DEFINE2(delete_module, const char __user *, name_user,
+ 		}
+ 	}
+ 
++#ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
++	ret = klp_module_delete_safety_check(mod);
++	if (ret != 0)
++		goto out;
++#endif
++
+ 	/* Stop the machine so refcounts can't move and disable module. */
+ 	ret = try_stop_module(mod, flags, &forced);
+ 	if (ret != 0)
+-- 
+2.33.0
+

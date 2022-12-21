@@ -1,0 +1,97 @@
+From 4a46412accd7e9bd90be746b163050772e6d6180 Mon Sep 17 00:00:00 2001
+From: Peng Liu <liupeng256@huawei.com>
+Date: Thu, 17 Mar 2022 12:33:54 +0800
+Subject: [PATCH] kfence: Fix wrong size of alloc_covered when enable dynamic
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 4a46412accd7e9bd90be746b163050772e6d6180
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4V388
+CVE: NA
+
+--------------------------------
+
+Patch "kfence: Add a module parameter to adjust kfence objects"
+enable dynamic configuration of the number of KFENCE guarded
+objects, but the size of alloc_covered is not the same with the
+original kfence. This is because const_ilog2 is just valid for
+a constant, and KFENCE_NR_OBJECTS is not a constant when enabling
+dynamic configuration.
+
+This difference between original kfence will lead to a confusion
+loggic in the process of skipping covered path. In a arm64 machine,
+the following panic is observed.
+
+  Call trace:
+   __kfence_alloc+0x378/0x780
+   kmem_cache_alloc+0x204/0x614
+   getname_kernel+0x38/0xf4
+   filp_open+0x2c/0x6c
+   populate_rootfs+0xcc/0x174
+   do_one_initcall+0xac/0x20c
+   kernel_init_freeable+0x380/0x3c8
+   kernel_init+0x18/0xf0
+   ret_from_fork+0x10/0x18
+  Code: 54000080 a9400381 f9000420 f9000001 (f900039c)
+  ---[ end trace 814fe40d608e1b74 ]---
+  Kernel panic - not syncing: TLB conflict abort: Fatal exception
+
+To fix this, ilog2 is used to replace const_ilog2 when enable
+dynamic configuration of KFENCE guarded objects.
+
+Fixes: 901b983c886b ("kfence: Add a module parameter to adjust kfence objects")
+Signed-off-by: Peng Liu <liupeng256@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/kfence/core.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/mm/kfence/core.c b/mm/kfence/core.c
+index 3a559f0f282d..98f5317368be 100644
+--- a/mm/kfence/core.c
++++ b/mm/kfence/core.c
+@@ -146,6 +146,8 @@ module_param_cb(num_objects, &num_objects_param_ops, &kfence_num_objects, 0600);
+  * backing pages (in __kfence_pool).
+  */
+ #ifdef CONFIG_KFENCE_DYNAMIC_OBJECTS
++#define ILOG2(x) (ilog2((x)))
++
+ struct kfence_metadata *kfence_metadata;
+ static phys_addr_t metadata_size;
+ 
+@@ -155,6 +157,8 @@ static inline bool kfence_metadata_valid(void)
+ }
+ 
+ #else
++#define ILOG2(x) (const_ilog2((x)))
++
+ static_assert(CONFIG_KFENCE_NUM_OBJECTS > 0);
+ struct kfence_metadata kfence_metadata[CONFIG_KFENCE_NUM_OBJECTS];
+ 
+@@ -185,7 +189,7 @@ atomic_t kfence_allocation_gate = ATOMIC_INIT(1);
+  *	P(alloc_traces) = (1 - e^(-HNUM * (alloc_traces / SIZE)) ^ HNUM
+  */
+ #define ALLOC_COVERED_HNUM	2
+-#define ALLOC_COVERED_ORDER	(const_ilog2(KFENCE_NR_OBJECTS) + 2)
++#define ALLOC_COVERED_ORDER	(ILOG2(KFENCE_NR_OBJECTS) + 2)
+ #define ALLOC_COVERED_SIZE	(1 << ALLOC_COVERED_ORDER)
+ #define ALLOC_COVERED_HNEXT(h)	hash_32(h, ALLOC_COVERED_ORDER)
+ #define ALLOC_COVERED_MASK	(ALLOC_COVERED_SIZE - 1)
+@@ -831,7 +835,7 @@ static int __init kfence_dynamic_init(void)
+ 		return -ENOMEM;
+ 	}
+ 
+-	covered_size = sizeof(atomic_t) * KFENCE_NR_OBJECTS;
++	covered_size = sizeof(atomic_t) * ALLOC_COVERED_SIZE;
+ 	alloc_covered = memblock_alloc(covered_size, PAGE_SIZE);
+ 	if (!alloc_covered) {
+ 		memblock_free((phys_addr_t)kfence_metadata, metadata_size);
+-- 
+2.33.0
+

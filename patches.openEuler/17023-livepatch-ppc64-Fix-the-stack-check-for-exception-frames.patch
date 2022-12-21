@@ -1,0 +1,78 @@
+From 27d852d29cd2f760d33cc4aa2244de3f6ddf5ebd Mon Sep 17 00:00:00 2001
+From: Li Huafei <lihuafei1@huawei.com>
+Date: Tue, 12 Jul 2022 22:51:52 +0800
+Subject: [PATCH] livepatch/ppc64: Fix the stack check for exception frames
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 27d852d29cd2f760d33cc4aa2244de3f6ddf5ebd
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5CJ7X
+
+--------------------------------
+
+For exception frames, we need to check NIP in addition to PC. When a
+task is interrupted, NIP is the interrupt return address. The function
+where the NIP is located is also on the stack.
+
+Fixes: ec2244b5adcf ("livepatch/ppc64: only check stack top")
+Fixes: 2a7c3db6e6a8 ("livepatch/powerpc64: Add arch_klp_module_check_calltrace")
+Signed-off-by: Li Huafei <lihuafei1@huawei.com>
+Reviewed-by: Xu Kuohai <xukuohai@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/powerpc/kernel/livepatch_64.c | 25 +++++++++++++++++++------
+ 1 file changed, 19 insertions(+), 6 deletions(-)
+
+diff --git a/arch/powerpc/kernel/livepatch_64.c b/arch/powerpc/kernel/livepatch_64.c
+index 2487fab569a7..acd3658d37a3 100644
+--- a/arch/powerpc/kernel/livepatch_64.c
++++ b/arch/powerpc/kernel/livepatch_64.c
+@@ -326,9 +326,14 @@ static int klp_check_jump_func(struct stackframe *frame, void *data)
+ 	struct walk_stackframe_args *args = data;
+ 	struct klp_func_list *check_funcs = args->check_funcs;
+ 
+-	if (!check_func_list(check_funcs, &args->ret, frame->pc)) {
++	/* check the PC first */
++	if (!check_func_list(check_funcs, &args->ret, frame->pc))
+ 		return args->ret;
+-	}
++
++	/* check NIP when the exception stack switching */
++	if (frame->nip && !check_func_list(check_funcs, &args->ret, frame->nip))
++		return args->ret;
++
+ 	return 0;
+ }
+ 
+@@ -430,11 +435,19 @@ static int check_module_calltrace(struct stackframe *frame, void *data)
+ {
+ 	struct walk_stackframe_args *args = data;
+ 
+-	if (within_module_core(frame->pc, args->mod)) {
+-		pr_err("module %s is in use!\n", args->mod->name);
+-		return (args->ret = -EBUSY);
+-	}
++	/* check the PC first */
++	if (within_module_core(frame->pc, args->mod))
++		goto err_out;
++
++	/* check NIP when the exception stack switching */
++	if (frame->nip && within_module_core(frame->nip, args->mod))
++		goto err_out;
++
+ 	return 0;
++
++err_out:
++	pr_err("module %s is in use!\n", args->mod->name);
++	return (args->ret = -EBUSY);
+ }
+ 
+ int arch_klp_module_check_calltrace(void *data)
+-- 
+2.33.0
+

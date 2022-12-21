@@ -1,0 +1,154 @@
+From 7fbc48aac5b786563e1c1c11922dbaf0df31eb62 Mon Sep 17 00:00:00 2001
+From: Hao Lan <lanhao@huawei.com>
+Date: Wed, 30 Nov 2022 18:23:58 +0800
+Subject: [PATCH] net: hns3: support debugfs for wake on lan
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 7fbc48aac5b786563e1c1c11922dbaf0df31eb62
+Modified-by-SEL: No
+
+
+driver inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I63AH1
+CVE: NA
+
+----------------------------------------------------------------------
+
+Implement debugfs for wake on lan to hns3. The debugfs
+support verify the firmware wake on lan configuration.
+
+Signed-off-by: Hao Lan <lanhao@huawei.com>
+Signed-off-by: Jiantao Xiao <xiaojiantao1@h-partners.com>
+Reviewed-by: Yue Haibing <yuehaibing@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/net/ethernet/hisilicon/hns3/hnae3.h   |  1 +
+ .../ethernet/hisilicon/hns3/hns3_debugfs.c    | 10 +++
+ .../hisilicon/hns3/hns3pf/hclge_debugfs.c     | 62 +++++++++++++++++++
+ 3 files changed, 73 insertions(+)
+
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hnae3.h b/drivers/net/ethernet/hisilicon/hns3/hnae3.h
+index 91c2a826f2b3..8bda1649de32 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hnae3.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hnae3.h
+@@ -326,6 +326,7 @@ enum hnae3_dbg_cmd {
+ 	HNAE3_DBG_CMD_UMV_INFO,
+ 	HNAE3_DBG_CMD_PAGE_POOL_INFO,
+ 	HNAE3_DBG_CMD_COAL_INFO,
++	HNAE3_DBG_CMD_WOL_INFO,
+ 	HNAE3_DBG_CMD_UNKNOWN,
+ };
+ 
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3_debugfs.c b/drivers/net/ethernet/hisilicon/hns3/hns3_debugfs.c
+index a31b10748ac1..62250669b9e8 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3_debugfs.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3_debugfs.c
+@@ -357,6 +357,13 @@ static struct hns3_dbg_cmd_info hns3_dbg_cmd[] = {
+ 		.buf_len = HNS3_DBG_READ_LEN_1MB,
+ 		.init = hns3_dbg_common_file_init,
+ 	},
++	{
++		.name = "wol_info",
++		.cmd = HNAE3_DBG_CMD_WOL_INFO,
++		.dentry = HNS3_DBG_DENTRY_COMMON,
++		.buf_len = HNS3_DBG_READ_LEN,
++		.init = hns3_dbg_common_file_init,
++	},
+ };
+ 
+ static struct hns3_dbg_cap_info hns3_dbg_cap[] = {
+@@ -402,6 +409,9 @@ static struct hns3_dbg_cap_info hns3_dbg_cap[] = {
+ 	}, {
+ 		.name = "support modify vlan filter state",
+ 		.cap_bit = HNAE3_DEV_SUPPORT_VLAN_FLTR_MDF_B,
++	}, {
++		.name = "support wake on lan",
++		.cap_bit = HNAE3_DEV_SUPPORT_WOL_B,
+ 	}
+ };
+ 
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_debugfs.c b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_debugfs.c
+index 0b7e8b4c7571..1a69638f1ba6 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_debugfs.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_debugfs.c
+@@ -2495,6 +2495,64 @@ static int hclge_dbg_dump_mac_mc(struct hclge_dev *hdev, char *buf, int len)
+ 	return 0;
+ }
+ 
++static void hclge_dump_wol_mode(u32 mode, char *buf, int len, int *pos)
++{
++	if (mode & HCLGE_WOL_PHY)
++		*pos += scnprintf(buf + *pos, len - *pos, "  [p]phy\n");
++
++	if (mode & HCLGE_WOL_UNICAST)
++		*pos += scnprintf(buf + *pos, len - *pos, "  [u]unicast\n");
++
++	if (mode & HCLGE_WOL_MULTICAST)
++		*pos += scnprintf(buf + *pos, len - *pos, "  [m]multicast\n");
++
++	if (mode & HCLGE_WOL_BROADCAST)
++		*pos += scnprintf(buf + *pos, len - *pos, "  [b]broadcast\n");
++
++	if (mode & HCLGE_WOL_ARP)
++		*pos += scnprintf(buf + *pos, len - *pos, "  [a]arp\n");
++
++	if (mode & HCLGE_WOL_MAGIC)
++		*pos += scnprintf(buf + *pos, len - *pos, "  [g]magic\n");
++
++	if (mode & HCLGE_WOL_MAGICSECURED)
++		*pos += scnprintf(buf + *pos, len - *pos,
++				 "  [s]magic secured\n");
++
++	if (mode & HCLGE_WOL_FILTER)
++		*pos += scnprintf(buf + *pos, len - *pos, "  [f]filter\n");
++}
++
++static int hclge_dbg_dump_wol_info(struct hclge_dev *hdev, char *buf, int len)
++{
++	u32 wol_supported;
++	int pos = 0;
++	u32 mode;
++
++	if (!hnae3_ae_dev_wol_supported(hdev->ae_dev)) {
++		pos += scnprintf(buf + pos, len - pos,
++				 "wake-on-lan is unsupported\n");
++		return 0;
++	}
++
++	pos += scnprintf(buf + pos, len - pos, "wake-on-lan mode:\n");
++	pos += scnprintf(buf + pos, len - pos, " supported:\n");
++	if (hclge_get_wol_supported_mode(hdev, &wol_supported))
++		return -EINVAL;
++
++	hclge_dump_wol_mode(wol_supported, buf, len, &pos);
++
++	pos += scnprintf(buf + pos, len - pos, " current:\n");
++	if (hclge_get_wol_cfg(hdev, &mode))
++		return -EINVAL;
++	if (mode)
++		hclge_dump_wol_mode(mode, buf, len, &pos);
++	else
++		pos += scnprintf(buf + pos, len - pos, "  [d]disabled\n");
++
++	return 0;
++}
++
+ static const struct hclge_dbg_func hclge_dbg_cmd_func[] = {
+ 	{
+ 		.cmd = HNAE3_DBG_CMD_TM_NODES,
+@@ -2644,6 +2702,10 @@ static const struct hclge_dbg_func hclge_dbg_cmd_func[] = {
+ 		.cmd = HNAE3_DBG_CMD_UMV_INFO,
+ 		.dbg_dump = hclge_dbg_dump_umv_info,
+ 	},
++	{
++		.cmd = HNAE3_DBG_CMD_WOL_INFO,
++		.dbg_dump = hclge_dbg_dump_wol_info,
++	},
+ };
+ 
+ int hclge_dbg_read_cmd(struct hnae3_handle *handle, enum hnae3_dbg_cmd cmd,
+-- 
+2.33.0
+

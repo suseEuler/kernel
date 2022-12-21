@@ -1,0 +1,127 @@
+From d2d3b8e656fe494a16cd4b7f869e89b88862a3c4 Mon Sep 17 00:00:00 2001
+From: Roman Gushchin <guro@fb.com>
+Date: Fri, 25 Nov 2022 11:56:10 +0800
+Subject: [PATCH] bpf: sched: introduce bpf_sched_enable()
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: d2d3b8e656fe494a16cd4b7f869e89b88862a3c4
+Modified-by-SEL: Yes, modified due to different context
+
+
+maillist inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5F6X6
+CVE: NA
+
+Reference: https://lore.kernel.org/all/20210916162451.709260-1-guro@fb.com/
+
+-------------------
+
+Introduce a dedicated static key and the bpf_sched_enabled() wrapper
+to guard all invocations of bpf programs in the scheduler code.
+
+It will help to avoid any potential performance regression in a case
+when no scheduler bpf programs are attached.
+
+Signed-off-by: Roman Gushchin <guro@fb.com>
+Signed-off-by: Chen Hui <judy.chenhui@huawei.com>
+Signed-off-by: Ren Zhijie <renzhijie2@huawei.com>
+Signed-off-by: Hui Tang <tanghui20@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/bpf_sched.h |   24 ++++++++++++++++++++++++
+ kernel/bpf/syscall.c      |   11 +++++++++++
+ kernel/sched/bpf_sched.c  |    2 ++
+ 3 files changed, 37 insertions(+)
+
+--- a/include/linux/bpf_sched.h
++++ b/include/linux/bpf_sched.h
+@@ -6,6 +6,8 @@
+ 
+ #ifdef CONFIG_BPF_SCHED
+ 
++#include <linux/jump_label.h>
++
+ #define BPF_SCHED_HOOK(RET, DEFAULT, NAME, ...) \
+ 	RET bpf_sched_##NAME(__VA_ARGS__);
+ #include <linux/sched_hook_defs.h>
+@@ -14,6 +16,23 @@
+ int bpf_sched_verify_prog(struct bpf_verifier_log *vlog,
+ 			  const struct bpf_prog *prog);
+ 
++DECLARE_STATIC_KEY_FALSE(bpf_sched_enabled_key);
++
++static inline bool bpf_sched_enabled(void)
++{
++	return static_branch_unlikely(&bpf_sched_enabled_key);
++}
++
++static inline void bpf_sched_inc(void)
++{
++	static_branch_inc(&bpf_sched_enabled_key);
++}
++
++static inline void bpf_sched_dec(void)
++{
++	static_branch_dec(&bpf_sched_enabled_key);
++}
++
+ #else /* !CONFIG_BPF_SCHED */
+ 
+ static inline int bpf_sched_verify_prog(struct bpf_verifier_log *vlog,
+@@ -22,5 +41,10 @@ static inline int bpf_sched_verify_prog(
+ 	return -EOPNOTSUPP;
+ }
+ 
++static inline bool bpf_sched_enabled(void)
++{
++	return false;
++}
++
+ #endif /* CONFIG_BPF_SCHED */
+ #endif /* _LINUX_BPF_SCHED_H */
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -31,6 +31,7 @@
+ #include <linux/poll.h>
+ #include <linux/bpf-netns.h>
+ #include <linux/rcupdate_trace.h>
++#include <linux/bpf_sched.h>
+ #include <linux/memcontrol.h>
+ 
+ #define IS_FD_ARRAY(map) ((map)->map_type == BPF_MAP_TYPE_PERF_EVENT_ARRAY || \
+@@ -2649,6 +2650,11 @@ static void bpf_tracing_link_release(str
+ 	struct bpf_tracing_link *tr_link =
+ 		container_of(link, struct bpf_tracing_link, link);
+ 
++#ifdef CONFIG_BPF_SCHED
++	if (link->prog->type == BPF_PROG_TYPE_SCHED)
++		bpf_sched_dec();
++#endif
++
+ 	WARN_ON_ONCE(bpf_trampoline_unlink_prog(link->prog,
+ 						tr_link->trampoline));
+ 
+@@ -2850,6 +2856,11 @@ static int bpf_tracing_prog_attach(struc
+ 		goto out_unlock;
+ 	}
+ 
++#ifdef CONFIG_BPF_SCHED
++	if (prog->type == BPF_PROG_TYPE_SCHED)
++		bpf_sched_inc();
++#endif
++
+ 	link->tgt_prog = tgt_prog;
+ 	link->trampoline = tr;
+ 
+--- a/kernel/sched/bpf_sched.c
++++ b/kernel/sched/bpf_sched.c
+@@ -6,6 +6,8 @@
+ #include <linux/btf_ids.h>
+ #include "sched.h"
+ 
++DEFINE_STATIC_KEY_FALSE(bpf_sched_enabled_key);
++
+ /*
+  * For every hook declare a nop function where a BPF program can be attached.
+  */

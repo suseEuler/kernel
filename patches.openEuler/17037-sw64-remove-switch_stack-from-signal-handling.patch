@@ -1,0 +1,166 @@
+From 40f13ed00ba08ca82c764d04f78fdf08d7583263 Mon Sep 17 00:00:00 2001
+From: He Sheng <hesheng@wxiat.com>
+Date: Sun, 24 Apr 2022 12:01:24 +0800
+Subject: [PATCH] sw64: remove switch_stack from signal handling
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 40f13ed00ba08ca82c764d04f78fdf08d7583263
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5GF7A
+
+--------------------------------
+
+The new pt_regs struct holds r9 ~ r15, and it's sufficient to setup
+and restore sigcontext. Take care that fpregs state of current task
+should be saved and restored explicitly after switch_stack removed.
+
+Signed-off-by: He Sheng <hesheng@wxiat.com>
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/kernel/entry.S  |  8 ++------
+ arch/sw_64/kernel/signal.c | 38 ++++++++++++++++++--------------------
+ 2 files changed, 20 insertions(+), 26 deletions(-)
+
+diff --git a/arch/sw_64/kernel/entry.S b/arch/sw_64/kernel/entry.S
+index f843acd88249..730346754ecc 100644
+--- a/arch/sw_64/kernel/entry.S
++++ b/arch/sw_64/kernel/entry.S
+@@ -663,12 +663,10 @@ sys_sigreturn:
+ 	.prologue 0
+ 	ldi	$9, ret_from_straced
+ 	cmpult	$26, $9, $9
+-	ldi	$sp, -SWITCH_STACK_SIZE($sp)
+ 	call	$26, do_sigreturn
+ 	bne	$9, 1f
+ 	call	$26, syscall_trace_leave
+-1:	br	$1, undo_switch_stack
+-	br	ret_from_sys_call
++1:	br	ret_from_sys_call
+ 	.end sys_sigreturn
+ 
+ 	.align 4
+@@ -678,12 +676,10 @@ sys_rt_sigreturn:
+ 	.prologue 0
+ 	ldi	$9, ret_from_straced
+ 	cmpult	$26, $9, $9
+-	ldi	$sp, -SWITCH_STACK_SIZE($sp)
+ 	call	$26, do_rt_sigreturn
+ 	bne	$9, 1f
+ 	call	$26, syscall_trace_leave
+-1:	br	$1, undo_switch_stack
+-	br	ret_from_sys_call
++1:	br	ret_from_sys_call
+ 	.end sys_rt_sigreturn
+ 
+ 	.align 4
+diff --git a/arch/sw_64/kernel/signal.c b/arch/sw_64/kernel/signal.c
+index dd0d8ff42420..887326812624 100644
+--- a/arch/sw_64/kernel/signal.c
++++ b/arch/sw_64/kernel/signal.c
+@@ -14,6 +14,7 @@
+ 
+ #include <asm/ucontext.h>
+ #include <asm/vdso.h>
++#include <asm/switch_to.h>
+ 
+ #include "proto.h"
+ 
+@@ -22,8 +23,6 @@
+ 
+ #define _BLOCKABLE (~(sigmask(SIGKILL) | sigmask(SIGSTOP)))
+ 
+-asmlinkage void ret_from_sys_call(void);
+-
+ SYSCALL_DEFINE2(odd_sigprocmask, int, how, unsigned long, newmask)
+ {
+ 	sigset_t oldmask;
+@@ -64,13 +63,10 @@ static long
+ restore_sigcontext(struct sigcontext __user *sc, struct pt_regs *regs)
+ {
+ 	unsigned long usp;
+-	struct switch_stack *sw = (struct switch_stack *)regs - 1;
+ 	long err = __get_user(regs->pc, &sc->sc_pc);
+ 
+ 	current->restart_block.fn = do_no_restart_syscall;
+ 
+-	sw->r26 = (unsigned long) ret_from_sys_call;
+-
+ 	err |= __get_user(regs->r0, sc->sc_regs+0);
+ 	err |= __get_user(regs->r1, sc->sc_regs+1);
+ 	err |= __get_user(regs->r2, sc->sc_regs+2);
+@@ -80,13 +76,13 @@ restore_sigcontext(struct sigcontext __user *sc, struct pt_regs *regs)
+ 	err |= __get_user(regs->r6, sc->sc_regs+6);
+ 	err |= __get_user(regs->r7, sc->sc_regs+7);
+ 	err |= __get_user(regs->r8, sc->sc_regs+8);
+-	err |= __get_user(sw->r9, sc->sc_regs+9);
+-	err |= __get_user(sw->r10, sc->sc_regs+10);
+-	err |= __get_user(sw->r11, sc->sc_regs+11);
+-	err |= __get_user(sw->r12, sc->sc_regs+12);
+-	err |= __get_user(sw->r13, sc->sc_regs+13);
+-	err |= __get_user(sw->r14, sc->sc_regs+14);
+-	err |= __get_user(sw->r15, sc->sc_regs+15);
++	err |= __get_user(regs->r9, sc->sc_regs+9);
++	err |= __get_user(regs->r10, sc->sc_regs+10);
++	err |= __get_user(regs->r11, sc->sc_regs+11);
++	err |= __get_user(regs->r12, sc->sc_regs+12);
++	err |= __get_user(regs->r13, sc->sc_regs+13);
++	err |= __get_user(regs->r14, sc->sc_regs+14);
++	err |= __get_user(regs->r15, sc->sc_regs+15);
+ 	err |= __get_user(regs->r16, sc->sc_regs+16);
+ 	err |= __get_user(regs->r17, sc->sc_regs+17);
+ 	err |= __get_user(regs->r18, sc->sc_regs+18);
+@@ -107,6 +103,8 @@ restore_sigcontext(struct sigcontext __user *sc, struct pt_regs *regs)
+ 	err |= __copy_from_user(&current->thread.ctx_fp,
+ 			&sc->sc_fpregs, sizeof(struct context_fpregs));
+ 	err |= __get_user(current->thread.fpcr, &sc->sc_fpcr);
++	if (likely(!err))
++		__fpstate_restore(current);
+ 
+ 	return err;
+ }
+@@ -191,7 +189,6 @@ static long
+ setup_sigcontext(struct sigcontext __user *sc, struct pt_regs *regs,
+ 		 unsigned long mask, unsigned long sp)
+ {
+-	struct switch_stack *sw = (struct switch_stack *)regs - 1;
+ 	long err = 0;
+ 
+ 	err |= __put_user(on_sig_stack((unsigned long)sc), &sc->sc_onstack);
+@@ -208,13 +205,13 @@ setup_sigcontext(struct sigcontext __user *sc, struct pt_regs *regs,
+ 	err |= __put_user(regs->r6, sc->sc_regs+6);
+ 	err |= __put_user(regs->r7, sc->sc_regs+7);
+ 	err |= __put_user(regs->r8, sc->sc_regs+8);
+-	err |= __put_user(sw->r9, sc->sc_regs+9);
+-	err |= __put_user(sw->r10, sc->sc_regs+10);
+-	err |= __put_user(sw->r11, sc->sc_regs+11);
+-	err |= __put_user(sw->r12, sc->sc_regs+12);
+-	err |= __put_user(sw->r13, sc->sc_regs+13);
+-	err |= __put_user(sw->r14, sc->sc_regs+14);
+-	err |= __put_user(sw->r15, sc->sc_regs+15);
++	err |= __put_user(regs->r9, sc->sc_regs+9);
++	err |= __put_user(regs->r10, sc->sc_regs+10);
++	err |= __put_user(regs->r11, sc->sc_regs+11);
++	err |= __put_user(regs->r12, sc->sc_regs+12);
++	err |= __put_user(regs->r13, sc->sc_regs+13);
++	err |= __put_user(regs->r14, sc->sc_regs+14);
++	err |= __put_user(regs->r15, sc->sc_regs+15);
+ 	err |= __put_user(regs->r16, sc->sc_regs+16);
+ 	err |= __put_user(regs->r17, sc->sc_regs+17);
+ 	err |= __put_user(regs->r18, sc->sc_regs+18);
+@@ -232,6 +229,7 @@ setup_sigcontext(struct sigcontext __user *sc, struct pt_regs *regs,
+ 	err |= __put_user(sp, sc->sc_regs+30);
+ 	err |= __put_user(0, sc->sc_regs+31);
+ 	/* simd-fp */
++	__fpstate_save(current);
+ 	err |= __copy_to_user(&sc->sc_fpregs,
+ 			&current->thread.ctx_fp, sizeof(struct context_fpregs));
+ 	err |= __put_user(current->thread.fpcr, &sc->sc_fpcr);
+-- 
+2.33.0
+

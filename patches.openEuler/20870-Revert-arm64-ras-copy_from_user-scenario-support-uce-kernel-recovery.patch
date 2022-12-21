@@ -1,0 +1,359 @@
+From 7cfb96fd69b418362c4a798c56c6e5338564bf38 Mon Sep 17 00:00:00 2001
+From: Tong Tiangen <tongtiangen@huawei.com>
+Date: Fri, 18 Nov 2022 02:08:48 +0000
+Subject: [PATCH] Revert "arm64: ras: copy_from_user scenario support uce
+ kernel recovery"
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 7cfb96fd69b418362c4a798c56c6e5338564bf38
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5GB28
+CVE: NA
+
+-------------------------------
+
+This reverts commit dcd1c6a940ae973d3bd2c99fa77cf590f2e58ad8.
+
+Signed-off-by: Tong Tiangen <tongtiangen@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ Documentation/admin-guide/sysctl/kernel.rst |  17 --
+ arch/arm64/Kconfig                          |   9 -
+ arch/arm64/include/asm/exception.h          |  13 --
+ arch/arm64/lib/copy_from_user.S             |  11 --
+ arch/arm64/mm/Makefile                      |   2 -
+ arch/arm64/mm/fault.c                       |   4 -
+ arch/arm64/mm/uce_kernel_recovery.c         | 198 --------------------
+ 7 files changed, 254 deletions(-)
+ delete mode 100644 arch/arm64/mm/uce_kernel_recovery.c
+
+diff --git a/Documentation/admin-guide/sysctl/kernel.rst b/Documentation/admin-guide/sysctl/kernel.rst
+index 83ad8d6a1f73..a4b1ebc2e70b 100644
+--- a/Documentation/admin-guide/sysctl/kernel.rst
++++ b/Documentation/admin-guide/sysctl/kernel.rst
+@@ -1521,20 +1521,3 @@ is 10 seconds.
+ 
+ The softlockup threshold is (``2 * watchdog_thresh``). Setting this
+ tunable to zero will disable lockup detection altogether.
+-
+-uce_kernel_recovery(ARM64 only)
+-===============================
+-
+-This value can be used to control whether panic the kernel when UCE RAS
+-errors occur in a specific scenario. Each bit controls a scene, 1 means
+-avoid kernel panic when encountering UCE RAS error in this scenario, and
+-0 means kernel panic.
+-
+-Current usage of each bit:
+-
+-============  ==============
+-bit0          reserved
+-bit1          reserved
+-bit2          copy_from_user
+-bit3 ~ bit31  reserved
+-============  ==============
+diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
+index 969f0889fbea..1862a19a9668 100644
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -1647,15 +1647,6 @@ config ARM64_CNP
+ 	  at runtime, and does not affect PEs that do not implement
+ 	  this feature.
+ 
+-config ARM64_UCE_KERNEL_RECOVERY
+-	bool "arm64 uce kernel recovery for special scenario"
+-	depends on ACPI_APEI_SEA
+-	help
+-	  With ARM v8.2 RAS Extension, SEA are usually triggered when memory
+-	  error are consumed. In some cases, if the error address is in a
+-	  user page there is a chance to recover. we can isolate this page
+-	  and killing process instead of die.
+-
+ endmenu
+ 
+ menu "ARMv8.3 architectural features"
+diff --git a/arch/arm64/include/asm/exception.h b/arch/arm64/include/asm/exception.h
+index 731cf01d9296..0756191f44f6 100644
+--- a/arch/arm64/include/asm/exception.h
++++ b/arch/arm64/include/asm/exception.h
+@@ -19,19 +19,6 @@
+ #define __exception_irq_entry	__kprobes
+ #endif
+ 
+-#ifdef CONFIG_ARM64_UCE_KERNEL_RECOVERY
+-bool arm64_process_kernel_sea(unsigned long addr, unsigned int esr,
+-			      struct pt_regs *regs, int sig,
+-			      int code, void __user *siaddr);
+-#else
+-static inline bool arm64_process_kernel_sea(unsigned long addr, unsigned int esr,
+-					    struct pt_regs *regs, int sig,
+-					    int code, void __user *siaddr)
+-{
+-	return false;
+-}
+-#endif
+-
+ static inline u32 disr_to_esr(u64 disr)
+ {
+ 	unsigned int esr = ESR_ELx_EC_SERROR << ESR_ELx_EC_SHIFT;
+diff --git a/arch/arm64/lib/copy_from_user.S b/arch/arm64/lib/copy_from_user.S
+index 100de4e2d9ee..2cf999e41d30 100644
+--- a/arch/arm64/lib/copy_from_user.S
++++ b/arch/arm64/lib/copy_from_user.S
+@@ -60,17 +60,6 @@ SYM_FUNC_START(__arch_copy_from_user)
+ #include "copy_template.S"
+ 	mov	x0, #0				// Nothing to copy
+ 	ret
+-
+-/*
+- * In feature CONFIG_ARM64_UCE_KERNEL_RECOVERY, if RAS error is triggered
+- * in copy_from_user(), RAS error is processed in do_sea() and
+- * copy_from_user_sea_fallback will be assigned to regs->pc, finally return
+- * here to continue processing.
+- */
+-	.global copy_from_user_sea_fallback
+-copy_from_user_sea_fallback:
+-	sub	x0, end, dst			// bytes not copied
+-	ret
+ SYM_FUNC_END(__arch_copy_from_user)
+ EXPORT_SYMBOL(__arch_copy_from_user)
+ 
+diff --git a/arch/arm64/mm/Makefile b/arch/arm64/mm/Makefile
+index 68a32305cff9..f60119034f20 100644
+--- a/arch/arm64/mm/Makefile
++++ b/arch/arm64/mm/Makefile
+@@ -11,8 +11,6 @@ obj-$(CONFIG_DEBUG_VIRTUAL)	+= physaddr.o
+ obj-$(CONFIG_ARM64_MTE)		+= mteswap.o
+ KASAN_SANITIZE_physaddr.o	+= n
+ 
+-obj-$(CONFIG_ARM64_UCE_KERNEL_RECOVERY)	+= uce_kernel_recovery.o
+-
+ obj-$(CONFIG_KASAN)		+= kasan_init.o
+ KASAN_SANITIZE_kasan_init.o	:= n
+ 
+diff --git a/arch/arm64/mm/fault.c b/arch/arm64/mm/fault.c
+index 7da2f8118b35..3fc5aceb72eb 100644
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@ -653,10 +653,6 @@ static int do_sea(unsigned long addr, unsigned int esr, struct pt_regs *regs)
+ 		siaddr = NULL;
+ 	else
+ 		siaddr  = (void __user *)addr;
+-
+-	if (arm64_process_kernel_sea(addr, esr, regs, inf->sig, inf->code, siaddr))
+-		return 0;
+-
+ 	arm64_notify_die(inf->name, regs, inf->sig, inf->code, siaddr, esr);
+ 
+ 	return 0;
+diff --git a/arch/arm64/mm/uce_kernel_recovery.c b/arch/arm64/mm/uce_kernel_recovery.c
+deleted file mode 100644
+index c654dc6c4dfd..000000000000
+--- a/arch/arm64/mm/uce_kernel_recovery.c
++++ /dev/null
+@@ -1,198 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0-only
+-
+-#define pr_fmt(fmt) "ARM64 UCE: " fmt
+-
+-#include <linux/acpi.h>
+-#include <linux/kallsyms.h>
+-#include <linux/mm.h>
+-#include <linux/kernel.h>
+-#include <linux/sysctl.h>
+-
+-#include <asm/acpi.h>
+-#include <asm/exception.h>
+-#include <asm/system_misc.h>
+-#include <asm/traps.h>
+-#include <asm/esr.h>
+-
+-struct uce_kernel_recovery_info {
+-	int (*fn)(void);
+-	const char *name;
+-	unsigned long addr;
+-	unsigned long size;
+-};
+-
+-int copy_from_user_sea_fallback(void);
+-
+-static int kernel_access_sea_recovery;
+-static int kernel_uce_recovery_sysctl_max = 7;
+-
+-#define UCE_KER_REC_NUM   ARRAY_SIZE(reco_info)
+-static struct uce_kernel_recovery_info reco_info[] = {
+-	{NULL, NULL, 0, 0},  /* reserved */
+-	{NULL, NULL, 0, 0},  /* reserved */
+-	{copy_from_user_sea_fallback, "__arch_copy_from_user", (unsigned long)__arch_copy_from_user, 0},
+-};
+-
+-static struct ctl_table uce_kernel_recovery_ctl_table[] = {
+-	{
+-		.procname	= "uce_kernel_recovery",
+-		.data		= &kernel_access_sea_recovery,
+-		.maxlen		= sizeof(kernel_access_sea_recovery),
+-		.mode		= 0644,
+-		.proc_handler	= proc_dointvec_minmax,
+-		.extra1		= SYSCTL_ZERO,
+-		.extra2		= &kernel_uce_recovery_sysctl_max,
+-	},
+-	{ }
+-};
+-
+-static int __init kernel_access_sea_recovery_init(void)
+-{
+-	unsigned long addr, size, offset;
+-	unsigned int i;
+-
+-	for (i = 0; i < UCE_KER_REC_NUM; i++) {
+-		addr = reco_info[i].addr;
+-
+-		if (!addr)
+-			continue;
+-
+-		if (!kallsyms_lookup_size_offset(addr, &size, &offset)) {
+-			pr_info("symbol %s lookup addr fail.\n",
+-				reco_info[i].name);
+-			size = 0;
+-		}
+-
+-		reco_info[i].size = size;
+-	}
+-
+-	if (!register_sysctl("kernel", uce_kernel_recovery_ctl_table))
+-		pr_err("register sysctl table fail.\n");
+-
+-	return 1;
+-}
+-fs_initcall(kernel_access_sea_recovery_init);
+-
+-static int __init enable_kernel_access_sea_recovery(char *str)
+-{
+-	int max = (1 << UCE_KER_REC_NUM) - 1;
+-	int val;
+-
+-	if (kstrtoint(str, 0, &val))
+-		return -EINVAL;
+-
+-	if (val < 0 || val > max) {
+-		pr_info("invalid uce_kernel_recovery value %d", val);
+-		return -EINVAL;
+-	}
+-
+-	kernel_access_sea_recovery = val;
+-
+-	return 1;
+-}
+-__setup("uce_kernel_recovery=", enable_kernel_access_sea_recovery);
+-
+-/*
+- * what is kernel recovery?
+- * If the process's private data is accessed in the kernel mode to trigger
+- * special sea fault, it can controlled by killing the process and isolating
+- * the failure pages instead of die.
+- */
+-static int is_in_kernel_recovery(unsigned int esr, struct pt_regs *regs)
+-{
+-	/*
+-	 * target insn: ldp-pre, ldp-post, ldp-offset,
+-	 * ldr-64bit-pre/pose, ldr-32bit-pre/post, ldrb-pre/post, ldrh-pre/post
+-	 */
+-	u32 target_insn[] = {0xa8c, 0xa9c, 0xa94, 0xf84, 0x784, 0x384, 0xb84};
+-	void  *pc = (void  *)instruction_pointer(regs);
+-	struct uce_kernel_recovery_info *info;
+-	bool insn_match = false;
+-	u32 insn;
+-	int i;
+-
+-	pr_emerg("%s-%d, kernel recovery: 0x%x, esr: 0x%08x -- %s, %pS\n",
+-		 current->comm, current->pid, kernel_access_sea_recovery, esr,
+-		 esr_get_class_string(esr), pc);
+-
+-	if (aarch64_insn_read((void *)pc, &insn)) {
+-		pr_emerg("insn read fail.\n");
+-		return -EFAULT;
+-	}
+-
+-	/*
+-	 * We process special ESR:
+-	 * EC : 0b100101   Data Abort taken without a change in Exception level.
+-	 * DFSC : 0b010000 Synchronous External abort, not on translation table
+-	 * walk or hardware update of translation table.
+-	 * eg: 0x96000610
+-	 */
+-	if (ESR_ELx_EC(esr) != ESR_ELx_EC_DABT_CUR ||
+-		(esr & ESR_ELx_FSC) != ESR_ELx_FSC_EXTABT) {
+-		pr_emerg("esr not match.\n");
+-		return -EINVAL;
+-	}
+-
+-	insn = (insn >> 20) & 0xffc;
+-	for (i = 0; i < ARRAY_SIZE(target_insn); i++) {
+-		if (insn == target_insn[i]) {
+-			insn_match = true;
+-			break;
+-		}
+-	}
+-
+-	if (!insn_match) {
+-		pr_emerg("insn 0x%x is not match.\n", insn);
+-		return -EINVAL;
+-	}
+-
+-	for (i = 0; i < UCE_KER_REC_NUM; i++) {
+-		if (!((kernel_access_sea_recovery >> i) & 0x1))
+-			continue;
+-
+-		info = &reco_info[i];
+-		if (info->fn && regs->pc >= info->addr &&
+-		    regs->pc < (info->addr + info->size)) {
+-			pr_emerg("total match %s success.\n", info->name);
+-			return i;
+-		}
+-	}
+-
+-	pr_emerg("scene is not match, kernel recovery %d.\n",
+-		 kernel_access_sea_recovery);
+-	return -EINVAL;
+-}
+-
+-bool arm64_process_kernel_sea(unsigned long addr, unsigned int esr,
+-			      struct pt_regs *regs, int sig,
+-			      int code, void __user *siaddr)
+-{
+-	int idx;
+-
+-	if (user_mode(regs) || apei_claim_sea(regs) < 0)
+-		return false;
+-
+-	if (!current->mm || !kernel_access_sea_recovery) {
+-		pr_emerg("kernel recovery %d, %s-%d is %s-thread.\n",
+-			 kernel_access_sea_recovery,
+-			 current->comm, current->pid,
+-			 (current->mm) ? "user" : "kernel");
+-
+-		return false;
+-	}
+-
+-	idx = is_in_kernel_recovery(esr, regs);
+-	if (idx < 0 || idx >= UCE_KER_REC_NUM) {
+-		pr_emerg("Uncorrected hardware memory error (sence not match or sence switch is off) in kernel-access\n");
+-		return false;
+-	}
+-
+-	current->thread.fault_address = 0;
+-	current->thread.fault_code = esr;
+-	regs->pc = (unsigned long)reco_info[idx].fn;
+-
+-	arm64_force_sig_fault(sig, code, siaddr,
+-		"Uncorrected hardware memory use with kernel recovery in kernel-access\n");
+-
+-	return true;
+-}
+-- 
+2.33.0
+

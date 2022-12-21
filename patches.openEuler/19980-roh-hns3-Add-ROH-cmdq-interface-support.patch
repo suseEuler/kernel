@@ -1,0 +1,650 @@
+From 1cb9fff330359280ce12b9ddee9848eb67098f6e Mon Sep 17 00:00:00 2001
+From: Ke Chen <chenke54@huawei.com>
+Date: Mon, 7 Nov 2022 19:53:07 +0800
+Subject: [PATCH] roh/hns3: Add ROH cmdq interface support
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 1cb9fff330359280ce12b9ddee9848eb67098f6e
+Modified-by-SEL: No
+
+
+driver inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5WKYW
+
+-----------------------------------------------------------------------
+
+Each ROH device has its own cmdq interface, which includes
+send queue CSQ and receive queue CRQ. These commands are
+used to obtain the resources of the ROH device from IMP and
+implement related configurations.
+
+This patch adds the support of IMP command interface to the
+ROH driver, include:
+1. initialize the roh command queue resource
+2. manage the roh command queue descriptors
+3. provide the cmdq send operation APIs
+
+Signed-off-by: Ke Chen <chenke54@huawei.com>
+Reviewed-by: Gang Zhang <gang.zhang@huawei.com>
+Reviewed-by: Yefeng Yan <yanyefeng@huawei.com>
+Reviewed-by: Jingchao Dai <daijingchao1@huawei.com>
+Reviewed-by: Jian Shen <shenjian15@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/roh/hw/hns3/Makefile      |   3 +-
+ drivers/roh/hw/hns3/hns3_cmdq.c   | 317 ++++++++++++++++++++++++++++++
+ drivers/roh/hw/hns3/hns3_cmdq.h   |  70 +++++++
+ drivers/roh/hw/hns3/hns3_common.h |  42 ++++
+ drivers/roh/hw/hns3/hns3_main.c   |  41 +++-
+ drivers/roh/hw/hns3/hns3_reg.h    |  31 +++
+ 6 files changed, 502 insertions(+), 2 deletions(-)
+ create mode 100644 drivers/roh/hw/hns3/hns3_cmdq.c
+ create mode 100644 drivers/roh/hw/hns3/hns3_cmdq.h
+ create mode 100644 drivers/roh/hw/hns3/hns3_reg.h
+
+diff --git a/drivers/roh/hw/hns3/Makefile b/drivers/roh/hw/hns3/Makefile
+index d903762b2e0d..3a7fb499fddb 100644
+--- a/drivers/roh/hw/hns3/Makefile
++++ b/drivers/roh/hw/hns3/Makefile
+@@ -7,5 +7,6 @@ ccflags-y :=  -I $(srctree)/drivers/net/ethernet/hisilicon/hns3
+ ccflags-y +=  -I $(srctree)/drivers/roh/core
+ ccflags-y +=  -I $(srctree)/drivers/roh/hw/hns3
+ 
+-hns-roh-v1-objs := hns3_main.o
++hns-roh-v1-objs := hns3_cmdq.o	\
++		   hns3_main.o
+ obj-$(CONFIG_ROH_HNS) += hns-roh-v1.o
+diff --git a/drivers/roh/hw/hns3/hns3_cmdq.c b/drivers/roh/hw/hns3/hns3_cmdq.c
+new file mode 100644
+index 000000000000..325b5a20f431
+--- /dev/null
++++ b/drivers/roh/hw/hns3/hns3_cmdq.c
+@@ -0,0 +1,317 @@
++// SPDX-License-Identifier: GPL-2.0+
++// Copyright (c) 2020-2022 Hisilicon Limited.
++
++#include <linux/module.h>
++#include <linux/dmapool.h>
++#include <linux/dma-mapping.h>
++#include <linux/slab.h>
++#include <linux/delay.h>
++
++#include "core.h"
++#include "hns3_common.h"
++#include "hns3_cmdq.h"
++#include "hns3_reg.h"
++
++static int hns3_roh_alloc_cmdq_desc(struct hns3_roh_device *hroh_dev,
++				    struct hns3_roh_cmdq_ring *ring)
++{
++	u32 size = ring->desc_num * sizeof(struct hns3_roh_desc);
++
++	ring->desc = kzalloc(size, GFP_KERNEL);
++	if (!ring->desc)
++		return -ENOMEM;
++
++	ring->desc_dma_addr = dma_map_single(hroh_dev->dev, ring->desc, size,
++					     DMA_BIDIRECTIONAL);
++	if (dma_mapping_error(hroh_dev->dev, ring->desc_dma_addr)) {
++		dev_err(hroh_dev->dev, "failed to dma mapping.\n");
++		ring->desc_dma_addr = 0;
++		kfree(ring->desc);
++		ring->desc = NULL;
++		return -ENOMEM;
++	}
++
++	return 0;
++}
++
++static void hns3_roh_free_cmdq_desc(struct hns3_roh_device *hroh_dev,
++				    struct hns3_roh_cmdq_ring *ring)
++{
++	dma_unmap_single(hroh_dev->dev, ring->desc_dma_addr,
++			 ring->desc_num * sizeof(struct hns3_roh_desc),
++			 DMA_BIDIRECTIONAL);
++
++	ring->desc_dma_addr = 0;
++	kfree(ring->desc);
++	ring->desc = NULL;
++}
++
++static int hns3_roh_init_cmdq_ring(struct hns3_roh_device *hroh_dev, u8 ring_type)
++{
++	struct hns3_roh_priv *priv = (struct hns3_roh_priv *)hroh_dev->priv;
++	struct hns3_roh_cmdq_ring *ring =
++		(ring_type == HNS3_ROH_CMDQ_CSQ) ? &priv->cmdq.csq : &priv->cmdq.crq;
++
++	ring->flag = ring_type;
++	ring->next_to_clean = 0;
++	ring->next_to_use = 0;
++
++	return hns3_roh_alloc_cmdq_desc(hroh_dev, ring);
++}
++
++static void hns3_roh_cmdq_clear_regs(struct hns3_roh_device *hroh_dev)
++{
++	hns3_roh_write(hroh_dev, HNS3_ROH_TX_CMDQ_BASEADDR_L_REG, 0);
++	hns3_roh_write(hroh_dev, HNS3_ROH_TX_CMDQ_BASEADDR_H_REG, 0);
++	hns3_roh_write(hroh_dev, HNS3_ROH_TX_CMDQ_DEPTH_REG, 0);
++	hns3_roh_write(hroh_dev, HNS3_ROH_TX_CMDQ_HEAD_REG, 0);
++	hns3_roh_write(hroh_dev, HNS3_ROH_TX_CMDQ_TAIL_REG, 0);
++	hns3_roh_write(hroh_dev, HNS3_ROH_RX_CMDQ_BASEADDR_L_REG, 0);
++	hns3_roh_write(hroh_dev, HNS3_ROH_RX_CMDQ_BASEADDR_H_REG, 0);
++	hns3_roh_write(hroh_dev, HNS3_ROH_RX_CMDQ_DEPTH_REG, 0);
++	hns3_roh_write(hroh_dev, HNS3_ROH_RX_CMDQ_HEAD_REG, 0);
++	hns3_roh_write(hroh_dev, HNS3_ROH_RX_CMDQ_TAIL_REG, 0);
++}
++
++static void hns3_roh_cmdq_init_regs(struct hns3_roh_device *hroh_dev, u8 ring_type)
++{
++	struct hns3_roh_priv *priv = (struct hns3_roh_priv *)hroh_dev->priv;
++	struct hns3_roh_cmdq_ring *ring =
++		(ring_type == HNS3_ROH_CMDQ_CSQ) ? &priv->cmdq.csq : &priv->cmdq.crq;
++	dma_addr_t dma = ring->desc_dma_addr;
++
++	if (ring_type == HNS3_ROH_CMDQ_CSQ) {
++		hns3_roh_write(hroh_dev, HNS3_ROH_TX_CMDQ_BASEADDR_L_REG, (u32)dma);
++		hns3_roh_write(hroh_dev, HNS3_ROH_TX_CMDQ_BASEADDR_H_REG,
++			       upper_32_bits(dma));
++		hns3_roh_write(hroh_dev, HNS3_ROH_TX_CMDQ_DEPTH_REG,
++			       ring->desc_num >> HNS3_ROH_CMDQ_DESC_NUM);
++		hns3_roh_write(hroh_dev, HNS3_ROH_TX_CMDQ_HEAD_REG, 0);
++		hns3_roh_write(hroh_dev, HNS3_ROH_TX_CMDQ_TAIL_REG, 0);
++	} else {
++		hns3_roh_write(hroh_dev, HNS3_ROH_RX_CMDQ_BASEADDR_L_REG, (u32)dma);
++		hns3_roh_write(hroh_dev, HNS3_ROH_RX_CMDQ_BASEADDR_H_REG,
++			       upper_32_bits(dma));
++		hns3_roh_write(hroh_dev, HNS3_ROH_RX_CMDQ_DEPTH_REG,
++			       ring->desc_num >> HNS3_ROH_CMDQ_DESC_NUM);
++		hns3_roh_write(hroh_dev, HNS3_ROH_RX_CMDQ_HEAD_REG, 0);
++		hns3_roh_write(hroh_dev, HNS3_ROH_RX_CMDQ_TAIL_REG, 0);
++	}
++}
++
++int hns3_roh_cmdq_init(struct hns3_roh_device *hroh_dev)
++{
++	struct hns3_roh_priv *priv = (struct hns3_roh_priv *)hroh_dev->priv;
++	int ret;
++
++	/* Setup the lock for command queue */
++	spin_lock_init(&priv->cmdq.csq.lock);
++	spin_lock_init(&priv->cmdq.crq.lock);
++
++	/* Clear up all command register,
++	 * in case there are some residual values
++	 */
++	hns3_roh_cmdq_clear_regs(hroh_dev);
++
++	/* Setup the queue entries for command queue */
++	priv->cmdq.csq.desc_num = HNS3_ROH_CMDQ_CSQ_DESC_NUM;
++	priv->cmdq.crq.desc_num = HNS3_ROH_CMDQ_CRQ_DESC_NUM;
++
++	/* Setup Tx write back timeout */
++	priv->cmdq.tx_timeout = HNS3_ROH_CMDQ_TX_TIMEOUT;
++
++	/* Init CSQ */
++	ret = hns3_roh_init_cmdq_ring(hroh_dev, HNS3_ROH_CMDQ_CSQ);
++	if (ret) {
++		dev_err(hroh_dev->dev, "failed to init csq, ret = %d\n", ret);
++		return ret;
++	}
++
++	/* Init CRQ */
++	ret = hns3_roh_init_cmdq_ring(hroh_dev, HNS3_ROH_CMDQ_CRQ);
++	if (ret) {
++		dev_err(hroh_dev->dev, "failed to init crq, ret = %d\n", ret);
++		goto err_crq;
++	}
++
++	/* Init CSQ REG */
++	hns3_roh_cmdq_init_regs(hroh_dev, HNS3_ROH_CMDQ_CSQ);
++
++	/* Init CRQ REG */
++	hns3_roh_cmdq_init_regs(hroh_dev, HNS3_ROH_CMDQ_CRQ);
++
++	return 0;
++
++err_crq:
++	hns3_roh_free_cmdq_desc(hroh_dev, &priv->cmdq.csq);
++	return ret;
++}
++
++void hns3_roh_cmdq_exit(struct hns3_roh_device *hroh_dev)
++{
++	struct hns3_roh_priv *priv = (struct hns3_roh_priv *)hroh_dev->priv;
++
++	spin_lock_bh(&priv->cmdq.csq.lock);
++	spin_lock(&priv->cmdq.crq.lock);
++	hns3_roh_cmdq_clear_regs(hroh_dev);
++	spin_unlock(&priv->cmdq.crq.lock);
++	spin_unlock_bh(&priv->cmdq.csq.lock);
++
++	hns3_roh_free_cmdq_desc(hroh_dev, &priv->cmdq.csq);
++	hns3_roh_free_cmdq_desc(hroh_dev, &priv->cmdq.crq);
++}
++
++static int hns3_roh_cmdq_space(struct hns3_roh_cmdq_ring *ring)
++{
++	int ntu = ring->next_to_use;
++	int ntc = ring->next_to_clean;
++	int used = (ntu - ntc + ring->desc_num) % ring->desc_num;
++
++	return ring->desc_num - used - 1;
++}
++
++void hns3_roh_cmdq_setup_basic_desc(struct hns3_roh_desc *desc,
++				    enum hns3_roh_opcode_type opcode,
++				    bool is_read)
++{
++	memset((void *)desc, 0, sizeof(struct hns3_roh_desc));
++	desc->opcode = cpu_to_le16(opcode);
++	desc->flag = cpu_to_le16(HNS3_ROH_CMD_FLAG_NO_INTR | HNS3_ROH_CMD_FLAG_IN);
++	if (is_read)
++		desc->flag |= cpu_to_le16(HNS3_ROH_CMD_FLAG_WR);
++}
++
++static int hns3_roh_cmdq_csq_done(struct hns3_roh_device *hroh_dev)
++{
++	struct hns3_roh_priv *priv = (struct hns3_roh_priv *)hroh_dev->priv;
++	u32 head = hns3_roh_read(hroh_dev, HNS3_ROH_TX_CMDQ_HEAD_REG);
++
++	return head == priv->cmdq.csq.next_to_use;
++}
++
++static int hns3_roh_cmdq_csq_clean(struct hns3_roh_device *hroh_dev)
++{
++	struct hns3_roh_priv *priv = (struct hns3_roh_priv *)hroh_dev->priv;
++	struct hns3_roh_cmdq_ring *csq = &priv->cmdq.csq;
++	u16 ntc = csq->next_to_clean;
++	struct hns3_roh_desc *desc;
++	int clean = 0;
++	u32 head;
++
++	desc = &csq->desc[ntc];
++	head = hns3_roh_read(hroh_dev, HNS3_ROH_TX_CMDQ_HEAD_REG);
++	while (head != ntc) {
++		memset(desc, 0, sizeof(*desc));
++		ntc++;
++		if (ntc == csq->desc_num)
++			ntc = 0;
++		desc = &csq->desc[ntc];
++		clean++;
++	}
++	csq->next_to_clean = ntc;
++
++	return clean;
++}
++
++static int hns3_roh_cmdq_build(struct hns3_roh_device *hroh_dev,
++			       struct hns3_roh_desc *desc,
++			       int num, int *ntc)
++{
++	struct hns3_roh_priv *priv = (struct hns3_roh_priv *)hroh_dev->priv;
++	struct hns3_roh_cmdq_ring *csq = &priv->cmdq.csq;
++	struct hns3_roh_desc *desc_to_use = NULL;
++	int handle = 0;
++
++	if (num > hns3_roh_cmdq_space(csq)) {
++		dev_err(hroh_dev->dev, "cmdq is full, opcode %x\n", desc->opcode);
++		return -EBUSY;
++	}
++
++	*ntc = csq->next_to_use;
++	while (handle < num) {
++		desc_to_use = &csq->desc[csq->next_to_use];
++		*desc_to_use = desc[handle];
++		csq->next_to_use++;
++		if (csq->next_to_use == csq->desc_num)
++			csq->next_to_use = 0;
++		handle++;
++	}
++
++	return 0;
++}
++
++static int hns3_roh_cmdq_done_parse(struct hns3_roh_device *hroh_dev,
++				    struct hns3_roh_desc *desc,
++				    int num, int ntc)
++{
++	struct hns3_roh_priv *priv = (struct hns3_roh_priv *)hroh_dev->priv;
++	struct hns3_roh_cmdq_ring *csq = &priv->cmdq.csq;
++	struct hns3_roh_desc *desc_to_use = NULL;
++	int handle = 0;
++	u16 desc_ret;
++	int ret;
++
++	if (hns3_roh_cmdq_csq_done(hroh_dev)) {
++		while (handle < num) {
++			desc_to_use = &csq->desc[ntc];
++			desc[handle] = *desc_to_use;
++			desc_ret = le16_to_cpu(desc[handle].retval);
++			if (desc_ret == HNS3_ROH_CMD_EXEC_SUCCESS) {
++				ret = 0;
++			} else if (desc_ret == HNS3_ROH_CMD_EXEC_TIMEOUT) {
++				priv->cmdq.last_status = desc_ret;
++				ret = -ETIME;
++			} else {
++				pr_err("desc_ret = %d\n", desc_ret);
++				ret = -EIO;
++			}
++
++			ntc++;
++			handle++;
++			if (ntc == csq->desc_num)
++				ntc = 0;
++		}
++	} else {
++		ret = -EAGAIN;
++	}
++
++	return ret;
++}
++
++int hns3_roh_cmdq_send(struct hns3_roh_device *hroh_dev, struct hns3_roh_desc *desc, int num)
++{
++	struct hns3_roh_priv *priv = (struct hns3_roh_priv *)hroh_dev->priv;
++	struct hns3_roh_cmdq_ring *csq = &priv->cmdq.csq;
++	u32 timeout = 0;
++	int handle = 0;
++	int ntc = 0;
++	int ret = 0;
++
++	spin_lock_bh(&csq->lock);
++	ret = hns3_roh_cmdq_build(hroh_dev, desc, num, &ntc);
++	if (ret) {
++		spin_unlock_bh(&csq->lock);
++		return ret;
++	}
++
++	/* Write to hardware */
++	hns3_roh_write(hroh_dev, HNS3_ROH_TX_CMDQ_TAIL_REG, csq->next_to_use);
++
++	if (desc->flag & cpu_to_le16(HNS3_ROH_CMD_FLAG_NO_INTR)) {
++		do {
++			if (hns3_roh_cmdq_csq_done(hroh_dev))
++				break;
++			udelay(1);
++			timeout++;
++		} while (timeout < priv->cmdq.tx_timeout);
++	}
++
++	ret = hns3_roh_cmdq_done_parse(hroh_dev, desc, num, ntc);
++
++	handle = hns3_roh_cmdq_csq_clean(hroh_dev);
++	if (handle != num)
++		dev_warn(hroh_dev->dev, "cleaned %d, need to clean %d\n", handle, num);
++	spin_unlock_bh(&csq->lock);
++
++	return ret;
++}
+diff --git a/drivers/roh/hw/hns3/hns3_cmdq.h b/drivers/roh/hw/hns3/hns3_cmdq.h
+new file mode 100644
+index 000000000000..ca6df81c43d9
+--- /dev/null
++++ b/drivers/roh/hw/hns3/hns3_cmdq.h
+@@ -0,0 +1,70 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++// Copyright (c) 2020-2022 Hisilicon Limited.
++
++#ifndef __HNS3_ROH_CMDQ_H__
++#define __HNS3_ROH_CMDQ_H__
++
++#include "hns3_common.h"
++
++#define HNS3_ROH_MAILBOX_SIZE 4096
++#define HNS3_ROH_CMDQ_DESC_NUM 3
++#define HNS3_ROH_CMDQ_TX_TIMEOUT 30000
++
++#define HNS3_ROH_MAX_CMD_NUM 32
++
++#define HNS3_ROH_CMDQ_CSQ_DESC_NUM 1024
++#define HNS3_ROH_CMDQ_CRQ_DESC_NUM 1024
++
++#define HNS3_ROH_CMD_FLAG_IN BIT(0)
++#define HNS3_ROH_CMD_FLAG_OUT BIT(1)
++#define HNS3_ROH_CMD_FLAG_NEXT BIT(2)
++#define HNS3_ROH_CMD_FLAG_WR BIT(3)
++#define HNS3_ROH_CMD_FLAG_NO_INTR BIT(4)
++#define HNS3_ROH_CMD_FLAG_ERR_INTR BIT(5)
++
++enum { HNS3_ROH_CMDQ_CRQ = 0, HNS3_ROH_CMDQ_CSQ };
++
++enum hns3_roh_opcode_type {
++	HNS3_ROH_OPC_GET_INTR_INFO = 0x0023,
++	HNS3_ROH_OPC_SET_EID = 0x9001,
++	HNS3_ROH_OPC_GET_GUID = 0x9002,
++	HNS3_ROH_OPC_QUERY_MIB_PUBLIC = 0x9005,
++	HNS3_ROH_OPC_QUERY_MIB_PRIVATE = 0x9006,
++};
++
++enum hns3_roh_cmd_return_status {
++	HNS3_ROH_CMD_EXEC_SUCCESS = 0,
++	HNS3_ROH_CMD_NO_AUTH,
++	HNS3_ROH_CMD_NOT_EXIST,
++	HNS3_ROH_CMD_QUEUE_FULL,
++	HNS3_ROH_CMD_NEXT_ERR,
++	HNS3_ROH_CMD_NOT_EXEC,
++	HNS3_ROH_CMD_PARA_ERR,
++	HNS3_ROH_CMD_RESULT_ERR,
++	HNS3_ROH_CMD_EXEC_TIMEOUT
++};
++
++struct hns3_roh_set_eid_info {
++	__le32 base_eid;
++	__le32 num_eid;
++	u8 rsv[16];
++};
++
++struct hns3_roh_get_guid_info {
++	u8 guid[16];
++	u8 rsv[8];
++};
++
++static inline void hns3_roh_mbx_ring_ptr_move_crq(struct hns3_roh_cmdq_ring *crq)
++{
++	crq->next_to_use = (crq->next_to_use + 1) % crq->desc_num;
++}
++
++int hns3_roh_cmdq_init(struct hns3_roh_device *hroh_dev);
++void hns3_roh_cmdq_exit(struct hns3_roh_device *hroh_dev);
++int hns3_roh_cmdq_send(struct hns3_roh_device *hroh_dev,
++		       struct hns3_roh_desc *desc, int num);
++void hns3_roh_cmdq_setup_basic_desc(struct hns3_roh_desc *desc,
++				    enum hns3_roh_opcode_type opcode, bool is_read);
++
++#endif /* __HNS3_ROH_CMDQ_H__ */
+diff --git a/drivers/roh/hw/hns3/hns3_common.h b/drivers/roh/hw/hns3/hns3_common.h
+index 707885e734fc..5109b3aefb97 100644
+--- a/drivers/roh/hw/hns3/hns3_common.h
++++ b/drivers/roh/hw/hns3/hns3_common.h
+@@ -10,8 +10,44 @@
+ 
+ #define HNS3_ROH_NAME "roh"
+ 
++#define HNS3_ROH_DESC_DATA_LEN 6
++
++struct hns3_roh_desc {
++	__le16 opcode;
++
++#define HNS3_ROH_CMDQ_RX_INVLD_B 0
++#define HNS3_ROH_CMDQ_RX_OUTVLD_B 1
++
++	__le16 flag;
++	__le16 retval;
++	__le16 rsv;
++	__le32 data[HNS3_ROH_DESC_DATA_LEN];
++};
++
++struct hns3_roh_cmdq_ring {
++	dma_addr_t desc_dma_addr;
++	struct hns3_roh_desc *desc;
++	u32 head;
++	u32 tail;
++
++	u16 buf_size;
++	u16 desc_num;
++	int next_to_use;
++	int next_to_clean;
++	u8 flag;
++	spinlock_t lock; /* CMDq lock */
++};
++
++struct hns3_roh_cmdq {
++	struct hns3_roh_cmdq_ring csq;
++	struct hns3_roh_cmdq_ring crq;
++	u16 tx_timeout;
++	u16 last_status;
++};
++
+ struct hns3_roh_priv {
+ 	struct hnae3_handle *handle;
++	struct hns3_roh_cmdq cmdq;
+ 	unsigned long state;
+ };
+ 
+@@ -23,9 +59,15 @@ struct hns3_roh_device {
+ 	struct net_device *netdev;
+ 
+ 	u8 __iomem *reg_base;
++	const struct hns3_roh_hw *hw;
+ 	struct hns3_roh_priv *priv;
+ };
+ 
++struct hns3_roh_hw {
++	int (*cmdq_init)(struct hns3_roh_device *hroh_dev);
++	void (*cmdq_exit)(struct hns3_roh_device *hroh_dev);
++};
++
+ static inline struct hns3_roh_device *to_hroh_dev(struct roh_device *rohdev)
+ {
+ 	return container_of(rohdev, struct hns3_roh_device, roh_dev);
+diff --git a/drivers/roh/hw/hns3/hns3_main.c b/drivers/roh/hw/hns3/hns3_main.c
+index e766b5c5c943..85ff9b15bd4b 100644
+--- a/drivers/roh/hw/hns3/hns3_main.c
++++ b/drivers/roh/hw/hns3/hns3_main.c
+@@ -8,6 +8,7 @@
+ #include "core.h"
+ #include "hnae3.h"
+ #include "hns3_common.h"
++#include "hns3_cmdq.h"
+ 
+ static const struct pci_device_id hns3_roh_pci_tbl[] = {
+ 	{ PCI_VDEVICE(HUAWEI, HNAE3_DEV_ID_100G_ROH), 0 },
+@@ -49,30 +50,66 @@ static int hns3_roh_register_device(struct hns3_roh_device *hroh_dev)
+ 	return 0;
+ }
+ 
++static int hns3_roh_init_hw(struct hns3_roh_device *hroh_dev)
++{
++	struct device *dev = hroh_dev->dev;
++	int ret;
++
++	ret = hroh_dev->hw->cmdq_init(hroh_dev);
++	if (ret) {
++		dev_err(dev, "failed to init cmdq, ret = %d\n", ret);
++		return ret;
++	}
++
++	return 0;
++}
++
++static void hns3_roh_uninit_hw(struct hns3_roh_device *hroh_dev)
++{
++	hroh_dev->hw->cmdq_exit(hroh_dev);
++}
++
+ static int hns3_roh_init(struct hns3_roh_device *hroh_dev)
+ {
+ 	struct device *dev = hroh_dev->dev;
+ 	int ret;
+ 
++	ret = hns3_roh_init_hw(hroh_dev);
++	if (ret) {
++		dev_err(dev, "failed to init hw resources, ret = %d\n", ret);
++		return ret;
++	}
++
+ 	ret = hns3_roh_register_device(hroh_dev);
+ 	if (ret) {
+ 		dev_err(dev, "failed to register roh device, ret = %d\n", ret);
+-		return ret;
++		goto err_uninit_hw;
+ 	}
+ 
+ 	dev_info(dev, "%s driver init success.\n", HNS3_ROH_NAME);
+ 
+ 	return 0;
++
++err_uninit_hw:
++	hns3_roh_uninit_hw(hroh_dev);
++	return ret;
+ }
+ 
+ static void hns3_roh_exit(struct hns3_roh_device *hroh_dev)
+ {
+ 	hns3_roh_unregister_device(hroh_dev);
+ 
++	hns3_roh_uninit_hw(hroh_dev);
++
+ 	dev_info(&hroh_dev->pdev->dev,
+ 		 "%s driver uninit success.\n", HNS3_ROH_NAME);
+ }
+ 
++static const struct hns3_roh_hw hns3_roh_hw = {
++	.cmdq_init = hns3_roh_cmdq_init,
++	.cmdq_exit = hns3_roh_cmdq_exit,
++};
++
+ static void hns3_roh_get_cfg_from_frame(struct hns3_roh_device *hroh_dev,
+ 					struct hnae3_handle *handle)
+ {
+@@ -82,6 +119,8 @@ static void hns3_roh_get_cfg_from_frame(struct hns3_roh_device *hroh_dev,
+ 	hroh_dev->netdev = handle->rohinfo.netdev;
+ 	hroh_dev->reg_base = handle->rohinfo.roh_io_base;
+ 
++	hroh_dev->hw = &hns3_roh_hw;
++
+ 	hroh_dev->priv->handle = handle;
+ }
+ 
+diff --git a/drivers/roh/hw/hns3/hns3_reg.h b/drivers/roh/hw/hns3/hns3_reg.h
+new file mode 100644
+index 000000000000..072c21ef1909
+--- /dev/null
++++ b/drivers/roh/hw/hns3/hns3_reg.h
+@@ -0,0 +1,31 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++// Copyright (c) 2020-2022 Hisilicon Limited.
++#ifndef __HNS3_ROH_REG_H__
++#define __HNS3_ROH_REG_H__
++
++/* CMDq Reg */
++#define HNS3_ROH_CMDQ_BASE 0x26000
++#define HNS3_ROH_TX_CMDQ_BASEADDR_L_REG (HNS3_ROH_CMDQ_BASE + 0x0)
++#define HNS3_ROH_TX_CMDQ_BASEADDR_H_REG (HNS3_ROH_CMDQ_BASE + 0x4)
++#define HNS3_ROH_TX_CMDQ_DEPTH_REG (HNS3_ROH_CMDQ_BASE + 0x8)
++#define HNS3_ROH_TX_CMDQ_TAIL_REG (HNS3_ROH_CMDQ_BASE + 0x10)
++#define HNS3_ROH_TX_CMDQ_HEAD_REG (HNS3_ROH_CMDQ_BASE + 0x14)
++
++#define HNS3_ROH_RX_CMDQ_BASEADDR_L_REG (HNS3_ROH_CMDQ_BASE + 0x18)
++#define HNS3_ROH_RX_CMDQ_BASEADDR_H_REG (HNS3_ROH_CMDQ_BASE + 0x1c)
++#define HNS3_ROH_RX_CMDQ_DEPTH_REG (HNS3_ROH_CMDQ_BASE + 0x20)
++#define HNS3_ROH_RX_CMDQ_TAIL_REG (HNS3_ROH_CMDQ_BASE + 0x24)
++#define HNS3_ROH_RX_CMDQ_HEAD_REG (HNS3_ROH_CMDQ_BASE + 0x28)
++
++/* Vector0 interrupt CMDQ event source register(RW) */
++#define HNS3_ROH_VECTOR0_CMDQ_SRC_REG (HNS3_ROH_CMDQ_BASE + 0x110)
++#define HNS3_ROH_VECTOR0_RX_CMDQ_INT_B 1
++
++#define HNS3_ROH_VECTOR0_INT_CTRL_REG 0x20404
++
++#define hns3_roh_write(dev, reg, val) writel((val), (dev)->reg_base + (reg))
++#define hns3_roh_read(dev, reg) readl((dev)->reg_base + (reg))
++#define hns3_roh_raw_write(value, addr) \
++	__raw_writel((__force u32)cpu_to_le32(value), (addr))
++
++#endif /* __HNS3_ROH_REG_H__ */
+-- 
+2.33.0
+

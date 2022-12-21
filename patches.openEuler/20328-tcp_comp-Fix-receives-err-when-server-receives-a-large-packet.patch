@@ -1,0 +1,80 @@
+From 58ab57d405d01dc8cdaf0349a0986ff7e918cf43 Mon Sep 17 00:00:00 2001
+From: Lu Wei <luwei32@huawei.com>
+Date: Tue, 15 Nov 2022 23:04:06 +0800
+Subject: [PATCH] tcp_comp: Fix receives err when server receives a large
+ packet
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 58ab57d405d01dc8cdaf0349a0986ff7e918cf43
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 186745, https://gitee.com/openeuler/kernel/issues/I60M9A
+CVE: NA
+
+----------------------------------------
+
+When tcp compression is uses, if server receives a large packet,
+which is larger than PAGE_SIZES * MAX_SKB_FRAGS bytes, it needs
+more than one skb to store the data since one skb can only store
+PAGE_SIZES * MAX_SKB_FRAGS bytes data.
+    In function tcp_comp_decompress(), it breaks the while-loop
+which copy decompressed data to new skb when more than MAX_SKB_FRAGS
+pages is needed, causing part of data is copied into the new skb and
+received by user but the compressed_len is not added. In this case,
+the data will be decompressed infinitely.
+    The patch limits the decompressed length so it can be copied
+into one skb. Moreover, once a skb is full, quit decompress process
+directly.
+
+Fixes: c31c696f9300 ("tcp_comp: Del compressed_data and remaining_data from tcp_comp_context_rx")
+Signed-off-by: Lu Wei <luwei32@huawei.com>
+Reviewed-by: Yue Haibing <yuehaibing@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ net/ipv4/tcp_comp.c | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/net/ipv4/tcp_comp.c b/net/ipv4/tcp_comp.c
+index ffddbd6d3a6b..add060c8432d 100644
+--- a/net/ipv4/tcp_comp.c
++++ b/net/ipv4/tcp_comp.c
+@@ -9,9 +9,10 @@
+ #include <linux/zstd.h>
+ 
+ #define TCP_COMP_MAX_PADDING	64
+-#define TCP_COMP_SCRATCH_SIZE	65535
++#define TCP_COMP_DATA_SIZE	65536
++#define TCP_COMP_SCRATCH_SIZE	(TCP_COMP_DATA_SIZE - 1)
+ #define TCP_COMP_MAX_CSIZE	(TCP_COMP_SCRATCH_SIZE + TCP_COMP_MAX_PADDING)
+-#define TCP_COMP_ALLOC_ORDER   get_order(65536)
++#define TCP_COMP_ALLOC_ORDER   get_order(TCP_COMP_DATA_SIZE)
+ #define TCP_COMP_MAX_WINDOWLOG 17
+ #define TCP_COMP_MAX_INPUT (1 << TCP_COMP_MAX_WINDOWLOG)
+ 
+@@ -589,6 +590,9 @@ static int tcp_comp_decompress(struct sock *sk, struct sk_buff *skb, int flags)
+ 		return -ENOMEM;
+ 
+ 	while (compressed_len < (skb->len - rxm->offset)) {
++		if (skb_shinfo(nskb)->nr_frags >= MAX_SKB_FRAGS)
++			break;
++
+ 		len = 0;
+ 		plen = skb->len - rxm->offset - compressed_len;
+ 		if (plen > TCP_COMP_MAX_CSIZE)
+@@ -600,7 +604,8 @@ static int tcp_comp_decompress(struct sock *sk, struct sk_buff *skb, int flags)
+ 
+ 		outbuf.dst = ctx->rx.plaintext_data;
+ 		outbuf.pos = 0;
+-		outbuf.size = TCP_COMP_MAX_CSIZE * 32;
++		outbuf.size = MAX_SKB_FRAGS * TCP_COMP_DATA_SIZE;
++		outbuf.size -= skb_shinfo(nskb)->nr_frags * TCP_COMP_DATA_SIZE;
+ 
+ 		ret = ZSTD_decompressStream(ctx->rx.dstream, &outbuf, &inbuf);
+ 		if (ZSTD_isError(ret)) {
+-- 
+2.33.0
+

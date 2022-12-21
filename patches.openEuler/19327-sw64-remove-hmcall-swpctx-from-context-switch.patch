@@ -1,0 +1,650 @@
+From 14e852c089e0a6beaba933b55bd1a158da57a059 Mon Sep 17 00:00:00 2001
+From: He Sheng <hesheng@wxiat.com>
+Date: Tue, 28 Jun 2022 14:03:13 +0800
+Subject: [PATCH] sw64: remove hmcall swpctx from context switch
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 14e852c089e0a6beaba933b55bd1a158da57a059
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56OLG
+
+--------------------------------
+
+It used to switch context in hmcall swpctx, which is not flexible
+enough. We try to make it happen in kernel without hmcall swpctx.
+
+To achieve this end, not only fpu state but also usp and tls pointer
+have to be saved and restored. For process creation and hibernation,
+the current tls pointer has to be read from CSR:TID as it may be out-
+of-sync with the saved value. For suspend, it's better to be saved
+and restored because there is no guarantee that WAKEUP interrupt will
+be used. To do this, we add hmcall fixup to access CSR:TID and obtain
+backward compatibility for user.
+
+Besides, the old `unique` is too obscure to be understood. To make it
+clear, we rename it to `tp` which is short for tls pointer, and then
+retain HMC_rdunique/wrunique as alias of HMC_rdtp/wrtp.
+
+Signed-off-by: He Sheng <hesheng@wxiat.com>
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/include/asm/hmcall.h      | 14 ++++----
+ arch/sw_64/include/asm/mmu_context.h | 20 ++++-------
+ arch/sw_64/include/asm/switch_to.h   | 31 ++++++++++------
+ arch/sw_64/include/asm/thread_info.h | 10 +++++-
+ arch/sw_64/include/asm/vcpu.h        |  2 +-
+ arch/sw_64/include/uapi/asm/hmcall.h |  6 ++--
+ arch/sw_64/include/uapi/asm/ptrace.h |  3 +-
+ arch/sw_64/kernel/Makefile           |  2 +-
+ arch/sw_64/kernel/early_init.c       |  1 +
+ arch/sw_64/kernel/entry.S            | 52 ++++++++++++---------------
+ arch/sw_64/kernel/hibernate.c        |  4 +--
+ arch/sw_64/kernel/hmcall.c           | 54 ++++++++++++++++++++++++++++
+ arch/sw_64/kernel/kgdb.c             |  2 +-
+ arch/sw_64/kernel/process.c          | 16 ++++++---
+ arch/sw_64/kernel/ptrace.c           |  2 +-
+ arch/sw_64/kernel/smp.c              |  2 +-
+ arch/sw_64/kernel/suspend.c          |  2 ++
+ arch/sw_64/mm/fault.c                | 10 +++---
+ arch/sw_64/mm/init.c                 | 13 +------
+ 19 files changed, 151 insertions(+), 95 deletions(-)
+ create mode 100644 arch/sw_64/kernel/hmcall.c
+
+diff --git a/arch/sw_64/include/asm/hmcall.h b/arch/sw_64/include/asm/hmcall.h
+index 30afc542039c..084a39ba649e 100644
+--- a/arch/sw_64/include/asm/hmcall.h
++++ b/arch/sw_64/include/asm/hmcall.h
+@@ -45,20 +45,19 @@
+ 
+ 
+ /* 0x80  - 0xBF : User Level HMC routine */
+-#define HMC_bpt			0x80
+-#define HMC_callsys		0x83
+-#define HMC_imb			0x86
++#include <uapi/asm/hmcall.h>
++
++/* Following will be deprecated from user level invocation */
+ #define HMC_rwreg		0x87
+-#define HMC_rdunique		0x9E
+-#define HMC_wrunique		0x9F
+ #define HMC_sz_uflush		0xA8
+-#define HMC_gentrap		0xAA
+-#define HMC_wrperfmon		0xB0
+ #define HMC_longtime		0xB1
+ 
+ #ifdef __KERNEL__
+ #ifndef __ASSEMBLY__
+ 
++#include <linux/init.h>
++extern void __init fixup_hmcall(void);
++
+ extern void halt(void) __attribute__((noreturn));
+ #define __halt() __asm__ __volatile__ ("sys_call %0 #halt" : : "i" (HMC_halt))
+ 
+@@ -183,6 +182,7 @@ __CALL_HMC_W1(wrtimer, unsigned long);
+ __CALL_HMC_RW3(tbivpn, unsigned long, unsigned long, unsigned long, unsigned long);
+ __CALL_HMC_RW2(cpuid, unsigned long, unsigned long, unsigned long);
+ 
++__CALL_HMC_W1(wrtp, unsigned long);
+ /*
+  * TB routines..
+  */
+diff --git a/arch/sw_64/include/asm/mmu_context.h b/arch/sw_64/include/asm/mmu_context.h
+index 3e75f34895bf..10199db1d637 100644
+--- a/arch/sw_64/include/asm/mmu_context.h
++++ b/arch/sw_64/include/asm/mmu_context.h
+@@ -73,8 +73,7 @@ switch_mm(struct mm_struct *prev_mm, struct mm_struct *next_mm,
+ 	  struct task_struct *next)
+ {
+ 	/* Check if our ASN is of an older version, and thus invalid. */
+-	unsigned long asn;
+-	unsigned long mmc;
++	unsigned long asn, mmc, ptbr;
+ 	long cpu = smp_processor_id();
+ 
+ #ifdef CONFIG_SMP
+@@ -94,17 +93,13 @@ switch_mm(struct mm_struct *prev_mm, struct mm_struct *next_mm,
+ #endif
+ 
+ 	/*
+-	 * Always update the PCB ASN.  Another thread may have allocated
+-	 * a new mm->context (via flush_tlb_mm) without the ASN serial
++	 * Update CSR:UPN and CSR:PTBR. Another thread may have allocated
++	 * a new mm->context[asid] (via flush_tlb_mm) without the ASN serial
+ 	 * number wrapping.  We have no way to detect when this is needed.
+ 	 */
+-	task_thread_info(next)->pcb.asn = mmc & HARDWARE_ASN_MASK;
+-	/*
+-	 * Always update the PCB PTBR. If next is kernel thread, it must
+-	 * update PTBR. If next is user process, it's ok to update PTBR.
+-	 */
+-	task_thread_info(next)->pcb.ptbr = virt_to_pfn(next_mm->pgd);
+-	load_asn_ptbr(task_thread_info(next)->pcb.asn, task_thread_info(next)->pcb.ptbr);
++	asn = mmc & HARDWARE_ASN_MASK;
++	ptbr = virt_to_pfn(next_mm->pgd);
++	load_asn_ptbr(asn, ptbr);
+ }
+ 
+ extern void __load_new_mm_context(struct mm_struct *);
+@@ -141,8 +136,6 @@ static inline int init_new_context(struct task_struct *tsk,
+ 
+ 	for_each_possible_cpu(i)
+ 		mm->context.asid[i] = 0;
+-	if (tsk != current)
+-		task_thread_info(tsk)->pcb.ptbr = virt_to_pfn(mm->pgd);
+ 	return 0;
+ }
+ 
+@@ -154,7 +147,6 @@ static inline void destroy_context(struct mm_struct *mm)
+ static inline void enter_lazy_tlb(struct mm_struct *mm,
+ 				  struct task_struct *tsk)
+ {
+-	task_thread_info(tsk)->pcb.ptbr = virt_to_pfn(mm->pgd);
+ }
+ 
+ static inline int arch_dup_mmap(struct mm_struct *oldmm,
+diff --git a/arch/sw_64/include/asm/switch_to.h b/arch/sw_64/include/asm/switch_to.h
+index d503fc59390f..967fe1d680da 100644
+--- a/arch/sw_64/include/asm/switch_to.h
++++ b/arch/sw_64/include/asm/switch_to.h
+@@ -6,27 +6,39 @@
+ 
+ extern void __fpstate_save(struct task_struct *save_to);
+ extern void __fpstate_restore(struct task_struct *restore_from);
+-extern struct task_struct *__switch_to(unsigned long pcb,
+-		struct task_struct *prev, struct task_struct *next);
++extern struct task_struct *__switch_to(struct task_struct *prev,
++				       struct task_struct *next);
+ extern void restore_da_match_after_sched(void);
+ 
+-static inline void fpstate_save(struct task_struct *task)
++static inline void aux_save(struct task_struct *task)
+ {
+-	if (likely(!(task->flags & PF_KTHREAD)))
++	struct pcb_struct *pcb;
++
++	if (likely(!(task->flags & PF_KTHREAD))) {
++		pcb = &task_thread_info(task)->pcb;
++		pcb->usp = rdusp();
++		pcb->tp = rtid();
+ 		__fpstate_save(task);
++	}
+ }
+ 
+-static inline void fpstate_restore(struct task_struct *task)
++static inline void aux_restore(struct task_struct *task)
+ {
+-	if (likely(!(task->flags & PF_KTHREAD)))
++	struct pcb_struct *pcb;
++
++	if (likely(!(task->flags & PF_KTHREAD))) {
++		pcb = &task_thread_info(task)->pcb;
++		wrusp(pcb->usp);
++		wrtp(pcb->tp);
+ 		__fpstate_restore(task);
++	}
+ }
+ 
+ static inline void __switch_to_aux(struct task_struct *prev,
+ 				   struct task_struct *next)
+ {
+-	fpstate_save(prev);
+-	fpstate_restore(next);
++	aux_save(prev);
++	aux_restore(next);
+ }
+ 
+ 
+@@ -34,9 +46,8 @@ static inline void __switch_to_aux(struct task_struct *prev,
+ do {									\
+ 	struct task_struct *__prev = (prev);				\
+ 	struct task_struct *__next = (next);				\
+-	__u64 __nextpcb = virt_to_phys(&task_thread_info(__next)->pcb);	\
+ 	__switch_to_aux(__prev, __next);				\
+-	(last) = __switch_to(__nextpcb, __prev, __next);		\
++	(last) = __switch_to(__prev, __next);				\
+ 	check_mmu_context();						\
+ } while (0)
+ 
+diff --git a/arch/sw_64/include/asm/thread_info.h b/arch/sw_64/include/asm/thread_info.h
+index 33b95f815448..8e4e1f372d73 100644
+--- a/arch/sw_64/include/asm/thread_info.h
++++ b/arch/sw_64/include/asm/thread_info.h
+@@ -20,7 +20,7 @@ struct pcb_struct {
+ 	unsigned long ptbr;
+ 	unsigned int pcc;
+ 	unsigned int asn;
+-	unsigned long unique;
++	unsigned long tp;
+ 	unsigned long flags;
+ 	unsigned long da_match, da_mask;
+ 	unsigned long dv_match, dv_mask;
+@@ -47,6 +47,14 @@ struct thread_info {
+ #endif
+ };
+ 
++static __always_inline u64 rtid(void)
++{
++	u64 val;
++
++	asm volatile("rtid %0" : "=r" (val) : :);
++	return val;
++}
++
+ /*
+  * Macros/functions for gaining access to the thread information structure.
+  */
+diff --git a/arch/sw_64/include/asm/vcpu.h b/arch/sw_64/include/asm/vcpu.h
+index 5b3fe80aed1b..476c396c5aa4 100644
+--- a/arch/sw_64/include/asm/vcpu.h
++++ b/arch/sw_64/include/asm/vcpu.h
+@@ -32,7 +32,7 @@ struct vcpucb {
+ 	unsigned long vcpu_irq_disabled;
+ 	unsigned long vcpu_irq;
+ 	unsigned long ptbr;
+-	unsigned long int_stat0;
++	unsigned long tid;
+ 	unsigned long int_stat1;
+ 	unsigned long int_stat2;
+ 	unsigned long int_stat3;
+diff --git a/arch/sw_64/include/uapi/asm/hmcall.h b/arch/sw_64/include/uapi/asm/hmcall.h
+index f10378ba99c8..dcff778e1616 100644
+--- a/arch/sw_64/include/uapi/asm/hmcall.h
++++ b/arch/sw_64/include/uapi/asm/hmcall.h
+@@ -7,8 +7,10 @@
+ #define HMC_bpt			0x80
+ #define HMC_callsys		0x83
+ #define HMC_imb			0x86
+-#define HMC_rdunique		0x9E
+-#define HMC_wrunique		0x9F
++#define HMC_rdtp		0x9E
++#define HMC_wrtp		0x9F
++#define HMC_rdunique		HMC_rdtp
++#define HMC_wrunique		HMC_wrtp
+ #define HMC_gentrap		0xAA
+ #define HMC_wrperfmon		0xB0
+ 
+diff --git a/arch/sw_64/include/uapi/asm/ptrace.h b/arch/sw_64/include/uapi/asm/ptrace.h
+index 80bad067fc15..5cf3ca1d3dd8 100644
+--- a/arch/sw_64/include/uapi/asm/ptrace.h
++++ b/arch/sw_64/include/uapi/asm/ptrace.h
+@@ -36,7 +36,8 @@ struct user_fpsimd_state {
+ #define FPREG_END		62
+ #define FPCR			63
+ #define PC			64
+-#define UNIQUE			65
++#define TP			65
++#define UNIQUE			TP
+ #define VECREG_BASE		67
+ #define VECREG_END		161
+ #define F31_V1			98
+diff --git a/arch/sw_64/kernel/Makefile b/arch/sw_64/kernel/Makefile
+index 8cc09dd8fdbc..02facabae2d9 100644
+--- a/arch/sw_64/kernel/Makefile
++++ b/arch/sw_64/kernel/Makefile
+@@ -17,7 +17,7 @@ obj-y    := entry.o fpu.o traps.o process.o sys_sw64.o irq.o \
+ 	    irq_sw64.o signal.o setup.o ptrace.o time.o \
+ 	    systbls.o dup_print.o tc.o timer.o \
+ 	    insn.o early_init.o topology.o cacheinfo.o \
+-	    vdso.o vdso/
++	    vdso.o vdso/ hmcall.o
+ 
+ obj-$(CONFIG_ACPI) += acpi.o
+ obj-$(CONFIG_STACKTRACE) += stacktrace.o
+diff --git a/arch/sw_64/kernel/early_init.c b/arch/sw_64/kernel/early_init.c
+index 392627bef8bb..2f38719cc216 100644
+--- a/arch/sw_64/kernel/early_init.c
++++ b/arch/sw_64/kernel/early_init.c
+@@ -23,6 +23,7 @@ static void __init sw64_setup_platform_ops(void)
+ 
+ asmlinkage __visible void __init sw64_start_kernel(void)
+ {
++	fixup_hmcall();
+ 	sw64_setup_chip_ops();
+ 	sw64_setup_platform_ops();
+ 	sw64_platform->ops_fixup();
+diff --git a/arch/sw_64/kernel/entry.S b/arch/sw_64/kernel/entry.S
+index f79c9a6ddf36..01896128ed23 100644
+--- a/arch/sw_64/kernel/entry.S
++++ b/arch/sw_64/kernel/entry.S
+@@ -384,11 +384,10 @@ $syscall_trace_failed:
+  * Integer register context switch
+  * The callee-saved registers must be saved and restored.
+  *
+- *   a0: physical address of next task's pcb, used by hmcode
+- *   a1: previous task_struct (must be preserved across the switch)
+- *   a2: next task_struct
++ *   a0: previous task_struct (must be preserved across the switch)
++ *   a1: next task_struct
+  *
+- * The value of a1  must be preserved by this function, as that's how
++ * The value of a0  must be preserved by this function, as that's how
+  * arguments are passed to schedule_tail.
+  */
+ 	.align 4
+@@ -397,33 +396,28 @@ $syscall_trace_failed:
+ __switch_to:
+ 	.prologue 0
+ 	/* Save context into prev->thread */
+-	stl	$26, TASK_THREAD_RA($17)
+-	stl	$30, TASK_THREAD_SP($17)
+-	stl	$9, TASK_THREAD_S0($17)
+-	stl	$10, TASK_THREAD_S1($17)
+-	stl	$11, TASK_THREAD_S2($17)
+-	stl	$12, TASK_THREAD_S3($17)
+-	stl	$13, TASK_THREAD_S4($17)
+-	stl	$14, TASK_THREAD_S5($17)
+-	stl	$15, TASK_THREAD_S6($17)
++	stl	$26, TASK_THREAD_RA($16)
++	stl	$30, TASK_THREAD_SP($16)
++	stl	$9, TASK_THREAD_S0($16)
++	stl	$10, TASK_THREAD_S1($16)
++	stl	$11, TASK_THREAD_S2($16)
++	stl	$12, TASK_THREAD_S3($16)
++	stl	$13, TASK_THREAD_S4($16)
++	stl	$14, TASK_THREAD_S5($16)
++	stl	$15, TASK_THREAD_S6($16)
+ 	/* Restore context from next->thread */
+-	ldl	$26, TASK_THREAD_RA($18)
+-	ldl	$9, TASK_THREAD_S0($18)
+-	ldl	$10, TASK_THREAD_S1($18)
+-	ldl	$11, TASK_THREAD_S2($18)
+-	ldl	$12, TASK_THREAD_S3($18)
+-	ldl	$13, TASK_THREAD_S4($18)
+-	ldl	$14, TASK_THREAD_S5($18)
+-	ldl	$15, TASK_THREAD_S6($18)
+-	sys_call HMC_swpctx
+-	/*
+-	 * SP has been saved and restored by HMC_swpctx,
+-	 * and restore it again here for future expansion.
+-	 */
+-	ldl     $30, TASK_THREAD_SP($18)
++	ldl	$26, TASK_THREAD_RA($17)
++	ldl     $30, TASK_THREAD_SP($17)
++	ldl	$9, TASK_THREAD_S0($17)
++	ldl	$10, TASK_THREAD_S1($17)
++	ldl	$11, TASK_THREAD_S2($17)
++	ldl	$12, TASK_THREAD_S3($17)
++	ldl	$13, TASK_THREAD_S4($17)
++	ldl	$14, TASK_THREAD_S5($17)
++	ldl	$15, TASK_THREAD_S6($17)
+ 	ldi	$8, 0x3fff
+ 	bic	$sp, $8, $8
+-	mov	$17, $0
++	mov	$16, $0
+ 	ret
+ 	.end __switch_to
+ 
+@@ -436,7 +430,6 @@ __switch_to:
+ 	.ent ret_from_fork
+ ret_from_fork:
+ 	ldi	$26, ret_from_sys_call
+-	mov	$17, $16
+ 	jmp	$31, schedule_tail
+ 	.end ret_from_fork
+ 
+@@ -447,7 +440,6 @@ ret_from_fork:
+ 	.globl ret_from_kernel_thread
+ 	.ent ret_from_kernel_thread
+ ret_from_kernel_thread:
+-	mov	$17, $16
+ 	call	$26, schedule_tail
+ 	mov	$9, $27
+ 	mov	$10, $16
+diff --git a/arch/sw_64/kernel/hibernate.c b/arch/sw_64/kernel/hibernate.c
+index 799706db5b94..0e7e860c507e 100644
+--- a/arch/sw_64/kernel/hibernate.c
++++ b/arch/sw_64/kernel/hibernate.c
+@@ -14,7 +14,7 @@ void save_processor_state(void)
+ 
+ 	vcb->ksp = rdksp();
+ 	vcb->usp = rdusp();
+-	vcb->pcbb = rdpcbb();
++	vcb->tid = rtid();
+ 	vcb->ptbr = rdptbr();
+ }
+ 
+@@ -24,7 +24,7 @@ void restore_processor_state(void)
+ 
+ 	wrksp(vcb->ksp);
+ 	wrusp(vcb->usp);
+-	wrpcbb(vcb->pcbb);
++	wrtp(vcb->tid);
+ 	wrptbr(vcb->ptbr);
+ 	sflush();
+ 	tbiv();
+diff --git a/arch/sw_64/kernel/hmcall.c b/arch/sw_64/kernel/hmcall.c
+new file mode 100644
+index 000000000000..b81d7fff1c34
+--- /dev/null
++++ b/arch/sw_64/kernel/hmcall.c
+@@ -0,0 +1,54 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * arch/sw_64/kernel/hmcall.c
++ *
++ * Copyright (C) 2022 WXIAT
++ * Author: He Sheng
++ */
++
++#include <asm/hmcall.h>
++#include <asm/page.h>
++
++#define A0(func)	(((HMC_##func & 0xFF) >> 6) & 0x1)
++#define A1(func)	((((HMC_##func & 0xFF)>>6) & 0x2) >> 1)
++#define A2(func)	((HMC_##func & 0x3F) << 7)
++
++#define T(func)		((A0(func) ^ A1(func)) & 0x1)
++#define B0(func)	((T(func) | A0(func)) << 13)
++#define B1(func)	(((~T(func) & 1) | A1(func)) << 14)
++
++#define PRI_BASE	0x10000UL
++
++#define HMCALL_ENTRY(func)	(PRI_BASE | B1(func) | B0(func) | A2(func))
++
++
++static inline void fixup_rdtp(void)
++{
++	unsigned int *entry = __va(HMCALL_ENTRY(rdtp));
++
++	entry[0] = 0x181ffec7;	/* pri_rcsr $0, CSR__TID */
++	entry[1] = 0x1ee00000;	/* pri_ret $23 */
++}
++
++static inline void fixup_wrtp(void)
++{
++	unsigned int *entry = __va(HMCALL_ENTRY(wrtp));
++
++	entry[0] = 0x1a1fffc7;	/* pri_wcsr $16, CSR__TID */
++	entry[1] = 0x1ee00000;	/* pri_ret $23 */
++}
++
++void __init fixup_hmcall(void)
++{
++#if defined(CONFIG_SUBARCH_C3A) || defined(CONFIG_SUBARCH_C3B)
++	fixup_rdtp();
++	fixup_wrtp();
++#endif
++}
++
++#undef A0
++#undef A1
++#undef A2
++#undef T
++#undef B0
++#undef B1
+diff --git a/arch/sw_64/kernel/kgdb.c b/arch/sw_64/kernel/kgdb.c
+index ac2f397f1609..95970b293de0 100644
+--- a/arch/sw_64/kernel/kgdb.c
++++ b/arch/sw_64/kernel/kgdb.c
+@@ -95,7 +95,7 @@ struct dbg_reg_def_t dbg_reg_def[DBG_MAX_REG_NUM] = {
+ 
+ 	{ "pc", 8, offsetof(struct pt_regs, pc)},
+ 	{ "", 8, -1 },
+-	{ "unique", 8, -1},
++	{ "tp", 8, -1},
+ };
+ 
+ char *dbg_get_reg(int regno, void *mem, struct pt_regs *regs)
+diff --git a/arch/sw_64/kernel/process.c b/arch/sw_64/kernel/process.c
+index f5525a194072..31e95e722e81 100644
+--- a/arch/sw_64/kernel/process.c
++++ b/arch/sw_64/kernel/process.c
+@@ -125,7 +125,7 @@ flush_thread(void)
+ 	wrfpcr(FPCR_DYN_NORMAL | ieee_swcr_to_fpcr(0));
+ 
+ 	/* Clean slate for TLS.  */
+-	current_thread_info()->pcb.unique = 0;
++	current_thread_info()->pcb.tp = 0;
+ }
+ 
+ void
+@@ -135,7 +135,11 @@ release_thread(struct task_struct *dead_task)
+ 
+ int arch_dup_task_struct(struct task_struct *dst, struct task_struct *src)
+ {
+-	fpstate_save(src);
++	/*
++	 * aux_save() has to read the current TLS pointer from CSR:TID as it
++	 * may be out-of-sync with the saved value.
++	 */
++	aux_save(src);
+ 	*dst = *src;
+ 	return 0;
+ }
+@@ -168,6 +172,7 @@ copy_thread(unsigned long clone_flags, unsigned long usp,
+ 		childti->pcb.usp = 0;
+ 		return 0;
+ 	}
++
+ 	/*
+ 	 * Note: if CLONE_SETTLS is not set, then we must inherit the
+ 	 * value from the parent, which will have been set by the block
+@@ -176,10 +181,11 @@ copy_thread(unsigned long clone_flags, unsigned long usp,
+ 	 * application calling fork.
+ 	 */
+ 	if (clone_flags & CLONE_SETTLS)
+-		childti->pcb.unique = tls;
++		childti->pcb.tp = regs->r20;
+ 	else
+ 		regs->r20 = 0;
+-	childti->pcb.usp = usp ?: rdusp();
++	if (usp)
++		childti->pcb.usp = usp;
+ 	*childregs = *regs;
+ 	childregs->r0 = 0;
+ 	childregs->r19 = 0;
+@@ -202,7 +208,7 @@ void sw64_elf_core_copy_regs(elf_greg_t *dest, struct pt_regs *regs)
+ 		dest[i] = *(__u64 *)((void *)regs + regoffsets[i]);
+ 	dest[30] = ti == current_thread_info() ? rdusp() : ti->pcb.usp;
+ 	dest[31] = regs->pc;
+-	dest[32] = ti->pcb.unique;
++	dest[32] = ti->pcb.tp;
+ }
+ EXPORT_SYMBOL(sw64_elf_core_copy_regs);
+ 
+diff --git a/arch/sw_64/kernel/ptrace.c b/arch/sw_64/kernel/ptrace.c
+index 064296711b2f..51826cdbe9ef 100644
+--- a/arch/sw_64/kernel/ptrace.c
++++ b/arch/sw_64/kernel/ptrace.c
+@@ -72,7 +72,7 @@ short regoffsets[32] = {
+ 
+ static int pcboff[] = {
+ 	[USP] = PCB_OFF(usp),
+-	[UNIQUE] = PCB_OFF(unique),
++	[TP] = PCB_OFF(tp),
+ 	[DA_MATCH] = PCB_OFF(da_match),
+ 	[DA_MASK] = PCB_OFF(da_mask),
+ 	[DV_MATCH] = PCB_OFF(dv_match),
+diff --git a/arch/sw_64/kernel/smp.c b/arch/sw_64/kernel/smp.c
+index 43d803c49545..8f752c604db0 100644
+--- a/arch/sw_64/kernel/smp.c
++++ b/arch/sw_64/kernel/smp.c
+@@ -111,7 +111,7 @@ void smp_callin(void)
+ 	mmgrab(&init_mm);
+ 	current->active_mm = &init_mm;
+ 	/* update csr:ptbr */
+-	wrptbr(PFN_PHYS(current_thread_info()->pcb.ptbr));
++	wrptbr(virt_to_phys(init_mm.pgd));
+ 
+ 	/* inform the notifiers about the new cpu */
+ 	notify_cpu_starting(cpuid);
+diff --git a/arch/sw_64/kernel/suspend.c b/arch/sw_64/kernel/suspend.c
+index 369bc1e19b85..994d8e245878 100644
+--- a/arch/sw_64/kernel/suspend.c
++++ b/arch/sw_64/kernel/suspend.c
+@@ -33,6 +33,7 @@ void sw64_suspend_enter(void)
+ 	 */
+ 
+ 	disable_local_timer();
++	current_thread_info()->pcb.tp = rtid();
+ 
+ #ifdef CONFIG_SW64_SUSPEND_DEEPSLEEP_BOOTCORE
+ 	sw64_suspend_deep_sleep(&suspend_state);
+@@ -40,6 +41,7 @@ void sw64_suspend_enter(void)
+ 	mtinten();
+ 	asm("halt");
+ #endif
++	wrtp(current_thread_info()->pcb.tp);
+ 
+ 	disable_local_timer();
+ }
+diff --git a/arch/sw_64/mm/fault.c b/arch/sw_64/mm/fault.c
+index b7fc2c816698..126752771b11 100644
+--- a/arch/sw_64/mm/fault.c
++++ b/arch/sw_64/mm/fault.c
+@@ -66,17 +66,15 @@ void show_all_vma(void)
+  */
+ void __load_new_mm_context(struct mm_struct *next_mm)
+ {
+-	unsigned long mmc;
+-	struct pcb_struct *pcb;
++	unsigned long mmc, asn, ptbr;
+ 
+ 	mmc = __get_new_mm_context(next_mm, smp_processor_id());
+ 	next_mm->context.asid[smp_processor_id()] = mmc;
+ 
+-	pcb = &current_thread_info()->pcb;
+-	pcb->asn = mmc & HARDWARE_ASN_MASK;
+-	pcb->ptbr = virt_to_pfn(next_mm->pgd);
++	asn = mmc & HARDWARE_ASN_MASK;
++	ptbr = virt_to_pfn(next_mm->pgd);
+ 
+-	load_asn_ptbr(pcb->asn, pcb->ptbr);
++	load_asn_ptbr(asn, ptbr);
+ }
+ 
+ /*
+diff --git a/arch/sw_64/mm/init.c b/arch/sw_64/mm/init.c
+index ef8e45ece0ff..93ec3ecdf4f1 100644
+--- a/arch/sw_64/mm/init.c
++++ b/arch/sw_64/mm/init.c
+@@ -82,19 +82,8 @@ pgd_alloc(struct mm_struct *mm)
+ static inline void
+ switch_to_system_map(void)
+ {
+-	unsigned long newptbr;
+-
+-	/*
+-	 * Initialize the kernel's page tables.  Linux puts the vptb in
+-	 * the last slot of the L1 page table.
+-	 */
+ 	memset(swapper_pg_dir, 0, PAGE_SIZE);
+-	newptbr = virt_to_pfn(swapper_pg_dir);
+-
+-	/* Also set up the real kernel PCB while we're at it.  */
+-	init_thread_info.pcb.ptbr = newptbr;
+-	init_thread_info.pcb.flags = 1;	/* set FEN, clear everything else */
+-	wrptbr(PFN_PHYS(newptbr));
++	wrptbr(virt_to_phys(swapper_pg_dir));
+ 	tbiv();
+ }
+ 
+-- 
+2.33.0
+

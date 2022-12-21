@@ -1,0 +1,257 @@
+From a11aeaf7596912b10867b64306a167dc4a1282f0 Mon Sep 17 00:00:00 2001
+From: He Sheng <hesheng@wxiat.com>
+Date: Tue, 9 Aug 2022 17:02:26 +0800
+Subject: [PATCH] sw64: clean up unused single step support in kernel
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: a11aeaf7596912b10867b64306a167dc4a1282f0
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5PNCX
+
+--------------------------------
+
+Single step is supported by GDB on sw64, and those unused code
+can be removed.
+
+Signed-off-by: He Sheng <hesheng@wxiat.com>
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/include/asm/ptrace.h      |   1 -
+ arch/sw_64/include/asm/thread_info.h |   3 -
+ arch/sw_64/kernel/proto.h            |   4 -
+ arch/sw_64/kernel/ptrace.c           | 111 +--------------------------
+ arch/sw_64/kernel/signal.c           |  16 ----
+ 5 files changed, 2 insertions(+), 133 deletions(-)
+
+diff --git a/arch/sw_64/include/asm/ptrace.h b/arch/sw_64/include/asm/ptrace.h
+index ac9943015663..c7267b1432dd 100644
+--- a/arch/sw_64/include/asm/ptrace.h
++++ b/arch/sw_64/include/asm/ptrace.h
+@@ -54,7 +54,6 @@ struct pt_regs {
+ 	unsigned long r18;
+ };
+ 
+-#define arch_has_single_step()		(1)
+ #define user_mode(regs) (((regs)->ps & 8) != 0)
+ #define instruction_pointer(regs) ((regs)->pc)
+ #define profile_pc(regs) instruction_pointer(regs)
+diff --git a/arch/sw_64/include/asm/thread_info.h b/arch/sw_64/include/asm/thread_info.h
+index 7cdafaec62e4..31740003d0b2 100644
+--- a/arch/sw_64/include/asm/thread_info.h
++++ b/arch/sw_64/include/asm/thread_info.h
+@@ -34,9 +34,6 @@ struct thread_info {
+ 	int			preempt_count;	/* 0 => preemptible, <0 => BUG */
+ 	unsigned int		status;		/* thread-synchronous flags */
+ 
+-	int bpt_nsaved;
+-	unsigned long bpt_addr[2];		/* breakpoint handling  */
+-	unsigned int bpt_insn[2];
+ #ifdef CONFIG_DYNAMIC_FTRACE
+ 	unsigned long		dyn_ftrace_addr;
+ #endif
+diff --git a/arch/sw_64/kernel/proto.h b/arch/sw_64/kernel/proto.h
+index f84629ec05ea..8c31eca3cc32 100644
+--- a/arch/sw_64/kernel/proto.h
++++ b/arch/sw_64/kernel/proto.h
+@@ -7,10 +7,6 @@
+ #include <asm/pgtable.h>
+ #include <asm/sw64io.h>
+ 
+-/* ptrace.c */
+-extern int ptrace_set_bpt(struct task_struct *child);
+-extern int ptrace_cancel_bpt(struct task_struct *child);
+-
+ /* traps.c */
+ extern void show_regs(struct pt_regs *regs);
+ extern void die(char *str, struct pt_regs *regs, long err);
+diff --git a/arch/sw_64/kernel/ptrace.c b/arch/sw_64/kernel/ptrace.c
+index 51826cdbe9ef..e8b9ec104e3b 100644
+--- a/arch/sw_64/kernel/ptrace.c
++++ b/arch/sw_64/kernel/ptrace.c
+@@ -154,119 +154,12 @@ put_reg(struct task_struct *task, unsigned long regno, unsigned long data)
+ 	return 0;
+ }
+ 
+-static inline int
+-read_int(struct task_struct *task, unsigned long addr, int *data)
+-{
+-	int copied = access_process_vm(task, addr, data, sizeof(int), FOLL_FORCE);
+-
+-	return (copied == sizeof(int)) ? 0 : -EIO;
+-}
+-
+-static inline int
+-write_int(struct task_struct *task, unsigned long addr, int data)
+-{
+-	int copied = access_process_vm(task, addr, &data, sizeof(int),
+-			FOLL_FORCE | FOLL_WRITE);
+-	return (copied == sizeof(int)) ? 0 : -EIO;
+-}
+-
+-/*
+- * Set breakpoint.
+- */
+-int
+-ptrace_set_bpt(struct task_struct *child)
+-{
+-	int displ, i, res, reg_b, nsaved = 0;
+-	unsigned int insn, op_code;
+-	unsigned long pc;
+-
+-	pc = get_reg(child, REG_PC);
+-	res = read_int(child, pc, (int *)&insn);
+-	if (res < 0)
+-		return res;
+-
+-	op_code = insn >> 26;
+-	/* br bsr beq bne blt ble bgt bge blbc blbs fbeq fbne fblt fble fbgt fbge */
+-	if ((1UL << op_code) & 0x3fff000000000030UL) {
+-		/*
+-		 * It's a branch: instead of trying to figure out
+-		 * whether the branch will be taken or not, we'll put
+-		 * a breakpoint at either location.  This is simpler,
+-		 * more reliable, and probably not a whole lot slower
+-		 * than the alternative approach of emulating the
+-		 * branch (emulation can be tricky for fp branches).
+-		 */
+-		displ = ((s32)(insn << 11)) >> 9;
+-		task_thread_info(child)->bpt_addr[nsaved++] = pc + 4;
+-		if (displ) /* guard against unoptimized code */
+-			task_thread_info(child)->bpt_addr[nsaved++]
+-				= pc + 4 + displ;
+-		/*call ret jmp*/
+-	} else if (op_code >= 0x1 && op_code <= 0x3) {
+-		reg_b = (insn >> 16) & 0x1f;
+-		task_thread_info(child)->bpt_addr[nsaved++] = get_reg(child, reg_b);
+-	} else {
+-		task_thread_info(child)->bpt_addr[nsaved++] = pc + 4;
+-	}
+-
+-	/* install breakpoints: */
+-	for (i = 0; i < nsaved; ++i) {
+-		res = read_int(child, task_thread_info(child)->bpt_addr[i],
+-				(int *)&insn);
+-		if (res < 0)
+-			return res;
+-		task_thread_info(child)->bpt_insn[i] = insn;
+-		res = write_int(child, task_thread_info(child)->bpt_addr[i],
+-				BREAKINST);
+-		if (res < 0)
+-			return res;
+-	}
+-	task_thread_info(child)->bpt_nsaved = nsaved;
+-	return 0;
+-}
+-
+ /*
+- * Ensure no single-step breakpoint is pending.  Returns non-zero
+- * value if child was being single-stepped.
+- */
+-int
+-ptrace_cancel_bpt(struct task_struct *child)
+-{
+-	int i, nsaved = task_thread_info(child)->bpt_nsaved;
+-
+-	task_thread_info(child)->bpt_nsaved = 0;
+-
+-	if (nsaved > 2) {
+-		printk("%s: bogus nsaved: %d!\n", __func__, nsaved);
+-		nsaved = 2;
+-	}
+-
+-	for (i = 0; i < nsaved; ++i) {
+-		write_int(child, task_thread_info(child)->bpt_addr[i],
+-				task_thread_info(child)->bpt_insn[i]);
+-	}
+-	return (nsaved != 0);
+-}
+-
+-void user_enable_single_step(struct task_struct *child)
+-{
+-	/* Mark single stepping.  */
+-	task_thread_info(child)->bpt_nsaved = -1;
+-}
+-
+-void user_disable_single_step(struct task_struct *child)
+-{
+-	ptrace_cancel_bpt(child);
+-}
+-
+-/*
+- * Called by kernel/ptrace.c when detaching..
+- *
+- * Make sure the single step bit is not set.
++ * Called by ptrace_detach
+  */
+ void ptrace_disable(struct task_struct *child)
+ {
+-	user_disable_single_step(child);
++	/**/
+ }
+ 
+ static int gpr_get(struct task_struct *target,
+diff --git a/arch/sw_64/kernel/signal.c b/arch/sw_64/kernel/signal.c
+index a1edc5300742..5b3664ab6591 100644
+--- a/arch/sw_64/kernel/signal.c
++++ b/arch/sw_64/kernel/signal.c
+@@ -163,11 +163,6 @@ do_sigreturn(struct sigcontext __user *sc)
+ 	if (restore_sigcontext(sc, regs))
+ 		goto give_sigsegv;
+ 
+-	/* Send SIGTRAP if we're single-stepping: */
+-	if (ptrace_cancel_bpt(current)) {
+-		force_sig_fault(SIGTRAP, TRAP_BRKPT,
+-				(void __user *)regs->pc, 0);
+-	}
+ 	return;
+ 
+ give_sigsegv:
+@@ -194,11 +189,6 @@ do_rt_sigreturn(struct rt_sigframe __user *frame)
+ 	if (restore_altstack(&frame->uc.uc_stack))
+ 		goto give_sigsegv;
+ 
+-	/* Send SIGTRAP if we're single-stepping: */
+-	if (ptrace_cancel_bpt(current)) {
+-		force_sig_fault(SIGTRAP, TRAP_BRKPT,
+-				(void __user *)regs->pc, 0);
+-	}
+ 	return;
+ 
+ give_sigsegv:
+@@ -381,19 +371,15 @@ syscall_restart(unsigned long r0, unsigned long r19,
+ static void
+ do_signal(struct pt_regs *regs, unsigned long r0, unsigned long r19)
+ {
+-	unsigned long single_stepping = ptrace_cancel_bpt(current);
+ 	struct ksignal ksig;
+ 
+ 	/* This lets the debugger run, ... */
+ 	if (get_signal(&ksig)) {
+-		/* ... so re-check the single stepping. */
+-		single_stepping |= ptrace_cancel_bpt(current);
+ 		/* Whee!  Actually deliver the signal.  */
+ 		if (r0)
+ 			syscall_restart(r0, r19, regs, &ksig.ka);
+ 		handle_signal(&ksig, regs);
+ 	} else {
+-		single_stepping |= ptrace_cancel_bpt(current);
+ 		if (r0) {
+ 			switch (regs->r0) {
+ 			case ERESTARTNOHAND:
+@@ -413,8 +399,6 @@ do_signal(struct pt_regs *regs, unsigned long r0, unsigned long r19)
+ 		}
+ 		restore_saved_sigmask();
+ 	}
+-	if (single_stepping)
+-		ptrace_set_bpt(current);        /* re-set breakpoint */
+ }
+ 
+ void
+-- 
+2.33.0
+

@@ -1,0 +1,174 @@
+From 31e5359825aa262ee8d1072c1a3bb1ce07698d55 Mon Sep 17 00:00:00 2001
+From: Quan Zhou <zhouquan65@huawei.com>
+Date: Wed, 30 Nov 2022 18:23:40 +0800
+Subject: [PATCH] KVM: arm64: Probe and configure DVMBM capability on HiSi CPUs
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 31e5359825aa262ee8d1072c1a3bb1ce07698d55
+Modified-by-SEL: No
+
+
+virt inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I62Q2L
+CVE: NA
+
+----------------------------------------------------
+
+DVMBM is an virtualization extension since HIP09, which allows TLBI
+executed at NS EL1 to be broadcast in a configurable range of physical
+CPUs (even with HCR_EL2.FB set). It will bring TLBI broadcast optimization.
+
+Introduce the method to detect and enable this feature. Also add a kernel
+command parameter "kvm-arm.dvmbm_enabled" (=0 on default) so that users can
+{en,dis}able DVMBM on need. The parameter description is added under
+Documentation/.
+
+Signed-off-by: Quan Zhou <zhouquan65@huawei.com>
+Reviewed-by: Zenghui Yu <yuzenghui@huawei.com>
+Reviewed-by: Nianyao Tang <tangnianyao@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ .../admin-guide/kernel-parameters.txt         |  3 ++
+ arch/arm64/include/asm/kvm_host.h             |  1 +
+ arch/arm64/kvm/arm.c                          |  5 ++
+ arch/arm64/kvm/hisilicon/hisi_virt.c          | 49 +++++++++++++++++++
+ arch/arm64/kvm/hisilicon/hisi_virt.h          |  6 +++
+ 5 files changed, 64 insertions(+)
+
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index 3860cb462f0b..8a1a25216da6 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -2408,6 +2408,9 @@
+ 			[KVM,ARM] Allow use of GICv4 for direct injection of
+ 			LPIs.
+ 
++	kvm-arm.dvmbm_enabled=
++			[KVM,ARM] Allow use of HiSilicon DVMBM capability.
++
+ 	kvm_cma_resv_ratio=n [PPC]
+ 			Reserves given percentage from system memory area for
+ 			contiguous memory allocation for KVM hash pagetable
+diff --git a/arch/arm64/include/asm/kvm_host.h b/arch/arm64/include/asm/kvm_host.h
+index 71a3ba24b287..df75b7e45c77 100644
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@ -715,5 +715,6 @@ extern unsigned int twedel;
+ #endif
+ 
+ extern bool kvm_ncsnp_support;
++extern bool kvm_dvmbm_support;
+ 
+ #endif /* __ARM64_KVM_HOST_H__ */
+diff --git a/arch/arm64/kvm/arm.c b/arch/arm64/kvm/arm.c
+index 469f324ce536..ca990f0269b2 100644
+--- a/arch/arm64/kvm/arm.c
++++ b/arch/arm64/kvm/arm.c
+@@ -66,6 +66,9 @@ static bool vgic_present;
+ /* Capability of non-cacheable snooping */
+ bool kvm_ncsnp_support;
+ 
++/* Capability of DVMBM */
++bool kvm_dvmbm_support;
++
+ static DEFINE_PER_CPU(unsigned char, kvm_arm_hardware_enabled);
+ DEFINE_STATIC_KEY_FALSE(userspace_irqchip_in_use);
+ 
+@@ -1865,8 +1868,10 @@ int kvm_arch_init(void *opaque)
+ #ifdef CONFIG_KVM_HISI_VIRT
+ 	probe_hisi_cpu_type();
+ 	kvm_ncsnp_support = hisi_ncsnp_supported();
++	kvm_dvmbm_support = hisi_dvmbm_supported();
+ #endif
+ 	kvm_info("KVM ncsnp %s\n", kvm_ncsnp_support ? "enabled" : "disabled");
++	kvm_info("KVM dvmbm %s\n", kvm_dvmbm_support ? "enabled" : "disabled");
+ 
+ 	in_hyp_mode = is_kernel_in_hyp_mode();
+ 
+diff --git a/arch/arm64/kvm/hisilicon/hisi_virt.c b/arch/arm64/kvm/hisilicon/hisi_virt.c
+index 90c363ed642e..b81488cd663b 100644
+--- a/arch/arm64/kvm/hisilicon/hisi_virt.c
++++ b/arch/arm64/kvm/hisilicon/hisi_virt.c
+@@ -11,6 +11,8 @@
+ 
+ static enum hisi_cpu_type cpu_type = UNKNOWN_HI_TYPE;
+ 
++static bool dvmbm_enabled;
++
+ static const char * const hisi_cpu_type_str[] = {
+ 	"Hisi1612",
+ 	"Hisi1616",
+@@ -124,3 +126,50 @@ bool hisi_ncsnp_supported(void)
+ 
+ 	return supported;
+ }
++
++static int __init early_dvmbm_enable(char *buf)
++{
++	return strtobool(buf, &dvmbm_enabled);
++}
++early_param("kvm-arm.dvmbm_enabled", early_dvmbm_enable);
++
++static void hardware_enable_dvmbm(void *data)
++{
++	u64 val;
++
++	val  = read_sysreg_s(SYS_LSUDVM_CTRL_EL2);
++	val |= LSUDVM_CTLR_EL2_MASK;
++	write_sysreg_s(val, SYS_LSUDVM_CTRL_EL2);
++}
++
++static void hardware_disable_dvmbm(void *data)
++{
++	u64 val;
++
++	val  = read_sysreg_s(SYS_LSUDVM_CTRL_EL2);
++	val &= ~LSUDVM_CTLR_EL2_MASK;
++	write_sysreg_s(val, SYS_LSUDVM_CTRL_EL2);
++}
++
++bool hisi_dvmbm_supported(void)
++{
++	if (cpu_type != HI_IP09)
++		return false;
++
++	/* Determine whether DVMBM is supported by the hardware */
++	if (!(read_sysreg(aidr_el1) & AIDR_EL1_DVMBM_MASK))
++		return false;
++
++	/* User provided kernel command-line parameter */
++	if (!dvmbm_enabled || !is_kernel_in_hyp_mode()) {
++		on_each_cpu(hardware_disable_dvmbm, NULL, 1);
++		return false;
++	}
++
++	/*
++	 * Enable TLBI Broadcast optimization by setting
++	 * LSUDVM_CTRL_EL2's bit[0].
++	 */
++	on_each_cpu(hardware_enable_dvmbm, NULL, 1);
++	return true;
++}
+diff --git a/arch/arm64/kvm/hisilicon/hisi_virt.h b/arch/arm64/kvm/hisilicon/hisi_virt.h
+index ebc462bf2a9d..95e5e889dcb1 100644
+--- a/arch/arm64/kvm/hisilicon/hisi_virt.h
++++ b/arch/arm64/kvm/hisilicon/hisi_virt.h
+@@ -14,7 +14,13 @@ enum hisi_cpu_type {
+ 	UNKNOWN_HI_TYPE
+ };
+ 
++/* HIP09 */
++#define AIDR_EL1_DVMBM_MASK	GENMASK_ULL(13, 12)
++#define SYS_LSUDVM_CTRL_EL2	sys_reg(3, 4, 15, 7, 4)
++#define LSUDVM_CTLR_EL2_MASK	BIT_ULL(0)
++
+ void probe_hisi_cpu_type(void);
+ bool hisi_ncsnp_supported(void);
++bool hisi_dvmbm_supported(void);
+ 
+ #endif /* __HISI_VIRT_H__ */
+-- 
+2.33.0
+

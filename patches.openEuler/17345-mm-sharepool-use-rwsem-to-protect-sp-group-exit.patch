@@ -1,0 +1,91 @@
+From 5cc1b791067f40e729f4690bc4957ba1c57aa943 Mon Sep 17 00:00:00 2001
+From: Guo Mengqi <guomengqi3@huawei.com>
+Date: Tue, 19 Jul 2022 11:36:03 +0800
+Subject: [PATCH] mm/sharepool: use rwsem to protect sp group exit
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 5cc1b791067f40e729f4690bc4957ba1c57aa943
+Modified-by-SEL: No
+
+
+ascend inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5DS9S
+CVE: NA
+
+-------------------------------------------------
+
+Fix following situation:
+
+when the last process in a group exits, and a second process tries to add
+to this group.
+
+The second process may get a invalid spg. However the group's
+use_count is increased by 1, which caused the first process failed to
+free the group when it exits. And then second process called
+sp_group_drop --> free_sp_group and cause a double request of rwsem.
+
+Signed-off-by: Guo Mengqi <guomengqi3@huawei.com>
+Reviewed-by: Weilong Chen <chenweilong@huawei.com>
+Signed-off-by: Yang Yingliang <yangyingliang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/share_pool.c | 18 ++++++++++++------
+ 1 file changed, 12 insertions(+), 6 deletions(-)
+
+diff --git a/mm/share_pool.c b/mm/share_pool.c
+index 60ad48e238c4..a8266a4a7e79 100644
+--- a/mm/share_pool.c
++++ b/mm/share_pool.c
+@@ -698,20 +698,25 @@ static void free_new_spg_id(bool new, int spg_id)
+ 		free_sp_group_id(spg_id);
+ }
+ 
+-static void free_sp_group(struct sp_group *spg)
++static void free_sp_group_locked(struct sp_group *spg)
+ {
+ 	fput(spg->file);
+ 	fput(spg->file_hugetlb);
+ 	free_spg_stat(spg->id);
+-	down_write(&sp_group_sem);
+ 	idr_remove(&sp_group_idr, spg->id);
+-	up_write(&sp_group_sem);
+ 	free_sp_group_id((unsigned int)spg->id);
+ 	kfree(spg);
+ 	system_group_count--;
+ 	WARN(system_group_count < 0, "unexpected group count\n");
+ }
+ 
++static void free_sp_group(struct sp_group *spg)
++{
++	down_write(&sp_group_sem);
++	free_sp_group_locked(spg);
++	up_write(&sp_group_sem);
++}
++
+ static void sp_group_drop(struct sp_group *spg)
+ {
+ 	if (atomic_dec_and_test(&spg->use_count))
+@@ -4473,14 +4478,15 @@ void sp_group_post_exit(struct mm_struct *mm)
+ 		sp_proc_stat_drop(stat);
+ 	}
+ 
+-	/* lockless traverse */
++	down_write(&sp_group_sem);
+ 	list_for_each_entry_safe(spg_node, tmp, &master->node_list, group_node) {
+ 		spg = spg_node->spg;
+ 		/* match with refcount inc in sp_group_add_task */
+-		sp_group_drop(spg);
++		if (atomic_dec_and_test(&spg->use_count))
++			free_sp_group_locked(spg);
+ 		kfree(spg_node);
+ 	}
+-
++	up_write(&sp_group_sem);
+ 	kfree(master);
+ }
+ 
+-- 
+2.33.0
+

@@ -1,0 +1,361 @@
+From 40e4b148b5bda041d665eb5eb071669b545c0557 Mon Sep 17 00:00:00 2001
+From: Chengchang Tang <tangchengchang@huawei.com>
+Date: Wed, 30 Nov 2022 18:24:03 +0800
+Subject: [PATCH] RDMA/hns: Configure DCA mode for the userspace QP
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 40e4b148b5bda041d665eb5eb071669b545c0557
+Modified-by-SEL: Yes, modified due to different context
+
+
+driver inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I63KVU
+
+----------------------------------------------------------
+
+If the userspace driver assign a NULL to the field of 'buf_addr' in
+'struct hns_roce_ib_create_qp' when creating QP, this means the kernel
+driver need setup the QP as DCA mode. So add a QP capability bit in
+response to indicate the userspace driver that the DCA mode has been
+enabled.
+
+Signed-off-by: Chengchang Tang <tangchengchang@huawei.com>
+Reviewed-by: Yangyang Li <liyangyang20@huawei.com>
+Reviewed-by: YueHaibing <yuehaibing@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/infiniband/hw/hns/hns_roce_dca.c    |   27 ++++--
+ drivers/infiniband/hw/hns/hns_roce_dca.h    |    4 
+ drivers/infiniband/hw/hns/hns_roce_device.h |    5 +
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.c  |   12 ++
+ drivers/infiniband/hw/hns/hns_roce_qp.c     |  114 +++++++++++++++++++++-------
+ include/uapi/rdma/hns-abi.h                 |    1 
+ 6 files changed, 126 insertions(+), 37 deletions(-)
+
+--- a/drivers/infiniband/hw/hns/hns_roce_dca.c
++++ b/drivers/infiniband/hw/hns/hns_roce_dca.c
+@@ -239,7 +239,7 @@ static int shrink_dca_page_proc(struct d
+ 		return DCA_MEM_NEXT_ITERATE;
+ }
+ 
+-static int shrink_dca_mem(struct hns_roce_dev *hr_dev,
++static void shrink_dca_mem(struct hns_roce_dev *hr_dev,
+ 			  struct hns_roce_ucontext *uctx, u64 reserved_size,
+ 			  struct hns_dca_shrink_resp *resp)
+ {
+@@ -252,13 +252,11 @@ static int shrink_dca_mem(struct hns_roc
+ 	need_shink = ctx->free_mems > 0 && ctx->free_size > reserved_size;
+ 	spin_unlock_irqrestore(&ctx->pool_lock, flags);
+ 	if (!need_shink)
+-		return 0;
++		return;
+ 
+ 	travel_dca_pages(ctx, &attr, shrink_dca_page_proc);
+ 	resp->free_mems = attr.shrink_mems;
+ 	resp->free_key = attr.shrink_key;
+-
+-	return 0;
+ }
+ 
+ static void init_dca_context(struct hns_roce_dca_ctx *ctx)
+@@ -356,6 +354,21 @@ static void free_dca_mem(struct dca_mem
+ 	spin_unlock(&mem->lock);
+ }
+ 
++void hns_roce_enable_dca(struct hns_roce_dev *hr_dev, struct hns_roce_qp *hr_qp)
++{
++	struct hns_roce_dca_cfg *cfg = &hr_qp->dca_cfg;
++
++	cfg->buf_id = HNS_DCA_INVALID_BUF_ID;
++}
++
++void hns_roce_disable_dca(struct hns_roce_dev *hr_dev,
++			  struct hns_roce_qp *hr_qp)
++{
++	struct hns_roce_dca_cfg *cfg = &hr_qp->dca_cfg;
++
++	cfg->buf_id = HNS_DCA_INVALID_BUF_ID;
++}
++
+ static inline struct hns_roce_ucontext *
+ uverbs_attr_to_hr_uctx(struct uverbs_attr_bundle *attrs)
+ {
+@@ -449,10 +462,8 @@ static int UVERBS_HANDLER(HNS_IB_METHOD_
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = shrink_dca_mem(to_hr_dev(uctx->ibucontext.device), uctx,
+-			     reserved_size, &resp);
+-	if (ret)
+-		return ret;
++	shrink_dca_mem(to_hr_dev(uctx->ibucontext.device), uctx,
++		       reserved_size, &resp);
+ 
+ 	ret = uverbs_copy_to(attrs, HNS_IB_ATTR_DCA_MEM_SHRINK_OUT_FREE_KEY,
+ 			     &resp.free_key, sizeof(resp.free_key));
+--- a/drivers/infiniband/hw/hns/hns_roce_dca.h
++++ b/drivers/infiniband/hw/hns/hns_roce_dca.h
+@@ -30,4 +30,8 @@ void hns_roce_register_udca(struct hns_r
+ void hns_roce_unregister_udca(struct hns_roce_dev *hr_dev,
+ 			      struct hns_roce_ucontext *uctx);
+ 
++void hns_roce_enable_dca(struct hns_roce_dev *hr_dev,
++			 struct hns_roce_qp *hr_qp);
++void hns_roce_disable_dca(struct hns_roce_dev *hr_dev,
++			  struct hns_roce_qp *hr_qp);
+ #endif
+--- a/drivers/infiniband/hw/hns/hns_roce_device.h
++++ b/drivers/infiniband/hw/hns/hns_roce_device.h
+@@ -314,6 +314,10 @@ struct hns_roce_mtr {
+ 	struct hns_roce_hem_cfg  hem_cfg; /* config for hardware addressing */
+ };
+ 
++struct hns_roce_dca_cfg {
++	u32 buf_id;
++};
++
+ struct hns_roce_mw {
+ 	struct ib_mw		ibmw;
+ 	u32			pdn;
+@@ -610,6 +614,7 @@ struct hns_roce_qp {
+ 	struct hns_roce_wq	sq;
+ 
+ 	struct hns_roce_mtr	mtr;
++	struct hns_roce_dca_cfg	dca_cfg;
+ 
+ 	u32			buff_size;
+ 	struct mutex		mutex;
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+@@ -4707,6 +4707,16 @@ static int modify_qp_init_to_rtr(struct
+ 	hr_reg_write(context, QPC_TRRL_BA_H, trrl_ba >> (32 + 16 + 4));
+ 	hr_reg_clear(qpc_mask, QPC_TRRL_BA_H);
+ 
++	if (hr_dev->pci_dev->revision >= PCI_REVISION_ID_HIP09) {
++		if (hr_qp->en_flags & HNS_ROCE_QP_CAP_DCA) {
++			hr_reg_enable(context, QPC_DCA_MODE);
++			hr_reg_clear(qpc_mask, QPC_DCA_MODE);
++		}
++	} else {
++		/* reset IRRL_HEAD */
++		hr_reg_clear(qpc_mask, QPC_V2_IRRL_HEAD);
++	}
++
+ 	context->irrl_ba = cpu_to_le32(irrl_ba >> 6);
+ 	qpc_mask->irrl_ba = 0;
+ 	hr_reg_write(context, QPC_IRRL_BA_H, irrl_ba >> (32 + 6));
+@@ -4843,8 +4853,6 @@ static int modify_qp_rtr_to_rts(struct i
+ 
+ 	hr_reg_clear(qpc_mask, QPC_CHECK_FLG);
+ 
+-	hr_reg_clear(qpc_mask, QPC_V2_IRRL_HEAD);
+-
+ 	return 0;
+ }
+ 
+--- a/drivers/infiniband/hw/hns/hns_roce_qp.c
++++ b/drivers/infiniband/hw/hns/hns_roce_qp.c
+@@ -38,6 +38,7 @@
+ #include "hns_roce_common.h"
+ #include "hns_roce_device.h"
+ #include "hns_roce_hem.h"
++#include "hns_roce_dca.h"
+ 
+ static void flush_work_handle(struct work_struct *work)
+ {
+@@ -635,8 +636,21 @@ static int set_user_sq_size(struct hns_r
+ 	return 0;
+ }
+ 
++static bool check_dca_is_enable(struct hns_roce_dev *hr_dev, bool is_user,
++				unsigned long addr)
++{
++	if (!(hr_dev->caps.flags & HNS_ROCE_CAP_FLAG_DCA_MODE))
++		return false;
++
++	/* If the user QP's buffer addr is 0, the DCA mode should be enabled */
++	if (is_user)
++		return !addr;
++
++	return false;
++}
++
+ static int set_wqe_buf_attr(struct hns_roce_dev *hr_dev,
+-			    struct hns_roce_qp *hr_qp,
++			    struct hns_roce_qp *hr_qp, bool dca_en,
+ 			    struct hns_roce_buf_attr *buf_attr)
+ {
+ 	int buf_size;
+@@ -680,9 +694,21 @@ static int set_wqe_buf_attr(struct hns_r
+ 	if (hr_qp->buff_size < 1)
+ 		return -EINVAL;
+ 
+-	buf_attr->page_shift = HNS_HW_PAGE_SHIFT + hr_dev->caps.mtt_buf_pg_sz;
+ 	buf_attr->region_count = idx;
+ 
++	if (dca_en) {
++		/*
++		 * When enable DCA, there's no need to alloc buffer now, and
++		 * the page shift should be fixed to 4K.
++		 */
++		buf_attr->mtt_only = true;
++		buf_attr->page_shift = HNS_HW_PAGE_SHIFT;
++	} else {
++		buf_attr->mtt_only = false;
++		buf_attr->page_shift = HNS_HW_PAGE_SHIFT +
++				       hr_dev->caps.mtt_buf_pg_sz;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -735,40 +761,74 @@ static int hns_roce_qp_has_rq(struct ib_
+ 	return 1;
+ }
+ 
+-static int alloc_qp_buf(struct hns_roce_dev *hr_dev, struct hns_roce_qp *hr_qp,
+-			struct ib_qp_init_attr *init_attr,
+-			struct ib_udata *udata, unsigned long addr)
++static int alloc_wqe_buf(struct hns_roce_dev *hr_dev, struct hns_roce_qp *hr_qp,
++			 bool dca_en, struct hns_roce_buf_attr *buf_attr,
++			 struct ib_udata *udata, unsigned long addr)
+ {
+ 	struct ib_device *ibdev = &hr_dev->ib_dev;
+-	struct hns_roce_buf_attr buf_attr = {};
+ 	int ret;
+ 
+-	ret = set_wqe_buf_attr(hr_dev, hr_qp, &buf_attr);
+-	if (ret) {
+-		ibdev_err(ibdev, "failed to split WQE buf, ret = %d.\n", ret);
+-		goto err_inline;
++	if (dca_en) {
++		/* DCA must be enabled after the buffer size is configured. */
++		hns_roce_enable_dca(hr_dev, hr_qp);
++
++		hr_qp->en_flags |= HNS_ROCE_QP_CAP_DCA;
++	} else {
++		/*
++		 * Because DCA and DWQE share the same fileds in RCWQE buffer,
++		 * so DWQE only supported when DCA is disable.
++		 */
++		if (hr_dev->caps.flags & HNS_ROCE_CAP_FLAG_DIRECT_WQE)
++			hr_qp->en_flags |= HNS_ROCE_QP_CAP_DIRECT_WQE;
+ 	}
+-	ret = hns_roce_mtr_create(hr_dev, &hr_qp->mtr, &buf_attr,
++	ret = hns_roce_mtr_create(hr_dev, &hr_qp->mtr, buf_attr,
+ 				  PAGE_SHIFT + hr_dev->caps.mtt_ba_pg_sz,
+ 				  udata, addr);
+ 	if (ret) {
+ 		ibdev_err(ibdev, "failed to create WQE mtr, ret = %d.\n", ret);
+-		goto err_inline;
++		if (dca_en)
++			hns_roce_disable_dca(hr_dev, hr_qp);
+ 	}
+ 
+-	if (hr_dev->caps.flags & HNS_ROCE_CAP_FLAG_DIRECT_WQE)
+-		hr_qp->en_flags |= HNS_ROCE_QP_CAP_DIRECT_WQE;
++	return ret;
++}
+ 
+-	return 0;
++static void free_wqe_buf(struct hns_roce_dev *hr_dev, struct hns_roce_qp *hr_qp,
++			 struct ib_udata *udata)
++{
++	hns_roce_mtr_destroy(hr_dev, &hr_qp->mtr);
++
++	if (hr_qp->en_flags & HNS_ROCE_QP_CAP_DCA)
++		hns_roce_disable_dca(hr_dev, hr_qp);
++}
++
++static int alloc_qp_wqe(struct hns_roce_dev *hr_dev, struct hns_roce_qp *hr_qp,
++			struct ib_qp_init_attr *init_attr,
++			struct ib_udata *udata, unsigned long addr)
++{
++	struct ib_device *ibdev = &hr_dev->ib_dev;
++	struct hns_roce_buf_attr buf_attr = {};
++	bool dca_en;
++	int ret;
+ 
+-err_inline:
++	dca_en = check_dca_is_enable(hr_dev, !!udata, addr);
++	ret = set_wqe_buf_attr(hr_dev, hr_qp, dca_en, &buf_attr);
++	if (ret) {
++		ibdev_err(ibdev, "failed to split WQE buf, ret = %d.\n", ret);
++		return ret;
++	}
++
++	ret = alloc_wqe_buf(hr_dev, hr_qp, dca_en, &buf_attr, udata, addr);
++	if (ret)
++		ibdev_err(ibdev, "failed to alloc WQE buf, ret = %d.\n", ret);
+ 
+ 	return ret;
+ }
+ 
+-static void free_qp_buf(struct hns_roce_dev *hr_dev, struct hns_roce_qp *hr_qp)
++static void free_qp_wqe(struct hns_roce_dev *hr_dev, struct hns_roce_qp *hr_qp,
++			struct ib_udata *udata)
+ {
+-	hns_roce_mtr_destroy(hr_dev, &hr_qp->mtr);
++	free_wqe_buf(hr_dev, hr_qp, udata);
+ }
+ 
+ static inline bool user_qp_has_sdb(struct hns_roce_dev *hr_dev,
+@@ -1097,18 +1157,18 @@ static int hns_roce_create_qp_common(str
+ 		}
+ 	}
+ 
+-	ret = alloc_qp_buf(hr_dev, hr_qp, init_attr, udata, ucmd.buf_addr);
+-	if (ret) {
+-		ibdev_err(ibdev, "failed to alloc QP buffer, ret = %d.\n", ret);
+-		goto err_buf;
+-	}
+-
+ 	ret = alloc_qpn(hr_dev, hr_qp);
+ 	if (ret) {
+ 		ibdev_err(ibdev, "failed to alloc QPN, ret = %d.\n", ret);
+ 		goto err_qpn;
+ 	}
+ 
++	ret = alloc_qp_wqe(hr_dev, hr_qp, init_attr, udata, ucmd.buf_addr);
++	if (ret) {
++		ibdev_err(ibdev, "failed to alloc QP buffer, ret = %d.\n", ret);
++		goto err_buf;
++	}
++
+ 	ret = alloc_qp_db(hr_dev, hr_qp, init_attr, udata, &ucmd, &resp);
+ 	if (ret) {
+ 		ibdev_err(ibdev, "failed to alloc QP doorbell, ret = %d.\n",
+@@ -1159,10 +1219,10 @@ err_store:
+ err_qpc:
+ 	free_qp_db(hr_dev, hr_qp, udata);
+ err_db:
++	free_qp_wqe(hr_dev, hr_qp, udata);
++err_buf:
+ 	free_qpn(hr_dev, hr_qp);
+ err_qpn:
+-	free_qp_buf(hr_dev, hr_qp);
+-err_buf:
+ 	free_kernel_wrid(hr_qp);
+ 	return ret;
+ }
+@@ -1176,7 +1236,7 @@ void hns_roce_qp_destroy(struct hns_roce
+ 
+ 	free_qpc(hr_dev, hr_qp);
+ 	free_qpn(hr_dev, hr_qp);
+-	free_qp_buf(hr_dev, hr_qp);
++	free_qp_wqe(hr_dev, hr_qp, udata);
+ 	free_kernel_wrid(hr_qp);
+ 	free_qp_db(hr_dev, hr_qp, udata);
+ 
+--- a/include/uapi/rdma/hns-abi.h
++++ b/include/uapi/rdma/hns-abi.h
+@@ -77,6 +77,7 @@ enum hns_roce_qp_cap_flags {
+ 	HNS_ROCE_QP_CAP_RQ_RECORD_DB = 1 << 0,
+ 	HNS_ROCE_QP_CAP_SQ_RECORD_DB = 1 << 1,
+ 	HNS_ROCE_QP_CAP_OWNER_DB = 1 << 2,
++	HNS_ROCE_QP_CAP_DCA = 1 << 4,
+ 	HNS_ROCE_QP_CAP_DIRECT_WQE = 1 << 5,
+ };
+ 

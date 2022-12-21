@@ -1,0 +1,257 @@
+From d9687e453946bfad0a403a249603582f258d5d18 Mon Sep 17 00:00:00 2001
+From: Chen Jun <chenjun102@huawei.com>
+Date: Thu, 3 Nov 2022 06:41:53 +0000
+Subject: [PATCH] mm/sharepool: Support alloc ro mapping
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: d9687e453946bfad0a403a249603582f258d5d18
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5I72Q
+CVE: NA
+
+--------------------------------
+
+1. Split sharepool normal area(8T) to sharepool readonly area(64G) and
+sharepool normal area(8T - 64G)
+2. User programs can not write to the address in sharepool readonly
+   area.
+3. Add SP_PROT_FOCUS for sp_alloc.
+4. sp_alloc with SP_PROT_RO | SP_PROT_FOCUS returns the virtual address
+   within sharepool readonly area.
+5. Other user programs which add into task with write prot can not write
+the address in sharepool readonly area.
+
+Signed-off-by: Chen Jun <chenjun102@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/share_pool.h | 36 +++++++++++++++++++++-----------
+ mm/share_pool.c            | 42 +++++++++++++++++++++++++++++++++++---
+ 2 files changed, 63 insertions(+), 15 deletions(-)
+
+diff --git a/include/linux/share_pool.h b/include/linux/share_pool.h
+index b5fa0d4d59e0..1432aaa08087 100644
+--- a/include/linux/share_pool.h
++++ b/include/linux/share_pool.h
+@@ -17,6 +17,11 @@
+ #define SP_DVPP			(1 << 2)
+ #define SP_SPEC_NODE_ID		(1 << 3)
+ #define SP_PROT_RO		(1 << 16)
++/*
++ * SP_PROT_FOCUS should used with SP_PROT_RO,
++ * to alloc a memory within sharepool ro memory.
++ */
++#define SP_PROT_FOCUS		(1 << 17)
+ 
+ #define DEVICE_ID_BITS		4UL
+ #define DEVICE_ID_MASK		((1UL << DEVICE_ID_BITS) - 1UL)
+@@ -26,7 +31,7 @@
+ #define NODE_ID_SHIFT		(DEVICE_ID_SHIFT + DEVICE_ID_BITS)
+ 
+ #define SP_FLAG_MASK		(SP_HUGEPAGE | SP_HUGEPAGE_ONLY | SP_DVPP | \
+-				 SP_SPEC_NODE_ID | SP_PROT_RO | \
++				 SP_SPEC_NODE_ID | SP_PROT_RO | SP_PROT_FOCUS | \
+ 				(DEVICE_ID_MASK << DEVICE_ID_SHIFT) | \
+ 				(NODE_ID_MASK << NODE_ID_SHIFT))
+ 
+@@ -113,19 +118,22 @@ struct sp_mapping {
+ /* Processes in the same sp_group can share memory.
+  * Memory layout for share pool:
+  *
+- * |-------------------- 8T -------------------|---|------ 8T ------------|
+- * |		Device 0	   |  Device 1 |...|                      |
+- * |----------------------------------------------------------------------|
+- * |------------- 16G -------------|    16G    |   |                      |
+- * | DVPP GROUP0   | DVPP GROUP1   | ... | ... |...|  sp normal memory    |
+- * |     sp        |    sp         |     |     |   |                      |
+- * |----------------------------------------------------------------------|
++ * |-------------------- 8T -------------------|---|---64G---|----- 8T-64G -----|
++ * |		Device 0	   |  Device 1 |...|         |                  |
++ * |-----------------------------------------------|---------|------------------|
++ * |------------- 16G -------------|    16G    |   |         |                  |
++ * | DVPP GROUP0   | DVPP GROUP1   | ... | ... |...|  sp ro  | sp normal memory |
++ * |     sp        |    sp         |     |     |   |         |                  |
++ * |----------------------------------------------------------------------------|
+  *
+  * The host SVM feature reserves 8T virtual memory by mmap, and due to the
+  * restriction of DVPP, while SVM and share pool will both allocate memory
+  * for DVPP, the memory have to be in the same 32G range.
+  *
+- * Share pool reserves 16T memory, with 8T for normal uses and 8T for DVPP.
++ * Share pool reserves 16T memory, 8T-64G for normal uses, 64G for ro memory
++ * and 8T for DVPP.
++ * Within this 64G ro memory, user application will never have write permission
++ * to this memory address.
+  * Within this 8T DVPP memory, SVM will call sp_config_dvpp_range() to
+  * tell us which 16G memory range is reserved for share pool .
+  *
+@@ -207,8 +215,10 @@ struct sp_walk_data {
+ 
+ #define MMAP_TOP_4G_SIZE		0x100000000UL
+ 
+-/* 8T size */
+-#define MMAP_SHARE_POOL_NORMAL_SIZE	0x80000000000UL
++/* 8T - 64G size */
++#define MMAP_SHARE_POOL_NORMAL_SIZE	0x7F000000000UL
++/* 64G */
++#define MMAP_SHARE_POOL_RO_SIZE		0x1000000000UL
+ /* 8T size*/
+ #define MMAP_SHARE_POOL_DVPP_SIZE	0x80000000000UL
+ /* 16G size */
+@@ -219,7 +229,9 @@ struct sp_walk_data {
+ #define MMAP_SHARE_POLL_DVPP_END	(MMAP_SHARE_POOL_END)
+ /* MMAP_SHARE_POOL_DVPP_START should be align to 16G */
+ #define MMAP_SHARE_POOL_DVPP_START	(MMAP_SHARE_POLL_DVPP_END - MMAP_SHARE_POOL_DVPP_SIZE)
+-#define MMAP_SHARE_POOL_NORMAL_END	(MMAP_SHARE_POOL_DVPP_START)
++#define MMAP_SHARE_POOL_RO_END		(MMAP_SHARE_POOL_DVPP_START)
++#define MMAP_SHARE_POOL_RO_START	(MMAP_SHARE_POOL_RO_END - MMAP_SHARE_POOL_RO_SIZE)
++#define MMAP_SHARE_POOL_NORMAL_END	(MMAP_SHARE_POOL_RO_START)
+ #define MMAP_SHARE_POOL_NORMAL_START	(MMAP_SHARE_POOL_NORMAL_END - MMAP_SHARE_POOL_NORMAL_SIZE)
+ #define MMAP_SHARE_POOL_START		(MMAP_SHARE_POOL_NORMAL_START)
+ 
+diff --git a/mm/share_pool.c b/mm/share_pool.c
+index ad37a7a7d0c5..ffaec8d250bb 100644
+--- a/mm/share_pool.c
++++ b/mm/share_pool.c
+@@ -151,6 +151,7 @@ enum sp_mapping_type {
+ 	SP_MAPPING_START,
+ 	SP_MAPPING_DVPP		= SP_MAPPING_START,
+ 	SP_MAPPING_NORMAL,
++	SP_MAPPING_RO,
+ 	SP_MAPPING_END,
+ };
+ 
+@@ -278,6 +279,7 @@ static void sp_mapping_set_type(struct sp_mapping *spm, unsigned long type)
+ }
+ 
+ static struct sp_mapping *sp_mapping_normal;
++static struct sp_mapping *sp_mapping_ro;
+ 
+ static void sp_mapping_add_to_list(struct sp_mapping *spm)
+ {
+@@ -301,6 +303,10 @@ static void sp_mapping_range_init(struct sp_mapping *spm)
+ 
+ 	for (i = 0; i < MAX_DEVID; i++) {
+ 		switch (sp_mapping_type(spm)) {
++		case SP_MAPPING_RO:
++			spm->start[i] = MMAP_SHARE_POOL_RO_START;
++			spm->end[i]   = MMAP_SHARE_POOL_RO_END;
++			break;
+ 		case SP_MAPPING_NORMAL:
+ 			spm->start[i] = MMAP_SHARE_POOL_NORMAL_START;
+ 			spm->end[i]   = MMAP_SHARE_POOL_NORMAL_END;
+@@ -443,6 +449,8 @@ static int sp_mapping_group_setup(struct mm_struct *mm, struct sp_group *spg)
+ 			sp_mapping_attach(spg, local_dvpp_mapping);
+ 		if (!spg->mapping[SP_MAPPING_NORMAL])
+ 			sp_mapping_attach(spg, sp_mapping_normal);
++		if (!spg->mapping[SP_MAPPING_RO])
++			sp_mapping_attach(spg, sp_mapping_ro);
+ 	}
+ 
+ 	return 0;
+@@ -454,6 +462,9 @@ static inline struct sp_mapping *sp_mapping_find(struct sp_group *spg,
+ 	if (addr >= MMAP_SHARE_POOL_NORMAL_START && addr < MMAP_SHARE_POOL_NORMAL_END)
+ 		return spg->mapping[SP_MAPPING_NORMAL];
+ 
++	if (addr >= MMAP_SHARE_POOL_RO_START && addr < MMAP_SHARE_POOL_RO_END)
++		return spg->mapping[SP_MAPPING_RO];
++
+ 	return spg->mapping[SP_MAPPING_DVPP];
+ }
+ 
+@@ -489,6 +500,7 @@ static int init_local_group(struct mm_struct *mm)
+ 	}
+ 	sp_mapping_attach(master->local, spm);
+ 	sp_mapping_attach(master->local, sp_mapping_normal);
++	sp_mapping_attach(master->local, sp_mapping_ro);
+ 
+ 	ret = local_group_add_task(mm, spg);
+ 	if (ret < 0)
+@@ -1483,6 +1495,10 @@ int mg_sp_group_add_task(int pid, unsigned long prot, int spg_id)
+ 		unsigned long populate = 0;
+ 		struct file *file = spa_file(spa);
+ 		unsigned long addr;
++		unsigned long __prot = prot;
++
++		if ((spa->flags & (SP_PROT_RO | SP_PROT_FOCUS)) == (SP_PROT_RO | SP_PROT_FOCUS))
++			__prot &= ~PROT_WRITE;
+ 
+ 		__sp_area_drop_locked(prev);
+ 		prev = spa;
+@@ -1495,7 +1511,7 @@ int mg_sp_group_add_task(int pid, unsigned long prot, int spg_id)
+ 		spin_unlock(&sp_area_lock);
+ 
+ 		if (spa->type == SPA_TYPE_K2SPG && spa->kva) {
+-			addr = sp_remap_kva_to_vma(spa->kva, spa, mm, prot, NULL);
++			addr = sp_remap_kva_to_vma(spa->kva, spa, mm, __prot, NULL);
+ 			if (IS_ERR_VALUE(addr))
+ 				pr_warn("add group remap k2u failed %ld\n", addr);
+ 
+@@ -1513,7 +1529,7 @@ int mg_sp_group_add_task(int pid, unsigned long prot, int spg_id)
+ 			break;
+ 		}
+ 
+-		addr = sp_mmap(mm, file, spa, &populate, prot, NULL);
++		addr = sp_mmap(mm, file, spa, &populate, __prot, NULL);
+ 		if (IS_ERR_VALUE(addr)) {
+ 			sp_munmap_task_areas(mm, spg, &spa->link);
+ 			up_write(&mm->mmap_lock);
+@@ -1761,7 +1777,13 @@ static struct sp_area *sp_alloc_area(unsigned long size, unsigned long flags,
+ 		return ERR_PTR(-EINVAL);
+ 	}
+ 
+-	if (flags & SP_DVPP)
++	if (flags & SP_PROT_FOCUS) {
++		if ((flags & (SP_DVPP | SP_PROT_RO)) != SP_PROT_RO) {
++			pr_err("invalid sp_flags [%lx]\n", flags);
++			return ERR_PTR(-EINVAL);
++		}
++		mapping = spg->mapping[SP_MAPPING_RO];
++	} else if (flags & SP_DVPP)
+ 		mapping = spg->mapping[SP_MAPPING_DVPP];
+ 	else
+ 		mapping = spg->mapping[SP_MAPPING_NORMAL];
+@@ -3893,6 +3915,11 @@ static void spa_stat_of_mapping_show(struct seq_file *seq, struct sp_mapping *sp
+ 	spin_unlock(&sp_area_lock);
+ }
+ 
++static void spa_ro_stat_show(struct seq_file *seq)
++{
++	spa_stat_of_mapping_show(seq, sp_mapping_ro);
++}
++
+ static void spa_normal_stat_show(struct seq_file *seq)
+ {
+ 	spa_stat_of_mapping_show(seq, sp_mapping_normal);
+@@ -4023,6 +4050,7 @@ static int spa_stat_show(struct seq_file *seq, void *offset)
+ 	/* print the file header */
+ 	seq_printf(seq, "%-10s %-16s %-16s %-10s %-7s %-5s %-8s %-8s\n",
+ 			"Group ID", "va_start", "va_end", "Size(KB)", "Type", "Huge", "PID", "Ref");
++	spa_ro_stat_show(seq);
+ 	spa_normal_stat_show(seq);
+ 	spa_dvpp_stat_show(seq);
+ 	return 0;
+@@ -4402,9 +4430,17 @@ static int __init share_pool_init(void)
+ 		goto fail;
+ 	atomic_inc(&sp_mapping_normal->user);
+ 
++	sp_mapping_ro = sp_mapping_create(SP_MAPPING_RO);
++	if (IS_ERR(sp_mapping_ro))
++		goto free_normal;
++	atomic_inc(&sp_mapping_ro->user);
++
+ 	proc_sharepool_init();
+ 
+ 	return 0;
++
++free_normal:
++	kfree(sp_mapping_normal);
+ fail:
+ 	pr_err("Ascend share pool initialization failed\n");
+ 	static_branch_disable(&share_pool_enabled_key);
+-- 
+2.33.0
+

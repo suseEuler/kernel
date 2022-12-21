@@ -1,0 +1,338 @@
+From 7c0849c7ab64467dc7c090a8326168f45b4d851f Mon Sep 17 00:00:00 2001
+From: Hao Chen <chenhao418@huawei.com>
+Date: Wed, 30 Nov 2022 18:23:35 +0800
+Subject: [PATCH] net: hns3: PF supports to set and query lane_num by sysfs
+MIME-Version: 1.0
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 7c0849c7ab64467dc7c090a8326168f45b4d851f
+Modified-by-SEL: No
+
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+driver inclusion
+category:feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I62HX2
+
+----------------------------------------------------------------------
+
+When serdes lane support setting 25Gb/s、50Gb/s speed and user wants to
+set port speed as 50Gb/s, it can be setted as one 50Gb/s serdes lane or
+two 25Gb/s serdes lanes.
+
+So, this patch adds support to query and set lane number by sysfs
+to satisfy this scenario.
+
+Signed-off-by: Hao Chen <chenhao418@huawei.com>
+Signed-off-by: Jiantao Xiao <xiaojiantao1@h-partners.com>
+Reviewed-by: Yue Haibing <yuehaibing@huawei.com>
+Reviewed-by: Jian Shen <shenjian15@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/net/ethernet/hisilicon/hns3/Makefile  |  2 +-
+ drivers/net/ethernet/hisilicon/hns3/hnae3.h   |  4 +
+ .../hns3/hns3_common/hclge_comm_cmd.c         |  1 +
+ .../hns3/hns3_common/hclge_comm_cmd.h         |  1 +
+ .../hisilicon/hns3/hns3pf/hclge_cmd.h         |  7 +-
+ .../hisilicon/hns3/hns3pf/hclge_main.c        | 24 +++--
+ .../hisilicon/hns3/hns3pf/hclge_main.h        |  5 +
+ .../hisilicon/hns3/hns3pf/hclge_sysfs.c       | 91 +++++++++++++++++++
+ 8 files changed, 126 insertions(+), 9 deletions(-)
+ create mode 100644 drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_sysfs.c
+
+diff --git a/drivers/net/ethernet/hisilicon/hns3/Makefile b/drivers/net/ethernet/hisilicon/hns3/Makefile
+index 6efea4662858..0bb3a28f6f8f 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/Makefile
++++ b/drivers/net/ethernet/hisilicon/hns3/Makefile
+@@ -21,7 +21,7 @@ hclgevf-objs = hns3vf/hclgevf_main.o hns3vf/hclgevf_mbx.o  hns3vf/hclgevf_devlin
+ 		hns3_common/hclge_comm_cmd.o hns3_common/hclge_comm_rss.o hns3_common/hclge_comm_tqp_stats.o
+ 
+ obj-$(CONFIG_HNS3_HCLGE) += hclge.o
+-hclge-objs = hns3pf/hclge_main.o hns3pf/hclge_mdio.o hns3pf/hclge_tm.o \
++hclge-objs = hns3pf/hclge_main.o hns3pf/hclge_mdio.o hns3pf/hclge_tm.o hns3pf/hclge_sysfs.o \
+ 		hns3pf/hclge_mbx.o hns3pf/hclge_err.o  hns3pf/hclge_debugfs.o hns3pf/hclge_ptp.o hns3pf/hclge_devlink.o \
+ 		hns3_common/hclge_comm_cmd.o hns3_common/hclge_comm_rss.o hns3_common/hclge_comm_tqp_stats.o
+ 
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hnae3.h b/drivers/net/ethernet/hisilicon/hns3/hnae3.h
+index 0b1d4b72ac14..779b32bd646d 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hnae3.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hnae3.h
+@@ -100,6 +100,7 @@ enum HNAE3_DEV_CAP_BITS {
+ 	HNAE3_DEV_SUPPORT_VLAN_FLTR_MDF_B,
+ 	HNAE3_DEV_SUPPORT_MC_MAC_MNG_B,
+ 	HNAE3_DEV_SUPPORT_CQ_B,
++	HNAE3_DEV_SUPPORT_LANE_NUM_B,
+ };
+ 
+ #define hnae3_ae_dev_fd_supported(ae_dev) \
+@@ -162,6 +163,9 @@ enum HNAE3_DEV_CAP_BITS {
+ #define hnae3_ae_dev_cq_supported(ae_dev) \
+ 	test_bit(HNAE3_DEV_SUPPORT_CQ_B, (ae_dev)->caps)
+ 
++#define hnae3_ae_dev_lane_num_supported(ae_dev) \
++	test_bit(HNAE3_DEV_SUPPORT_LANE_NUM_B, (ae_dev)->caps)
++
+ enum HNAE3_PF_CAP_BITS {
+ 	HNAE3_PF_SUPPORT_VLAN_FLTR_MDF_B = 0,
+ };
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3_common/hclge_comm_cmd.c b/drivers/net/ethernet/hisilicon/hns3/hns3_common/hclge_comm_cmd.c
+index f9bd3fc969c5..f1251890ef14 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3_common/hclge_comm_cmd.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3_common/hclge_comm_cmd.c
+@@ -153,6 +153,7 @@ static const struct hclge_comm_caps_bit_map hclge_pf_cmd_caps[] = {
+ 	{HCLGE_COMM_CAP_CQ_B, HNAE3_DEV_SUPPORT_CQ_B},
+ 	{HCLGE_COMM_CAP_GRO_B, HNAE3_DEV_SUPPORT_GRO_B},
+ 	{HCLGE_COMM_CAP_FD_B, HNAE3_DEV_SUPPORT_FD_B},
++	{HCLGE_COMM_CAP_LANE_NUM_B, HNAE3_DEV_SUPPORT_LANE_NUM_B},
+ };
+ 
+ static const struct hclge_comm_caps_bit_map hclge_vf_cmd_caps[] = {
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3_common/hclge_comm_cmd.h b/drivers/net/ethernet/hisilicon/hns3/hns3_common/hclge_comm_cmd.h
+index 8aaa5fdfa2f6..ec1cb010d0ac 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3_common/hclge_comm_cmd.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3_common/hclge_comm_cmd.h
+@@ -342,6 +342,7 @@ enum HCLGE_COMM_CAP_BITS {
+ 	HCLGE_COMM_CAP_CQ_B = 18,
+ 	HCLGE_COMM_CAP_GRO_B = 20,
+ 	HCLGE_COMM_CAP_FD_B = 21,
++	HCLGE_COMM_CAP_LANE_NUM_B = 27,
+ };
+ 
+ enum HCLGE_COMM_API_CAP_BITS {
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_cmd.h b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_cmd.h
+index eee9a1082894..ce0e72862257 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_cmd.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_cmd.h
+@@ -322,7 +322,9 @@ struct hclge_config_mac_speed_dup_cmd {
+ 
+ #define HCLGE_CFG_MAC_SPEED_CHANGE_EN_B	0
+ 	u8 mac_change_fec_en;
+-	u8 rsv[22];
++	u8 rsv[4];
++	u8 lane_num;
++	u8 rsv1[17];
+ };
+ 
+ #define HCLGE_TQP_ENABLE_B		0
+@@ -349,7 +351,8 @@ struct hclge_sfp_info_cmd {
+ 	__le32 speed_ability; /* speed ability for current media */
+ 	__le32 module_type;
+ 	u8 fec_ability;
+-	u8 rsv[7];
++	u8 lane_num;
++	u8 rsv[6];
+ };
+ 
+ #define HCLGE_MAC_CFG_FEC_AUTO_EN_B	0
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
+index afac6036a748..a10a3a746742 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
+@@ -2663,8 +2663,8 @@ static int hclge_convert_to_fw_speed(u32 speed_drv, u32 *speed_fw)
+ 	return -EINVAL;
+ }
+ 
+-static int hclge_cfg_mac_speed_dup_hw(struct hclge_dev *hdev, int speed,
+-				      u8 duplex)
++int hclge_cfg_mac_speed_dup_hw(struct hclge_dev *hdev, int speed,
++			       u8 duplex, u8 lane_num)
+ {
+ 	struct hclge_config_mac_speed_dup_cmd *req;
+ 	struct hclge_desc desc;
+@@ -2688,6 +2688,7 @@ static int hclge_cfg_mac_speed_dup_hw(struct hclge_dev *hdev, int speed,
+ 			speed_fw);
+ 	hnae3_set_bit(req->mac_change_fec_en, HCLGE_CFG_MAC_SPEED_CHANGE_EN_B,
+ 		      1);
++	req->lane_num = lane_num;
+ 
+ 	ret = hclge_cmd_send(&hdev->hw, &desc, 1);
+ 	if (ret) {
+@@ -2709,7 +2710,7 @@ int hclge_cfg_mac_speed_dup(struct hclge_dev *hdev, int speed, u8 duplex)
+ 	    mac->duplex == duplex)
+ 		return 0;
+ 
+-	ret = hclge_cfg_mac_speed_dup_hw(hdev, speed, duplex);
++	ret = hclge_cfg_mac_speed_dup_hw(hdev, speed, duplex, 0);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -2875,7 +2876,8 @@ static int hclge_mac_init(struct hclge_dev *hdev)
+ 	hdev->support_sfp_query = true;
+ 	hdev->hw.mac.duplex = HCLGE_MAC_FULL;
+ 	ret = hclge_cfg_mac_speed_dup_hw(hdev, hdev->hw.mac.speed,
+-					 hdev->hw.mac.duplex);
++					 hdev->hw.mac.duplex,
++					 hdev->hw.mac.lane_num);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -3200,6 +3202,7 @@ static int hclge_get_sfp_info(struct hclge_dev *hdev, struct hclge_mac *mac)
+ 		mac->autoneg = resp->autoneg;
+ 		mac->support_autoneg = resp->autoneg_ability;
+ 		mac->speed_type = QUERY_ACTIVE_SPEED;
++		mac->lane_num = resp->lane_num;
+ 		if (!resp->active_fec)
+ 			mac->fec_mode = 0;
+ 		else
+@@ -12173,13 +12176,19 @@ static int hclge_init_ae_dev(struct hnae3_ae_dev *ae_dev)
+ 		goto err_mdiobus_unreg;
+ 	}
+ 
++	ret = hclge_register_sysfs(hdev);
++	if (ret) {
++		dev_err(&pdev->dev, "failed to register sysfs, ret = %d\n", ret);
++		goto err_mdiobus_unreg;
++	}
++
+ 	ret = hclge_ptp_init(hdev);
+ 	if (ret)
+-		goto err_mdiobus_unreg;
++		goto err_sysfs_unregister;
+ 
+ 	ret = hclge_update_port_info(hdev);
+ 	if (ret)
+-		goto err_mdiobus_unreg;
++		goto err_sysfs_unregister;
+ 
+ 	INIT_KFIFO(hdev->mac_tnl_log);
+ 
+@@ -12224,6 +12233,8 @@ static int hclge_init_ae_dev(struct hnae3_ae_dev *ae_dev)
+ 
+ 	return 0;
+ 
++err_sysfs_unregister:
++	hclge_unregister_sysfs(hdev);
+ err_mdiobus_unreg:
+ 	if (hdev->hw.mac.phydev)
+ 		mdiobus_unregister(hdev->hw.mac.mdio_bus);
+@@ -12605,6 +12616,7 @@ static void hclge_uninit_ae_dev(struct hnae3_ae_dev *ae_dev)
+ 	struct hclge_dev *hdev = ae_dev->priv;
+ 	struct hclge_mac *mac = &hdev->hw.mac;
+ 
++	hclge_unregister_sysfs(hdev);
+ 	hclge_reset_vf_rate(hdev);
+ 	hclge_clear_vf_vlan(hdev);
+ 	hclge_state_uninit(hdev);
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.h b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.h
+index 1399f519b5f5..e5d786adafc3 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.h
+@@ -260,6 +260,7 @@ struct hclge_mac {
+ 	u8 duplex;
+ 	u8 support_autoneg;
+ 	u8 speed_type;	/* 0: sfp speed, 1: active speed */
++	u8 lane_num;
+ 	u32 speed;
+ 	u32 max_speed;
+ 	u32 speed_ability; /* speed ability supported by current media */
+@@ -1143,4 +1144,8 @@ int hclge_check_mac_addr_valid(struct hclge_dev *hdev, u8 vf,
+ int hclge_push_vf_link_status(struct hclge_vport *vport);
+ int hclge_enable_vport_vlan_filter(struct hclge_vport *vport, bool request_en);
+ int hclge_mac_update_stats(struct hclge_dev *hdev);
++int hclge_register_sysfs(struct hclge_dev *hdev);
++void hclge_unregister_sysfs(struct hclge_dev *hdev);
++int hclge_cfg_mac_speed_dup_hw(struct hclge_dev *hdev, int speed, u8 duplex,
++			       u8 lane_num);
+ #endif
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_sysfs.c b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_sysfs.c
+new file mode 100644
+index 000000000000..b7cc89c3f6d8
+--- /dev/null
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_sysfs.c
+@@ -0,0 +1,91 @@
++// SPDX-License-Identifier: GPL-2.0+
++// Copyright (c) Huawei Technologies Co., Ltd. 2022. All rights reserved.
++
++#include "hnae3.h"
++#include "hclge_main.h"
++
++static ssize_t lane_num_show(struct device *dev,
++			     struct device_attribute *attr, char *buf)
++{
++	struct pci_dev *pdev = container_of(dev, struct pci_dev, dev);
++	struct hnae3_ae_dev *ae_dev = pci_get_drvdata(pdev);
++	struct hclge_dev *hdev = ae_dev->priv;
++
++	return scnprintf(buf, PAGE_SIZE, "%u\n", hdev->hw.mac.lane_num);
++}
++
++static ssize_t lane_num_store(struct device *dev,
++			      struct device_attribute *attr,
++			      const char *buf, size_t count)
++{
++#define HCLGE_CONVERSION_NUM	10  /* Convert string to decimal number */
++
++	struct pci_dev *pdev = container_of(dev, struct pci_dev, dev);
++	struct hnae3_ae_dev *ae_dev = pci_get_drvdata(pdev);
++	struct hclge_dev *hdev = ae_dev->priv;
++	u8 lane_num, duplex;
++	u32 speed;
++	int ret;
++
++	ret = kstrtou8(buf, HCLGE_CONVERSION_NUM, &lane_num);
++	if (ret) {
++		dev_err(dev, "input params of lane number format unmatch.\n");
++		return -EINVAL;
++	}
++
++	if (!lane_num || lane_num > 8 || !is_power_of_2(lane_num)) {
++		dev_err(dev, "lane number only supports setting 1, 2, 4, 8.\n");
++		return -EINVAL;
++	}
++
++	rtnl_lock();
++
++	if (hdev->hw.mac.support_autoneg && hdev->hw.mac.autoneg) {
++		ret = count;
++		goto out;
++	}
++
++	if (lane_num == hdev->hw.mac.lane_num) {
++		dev_info(dev, "setting lane number not changed.\n");
++		ret = count;
++		goto out;
++	}
++
++	speed = hdev->hw.mac.speed;
++	duplex = hdev->hw.mac.duplex;
++
++	ret = hclge_cfg_mac_speed_dup_hw(hdev, speed, duplex, lane_num);
++	if (!ret)
++		ret = count;
++
++out:
++	rtnl_unlock();
++	return ret;
++}
++
++static DEVICE_ATTR_RW(lane_num);
++
++static const struct device_attribute *hclge_hw_attrs_list[] = {
++	&dev_attr_lane_num,
++};
++
++int hclge_register_sysfs(struct hclge_dev *hdev)
++{
++	int ret;
++
++	if (!hnae3_ae_dev_lane_num_supported(hdev->ae_dev))
++		return 0;
++
++	ret = device_create_file(&hdev->pdev->dev, hclge_hw_attrs_list[0]);
++	if (ret)
++		dev_err(&hdev->pdev->dev,
++			"failed to create node %s, ret = %d.\n",
++			hclge_hw_attrs_list[0]->attr.name, ret);
++
++	return ret;
++}
++
++void hclge_unregister_sysfs(struct hclge_dev *hdev)
++{
++	device_remove_file(&hdev->pdev->dev, hclge_hw_attrs_list[0]);
++}
+-- 
+2.33.0
+

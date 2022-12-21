@@ -1,0 +1,290 @@
+From 0cf17392d2667953f45ec06bccb1d862c0049110 Mon Sep 17 00:00:00 2001
+From: Chengchang Tang <tangchengchang@huawei.com>
+Date: Wed, 30 Nov 2022 18:24:05 +0800
+Subject: [PATCH] RDMA/hns: Setup the configuration of WQE addressing to QPC
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 0cf17392d2667953f45ec06bccb1d862c0049110
+Modified-by-SEL: Yes, refreshed due to different context
+
+
+driver inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I63KVU
+
+----------------------------------------------------------
+
+Add a new command to update the configuration of WQE buffer addressing to
+QPC in DCA mode.
+
+Signed-off-by: Chengchang Tang <tangchengchang@huawei.com>
+Reviewed-by: Yangyang Li <liyangyang20@huawei.com>
+Reviewed-by: YueHaibing <yuehaibing@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.c |  153 ++++++++++++++++++++++++++---
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.h |    1 
+ 2 files changed, 140 insertions(+), 14 deletions(-)
+
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+@@ -3104,6 +3104,16 @@ static void hns_roce_v2_exit(struct hns_
+ 		free_dip_list(hr_dev);
+ }
+ 
++static inline void mbox_desc_init(struct hns_roce_post_mbox *mb,
++				  struct hns_roce_mbox_msg *mbox_msg)
++{
++	mb->in_param_l = cpu_to_le32(mbox_msg->in_param);
++	mb->in_param_h = cpu_to_le32(mbox_msg->in_param >> 32);
++	mb->out_param_l = cpu_to_le32(mbox_msg->out_param);
++	mb->out_param_h = cpu_to_le32(mbox_msg->out_param >> 32);
++	mb->cmd_tag = cpu_to_le32(mbox_msg->tag << 8 | mbox_msg->cmd);
++}
++
+ static int hns_roce_mbox_post(struct hns_roce_dev *hr_dev,
+ 			      struct hns_roce_mbox_msg *mbox_msg)
+ {
+@@ -3112,17 +3122,34 @@ static int hns_roce_mbox_post(struct hns
+ 
+ 	hns_roce_cmq_setup_basic_desc(&desc, HNS_ROCE_OPC_POST_MB, false);
+ 
+-	mb->in_param_l = cpu_to_le32(mbox_msg->in_param);
+-	mb->in_param_h = cpu_to_le32(mbox_msg->in_param >> 32);
+-	mb->out_param_l = cpu_to_le32(mbox_msg->out_param);
+-	mb->out_param_h = cpu_to_le32(mbox_msg->out_param >> 32);
+-	mb->cmd_tag = cpu_to_le32(mbox_msg->tag << 8 | mbox_msg->cmd);
++	mbox_desc_init(mb, mbox_msg);
+ 	mb->token_event_en = cpu_to_le32(mbox_msg->event_en << 16 |
+ 					 mbox_msg->token);
+ 
+ 	return hns_roce_cmq_send(hr_dev, &desc, 1);
+ }
+ 
++static int hns_roce_mbox_send(struct hns_roce_dev *hr_dev,
++			      struct hns_roce_mbox_msg *mbox_msg)
++{
++	struct hns_roce_cmq_desc desc;
++	struct hns_roce_post_mbox *mb = (struct hns_roce_post_mbox *)desc.data;
++
++	hns_roce_cmq_setup_basic_desc(&desc, HNS_ROCE_OPC_SYNC_MB, false);
++
++	mbox_desc_init(mb, mbox_msg);
++
++	/* The hardware doesn't care about the token fields when working in
++	 * sync mode.
++	 */
++	mb->token_event_en = 0;
++
++	/* The cmdq send returns 0 indicates that the hardware has already
++	 * finished the operation defined in this mbox.
++	 */
++	return hns_roce_cmq_send(hr_dev, &desc, 1);
++}
++
+ static int v2_wait_mbox_complete(struct hns_roce_dev *hr_dev, u32 timeout,
+ 				 u8 *complete_status)
+ {
+@@ -4515,15 +4542,16 @@ static void modify_qp_init_to_init(struc
+ static int config_qp_rq_buf(struct hns_roce_dev *hr_dev,
+ 			    struct hns_roce_qp *hr_qp,
+ 			    struct hns_roce_v2_qp_context *context,
+-			    struct hns_roce_v2_qp_context *qpc_mask)
++			    struct hns_roce_v2_qp_context *qpc_mask,
++			    struct hns_roce_dca_attr *dca_attr)
+ {
+ 	u64 mtts[MTT_MIN_COUNT] = { 0 };
+ 	u64 wqe_sge_ba;
+ 	int count;
+ 
+ 	/* Search qp buf's mtts */
+-	count = hns_roce_mtr_find(hr_dev, &hr_qp->mtr, hr_qp->rq.offset, mtts,
+-				  MTT_MIN_COUNT, &wqe_sge_ba);
++	count = hns_roce_mtr_find(hr_dev, &hr_qp->mtr, dca_attr->rq_offset,
++				  mtts, ARRAY_SIZE(mtts), &wqe_sge_ba);
+ 	if (hr_qp->rq.wqe_cnt && count < 1) {
+ 		ibdev_err(&hr_dev->ib_dev,
+ 			  "failed to find RQ WQE, QPN = 0x%lx.\n", hr_qp->qpn);
+@@ -4589,7 +4617,8 @@ static int config_qp_rq_buf(struct hns_r
+ static int config_qp_sq_buf(struct hns_roce_dev *hr_dev,
+ 			    struct hns_roce_qp *hr_qp,
+ 			    struct hns_roce_v2_qp_context *context,
+-			    struct hns_roce_v2_qp_context *qpc_mask)
++			    struct hns_roce_v2_qp_context *qpc_mask,
++			    struct hns_roce_dca_attr *dca_attr)
+ {
+ 	struct ib_device *ibdev = &hr_dev->ib_dev;
+ 	u64 sge_cur_blk = 0;
+@@ -4597,7 +4626,8 @@ static int config_qp_sq_buf(struct hns_r
+ 	int count;
+ 
+ 	/* search qp buf's mtts */
+-	count = hns_roce_mtr_find(hr_dev, &hr_qp->mtr, 0, &sq_cur_blk, 1, NULL);
++	count = hns_roce_mtr_find(hr_dev, &hr_qp->mtr, dca_attr->sq_offset,
++				  &sq_cur_blk, 1, NULL);
+ 	if (count < 1) {
+ 		ibdev_err(ibdev, "failed to find QP(0x%lx) SQ buf.\n",
+ 			  hr_qp->qpn);
+@@ -4605,8 +4635,8 @@ static int config_qp_sq_buf(struct hns_r
+ 	}
+ 	if (hr_qp->sge.sge_cnt > 0) {
+ 		count = hns_roce_mtr_find(hr_dev, &hr_qp->mtr,
+-					  hr_qp->sge.offset,
+-					  &sge_cur_blk, 1, NULL);
++					  dca_attr->sge_offset, &sge_cur_blk, 1,
++					  NULL);
+ 		if (count < 1) {
+ 			ibdev_err(ibdev, "failed to find QP(0x%lx) SGE buf.\n",
+ 				  hr_qp->qpn);
+@@ -4664,6 +4694,7 @@ static int modify_qp_init_to_rtr(struct
+ 	struct hns_roce_dev *hr_dev = to_hr_dev(ibqp->device);
+ 	struct hns_roce_qp *hr_qp = to_hr_qp(ibqp);
+ 	struct ib_device *ibdev = &hr_dev->ib_dev;
++	struct hns_roce_dca_attr dca_attr = {};
+ 	dma_addr_t trrl_ba;
+ 	dma_addr_t irrl_ba;
+ 	enum ib_mtu ib_mtu;
+@@ -4675,7 +4706,8 @@ static int modify_qp_init_to_rtr(struct
+ 	int mtu;
+ 	int ret;
+ 
+-	ret = config_qp_rq_buf(hr_dev, hr_qp, context, qpc_mask);
++	dca_attr.rq_offset = hr_qp->rq.offset;
++	ret = config_qp_rq_buf(hr_dev, hr_qp, context, qpc_mask, &dca_attr);
+ 	if (ret) {
+ 		ibdev_err(ibdev, "failed to config rq buf, ret = %d.\n", ret);
+ 		return ret;
+@@ -4821,6 +4853,7 @@ static int modify_qp_rtr_to_rts(struct i
+ 	struct hns_roce_dev *hr_dev = to_hr_dev(ibqp->device);
+ 	struct hns_roce_qp *hr_qp = to_hr_qp(ibqp);
+ 	struct ib_device *ibdev = &hr_dev->ib_dev;
++	struct hns_roce_dca_attr dca_attr = {};
+ 	int ret;
+ 
+ 	/* Not support alternate path and path migration */
+@@ -4829,7 +4862,9 @@ static int modify_qp_rtr_to_rts(struct i
+ 		return -EINVAL;
+ 	}
+ 
+-	ret = config_qp_sq_buf(hr_dev, hr_qp, context, qpc_mask);
++	dca_attr.sq_offset = hr_qp->sq.offset;
++	dca_attr.sge_offset = hr_qp->sge.offset;
++	ret = config_qp_sq_buf(hr_dev, hr_qp, context, qpc_mask, &dca_attr);
+ 	if (ret) {
+ 		ibdev_err(ibdev, "failed to config sq buf, ret = %d.\n", ret);
+ 		return ret;
+@@ -5491,6 +5526,95 @@ out:
+ 	return ret;
+ }
+ 
++static int init_dca_buf_attr(struct hns_roce_dev *hr_dev,
++			     struct hns_roce_qp *hr_qp,
++			     struct hns_roce_dca_attr *init_attr,
++			     struct hns_roce_dca_attr *dca_attr)
++{
++	struct ib_device *ibdev = &hr_dev->ib_dev;
++
++	if (hr_qp->sq.wqe_cnt > 0) {
++		dca_attr->sq_offset = hr_qp->sq.offset + init_attr->sq_offset;
++		if (dca_attr->sq_offset >= hr_qp->sge.offset) {
++			ibdev_err(ibdev, "failed to check SQ offset = %u\n",
++				  init_attr->sq_offset);
++			return -EINVAL;
++		}
++	}
++
++	if (hr_qp->sge.sge_cnt > 0) {
++		dca_attr->sge_offset = hr_qp->sge.offset + init_attr->sge_offset;
++		if (dca_attr->sge_offset >= hr_qp->rq.offset) {
++			ibdev_err(ibdev, "failed to check exSGE offset = %u\n",
++				  init_attr->sge_offset);
++			return -EINVAL;
++		}
++	}
++
++	if (hr_qp->rq.wqe_cnt > 0) {
++		dca_attr->rq_offset = hr_qp->rq.offset + init_attr->rq_offset;
++		if (dca_attr->rq_offset >= hr_qp->buff_size) {
++			ibdev_err(ibdev, "failed to check RQ offset = %u\n",
++				  init_attr->rq_offset);
++			return -EINVAL;
++		}
++	}
++
++	return 0;
++}
++
++static int hns_roce_v2_set_dca_buf(struct hns_roce_dev *hr_dev,
++				   struct hns_roce_qp *hr_qp,
++				   struct hns_roce_dca_attr *init_attr)
++{
++	struct ib_device *ibdev = &hr_dev->ib_dev;
++	struct hns_roce_v2_qp_context *qpc, *msk;
++	struct hns_roce_dca_attr dca_attr = {};
++	struct hns_roce_mbox_msg mbox_msg = {};
++	dma_addr_t dma_handle;
++	int qpc_sz;
++	int ret;
++
++	ret = init_dca_buf_attr(hr_dev, hr_qp, init_attr, &dca_attr);
++	if (ret) {
++		ibdev_err(ibdev, "failed to init DCA attr, ret = %d.\n", ret);
++		return ret;
++	}
++
++	qpc_sz = hr_dev->caps.qpc_sz;
++	WARN_ON(2 * qpc_sz > HNS_ROCE_MAILBOX_SIZE);
++	qpc = dma_pool_alloc(hr_dev->cmd.pool, GFP_NOWAIT, &dma_handle);
++	if (!qpc)
++		return -ENOMEM;
++
++	msk = (struct hns_roce_v2_qp_context *)((void *)qpc + qpc_sz);
++	memset(msk, 0xff, qpc_sz);
++
++	ret = config_qp_rq_buf(hr_dev, hr_qp, qpc, msk, &dca_attr);
++	if (ret) {
++		ibdev_err(ibdev, "failed to config rq qpc, ret = %d.\n", ret);
++		goto done;
++	}
++
++	ret = config_qp_sq_buf(hr_dev, hr_qp, qpc, msk, &dca_attr);
++	if (ret) {
++		ibdev_err(ibdev, "failed to config sq qpc, ret = %d.\n", ret);
++		goto done;
++	}
++
++	mbox_msg.in_param = dma_handle;
++	mbox_msg.tag = hr_qp->qpn;
++	mbox_msg.cmd = HNS_ROCE_CMD_MODIFY_QPC;
++	ret = hns_roce_mbox_send(hr_dev, &mbox_msg);
++	if (ret)
++		ibdev_err(ibdev, "failed to modify DCA buf, ret = %d.\n", ret);
++
++done:
++	dma_pool_free(hr_dev->cmd.pool, qpc, dma_handle);
++
++	return ret;
++}
++
+ static int to_ib_qp_st(enum hns_roce_v2_qp_state state)
+ {
+ 	static const enum ib_qp_state map[] = {
+@@ -6866,6 +6990,7 @@ static const struct hns_roce_hw hns_roce
+ 	.write_cqc = hns_roce_v2_write_cqc,
+ 	.set_hem = hns_roce_v2_set_hem,
+ 	.clear_hem = hns_roce_v2_clear_hem,
++	.set_dca_buf = hns_roce_v2_set_dca_buf,
+ 	.modify_qp = hns_roce_v2_modify_qp,
+ 	.dereg_mr = hns_roce_v2_dereg_mr,
+ 	.qp_flow_control_init = hns_roce_v2_qp_flow_control_init,
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.h
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.h
+@@ -250,6 +250,7 @@ enum hns_roce_opcode_type {
+ 	HNS_ROCE_OPC_QUERY_VF_RES			= 0x850e,
+ 	HNS_ROCE_OPC_CFG_GMV_TBL			= 0x850f,
+ 	HNS_ROCE_OPC_CFG_GMV_BT				= 0x8510,
++	HNS_ROCE_OPC_SYNC_MB				= 0x8511,
+ 	HNS_ROCE_OPC_EXT_CFG				= 0x8512,
+ 	HNS_ROCE_QUERY_RAM_ECC				= 0x8513,
+ 	HNS_SWITCH_PARAMETER_CFG			= 0x1033,

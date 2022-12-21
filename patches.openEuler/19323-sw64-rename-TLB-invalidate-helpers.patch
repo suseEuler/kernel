@@ -1,0 +1,189 @@
+From cfb6c2c687c58e39c4031e069be2184272395757 Mon Sep 17 00:00:00 2001
+From: He Sheng <hesheng@wxiat.com>
+Date: Tue, 26 Jul 2022 13:41:18 +0800
+Subject: [PATCH] sw64: rename TLB invalidate helpers
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: cfb6c2c687c58e39c4031e069be2184272395757
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56OLG
+
+--------------------------------
+
+Rename these helpers and their usages according to SW64 architecture
+manuals.
+
+Signed-off-by: He Sheng <hesheng@wxiat.com>
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/include/asm/hmcall.h      | 24 ++++++++++++++++++++----
+ arch/sw_64/include/asm/mmu_context.h |  4 ++--
+ arch/sw_64/include/asm/tlbflush.h    |  6 +++---
+ arch/sw_64/kernel/head.S             |  2 +-
+ arch/sw_64/kernel/hibernate.c        |  3 +--
+ arch/sw_64/kernel/machine_kexec.c    |  3 ---
+ arch/sw_64/kernel/smp.c              |  2 +-
+ arch/sw_64/mm/init.c                 |  2 +-
+ 8 files changed, 29 insertions(+), 17 deletions(-)
+
+diff --git a/arch/sw_64/include/asm/hmcall.h b/arch/sw_64/include/asm/hmcall.h
+index 310cc61a5a34..0e609e9cade7 100644
+--- a/arch/sw_64/include/asm/hmcall.h
++++ b/arch/sw_64/include/asm/hmcall.h
+@@ -193,12 +193,28 @@ __CALL_HMC_RW2(cpuid, unsigned long, unsigned long, unsigned long);
+ })
+ 
+ #define tbi(x, y)	__tbi(x, __r17 = (y), "1" (__r17))
+-#define tbisi(x)	__tbi(1, __r17 = (x), "1" (__r17))
+-#define tbisd(x)	__tbi(2, __r17 = (x), "1" (__r17))
+-#define tbis(x)		__tbi(3, __r17 = (x), "1" (__r17))
+-#define tbiap()		__tbi(-1, /* no second argument */)
++
++/* Invalidate all TLB, only used by hypervisor */
+ #define tbia()		__tbi(-2, /* no second argument */)
+ 
++/* Invalidate TLB for all processes with currnet VPN */
++#define tbivp()		__tbi(-1, /* no second argument */)
++
++/* Invalidate all TLB with current VPN */
++#define tbiv()		__tbi(0, /* no second argument */)
++
++/* Invalidate ITLB of addr with current UPN and VPN */
++#define tbisi(addr)	__tbi(1, __r17 = (addr), "1" (__r17))
++
++/* Invalidate DTLB of addr with current UPN and VPN */
++#define tbisd(addr)	__tbi(2, __r17 = (addr), "1" (__r17))
++
++/* Invalidate TLB of addr with current UPN and VPN */
++#define tbis(addr)	__tbi(3, __r17 = (addr), "1" (__r17))
++
++/* Invalidate all user TLB with current UPN and VPN */
++#define tbiu()		__tbi(4, /* no second argument */)
++
+ #endif /* !__ASSEMBLY__ */
+ #endif /* __KERNEL__ */
+ 
+diff --git a/arch/sw_64/include/asm/mmu_context.h b/arch/sw_64/include/asm/mmu_context.h
+index a797673273af..762ffbf72dbb 100644
+--- a/arch/sw_64/include/asm/mmu_context.h
++++ b/arch/sw_64/include/asm/mmu_context.h
+@@ -72,7 +72,7 @@ __reload_thread(struct pcb_struct *pcb)
+  * need to do "p->mm->context = 0".
+  *
+  * If we need more ASN's than the processor has, we invalidate the old
+- * user TLB's (tbiap()) and start a new ASN version. That will automatically
++ * user TLB's (tbivp()) and start a new ASN version. That will automatically
+  * force a new asn for any other processes the next time they want to
+  * run.
+  */
+@@ -84,7 +84,7 @@ __get_new_mm_context(struct mm_struct *mm, long cpu)
+ 	unsigned long next = asn + 1;
+ 
+ 	if ((asn & HARDWARE_ASN_MASK) >= HARDWARE_ASN_MASK) {
+-		tbiap();
++		tbivp();
+ 		next = (asn & ~HARDWARE_ASN_MASK) + ASN_FIRST_VERSION;
+ 	}
+ 	cpu_last_asn(cpu) = next;
+diff --git a/arch/sw_64/include/asm/tlbflush.h b/arch/sw_64/include/asm/tlbflush.h
+index 7805bb287257..1d6a0db2a054 100644
+--- a/arch/sw_64/include/asm/tlbflush.h
++++ b/arch/sw_64/include/asm/tlbflush.h
+@@ -28,11 +28,11 @@ static inline void flush_tlb_current_page(struct mm_struct *mm,
+ 					  unsigned long addr)
+ {
+ 	if (vma->vm_flags & VM_EXEC) {
+-		tbi(3, addr);
++		tbis(addr);
+ 		if (icache_is_vivt_no_ictag())
+ 			imb();
+ 	} else
+-		tbi(2, addr);
++		tbisd(addr);
+ }
+ 
+ 
+@@ -65,7 +65,7 @@ static inline void flush_tlb_other(struct mm_struct *mm)
+  */
+ static inline void flush_tlb_all(void)
+ {
+-	tbia();
++	tbiv();
+ }
+ 
+ /* Flush a specified user mapping.  */
+diff --git a/arch/sw_64/kernel/head.S b/arch/sw_64/kernel/head.S
+index 5fff0f33c9e2..e43499d18357 100644
+--- a/arch/sw_64/kernel/head.S
++++ b/arch/sw_64/kernel/head.S
+@@ -71,7 +71,7 @@ __smp_callin:
+ 	br	$27, 2f		# we copy this from above "br $27 1f"
+ 2:	ldgp	$29, 0($27)	# First order of business, load the GP.
+ 
+-	subl	$31, 2, $16
++	bis	$31, $31, $16	# invalidate all TLB with current VPN
+ 	sys_call HMC_tbi
+ 
+ 	sys_call HMC_whami	# Get hard cid
+diff --git a/arch/sw_64/kernel/hibernate.c b/arch/sw_64/kernel/hibernate.c
+index 33426e3ed305..799706db5b94 100644
+--- a/arch/sw_64/kernel/hibernate.c
++++ b/arch/sw_64/kernel/hibernate.c
+@@ -27,8 +27,7 @@ void restore_processor_state(void)
+ 	wrpcbb(vcb->pcbb);
+ 	wrptbr(vcb->ptbr);
+ 	sflush();
+-	tbia();
+-	imb();
++	tbiv();
+ }
+ 
+ int swsusp_arch_resume(void)
+diff --git a/arch/sw_64/kernel/machine_kexec.c b/arch/sw_64/kernel/machine_kexec.c
+index c9ca7a728bd4..950998476cda 100644
+--- a/arch/sw_64/kernel/machine_kexec.c
++++ b/arch/sw_64/kernel/machine_kexec.c
+@@ -204,9 +204,6 @@ void machine_kexec(struct kimage *image)
+ 
+ 	pr_info("Will call new kernel at %08lx\n", image->start);
+ 	pr_info("Bye ...\n");
+-	//flush_cache_all();
+-	//sflush();
+-	//tbia();
+ 	smp_wmb();
+ 	((noretfun_t) reboot_code_buffer)();
+ }
+diff --git a/arch/sw_64/kernel/smp.c b/arch/sw_64/kernel/smp.c
+index 1004e9e3be27..1c534b22dc26 100644
+--- a/arch/sw_64/kernel/smp.c
++++ b/arch/sw_64/kernel/smp.c
+@@ -511,7 +511,7 @@ EXPORT_SYMBOL(smp_imb);
+ 
+ static void ipi_flush_tlb_all(void *ignored)
+ {
+-	tbia();
++	tbiv();
+ }
+ 
+ void flush_tlb_all(void)
+diff --git a/arch/sw_64/mm/init.c b/arch/sw_64/mm/init.c
+index e0096a0b432a..6ed1ef8e020c 100644
+--- a/arch/sw_64/mm/init.c
++++ b/arch/sw_64/mm/init.c
+@@ -104,7 +104,7 @@ switch_to_system_map(void)
+ 	init_thread_info.pcb.ptbr = newptbr;
+ 	init_thread_info.pcb.flags = 1;	/* set FEN, clear everything else */
+ 	original_pcb_ptr = load_PCB(&init_thread_info.pcb);
+-	tbia();
++	tbiv();
+ }
+ 
+ void __init callback_init(void)
+-- 
+2.33.0
+

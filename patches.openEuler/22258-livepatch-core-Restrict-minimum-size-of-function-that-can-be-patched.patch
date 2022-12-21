@@ -1,0 +1,270 @@
+From ed8c4c729c5f65fc8b6c14912793d85070d03fe5 Mon Sep 17 00:00:00 2001
+From: Zheng Yejian <zhengyejian1@huawei.com>
+Date: Wed, 30 Nov 2022 18:23:51 +0800
+Subject: [PATCH] livepatch/core: Restrict minimum size of function that can be
+ patched
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: ed8c4c729c5f65fc8b6c14912793d85070d03fe5
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I60L10
+CVE: NA
+
+--------------------------------
+
+If a function is patched, instructions at the beginning are modified to be
+'jump codes' which jump to new function. This requires the function be big
+enough, otherwise the modification may be out of function range.
+
+Currently each architecture needs to implement arch_klp_func_can_patch()
+to check function size. However, there exists following problems:
+  1. arch 'x86' didn't implement arch_klp_func_can_patch();
+  2. implementations in arm64 & ppc32, function size is checked only if
+     there's a long jump. There is a scenario where a very short function
+     is successfully patched, but as kernel module increases, someday long
+     jump is required, then the function become unable to be patched.
+  3. implementaions look like duplicate.
+
+In this patch, introduce macro KLP_MAX_REPLACE_SIZE to denote the maximum
+size that will be replaced on patching, then move the check ahead into
+klp_init_object_loaded().
+
+Fixes: c33e42836a74 ("livepatch/core: Allow implementation without ftrace")
+Signed-off-by: Zheng Yejian <zhengyejian1@huawei.com>
+Reviewed-by: Kuohai Xu <xukuohai@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm/include/asm/livepatch.h     |  2 ++
+ arch/arm/kernel/livepatch.c          | 25 -------------------------
+ arch/arm64/include/asm/livepatch.h   |  2 ++
+ arch/arm64/kernel/livepatch.c        | 25 -------------------------
+ arch/powerpc/include/asm/livepatch.h |  2 ++
+ arch/powerpc/kernel/livepatch_32.c   | 18 ------------------
+ arch/powerpc/kernel/livepatch_64.c   | 15 ---------------
+ arch/x86/include/asm/livepatch.h     |  2 ++
+ kernel/livepatch/core.c              | 15 ++++++---------
+ 9 files changed, 14 insertions(+), 92 deletions(-)
+
+diff --git a/arch/arm/include/asm/livepatch.h b/arch/arm/include/asm/livepatch.h
+index 47d8b01618c7..445a78d83d21 100644
+--- a/arch/arm/include/asm/livepatch.h
++++ b/arch/arm/include/asm/livepatch.h
+@@ -57,6 +57,8 @@ struct arch_klp_data {
+ 	u32 saved_opcode;
+ };
+ 
++#define KLP_MAX_REPLACE_SIZE sizeof_field(struct arch_klp_data, old_insns)
++
+ int arch_klp_add_breakpoint(struct arch_klp_data *arch_data, void *old_func);
+ void arch_klp_remove_breakpoint(struct arch_klp_data *arch_data, void *old_func);
+ long arch_klp_save_old_code(struct arch_klp_data *arch_data, void *old_func);
+diff --git a/arch/arm/kernel/livepatch.c b/arch/arm/kernel/livepatch.c
+index 713ce67fa6e3..bc09f338e713 100644
+--- a/arch/arm/kernel/livepatch.c
++++ b/arch/arm/kernel/livepatch.c
+@@ -496,28 +496,3 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 		do_patch(pc, (unsigned long)next_func->new_func);
+ 	}
+ }
+-
+-#ifdef CONFIG_ARM_MODULE_PLTS
+-/* return 0 if the func can be patched */
+-int arch_klp_func_can_patch(struct klp_func *func)
+-{
+-	unsigned long pc = (unsigned long)func->old_func;
+-	unsigned long new_addr = (unsigned long)func->new_func;
+-	unsigned long old_size = func->old_size;
+-
+-	if (!old_size)
+-		return -EINVAL;
+-
+-	if (!offset_in_range(pc, new_addr, SZ_32M) &&
+-	    (old_size < LJMP_INSN_SIZE * ARM_INSN_SIZE)) {
+-		pr_err("func %s size less than limit\n", func->old_name);
+-		return -EPERM;
+-	}
+-	return 0;
+-}
+-#else
+-int arch_klp_func_can_patch(struct klp_func *func)
+-{
+-	return 0;
+-}
+-#endif /* #ifdef CONFIG_ARM_MODULE_PLTS */
+diff --git a/arch/arm64/include/asm/livepatch.h b/arch/arm64/include/asm/livepatch.h
+index bcb6c4081978..c41a22adc944 100644
+--- a/arch/arm64/include/asm/livepatch.h
++++ b/arch/arm64/include/asm/livepatch.h
+@@ -66,6 +66,8 @@ struct arch_klp_data {
+ 	u32 saved_opcode;
+ };
+ 
++#define KLP_MAX_REPLACE_SIZE sizeof_field(struct arch_klp_data, old_insns)
++
+ int arch_klp_add_breakpoint(struct arch_klp_data *arch_data, void *old_func);
+ void arch_klp_remove_breakpoint(struct arch_klp_data *arch_data, void *old_func);
+ long arch_klp_save_old_code(struct arch_klp_data *arch_data, void *old_func);
+diff --git a/arch/arm64/kernel/livepatch.c b/arch/arm64/kernel/livepatch.c
+index cda56066d859..8ec09c22dc26 100644
+--- a/arch/arm64/kernel/livepatch.c
++++ b/arch/arm64/kernel/livepatch.c
+@@ -483,28 +483,3 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 		do_patch(pc, (unsigned long)next_func->new_func);
+ 	}
+ }
+-
+-#ifdef CONFIG_ARM64_MODULE_PLTS
+-/* return 0 if the func can be patched */
+-int arch_klp_func_can_patch(struct klp_func *func)
+-{
+-	unsigned long pc = (unsigned long)func->old_func;
+-	unsigned long new_addr = (unsigned long)func->new_func;
+-	unsigned long old_size = func->old_size;
+-
+-	if ((long)old_size <= 0)
+-		return -EINVAL;
+-
+-	if (!offset_in_range(pc, new_addr, SZ_128M) &&
+-	  (old_size < LJMP_INSN_SIZE * sizeof(u32))) {
+-		pr_err("func %s size less than limit\n", func->old_name);
+-		return -EPERM;
+-	}
+-	return 0;
+-}
+-#else
+-int arch_klp_func_can_patch(struct klp_func *func)
+-{
+-	return 0;
+-}
+-#endif
+diff --git a/arch/powerpc/include/asm/livepatch.h b/arch/powerpc/include/asm/livepatch.h
+index 39dcfc3c28ce..ae674ea59ab3 100644
+--- a/arch/powerpc/include/asm/livepatch.h
++++ b/arch/powerpc/include/asm/livepatch.h
+@@ -118,6 +118,8 @@ struct arch_klp_data {
+ 
+ #endif	/* CONFIG_PPC64 */
+ 
++#define KLP_MAX_REPLACE_SIZE sizeof_field(struct arch_klp_data, old_insns)
++
+ struct stackframe {
+ 	unsigned long sp;
+ 	unsigned long pc;
+diff --git a/arch/powerpc/kernel/livepatch_32.c b/arch/powerpc/kernel/livepatch_32.c
+index 8f53386e7cf8..4eefae2f92dc 100644
+--- a/arch/powerpc/kernel/livepatch_32.c
++++ b/arch/powerpc/kernel/livepatch_32.c
+@@ -488,22 +488,4 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 		do_patch(pc, (unsigned long)next_func->new_func);
+ 	}
+ }
+-
+-/* return 0 if the func can be patched */
+-int arch_klp_func_can_patch(struct klp_func *func)
+-{
+-	unsigned long pc = (unsigned long)func->old_func;
+-	unsigned long new_addr = (unsigned long)func->new_func;
+-	unsigned long old_size = func->old_size;
+-
+-	if (!old_size)
+-		return -EINVAL;
+-
+-	if (!offset_in_range(pc, new_addr, SZ_32M) &&
+-	    (old_size < LJMP_INSN_SIZE * sizeof(u32))) {
+-		pr_err("func %s size less than limit\n", func->old_name);
+-		return -EPERM;
+-	}
+-	return 0;
+-}
+ #endif
+diff --git a/arch/powerpc/kernel/livepatch_64.c b/arch/powerpc/kernel/livepatch_64.c
+index cbb5e02cccff..aca7361ac12b 100644
+--- a/arch/powerpc/kernel/livepatch_64.c
++++ b/arch/powerpc/kernel/livepatch_64.c
+@@ -491,21 +491,6 @@ void arch_klp_unpatch_func(struct klp_func *func)
+ 	}
+ }
+ 
+-/* return 0 if the func can be patched */
+-int arch_klp_func_can_patch(struct klp_func *func)
+-{
+-	unsigned long old_size = func->old_size;
+-
+-	if (!old_size)
+-		return -EINVAL;
+-
+-	if (old_size < LJMP_INSN_SIZE * sizeof(u32)) {
+-		pr_err("func %s size less than limit\n", func->old_name);
+-		return -EPERM;
+-	}
+-	return 0;
+-}
+-
+ int arch_klp_init_func(struct klp_object *obj, struct klp_func *func)
+ {
+ #ifdef PPC64_ELF_ABI_v1
+diff --git a/arch/x86/include/asm/livepatch.h b/arch/x86/include/asm/livepatch.h
+index dbcf69b9c4cb..e2cef5b2d8aa 100644
+--- a/arch/x86/include/asm/livepatch.h
++++ b/arch/x86/include/asm/livepatch.h
+@@ -46,6 +46,8 @@ struct arch_klp_data {
+ #endif
+ };
+ 
++#define KLP_MAX_REPLACE_SIZE sizeof_field(struct arch_klp_data, old_insns)
++
+ long arch_klp_save_old_code(struct arch_klp_data *arch_data, void *old_func);
+ #ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
+ int arch_klp_check_breakpoint(struct arch_klp_data *arch_data, void *old_func);
+diff --git a/kernel/livepatch/core.c b/kernel/livepatch/core.c
+index 338c2624de0e..f613e94f0e38 100644
+--- a/kernel/livepatch/core.c
++++ b/kernel/livepatch/core.c
+@@ -938,11 +938,6 @@ void klp_free_replaced_patches_async(struct klp_patch *new_patch)
+ }
+ 
+ #ifdef CONFIG_LIVEPATCH_WO_FTRACE
+-int __weak arch_klp_func_can_patch(struct klp_func *func)
+-{
+-	return 0;
+-}
+-
+ int __weak arch_klp_init_func(struct klp_object *obj, struct klp_func *func)
+ {
+ 	return 0;
+@@ -965,9 +960,6 @@ static int klp_init_func(struct klp_object *obj, struct klp_func *func)
+ 	else
+ 		func->old_mod = NULL;
+ #endif
+-	ret = arch_klp_func_can_patch(func);
+-	if (ret)
+-		return ret;
+ 
+ 	ret = arch_klp_init_func(obj, func);
+ 	if (ret)
+@@ -1043,11 +1035,16 @@ static int klp_init_object_loaded(struct klp_patch *patch,
+ 
+ 		ret = kallsyms_lookup_size_offset((unsigned long)func->old_func,
+ 						  &func->old_size, NULL);
+-		if (!ret) {
++		if (!ret || ((long)func->old_size < 0)) {
+ 			pr_err("kallsyms size lookup failed for '%s'\n",
+ 			       func->old_name);
+ 			return -ENOENT;
+ 		}
++		if (func->old_size < KLP_MAX_REPLACE_SIZE) {
++			pr_err("%s size less than limit (%lu < %zu)\n", func->old_name,
++			       func->old_size, KLP_MAX_REPLACE_SIZE);
++			return -EINVAL;
++		}
+ 
+ #ifdef PPC64_ELF_ABI_v1
+ 		/*
+-- 
+2.33.0
+

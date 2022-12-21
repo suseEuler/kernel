@@ -1,0 +1,327 @@
+From 426b9efea56f9b065151d165caab2ebd32906505 Mon Sep 17 00:00:00 2001
+From: Yu Liao <liaoyu15@huawei.com>
+Date: Fri, 11 Nov 2022 09:32:46 +0800
+Subject: [PATCH] mm: Add sysctl to clear free list pages
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 426b9efea56f9b065151d165caab2ebd32906505
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4SK3S
+CVE: NA
+
+--------------------------------
+
+This patch add sysctl to clear pages in free lists of each NUMA node.
+For each NUMA node, clear each page in the free list, these work is
+scheduled on a random CPU of the NUMA node.
+
+When kasan is enabled and the pages are free, the shadow memory will be
+filled with 0xFF, writing these free pages will cause UAF, so just
+disable KASAN for clear freelist.
+
+In the case of large memory, the clear freelist will hold zone lock
+for a long time. As a result, the process may be blocked unless clear
+freelist thread exit, and causing the system to be reset by the watchdog.
+
+Provide a mechanism to stop clear freelist threads when elapsed time
+exceeds cfp_timeout, which can be set by module_param().
+
+Signed-off-by: Yu Liao <liaoyu15@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ .../admin-guide/kernel-parameters.txt         |   4 +
+ Documentation/admin-guide/sysctl/vm.rst       |  13 ++
+ mm/Kconfig                                    |  13 ++
+ mm/Makefile                                   |   2 +
+ mm/clear_freelist_page.c                      | 187 ++++++++++++++++++
+ 5 files changed, 219 insertions(+)
+ create mode 100644 mm/clear_freelist_page.c
+
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index 71d45c34858f..0ec4c66752af 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -539,6 +539,10 @@
+ 
+ 	cio_ignore=	[S390]
+ 			See Documentation/s390/common_io.rst for details.
++
++	clear_freelist
++			Enable clear_freelist feature.
++
+ 	clk_ignore_unused
+ 			[CLK]
+ 			Prevents the clock framework from automatically gating
+diff --git a/Documentation/admin-guide/sysctl/vm.rst b/Documentation/admin-guide/sysctl/vm.rst
+index eb227015a895..a84bef7aa864 100644
+--- a/Documentation/admin-guide/sysctl/vm.rst
++++ b/Documentation/admin-guide/sysctl/vm.rst
+@@ -25,6 +25,7 @@ files can be found in mm/swap.c.
+ Currently, these files are in /proc/sys/vm:
+ 
+ - admin_reserve_kbytes
++- clear_freelist_pages
+ - compact_memory
+ - compaction_proactiveness
+ - compact_unevictable_allowed
+@@ -109,6 +110,18 @@ On x86_64 this is about 128MB.
+ Changing this takes effect whenever an application requests memory.
+ 
+ 
++clear_freelist_pages
++====================
++
++Available only when CONFIG_CLEAR_FREELIST_PAGE is set. When 1 is written to the
++file, all pages in free lists will be written with 0.
++
++Zone lock is held during clear_freelist_pages, if the execution time is too
++long, RCU CPU Stall warnings will be print. For each NUMA node,
++clear_freelist_pages is performed on a "random" CPU of the NUMA node.
++The time consuming is related to the hardware.
++
++
+ compact_memory
+ ==============
+ 
+diff --git a/mm/Kconfig b/mm/Kconfig
+index 5e1175da720e..be7fd4ed2c4f 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -980,6 +980,19 @@ config MEMORY_RELIABLE
+ 	  To enable this function, mirrored memory is needed and
+ 	  "kernelcore=reliable" need to be added in kernel parameters.
+ 
++config CLEAR_FREELIST_PAGE
++	bool "Support for clear free list pages"
++	depends on MMU && SYSCTL
++	default n
++	help
++	  Say y here to enable the clear free list pages feature. When
++	  writing to clear_freelist, trigger to clean up the free memory
++	  of the buddy system.
++
++	  To enable this feature, kernel parameter "clear_freelist" also
++	  needs to be added.
++
++
+ source "mm/damon/Kconfig"
+ 
+ endmenu
+diff --git a/mm/Makefile b/mm/Makefile
+index 9798d8735cc7..696ee59c2ac7 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -7,6 +7,7 @@ KASAN_SANITIZE_slab_common.o := n
+ KASAN_SANITIZE_slab.o := n
+ KASAN_SANITIZE_slub.o := n
+ KCSAN_SANITIZE_kmemleak.o := n
++KASAN_SANITIZE_clear_freelist_page.o := n
+ 
+ # These produce frequent data race reports: most of them are due to races on
+ # the same word but accesses to different bits of that word. Re-enable KCSAN
+@@ -130,3 +131,4 @@ obj-$(CONFIG_ASCEND_SHARE_POOL) += share_pool.o
+ obj-$(CONFIG_MEMORY_RELIABLE) += mem_reliable.o
+ obj-$(CONFIG_MEMCG_MEMFS_INFO) += memcg_memfs_info.o
+ obj-$(CONFIG_PAGE_CACHE_LIMIT) += page_cache_limit.o
++obj-$(CONFIG_CLEAR_FREELIST_PAGE) += clear_freelist_page.o
+diff --git a/mm/clear_freelist_page.c b/mm/clear_freelist_page.c
+new file mode 100644
+index 000000000000..50b7ec918bfb
+--- /dev/null
++++ b/mm/clear_freelist_page.c
+@@ -0,0 +1,187 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Support for clear free list pages.
++ */
++
++#include <linux/mmzone.h>
++#include <linux/mm_types.h>
++#include <linux/mm.h>
++#include <linux/sysctl.h>
++#include <linux/highmem.h>
++#include <linux/slab.h>
++#include <linux/workqueue.h>
++#include <linux/sched.h>
++#include <linux/atomic.h>
++#include <linux/nmi.h>
++#include <linux/sched/clock.h>
++#include <linux/module.h>
++
++#define CFP_DEFAULT_TIMEOUT 2000
++#define for_each_populated_zone_pgdat(pgdat, zone) \
++	for (zone = pgdat->node_zones;      \
++		zone;                  \
++		zone = next_pgdat_zone(zone))      \
++		if (!populated_zone(zone))      \
++			; /* do nothing */      \
++		else
++
++struct pgdat_entry {
++	struct pglist_data *pgdat;
++	struct work_struct work;
++};
++
++static DECLARE_WAIT_QUEUE_HEAD(clear_freelist_wait);
++static DEFINE_MUTEX(clear_freelist_lock);
++static atomic_t clear_freelist_workers;
++static atomic_t clear_pages_num;
++static ulong cfp_timeout_ms = CFP_DEFAULT_TIMEOUT;
++
++/*
++ * next_pgdat_zone - helper magic for for_each_populated_zone_pgdat()
++ */
++static struct zone *next_pgdat_zone(struct zone *zone)
++{
++	pg_data_t *pgdat = zone->zone_pgdat;
++
++	if (zone < pgdat->node_zones + MAX_NR_ZONES - 1)
++		zone++;
++	else
++		zone = NULL;
++	return zone;
++}
++
++static void clear_pgdat_freelist_pages(struct work_struct *work)
++{
++	struct pgdat_entry *entry = container_of(work, struct pgdat_entry, work);
++	u64 cfp_timeout_ns = cfp_timeout_ms * NSEC_PER_MSEC;
++	struct pglist_data *pgdat = entry->pgdat;
++	unsigned long flags, order, t;
++	struct page *page;
++	struct zone *zone;
++	u64 start, now;
++
++	start = sched_clock();
++
++	for_each_populated_zone_pgdat(pgdat, zone) {
++		spin_lock_irqsave(&zone->lock, flags);
++		for_each_migratetype_order(order, t) {
++			list_for_each_entry(page, &zone->free_area[order].free_list[t], lru) {
++				now = sched_clock();
++				if (unlikely(now - start > cfp_timeout_ns)) {
++					spin_unlock_irqrestore(&zone->lock, flags);
++					goto out;
++				}
++
++#ifdef CONFIG_KMAP_LOCAL
++				int i;
++
++				/* Clear highmem by clear_highpage() */
++				for (i = 0; i < (1 << order); i++)
++					clear_highpage(page + i);
++#else
++				memset(page_address(page), 0, (1 << order) * PAGE_SIZE);
++#endif
++				touch_nmi_watchdog();
++				atomic_add(1 << order, &clear_pages_num);
++			}
++		}
++		spin_unlock_irqrestore(&zone->lock, flags);
++
++		cond_resched();
++	}
++
++out:
++	kfree(entry);
++
++	if (atomic_dec_and_test(&clear_freelist_workers))
++		wake_up(&clear_freelist_wait);
++}
++
++static void init_clear_freelist_work(struct pglist_data *pgdat)
++{
++	struct pgdat_entry *entry;
++
++	entry = kzalloc(sizeof(struct pgdat_entry), GFP_KERNEL);
++	if (!entry)
++		return;
++
++	entry->pgdat = pgdat;
++	INIT_WORK(&entry->work, clear_pgdat_freelist_pages);
++	queue_work_node(pgdat->node_id, system_unbound_wq, &entry->work);
++}
++
++static void clear_freelist_pages(void)
++{
++	struct pglist_data *pgdat;
++
++	mutex_lock(&clear_freelist_lock);
++	drain_all_pages(NULL);
++
++	for_each_online_pgdat(pgdat) {
++		atomic_inc(&clear_freelist_workers);
++		init_clear_freelist_work(pgdat);
++	}
++
++	wait_event(clear_freelist_wait, atomic_read(&clear_freelist_workers) == 0);
++
++	pr_debug("Cleared pages %d\nFree pages %lu\n", atomic_read(&clear_pages_num),
++		global_zone_page_state(NR_FREE_PAGES));
++	atomic_set(&clear_pages_num, 0);
++
++	mutex_unlock(&clear_freelist_lock);
++}
++
++static int sysctl_clear_freelist_handler(struct ctl_table *table, int write,
++		void __user *buffer, size_t *lenp, loff_t *ppos)
++{
++	int ret;
++	int val;
++
++	table->data = &val;
++	ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
++
++	if (!ret && write)
++		clear_freelist_pages();
++
++	return ret;
++}
++
++static struct ctl_table clear_freelist_table[] = {
++	{
++		.procname   = "clear_freelist_pages",
++		.data       = NULL,
++		.maxlen     = sizeof(int),
++		.mode       = 0200,
++		.proc_handler   = &sysctl_clear_freelist_handler,
++		.extra1     = SYSCTL_ONE,
++		.extra2     = SYSCTL_ONE,
++	},
++	{ }
++};
++
++static struct ctl_table sys_ctl_table[] = {
++	{
++		.procname   = "vm",
++		.mode       = 0555,
++		.child      = clear_freelist_table,
++	},
++	{ }
++};
++
++static bool clear_freelist_enabled;
++static int __init setup_clear_freelist(char *str)
++{
++	clear_freelist_enabled = true;
++	return 1;
++}
++__setup("clear_freelist", setup_clear_freelist);
++
++static int __init clear_freelist_init(void)
++{
++	if (clear_freelist_enabled)
++		register_sysctl_table(sys_ctl_table);
++
++	return 0;
++}
++module_init(clear_freelist_init);
++module_param(cfp_timeout_ms, ulong, 0644);
+-- 
+2.33.0
+

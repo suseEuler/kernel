@@ -1,0 +1,242 @@
+From ef588f6bce82bdeface18c414af7ffe0a97a1773 Mon Sep 17 00:00:00 2001
+From: He Sheng <hesheng@wxiat.com>
+Date: Thu, 28 Apr 2022 09:32:24 +0800
+Subject: [PATCH] sw64: access pt_regs with regoffsets where appropriate
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: ef588f6bce82bdeface18c414af7ffe0a97a1773
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5GF7A
+
+--------------------------------
+
+The struct pt_regs of sw64 is a bit weird because r16~r18, r29 and
+r30 are saved at odd location by hmcode, which makes it complicated
+to reference them with regno. To improve maintainability, we map
+these regno(s) in an unified way.
+
+Signed-off-by: He Sheng <hesheng@wxiat.com>
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/include/asm/extable.h |  4 ++++
+ arch/sw_64/include/asm/ptrace.h  |  3 +++
+ arch/sw_64/kernel/ptrace.c       | 27 +++++++++++++--------------
+ arch/sw_64/kernel/traps.c        | 31 +++++++------------------------
+ arch/sw_64/mm/fault.c            |  6 +-----
+ 5 files changed, 28 insertions(+), 43 deletions(-)
+
+diff --git a/arch/sw_64/include/asm/extable.h b/arch/sw_64/include/asm/extable.h
+index 12b50b68a0d2..ae753772a45a 100644
+--- a/arch/sw_64/include/asm/extable.h
++++ b/arch/sw_64/include/asm/extable.h
+@@ -52,4 +52,8 @@ struct exception_table_entry {
+ 		(b)->fixup.unit = (tmp).fixup.unit;		\
+ 	} while (0)
+ 
++/* Macro for exception fixup code to access integer registers. */
++extern short regoffsets[];
++#define map_regs(r) (*(unsigned long *)((char *)regs + regoffsets[r]))
++
+ #endif
+diff --git a/arch/sw_64/include/asm/ptrace.h b/arch/sw_64/include/asm/ptrace.h
+index 74349a05b9e4..0f0de9a3f8ce 100644
+--- a/arch/sw_64/include/asm/ptrace.h
++++ b/arch/sw_64/include/asm/ptrace.h
+@@ -28,6 +28,9 @@
+ #define force_successful_syscall_return() (current_pt_regs()->r0 = 0)
+ 
+ #define MAX_REG_OFFSET (offsetof(struct pt_regs, r18))
++
++extern short regoffsets[];
++
+ /**
+  * regs_get_register() - get register value from its offset
+  * @regs:       pt_regs from which register value is gotten
+diff --git a/arch/sw_64/kernel/ptrace.c b/arch/sw_64/kernel/ptrace.c
+index 097590b22a5a..ce41d89a54cb 100644
+--- a/arch/sw_64/kernel/ptrace.c
++++ b/arch/sw_64/kernel/ptrace.c
+@@ -9,6 +9,7 @@
+ #include <linux/audit.h>
+ 
+ #include <asm/reg.h>
++#include <asm/asm-offsets.h>
+ 
+ #include "proto.h"
+ 
+@@ -52,23 +53,21 @@ enum {
+ 	REG_GP = 29
+ };
+ 
+-#define PT_REG(reg) \
+-	(PAGE_SIZE * 2 - sizeof(struct pt_regs) + offsetof(struct pt_regs, reg))
+-
+ #define FP_REG(fp_regno, vector_regno) \
+ 	(fp_regno * 32 + vector_regno * 8)
+ 
+-static int regoff[] = {
+-	PT_REG(r0), PT_REG(r1), PT_REG(r2), PT_REG(r3),
+-	PT_REG(r4), PT_REG(r5), PT_REG(r6), PT_REG(r7),
+-	PT_REG(r8), PT_REG(r9), PT_REG(r10), PT_REG(r11),
+-	PT_REG(r12), PT_REG(r13), PT_REG(r14), PT_REG(r15),
+-	PT_REG(r16), PT_REG(r17), PT_REG(r18), PT_REG(r19),
+-	PT_REG(r20), PT_REG(r21), PT_REG(r22), PT_REG(r23),
+-	PT_REG(r24), PT_REG(r25), PT_REG(r26), PT_REG(r27),
+-	PT_REG(r28), PT_REG(gp), -1, -1
++#define R(x)	((size_t) &((struct pt_regs *)0)->x)
++
++short regoffsets[32] = {
++	R(r0), R(r1), R(r2), R(r3), R(r4), R(r5), R(r6), R(r7), R(r8),
++	R(r9), R(r10), R(r11), R(r12), R(r13), R(r14), R(r15),
++	R(r16), R(r17), R(r18),
++	R(r19), R(r20), R(r21), R(r22), R(r23), R(r24), R(r25), R(r26),
++	R(r27), R(r28), R(gp), 0, 0
+ };
+ 
++#undef R
++
+ #define PCB_OFF(var)	offsetof(struct pcb_struct, var)
+ 
+ static int pcboff[] = {
+@@ -104,7 +103,7 @@ get_reg_addr(struct task_struct *task, unsigned long regno)
+ 		addr = (void *)task_thread_info(task) + pcboff[regno];
+ 		break;
+ 	case REG_BASE ... REG_END:
+-		addr = (void *)task_thread_info(task) + regoff[regno];
++		addr = (void *)task_pt_regs(task) + regoffsets[regno];
+ 		break;
+ 	case FPREG_BASE ... FPREG_END:
+ 		fp_regno = regno - FPREG_BASE;
+@@ -128,7 +127,7 @@ get_reg_addr(struct task_struct *task, unsigned long regno)
+ 		addr = (void *)&task->thread.fpcr;
+ 		break;
+ 	case PC:
+-		addr = (void *)task_thread_info(task) + PT_REG(pc);
++		addr = (void *)task_pt_regs(task) + PT_REGS_PC;
+ 		break;
+ 	default:
+ 		addr = &zero;
+diff --git a/arch/sw_64/kernel/traps.c b/arch/sw_64/kernel/traps.c
+index 19fbf50b6ebc..a61c851967a9 100644
+--- a/arch/sw_64/kernel/traps.c
++++ b/arch/sw_64/kernel/traps.c
+@@ -325,23 +325,6 @@ struct unaligned_stat {
+ } unaligned[2];
+ 
+ 
+-/* Macro for exception fixup code to access integer registers. */
+-#define R(x)	((size_t) &((struct pt_regs *)0)->x)
+-
+-static int regoffsets[32] = {
+-	R(r0), R(r1), R(r2), R(r3), R(r4), R(r5), R(r6), R(r7), R(r8),
+-	R(r9), R(r10), R(r11), R(r12), R(r13), R(r14), R(r15),
+-	R(r16), R(r17), R(r18),
+-	R(r19), R(r20), R(r21), R(r22), R(r23), R(r24), R(r25), R(r26),
+-	R(r27), R(r28), R(gp),
+-	0, 0
+-};
+-
+-#undef R
+-
+-#define una_reg(r) (*(unsigned long *)((char *)regs + regoffsets[r]))
+-
+-
+ asmlinkage void
+ do_entUna(void *va, unsigned long opcode, unsigned long reg,
+ 	  struct pt_regs *regs)
+@@ -380,7 +363,7 @@ do_entUna(void *va, unsigned long opcode, unsigned long reg,
+ 
+ 		if (error)
+ 			goto got_exception;
+-		una_reg(reg) = tmp1 | tmp2;
++		map_regs(reg) = tmp1 | tmp2;
+ 		return;
+ 
+ 	case 0x22:
+@@ -401,7 +384,7 @@ do_entUna(void *va, unsigned long opcode, unsigned long reg,
+ 
+ 		if (error)
+ 			goto got_exception;
+-		una_reg(reg) = (int)(tmp1 | tmp2);
++		map_regs(reg) = (int)(tmp1 | tmp2);
+ 		return;
+ 
+ 	case 0x23: /* ldl */
+@@ -422,7 +405,7 @@ do_entUna(void *va, unsigned long opcode, unsigned long reg,
+ 
+ 		if (error)
+ 			goto got_exception;
+-		una_reg(reg) = tmp1 | tmp2;
++		map_regs(reg) = tmp1 | tmp2;
+ 		return;
+ 
+ 	case 0x29: /* sth */
+@@ -440,7 +423,7 @@ do_entUna(void *va, unsigned long opcode, unsigned long reg,
+ 		".previous"
+ 		: "=r"(error), "=&r"(tmp1), "=&r"(tmp2),
+ 		"=&r"(tmp3), "=&r"(tmp4)
+-		: "r"(va), "r"(una_reg(reg)), "0"(0));
++		: "r"(va), "r"(map_regs(reg)), "0"(0));
+ 
+ 		if (error)
+ 			goto got_exception;
+@@ -472,7 +455,7 @@ do_entUna(void *va, unsigned long opcode, unsigned long reg,
+ 		".previous"
+ 		: "=r"(error), "=&r"(tmp1), "=&r"(tmp2),
+ 		  "=&r"(tmp3), "=&r"(tmp4)
+-		: "r"(va), "r"(una_reg(reg)), "0"(0));
++		: "r"(va), "r"(map_regs(reg)), "0"(0));
+ 
+ 		if (error)
+ 			goto got_exception;
+@@ -524,7 +507,7 @@ do_entUna(void *va, unsigned long opcode, unsigned long reg,
+ 		".previous"
+ 		: "=r"(error), "=&r"(tmp1), "=&r"(tmp2), "=&r"(tmp3),
+ 		"=&r"(tmp4), "=&r"(tmp5), "=&r"(tmp6), "=&r"(tmp7), "=&r"(tmp8)
+-		: "r"(va), "r"(una_reg(reg)), "0"(0));
++		: "r"(va), "r"(map_regs(reg)), "0"(0));
+ 
+ 		if (error)
+ 			goto got_exception;
+@@ -543,7 +526,7 @@ do_entUna(void *va, unsigned long opcode, unsigned long reg,
+ 	if (fixup != 0) {
+ 		unsigned long newpc;
+ 
+-		newpc = fixup_exception(una_reg, fixup, pc);
++		newpc = fixup_exception(map_regs, fixup, pc);
+ 		printk("Forwarding unaligned exception at %lx (%lx)\n",
+ 		       pc, newpc);
+ 
+diff --git a/arch/sw_64/mm/fault.c b/arch/sw_64/mm/fault.c
+index 9562bc3ba37f..9b0ad9eb5a3a 100644
+--- a/arch/sw_64/mm/fault.c
++++ b/arch/sw_64/mm/fault.c
+@@ -107,10 +107,6 @@ __load_new_mm_context(struct mm_struct *next_mm)
+  * modify them.
+  */
+ 
+-/* Macro for exception fixup code to access integer registers.  */
+-#define dpf_reg(r)							\
+-	(((unsigned long *)regs)[(r) <= 8 ? (r) : (r) <= 15 ? (r)-16 :	\
+-				 (r) <= 18 ? (r)+10 : (r)-10])
+ unsigned long show_va_to_pa(struct mm_struct *mm, unsigned long addr)
+ {
+ 	pgd_t *pgd = NULL;
+@@ -294,7 +290,7 @@ do_page_fault(unsigned long address, unsigned long mmcsr,
+ 	if (fixup != 0) {
+ 		unsigned long newpc;
+ 
+-		newpc = fixup_exception(dpf_reg, fixup, regs->pc);
++		newpc = fixup_exception(map_regs, fixup, regs->pc);
+ 		regs->pc = newpc;
+ 		return;
+ 	}
+-- 
+2.33.0
+

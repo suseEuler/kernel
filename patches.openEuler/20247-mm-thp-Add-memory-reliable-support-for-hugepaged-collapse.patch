@@ -1,0 +1,131 @@
+From 6263994761a3d3ad6e5fa3beff9ca8cbd38d3bf3 Mon Sep 17 00:00:00 2001
+From: Ma Wupeng <mawupeng1@huawei.com>
+Date: Fri, 11 Nov 2022 09:32:33 +0800
+Subject: [PATCH] mm: thp: Add memory reliable support for hugepaged collapse
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 6263994761a3d3ad6e5fa3beff9ca8cbd38d3bf3
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4SK3S
+CVE: NA
+
+--------------------------------
+
+Hugepaged collapse pages into huge page will use the same memory region.
+When hugepaged collapse pages into huge page, hugepaged will check if
+there is any reliable pages in the area to be collapsed. If this area
+contains any reliable pages, hugepaged will alloc memory from mirrored
+region. Otherwise it will alloc momory from non-mirrored region.
+
+Signed-off-by: Ma Wupeng <mawupeng1@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/khugepaged.c | 24 ++++++++++++++++++++----
+ 1 file changed, 20 insertions(+), 4 deletions(-)
+
+diff --git a/mm/khugepaged.c b/mm/khugepaged.c
+index 44c048d7b783..254211e56153 100644
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@ -1057,7 +1057,8 @@ static bool __collapse_huge_page_swapin(struct mm_struct *mm,
+ static void collapse_huge_page(struct mm_struct *mm,
+ 				   unsigned long address,
+ 				   struct page **hpage,
+-				   int node, int referenced, int unmapped)
++				   int node, int referenced, int unmapped,
++				   bool reliable)
+ {
+ 	LIST_HEAD(compound_pagelist);
+ 	pmd_t *pmd, _pmd;
+@@ -1075,6 +1076,9 @@ static void collapse_huge_page(struct mm_struct *mm,
+ 	/* Only allocate from the target node */
+ 	gfp = alloc_hugepage_khugepaged_gfpmask() | __GFP_THISNODE;
+ 
++	if (reliable)
++		gfp |= GFP_RELIABLE;
++
+ 	/*
+ 	 * Before allocating the hugepage, release the mmap_lock read lock.
+ 	 * The allocation can take potentially a long time if it involves
+@@ -1234,6 +1238,7 @@ static int khugepaged_scan_pmd(struct mm_struct *mm,
+ 	spinlock_t *ptl;
+ 	int node = NUMA_NO_NODE, unmapped = 0;
+ 	bool writable = false;
++	bool reliable = false;
+ 
+ 	VM_BUG_ON(address & ~HPAGE_PMD_MASK);
+ 
+@@ -1358,6 +1363,9 @@ static int khugepaged_scan_pmd(struct mm_struct *mm,
+ 		    page_is_young(page) || PageReferenced(page) ||
+ 		    mmu_notifier_test_young(vma->vm_mm, address))
+ 			referenced++;
++
++		if (page_reliable(page))
++			reliable = true;
+ 	}
+ 	if (!writable) {
+ 		result = SCAN_PAGE_RO;
+@@ -1373,7 +1381,7 @@ static int khugepaged_scan_pmd(struct mm_struct *mm,
+ 		node = khugepaged_find_target_node();
+ 		/* collapse_huge_page will return with the mmap_lock released */
+ 		collapse_huge_page(mm, address, hpage, node,
+-				referenced, unmapped);
++				referenced, unmapped, reliable);
+ 	}
+ out:
+ 	trace_mm_khugepaged_scan_pmd(mm, page, writable, referenced,
+@@ -1633,7 +1641,8 @@ static void retract_page_tables(struct address_space *mapping, pgoff_t pgoff)
+  */
+ static void collapse_file(struct mm_struct *mm,
+ 		struct file *file, pgoff_t start,
+-		struct page **hpage, int node)
++		struct page **hpage, int node,
++		bool reliable)
+ {
+ 	struct address_space *mapping = file->f_mapping;
+ 	gfp_t gfp;
+@@ -1650,6 +1659,9 @@ static void collapse_file(struct mm_struct *mm,
+ 	/* Only allocate from the target node */
+ 	gfp = alloc_hugepage_khugepaged_gfpmask() | __GFP_THISNODE;
+ 
++	if (reliable)
++		gfp |= GFP_RELIABLE;
++
+ 	new_page = khugepaged_alloc_page(hpage, gfp, node);
+ 	if (!new_page) {
+ 		result = SCAN_ALLOC_HUGE_PAGE_FAIL;
+@@ -1977,6 +1989,7 @@ static void khugepaged_scan_file(struct mm_struct *mm,
+ 	int present, swap;
+ 	int node = NUMA_NO_NODE;
+ 	int result = SCAN_SUCCEED;
++	bool reliable = false;
+ 
+ 	present = 0;
+ 	swap = 0;
+@@ -2029,6 +2042,9 @@ static void khugepaged_scan_file(struct mm_struct *mm,
+ 			xas_pause(&xas);
+ 			cond_resched_rcu();
+ 		}
++
++		if (page_reliable(page))
++			reliable = true;
+ 	}
+ 	rcu_read_unlock();
+ 
+@@ -2037,7 +2053,7 @@ static void khugepaged_scan_file(struct mm_struct *mm,
+ 			result = SCAN_EXCEED_NONE_PTE;
+ 		} else {
+ 			node = khugepaged_find_target_node();
+-			collapse_file(mm, file, start, hpage, node);
++			collapse_file(mm, file, start, hpage, node, reliable);
+ 		}
+ 	}
+ 
+-- 
+2.33.0
+

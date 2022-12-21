@@ -1,0 +1,473 @@
+From 1dcb0a92855c7ab125412c7fbd578460ab3c23bb Mon Sep 17 00:00:00 2001
+From: Xu Qiang <xuqiang36@huawei.com>
+Date: Mon, 23 May 2022 21:18:27 +0800
+Subject: [PATCH] irq-gic-v3: Add support to init ts core GICR
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 1dcb0a92855c7ab125412c7fbd578460ab3c23bb
+Modified-by-SEL: No
+
+
+ascend inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I554T5
+CVE: NA
+
+------------
+
+For Ascend platform, other NON-OS managed GICRs need be initialized
+in OS.
+
+Signed-off-by: Xu Qiang <xuqiang36@huawei.com>
+Reviewed-by: Liao Chang <liaochang1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/irqchip/Kconfig            |  10 ++
+ drivers/irqchip/irq-gic-v3-its.c   | 217 ++++++++++++++++++++++++++++-
+ drivers/irqchip/irq-gic-v3.c       | 102 +++++++++++++-
+ include/linux/irqchip/arm-gic-v3.h |   5 +
+ 4 files changed, 326 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/irqchip/Kconfig b/drivers/irqchip/Kconfig
+index 214d7fd1fdd1..375ba3b30b72 100644
+--- a/drivers/irqchip/Kconfig
++++ b/drivers/irqchip/Kconfig
+@@ -178,6 +178,16 @@ config HISILICON_IRQ_MBIGEN
+ 	select ARM_GIC_V3
+ 	select ARM_GIC_V3_ITS
+ 
++if ASCEND_FEATURES
++
++config ASCEND_INIT_ALL_GICR
++	bool "Enable init all GICR for Ascend"
++	depends on ARM_GIC_V3
++	depends on ARM_GIC_V3_ITS
++	default n
++
++endif
++
+ config IMGPDC_IRQ
+ 	bool
+ 	select GENERIC_IRQ_CHIP
+diff --git a/drivers/irqchip/irq-gic-v3-its.c b/drivers/irqchip/irq-gic-v3-its.c
+index 6b46cfdcb402..e04e0166eac3 100644
+--- a/drivers/irqchip/irq-gic-v3-its.c
++++ b/drivers/irqchip/irq-gic-v3-its.c
+@@ -195,6 +195,14 @@ static DEFINE_RAW_SPINLOCK(vmovp_lock);
+ 
+ static DEFINE_IDA(its_vpeid_ida);
+ 
++#ifdef CONFIG_ASCEND_INIT_ALL_GICR
++static bool init_all_gicr;
++static int nr_gicr;
++#else
++#define init_all_gicr	false
++#define nr_gicr		0
++#endif
++
+ #define gic_data_rdist()		(raw_cpu_ptr(gic_rdists->rdist))
+ #define gic_data_rdist_cpu(cpu)		(per_cpu_ptr(gic_rdists->rdist, cpu))
+ #define gic_data_rdist_rd_base()	(gic_data_rdist()->rd_base)
+@@ -1640,6 +1648,26 @@ static int its_select_cpu(struct irq_data *d,
+ 	return cpu;
+ }
+ 
++#ifdef CONFIG_ASCEND_INIT_ALL_GICR
++static int its_select_cpu_other(const struct cpumask *mask_val)
++{
++	int cpu;
++
++	if (!init_all_gicr)
++		return -EINVAL;
++
++	cpu = find_first_bit(cpumask_bits(mask_val), NR_CPUS);
++	if (cpu >= nr_gicr)
++		cpu = -EINVAL;
++	return cpu;
++}
++#else
++static int its_select_cpu_other(const struct cpumask *mask_val)
++{
++	return -EINVAL;
++}
++#endif
++
+ static int its_set_affinity(struct irq_data *d, const struct cpumask *mask_val,
+ 			    bool force)
+ {
+@@ -1661,6 +1689,9 @@ static int its_set_affinity(struct irq_data *d, const struct cpumask *mask_val,
+ 		cpu = cpumask_pick_least_loaded(d, mask_val);
+ 
+ 	if (cpu < 0 || cpu >= nr_cpu_ids)
++		cpu = its_select_cpu_other(mask_val);
++
++	if (cpu < 0)
+ 		goto err;
+ 
+ 	/* don't set the affinity when the target cpu is same as current one */
+@@ -2928,8 +2959,12 @@ static int allocate_vpe_l1_table(void)
+ static int its_alloc_collections(struct its_node *its)
+ {
+ 	int i;
++	int cpu_nr = nr_cpu_ids;
++
++	if (init_all_gicr)
++		cpu_nr = CONFIG_NR_CPUS;
+ 
+-	its->collections = kcalloc(nr_cpu_ids, sizeof(*its->collections),
++	its->collections = kcalloc(cpu_nr, sizeof(*its->collections),
+ 				   GFP_KERNEL);
+ 	if (!its->collections)
+ 		return -ENOMEM;
+@@ -3225,6 +3260,186 @@ static void its_cpu_init_collections(void)
+ 	raw_spin_unlock(&its_lock);
+ }
+ 
++#ifdef CONFIG_ASCEND_INIT_ALL_GICR
++void its_set_gicr_nr(int nr)
++{
++	nr_gicr = nr;
++}
++
++static int __init its_enable_init_all_gicr(char *str)
++{
++	init_all_gicr = true;
++	return 1;
++}
++
++__setup("init_all_gicr", its_enable_init_all_gicr);
++
++bool its_init_all_gicr(void)
++{
++	return init_all_gicr;
++}
++
++static void its_cpu_init_lpis_others(void __iomem *rbase, int cpu)
++{
++	struct page *pend_page;
++	phys_addr_t paddr;
++	u64 val, tmp;
++
++	if (!init_all_gicr)
++		return;
++
++	val = readl_relaxed(rbase + GICR_CTLR);
++	if ((gic_rdists->flags & RDIST_FLAGS_RD_TABLES_PREALLOCATED) &&
++	    (val & GICR_CTLR_ENABLE_LPIS)) {
++		/*
++		 * Check that we get the same property table on all
++		 * RDs. If we don't, this is hopeless.
++		 */
++		paddr = gicr_read_propbaser(rbase + GICR_PROPBASER);
++		paddr &= GENMASK_ULL(51, 12);
++		if (WARN_ON(gic_rdists->prop_table_pa != paddr))
++			add_taint(TAINT_CRAP, LOCKDEP_STILL_OK);
++
++		paddr = gicr_read_pendbaser(rbase + GICR_PENDBASER);
++		paddr &= GENMASK_ULL(51, 16);
++
++		WARN_ON(!gic_check_reserved_range(paddr, LPI_PENDBASE_SZ));
++
++		goto out;
++	}
++
++	/* If we didn't allocate the pending table yet, do it now */
++	pend_page = its_allocate_pending_table(GFP_NOWAIT);
++	if (!pend_page) {
++		pr_err("Failed to allocate PENDBASE for GICR:%p\n", rbase);
++		return;
++	}
++
++	paddr = page_to_phys(pend_page);
++	pr_info("GICR:%p using LPI pending table @%pa\n",
++		rbase, &paddr);
++
++	WARN_ON(gic_reserve_range(paddr, LPI_PENDBASE_SZ));
++
++	/* Disable LPIs */
++	val = readl_relaxed(rbase + GICR_CTLR);
++	val &= ~GICR_CTLR_ENABLE_LPIS;
++	writel_relaxed(val, rbase + GICR_CTLR);
++
++	/*
++	 * Make sure any change to the table is observable by the GIC.
++	 */
++	dsb(sy);
++
++	/* set PROPBASE */
++	val = (gic_rdists->prop_table_pa |
++	       GICR_PROPBASER_InnerShareable |
++	       GICR_PROPBASER_RaWaWb |
++	       ((LPI_NRBITS - 1) & GICR_PROPBASER_IDBITS_MASK));
++
++	gicr_write_propbaser(val, rbase + GICR_PROPBASER);
++	tmp = gicr_read_propbaser(rbase + GICR_PROPBASER);
++
++	if ((tmp ^ val) & GICR_PROPBASER_SHAREABILITY_MASK) {
++		if (!(tmp & GICR_PROPBASER_SHAREABILITY_MASK)) {
++			/*
++			 * The HW reports non-shareable, we must
++			 * remove the cacheability attributes as
++			 * well.
++			 */
++			val &= ~(GICR_PROPBASER_SHAREABILITY_MASK |
++				 GICR_PROPBASER_CACHEABILITY_MASK);
++			val |= GICR_PROPBASER_nC;
++			gicr_write_propbaser(val, rbase + GICR_PROPBASER);
++		}
++		pr_info_once("GIC: using cache flushing for LPI property table\n");
++		gic_rdists->flags |= RDIST_FLAGS_PROPBASE_NEEDS_FLUSHING;
++	}
++
++	/* set PENDBASE */
++	val = (page_to_phys(pend_page) |
++	       GICR_PENDBASER_InnerShareable |
++	       GICR_PENDBASER_RaWaWb);
++
++	gicr_write_pendbaser(val, rbase + GICR_PENDBASER);
++	tmp = gicr_read_pendbaser(rbase + GICR_PENDBASER);
++
++	if (!(tmp & GICR_PENDBASER_SHAREABILITY_MASK)) {
++		/*
++		 * The HW reports non-shareable, we must remove the
++		 * cacheability attributes as well.
++		 */
++		val &= ~(GICR_PENDBASER_SHAREABILITY_MASK |
++			 GICR_PENDBASER_CACHEABILITY_MASK);
++		val |= GICR_PENDBASER_nC;
++		gicr_write_pendbaser(val, rbase + GICR_PENDBASER);
++	}
++
++	/* Enable LPIs */
++	val = readl_relaxed(rbase + GICR_CTLR);
++	val |= GICR_CTLR_ENABLE_LPIS;
++	writel_relaxed(val, rbase + GICR_CTLR);
++
++	/* Make sure the GIC has seen the above */
++	dsb(sy);
++out:
++	pr_info("GICv3: CPU%d: using %s LPI pending table @%pa\n",
++		cpu, pend_page ? "allocated" : "reserved",	&paddr);
++}
++
++static void its_cpu_init_collection_others(void __iomem *rbase,
++					   phys_addr_t phys_base, int cpu)
++{
++	struct its_node *its;
++
++	if (!init_all_gicr)
++		return;
++
++	raw_spin_lock(&its_lock);
++
++	list_for_each_entry(its, &its_nodes, entry) {
++		u64 target;
++
++		/*
++		 * We now have to bind each collection to its target
++		 * redistributor.
++		 */
++		if (gic_read_typer(its->base + GITS_TYPER) & GITS_TYPER_PTA) {
++			/*
++			 * This ITS wants the physical address of the
++			 * redistributor.
++			 */
++			target = phys_base;
++		} else {
++			/*
++			 * This ITS wants a linear CPU number.
++			 */
++			target = gic_read_typer(rbase + GICR_TYPER);
++			target = GICR_TYPER_CPU_NUMBER(target) << 16;
++		}
++
++		/* Perform collection mapping */
++		its->collections[cpu].target_address = target;
++		its->collections[cpu].col_id = cpu;
++
++		its_send_mapc(its, &its->collections[cpu], 1);
++		its_send_invall(its, &its->collections[cpu]);
++	}
++
++	raw_spin_unlock(&its_lock);
++}
++
++int its_cpu_init_others(void __iomem *base, phys_addr_t phys_base, int cpu)
++{
++	if (!list_empty(&its_nodes)) {
++		its_cpu_init_lpis_others(base, cpu);
++		its_cpu_init_collection_others(base, phys_base, cpu);
++	}
++
++	return 0;
++}
++#endif
++
+ static struct its_device *its_find_device(struct its_node *its, u32 dev_id)
+ {
+ 	struct its_device *its_dev = NULL, *tmp;
+diff --git a/drivers/irqchip/irq-gic-v3.c b/drivers/irqchip/irq-gic-v3.c
+index 5418c398b6a5..aa8facbdf407 100644
+--- a/drivers/irqchip/irq-gic-v3.c
++++ b/drivers/irqchip/irq-gic-v3.c
+@@ -244,17 +244,11 @@ static u64 __maybe_unused gic_read_iar(void)
+ }
+ #endif
+ 
+-static void gic_enable_redist(bool enable)
++static void __gic_enable_redist(void __iomem *rbase, bool enable)
+ {
+-	void __iomem *rbase;
+ 	u32 count = 1000000;	/* 1s! */
+ 	u32 val;
+ 
+-	if (gic_data.flags & FLAGS_WORKAROUND_GICR_WAKER_MSM8996)
+-		return;
+-
+-	rbase = gic_data_rdist_rd_base();
+-
+ 	val = readl_relaxed(rbase + GICR_WAKER);
+ 	if (enable)
+ 		/* Wake up this CPU redistributor */
+@@ -281,6 +275,14 @@ static void gic_enable_redist(bool enable)
+ 				   enable ? "wakeup" : "sleep");
+ }
+ 
++static void gic_enable_redist(bool enable)
++{
++	if (gic_data.flags & FLAGS_WORKAROUND_GICR_WAKER_MSM8996)
++		return;
++
++	__gic_enable_redist(gic_data_rdist_rd_base(), enable);
++}
++
+ /*
+  * Routines to disable, enable, EOI and route interrupts
+  */
+@@ -1142,6 +1144,89 @@ static void gic_cpu_init(void)
+ 	gic_cpu_sys_reg_init();
+ }
+ 
++#ifdef CONFIG_ASCEND_INIT_ALL_GICR
++static int __gic_compute_nr_gicr(struct redist_region *region, void __iomem *ptr)
++{
++	static int gicr_nr = 0;
++
++	its_set_gicr_nr(++gicr_nr);
++
++	return 1;
++}
++
++static void gic_compute_nr_gicr(void)
++{
++	gic_iterate_rdists(__gic_compute_nr_gicr);
++}
++
++static int gic_rdist_cpu(void __iomem *ptr, unsigned int cpu)
++{
++	unsigned long mpidr = cpu_logical_map(cpu);
++	u64 typer;
++	u32 aff;
++
++	/*
++	 * Convert affinity to a 32bit value that can be matched to
++	 * GICR_TYPER bits [63:32].
++	 */
++	aff = (MPIDR_AFFINITY_LEVEL(mpidr, 3) << 24 |
++	       MPIDR_AFFINITY_LEVEL(mpidr, 2) << 16 |
++	       MPIDR_AFFINITY_LEVEL(mpidr, 1) << 8 |
++	       MPIDR_AFFINITY_LEVEL(mpidr, 0));
++
++	typer = gic_read_typer(ptr + GICR_TYPER);
++	if ((typer >> 32) == aff)
++		return 0;
++
++	return 1;
++}
++
++static int gic_rdist_cpus(void __iomem *ptr)
++{
++	unsigned int i;
++
++	for (i = 0; i < nr_cpu_ids; i++) {
++		if (gic_rdist_cpu(ptr, i) == 0)
++			return 0;
++	}
++
++	return 1;
++}
++
++static int gic_cpu_init_other(struct redist_region *region, void __iomem *ptr)
++{
++	u64 offset;
++	phys_addr_t phys_base;
++	static int cpu = 0;
++
++	if (cpu == 0)
++		cpu = nr_cpu_ids;
++
++	if (gic_rdist_cpus(ptr) == 1) {
++		offset = ptr - region->redist_base;
++		phys_base = region->phys_base + offset;
++		__gic_enable_redist(ptr, true);
++		if (gic_dist_supports_lpis())
++			its_cpu_init_others(ptr, phys_base, cpu);
++		cpu++;
++	}
++
++	return 1;
++}
++
++static void gic_cpu_init_others(void)
++{
++	if (!its_init_all_gicr())
++		return;
++
++	gic_iterate_rdists(gic_cpu_init_other);
++}
++#else
++static inline void gic_compute_nr_gicr(void) {}
++
++static inline void gic_cpu_init_others(void) {}
++#endif
++
+ #ifdef CONFIG_SMP
+ 
+ #define MPIDR_TO_SGI_RS(mpidr)	(MPIDR_RS(mpidr) << ICC_SGI1R_RS_SHIFT)
+@@ -1763,6 +1848,7 @@ static int __init gic_init_bases(void __iomem *dist_base,
+ 	gic_data.rdists.has_vlpis = true;
+ 	gic_data.rdists.has_direct_lpi = true;
+ 	gic_data.rdists.has_vpend_valid_dirty = true;
++	gic_compute_nr_gicr();
+ 
+ 	if (WARN_ON(!gic_data.domain) || WARN_ON(!gic_data.rdists.rdist)) {
+ 		err = -ENOMEM;
+@@ -1799,6 +1885,8 @@ static int __init gic_init_bases(void __iomem *dist_base,
+ 			gicv2m_init(handle, gic_data.domain);
+ 	}
+ 
++	gic_cpu_init_others();
++
+ 	return 0;
+ 
+ out_free:
+diff --git a/include/linux/irqchip/arm-gic-v3.h b/include/linux/irqchip/arm-gic-v3.h
+index f6d092fdb93d..380c83b7a89f 100644
+--- a/include/linux/irqchip/arm-gic-v3.h
++++ b/include/linux/irqchip/arm-gic-v3.h
+@@ -689,6 +689,11 @@ struct rdists {
+ struct irq_domain;
+ struct fwnode_handle;
+ int its_cpu_init(void);
++#ifdef CONFIG_ASCEND_INIT_ALL_GICR
++void its_set_gicr_nr(int nr);
++bool its_init_all_gicr(void);
++int its_cpu_init_others(void __iomem *base, phys_addr_t phys_base, int idx);
++#endif
+ int its_init(struct fwnode_handle *handle, struct rdists *rdists,
+ 	     struct irq_domain *domain);
+ int mbi_init(struct fwnode_handle *fwnode, struct irq_domain *parent);
+-- 
+2.33.0
+

@@ -1,0 +1,123 @@
+From 8cc109c4a51ea3c343c15b47eb62d99d0adae211 Mon Sep 17 00:00:00 2001
+From: Wu Liliu <wuliliu@wxiat.com>
+Date: Tue, 21 Jun 2022 14:19:58 +0800
+Subject: [PATCH] sw64: reimplement get_wchan()
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 8cc109c4a51ea3c343c15b47eb62d99d0adae211
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5GFUD
+
+--------------------------------
+
+The get_wchan() always return 0 because `fp > sp` is false. This
+patch reimplements it entirely and fixes this error.
+
+Signed-off-by: Wu Liliu <wuliliu@wxiat.com>
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/kernel/process.c    | 51 ----------------------------------
+ arch/sw_64/kernel/stacktrace.c | 22 +++++++++++++++
+ 2 files changed, 22 insertions(+), 51 deletions(-)
+
+diff --git a/arch/sw_64/kernel/process.c b/arch/sw_64/kernel/process.c
+index da721d4266ee..a75ae20205f3 100644
+--- a/arch/sw_64/kernel/process.c
++++ b/arch/sw_64/kernel/process.c
+@@ -226,57 +226,6 @@ int dump_fpu(struct pt_regs *regs, elf_fpregset_t *fpu)
+ }
+ EXPORT_SYMBOL(dump_fpu);
+ 
+-/*
+- * Under heavy swap load I've seen this lose in an ugly way.  So do
+- * some extra sanity checking on the ranges we expect these pointers
+- * to be in so that we can fail gracefully.  This is just for ps after
+- * all.  -- r~
+- */
+-
+-unsigned long
+-thread_saved_pc(struct task_struct *t)
+-{
+-	unsigned long top, fp, sp;
+-
+-	top = (unsigned long)task_stack_page(t) + 2 * PAGE_SIZE;
+-	sp = task_thread_info(t)->pcb.ksp;
+-	fp = t->thread.s[6];
+-
+-	if (fp > sp && fp < top)
+-		return *(unsigned long *)fp;
+-
+-	return 0;
+-}
+-
+-unsigned long
+-get_wchan(struct task_struct *p)
+-{
+-	unsigned long schedule_frame;
+-	unsigned long pc, top, sp;
+-
+-	if (!p || p == current || p->state == TASK_RUNNING)
+-		return 0;
+-	/*
+-	 * This one depends on the frame size of schedule().  Do a
+-	 * "disass schedule" in gdb to find the frame size.  Also, the
+-	 * code assumes that sleep_on() follows immediately after
+-	 * interruptible_sleep_on() and that add_timer() follows
+-	 * immediately after interruptible_sleep().  Ugly, isn't it?
+-	 * Maybe adding a wchan field to task_struct would be better,
+-	 * after all...
+-	 */
+-
+-	pc = thread_saved_pc(p);
+-	if (in_sched_functions(pc)) {
+-		top = (unsigned long)task_stack_page(p) + 2 * PAGE_SIZE;
+-		sp = task_thread_info(p)->pcb.ksp;
+-		schedule_frame = p->thread.s[6];
+-		if (schedule_frame > sp && schedule_frame < top)
+-			return ((unsigned long *)schedule_frame)[12];
+-	}
+-	return pc;
+-}
+-
+ unsigned long arch_randomize_brk(struct mm_struct *mm)
+ {
+ 	return randomize_page(mm->brk, 0x02000000);
+diff --git a/arch/sw_64/kernel/stacktrace.c b/arch/sw_64/kernel/stacktrace.c
+index 4e9acf99aaab..b51b1500c736 100644
+--- a/arch/sw_64/kernel/stacktrace.c
++++ b/arch/sw_64/kernel/stacktrace.c
+@@ -172,3 +172,25 @@ void save_stack_trace_tsk(struct task_struct *tsk, struct stack_trace *trace)
+ 		trace->entries[trace->nr_entries++] = ULONG_MAX;
+ }
+ EXPORT_SYMBOL_GPL(save_stack_trace_tsk);
++
++static int save_pc(unsigned long pc, void *data)
++{
++	unsigned long *p = data;
++	*p = 0;
++
++	if (!in_sched_functions(pc))
++		*p = pc;
++
++	return *p;
++}
++
++unsigned long get_wchan(struct task_struct *tsk)
++{
++	unsigned long pc;
++
++	if (!tsk || tsk == current || tsk->state == TASK_RUNNING)
++		return 0;
++	walk_stackframe(tsk, NULL, save_pc, &pc);
++
++	return pc;
++}
+-- 
+2.33.0
+

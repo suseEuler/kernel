@@ -1,0 +1,116 @@
+From a3266d177538c7304143e30f9c1c9de6cda945d4 Mon Sep 17 00:00:00 2001
+From: Wu Liliu <wuliliu@wxiat.com>
+Date: Fri, 24 Jun 2022 14:12:33 +0800
+Subject: [PATCH] sw64: reimplement save_stack_trace()
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: a3266d177538c7304143e30f9c1c9de6cda945d4
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5GFQQ
+
+--------------------------------
+
+It used to save stack-backtrace addresses by SP, which is inaccurate.
+In order to implement this function accurately, we provide two ways
+to support it.
+
+Signed-off-by: Wu Liliu <wuliliu@wxiat.com>
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/kernel/stacktrace.c | 62 ++++++++++++++++++++++------------
+ 1 file changed, 40 insertions(+), 22 deletions(-)
+
+diff --git a/arch/sw_64/kernel/stacktrace.c b/arch/sw_64/kernel/stacktrace.c
+index b51b1500c736..7b5ddc78bd6d 100644
+--- a/arch/sw_64/kernel/stacktrace.c
++++ b/arch/sw_64/kernel/stacktrace.c
+@@ -139,40 +139,58 @@ void show_stack(struct task_struct *task, unsigned long *sp, const char *loglvl)
+ 	walk_stackframe(task, NULL, print_address_trace, (void *)loglvl);
+ }
+ 
++#ifdef CONFIG_STACKTRACE
+ /*
+  * Save stack-backtrace addresses into a stack_trace buffer.
+  */
+-void save_stack_trace(struct stack_trace *trace)
++struct stack_trace_data {
++	struct stack_trace *trace;
++	unsigned int nosched;
++};
++
++int save_trace(unsigned long pc, void *d)
+ {
+-	save_stack_trace_tsk(current, trace);
+-}
+-EXPORT_SYMBOL_GPL(save_stack_trace);
++	struct stack_trace_data *data = d;
++	struct stack_trace *trace = data->trace;
++
++	if (data->nosched && in_sched_functions(pc))
++		return 0;
++	if (trace->skip > 0) {
++		trace->skip--;
++		return 0;
++	}
+ 
++	trace->entries[trace->nr_entries++] = pc;
++	return (trace->nr_entries >= trace->max_entries);
++}
+ 
+-void save_stack_trace_tsk(struct task_struct *tsk, struct stack_trace *trace)
++static void __save_stack_trace(struct task_struct *tsk,
++		struct stack_trace *trace, unsigned int nosched)
+ {
+-	unsigned long *sp = (unsigned long *)task_thread_info(tsk)->pcb.ksp;
+-	unsigned long addr;
+-
+-	WARN_ON(trace->nr_entries || !trace->max_entries);
+-
+-	while (!kstack_end(sp)) {
+-		addr = *sp++;
+-		if (__kernel_text_address(addr) &&
+-				!in_sched_functions(addr)) {
+-			if (trace->skip > 0)
+-				trace->skip--;
+-			else
+-				trace->entries[trace->nr_entries++] = addr;
+-			if (trace->nr_entries >= trace->max_entries)
+-				break;
+-		}
+-	}
++	struct stack_trace_data data;
++
++	data.trace = trace;
++	data.nosched = nosched;
++
++	walk_stackframe(tsk, NULL, save_trace, &data);
++
+ 	if (trace->nr_entries < trace->max_entries)
+ 		trace->entries[trace->nr_entries++] = ULONG_MAX;
+ }
++
++void save_stack_trace_tsk(struct task_struct *tsk, struct stack_trace *trace)
++{
++	__save_stack_trace(tsk, trace, 1);
++}
+ EXPORT_SYMBOL_GPL(save_stack_trace_tsk);
+ 
++void save_stack_trace(struct stack_trace *trace)
++{
++	__save_stack_trace(current, trace, 0);
++}
++EXPORT_SYMBOL_GPL(save_stack_trace);
++#endif
++
+ static int save_pc(unsigned long pc, void *data)
+ {
+ 	unsigned long *p = data;
+-- 
+2.33.0
+

@@ -1,0 +1,307 @@
+From ad275981eba4127e8e29b3537b479c89d0782d68 Mon Sep 17 00:00:00 2001
+From: He Sheng <hesheng@wxiat.com>
+Date: Wed, 26 Oct 2022 15:56:28 +0800
+Subject: [PATCH] sw64: fix recordmcount and dynamic ftrace
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: ad275981eba4127e8e29b3537b479c89d0782d68
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I645P4
+
+--------------------------------
+
+SW64 mcount call site has 5 instructions as follows:
+
+ 0:       00 00 bb ff     ldih    $r29,0($r27)
+                  0: GPDISP       .text+0x4
+ 4:       00 00 bd fb     ldi     $r29,0($r29)
+ 8:       00 00 9d ff     ldih    $r28,0($r29)
+                  8: ELF_LITERAL_GOT      *ABS*
+ c:       00 00 9d 8f     ldl     $r28,0($r29)
+                  c: ELF_LITERAL  _mcount
+10:       00 00 9c 07     call    $r28,($r28)
+		  10: HINT        _mcount
+
+It shows that there are 2 _mcount symbols, so recordmcount has to
+set the second one as fake and filter it, then do the necessary
+offset adjustment.
+
+The first two instructions are aimed at loading global pointer(ldgp),
+because _mcount is global symbol and global symbols must be accessed
+through gp due to the design of GCC on sw64.
+
+For functions that access global symbols, the ldgp instructions are
+necessary for both _mcount call and other symbols. However, there is
+no way to tell whether a function access global symbols, so it has to
+always reserve the ldgp instructions for dynamic function tracer even
+when tracing is disabled. This has a negative impact on performance.
+
+With it, to disable tracing(ftrace_make_nop), the last 3 instructions
+in position are replaced with 3 NOP instructions at once. To enable
+tracing(ftrace_make_call), they are replaced with:
+
+nop
+ldl	$28, TI_FTRACE_ADDR($8)
+call	$28, ($28), 1
+
+Signed-off-by: He Sheng <hesheng@wxiat.com>
+Reviewed-by: Cui Wei <cuiwei@wxiat.com>
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/include/asm/ftrace.h  |  5 ++--
+ arch/sw_64/include/asm/insn.h    |  1 +
+ arch/sw_64/kernel/entry-ftrace.S | 10 +++----
+ arch/sw_64/kernel/ftrace.c       | 50 ++++++++++----------------------
+ scripts/recordmcount.c           | 37 ++++++++++++++++-------
+ 5 files changed, 49 insertions(+), 54 deletions(-)
+
+diff --git a/arch/sw_64/include/asm/ftrace.h b/arch/sw_64/include/asm/ftrace.h
+index ea82224e5826..61933103dcd4 100644
+--- a/arch/sw_64/include/asm/ftrace.h
++++ b/arch/sw_64/include/asm/ftrace.h
+@@ -10,13 +10,14 @@
+  */
+ #ifndef _ASM_SW64_FTRACE_H
+ #define _ASM_SW64_FTRACE_H
+-#include <asm/insn.h>
+ 
+ #define MCOUNT_ADDR		((unsigned long)_mcount)
+-#define MCOUNT_INSN_SIZE	SW64_INSN_SIZE
++#define MCOUNT_INSN_SIZE	20	/* 5 * SW64_INSN_SIZE */
++#define MCOUNT_LDGP_SIZE	8	/* 2 * SW64_INSN_SIZE */
+ 
+ #ifndef __ASSEMBLY__
+ #include <linux/compat.h>
++#include <asm/insn.h>
+ 
+ extern void _mcount(unsigned long);
+ 
+diff --git a/arch/sw_64/include/asm/insn.h b/arch/sw_64/include/asm/insn.h
+index ec0efae3aed0..437cb48d1e93 100644
+--- a/arch/sw_64/include/asm/insn.h
++++ b/arch/sw_64/include/asm/insn.h
+@@ -43,6 +43,7 @@ enum {
+ #define SW64_INSN_SYS_CALL	0x02000000
+ #define SW64_INSN_BR		0x10000000
+ 
++#define SW64_NOP		(0x43ff075f)
+ #define SW64_BIS(a, b, c)	(SW64_INSN_BIS | ___SW64_RA(a)	| ___SW64_RB(b) | ___SW64_SIMP_RC(c))
+ #define SW64_CALL(a, b, disp)	(SW64_INSN_CALL | ___SW64_RA(a)	| ___SW64_RB(b) | ___SW64_ST_DISP(disp))
+ #define SW64_SYS_CALL(func)	(SW64_INSN_SYS_CALL | ___SW64_SYSCALL_FUNC(func))
+diff --git a/arch/sw_64/kernel/entry-ftrace.S b/arch/sw_64/kernel/entry-ftrace.S
+index 223dd5fc0808..07bdf5a6e35a 100644
+--- a/arch/sw_64/kernel/entry-ftrace.S
++++ b/arch/sw_64/kernel/entry-ftrace.S
+@@ -10,6 +10,7 @@
+  *
+  */
+ #include <linux/linkage.h>
++#include <asm/ftrace.h>
+ 
+ 	.text
+ 	.set noat
+@@ -60,8 +61,7 @@ ftrace_caller:
+ 	br	$27, 2f
+ 2:	ldgp	$29, 0($27)
+ 
+-	bis	$28, $31, $16
+-	subl	$16, 8,	$16
++	subl	$28, MCOUNT_INSN_SIZE, $16
+ 	bis	$26, $31, $17
+ 
+ 	ldi	$4, current_tracer
+@@ -97,8 +97,7 @@ _mcount:
+ 	cmpeq	$4, $5, $6
+ 	bne	$6, skip_ftrace
+ 
+-	bis	$28, $31, $16
+-	subl	$16, 8,	$16
++	subl	$28, MCOUNT_INSN_SIZE, $16
+ 	bis	$26, $31, $17
+ 	call	$26, ($27), 1
+ 
+@@ -164,8 +163,7 @@ ftrace_graph_caller:
+ 	memb			/* need memb, otherwise it'll  go wrong */
+ 	RESTORE_GRAPH_ARGS
+ 	addl	$sp, 0x18, $16
+-	bis	$28, $31, $17
+-	subl	$17, 8,	$17
++	subl	$28, MCOUNT_INSN_SIZE, $17
+ 	bis	$15, $31, $18	/* parent's fp */
+ 
+ 	call	$26, ($27)	/* prepare_ftrace_return() */
+diff --git a/arch/sw_64/kernel/ftrace.c b/arch/sw_64/kernel/ftrace.c
+index 42efca28d386..cf1524c15f15 100644
+--- a/arch/sw_64/kernel/ftrace.c
++++ b/arch/sw_64/kernel/ftrace.c
+@@ -19,17 +19,9 @@ EXPORT_SYMBOL(_mcount);
+ 
+ #ifdef CONFIG_DYNAMIC_FTRACE
+ 
+-unsigned long current_tracer = (unsigned long)ftrace_stub;
++#define TI_FTRACE_ADDR	(offsetof(struct thread_info, dyn_ftrace_addr))
+ 
+-/*
+- * Replace two instruction, which may be a branch or NOP.
+- */
+-static int ftrace_modify_double_code(unsigned long pc, u64 new)
+-{
+-	if (sw64_insn_double_write((void *)pc, new))
+-		return -EPERM;
+-	return 0;
+-}
++unsigned long current_tracer = (unsigned long)ftrace_stub;
+ 
+ /*
+  * Replace a single instruction, which may be a branch or NOP.
+@@ -47,17 +39,13 @@ static int ftrace_modify_code(unsigned long pc, u32 new)
+ int ftrace_update_ftrace_func(ftrace_func_t func)
+ {
+ 	unsigned long pc;
+-	int ret;
+ 	u32 new;
+ 
+ 	current_tracer = (unsigned long)func;
+-
+ 	pc = (unsigned long)&ftrace_call;
++	new = SW64_CALL(R26, R27, 1);
+ 
+-	new = sw64_insn_call(R26, R27);
+-	if (ftrace_modify_code(pc, new))
+-		return ret;
+-	return 0;
++	return ftrace_modify_code(pc, new);
+ }
+ 
+ /*
+@@ -65,19 +53,16 @@ int ftrace_update_ftrace_func(ftrace_func_t func)
+  */
+ int ftrace_make_call(struct dyn_ftrace *rec, unsigned long addr)
+ {
+-	unsigned long pc = rec->ip;
+-	u32 new;
+-	int ret;
++	unsigned int insn[3];
++	unsigned long pc = rec->ip + MCOUNT_LDGP_SIZE;
+ 
++	insn[0] = SW64_NOP;
+ 	/* ldl r28,(ftrace_addr_offset)(r8) */
+-	new = (0x23U << 26) | (28U << 21) | (8U << 16) | offsetof(struct thread_info, dyn_ftrace_addr);
+-	if (ftrace_modify_code(pc, new))
+-		return ret;
+-	pc = pc + 4;
+-	new = sw64_insn_call(R28, R28);
+-	if (ftrace_modify_code(pc, new))
+-		return ret;
+-	return 0;
++	insn[1] = (0x23U << 26) | (28U << 21) | (8U << 16) | TI_FTRACE_ADDR;
++	insn[2] = SW64_CALL(R28, R28, 1);
++
++	/* replace the 3 mcount instructions at once */
++	return copy_to_kernel_nofault((void *)pc, insn, 3 * SW64_INSN_SIZE);
+ }
+ 
+ /*
+@@ -86,15 +71,10 @@ int ftrace_make_call(struct dyn_ftrace *rec, unsigned long addr)
+ int ftrace_make_nop(struct module *mod, struct dyn_ftrace *rec,
+ 		    unsigned long addr)
+ {
+-	unsigned long pc = rec->ip;
+-	unsigned long insn;
+-	int ret;
+-
+-	insn = sw64_insn_nop();
+-	insn = (insn << 32) | insn;
+-	ret = ftrace_modify_double_code(pc, insn);
+-	return ret;
++	unsigned long pc = rec->ip + MCOUNT_LDGP_SIZE;
++	unsigned int insn[3] = {SW64_NOP, SW64_NOP, SW64_NOP};
+ 
++	return copy_to_kernel_nofault((void *)pc, insn, 3 * SW64_INSN_SIZE);
+ }
+ 
+ void arch_ftrace_update_code(int command)
+diff --git a/scripts/recordmcount.c b/scripts/recordmcount.c
+index 84ea65aec015..f7cf4fd36898 100644
+--- a/scripts/recordmcount.c
++++ b/scripts/recordmcount.c
+@@ -40,8 +40,8 @@
+ 
+ #ifndef EM_SW64
+ #define EM_SW64			0x9916
+-#define R_SW_64_NONE            0
+-#define R_SW_64_REFQUAD         2       /* Direct 64 bit */
++#define R_SW64_NONE		0
++#define R_SW64_REFQUAD		2       /* Direct 64 bit */
+ #endif
+ 
+ #define R_ARM_PC24		1
+@@ -320,8 +320,9 @@ static int make_nop_arm64(void *map, size_t const offset)
+ 	return 0;
+ }
+ 
+-static unsigned char ideal_nop4_sw_64[4] = {0x5f, 0x07, 0xff, 0x43};
+-static int make_nop_sw_64(void *map, size_t const offset)
++static unsigned char ideal_nop4_sw64[4] = {0x5f, 0x07, 0xff, 0x43};
++
++static int make_nop_sw64(void *map, size_t const offset)
+ {
+ 	/* Convert to nop */
+ 	ulseek(offset, SEEK_SET);
+@@ -456,6 +457,21 @@ static int arm64_is_fake_mcount(Elf64_Rel const *rp)
+ 	return ELF64_R_TYPE(w8(rp->r_info)) != R_AARCH64_CALL26;
+ }
+ 
++#define SW64_FAKEMCOUNT_OFFSET	4
++
++static int sw64_is_fake_mcount(Elf64_Rel const *rp)
++{
++	static Elf64_Addr old_r_offset = ~(Elf64_Addr)0;
++	Elf64_Addr current_r_offset = _w(rp->r_offset);
++	int is_fake;
++
++	is_fake = (old_r_offset != ~(Elf64_Addr)0) &&
++		(current_r_offset - old_r_offset == SW64_FAKEMCOUNT_OFFSET);
++	old_r_offset = current_r_offset;
++
++	return is_fake;
++}
++
+ /* 64-bit EM_MIPS has weird ELF64_Rela.r_info.
+  * http://techpubs.sgi.com/library/manuals/4000/007-4658-001/pdf/007-4658-001.pdf
+  * We interpret Table 29 Relocation Operation (Elf64_Rel, Elf64_Rela) [p.40]
+@@ -572,10 +588,12 @@ static int do_file(char const *const fname)
+ 		is_fake_mcount64 = arm64_is_fake_mcount;
+ 		break;
+ 	case EM_SW64:
+-		reltype = R_SW_64_REFQUAD;
+-		make_nop = make_nop_sw_64;
+-		rel_type_nop = R_SW_64_NONE;
+-		ideal_nop = ideal_nop4_sw_64;
++		reltype = R_SW64_REFQUAD;
++		make_nop = make_nop_sw64;
++		rel_type_nop = R_SW64_NONE;
++		ideal_nop = ideal_nop4_sw64;
++		mcount_adjust_64 = -12;
++		is_fake_mcount64 = sw64_is_fake_mcount;
+ 		break;
+ 	case EM_IA_64:	reltype = R_IA64_IMM64; break;
+ 	case EM_MIPS:	/* reltype: e_class    */ break;
+@@ -631,9 +649,6 @@ static int do_file(char const *const fname)
+ 			Elf64_r_info = MIPS64_r_info;
+ 			is_fake_mcount64 = MIPS64_is_fake_mcount;
+ 		}
+-		if (w2(ghdr->e_machine) == EM_SW64)
+-			is_fake_mcount64 = MIPS64_is_fake_mcount;
+-
+ 		if (do64(ghdr, fname, reltype) < 0)
+ 			goto out;
+ 		break;
+-- 
+2.33.0
+

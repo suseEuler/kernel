@@ -1,0 +1,464 @@
+From fa1cadd2b145b88c6ffb9fd8cd540967b5f7c067 Mon Sep 17 00:00:00 2001
+From: He Sheng <hesheng@wxiat.com>
+Date: Fri, 22 Apr 2022 09:29:43 +0800
+Subject: [PATCH] sw64: switch to generic fork like system calls
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: fa1cadd2b145b88c6ffb9fd8cd540967b5f7c067
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5GF7A
+
+--------------------------------
+
+We put thread's callee-saved registers in thread_struct, and put
+exception callee-saved registers in pt_regs. For context switch,
+it switches fpu state first, and then switches integer registers
+in __switch_to.
+
+Because callee-saved registers are always saved and restored, it
+will cause a little overhead.
+
+As a result, the special sw64 fork like system calls are removed.
+
+Signed-off-by: He Sheng <hesheng@wxiat.com>
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/include/asm/processor.h     |   3 +
+ arch/sw_64/include/asm/switch_to.h     |  37 +++++-
+ arch/sw_64/include/uapi/asm/ptrace.h   |  15 ++-
+ arch/sw_64/kernel/asm-offsets.c        |  16 +++
+ arch/sw_64/kernel/entry.S              | 173 +++++++++++++++----------
+ arch/sw_64/kernel/process.c            |  21 ++-
+ arch/sw_64/kernel/syscalls/syscall.tbl |   6 +-
+ 7 files changed, 175 insertions(+), 96 deletions(-)
+
+diff --git a/arch/sw_64/include/asm/processor.h b/arch/sw_64/include/asm/processor.h
+index 645c33a596ff..67d3b4368987 100644
+--- a/arch/sw_64/include/asm/processor.h
++++ b/arch/sw_64/include/asm/processor.h
+@@ -78,6 +78,9 @@ struct context_fpregs {
+ struct thread_struct {
+ 	struct context_fpregs ctx_fp;
+ 	unsigned long fpcr;
++	/* Callee-saved registers */
++	unsigned long ra;
++	unsigned long s[7];	/* s0 ~ s6 */
+ };
+ #define INIT_THREAD  { }
+ 
+diff --git a/arch/sw_64/include/asm/switch_to.h b/arch/sw_64/include/asm/switch_to.h
+index 22045b247557..d503fc59390f 100644
+--- a/arch/sw_64/include/asm/switch_to.h
++++ b/arch/sw_64/include/asm/switch_to.h
+@@ -2,12 +2,41 @@
+ #ifndef _ASM_SW64_SWITCH_TO_H
+ #define _ASM_SW64_SWITCH_TO_H
+ 
+-struct task_struct;
+-extern struct task_struct *__switch_to(unsigned long, struct task_struct *);
++#include<linux/sched.h>
++
++extern void __fpstate_save(struct task_struct *save_to);
++extern void __fpstate_restore(struct task_struct *restore_from);
++extern struct task_struct *__switch_to(unsigned long pcb,
++		struct task_struct *prev, struct task_struct *next);
+ extern void restore_da_match_after_sched(void);
+-#define switch_to(P, N, L)						\
++
++static inline void fpstate_save(struct task_struct *task)
++{
++	if (likely(!(task->flags & PF_KTHREAD)))
++		__fpstate_save(task);
++}
++
++static inline void fpstate_restore(struct task_struct *task)
++{
++	if (likely(!(task->flags & PF_KTHREAD)))
++		__fpstate_restore(task);
++}
++
++static inline void __switch_to_aux(struct task_struct *prev,
++				   struct task_struct *next)
++{
++	fpstate_save(prev);
++	fpstate_restore(next);
++}
++
++
++#define switch_to(prev, next, last)					\
+ do {									\
+-	(L) = __switch_to(virt_to_phys(&task_thread_info(N)->pcb), (P));\
++	struct task_struct *__prev = (prev);				\
++	struct task_struct *__next = (next);				\
++	__u64 __nextpcb = virt_to_phys(&task_thread_info(__next)->pcb);	\
++	__switch_to_aux(__prev, __next);				\
++	(last) = __switch_to(__nextpcb, __prev, __next);		\
+ 	check_mmu_context();						\
+ } while (0)
+ 
+diff --git a/arch/sw_64/include/uapi/asm/ptrace.h b/arch/sw_64/include/uapi/asm/ptrace.h
+index 96cb10891bea..4549e8d4bf57 100644
+--- a/arch/sw_64/include/uapi/asm/ptrace.h
++++ b/arch/sw_64/include/uapi/asm/ptrace.h
+@@ -9,12 +9,7 @@
+  *
+  * NOTE! I want to minimize the overhead of system calls, so this
+  * struct has as little information as possible.  I does not have
+- *
+- *  - floating point regs: the kernel doesn't change those
+- *  - r9-15: saved by the C compiler
+- *
+- * This makes "fork()" and "exec()" a bit more complex, but should
+- * give us low system call latency.
++ * floating point regs, because the kernel doesn't change those
+  */
+ 
+ struct pt_regs {
+@@ -27,6 +22,14 @@ struct pt_regs {
+ 	unsigned long r6;
+ 	unsigned long r7;
+ 	unsigned long r8;
++	unsigned long r9;
++	unsigned long r10;
++	unsigned long r11;
++	unsigned long r12;
++	unsigned long r13;
++	unsigned long r14;
++	unsigned long r15;
++	/* r16 ~ r18 saved by hmcode */
+ 	unsigned long r19;
+ 	unsigned long r20;
+ 	unsigned long r21;
+diff --git a/arch/sw_64/kernel/asm-offsets.c b/arch/sw_64/kernel/asm-offsets.c
+index bea12d2d96fe..349bc5c4e2f1 100644
+--- a/arch/sw_64/kernel/asm-offsets.c
++++ b/arch/sw_64/kernel/asm-offsets.c
+@@ -72,6 +72,13 @@ void foo(void)
+ 	DEFINE(PT_REGS_R6, offsetof(struct pt_regs, r6));
+ 	DEFINE(PT_REGS_R7, offsetof(struct pt_regs, r7));
+ 	DEFINE(PT_REGS_R8, offsetof(struct pt_regs, r8));
++	DEFINE(PT_REGS_R9, offsetof(struct pt_regs, r9));
++	DEFINE(PT_REGS_R10, offsetof(struct pt_regs, r10));
++	DEFINE(PT_REGS_R11, offsetof(struct pt_regs, r11));
++	DEFINE(PT_REGS_R12, offsetof(struct pt_regs, r12));
++	DEFINE(PT_REGS_R13, offsetof(struct pt_regs, r13));
++	DEFINE(PT_REGS_R14, offsetof(struct pt_regs, r14));
++	DEFINE(PT_REGS_R15, offsetof(struct pt_regs, r15));
+ 	DEFINE(PT_REGS_R19, offsetof(struct pt_regs, r19));
+ 	DEFINE(PT_REGS_R20, offsetof(struct pt_regs, r20));
+ 	DEFINE(PT_REGS_R21, offsetof(struct pt_regs, r21));
+@@ -258,4 +265,13 @@ void foo(void)
+ 	DEFINE(CTX_FP_F29, offsetof(struct context_fpregs, f29));
+ 	DEFINE(CTX_FP_F30, offsetof(struct context_fpregs, f30));
+ 	BLANK();
++	OFFSET(TASK_THREAD_RA, task_struct, thread.ra);
++	OFFSET(TASK_THREAD_S0, task_struct, thread.s[0]);
++	OFFSET(TASK_THREAD_S1, task_struct, thread.s[1]);
++	OFFSET(TASK_THREAD_S2, task_struct, thread.s[2]);
++	OFFSET(TASK_THREAD_S3, task_struct, thread.s[3]);
++	OFFSET(TASK_THREAD_S4, task_struct, thread.s[4]);
++	OFFSET(TASK_THREAD_S5, task_struct, thread.s[5]);
++	OFFSET(TASK_THREAD_S6, task_struct, thread.s[6]);
++	BLANK();
+ }
+diff --git a/arch/sw_64/kernel/entry.S b/arch/sw_64/kernel/entry.S
+index 6c40d2015439..ac62461aa9dc 100644
+--- a/arch/sw_64/kernel/entry.S
++++ b/arch/sw_64/kernel/entry.S
+@@ -21,52 +21,84 @@
+  * the hmcode-provided values are available to the signal handler.
+  */
+ 
+-#define SAVE_ALL				\
+-	ldi	$sp, -PT_REGS_PS($sp);		\
+-	stl	$0, PT_REGS_R0($sp);		\
+-	stl	$1, PT_REGS_R1($sp);		\
+-	stl	$2, PT_REGS_R2($sp);		\
+-	stl	$3, PT_REGS_R3($sp);		\
+-	stl	$4, PT_REGS_R4($sp);		\
+-	stl	$28, PT_REGS_R28($sp);		\
+-	stl	$5, PT_REGS_R5($sp);		\
+-	stl	$6, PT_REGS_R6($sp);		\
+-	stl	$7, PT_REGS_R7($sp);		\
+-	stl	$8, PT_REGS_R8($sp);		\
+-	stl	$19, PT_REGS_R19($sp);		\
+-	stl	$20, PT_REGS_R20($sp);		\
+-	stl	$21, PT_REGS_R21($sp);		\
+-	stl	$22, PT_REGS_R22($sp);		\
+-	stl	$23, PT_REGS_R23($sp);		\
+-	stl	$24, PT_REGS_R24($sp);		\
+-	stl	$25, PT_REGS_R25($sp);		\
+-	stl	$26, PT_REGS_R26($sp);		\
+-	stl	$27, PT_REGS_R27($sp);		\
+-	stl	$16, PT_REGS_TRAP_A0($sp);	\
+-	stl	$17, PT_REGS_TRAP_A1($sp);	\
++	.macro SAVE_COMMON_REGS
++	ldi	$sp, -PT_REGS_PS($sp)
++	stl	$0, PT_REGS_R0($sp)
++	stl	$1, PT_REGS_R1($sp)
++	stl	$2, PT_REGS_R2($sp)
++	stl	$3, PT_REGS_R3($sp)
++	stl	$4, PT_REGS_R4($sp)
++	stl	$28, PT_REGS_R28($sp)
++	stl	$5, PT_REGS_R5($sp)
++	stl	$6, PT_REGS_R6($sp)
++	stl	$7, PT_REGS_R7($sp)
++	stl	$8, PT_REGS_R8($sp)
++	stl	$19, PT_REGS_R19($sp)
++	stl	$20, PT_REGS_R20($sp)
++	stl	$21, PT_REGS_R21($sp)
++	stl	$22, PT_REGS_R22($sp)
++	stl	$23, PT_REGS_R23($sp)
++	stl	$24, PT_REGS_R24($sp)
++	stl	$25, PT_REGS_R25($sp)
++	stl	$26, PT_REGS_R26($sp)
++	stl	$27, PT_REGS_R27($sp)
++	stl	$16, PT_REGS_TRAP_A0($sp)
++	stl	$17, PT_REGS_TRAP_A1($sp)
+ 	stl	$18, PT_REGS_TRAP_A2($sp)
++	.endm
+ 
+-#define RESTORE_ALL				\
+-	ldl	$0, PT_REGS_R0($sp);		\
+-	ldl	$1, PT_REGS_R1($sp);		\
+-	ldl	$2, PT_REGS_R2($sp);		\
+-	ldl	$3, PT_REGS_R3($sp);		\
+-	ldl	$4, PT_REGS_R4($sp);		\
+-	ldl	$5, PT_REGS_R5($sp);		\
+-	ldl	$6, PT_REGS_R6($sp);		\
+-	ldl	$7, PT_REGS_R7($sp);		\
+-	ldl	$8, PT_REGS_R8($sp);		\
+-	ldl	$19, PT_REGS_R19($sp);		\
+-	ldl	$20, PT_REGS_R20($sp);		\
+-	ldl	$21, PT_REGS_R21($sp);		\
+-	ldl	$22, PT_REGS_R22($sp);		\
+-	ldl	$23, PT_REGS_R23($sp);		\
+-	ldl	$24, PT_REGS_R24($sp);		\
+-	ldl	$25, PT_REGS_R25($sp);		\
+-	ldl	$26, PT_REGS_R26($sp);		\
+-	ldl	$27, PT_REGS_R27($sp);		\
+-	ldl	$28, PT_REGS_R28($sp);		\
++	.macro RESTORE_COMMON_REGS
++	ldl	$0, PT_REGS_R0($sp)
++	ldl	$1, PT_REGS_R1($sp)
++	ldl	$2, PT_REGS_R2($sp)
++	ldl	$3, PT_REGS_R3($sp)
++	ldl	$4, PT_REGS_R4($sp)
++	ldl	$5, PT_REGS_R5($sp)
++	ldl	$6, PT_REGS_R6($sp)
++	ldl	$7, PT_REGS_R7($sp)
++	ldl	$8, PT_REGS_R8($sp)
++	ldl	$19, PT_REGS_R19($sp)
++	ldl	$20, PT_REGS_R20($sp)
++	ldl	$21, PT_REGS_R21($sp)
++	ldl	$22, PT_REGS_R22($sp)
++	ldl	$23, PT_REGS_R23($sp)
++	ldl	$24, PT_REGS_R24($sp)
++	ldl	$25, PT_REGS_R25($sp)
++	ldl	$26, PT_REGS_R26($sp)
++	ldl	$27, PT_REGS_R27($sp)
++	ldl	$28, PT_REGS_R28($sp)
+ 	ldi	$sp, PT_REGS_PS($sp)
++	.endm
++
++	.macro SAVE_CALLEE_REGS
++	stl	$9, PT_REGS_R9($sp)
++	stl	$10, PT_REGS_R10($sp)
++	stl	$11, PT_REGS_R11($sp)
++	stl	$12, PT_REGS_R12($sp)
++	stl	$13, PT_REGS_R13($sp)
++	stl	$14, PT_REGS_R14($sp)
++	stl	$15, PT_REGS_R15($sp)
++	.endm
++
++	.macro RESTORE_CALLEE_REGS
++	ldl	$9, PT_REGS_R9($sp)
++	ldl	$10, PT_REGS_R10($sp)
++	ldl	$11, PT_REGS_R11($sp)
++	ldl	$12, PT_REGS_R12($sp)
++	ldl	$13, PT_REGS_R13($sp)
++	ldl	$14, PT_REGS_R14($sp)
++	ldl	$15, PT_REGS_R15($sp)
++	.endm
++
++	.macro SAVE_ALL
++	SAVE_COMMON_REGS
++	SAVE_CALLEE_REGS
++	.endm
++
++	.macro RESTORE_ALL
++	RESTORE_CALLEE_REGS
++	RESTORE_COMMON_REGS
++	.endm
+ 
+ /*
+  * Non-syscall kernel entry points.
+@@ -591,19 +623,42 @@ $setfpec_over:
+ 	.end undo_switch_stack
+ 
+ /*
+- * The meat of the context switch code.
++ * Integer register context switch
++ * The callee-saved registers must be saved and restored.
++ *
++ *   a0: physical address of next task's pcb, used by hmcode
++ *   a1: previous task_struct (must be preserved across the switch)
++ *   a2: next task_struct
++ *
++ * The value of a1  must be preserved by this function, as that's how
++ * arguments are passed to schedule_tail.
+  */
+-
+ 	.align 4
+ 	.globl __switch_to
+ 	.ent __switch_to
+ __switch_to:
+ 	.prologue 0
+-	bsr	$1, do_switch_stack
++	/* Save context into prev->thread */
++	stl	$26, TASK_THREAD_RA($17)
++	stl	$9, TASK_THREAD_S0($17)
++	stl	$10, TASK_THREAD_S1($17)
++	stl	$11, TASK_THREAD_S2($17)
++	stl	$12, TASK_THREAD_S3($17)
++	stl	$13, TASK_THREAD_S4($17)
++	stl	$14, TASK_THREAD_S5($17)
++	stl	$15, TASK_THREAD_S6($17)
++	/* Restore context from next->thread */
++	ldl	$26, TASK_THREAD_RA($18)
++	ldl	$9, TASK_THREAD_S0($18)
++	ldl	$10, TASK_THREAD_S1($18)
++	ldl	$11, TASK_THREAD_S2($18)
++	ldl	$12, TASK_THREAD_S3($18)
++	ldl	$13, TASK_THREAD_S4($18)
++	ldl	$14, TASK_THREAD_S5($18)
++	ldl	$15, TASK_THREAD_S6($18)
+ 	sys_call HMC_swpctx
+ 	ldi	$8, 0x3fff
+ 	bic	$sp, $8, $8
+-	bsr	$1, undo_switch_stack
+ 	mov	$17, $0
+ 	ret
+ 	.end __switch_to
+@@ -637,30 +692,6 @@ ret_from_kernel_thread:
+ 	br	$31, ret_to_user
+ 	.end ret_from_kernel_thread
+ 
+-/*
+- * Special system calls.  Most of these are special in that they either
+- * have to play switch_stack games or in some way use the pt_regs struct.
+- */
+-
+-.macro	fork_like name
+-	.align 4
+-	.globl sw64_\name
+-	.ent sw64_\name
+-sw64_\name:
+-	.prologue 0
+-	bsr	$1, do_switch_stack
+-	call	$26, sys_\name
+-	ldl	$26, SWITCH_STACK_RA($sp)
+-	ldi	$sp, SWITCH_STACK_SIZE($sp)
+-	ret
+-	.end	sw64_\name
+-	.endm
+-
+-fork_like fork
+-fork_like vfork
+-fork_like clone
+-fork_like clone3
+-
+ 	.align 4
+ 	.globl sys_sigreturn
+ 	.ent sys_sigreturn
+diff --git a/arch/sw_64/kernel/process.c b/arch/sw_64/kernel/process.c
+index 4192d50f5b0e..c6e87874af19 100644
+--- a/arch/sw_64/kernel/process.c
++++ b/arch/sw_64/kernel/process.c
+@@ -11,6 +11,7 @@
+ #include <linux/random.h>
+ 
+ #include <asm/fpu.h>
++#include <asm/switch_to.h>
+ 
+ #include "proto.h"
+ 
+@@ -158,19 +159,18 @@ copy_thread(unsigned long clone_flags, unsigned long usp,
+ 	struct thread_info *childti = task_thread_info(p);
+ 	struct pt_regs *childregs = task_pt_regs(p);
+ 	struct pt_regs *regs = current_pt_regs();
+-	struct switch_stack *childstack, *stack;
+ 
+-	childstack = ((struct switch_stack *) childregs) - 1;
+-	childti->pcb.ksp = (unsigned long) childstack;
++	childti->pcb.ksp = (unsigned long) childregs;
+ 	childti->pcb.flags = 7;	/* set FEN, clear everything else */
++	__fpstate_save(current);
++	p->thread = current->thread;
+ 
+ 	if (unlikely(p->flags & PF_KTHREAD)) {
+ 		/* kernel thread */
+-		memset(childstack, 0,
+-			sizeof(struct switch_stack) + sizeof(struct pt_regs));
+-		childstack->r26 = (unsigned long) ret_from_kernel_thread;
+-		childstack->r9 = usp;	/* function */
+-		childstack->r10 = kthread_arg;
++		memset(childregs, 0, sizeof(struct pt_regs));
++		p->thread.ra = (unsigned long) ret_from_kernel_thread;
++		p->thread.s[0] = usp;	/* function */
++		p->thread.s[1] = kthread_arg;
+ 		childti->pcb.usp = 0;
+ 		return 0;
+ 	}
+@@ -189,10 +189,7 @@ copy_thread(unsigned long clone_flags, unsigned long usp,
+ 	*childregs = *regs;
+ 	childregs->r0 = 0;
+ 	childregs->r19 = 0;
+-	stack = ((struct switch_stack *) regs) - 1;
+-	*childstack = *stack;
+-	p->thread = current->thread;
+-	childstack->r26 = (unsigned long) ret_from_fork;
++	p->thread.ra = (unsigned long) ret_from_fork;
+ 	return 0;
+ }
+ 
+diff --git a/arch/sw_64/kernel/syscalls/syscall.tbl b/arch/sw_64/kernel/syscalls/syscall.tbl
+index b9b93d70124d..42a179422b6b 100644
+--- a/arch/sw_64/kernel/syscalls/syscall.tbl
++++ b/arch/sw_64/kernel/syscalls/syscall.tbl
+@@ -73,7 +73,7 @@
+ 63	common	getpgrp				sys_getpgrp
+ #64 is unused
+ #65 is unused
+-66	common	vfork				sw64_vfork
++66	common	vfork				sys_vfork
+ 67	common	stat				sys_newstat
+ 68	common	lstat				sys_newlstat
+ #69 is unused
+@@ -289,7 +289,7 @@
+ 279	common	fsmount				sys_fsmount
+ 280	common	fspick				sys_fspick
+ 281	common	pidfd_open			sys_pidfd_open
+-282	common	clone3				sw64_clone3
++282	common	clone3				sys_clone3
+ 283	common	close_range			sys_close_range
+ 284	common	openat2				sys_openat2
+ 285	common	pidfd_getfd			sys_pidfd_getfd
+@@ -319,7 +319,7 @@
+ 309	common	get_kernel_syms			sys_ni_syscall
+ 310	common	syslog				sys_syslog
+ 311	common	reboot				sys_reboot
+-312	common	clone				sw64_clone
++312	common	clone				sys_clone
+ 313	common	uselib				sys_uselib
+ 314	common	mlock				sys_mlock
+ 315	common	munlock				sys_munlock
+-- 
+2.33.0
+

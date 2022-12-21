@@ -1,0 +1,104 @@
+From 9a9fa2f04d16ff8ad28507b28db10c8dd238db5b Mon Sep 17 00:00:00 2001
+From: Chengchang Tang <tangchengchang@huawei.com>
+Date: Tue, 1 Nov 2022 23:04:32 +0800
+Subject: [PATCH] RDMA/hns: Fix level-0 addressing for huge page
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 9a9fa2f04d16ff8ad28507b28db10c8dd238db5b
+Modified-by-SEL: No
+
+
+driver inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5Y79T
+
+-------------------------------------------------------------------
+
+Currently, when creating a MR, there is a certain probability of
+causing a hardware exception when addressing at level 0 with a huge
+page. This is because the PA address is now aligned to 4K instead of
+the actual page size set by the driver.
+
+When the MTR of multiple regions is addressed at level 0 with a huge
+page, multiple regions will share the same huge page. This huge page
+will be divided into multiple 4K pages, and these pages will be
+allocated to different regions. At this point, all the regions of this
+MTR only require 4k alignment instead of the actual pagesize. This can
+help reduce memory consumption.
+
+But when there is only one region, the MTR with level-0 addressing can
+directly use this huge page. At this point the hardware needs this page
+to be aligned to the actual page size, not 4K.
+
+This patch set page size to 4k only when the MTR with level 0 addressing
+has mutliple regions.
+
+Fixes: 0e0ab04b5bbe ("RDMA/hns: Refactor the MTR creation flow")
+Signed-off-by: Chengchang Tang <tangchengchang@huawei.com>
+Reviewed-by: Yangyang Li <liyangyang20@huawei.com>
+Reviewed-by: YueHaibing <yuehaibing@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/infiniband/hw/hns/hns_roce_mr.c | 24 ++++++++++++++----------
+ 1 file changed, 14 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/infiniband/hw/hns/hns_roce_mr.c b/drivers/infiniband/hw/hns/hns_roce_mr.c
+index 63e8f29e5807..30c2f5e8e84a 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_mr.c
++++ b/drivers/infiniband/hw/hns/hns_roce_mr.c
+@@ -712,6 +712,16 @@ static int cal_mtr_pg_cnt(struct hns_roce_mtr *mtr)
+ 	return page_cnt;
+ }
+ 
++static bool need_split_huge_page(struct hns_roce_mtr *mtr)
++{
++	/* When HEM buffer uses 0-level addressing, the page size is
++	 * equal to the whole buffer size. If the current MTR has multiple
++	 * regions, we split the buffer into small pages(4k, required by hns
++	 * ROCEE). These pages will be used in multiple regions.
++	 */
++	return mtr->hem_cfg.is_direct && mtr->hem_cfg.region_count > 1;
++}
++
+ static int mtr_map_bufs(struct hns_roce_dev *hr_dev, struct hns_roce_mtr *mtr)
+ {
+ 	struct ib_device *ibdev = &hr_dev->ib_dev;
+@@ -721,14 +731,8 @@ static int mtr_map_bufs(struct hns_roce_dev *hr_dev, struct hns_roce_mtr *mtr)
+ 	int npage;
+ 	int ret;
+ 
+-	/* When HEM buffer uses 0-level addressing, the page size is
+-	 * equal to the whole buffer size, and we split the buffer into
+-	 * small pages which is used to check whether the adjacent
+-	 * units are in the continuous space and its size is fixed to
+-	 * 4K based on hns ROCEE's requirement.
+-	 */
+-	page_shift = mtr->hem_cfg.is_direct ? HNS_HW_PAGE_SHIFT :
+-					      mtr->hem_cfg.buf_pg_shift;
++	page_shift = need_split_huge_page(mtr) ? HNS_HW_PAGE_SHIFT :
++						 mtr->hem_cfg.buf_pg_shift;
+ 	/* alloc a tmp array to store buffer's dma address */
+ 	pages = kvcalloc(page_count, sizeof(dma_addr_t), GFP_KERNEL);
+ 	if (!pages)
+@@ -748,7 +752,7 @@ static int mtr_map_bufs(struct hns_roce_dev *hr_dev, struct hns_roce_mtr *mtr)
+ 		goto err_alloc_list;
+ 	}
+ 
+-	if (mtr->hem_cfg.is_direct && npage > 1) {
++	if (need_split_huge_page(mtr) && npage > 1) {
+ 		ret = mtr_check_direct_pages(pages, npage, page_shift);
+ 		if (ret) {
+ 			ibdev_err(ibdev, "failed to check %s page: %d / %d.\n",
+@@ -1026,7 +1030,7 @@ static int mtr_init_buf_cfg(struct hns_roce_dev *hr_dev,
+ 	cfg->is_direct = !mtr_has_mtt(attr);
+ 	cfg->region_count = attr->region_count;
+ 	buf_size = mtr_bufs_size(attr);
+-	if (cfg->is_direct) {
++	if (need_split_huge_page(mtr)) {
+ 		buf_pg_sz = HNS_HW_PAGE_SIZE;
+ 		cfg->buf_pg_count = 1;
+ 		/* The ROCEE requires the page size to be 4K * 2 ^ N. */
+-- 
+2.33.0
+

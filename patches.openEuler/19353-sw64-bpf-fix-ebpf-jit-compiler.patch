@@ -1,0 +1,156 @@
+From 02da9e00679727f2984bbcca9210fde0ee3697c5 Mon Sep 17 00:00:00 2001
+From: Mao Minkai <maominkai@wxiat.com>
+Date: Tue, 30 Aug 2022 13:58:58 +0800
+Subject: [PATCH] sw64: bpf: fix ebpf jit compiler
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 02da9e00679727f2984bbcca9210fde0ee3697c5
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5PNGJ
+
+--------------------------------
+
+This patch makes following changes to ebpf jit compiler:
+   * switch to unsigned 64-bit div and mod to avoid incorrect overflow
+     result
+   * fix calling other bpf programs directly
+   * fix tail call
+   * fix jit_fill_hole()
+   * change ILLEGAL_INSN so it can be used in the future
+
+Results of "test_verifier" in jited and emulated mode are now same.
+
+Extra space in jited image is now filled with illegal instructions
+correctly.
+
+Signed-off-by: Mao Minkai <maominkai@wxiat.com>
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/net/bpf_jit.h      |  2 +-
+ arch/sw_64/net/bpf_jit_comp.c | 35 +++++++++++++++++++++--------------
+ 2 files changed, 22 insertions(+), 15 deletions(-)
+
+diff --git a/arch/sw_64/net/bpf_jit.h b/arch/sw_64/net/bpf_jit.h
+index e4c96995bd96..2cf5ba5253a8 100644
+--- a/arch/sw_64/net/bpf_jit.h
++++ b/arch/sw_64/net/bpf_jit.h
+@@ -96,7 +96,7 @@
+ #define SW64_BPF_FUNC_ALU_SEXTH		0x6B
+ 
+ /* special instuction used in jit_fill_hole() */
+-#define SW64_BPF_ILLEGAL_INSN	(0x1bff1000)	/* rd_f $31 */
++#define SW64_BPF_ILLEGAL_INSN	(0x1ff00000)	/* pri_ret/b	$31 */
+ 
+ enum sw64_bpf_registers {
+ 	SW64_BPF_REG_V0		= 0,	/* keep return value */
+diff --git a/arch/sw_64/net/bpf_jit_comp.c b/arch/sw_64/net/bpf_jit_comp.c
+index f1e471a0789b..98ddb60200c8 100644
+--- a/arch/sw_64/net/bpf_jit_comp.c
++++ b/arch/sw_64/net/bpf_jit_comp.c
+@@ -307,9 +307,9 @@ noinline void sw64_bpf_jit_helper_mod32(void)
+ 
+ noinline void sw64_bpf_jit_helper_div64(void)
+ {
+-	register s64 __dividend asm(REG(DIVIDEND));
+-	register s64 __divisor asm(REG(DIVISOR));
+-	s64 res = __dividend / __divisor;
++	register u64 __dividend asm(REG(DIVIDEND));
++	register u64 __divisor asm(REG(DIVISOR));
++	u64 res = __dividend / __divisor;
+ 
+ 	asm volatile(
+ 	""
+@@ -318,9 +318,9 @@ noinline void sw64_bpf_jit_helper_div64(void)
+ 
+ noinline void sw64_bpf_jit_helper_mod64(void)
+ {
+-	register s64 __dividend asm(REG(DIVIDEND));
+-	register s64 __divisor asm(REG(DIVISOR));
+-	s64 res = __dividend % __divisor;
++	register u64 __dividend asm(REG(DIVIDEND));
++	register u64 __divisor asm(REG(DIVISOR));
++	u64 res = __dividend % __divisor;
+ 
+ 	asm volatile(
+ 	""
+@@ -508,7 +508,10 @@ static void emit_sw64_htobe64(const int dst, struct jit_ctx *ctx)
+ 
+ static void jit_fill_hole(void *area, unsigned int size)
+ {
+-	memset(area, SW64_BPF_ILLEGAL_INSN, size);
++	unsigned long c = SW64_BPF_ILLEGAL_INSN;
++
++	c |= c << 32;
++	__constant_c_memset(area, c, size);
+ }
+ 
+ static int bpf2sw64_offset(int bpf_idx, s32 off, const struct jit_ctx *ctx)
+@@ -593,9 +596,9 @@ static void build_epilogue(struct jit_ctx *ctx)
+ 
+ static int emit_bpf_tail_call(struct jit_ctx *ctx)
+ {
+-	/* bpf_tail_call(void *prog_ctx, struct bpf_array *array, u64 index) */
++	/* bpf_tail_call(void *ctx, struct bpf_map *prog_array_map, u32 index) */
+ 	const u8 r2 = bpf2sw64[BPF_REG_2];	/* struct bpf_array *array */
+-	const u8 r3 = bpf2sw64[BPF_REG_3];	/* u64 index */
++	const u8 r3 = bpf2sw64[BPF_REG_3];	/* u32 index */
+ 
+ 	const u8 tmp = get_tmp_reg(ctx);
+ 	const u8 prg = get_tmp_reg(ctx);
+@@ -612,6 +615,7 @@ static int emit_bpf_tail_call(struct jit_ctx *ctx)
+ 	emit(SW64_BPF_ADDL_REG(r2, tmp, tmp), ctx);	/* tmp = r2 + tmp = &map.max_entries */
+ 	emit(SW64_BPF_LDW(tmp, tmp, 0), ctx);		/* tmp = *tmp = map.max_entries */
+ 	emit(SW64_BPF_ZAP_IMM(tmp, 0xf0, tmp), ctx);	/* map.max_entries is u32 */
++	emit(SW64_BPF_ZAP_IMM(r3, 0xf0, r3), ctx);	/* index is u32 */
+ 	emit(SW64_BPF_CMPULE_REG(tmp, r3, tmp), ctx);
+ 	emit(SW64_BPF_BNE(tmp, out_offset), ctx);
+ 
+@@ -620,8 +624,8 @@ static int emit_bpf_tail_call(struct jit_ctx *ctx)
+ 	 * tail_call_cnt++;
+ 	 */
+ 	emit_sw64_ldu64(tmp, MAX_TAIL_CALL_CNT, ctx);
+-	emit(SW64_BPF_CMPULE_REG(tcc, tmp, tmp), ctx);
+-	emit(SW64_BPF_BEQ(tmp, out_offset), ctx);
++	emit(SW64_BPF_CMPULT_REG(tmp, tcc, tmp), ctx);
++	emit(SW64_BPF_BNE(tmp, out_offset), ctx);
+ 	emit(SW64_BPF_ADDL_IMM(tcc, 1, tcc), ctx);
+ 
+ 	/* prog = array->ptrs[index];
+@@ -642,8 +646,8 @@ static int emit_bpf_tail_call(struct jit_ctx *ctx)
+ 	emit(SW64_BPF_ADDL_REG(prg, tmp, tmp), ctx);	/* tmp = prg + tmp = &bpf_func */
+ 	emit(SW64_BPF_LDL(tmp, tmp, 0), ctx);		/* tmp = *tmp = bpf_func */
+ 	emit(SW64_BPF_BEQ(tmp, out_offset), ctx);
+-	emit(SW64_BPF_ADDL_REG(tmp, sizeof(u32) * PROLOGUE_OFFSET, tmp), ctx);
+-	emit(SW64_BPF_ADDL_REG(SW64_BPF_REG_SP, ctx->stack_size, SW64_BPF_REG_SP), ctx);
++	emit(SW64_BPF_LDI(tmp, tmp, sizeof(u32) * PROLOGUE_OFFSET), ctx);
++	emit(SW64_BPF_LDI(SW64_BPF_REG_SP, SW64_BPF_REG_SP, ctx->stack_size), ctx);
+ 	emit(SW64_BPF_JMP(SW64_BPF_REG_ZR, tmp), ctx);
+ 
+ 	put_tmp_reg(ctx);
+@@ -652,7 +656,7 @@ static int emit_bpf_tail_call(struct jit_ctx *ctx)
+ 	/* out */
+ 	if (ctx->image == NULL)
+ 		out_idx = ctx->idx;
+-	if (ctx->image != NULL && out_offset <= 0)
++	if (ctx->image != NULL && out_idx <= 0)
+ 		return -1;
+ #undef out_offset
+ 	return 0;
+@@ -1102,6 +1106,9 @@ static int build_insn(const struct bpf_insn *insn, struct jit_ctx *ctx)
+ 
+ 	case BPF_JMP | BPF_CALL:
+ 		func = (u64)__bpf_call_base + imm;
++		if ((func & 0xffffffffe0000000UL) != 0xffffffff80000000UL)
++			/* calling bpf program, switch to vmalloc addr */
++			func = (func & 0xffffffff) | 0xfffff00000000000UL;
+ 		emit_sw64_ldu64(SW64_BPF_REG_PV, func, ctx);
+ 		emit(SW64_BPF_CALL(SW64_BPF_REG_RA, SW64_BPF_REG_PV), ctx);
+ 		break;
+-- 
+2.33.0
+

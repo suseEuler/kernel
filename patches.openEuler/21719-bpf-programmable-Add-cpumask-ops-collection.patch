@@ -1,0 +1,304 @@
+From 2bc344acbb2b930cac3e6b9c555b586b6d140d58 Mon Sep 17 00:00:00 2001
+From: Chen Hui <judy.chenhui@huawei.com>
+Date: Fri, 25 Nov 2022 11:56:23 +0800
+Subject: [PATCH] bpf:programmable: Add cpumask ops collection
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 2bc344acbb2b930cac3e6b9c555b586b6d140d58
+Modified-by-SEL: Yes, modified due to different context
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5KUFB
+CVE: NA
+
+--------------------------------
+
+Add cpumask ops collection, such as cpumask_empty,
+cpumask_and, cpumask_andnot, cpumask_subset,
+cpumask_equal, cpumask_copy.
+
+Signed-off-by: Chen Hui <judy.chenhui@huawei.com>
+Signed-off-by: Hui Tang <tanghui20@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/sched.h          |   23 ++++++++++
+ include/uapi/linux/bpf.h       |   43 ++++++++++++++++++++
+ kernel/sched/bpf_sched.c       |   87 +++++++++++++++++++++++++++++++++++++++++
+ scripts/bpf_doc.py             |    4 +
+ tools/include/uapi/linux/bpf.h |   43 ++++++++++++++++++++
+ 5 files changed, 200 insertions(+)
+
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -2251,5 +2251,28 @@ struct bpf_sched_cpu_stats {
+ 	unsigned long capacity_orig;
+ };
+ 
++struct cpumask_op_args {
++	unsigned int op_type;
++	void *arg1;
++	void *arg2;
++	void *arg3;
++	void *arg4;
++};
++
++enum cpumask_op_type {
++	CPUMASK_EMPTY,
++	CPUMASK_AND,
++	CPUMASK_ANDNOT,
++	CPUMASK_SUBSET,
++	CPUMASK_EQUAL,
++	CPUMASK_TEST_CPU,
++	CPUMASK_COPY,
++	CPUMASK_WEIGHT,
++	CPUMASK_NEXT,
++	CPUMASK_NEXT_WRAP,
++	CPUMASK_NEXT_AND,
++	CPUMASK_CPULIST_PARSE
++};
++
+ #endif
+ #endif
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -5118,6 +5118,48 @@ union bpf_attr {
+  *		Return task group of *se* if se is a task group.
+  *	Return
+  *		Task struct if se is a task group, NULL otherwise.
++ *
++ * int bpf_cpumask_op(struct cpumask_op_args *op, int len)
++ *	Description
++ *		A series of cpumask-related operations. Perform different
++ *		operations base on *op*->type. User also need fill other
++ *		*op* field base on *op*->type. *op*->type is one of them
++ *
++ *		**CPUMASK_EMPTY**
++ *			*(op->arg1) == 0 returned.
++ *		**CPUMASK_AND**
++ *			*(op->arg1) = *(op->arg2) & *(op->arg3)
++ *		**CPUMASK_ANDNOT**
++ *			*(op->arg1) = *(op->arg2) & ~*(op->arg3)
++ *		**CPUMASK_SUBSET**
++ *			*(op->arg1) & ~*(op->arg2) == 0 returned
++ *		**CPUMASK_EQUAL**
++ *			*(op->arg1) == *(op->arg2) returned
++ *		**CPUMASK_TEST_CPU**
++ *			test for a cpu *(int)(op->arg1) in *(op->arg2)
++ *			returns 1 if *op*->arg1 is set in *op*->arg2, else returns 0
++ *		**CPUMASK_COPY**
++ *			*(op->arg1) = *(op->arg2), return 0 always
++ *		**CPUMASK_WEIGHT**
++ *			count of bits in *(op->arg1)
++ *		**CPUMASK_NEXT**
++ *			get the next cpu in *(struct cpumask *)(op->arg2)
++ *			*(int *)(op->arg1): the cpu prior to the place to search
++ *		**CPUMASK_NEXT_WRAP**
++ *			helper to implement for_each_cpu_wrap
++ *			@op->arg1: the cpu prior to the place to search
++ *			@op->arg2: the cpumask pointer
++ *			@op->arg3: the start point of the iteration
++ *			@op->arg4: assume @op->arg1 crossing @op->arg3 terminates the iteration
++ *			returns >= nr_cpu_ids on completion
++ *		**CPUMASK_NEXT_AND**
++ *			get the next cpu in *(op->arg1) & *(op->arg2)
++ *		**CPUMASK_CPULIST_PARSE**
++ *			extract a cpumask from a user string of ranges.
++ *			(char *)op->arg1 -> (struct cpumask *)(op->arg2)
++ *			0 on success, or a negative error in case of failure.
++ *	Return
++ *		View above.
+  */
+ #define __BPF_FUNC_MAPPER(FN)		\
+ 	FN(unspec),			\
+@@ -5288,6 +5330,7 @@ union bpf_attr {
+  	FN(sched_entity_is_task),	\
+  	FN(sched_entity_to_task),	\
+  	FN(sched_entity_to_tg),		\
++	FN(cpumask_op),			\
+ 	FN(task_storage_get),		\
+ 	FN(task_storage_delete),	\
+ 	FN(get_current_task_btf),	\
+--- a/kernel/sched/bpf_sched.c
++++ b/kernel/sched/bpf_sched.c
+@@ -175,6 +175,91 @@ static const struct bpf_func_proto bpf_s
+ 	.arg1_btf_id	= &btf_sched_entity_ids[0],
+ };
+ 
++BPF_CALL_2(bpf_cpumask_op, struct cpumask_op_args *, op, int, len)
++{
++	int ret;
++
++	if (len != sizeof(*op) || !op->arg1)
++		return -EINVAL;
++
++	switch (op->op_type) {
++	case CPUMASK_EMPTY:
++		return cpumask_empty((const struct cpumask *)op->arg1);
++	case CPUMASK_AND:
++		if (!op->arg2 || !op->arg3)
++			return -EINVAL;
++		return cpumask_and((struct cpumask *)op->arg1,
++				   (const struct cpumask *)op->arg2,
++				   (const struct cpumask *)op->arg3);
++	case CPUMASK_ANDNOT:
++		if (!op->arg2 || !op->arg3)
++			return -EINVAL;
++		cpumask_andnot((struct cpumask *)op->arg1,
++			       (const struct cpumask *)op->arg2,
++			       (const struct cpumask *)op->arg3);
++		break;
++	case CPUMASK_SUBSET:
++		if (!op->arg2)
++			return -EINVAL;
++		return cpumask_subset((const struct cpumask *)op->arg1,
++				      (const struct cpumask *)op->arg2);
++	case CPUMASK_EQUAL:
++		if (!op->arg2)
++			return -EINVAL;
++		return cpumask_equal((const struct cpumask *)op->arg1,
++				     (const struct cpumask *)op->arg2);
++	case CPUMASK_TEST_CPU:
++		if (!op->arg2)
++			return -EINVAL;
++		return cpumask_test_cpu(*(int *)op->arg1, op->arg2);
++	case CPUMASK_COPY:
++		if (!op->arg2)
++			return -EINVAL;
++		cpumask_copy((struct cpumask *)op->arg1,
++			     (const struct cpumask *)op->arg2);
++		break;
++	case CPUMASK_WEIGHT:
++		return cpumask_weight((const struct cpumask *)op->arg1);
++	case CPUMASK_NEXT:
++		if (!op->arg2)
++			return -EINVAL;
++		return cpumask_next(*(int *)op->arg1,
++				    (const struct cpumask *)op->arg2);
++	case CPUMASK_NEXT_WRAP:
++		if (!op->arg2 || !op->arg3 || !op->arg4)
++			return -EINVAL;
++		return cpumask_next_wrap(*(int *)op->arg1,
++					 (const struct cpumask *)op->arg2,
++					 *(int *)op->arg3, *(int *)op->arg4);
++	case CPUMASK_NEXT_AND:
++		if (!op->arg2 || !op->arg3)
++			return -EINVAL;
++		return cpumask_next_and(*(int *)op->arg1,
++					(const struct cpumask *)op->arg2,
++					(const struct cpumask *)op->arg3);
++	case CPUMASK_CPULIST_PARSE:
++		if (!op->arg2)
++			return -EINVAL;
++
++		op->arg1 = (void *)strstrip((void *)op->arg1);
++		ret = cpulist_parse((void *)op->arg1,
++				    (struct cpumask *)op->arg2);
++		return ret;
++	default:
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static const struct bpf_func_proto bpf_cpumask_op_proto = {
++	.func		= bpf_cpumask_op,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_PTR_TO_MEM,
++	.arg2_type	= ARG_CONST_SIZE,
++};
++
+ static const struct bpf_func_proto *
+ bpf_sched_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+ {
+@@ -193,6 +278,8 @@ bpf_sched_func_proto(enum bpf_func_id fu
+ 		return &bpf_sched_entity_to_task_proto;
+ 	case BPF_FUNC_sched_entity_to_tg:
+ 		return &bpf_sched_entity_to_tg_proto;
++	case BPF_FUNC_cpumask_op:
++		return &bpf_cpumask_op_proto;
+ 	default:
+ 		return bpf_base_func_proto(func_id);
+ 	}
+--- a/scripts/bpf_doc.py
++++ b/scripts/bpf_doc.py
+@@ -550,6 +550,8 @@ class PrinterHelpers(Printer):
+             'struct bpf_cpu_topology',
+             'struct bpf_cpumask_info',
+             'struct sched_entity',
++            'struct cpumask',
++            'struct cpumask_op_args',
+             'struct inode',
+             'struct socket',
+             'struct file',
+@@ -605,6 +607,8 @@ class PrinterHelpers(Printer):
+             'struct bpf_cpu_topology',
+             'struct bpf_cpumask_info',
+             'struct sched_entity',
++            'struct cpumask',
++            'struct cpumask_op_args',
+             'struct inode',
+             'struct socket',
+             'struct file',
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -5105,6 +5105,48 @@ union bpf_attr {
+  *		Return task group of *se* if se is a task group.
+  *	Return
+  *		Task struct if se is a task group, NULL otherwise.
++ *
++ * int bpf_cpumask_op(struct cpumask_op_args *op, int len)
++ *	Description
++ *		A series of cpumask-related operations. Perform different
++ *		operations base on *op*->type. User also need fill other
++ *		*op* field base on *op*->type. *op*->type is one of them
++ *
++ *		**CPUMASK_EMPTY**
++ *			*(op->arg1) == 0 returned.
++ *		**CPUMASK_AND**
++ *			*(op->arg1) = *(op->arg2) & *(op->arg3)
++ *		**CPUMASK_ANDNOT**
++ *			*(op->arg1) = *(op->arg2) & ~*(op->arg3)
++ *		**CPUMASK_SUBSET**
++ *			*(op->arg1) & ~*(op->arg2) == 0 returned
++ *		**CPUMASK_EQUAL**
++ *			*(op->arg1) == *(op->arg2) returned
++ *		**CPUMASK_TEST_CPU**
++ *			test for a cpu *(int)(op->arg1) in *(op->arg2)
++ *			returns 1 if *op*->arg1 is set in *op*->arg2, else returns 0
++ *		**CPUMASK_COPY**
++ *			*(op->arg1) = *(op->arg2), return 0 always
++ *		**CPUMASK_WEIGHT**
++ *			count of bits in *(op->arg1)
++ *		**CPUMASK_NEXT**
++ *			get the next cpu in *(struct cpumask *)(op->arg2)
++ *			*(int *)(op->arg1): the cpu prior to the place to search
++ *		**CPUMASK_NEXT_WRAP**
++ *			helper to implement for_each_cpu_wrap
++ *			@op->arg1: the cpu prior to the place to search
++ *			@op->arg2: the cpumask pointer
++ *			@op->arg3: the start point of the iteration
++ *			@op->arg4: assume @op->arg1 crossing @op->arg3 terminates the iteration
++ *			returns >= nr_cpu_ids on completion
++ *		**CPUMASK_NEXT_AND**
++ *			get the next cpu in *(op->arg1) & *(op->arg2)
++ *		**CPUMASK_CPULIST_PARSE**
++ *			extract a cpumask from a user string of ranges.
++ *			(char *)op->arg1 -> (struct cpumask *)(op->arg2)
++ *			0 on success, or a negative error in case of failure.
++ *	Return
++ *		View above.
+  */
+ #define __BPF_FUNC_MAPPER(FN)		\
+ 	FN(unspec),			\
+@@ -5275,6 +5317,7 @@ union bpf_attr {
+  	FN(sched_entity_is_task),	\
+  	FN(sched_entity_to_task),	\
+  	FN(sched_entity_to_tg),		\
++	FN(cpumask_op),			\
+ 	FN(task_storage_get),		\
+ 	FN(task_storage_delete),	\
+ 	FN(get_current_task_btf),	\

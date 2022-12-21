@@ -1,0 +1,126 @@
+From dcde4fb60cb54debcc32cba1513e5d7f750e152e Mon Sep 17 00:00:00 2001
+From: He Chuyue <hechuyue@wxiat.com>
+Date: Thu, 4 Aug 2022 16:35:30 +0800
+Subject: [PATCH] sw64: perf: fix PMI with no event
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: dcde4fb60cb54debcc32cba1513e5d7f750e152e
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5XTIW
+
+--------------------------------
+
+For perf disable PMU, this then presents the following error
+condition in processes schedule:
+
+Process A		Process B
+
+Disable irq
+<PMC overflow>
+Disable PMU
+			Enable irq
+			<PMI comes>
+			   ->sw64_perf_event_irq_handler()
+
+When irq is disabled, PMC may still overflow then a PMI triggers.
+After another process is scheduled and irq is enabled, this PMI
+will raise immediately.
+
+To avoid this, clear interrupt flag in hmcode when it disable PMU.
+However, in kernel, events that do not exist will return directly.
+
+Signed-off-by: He Chuyue <hechuyue@wxiat.com>
+Reviewed-by: He Sheng <hesheng@wxiat.com>
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/kernel/perf_event.c | 23 ++++-------------------
+ 1 file changed, 4 insertions(+), 19 deletions(-)
+
+diff --git a/arch/sw_64/kernel/perf_event.c b/arch/sw_64/kernel/perf_event.c
+index 6e344239917b..4122502da895 100644
+--- a/arch/sw_64/kernel/perf_event.c
++++ b/arch/sw_64/kernel/perf_event.c
+@@ -385,7 +385,6 @@ static int sw64_pmu_add(struct perf_event *event, int flags)
+ 	int err = 0;
+ 	unsigned long irq_flags;
+ 
+-	perf_pmu_disable(event->pmu);
+ 	local_irq_save(irq_flags);
+ 
+ 	if (cpuc->pmcs[hwc->idx] == PMC_IN_USE) {
+@@ -408,7 +407,6 @@ static int sw64_pmu_add(struct perf_event *event, int flags)
+ 
+ out:
+ 	local_irq_restore(irq_flags);
+-	perf_pmu_enable(event->pmu);
+ 
+ 	return err;
+ }
+@@ -422,24 +420,17 @@ static void sw64_pmu_del(struct perf_event *event, int flags)
+ 	struct hw_perf_event *hwc = &event->hw;
+ 	unsigned long irq_flags;
+ 
+-	perf_pmu_disable(event->pmu);
+ 	local_irq_save(irq_flags);
+ 
+-	if (cpuc->event[hwc->idx] != event)
+-		goto out;
+-
++	sw64_pmu_stop(event, PERF_EF_UPDATE);
+ 	cpuc->event[hwc->idx] = NULL;
+ 	cpuc->pmcs[hwc->idx] = PMC_NOT_USE;
+ 	cpuc->n_events--;
+ 
+-	sw64_pmu_stop(event, PERF_EF_UPDATE);
+-
+ 	/* Absorb the final count and turn off the event. */
+ 	perf_event_update_userpage(event);
+ 
+-out:
+ 	local_irq_restore(irq_flags);
+-	perf_pmu_enable(event->pmu);
+ }
+ 
+ /*
+@@ -478,6 +469,9 @@ static void sw64_pmu_stop(struct perf_event *event, int flags)
+ 	struct hw_perf_event *hwc = &event->hw;
+ 
+ 	if (!(hwc->state & PERF_HES_STOPPED)) {
++		wrperfmon(PERFMON_CMD_DISABLE, hwc->idx == 0 ?
++				PERFMON_DISABLE_ARGS_PC0 :
++				PERFMON_DISABLE_ARGS_PC1);
+ 		hwc->state |= PERF_HES_STOPPED;
+ 		barrier();
+ 	}
+@@ -486,12 +480,6 @@ static void sw64_pmu_stop(struct perf_event *event, int flags)
+ 		sw64_perf_event_update(event, hwc, hwc->idx, 0);
+ 		hwc->state |= PERF_HES_UPTODATE;
+ 	}
+-
+-	if (hwc->idx == 0)
+-		wrperfmon(PERFMON_CMD_DISABLE, PERFMON_DISABLE_ARGS_PC0);
+-	else
+-		wrperfmon(PERFMON_CMD_DISABLE, PERFMON_DISABLE_ARGS_PC1);
+-
+ }
+ 
+ /*
+@@ -659,10 +647,7 @@ static void sw64_perf_event_irq_handler(unsigned long perfmon_num,
+ 	event = cpuc->event[idx];
+ 
+ 	if (unlikely(!event)) {
+-		/* This should never occur! */
+ 		irq_err_count++;
+-		pr_warn("PMI: No event at index %d!\n", idx);
+-		wrperfmon(PERFMON_CMD_ENABLE, idx == 0 ? PERFMON_DISABLE_ARGS_PC0 : PERFMON_DISABLE_ARGS_PC1);
+ 		return;
+ 	}
+ 
+-- 
+2.33.0
+

@@ -1,0 +1,228 @@
+From 3c2d0f4d8e88d5ea5d05e62577db32210388ed1e Mon Sep 17 00:00:00 2001
+From: Chen Hui <judy.chenhui@huawei.com>
+Date: Fri, 25 Nov 2022 12:05:42 +0800
+Subject: [PATCH] bpf: sched: Add helper functions to get cpu statistics
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 3c2d0f4d8e88d5ea5d05e62577db32210388ed1e
+Modified-by-SEL: Yes, modified due to different context
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5KUFB
+CVE: NA
+
+--------------------------------
+
+Add the helper functions to get cpu statistics, as follows:
+1.acquire cfs/rt/irq cpu load statitic.
+2.acquire multiple types of nr_running statitic.
+3.acquire cpu idle statitic.
+4.acquire cpu capacity.
+
+Based on CPU statistics in different dimensions, specific scheduling
+policies can be implemented in bpf program.
+
+Signed-off-by: Chen Hui <judy.chenhui@huawei.com>
+Signed-off-by: Hui Tang <tanghui20@huawei.com>
+Signed-off-by: Ren Zhijie <renzhijie2@huawei.com>
+Signed-off-by: Hui Tang <tanghui20@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/sched.h          |   32 ++++++++++++++++++
+ include/uapi/linux/bpf.h       |    7 ++++
+ kernel/sched/bpf_sched.c       |   70 +++++++++++++++++++++++++++++++++++++++++
+ scripts/bpf_doc.py             |    2 +
+ tools/include/uapi/linux/bpf.h |    7 ++++
+ 5 files changed, 118 insertions(+)
+
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -2219,5 +2219,37 @@ static inline int sched_qos_cpu_overload
+ 
+ #ifdef CONFIG_BPF_SCHED
+ extern void sched_settag(struct task_struct *tsk, s64 tag);
++
++struct bpf_sched_cpu_stats {
++	/* load/util */
++	unsigned long cfs_load_avg;
++	unsigned long cfs_runnable_avg;
++	unsigned long cfs_util_avg;
++	unsigned long rt_load_avg;
++	unsigned long rt_runnable_avg;
++	unsigned long rt_util_avg;
++	unsigned long irq_load_avg;
++	unsigned long irq_runnable_avg;
++	unsigned long irq_util_avg;
++
++	/* nr_running */
++	unsigned int nr_running;
++	unsigned int cfs_nr_running;
++	unsigned int cfs_h_nr_running;
++	unsigned int cfs_idle_h_nr_running;
++	unsigned int rt_nr_running;
++	unsigned int rr_nr_running;
++
++	/* idle statistics */
++	int available_idle;
++	unsigned int exit_latency;
++	unsigned long idle_stamp;
++	unsigned long avg_idle;
++
++	/* capacity */
++	unsigned long capacity;
++	unsigned long capacity_orig;
++};
++
+ #endif
+ #endif
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -5082,6 +5082,12 @@ union bpf_attr {
+  *		Set tag to *tsk*.
+  *	Return
+  *		0 on success, or a negative error in case of failure.
++ *
++ * int bpf_sched_cpu_stats_of(int cpu, struct bpf_sched_cpu_stats *ctx, int len)
++ *	Description
++ *		Get multiple types of *cpu* statistics and store in *ctx*.
++ *	Return
++ *		0 on success, or a negative error in case of failure.
+  */
+ #define __BPF_FUNC_MAPPER(FN)		\
+ 	FN(unspec),			\
+@@ -5246,6 +5252,7 @@ union bpf_attr {
+  	FN(sched_task_tag_of),		\
+ 	FN(sched_set_tg_tag),		\
+ 	FN(sched_set_task_tag),		\
++ 	FN(sched_cpu_stats_of),		\
+ 	FN(task_storage_get),		\
+ 	FN(task_storage_delete),	\
+ 	FN(get_current_task_btf),	\
+--- a/kernel/sched/bpf_sched.c
++++ b/kernel/sched/bpf_sched.c
+@@ -44,12 +44,82 @@ int bpf_sched_verify_prog(struct bpf_ver
+ 	return 0;
+ }
+ 
++BPF_CALL_3(bpf_sched_cpu_stats_of, int, cpu,
++	   struct bpf_sched_cpu_stats *, ctx,
++	   int, len)
++{
++	struct cpuidle_state *idle;
++	struct rq *rq;
++
++	if (len != sizeof(*ctx))
++		return -EINVAL;
++
++	if ((unsigned int)cpu >= nr_cpu_ids)
++		return -EINVAL;
++
++	rq = cpu_rq(cpu);
++	memset(ctx, 0, sizeof(struct bpf_sched_cpu_stats));
++
++	/* load/util */
++#ifdef CONFIG_SMP
++	SCHED_WARN_ON(!rcu_read_lock_held());
++	ctx->cfs_load_avg = rq->cfs.avg.load_avg;
++	ctx->cfs_runnable_avg = rq->cfs.avg.runnable_avg;
++	ctx->cfs_util_avg = rq->cfs.avg.util_avg;
++	ctx->rt_load_avg = rq->avg_rt.load_avg;
++	ctx->rt_runnable_avg = rq->avg_rt.runnable_avg;
++	ctx->rt_util_avg = rq->avg_rt.util_avg;
++#ifdef CONFIG_HAVE_SCHED_AVG_IRQ
++	ctx->irq_load_avg = rq->avg_irq.load_avg;
++	ctx->irq_runnable_avg = rq->avg_irq.runnable_avg;
++	ctx->irq_util_avg = rq->avg_irq.util_avg;
++#endif
++#endif
++
++	/* nr_running */
++	ctx->nr_running = rq->nr_running;
++	ctx->cfs_nr_running = rq->cfs.nr_running;
++	ctx->cfs_h_nr_running = rq->cfs.h_nr_running;
++	ctx->cfs_idle_h_nr_running = rq->cfs.idle_h_nr_running;
++	ctx->rt_nr_running = rq->rt.rt_nr_running;
++	ctx->rr_nr_running = rq->rt.rr_nr_running;
++
++	/* idle statistics */
++	ctx->available_idle = available_idle_cpu(cpu);
++	idle = idle_get_state(rq);
++	if (idle)
++		ctx->exit_latency = idle->exit_latency;
++#ifdef CONFIG_SMP
++	ctx->idle_stamp = rq->idle_stamp;
++	ctx->avg_idle = rq->avg_idle;
++#endif
++
++	/* capacity */
++#ifdef CONFIG_SMP
++	ctx->capacity = rq->cpu_capacity;
++	ctx->capacity_orig = rq->cpu_capacity_orig;
++#endif
++
++	return 0;
++}
++
++static const struct bpf_func_proto bpf_sched_cpu_stats_of_proto = {
++	.func		= bpf_sched_cpu_stats_of,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_ANYTHING,
++	.arg2_type	= ARG_PTR_TO_UNINIT_MEM,
++	.arg3_type	= ARG_CONST_SIZE,
++};
++
+ static const struct bpf_func_proto *
+ bpf_sched_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+ {
+ 	switch (func_id) {
+ 	case BPF_FUNC_trace_printk:
+ 		return bpf_get_trace_printk_proto();
++	case BPF_FUNC_sched_cpu_stats_of:
++		return &bpf_sched_cpu_stats_of_proto;
+ 	default:
+ 		return bpf_base_func_proto(func_id);
+ 	}
+--- a/scripts/bpf_doc.py
++++ b/scripts/bpf_doc.py
+@@ -546,6 +546,7 @@ class PrinterHelpers(Printer):
+             'struct path',
+             'struct btf_ptr',
+             'struct task_group',
++            'struct bpf_sched_cpu_stats',
+             'struct inode',
+             'struct socket',
+             'struct file',
+@@ -597,6 +598,7 @@ class PrinterHelpers(Printer):
+             'struct path',
+             'struct btf_ptr',
+             'struct task_group',
++            'struct bpf_sched_cpu_stats',
+             'struct inode',
+             'struct socket',
+             'struct file',
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -5069,6 +5069,12 @@ union bpf_attr {
+  *		Set tag to *tsk*.
+  *	Return
+  *		0 on success, or a negative error in case of failure.
++ *
++ * int bpf_sched_cpu_stats_of(int cpu, struct bpf_sched_cpu_stats *ctx, int len)
++ *	Description
++ *		Get multiple types of *cpu* statistics and store in *ctx*.
++ *	Return
++ *		0 on success, or a negative error in case of failure.
+  */
+ #define __BPF_FUNC_MAPPER(FN)		\
+ 	FN(unspec),			\
+@@ -5233,6 +5239,7 @@ union bpf_attr {
+  	FN(sched_task_tag_of),		\
+ 	FN(sched_set_tg_tag),		\
+ 	FN(sched_set_task_tag),		\
++	FN(sched_cpu_stats_of),		\
+ 	FN(task_storage_get),		\
+ 	FN(task_storage_delete),	\
+ 	FN(get_current_task_btf),	\

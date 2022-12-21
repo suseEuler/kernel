@@ -1,0 +1,91 @@
+From 0782dd814b45ab6747980f162a6e908d5a53384a Mon Sep 17 00:00:00 2001
+From: Yu Liao <liaoyu15@huawei.com>
+Date: Mon, 21 Nov 2022 22:03:04 +0800
+Subject: [PATCH] rtc: Fix race when disable/enable UIE in rtc_set_time()
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 0782dd814b45ab6747980f162a6e908d5a53384a
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 186781, https://gitee.com/openeuler/kernel/issues/I61CEW
+CVE: NA
+
+--------------------------------
+
+When the RTC_SET_TIME and RTC_RD_TIME threads run in parallel,
+there is no guarantee that uie_rtctimer.enabled is equal to the
+previously read uie when executing rtc->ops->set_time.
+
+Fix this by keeping reading uie state, disabling uie, setting
+rtc time and enabling uie in critical sections.
+
+Fixes: 7e7c005b4b1f ("rtc: disable uie before setting time and enable after")
+Signed-off-by: Yu Liao <liaoyu15@huawei.com>
+Reviewed-by: Wei Li <liwei391@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/rtc/interface.c | 28 ++++++++++++----------------
+ 1 file changed, 12 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/rtc/interface.c b/drivers/rtc/interface.c
+index d4e576a65885..16fbcf6835f3 100644
+--- a/drivers/rtc/interface.c
++++ b/drivers/rtc/interface.c
+@@ -137,21 +137,19 @@ int rtc_set_time(struct rtc_device *rtc, struct rtc_time *tm)
+ 
+ 	rtc_subtract_offset(rtc, tm);
+ 
+-#ifdef CONFIG_RTC_INTF_DEV_UIE_EMUL
+-	uie = rtc->uie_rtctimer.enabled || rtc->uie_irq_active;
+-#else
++	err = mutex_lock_interruptible(&rtc->ops_lock);
++	if (err)
++		return err;
++
+ 	uie = rtc->uie_rtctimer.enabled;
+-#endif
+ 	if (uie) {
+-		err = rtc_update_irq_enable(rtc, 0);
+-		if (err)
++		err = __rtc_update_irq_enable(rtc, 0);
++		if (err) {
++			mutex_unlock(&rtc->ops_lock);
+ 			return err;
++		}
+ 	}
+ 
+-	err = mutex_lock_interruptible(&rtc->ops_lock);
+-	if (err)
+-		return err;
+-
+ 	if (!rtc->ops)
+ 		err = -ENODEV;
+ 	else if (rtc->ops->set_time)
+@@ -160,16 +158,14 @@ int rtc_set_time(struct rtc_device *rtc, struct rtc_time *tm)
+ 		err = -EINVAL;
+ 
+ 	pm_stay_awake(rtc->dev.parent);
++
++	if (uie)
++		err = __rtc_update_irq_enable(rtc, 1);
++
+ 	mutex_unlock(&rtc->ops_lock);
+ 	/* A timer might have just expired */
+ 	schedule_work(&rtc->irqwork);
+ 
+-	if (uie) {
+-		err = rtc_update_irq_enable(rtc, 1);
+-		if (err)
+-			return err;
+-	}
+-
+ 	trace_rtc_set_time(rtc_tm_to_time64(tm), err);
+ 	return err;
+ }
+-- 
+2.33.0
+

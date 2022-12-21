@@ -1,0 +1,339 @@
+From 72ed1e6e2775b868bb84d55f3c13ff8cd204d1d8 Mon Sep 17 00:00:00 2001
+From: He Sheng <hesheng@wxiat.com>
+Date: Mon, 25 Apr 2022 12:57:28 +0800
+Subject: [PATCH] sw64: remove switch_stack and allregs from entUna
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 72ed1e6e2775b868bb84d55f3c13ff8cd204d1d8
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5GF7A
+
+--------------------------------
+
+It's simple to maintain unified register layout for user-mode and
+kernel-mode unaligned accesses. With the new struct pt_regs, we
+are able to make the exception handler cleaner.
+
+After that, the unused struct allregs can be cleaned up.
+
+Signed-off-by: He Sheng <hesheng@wxiat.com>
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/kernel/asm-offsets.c |  41 ------------
+ arch/sw_64/kernel/entry.S       | 109 +++++---------------------------
+ arch/sw_64/kernel/traps.c       |  76 +++++-----------------
+ 3 files changed, 33 insertions(+), 193 deletions(-)
+
+diff --git a/arch/sw_64/kernel/asm-offsets.c b/arch/sw_64/kernel/asm-offsets.c
+index 349bc5c4e2f1..0e8a814f47ce 100644
+--- a/arch/sw_64/kernel/asm-offsets.c
++++ b/arch/sw_64/kernel/asm-offsets.c
+@@ -111,47 +111,6 @@ void foo(void)
+ 	DEFINE(SWITCH_STACK_RA, offsetof(struct switch_stack, r26));
+ 	BLANK();
+ 
+-	DEFINE(ALLREGS_SIZE, sizeof(struct allregs));
+-	DEFINE(ALLREGS_R0, offsetof(struct allregs, regs[0]));
+-	DEFINE(ALLREGS_R1, offsetof(struct allregs, regs[1]));
+-	DEFINE(ALLREGS_R2, offsetof(struct allregs, regs[2]));
+-	DEFINE(ALLREGS_R3, offsetof(struct allregs, regs[3]));
+-	DEFINE(ALLREGS_R4, offsetof(struct allregs, regs[4]));
+-	DEFINE(ALLREGS_R5, offsetof(struct allregs, regs[5]));
+-	DEFINE(ALLREGS_R6, offsetof(struct allregs, regs[6]));
+-	DEFINE(ALLREGS_R7, offsetof(struct allregs, regs[7]));
+-	DEFINE(ALLREGS_R8, offsetof(struct allregs, regs[8]));
+-	DEFINE(ALLREGS_R9, offsetof(struct allregs, regs[9]));
+-	DEFINE(ALLREGS_R10, offsetof(struct allregs, regs[10]));
+-	DEFINE(ALLREGS_R11, offsetof(struct allregs, regs[11]));
+-	DEFINE(ALLREGS_R12, offsetof(struct allregs, regs[12]));
+-	DEFINE(ALLREGS_R13, offsetof(struct allregs, regs[13]));
+-	DEFINE(ALLREGS_R14, offsetof(struct allregs, regs[14]));
+-	DEFINE(ALLREGS_R15, offsetof(struct allregs, regs[15]));
+-	DEFINE(ALLREGS_R16, offsetof(struct allregs, regs[16]));
+-	DEFINE(ALLREGS_R17, offsetof(struct allregs, regs[17]));
+-	DEFINE(ALLREGS_R18, offsetof(struct allregs, regs[18]));
+-	DEFINE(ALLREGS_R19, offsetof(struct allregs, regs[19]));
+-	DEFINE(ALLREGS_R20, offsetof(struct allregs, regs[20]));
+-	DEFINE(ALLREGS_R21, offsetof(struct allregs, regs[21]));
+-	DEFINE(ALLREGS_R22, offsetof(struct allregs, regs[22]));
+-	DEFINE(ALLREGS_R23, offsetof(struct allregs, regs[23]));
+-	DEFINE(ALLREGS_R24, offsetof(struct allregs, regs[24]));
+-	DEFINE(ALLREGS_R25, offsetof(struct allregs, regs[25]));
+-	DEFINE(ALLREGS_R26, offsetof(struct allregs, regs[26]));
+-	DEFINE(ALLREGS_R27, offsetof(struct allregs, regs[27]));
+-	DEFINE(ALLREGS_R28, offsetof(struct allregs, regs[28]));
+-	DEFINE(ALLREGS_R29, offsetof(struct allregs, regs[29]));
+-	DEFINE(ALLREGS_R30, offsetof(struct allregs, regs[30]));
+-	DEFINE(ALLREGS_R31, offsetof(struct allregs, regs[31]));
+-	DEFINE(ALLREGS_PS, offsetof(struct allregs, ps));
+-	DEFINE(ALLREGS_PC, offsetof(struct allregs, pc));
+-	DEFINE(ALLREGS_GP, offsetof(struct allregs, gp));
+-	DEFINE(ALLREGS_A0, offsetof(struct allregs, a0));
+-	DEFINE(ALLREGS_A1, offsetof(struct allregs, a1));
+-	DEFINE(ALLREGS_A2, offsetof(struct allregs, a2));
+-	BLANK();
+-
+ 	DEFINE(KVM_REGS_SIZE, sizeof(struct kvm_regs));
+ 	DEFINE(KVM_REGS_R0, offsetof(struct kvm_regs, r0));
+ 	DEFINE(KVM_REGS_R1, offsetof(struct kvm_regs, r1));
+diff --git a/arch/sw_64/kernel/entry.S b/arch/sw_64/kernel/entry.S
+index 730346754ecc..f54b02c1b3a9 100644
+--- a/arch/sw_64/kernel/entry.S
++++ b/arch/sw_64/kernel/entry.S
+@@ -152,109 +152,32 @@ entIF:
+ 	call	$31, do_entIF
+ 	.end entIF
+ 
++/*
++ * Handle unalignment exception.
++ * We don't handle the "gp" register correctly, but if we fault on a
++ * gp-register unaligned load/store, something is _very_ wrong in the
++ * kernel anyway.
++ */
+ 	.align 4
+ 	.globl entUna
+ 	.ent entUna
+ entUna:
+-	ldi	$sp, -ALLREGS_PS($sp)
+-	stl	$0, ALLREGS_R0($sp)
+-	ldl	$0, ALLREGS_PS($sp)	/* get PS */
+-	stl	$1, ALLREGS_R1($sp)
+-	stl	$2, ALLREGS_R2($sp)
+-	stl	$3, ALLREGS_R3($sp)
+-	and	$0, 8, $0	/* user mode? */
+-	stl	$4, ALLREGS_R4($sp)
+-	bne	$0, entUnaUser	/* yup -> do user-level unaligned fault */
+-	stl	$5, ALLREGS_R5($sp)
+-	stl	$6, ALLREGS_R6($sp)
+-	stl	$7, ALLREGS_R7($sp)
+-	stl	$8, ALLREGS_R8($sp)
+-	stl	$9, ALLREGS_R9($sp)
+-	stl	$10, ALLREGS_R10($sp)
+-	stl	$11, ALLREGS_R11($sp)
+-	stl	$12, ALLREGS_R12($sp)
+-	stl	$13, ALLREGS_R13($sp)
+-	stl	$14, ALLREGS_R14($sp)
+-	stl	$15, ALLREGS_R15($sp)
+-	/* 16-18 HMCODE-saved */
+-	stl	$19, ALLREGS_R19($sp)
+-	stl	$20, ALLREGS_R20($sp)
+-	stl	$21, ALLREGS_R21($sp)
+-	stl	$22, ALLREGS_R22($sp)
+-	stl	$23, ALLREGS_R23($sp)
+-	stl	$24, ALLREGS_R24($sp)
+-	stl	$25, ALLREGS_R25($sp)
+-	stl	$26, ALLREGS_R26($sp)
+-	stl	$27, ALLREGS_R27($sp)
+-	stl	$28, ALLREGS_R28($sp)
+-	mov	$sp, $19
+-	stl	$gp, ALLREGS_R29($sp)
++	SAVE_ALL
+ 	ldi	$8, 0x3fff
+-	stl	$31, ALLREGS_R31($sp)
+ 	bic	$sp, $8, $8
++	mov	$sp, $19
++	ldl	$0, PT_REGS_PS($sp)
++	and	$0, 8, $0		/* user mode ? */
++	beq	$0, 1f
++	ldi	$26, ret_from_sys_call
++	call	$31, do_entUnaUser	/* return to ret_from_syscall */
++1:	ldl	$9, PT_REGS_GP($sp)
+ 	call	$26, do_entUna
+-	ldl	$0, ALLREGS_R0($sp)
+-	ldl	$1, ALLREGS_R1($sp)
+-	ldl	$2, ALLREGS_R2($sp)
+-	ldl	$3, ALLREGS_R3($sp)
+-	ldl	$4, ALLREGS_R4($sp)
+-	ldl	$5, ALLREGS_R5($sp)
+-	ldl	$6, ALLREGS_R6($sp)
+-	ldl	$7, ALLREGS_R7($sp)
+-	ldl	$8, ALLREGS_R8($sp)
+-	ldl	$9, ALLREGS_R9($sp)
+-	ldl	$10, ALLREGS_R10($sp)
+-	ldl	$11, ALLREGS_R11($sp)
+-	ldl	$12, ALLREGS_R12($sp)
+-	ldl	$13, ALLREGS_R13($sp)
+-	ldl	$14, ALLREGS_R14($sp)
+-	ldl	$15, ALLREGS_R15($sp)
+-	/* 16-18 HMCODE-saved */
+-	ldl	$19, ALLREGS_R19($sp)
+-	ldl	$20, ALLREGS_R20($sp)
+-	ldl	$21, ALLREGS_R21($sp)
+-	ldl	$22, ALLREGS_R22($sp)
+-	ldl	$23, ALLREGS_R23($sp)
+-	ldl	$24, ALLREGS_R24($sp)
+-	ldl	$25, ALLREGS_R25($sp)
+-	ldl	$26, ALLREGS_R26($sp)
+-	ldl	$27, ALLREGS_R27($sp)
+-	ldl	$28, ALLREGS_R28($sp)
+-	ldl	$gp, ALLREGS_R29($sp)
+-	ldi	$sp, ALLREGS_PS($sp)
++	stl	$9, PT_REGS_GP($sp)
++	RESTORE_ALL
+ 	sys_call HMC_rti
+ 	.end entUna
+ 
+-	.align 4
+-	.ent entUnaUser
+-entUnaUser:
+-	ldl	$0, ALLREGS_R0($sp)	/* restore original $0 */
+-	ldi	$sp, ALLREGS_PS($sp)	/* pop entUna's stack frame */
+-	SAVE_ALL		/* setup normal kernel stack */
+-	ldi	$sp, -SWITCH_STACK_RA($sp)
+-	stl	$9, SWITCH_STACK_R9($sp)
+-	stl	$10, SWITCH_STACK_R10($sp)
+-	stl	$11, SWITCH_STACK_R11($sp)
+-	stl	$12, SWITCH_STACK_R12($sp)
+-	stl	$13, SWITCH_STACK_R13($sp)
+-	stl	$14, SWITCH_STACK_R14($sp)
+-	stl	$15, SWITCH_STACK_R15($sp)
+-	ldi	$8, 0x3fff
+-	addl	$sp, SWITCH_STACK_RA, $19
+-	bic	$sp, $8, $8
+-	call	$26, do_entUnaUser
+-	ldl	$9, SWITCH_STACK_R9($sp)
+-	ldl	$10, SWITCH_STACK_R10($sp)
+-	ldl	$11, SWITCH_STACK_R11($sp)
+-	ldl	$12, SWITCH_STACK_R12($sp)
+-	ldl	$13, SWITCH_STACK_R13($sp)
+-	ldl	$14, SWITCH_STACK_R14($sp)
+-	ldl	$15, SWITCH_STACK_R15($sp)
+-	ldi	$sp, SWITCH_STACK_RA($sp)
+-	br	ret_from_sys_call
+-	.end entUnaUser
+-
+-
+ /*
+  * The system call entry point is special.  Most importantly, it looks
+  * like a function call to userspace as far as clobbered registers.  We
+diff --git a/arch/sw_64/kernel/traps.c b/arch/sw_64/kernel/traps.c
+index b7c4e45df87b..6cd3ade905d1 100644
+--- a/arch/sw_64/kernel/traps.c
++++ b/arch/sw_64/kernel/traps.c
+@@ -321,41 +321,35 @@ do_entIF(unsigned long inst_type, struct pt_regs *regs)
+ 	force_sig_fault(SIGILL, ILL_ILLOPC, (void __user *)regs->pc, 0);
+ }
+ 
+-/*
+- * entUna has a different register layout to be reasonably simple. It
+- * needs access to all the integer registers (the kernel doesn't use
+- * fp-regs), and it needs to have them in order for simpler access.
+- *
+- * Due to the non-standard register layout (and because we don't want
+- * to handle floating-point regs), user-mode unaligned accesses are
+- * handled separately by do_entUnaUser below.
+- *
+- * Oh, btw, we don't handle the "gp" register correctly, but if we fault
+- * on a gp-register unaligned load/store, something is _very_ wrong
+- * in the kernel anyway..
+- */
+-struct allregs {
+-	unsigned long regs[32];
+-	unsigned long ps, pc, gp, a0, a1, a2;
+-};
+-
+ struct unaligned_stat {
+ 	unsigned long count, va, pc;
+ } unaligned[2];
+ 
+ 
+ /* Macro for exception fixup code to access integer registers. */
+-#define una_reg(r) (_regs[(r) >= 16 && (r) <= 18 ? (r) + 19 : (r)])
++#define R(x)	((size_t) &((struct pt_regs *)0)->x)
++
++static int regoffsets[32] = {
++	R(r0), R(r1), R(r2), R(r3), R(r4), R(r5), R(r6), R(r7), R(r8),
++	R(r9), R(r10), R(r11), R(r12), R(r13), R(r14), R(r15),
++	R(r16), R(r17), R(r18),
++	R(r19), R(r20), R(r21), R(r22), R(r23), R(r24), R(r25), R(r26),
++	R(r27), R(r28), R(gp),
++	0, 0
++};
++
++#undef R
++
++#define una_reg(r) (*(unsigned long *)((char *)regs + regoffsets[r]))
+ 
+ 
+ asmlinkage void
+ do_entUna(void *va, unsigned long opcode, unsigned long reg,
+-	  struct allregs *regs)
++	  struct pt_regs *regs)
+ {
+ 	long error;
+ 	unsigned long tmp1, tmp2, tmp3, tmp4, tmp5, tmp6, tmp7, tmp8;
+ 	unsigned long pc = regs->pc - 4;
+-	unsigned long *_regs = regs->regs;
+ 	const struct exception_table_entry *fixup;
+ 
+ 	unaligned[0].count++;
+@@ -566,29 +560,7 @@ do_entUna(void *va, unsigned long opcode, unsigned long reg,
+ 	printk("%s(%d): unhandled unaligned exception\n",
+ 	       current->comm, task_pid_nr(current));
+ 
+-	printk("pc = [<%016lx>]  ra = [<%016lx>]  ps = %04lx\n",
+-	       pc, una_reg(26), regs->ps);
+-	printk("r0 = %016lx  r1 = %016lx  r2 = %016lx\n",
+-	       una_reg(0), una_reg(1), una_reg(2));
+-	printk("r3 = %016lx  r4 = %016lx  r5 = %016lx\n",
+-	       una_reg(3), una_reg(4), una_reg(5));
+-	printk("r6 = %016lx  r7 = %016lx  r8 = %016lx\n",
+-	       una_reg(6), una_reg(7), una_reg(8));
+-	printk("r9 = %016lx  r10= %016lx  r11= %016lx\n",
+-	       una_reg(9), una_reg(10), una_reg(11));
+-	printk("r12= %016lx  r13= %016lx  r14= %016lx\n",
+-	       una_reg(12), una_reg(13), una_reg(14));
+-	printk("r15= %016lx\n", una_reg(15));
+-	printk("r16= %016lx  r17= %016lx  r18= %016lx\n",
+-	       una_reg(16), una_reg(17), una_reg(18));
+-	printk("r19= %016lx  r20= %016lx  r21= %016lx\n",
+-	       una_reg(19), una_reg(20), una_reg(21));
+-	printk("r22= %016lx  r23= %016lx  r24= %016lx\n",
+-	       una_reg(22), una_reg(23), una_reg(24));
+-	printk("r25= %016lx  r27= %016lx  r28= %016lx\n",
+-	       una_reg(25), una_reg(27), una_reg(28));
+-	printk("gp = %016lx  sp = %p\n", regs->gp, regs+1);
+-
++	dik_show_regs(regs);
+ 	dik_show_code((unsigned int *)pc);
+ 	dik_show_trace((unsigned long *)(regs+1), KERN_DEFAULT);
+ 
+@@ -668,20 +640,6 @@ s_reg_to_mem(unsigned long s_reg)
+ 			 1L << 0x2c | 1L << 0x2d | /* stw stl */	\
+ 			 1L << 0x0d | 1L << 0x0e)  /* sth stb */
+ 
+-#define R(x)	((size_t) &((struct pt_regs *)0)->x)
+-
+-static int unauser_reg_offsets[32] = {
+-	R(r0), R(r1), R(r2), R(r3), R(r4), R(r5), R(r6), R(r7), R(r8),
+-	/* r9 ... r15 are stored in front of regs. */
+-	-56, -48, -40, -32, -24, -16, -8,
+-	R(r16), R(r17), R(r18),
+-	R(r19), R(r20), R(r21), R(r22), R(r23), R(r24), R(r25), R(r26),
+-	R(r27), R(r28), R(gp),
+-	0, 0
+-};
+-
+-#undef R
+-
+ asmlinkage void
+ do_entUnaUser(void __user *va, unsigned long opcode,
+ 	      unsigned long reg, struct pt_regs *regs)
+@@ -734,7 +692,7 @@ do_entUnaUser(void __user *va, unsigned long opcode,
+ 		/* it's an integer load/store */
+ 		if (reg < 30) {
+ 			reg_addr = (unsigned long *)
+-				((char *)regs + unauser_reg_offsets[reg]);
++				((char *)regs + regoffsets[reg]);
+ 		} else if (reg == 30) {
+ 			/* usp in HMCODE regs */
+ 			fake_reg = rdusp();
+-- 
+2.33.0
+

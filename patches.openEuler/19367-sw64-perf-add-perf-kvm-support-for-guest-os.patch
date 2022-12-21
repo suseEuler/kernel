@@ -1,0 +1,365 @@
+From 6dd8947dffd3097881e9aacf1d0e0f7881de03a4 Mon Sep 17 00:00:00 2001
+From: Chen Wang <chenwang@wxiat.com>
+Date: Fri, 16 Sep 2022 09:30:41 +0800
+Subject: [PATCH] sw64: perf: add perf kvm support for guest os
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 6dd8947dffd3097881e9aacf1d0e0f7881de03a4
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5XTJN
+
+--------------------------------
+
+Signed-off-by: Chen Wang <chenwang@wxiat.com>
+Reviewed-by: He Sheng <hesheng@wxiat.com>
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/include/asm/kvm_asm.h    | 12 ++++++
+ arch/sw_64/include/asm/kvm_host.h   |  3 ++
+ arch/sw_64/include/asm/perf_event.h |  8 ++++
+ arch/sw_64/kernel/perf_event.c      | 32 +++++++++++++++
+ arch/sw_64/kvm/Makefile             |  2 +-
+ arch/sw_64/kvm/kvm-sw64.c           | 24 +++++++++++
+ arch/sw_64/kvm/perf.c               | 53 ++++++++++++++++++++++++
+ arch/sw_64/kvm/trace.h              | 62 +++++++++++++++++++++++++++++
+ 8 files changed, 195 insertions(+), 1 deletion(-)
+ create mode 100644 arch/sw_64/kvm/perf.c
+ create mode 100644 arch/sw_64/kvm/trace.h
+
+diff --git a/arch/sw_64/include/asm/kvm_asm.h b/arch/sw_64/include/asm/kvm_asm.h
+index 7e2c92ed4574..d408e90cee62 100644
+--- a/arch/sw_64/include/asm/kvm_asm.h
++++ b/arch/sw_64/include/asm/kvm_asm.h
+@@ -14,4 +14,16 @@
+ #ifdef CONFIG_KVM_MEMHOTPLUG
+ #define SW64_KVM_EXIT_MEMHOTPLUG	23
+ #endif
++
++#define kvm_sw64_exception_type	\
++	{0, "HOST_INTR" },	\
++	{1, "IO" },		\
++	{10, "HALT" },		\
++	{12, "SHUTDOWN" },	\
++	{13, "TIMER" },		\
++	{14, "IPI" },		\
++	{17, "RESTART" },	\
++	{22, "FATAL_ERROR" },	\
++	{23, "MEMHOTPLUG" }
++
+ #endif /* _ASM_SW64_KVM_ASM_H */
+diff --git a/arch/sw_64/include/asm/kvm_host.h b/arch/sw_64/include/asm/kvm_host.h
+index 835ccef7490f..02d7131f0286 100644
+--- a/arch/sw_64/include/asm/kvm_host.h
++++ b/arch/sw_64/include/asm/kvm_host.h
+@@ -124,4 +124,7 @@ static inline void kvm_arch_vcpu_blocking(struct kvm_vcpu *vcpu) {}
+ static inline void kvm_arch_vcpu_unblocking(struct kvm_vcpu *vcpu) {}
+ static inline void kvm_arch_vcpu_block_finish(struct kvm_vcpu *vcpu) {}
+ 
++int kvm_sw64_perf_init(void);
++int kvm_sw64_perf_teardown(void);
++
+ #endif /* _ASM_SW64_KVM_HOST_H */
+diff --git a/arch/sw_64/include/asm/perf_event.h b/arch/sw_64/include/asm/perf_event.h
+index 5f5a45217544..4212342334d5 100644
+--- a/arch/sw_64/include/asm/perf_event.h
++++ b/arch/sw_64/include/asm/perf_event.h
+@@ -3,5 +3,13 @@
+ #define _ASM_SW64_PERF_EVENT_H
+ 
+ #include <asm/wrperfmon.h>
++#include <asm/ptrace.h>
++
++#ifdef CONFIG_PERF_EVENTS
++struct pt_regs;
++extern unsigned long perf_instruction_pointer(struct pt_regs *regs);
++extern unsigned long perf_misc_flags(struct pt_regs *regs);
++#define perf_misc_flags(regs)  perf_misc_flags(regs)
++#endif
+ 
+ #endif /* _ASM_SW64_PERF_EVENT_H */
+diff --git a/arch/sw_64/kernel/perf_event.c b/arch/sw_64/kernel/perf_event.c
+index 4122502da895..f1f74a968cbc 100644
+--- a/arch/sw_64/kernel/perf_event.c
++++ b/arch/sw_64/kernel/perf_event.c
+@@ -760,6 +760,38 @@ void perf_callchain_kernel(struct perf_callchain_entry_ctx *entry,
+ 	walk_stackframe(NULL, regs, callchain_trace, entry);
+ }
+ 
++/*
++ * Gets the perf_instruction_pointer and perf_misc_flags for guest os.
++ */
++#undef is_in_guest
++
++unsigned long perf_instruction_pointer(struct pt_regs *regs)
++{
++	if (perf_guest_cbs && perf_guest_cbs->is_in_guest())
++		return perf_guest_cbs->get_guest_ip();
++
++	return instruction_pointer(regs);
++}
++
++unsigned long perf_misc_flags(struct pt_regs *regs)
++{
++	int misc = 0;
++
++	if (perf_guest_cbs && perf_guest_cbs->is_in_guest()) {
++		if (perf_guest_cbs->is_user_mode())
++			misc |= PERF_RECORD_MISC_GUEST_USER;
++		else
++			misc |= PERF_RECORD_MISC_GUEST_KERNEL;
++	} else {
++		if (user_mode(regs))
++			misc |= PERF_RECORD_MISC_USER;
++		else
++			misc |= PERF_RECORD_MISC_KERNEL;
++	}
++
++	return misc;
++}
++
+ /*
+  * Init call to initialise performance events at kernel startup.
+  */
+diff --git a/arch/sw_64/kvm/Makefile b/arch/sw_64/kvm/Makefile
+index 48ae938faab7..43cea19215ff 100644
+--- a/arch/sw_64/kvm/Makefile
++++ b/arch/sw_64/kvm/Makefile
+@@ -8,6 +8,6 @@ KVM := ../../../virt/kvm
+ ccflags-y += -Ivirt/kvm -Iarch/sw_64/kvm
+ 
+ kvm-$(CONFIG_KVM_SW64_HOST) += $(KVM)/kvm_main.o $(KVM)/eventfd.o $(KVM)/irqchip.o $(KVM)/vfio.o
+-kvm-$(CONFIG_KVM_SW64_HOST) += kvm-sw64.o entry.o emulate.o mmio.o kvm_timer.o handle_exit.o
++kvm-$(CONFIG_KVM_SW64_HOST) += kvm-sw64.o entry.o emulate.o mmio.o kvm_timer.o handle_exit.o perf.o
+ 
+ obj-$(CONFIG_KVM_SW64_HOST) += kvm.o
+diff --git a/arch/sw_64/kvm/kvm-sw64.c b/arch/sw_64/kvm/kvm-sw64.c
+index 825fe39f0494..6afff2257947 100644
+--- a/arch/sw_64/kvm/kvm-sw64.c
++++ b/arch/sw_64/kvm/kvm-sw64.c
+@@ -16,6 +16,9 @@
+ #include <asm/kvm_timer.h>
+ #include <asm/kvm_emulate.h>
+ 
++#define CREATE_TRACE_POINTS
++#include "trace.h"
++
+ #include "../kernel/pci_impl.h"
+ #include "vmem.c"
+ 
+@@ -34,6 +37,13 @@ extern bool bind_vcpu_enabled;
+ #define HARDWARE_VPN_MASK	((1UL << WIDTH_HARDWARE_VPN) - 1)
+ #define VPN_SHIFT		(64 - WIDTH_HARDWARE_VPN)
+ 
++static DEFINE_PER_CPU(struct kvm_vcpu *, kvm_running_vcpu);
++
++static void kvm_set_running_vcpu(struct kvm_vcpu *vcpu)
++{
++	__this_cpu_write(kvm_running_vcpu, vcpu);
++}
++
+ int vcpu_interrupt_line(struct kvm_vcpu *vcpu, int number, bool level)
+ {
+ 	set_bit(number, (vcpu->arch.irqs_pending));
+@@ -462,6 +472,7 @@ int kvm_arch_vcpu_setup(struct kvm_vcpu *vcpu)
+ void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+ {
+ 	vcpu->cpu = cpu;
++	kvm_set_running_vcpu(vcpu);
+ }
+ 
+ void kvm_arch_vcpu_put(struct kvm_vcpu *vcpu)
+@@ -472,6 +483,7 @@ void kvm_arch_vcpu_put(struct kvm_vcpu *vcpu)
+ 	 * optimized make_all_cpus_request path.
+ 	 */
+ 	vcpu->cpu = -1;
++	kvm_set_running_vcpu(NULL);
+ }
+ 
+ int kvm_arch_vcpu_ioctl_get_mpstate(struct kvm_vcpu *vcpu,
+@@ -561,6 +573,9 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
+ 		vcpu->arch.vcb.upcr = 0x7;
+ 	}
+ 
++#ifdef CONFIG_PERF_EVENTS
++	vcpu_load(vcpu);
++#endif
+ 	if (vcpu->sigset_active)
+ 		sigprocmask(SIG_SETMASK, &vcpu->sigset, &sigsaved);
+ 
+@@ -601,6 +616,7 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
+ 		guest_enter_irqoff();
+ 
+ 		/* Enter the guest */
++		trace_kvm_sw64_entry(vcpu->vcpu_id, vcpu->arch.regs.pc);
+ 		vcpu->mode = IN_GUEST_MODE;
+ 
+ 		ret = __sw64_vcpu_run((struct vcpucb *)__phys_addr((unsigned long)vcb), &(vcpu->arch.regs), &hargs);
+@@ -610,6 +626,9 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
+ 
+ 		local_irq_enable();
+ 		guest_exit_irqoff();
++
++		trace_kvm_sw64_exit(ret, vcpu->arch.regs.pc);
++
+ 		preempt_enable();
+ 
+ 		/* ret = 0 indicate interrupt in guest mode, ret > 0 indicate hcall */
+@@ -619,6 +638,9 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
+ 	if (vcpu->sigset_active)
+ 		sigprocmask(SIG_SETMASK, &sigsaved, NULL);
+ 
++#ifdef CONFIG_PERF_EVENTS
++	vcpu_put(vcpu);
++#endif
+ 	return ret;
+ }
+ 
+@@ -667,11 +689,13 @@ long kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
+ 
+ int kvm_arch_init(void *opaque)
+ {
++	kvm_sw64_perf_init();
+ 	return 0;
+ }
+ 
+ void kvm_arch_exit(void)
+ {
++	kvm_sw64_perf_teardown();
+ }
+ 
+ void kvm_arch_sync_dirty_log(struct kvm *kvm, struct kvm_memory_slot *memslot)
+diff --git a/arch/sw_64/kvm/perf.c b/arch/sw_64/kvm/perf.c
+new file mode 100644
+index 000000000000..8d90d79643de
+--- /dev/null
++++ b/arch/sw_64/kvm/perf.c
+@@ -0,0 +1,53 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Performance events support for KVM.
++ */
++
++#include <linux/perf_event.h>
++#include <linux/kvm_host.h>
++
++#include <asm/kvm_emulate.h>
++
++static int kvm_is_in_guest(void)
++{
++	return kvm_get_running_vcpu() != NULL;
++}
++
++static int kvm_is_user_mode(void)
++{
++	struct kvm_vcpu *vcpu;
++
++	vcpu = kvm_get_running_vcpu();
++
++	if (vcpu)
++		return (vcpu->arch.regs.ps & 8) != 0;
++
++	return 0;
++}
++
++static unsigned long kvm_get_guest_ip(void)
++{
++	struct kvm_vcpu *vcpu;
++
++	vcpu = kvm_get_running_vcpu();
++
++	if (vcpu)
++		return vcpu->arch.regs.pc;
++	return 0;
++}
++
++static struct perf_guest_info_callbacks kvm_guest_cbs = {
++	.is_in_guest	= kvm_is_in_guest,
++	.is_user_mode	= kvm_is_user_mode,
++	.get_guest_ip	= kvm_get_guest_ip,
++};
++
++int kvm_sw64_perf_init(void)
++{
++	return perf_register_guest_info_callbacks(&kvm_guest_cbs);
++}
++
++int kvm_sw64_perf_teardown(void)
++{
++	return perf_unregister_guest_info_callbacks(&kvm_guest_cbs);
++}
+diff --git a/arch/sw_64/kvm/trace.h b/arch/sw_64/kvm/trace.h
+new file mode 100644
+index 000000000000..2611df3d3fa5
+--- /dev/null
++++ b/arch/sw_64/kvm/trace.h
+@@ -0,0 +1,62 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#if !defined(_SW64_KVM_TRACE_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _SW64_KVM_TRACE_H
++
++#include <linux/tracepoint.h>
++
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM kvm
++
++/*
++ * Tracepoint for guest mode entry.
++ */
++TRACE_EVENT(kvm_sw64_entry,
++	TP_PROTO(unsigned int vcpu_id, unsigned int vcpu_pc),
++	TP_ARGS(vcpu_id, vcpu_pc),
++
++	TP_STRUCT__entry(
++		__field(unsigned int,   vcpu_id)
++		__field(unsigned int,	vcpu_pc)
++	),
++
++	TP_fast_assign(
++		__entry->vcpu_id = vcpu_id;
++		__entry->vcpu_pc = vcpu_pc;
++	),
++
++	TP_printk("VCPU %u: PC: 0x%08x", __entry->vcpu_id, __entry->vcpu_pc)
++);
++
++/*
++ * Tracepoint for guest mode exit.
++ */
++
++TRACE_EVENT(kvm_sw64_exit,
++	TP_PROTO(unsigned int exit_reason, unsigned long vcpu_pc),
++	TP_ARGS(exit_reason, vcpu_pc),
++
++	TP_STRUCT__entry(
++		__field(unsigned int,	exit_reason)
++		__field(unsigned long,	vcpu_pc)
++	),
++
++	TP_fast_assign(
++		__entry->exit_reason = exit_reason;
++		__entry->vcpu_pc = vcpu_pc;
++	),
++
++	TP_printk("exit_reason: 0x%04x (%11s),  PC: 0x%08lx",
++		__entry->exit_reason,
++		__print_symbolic(__entry->exit_reason, kvm_sw64_exception_type),
++		__entry->vcpu_pc)
++);
++
++#endif /* _SW64_KVM_TRACE_H */
++
++#undef TRACE_INCLUDE_PATH
++#define TRACE_INCLUDE_PATH .
++#undef TRACE_INCLUDE_FILE
++#define TRACE_INCLUDE_FILE trace
++
++/* This part must be outside protection */
++#include <trace/define_trace.h>
+-- 
+2.33.0
+

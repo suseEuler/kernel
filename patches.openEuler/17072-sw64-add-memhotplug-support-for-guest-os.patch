@@ -1,0 +1,701 @@
+From 248fac94e07c792a921d7f76c47f87c22b414ff6 Mon Sep 17 00:00:00 2001
+From: Lu Feifei <lufeifei@wxiat.com>
+Date: Wed, 15 Jun 2022 14:59:23 +0800
+Subject: [PATCH] sw64: add memhotplug support for guest os
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 248fac94e07c792a921d7f76c47f87c22b414ff6
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56WV8
+
+--------------------------------
+
+This patch introduces memory-hotplug support for guest os, and it
+should set CONFIG_KVM_MEMHOTLPUG=y on host to enable this feature.
+
+Currently, only 1GB memory-hotplug granularity is supported, and
+multiple granularity support will be implemented in the future.
+
+Signed-off-by: Lu Feifei <lufeifei@wxiat.com>
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/chip/chip3/chip.c      |   5 +
+ arch/sw_64/include/asm/hcall.h    |   1 +
+ arch/sw_64/include/asm/irq_impl.h |   1 +
+ arch/sw_64/include/asm/kvm_asm.h  |   3 +
+ arch/sw_64/include/asm/kvm_host.h |  11 +-
+ arch/sw_64/include/asm/memory.h   |   1 +
+ arch/sw_64/kvm/Kconfig            |   7 +
+ arch/sw_64/kvm/handle_exit.c      |   5 +
+ arch/sw_64/kvm/kvm-sw64.c         | 113 ++++++++++++-
+ arch/sw_64/mm/init.c              |   9 ++
+ drivers/misc/Kconfig              |   8 +
+ drivers/misc/Makefile             |   1 +
+ drivers/misc/sunway-ged.c         | 253 ++++++++++++++++++++++++++++++
+ 13 files changed, 410 insertions(+), 8 deletions(-)
+ create mode 100644 drivers/misc/sunway-ged.c
+
+diff --git a/arch/sw_64/chip/chip3/chip.c b/arch/sw_64/chip/chip3/chip.c
+index 2103d93a53a2..02b369b2b37b 100644
+--- a/arch/sw_64/chip/chip3/chip.c
++++ b/arch/sw_64/chip/chip3/chip.c
+@@ -701,6 +701,11 @@ void handle_chip_irq(unsigned long type, unsigned long vector,
+ 		handle_irq(type);
+ 		set_irq_regs(old_regs);
+ 		return;
++	case INT_VT_HOTPLUG:
++		old_regs = set_irq_regs(regs);
++		handle_irq(type);
++		set_irq_regs(old_regs);
++		return;
+ 	case INT_PC0:
+ 		perf_irq(PERFMON_PC0, regs);
+ 		return;
+diff --git a/arch/sw_64/include/asm/hcall.h b/arch/sw_64/include/asm/hcall.h
+index 8117752b657e..b5438b477c87 100644
+--- a/arch/sw_64/include/asm/hcall.h
++++ b/arch/sw_64/include/asm/hcall.h
+@@ -18,6 +18,7 @@ enum HCALL_TYPE {
+ 	HCALL_SWNET		= 20,   /* guest request swnet service */
+ 	HCALL_SWNET_IRQ		= 21,   /* guest request swnet intr */
+ 	HCALL_FATAL_ERROR	= 22,   /* guest fatal error, issued by hmcode */
++	HCALL_MEMHOTPLUG	= 23,   /* guest memory hotplug event */
+ 	NR_HCALL
+ };
+ 
+diff --git a/arch/sw_64/include/asm/irq_impl.h b/arch/sw_64/include/asm/irq_impl.h
+index 3679793d8b65..b568efef6994 100644
+--- a/arch/sw_64/include/asm/irq_impl.h
++++ b/arch/sw_64/include/asm/irq_impl.h
+@@ -32,6 +32,7 @@ enum sw64_irq_type {
+ 	INT_RTC		= 9,
+ 	INT_FAULT	= 10,
+ 	INT_VT_SERIAL	= 12,
++	INT_VT_HOTPLUG	= 13,
+ 	INT_DEV		= 17,
+ 	INT_NMI		= 18,
+ 	INT_LEGACY	= 31,
+diff --git a/arch/sw_64/include/asm/kvm_asm.h b/arch/sw_64/include/asm/kvm_asm.h
+index 4b851682188c..7e2c92ed4574 100644
+--- a/arch/sw_64/include/asm/kvm_asm.h
++++ b/arch/sw_64/include/asm/kvm_asm.h
+@@ -11,4 +11,7 @@
+ #define SW64_KVM_EXIT_RESTART		17
+ #define SW64_KVM_EXIT_FATAL_ERROR	22
+ 
++#ifdef CONFIG_KVM_MEMHOTPLUG
++#define SW64_KVM_EXIT_MEMHOTPLUG	23
++#endif
+ #endif /* _ASM_SW64_KVM_ASM_H */
+diff --git a/arch/sw_64/include/asm/kvm_host.h b/arch/sw_64/include/asm/kvm_host.h
+index e4ebb993153c..6d292c086347 100644
+--- a/arch/sw_64/include/asm/kvm_host.h
++++ b/arch/sw_64/include/asm/kvm_host.h
+@@ -29,7 +29,7 @@
+ #include <asm/kvm_mmio.h>
+ 
+ #define KVM_MAX_VCPUS 64
+-#define KVM_USER_MEM_SLOTS 512
++#define KVM_USER_MEM_SLOTS 64
+ 
+ #define KVM_HALT_POLL_NS_DEFAULT 0
+ #define KVM_IRQCHIP_NUM_PINS     256
+@@ -42,12 +42,16 @@
+ #define KVM_PAGES_PER_HPAGE(x)  (KVM_HPAGE_SIZE(x) / PAGE_SIZE)
+ 
+ struct kvm_arch_memory_slot {
+-
++	unsigned long host_phys_addr;
++	bool valid;
+ };
+ 
+ struct kvm_arch {
+ 	unsigned long host_phys_addr;
+ 	unsigned long size;
++
++	/* segment table */
++	unsigned long *seg_pgd;
+ };
+ 
+ 
+@@ -100,6 +104,9 @@ struct kvm_vcpu_stat {
+ 	u64 halt_poll_invalid;
+ };
+ 
++#ifdef CONFIG_KVM_MEMHOTPLUG
++void vcpu_mem_hotplug(struct kvm_vcpu *vcpu, unsigned long start_addr);
++#endif
+ int handle_exit(struct kvm_vcpu *vcpu, struct kvm_run *run,
+ 		int exception_index, struct hcall_args *hargs);
+ void vcpu_send_ipi(struct kvm_vcpu *vcpu, int target_vcpuid);
+diff --git a/arch/sw_64/include/asm/memory.h b/arch/sw_64/include/asm/memory.h
+index d3191165c7b5..b2b7492ae477 100644
+--- a/arch/sw_64/include/asm/memory.h
++++ b/arch/sw_64/include/asm/memory.h
+@@ -6,6 +6,7 @@
+ #include <linux/numa.h>
+ #endif
+ 
++#define MIN_MEMORY_BLOCK_SIZE_VM_MEMHP    (1UL << 30)
+ #define NODE0_START	(_TEXT_START - __START_KERNEL_map)
+ 
+ #define MAX_PHYSMEM_BITS	48
+diff --git a/arch/sw_64/kvm/Kconfig b/arch/sw_64/kvm/Kconfig
+index 230ac526911c..85323b48f564 100644
+--- a/arch/sw_64/kvm/Kconfig
++++ b/arch/sw_64/kvm/Kconfig
+@@ -42,6 +42,13 @@ config KVM_SW64_HOST
+ 	  Provides host support for SW64 processors.
+ 	  To compile this as a module, choose M here.
+ 
++config KVM_MEMHOTPLUG
++	bool "Memory hotplug support for guest"
++	depends on KVM
++	help
++	  Provides memory hotplug support for SW64 guest.
++
++
+ source "drivers/vhost/Kconfig"
+ 
+ endif # VIRTUALIZATION
+diff --git a/arch/sw_64/kvm/handle_exit.c b/arch/sw_64/kvm/handle_exit.c
+index 0d6806051fc7..5016bc0eddc2 100644
+--- a/arch/sw_64/kvm/handle_exit.c
++++ b/arch/sw_64/kvm/handle_exit.c
+@@ -34,6 +34,11 @@ int handle_exit(struct kvm_vcpu *vcpu, struct kvm_run *run,
+ 	case SW64_KVM_EXIT_IPI:
+ 		vcpu_send_ipi(vcpu, hargs->arg0);
+ 		return 1;
++#ifdef CONFIG_KVM_MEMHOTPLUG
++	case SW64_KVM_EXIT_MEMHOTPLUG:
++		vcpu_mem_hotplug(vcpu, hargs->arg0);
++		return 1;
++#endif
+ 	case SW64_KVM_EXIT_FATAL_ERROR:
+ 		printk("Guest fatal error: Reason=[%lx], EXC_PC=[%lx], DVA=[%lx]", hargs->arg0, hargs->arg1, hargs->arg2);
+ 		vcpu->run->exit_reason = KVM_EXIT_UNKNOWN;
+diff --git a/arch/sw_64/kvm/kvm-sw64.c b/arch/sw_64/kvm/kvm-sw64.c
+index 839ee83d57d5..af29d0ca8e7f 100644
+--- a/arch/sw_64/kvm/kvm-sw64.c
++++ b/arch/sw_64/kvm/kvm-sw64.c
+@@ -56,10 +56,18 @@ int kvm_set_msi(struct kvm_kernel_irq_routing_entry *e, struct kvm *kvm, int irq
+ 
+ extern int __sw64_vcpu_run(struct vcpucb *vcb, struct kvm_regs *regs, struct hcall_args *args);
+ 
+-static unsigned long get_vpcr(unsigned long machine_mem_offset, unsigned long memory_size, unsigned long vpn)
++#ifdef CONFIG_KVM_MEMHOTPLUG
++static u64 get_vpcr_memhp(u64 seg_base, u64 vpn)
+ {
+-	return (machine_mem_offset >> 23) | ((memory_size >> 23) << 16) | ((vpn & HARDWARE_VPN_MASK) << 44);
++	return seg_base | ((vpn & HARDWARE_VPN_MASK) << 44);
+ }
++#else
++static u64 get_vpcr(u64 hpa_base, u64 mem_size, u64 vpn)
++{
++	return (hpa_base >> 23) | ((mem_size >> 23) << 16)
++				| ((vpn & HARDWARE_VPN_MASK) << 44);
++}
++#endif
+ 
+ static unsigned long __get_new_vpn_context(struct kvm_vcpu *vcpu, long cpu)
+ {
+@@ -212,12 +220,38 @@ void kvm_arch_vcpu_destroy(struct kvm_vcpu *vcpu)
+ 
+ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
+ {
++#ifdef CONFIG_KVM_MEMHOTPLUG
++	unsigned long *seg_pgd;
++
++	if (kvm->arch.seg_pgd != NULL) {
++		kvm_err("kvm_arch already initialized?\n");
++		return -EINVAL;
++	}
++
++	seg_pgd = alloc_pages_exact(PAGE_SIZE, GFP_KERNEL | __GFP_ZERO);
++	if (!seg_pgd)
++		return -ENOMEM;
++
++	kvm->arch.seg_pgd = seg_pgd;
++#endif
++
+ 	return 0;
+ }
+ 
+ void kvm_arch_destroy_vm(struct kvm *kvm)
+ {
+ 	int i;
++#ifdef CONFIG_KVM_MEMHOTPLUG
++	void *seg_pgd = NULL;
++
++	if (kvm->arch.seg_pgd) {
++		seg_pgd = READ_ONCE(kvm->arch.seg_pgd);
++		kvm->arch.seg_pgd = NULL;
++	}
++
++	if (seg_pgd)
++		free_pages_exact(seg_pgd, PAGE_SIZE);
++#endif
+ 
+ 	for (i = 0; i < KVM_MAX_VCPUS; ++i) {
+ 		if (kvm->vcpus[i]) {
+@@ -227,7 +261,6 @@ void kvm_arch_destroy_vm(struct kvm *kvm)
+ 	}
+ 
+ 	atomic_set(&kvm->online_vcpus, 0);
+-
+ }
+ 
+ long kvm_arch_dev_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
+@@ -241,6 +274,22 @@ int kvm_arch_create_memslot(struct kvm *kvm, struct kvm_memory_slot *slot,
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_KVM_MEMHOTPLUG
++static void setup_segment_table(struct kvm *kvm,
++	struct kvm_memory_slot *memslot, unsigned long addr, size_t size)
++{
++	unsigned long *seg_pgd = kvm->arch.seg_pgd;
++	unsigned int num_of_entry = size >> 30;
++	unsigned long base_hpa = addr >> 30;
++	int i;
++
++	for (i = 0; i < num_of_entry; i++) {
++		*seg_pgd = base_hpa + i;
++		seg_pgd++;
++	}
++}
++#endif
++
+ int kvm_arch_prepare_memory_region(struct kvm *kvm,
+ 		struct kvm_memory_slot *memslot,
+ 		const struct kvm_userspace_memory_region *mem,
+@@ -253,8 +302,15 @@ int kvm_arch_prepare_memory_region(struct kvm *kvm,
+ 	unsigned long ret;
+ 	size_t size;
+ 
+-	if (change == KVM_MR_FLAGS_ONLY)
++	if (change == KVM_MR_FLAGS_ONLY || change == KVM_MR_DELETE)
++		return 0;
++
++#ifndef CONFIG_KVM_MEMHOTPLUG
++	if (mem->guest_phys_addr) {
++		pr_info("%s, No KVM MEMHOTPLUG support!\n", __func__);
+ 		return 0;
++	}
++#endif
+ 
+ 	if (test_bit(IO_MARK_BIT, &(mem->guest_phys_addr)))
+ 		return 0;
+@@ -276,7 +332,7 @@ int kvm_arch_prepare_memory_region(struct kvm *kvm,
+ 	if (!vm_file) {
+ 		info = kzalloc(sizeof(struct vmem_info), GFP_KERNEL);
+ 
+-		size = round_up(mem->memory_size, 8<<20);
++		size = round_up(mem->memory_size, 8 << 20);
+ 		addr = gen_pool_alloc(sw64_kvm_pool, size);
+ 		if (!addr)
+ 			return -ENOMEM;
+@@ -291,6 +347,18 @@ int kvm_arch_prepare_memory_region(struct kvm *kvm,
+ 		if (!vma)
+ 			return -ENOMEM;
+ 
++#ifdef CONFIG_KVM_MEMHOTPLUG
++		if (memslot->base_gfn == 0x0UL) {
++			setup_segment_table(kvm, memslot, addr, size);
++			kvm->arch.host_phys_addr = (u64)addr;
++			memslot->arch.host_phys_addr = addr;
++		} else {
++			/* used for memory hotplug */
++			memslot->arch.host_phys_addr = addr;
++			memslot->arch.valid = false;
++		}
++#endif
++
+ 		info->start = addr;
+ 		info->size = size;
+ 		vma->vm_private_data = (void *) info;
+@@ -308,8 +376,11 @@ int kvm_arch_prepare_memory_region(struct kvm *kvm,
+ 
+ 	pr_info("guest phys addr = %#lx, size = %#lx\n",
+ 			addr, vma->vm_end - vma->vm_start);
++
++#ifndef CONFIG_KVM_MEMHOTPLUG
+ 	kvm->arch.host_phys_addr = (u64)addr;
+-	kvm->arch.size = round_up(mem->memory_size, 8<<20);
++	kvm->arch.size = round_up(mem->memory_size, 8 << 20);
++#endif
+ 
+ 	memset(__va(addr), 0, 0x2000000);
+ 
+@@ -463,8 +534,14 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
+ 	/* Set guest vcb */
+ 	/* vpn will update later when vcpu is running */
+ 	if (vcpu->arch.vcb.vpcr == 0) {
++#ifndef CONFIG_KVM_MEMHOTPLUG
+ 		vcpu->arch.vcb.vpcr
+ 			= get_vpcr(vcpu->kvm->arch.host_phys_addr, vcpu->kvm->arch.size, 0);
++#else
++		unsigned long seg_base = virt_to_phys(vcpu->kvm->arch.seg_pgd);
++
++		vcpu->arch.vcb.vpcr = get_vpcr_memhp(seg_base, 0);
++#endif
+ 		vcpu->arch.vcb.upcr = 0x7;
+ 	}
+ 
+@@ -640,6 +717,30 @@ int kvm_dev_ioctl_check_extension(long ext)
+ 	return r;
+ }
+ 
++#ifdef CONFIG_KVM_MEMHOTPLUG
++void vcpu_mem_hotplug(struct kvm_vcpu *vcpu, unsigned long start_addr)
++{
++	struct kvm *kvm = vcpu->kvm;
++	struct kvm_memory_slot *slot;
++	unsigned long start_pfn = start_addr >> PAGE_SHIFT;
++
++	kvm_for_each_memslot(slot, kvm_memslots(kvm)) {
++		if (start_pfn == slot->base_gfn) {
++			unsigned long *seg_pgd;
++			unsigned long num_of_entry = slot->npages >> 17;
++			unsigned long base_hpa = slot->arch.host_phys_addr;
++			int i;
++
++			seg_pgd = kvm->arch.seg_pgd + (start_pfn >> 17);
++			for (i = 0; i < num_of_entry; i++) {
++				*seg_pgd = (base_hpa >> 30) + i;
++				seg_pgd++;
++			}
++		}
++	}
++}
++#endif
++
+ void vcpu_send_ipi(struct kvm_vcpu *vcpu, int target_vcpuid)
+ {
+ 	struct kvm_vcpu *target_vcpu = kvm_get_vcpu(vcpu->kvm, target_vcpuid);
+diff --git a/arch/sw_64/mm/init.c b/arch/sw_64/mm/init.c
+index 16d3da7beebe..82f2414ef7f7 100644
+--- a/arch/sw_64/mm/init.c
++++ b/arch/sw_64/mm/init.c
+@@ -10,6 +10,7 @@
+ #include <linux/memblock.h>
+ #include <linux/swiotlb.h>
+ #include <linux/acpi.h>
++#include <linux/memory.h>
+ 
+ #include <asm/mmu_context.h>
+ 
+@@ -33,6 +34,14 @@ static pud_t vmalloc_pud[1024]	__attribute__((__aligned__(PAGE_SIZE)));
+ static phys_addr_t mem_start;
+ static phys_addr_t mem_size_limit;
+ 
++unsigned long memory_block_size_bytes(void)
++{
++	if (is_in_guest())
++		return MIN_MEMORY_BLOCK_SIZE_VM_MEMHP;
++	else
++		return MIN_MEMORY_BLOCK_SIZE;
++}
++
+ static int __init setup_mem_size(char *p)
+ {
+ 	char *oldp;
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index fafa8b0d8099..140716083ab8 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -351,6 +351,14 @@ config HMC6352
+ 	  This driver provides support for the Honeywell HMC6352 compass,
+ 	  providing configuration and heading data via sysfs.
+ 
++config SUNWAY_GED
++	tristate "sunway generic device driver for memhotplug"
++	depends on SW64
++	depends on MEMORY_HOTPLUG
++	help
++	  This driver provides support for sunway generic device driver for
++	  memhotplug, providing configuration and heading data via sysfs.
++
+ config DS1682
+ 	tristate "Dallas DS1682 Total Elapsed Time Recorder with Alarm"
+ 	depends on I2C
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index d23231e73330..3615763234a6 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -34,6 +34,7 @@ obj-$(CONFIG_SENSORS_TSL2550)	+= tsl2550.o
+ obj-$(CONFIG_DS1682)		+= ds1682.o
+ obj-$(CONFIG_C2PORT)		+= c2port/
+ obj-$(CONFIG_HMC6352)		+= hmc6352.o
++obj-$(CONFIG_SUNWAY_GED)	+= sunway-ged.o
+ obj-y				+= eeprom/
+ obj-y				+= cb710/
+ obj-$(CONFIG_VMWARE_BALLOON)	+= vmw_balloon.o
+diff --git a/drivers/misc/sunway-ged.c b/drivers/misc/sunway-ged.c
+new file mode 100644
+index 000000000000..b4e4ca315852
+--- /dev/null
++++ b/drivers/misc/sunway-ged.c
+@@ -0,0 +1,253 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/* Generic Event Device for ACPI. */
++
++#include <linux/err.h>
++#include <linux/init.h>
++#include <linux/interrupt.h>
++#include <linux/list.h>
++#include <linux/platform_device.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++
++#define OFFSET_START_ADDR	0
++#define OFFSET_LENGTH		8
++#define OFFSET_STATUS		16
++#define OFFSET_SLOT		24
++
++/* Memory hotplug event */
++#define SUNWAY_MEMHOTPLUG_ADD		0x1
++#define SUNWAY_MEMHOTPLUG_REMOVE	0x2
++
++struct sunway_memory_device {
++	struct sunway_ged_device *device;
++	unsigned int state;     /* State of the memory device */
++	struct list_head list;
++
++	u64 start_addr;         /* Memory Range start physical addr */
++	u64 length;             /* Memory Range length */
++	u64 slot;		/* Memory Range slot */
++	unsigned int enabled:1;
++};
++
++struct sunway_ged_device {
++	struct device *dev;
++	void __iomem *membase;
++	void *driver_data;
++	spinlock_t lock;
++	struct list_head dev_list;
++};
++
++static int sunway_memory_enable_device(struct sunway_memory_device *mem_device)
++{
++	int num_enabled = 0;
++	int result = 0;
++
++	if (mem_device->enabled) {	/* just sanity check...*/
++		num_enabled++;
++		goto out;
++	}
++
++	/*
++	 * If the memory block size is zero, please ignore it.
++	 * Don't try to do the following memory hotplug flowchart.
++	 */
++	if (!mem_device->length)
++		goto out;
++
++	lock_device_hotplug();
++	/* suppose node = 0, fix me! */
++	result = __add_memory(0, mem_device->start_addr, mem_device->length);
++	unlock_device_hotplug();
++	/*
++	 * If the memory block has been used by the kernel, add_memory()
++	 * returns -EEXIST. If add_memory() returns the other error, it
++	 * means that this memory block is not used by the kernel.
++	 */
++	if (result && result != -EEXIST)
++		goto out;
++
++	mem_device->enabled = 1;
++
++	/*
++	 * Add num_enable even if add_memory() returns -EEXIST, so the
++	 * device is bound to this driver.
++	 */
++	num_enabled++;
++out:
++	if (!num_enabled) {
++		dev_err(mem_device->device->dev, "add_memory failed\n");
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int sunway_memory_get_meminfo(struct sunway_memory_device *mem_device)
++{
++	struct sunway_ged_device *geddev;
++
++	if (!mem_device)
++		return -EINVAL;
++
++	if (mem_device->enabled)
++		return 0;
++
++	geddev = mem_device->device;
++
++	mem_device->start_addr = readq(geddev->membase + OFFSET_START_ADDR);
++	mem_device->length = readq(geddev->membase + OFFSET_LENGTH);
++
++	return 0;
++}
++
++static void sunway_memory_device_remove(struct sunway_ged_device *device)
++{
++	struct sunway_memory_device *mem_dev, *n;
++	unsigned long start_addr, length, slot;
++
++	if (!device)
++		return;
++
++	start_addr = readq(device->membase + OFFSET_START_ADDR);
++	length = readq(device->membase + OFFSET_LENGTH);
++	slot = readq(device->membase + OFFSET_SLOT);
++
++	list_for_each_entry_safe(mem_dev, n, &device->dev_list, list) {
++		if (!mem_dev->enabled)
++			continue;
++
++		if ((start_addr == mem_dev->start_addr) &&
++				(length == mem_dev->length)) {
++			/* suppose node = 0, fix me! */
++			remove_memory(0, start_addr, length);
++			list_del(&mem_dev->list);
++			kfree(mem_dev);
++		}
++	}
++
++	writeq(slot, device->membase + OFFSET_SLOT);
++}
++
++static int sunway_memory_device_add(struct sunway_ged_device *device)
++{
++	struct sunway_memory_device *mem_device;
++	int result;
++
++	if (!device)
++		return -EINVAL;
++
++	mem_device = kzalloc(sizeof(struct sunway_memory_device), GFP_KERNEL);
++	if (!mem_device)
++		return -ENOMEM;
++
++	INIT_LIST_HEAD(&mem_device->list);
++	mem_device->device = device;
++
++	/* Get the range from the IO */
++	mem_device->start_addr = readq(device->membase + OFFSET_START_ADDR);
++	mem_device->length = readq(device->membase + OFFSET_LENGTH);
++	mem_device->slot = readq(device->membase + OFFSET_SLOT);
++
++	result = sunway_memory_enable_device(mem_device);
++	if (result) {
++		dev_err(device->dev, "sunway_memory_enable_device() error\n");
++		sunway_memory_device_remove(device);
++
++		return result;
++	}
++
++	list_add_tail(&mem_device->list, &device->dev_list);
++	dev_dbg(device->dev, "Memory device configured\n");
++
++	hcall(HCALL_MEMHOTPLUG, mem_device->start_addr, 0, 0);
++
++	return 1;
++}
++
++static irqreturn_t sunwayged_ist(int irq, void *data)
++{
++	struct sunway_ged_device *sunwayged_dev = data;
++	unsigned int status;
++
++	status = readl(sunwayged_dev->membase + OFFSET_STATUS);
++
++	/* through IO status to add or remove memory device  */
++	if (status & SUNWAY_MEMHOTPLUG_ADD)
++		sunway_memory_device_add(sunwayged_dev);
++
++	if (status & SUNWAY_MEMHOTPLUG_REMOVE)
++		sunway_memory_device_remove(sunwayged_dev);
++
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t sunwayged_irq_handler(int irq, void *data)
++{
++	return IRQ_WAKE_THREAD;
++}
++
++static int sunwayged_probe(struct platform_device *pdev)
++{
++	struct resource *regs = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	int irq = platform_get_irq(pdev, 0);
++	struct sunway_ged_device *geddev;
++	struct device *dev;
++	int irqflags;
++
++	if (!regs) {
++		dev_err(dev, "no registers defined\n");
++		return -EINVAL;
++	}
++
++	geddev = devm_kzalloc(&pdev->dev, sizeof(*geddev), GFP_KERNEL);
++	if (!geddev)
++		return -ENOMEM;
++
++	spin_lock_init(&geddev->lock);
++	geddev->membase = devm_ioremap(&pdev->dev,
++					regs->start, resource_size(regs));
++	if (!geddev->membase)
++		return -ENOMEM;
++
++	INIT_LIST_HEAD(&geddev->dev_list);
++	geddev->dev = &pdev->dev;
++	irqflags = IRQF_SHARED;
++
++	if (request_threaded_irq(irq, sunwayged_irq_handler, sunwayged_ist,
++				irqflags, "SUNWAY:Ged", geddev)) {
++		dev_err(dev, "failed to setup event handler for irq %u\n", irq);
++
++		return -EINVAL;
++	}
++
++	platform_set_drvdata(pdev, geddev);
++
++	return 0;
++}
++
++static int sunwayged_remove(struct platform_device *pdev)
++{
++	return 0;
++}
++
++static const struct of_device_id sunwayged_of_match[] = {
++	{.compatible = "sw6,sunway-ged", },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, sunwayged_of_match);
++
++static struct platform_driver sunwayged_platform_driver = {
++	.driver = {
++		.name		= "sunway-ged",
++		.of_match_table	= sunwayged_of_match,
++	},
++	.probe			= sunwayged_probe,
++	.remove			= sunwayged_remove,
++};
++module_platform_driver(sunwayged_platform_driver);
++
++MODULE_AUTHOR("Lu Feifei");
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("Sunway ged driver");
+-- 
+2.33.0
+

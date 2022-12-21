@@ -1,0 +1,138 @@
+From fcd18e535e1617537c599d605f49c88e1fa95b68 Mon Sep 17 00:00:00 2001
+From: Yang Jihong <yangjihong1@huawei.com>
+Date: Wed, 6 Jul 2022 18:05:22 +0800
+Subject: [PATCH] livepatch/arm64: Support breakpoint exception optimization
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: fcd18e535e1617537c599d605f49c88e1fa95b68
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5CJ7X
+
+--------------------------------
+
+Add breakpoint exception optimization support to improve livepatch
+success rate for arm64.
+
+Signed-off-by: Yang Jihong <yangjihong1@huawei.com>
+Reviewed-by: Xu Kuohai <xukuohai@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/brk-imm.h        |  1 +
+ arch/arm64/include/asm/debug-monitors.h |  2 ++
+ arch/arm64/include/asm/livepatch.h      |  8 +++++
+ arch/arm64/kernel/livepatch.c           | 41 +++++++++++++++++++++++++
+ 4 files changed, 52 insertions(+)
+
+diff --git a/arch/arm64/include/asm/brk-imm.h b/arch/arm64/include/asm/brk-imm.h
+index ec7720dbe2c8..1ac8bc293ea2 100644
+--- a/arch/arm64/include/asm/brk-imm.h
++++ b/arch/arm64/include/asm/brk-imm.h
+@@ -21,6 +21,7 @@
+ #define KPROBES_BRK_IMM			0x004
+ #define UPROBES_BRK_IMM			0x005
+ #define KPROBES_BRK_SS_IMM		0x006
++#define KLP_BRK_IMM			0x007
+ #define FAULT_BRK_IMM			0x100
+ #define KGDB_DYN_DBG_BRK_IMM		0x400
+ #define KGDB_COMPILED_DBG_BRK_IMM	0x401
+diff --git a/arch/arm64/include/asm/debug-monitors.h b/arch/arm64/include/asm/debug-monitors.h
+index 657c921fd784..bc015465ecd2 100644
+--- a/arch/arm64/include/asm/debug-monitors.h
++++ b/arch/arm64/include/asm/debug-monitors.h
+@@ -56,6 +56,8 @@
+ #define BRK64_OPCODE_KPROBES_SS	(AARCH64_BREAK_MON | (KPROBES_BRK_SS_IMM << 5))
+ /* uprobes BRK opcodes with ESR encoding  */
+ #define BRK64_OPCODE_UPROBES	(AARCH64_BREAK_MON | (UPROBES_BRK_IMM << 5))
++/* klp BRK opcodes with ESR encoding  */
++#define BRK64_OPCODE_KLP	(AARCH64_BREAK_MON | (KLP_BRK_IMM << 5))
+ 
+ /* AArch32 */
+ #define DBG_ESR_EVT_BKPT	0x4
+diff --git a/arch/arm64/include/asm/livepatch.h b/arch/arm64/include/asm/livepatch.h
+index 7b9ea5dcea4d..b87dc35c2b3f 100644
+--- a/arch/arm64/include/asm/livepatch.h
++++ b/arch/arm64/include/asm/livepatch.h
+@@ -58,8 +58,16 @@ int klp_check_calltrace(struct klp_patch *patch, int enable);
+ 
+ struct arch_klp_data {
+ 	u32 old_insns[LJMP_INSN_SIZE];
++
++	/*
++	 * Saved opcode at the entry of the old func (which maybe replaced
++	 * with breakpoint).
++	 */
++	u32 saved_opcode;
+ };
+ 
++int arch_klp_add_breakpoint(struct arch_klp_data *arch_data, void *old_func);
++void arch_klp_remove_breakpoint(struct arch_klp_data *arch_data, void *old_func);
+ long arch_klp_save_old_code(struct arch_klp_data *arch_data, void *old_func);
+ 
+ #endif
+diff --git a/arch/arm64/kernel/livepatch.c b/arch/arm64/kernel/livepatch.c
+index 3b1b4db58d52..508a43ce18ca 100644
+--- a/arch/arm64/kernel/livepatch.c
++++ b/arch/arm64/kernel/livepatch.c
+@@ -30,6 +30,7 @@
+ #include <asm/insn.h>
+ #include <asm-generic/sections.h>
+ #include <asm/ptrace.h>
++#include <asm/debug-monitors.h>
+ #include <linux/ftrace.h>
+ #include <linux/sched/debug.h>
+ #include <linux/kallsyms.h>
+@@ -315,6 +316,46 @@ int klp_check_calltrace(struct klp_patch *patch, int enable)
+ 	free_list(&check_funcs);
+ 	return ret;
+ }
++
++int arch_klp_add_breakpoint(struct arch_klp_data *arch_data, void *old_func)
++{
++	u32 insn = BRK64_OPCODE_KLP;
++	u32 *addr = (u32 *)old_func;
++
++	arch_data->saved_opcode = le32_to_cpu(*addr);
++	aarch64_insn_patch_text(&old_func, &insn, 1);
++	return 0;
++}
++
++void arch_klp_remove_breakpoint(struct arch_klp_data *arch_data, void *old_func)
++{
++	aarch64_insn_patch_text(&old_func, &arch_data->saved_opcode, 1);
++}
++
++static int klp_breakpoint_handler(struct pt_regs *regs, unsigned int esr)
++{
++	void *brk_func = NULL;
++	unsigned long addr = instruction_pointer(regs);
++
++	brk_func = klp_get_brk_func((void *)addr);
++	if (!brk_func) {
++		pr_warn("Unrecoverable livepatch detected.\n");
++		BUG();
++	}
++
++	instruction_pointer_set(regs, (unsigned long)brk_func);
++	return 0;
++}
++
++static struct break_hook klp_break_hook = {
++	.imm = KLP_BRK_IMM,
++	.fn = klp_breakpoint_handler,
++};
++
++void arch_klp_init(void)
++{
++	register_kernel_break_hook(&klp_break_hook);
++}
+ #endif
+ 
+ long arch_klp_save_old_code(struct arch_klp_data *arch_data, void *old_func)
+-- 
+2.33.0
+

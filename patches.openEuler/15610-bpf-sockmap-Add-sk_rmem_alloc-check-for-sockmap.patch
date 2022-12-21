@@ -1,0 +1,87 @@
+From 8818e269f18dfc125e7ae7c93db90c61238f9c80 Mon Sep 17 00:00:00 2001
+From: Wang Yufen <wangyufen@huawei.com>
+Date: Sat, 21 May 2022 12:18:54 +0800
+Subject: [PATCH] bpf, sockmap: Add sk_rmem_alloc check for sockmap
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 8818e269f18dfc125e7ae7c93db90c61238f9c80
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: 186640, https://gitee.com/openeuler/kernel/issues/I545NW
+
+--------------------------------
+
+A tcp socket in a sockmap. If the packets transmission rate is very fast
+and the packets receiving rate is very slow, a large number of packets
+are stacked in the ingress queue on the packets receiving side. As a
+result the memory is exhausted and the system ooms.
+
+To fix, we add sk_rmem_alloc while sk_msg queued in the ingress queue
+and subtract sk_rmem_alloc while sk_msg dequeued from the ingress queue
+and check sk_rmem_alloc at the beginning of bpf_tcp_ingress().
+
+Signed-off-by: Wang Yufen <wangyufen@huawei.com>
+Reviewed-by: Liu Jian <liujian56@huawei.com>
+Reviewed-by: Wei Yongjun <weiyongjun1@huawei.com>
+Reviewed-by: Yue Haibing <yuehaibing@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ net/core/skmsg.c   |  1 +
+ net/ipv4/tcp_bpf.c | 10 +++++++++-
+ 2 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index 75214e2a2333..02d6d254d94a 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -659,6 +659,7 @@ void __sk_psock_purge_ingress_msg(struct sk_psock *psock)
+ 
+ 	list_for_each_entry_safe(msg, tmp, &psock->ingress_msg, list) {
+ 		list_del(&msg->list);
++		atomic_sub(msg->sg.size, &psock->sk->sk_rmem_alloc);
+ 		sk_msg_free(psock->sk, msg);
+ 		kfree(msg);
+ 	}
+diff --git a/net/ipv4/tcp_bpf.c b/net/ipv4/tcp_bpf.c
+index 9eaace83231c..afeaf35194de 100644
+--- a/net/ipv4/tcp_bpf.c
++++ b/net/ipv4/tcp_bpf.c
+@@ -43,8 +43,10 @@ int __tcp_bpf_recvmsg(struct sock *sk, struct sk_psock *psock,
+ 			if (likely(!peek)) {
+ 				sge->offset += copy;
+ 				sge->length -= copy;
+-				if (!msg_rx->skb)
++				if (!msg_rx->skb) {
++					atomic_sub(copy, &sk->sk_rmem_alloc);
+ 					sk_mem_uncharge(sk, copy);
++				}
+ 				msg_rx->sg.size -= copy;
+ 
+ 				if (!sge->length) {
+@@ -98,6 +100,11 @@ static int bpf_tcp_ingress(struct sock *sk, struct sk_psock *psock,
+ 		return -ENOMEM;
+ 
+ 	lock_sock(sk);
++	if (atomic_read(&sk->sk_rmem_alloc) >= sk->sk_rcvbuf) {
++		kfree(tmp);
++		release_sock(sk);
++		return -EAGAIN;
++	}
+ 	tmp->sg.start = msg->sg.start;
+ 	i = msg->sg.start;
+ 	do {
+@@ -127,6 +134,7 @@ static int bpf_tcp_ingress(struct sock *sk, struct sk_psock *psock,
+ 	if (!ret) {
+ 		msg->sg.start = i;
+ 		sk_psock_queue_msg(psock, tmp);
++		atomic_add(tmp->sg.size, &sk->sk_rmem_alloc);
+ 		sk_psock_data_ready(sk, psock);
+ 	} else {
+ 		sk_msg_free(sk, tmp);
+-- 
+2.33.0
+

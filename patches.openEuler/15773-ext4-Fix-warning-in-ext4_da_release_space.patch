@@ -1,0 +1,188 @@
+From 782a6ba7d24f83d531cf494dd2d4b77201bc63c9 Mon Sep 17 00:00:00 2001
+From: Ye Bin <yebin10@huawei.com>
+Date: Mon, 23 May 2022 21:18:34 +0800
+Subject: [PATCH] ext4: Fix warning in ext4_da_release_space
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 782a6ba7d24f83d531cf494dd2d4b77201bc63c9
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I58KLD
+CVE: NA
+
+---------------------------
+
+We got issue as follows:
+WARNING: CPU: 2 PID: 1936 at fs/ext4/inode.c:1511 ext4_da_release_space+0x1b9/0x266
+Modules linked in:
+CPU: 2 PID: 1936 Comm: dd Not tainted 5.10.0+ #344
+RIP: 0010:ext4_da_release_space+0x1b9/0x266
+RSP: 0018:ffff888127307848 EFLAGS: 00010292
+RAX: 0000000000000000 RBX: 0000000000000001 RCX: ffffffff843f67cc
+RDX: 0000000000000000 RSI: 0000000000000000 RDI: ffffed1024e60ed9
+RBP: ffff888124dc8140 R08: 0000000000000083 R09: ffffed1075da6d23
+R10: ffff8883aed36917 R11: ffffed1075da6d22 R12: ffff888124dc83f0
+R13: ffff888124dc844c R14: ffff888124dc8168 R15: 000000000000000c
+FS:  00007f6b7247d740(0000) GS:ffff8883aed00000(0000) knlGS:0000000000000000
+CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+CR2: 00007ffc1a0b7dd8 CR3: 00000001065ce000 CR4: 00000000000006e0
+DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+Call Trace:
+ ext4_es_remove_extent+0x187/0x230
+ mpage_release_unused_pages+0x3af/0x470
+ ext4_writepages+0xb9b/0x1160
+ do_writepages+0xbb/0x1e0
+ __filemap_fdatawrite_range+0x1b1/0x1f0
+ file_write_and_wait_range+0x80/0xe0
+ ext4_sync_file+0x13d/0x800
+ vfs_fsync_range+0x75/0x140
+ do_fsync+0x4d/0x90
+ __x64_sys_fsync+0x1d/0x30
+ do_syscall_64+0x33/0x40
+ entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+Above issue may happens as follows:
+	process1                        process2
+ext4_da_write_begin
+  ext4_da_reserve_space
+    ext4_es_insert_delayed_block[1/1]
+                                    ext4_da_write_begin
+				      ext4_es_insert_delayed_block[0/1]
+ext4_writepages
+  ****Delayed block allocation failed****
+  mpage_release_unused_pages
+    ext4_es_remove_extent[1/1]
+      ext4_da_release_space [reserved 0]
+
+ext4_da_write_begin
+  ext4_es_scan_clu(inode, &ext4_es_is_delonly, lblk)
+   ->As there exist [0, 1] extent, so will return true
+                                   ext4_writepages
+				   ****Delayed block allocation failed****
+                                     mpage_release_unused_pages
+				       ext4_es_remove_extent[0/1]
+				         ext4_da_release_space [reserved 1]
+					   ei->i_reserved_data_blocks [1->0]
+
+  ext4_es_insert_delayed_block[1/1]
+
+ext4_writepages
+  ****Delayed block allocation failed****
+  mpage_release_unused_pages
+  ext4_es_remove_extent[1/1]
+   ext4_da_release_space [reserved 1]
+    ei->i_reserved_data_blocks[0, -1]
+    ->As ei->i_reserved_data_blocks already is zero but to_free is 1,
+    will trigger warning.
+
+To solve above issue, introduce i_clu_lock to protect insert delayed
+block and remove block under cluster delay allocate mode.
+
+Signed-off-by: Ye Bin <yebin10@huawei.com>
+Reviewed-by: Zhang Yi <yi.zhang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/ext4/ext4.h           |  3 +++
+ fs/ext4/extents_status.c |  5 +++++
+ fs/ext4/inode.c          | 11 +++++++++--
+ fs/ext4/super.c          |  1 +
+ 4 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index b32d559252b9..c11a23d73c79 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -1164,6 +1164,9 @@ struct ext4_inode_info {
+ 	__u32 i_csum_seed;
+ 
+ 	kprojid_t i_projid;
++
++	/* Protect concurrent add cluster delayed block and remove block */
++	struct mutex i_clu_lock;
+ };
+ 
+ /*
+diff --git a/fs/ext4/extents_status.c b/fs/ext4/extents_status.c
+index 9a3a8996aacf..dd679014db98 100644
+--- a/fs/ext4/extents_status.c
++++ b/fs/ext4/extents_status.c
+@@ -1433,6 +1433,7 @@ static int __es_remove_extent(struct inode *inode, ext4_lblk_t lblk,
+ int ext4_es_remove_extent(struct inode *inode, ext4_lblk_t lblk,
+ 			  ext4_lblk_t len)
+ {
++	struct ext4_sb_info *sbi = EXT4_SB(inode->i_sb);
+ 	ext4_lblk_t end;
+ 	int err = 0;
+ 	int reserved = 0;
+@@ -1455,9 +1456,13 @@ int ext4_es_remove_extent(struct inode *inode, ext4_lblk_t lblk,
+ 	 * so that we are sure __es_shrink() is done with the inode before it
+ 	 * is reclaimed.
+ 	 */
++	if (sbi->s_cluster_ratio != 1)
++		mutex_lock(&EXT4_I(inode)->i_clu_lock);
+ 	write_lock(&EXT4_I(inode)->i_es_lock);
+ 	err = __es_remove_extent(inode, lblk, end, &reserved);
+ 	write_unlock(&EXT4_I(inode)->i_es_lock);
++	if (sbi->s_cluster_ratio != 1)
++		mutex_unlock(&EXT4_I(inode)->i_clu_lock);
+ 	ext4_es_print_tree(inode);
+ 	ext4_da_release_space(inode, reserved);
+ 	return err;
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 6cf2eecef96b..a057b9f54bda 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -1648,17 +1648,22 @@ static int ext4_insert_delayed_block(struct inode *inode, ext4_lblk_t lblk)
+ 			goto errout;
+ 		reserved = true;
+ 	} else {   /* bigalloc */
++		mutex_lock(&EXT4_I(inode)->i_clu_lock);
+ 		if (!ext4_es_scan_clu(inode, &ext4_es_is_delonly, lblk)) {
+ 			if (!ext4_es_scan_clu(inode,
+ 					      &ext4_es_is_mapped, lblk)) {
+ 				ret = ext4_clu_mapped(inode,
+ 						      EXT4_B2C(sbi, lblk));
+-				if (ret < 0)
++				if (ret < 0) {
++					mutex_unlock(&EXT4_I(inode)->i_clu_lock);
+ 					goto errout;
++				}
+ 				if (ret == 0) {
+ 					ret = ext4_da_reserve_space(inode);
+-					if (ret != 0)   /* ENOSPC */
++					if (ret != 0) {   /* ENOSPC */
++						mutex_unlock(&EXT4_I(inode)->i_clu_lock);
+ 						goto errout;
++					}
+ 					reserved = true;
+ 				} else {
+ 					allocated = true;
+@@ -1670,6 +1675,8 @@ static int ext4_insert_delayed_block(struct inode *inode, ext4_lblk_t lblk)
+ 	}
+ 
+ 	ret = ext4_es_insert_delayed_block(inode, lblk, allocated);
++	if (sbi->s_cluster_ratio != 1)
++		mutex_unlock(&EXT4_I(inode)->i_clu_lock);
+ 	if (ret && reserved)
+ 		ext4_da_release_space(inode, 1);
+ 
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 9c004269f8d6..5e992775fc30 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -1367,6 +1367,7 @@ static struct inode *ext4_alloc_inode(struct super_block *sb)
+ 	INIT_WORK(&ei->i_rsv_conversion_work, ext4_end_io_rsv_work);
+ 	ext4_fc_init_inode(&ei->vfs_inode);
+ 	mutex_init(&ei->i_fc_lock);
++	mutex_init(&ei->i_clu_lock);
+ 	return &ei->vfs_inode;
+ }
+ 
+-- 
+2.33.0
+

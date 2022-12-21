@@ -1,0 +1,143 @@
+From f698ccf83bfded5033bea769cd663c7d942f344a Mon Sep 17 00:00:00 2001
+From: Chen Wandun <chenwandun@huawei.com>
+Date: Tue, 7 Jun 2022 17:43:53 +0800
+Subject: [PATCH] memcg: introduce per-memcg reclaim interface for cgroup v1
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: f698ccf83bfded5033bea769cd663c7d942f344a
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I545DF
+CVE: NA
+
+--------------------------------
+
+introduce per-memcg reclaim interface for cgroup v1, and
+disable memory reclaim for root memcg.
+
+Signed-off-by: Chen Wandun <chenwandun@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/memcontrol.c | 87 ++++++++++++++++++++++++++-----------------------
+ 1 file changed, 47 insertions(+), 40 deletions(-)
+
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 06cb2c417623..3ede56d6b307 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -5152,6 +5152,49 @@ static int memcg_events_local_show(struct seq_file *m, void *v)
+ 	return 0;
+ }
+ 
++static ssize_t memory_reclaim(struct kernfs_open_file *of, char *buf,
++			      size_t nbytes, loff_t off)
++{
++	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
++	unsigned int nr_retries = MAX_RECLAIM_RETRIES;
++	unsigned long nr_to_reclaim, nr_reclaimed = 0;
++	int err;
++
++	buf = strstrip(buf);
++	err = page_counter_memparse(buf, "", &nr_to_reclaim);
++	if (err)
++		return err;
++
++	if (!cgroup_subsys_on_dfl(memory_cgrp_subsys) &&
++			mem_cgroup_is_root(memcg))
++		return -EINVAL;
++
++	while (nr_reclaimed < nr_to_reclaim) {
++		unsigned long reclaimed;
++
++		if (signal_pending(current))
++			return -EINTR;
++
++		/* This is the final attempt, drain percpu lru caches in the
++		 * hope of introducing more evictable pages for
++		 * try_to_free_mem_cgroup_pages().
++		 */
++		if (!nr_retries)
++			lru_add_drain_all();
++
++		reclaimed = try_to_free_mem_cgroup_pages(memcg,
++						nr_to_reclaim - nr_reclaimed,
++						GFP_KERNEL, true);
++
++		if (!reclaimed && !nr_retries--)
++			return -EAGAIN;
++
++		nr_reclaimed += reclaimed;
++	}
++
++	return nbytes;
++}
++
+ static struct cftype mem_cgroup_legacy_files[] = {
+ 	{
+ 		.name = "usage_in_bytes",
+@@ -5345,6 +5388,10 @@ static struct cftype mem_cgroup_legacy_files[] = {
+ 		.file_offset = offsetof(struct mem_cgroup, events_local_file),
+ 		.seq_show = memcg_events_local_show,
+ 	},
++	{
++		.name = "reclaim",
++		.write = memory_reclaim,
++	},
+ 	{ },	/* terminate */
+ };
+ 
+@@ -6711,46 +6758,6 @@ static ssize_t memory_oom_group_write(struct kernfs_open_file *of,
+ 	return nbytes;
+ }
+ 
+-static ssize_t memory_reclaim(struct kernfs_open_file *of, char *buf,
+-			      size_t nbytes, loff_t off)
+-{
+-	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
+-	unsigned int nr_retries = MAX_RECLAIM_RETRIES;
+-	unsigned long nr_to_reclaim, nr_reclaimed = 0;
+-	int err;
+-
+-	buf = strstrip(buf);
+-	err = page_counter_memparse(buf, "", &nr_to_reclaim);
+-	if (err)
+-		return err;
+-
+-	while (nr_reclaimed < nr_to_reclaim) {
+-		unsigned long reclaimed;
+-
+-		if (signal_pending(current))
+-			return -EINTR;
+-
+-		/*
+-		 * This is the final attempt, drain percpu lru caches in the
+-		 * hope of introducing more evictable pages for
+-		 * try_to_free_mem_cgroup_pages().
+-		 */
+-		if (!nr_retries)
+-			lru_add_drain_all();
+-
+-		reclaimed = try_to_free_mem_cgroup_pages(memcg,
+-						nr_to_reclaim - nr_reclaimed,
+-						GFP_KERNEL, true);
+-
+-		if (!reclaimed && !nr_retries--)
+-			return -EAGAIN;
+-
+-		nr_reclaimed += reclaimed;
+-	}
+-
+-	return nbytes;
+-}
+-
+ static struct cftype memory_files[] = {
+ 	{
+ 		.name = "current",
+-- 
+2.33.0
+

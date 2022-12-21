@@ -1,0 +1,539 @@
+From d81e9624de2104c92417bfe2e72a374f6d864ba0 Mon Sep 17 00:00:00 2001
+From: Peng Wu <wupeng58@huawei.com>
+Date: Fri, 11 Nov 2022 09:32:42 +0800
+Subject: [PATCH] proc: Count reliable memory usage of reliable tasks
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: d81e9624de2104c92417bfe2e72a374f6d864ba0
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4SK3S
+CVE: NA
+
+--------------------------------
+
+Counting reliable memory allocated by the reliable user tasks.
+
+The policy of counting reliable memory usage is based on RSS statistics.
+Anywhere with counter of mm need count reliable pages too. Reliable page
+which is checked by page_reliable() need to update the reliable page
+counter by calling reliable_page_counter().
+
+Updating the reliable pages should be considered if the following logic is
+added:
+- add_mm_counter
+- dec_mm_counter
+- inc_mm_counter_fast
+- dec_mm_counter_fast
+- rss[mm_counter(page)]
+
+Signed-off-by: Peng Wu <wupeng58@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ Documentation/filesystems/proc.rst |  2 ++
+ fs/proc/task_mmu.c                 |  1 +
+ include/linux/mem_reliable.h       | 14 ++++++++++++++
+ kernel/events/uprobes.c            |  2 ++
+ mm/huge_memory.c                   |  8 ++++++++
+ mm/khugepaged.c                    |  4 ++++
+ mm/ksm.c                           |  2 ++
+ mm/mem_reliable.c                  | 13 +++++++++++++
+ mm/memory.c                        | 12 ++++++++++++
+ mm/migrate.c                       |  5 +++++
+ mm/mmap.c                          |  1 +
+ mm/rmap.c                          |  5 +++++
+ mm/shmem.c                         |  1 +
+ mm/swapfile.c                      |  2 ++
+ mm/userfaultfd.c                   |  1 +
+ 15 files changed, 73 insertions(+)
+
+diff --git a/Documentation/filesystems/proc.rst b/Documentation/filesystems/proc.rst
+index a57d96cf4644..2fa2f7cd1287 100644
+--- a/Documentation/filesystems/proc.rst
++++ b/Documentation/filesystems/proc.rst
+@@ -195,6 +195,7 @@ read the file /proc/PID/status::
+   VmPTE:        20 kb
+   VmSwap:        0 kB
+   HugetlbPages:          0 kB
++  Reliable:         1608 kB
+   CoreDumping:    0
+   THP_enabled:	  1
+   Threads:        1
+@@ -275,6 +276,7 @@ It's slow but very precise.
+  VmSwap                      amount of swap used by anonymous private data
+                              (shmem swap usage is not included)
+  HugetlbPages                size of hugetlb memory portions
++ Reliable                    size of reliable memory used
+  CoreDumping                 process's memory is currently being dumped
+                              (killing the process may lead to a corrupted core)
+  THP_enabled		     process is allowed to use THP (returns 0 when
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index c61a3fbbfd71..f96d081b881a 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -77,6 +77,7 @@ void task_mem(struct seq_file *m, struct mm_struct *mm)
+ 	SEQ_PUT_DEC(" kB\nVmSwap:\t", swap);
+ 	seq_puts(m, " kB\n");
+ 	hugetlb_report_usage(m, mm);
++	reliable_report_usage(m, mm);
+ }
+ #undef SEQ_PUT_DEC
+ 
+diff --git a/include/linux/mem_reliable.h b/include/linux/mem_reliable.h
+index 5e14980d5793..ddadf2803742 100644
+--- a/include/linux/mem_reliable.h
++++ b/include/linux/mem_reliable.h
+@@ -23,6 +23,7 @@ extern bool pagecache_use_reliable_mem;
+ extern struct percpu_counter pagecache_reliable_pages;
+ extern struct percpu_counter anon_reliable_pages;
+ extern unsigned long task_reliable_limit __read_mostly;
++extern atomic_long_t reliable_user_used_nr_page;
+ 
+ extern void mem_reliable_init(bool has_unmirrored_mem,
+ 			      unsigned long *zone_movable_pfn,
+@@ -39,6 +40,8 @@ extern bool mem_reliable_counter_initialized(void);
+ extern void mem_reliable_out_of_memory(gfp_t gfp_mask, unsigned int order,
+ 				       int preferred_nid, nodemask_t *nodemask);
+ extern void reliable_show_mem_info(void);
++extern void reliable_report_usage(struct seq_file *m,
++		struct mm_struct *mm);
+ 
+ static inline bool mem_reliable_is_enabled(void)
+ {
+@@ -125,6 +128,13 @@ static inline bool reliable_allow_fb_enabled(void)
+ {
+ 	return reliable_allow_fallback;
+ }
++
++static inline void reliable_page_counter(struct page *page,
++		struct mm_struct *mm, int val)
++{
++	if (page_reliable(page))
++		atomic_long_add(val, &mm->reliable_nr_page);
++}
+ #else
+ #define reliable_enabled 0
+ #define pagecache_use_reliable_mem 0
+@@ -164,6 +174,10 @@ static inline void mem_reliable_out_of_memory(gfp_t gfp_mask,
+ 					      nodemask_t *nodemask) {}
+ static inline bool reliable_allow_fb_enabled(void) { return false; }
+ static inline void reliable_show_mem_info(void) {}
++static inline void reliable_page_counter(struct page *page,
++		struct mm_struct *mm, int val) {}
++static inline void reliable_report_usage(struct seq_file *m,
++		struct mm_struct *mm) {}
+ #endif
+ 
+ #endif
+diff --git a/kernel/events/uprobes.c b/kernel/events/uprobes.c
+index e1bbb3b92921..ad6664fcc3b2 100644
+--- a/kernel/events/uprobes.c
++++ b/kernel/events/uprobes.c
+@@ -183,6 +183,7 @@ static int __replace_page(struct vm_area_struct *vma, unsigned long addr,
+ 
+ 	if (new_page) {
+ 		get_page(new_page);
++		reliable_page_counter(new_page, mm, 1);
+ 		page_add_new_anon_rmap(new_page, vma, addr, false);
+ 		lru_cache_add_inactive_or_unevictable(new_page, vma);
+ 	} else
+@@ -194,6 +195,7 @@ static int __replace_page(struct vm_area_struct *vma, unsigned long addr,
+ 		inc_mm_counter(mm, MM_ANONPAGES);
+ 	}
+ 
++	reliable_page_counter(old_page, mm, -1);
+ 	flush_cache_page(vma, addr, pte_pfn(*pvmw.pte));
+ 	ptep_clear_flush_notify(vma, addr, pvmw.pte);
+ 	if (new_page)
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index 012ecf107ae0..e6f1903f6f63 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -652,6 +652,7 @@ static vm_fault_t __do_huge_pmd_anonymous_page(struct vm_fault *vmf,
+ 		pgtable_trans_huge_deposit(vma->vm_mm, vmf->pmd, pgtable);
+ 		set_pmd_at(vma->vm_mm, haddr, vmf->pmd, entry);
+ 		add_mm_counter(vma->vm_mm, MM_ANONPAGES, HPAGE_PMD_NR);
++		reliable_page_counter(page, vma->vm_mm, HPAGE_PMD_NR);
+ 		mm_inc_nr_ptes(vma->vm_mm);
+ 		spin_unlock(vmf->ptl);
+ 		count_vm_event(THP_FAULT_ALLOC);
+@@ -1115,6 +1116,7 @@ int copy_huge_pmd(struct mm_struct *dst_mm, struct mm_struct *src_mm,
+ 	get_page(src_page);
+ 	page_dup_rmap(src_page, true);
+ 	add_mm_counter(dst_mm, MM_ANONPAGES, HPAGE_PMD_NR);
++	reliable_page_counter(src_page, dst_mm, HPAGE_PMD_NR);
+ out_zero_page:
+ 	mm_inc_nr_ptes(dst_mm);
+ 	pgtable_trans_huge_deposit(dst_mm, dst_pmd, pgtable);
+@@ -1696,6 +1698,7 @@ int zap_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
+ 
+ 		if (pmd_present(orig_pmd)) {
+ 			page = pmd_page(orig_pmd);
++			reliable_page_counter(page, tlb->mm, -HPAGE_PMD_NR);
+ 			page_remove_rmap(page, true);
+ 			VM_BUG_ON_PAGE(page_mapcount(page) < 0, page);
+ 			VM_BUG_ON_PAGE(!PageHead(page), page);
+@@ -2077,6 +2080,7 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
+ 				set_page_dirty(page);
+ 			if (!PageReferenced(page) && pmd_young(old_pmd))
+ 				SetPageReferenced(page);
++			reliable_page_counter(page, mm, -HPAGE_PMD_NR);
+ 			page_remove_rmap(page, true);
+ 			put_page(page);
+ 		}
+@@ -2212,6 +2216,7 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
+ 
+ 	if (freeze) {
+ 		for (i = 0; i < HPAGE_PMD_NR; i++) {
++			reliable_page_counter(page + i, mm, -1);
+ 			page_remove_rmap(page + i, false);
+ 			put_page(page + i);
+ 		}
+@@ -3004,6 +3009,7 @@ void set_pmd_migration_entry(struct page_vma_mapped_walk *pvmw,
+ 	if (pmd_soft_dirty(pmdval))
+ 		pmdswp = pmd_swp_mksoft_dirty(pmdswp);
+ 	set_pmd_at(mm, address, pvmw->pmd, pmdswp);
++	reliable_page_counter(page, mm, -HPAGE_PMD_NR);
+ 	page_remove_rmap(page, true);
+ 	put_page(page);
+ }
+@@ -3031,6 +3037,7 @@ void remove_migration_pmd(struct page_vma_mapped_walk *pvmw, struct page *new)
+ 		pmde = pmd_wrprotect(pmd_mkuffd_wp(pmde));
+ 
+ 	flush_cache_range(vma, mmun_start, mmun_start + HPAGE_PMD_SIZE);
++	reliable_page_counter(new, mm, HPAGE_PMD_NR);
+ 	if (PageAnon(new))
+ 		page_add_anon_rmap(new, vma, mmun_start, true);
+ 	else
+@@ -3087,6 +3094,7 @@ vm_fault_t do_anon_huge_page_remap(struct vm_area_struct *vma, unsigned long add
+ 		pgtable_trans_huge_deposit(vma->vm_mm, pmd, pgtable);
+ 		set_pmd_at(vma->vm_mm, address, pmd, entry);
+ 		add_mm_counter(vma->vm_mm, MM_ANONPAGES, HPAGE_PMD_NR);
++		reliable_page_counter(page, vma->vm_mm, HPAGE_PMD_NR);
+ 		mm_inc_nr_ptes(vma->vm_mm);
+ 		spin_unlock(ptl);
+ 		count_vm_event(THP_FAULT_ALLOC);
+diff --git a/mm/khugepaged.c b/mm/khugepaged.c
+index c1346c933586..aaef16aa8945 100644
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@ -748,6 +748,7 @@ static void __collapse_huge_page_copy(pte_t *pte, struct page *page,
+ 		if (pte_none(pteval) || is_zero_pfn(pte_pfn(pteval))) {
+ 			clear_user_highpage(page, address);
+ 			add_mm_counter(vma->vm_mm, MM_ANONPAGES, 1);
++			reliable_page_counter(page, vma->vm_mm, 1);
+ 			if (is_zero_pfn(pte_pfn(pteval))) {
+ 				/*
+ 				 * ptl mostly unnecessary.
+@@ -776,6 +777,7 @@ static void __collapse_huge_page_copy(pte_t *pte, struct page *page,
+ 			 * superfluous.
+ 			 */
+ 			pte_clear(vma->vm_mm, address, _pte);
++			reliable_page_counter(src_page, vma->vm_mm, -1);
+ 			page_remove_rmap(src_page, false);
+ 			spin_unlock(ptl);
+ 			free_page_and_swap_cache(src_page);
+@@ -1202,6 +1204,7 @@ static void collapse_huge_page(struct mm_struct *mm,
+ 
+ 	spin_lock(pmd_ptl);
+ 	BUG_ON(!pmd_none(*pmd));
++	reliable_page_counter(new_page, vma->vm_mm, HPAGE_PMD_NR);
+ 	page_add_new_anon_rmap(new_page, vma, address, true);
+ 	lru_cache_add_inactive_or_unevictable(new_page, vma);
+ 	pgtable_trans_huge_deposit(mm, pmd, pgtable);
+@@ -1509,6 +1512,7 @@ void collapse_pte_mapped_thp(struct mm_struct *mm, unsigned long addr)
+ 		if (pte_none(*pte))
+ 			continue;
+ 		page = vm_normal_page(vma, addr, *pte);
++		reliable_page_counter(page, mm, -1);
+ 		page_remove_rmap(page, false);
+ 	}
+ 
+diff --git a/mm/ksm.c b/mm/ksm.c
+index 582c02058baf..169c0da1a9db 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -1155,6 +1155,7 @@ static int replace_page(struct vm_area_struct *vma, struct page *page,
+ 	 */
+ 	if (!is_zero_pfn(page_to_pfn(kpage))) {
+ 		get_page(kpage);
++		reliable_page_counter(kpage, mm, 1);
+ 		page_add_anon_rmap(kpage, vma, addr, false);
+ 		newpte = mk_pte(kpage, vma->vm_page_prot);
+ 	} else {
+@@ -1179,6 +1180,7 @@ static int replace_page(struct vm_area_struct *vma, struct page *page,
+ 	ptep_clear_flush(vma, addr, ptep);
+ 	set_pte_at_notify(mm, addr, ptep, newpte);
+ 
++	reliable_page_counter(page, mm, -1);
+ 	page_remove_rmap(page, false);
+ 	if (!page_mapped(page))
+ 		try_to_free_swap(page);
+diff --git a/mm/mem_reliable.c b/mm/mem_reliable.c
+index 125f6ef5587b..28baba72bb5e 100644
+--- a/mm/mem_reliable.c
++++ b/mm/mem_reliable.c
+@@ -33,6 +33,7 @@ static unsigned long reliable_pagecache_max_bytes = ULONG_MAX;
+ /* reliable user limit for user tasks with reliable flag */
+ unsigned long task_reliable_limit = ULONG_MAX;
+ long shmem_reliable_nr_page = ULONG_MAX >> PAGE_SHIFT;
++atomic_long_t reliable_user_used_nr_page;
+ 
+ bool mem_reliable_counter_initialized(void)
+ {
+@@ -178,6 +179,7 @@ void reliable_report_meminfo(struct seq_file *m)
+ 
+ 	show_val_kb(m, "ReliableTotal:    ", total_reliable_pages());
+ 	show_val_kb(m, "ReliableUsed:     ", used_reliable_pages());
++	show_val_kb(m, "ReliableTaskUsed: ", task_reliable_used_pages());
+ 	show_val_kb(m, "ReliableBuddyMem: ", free_reliable_pages());
+ 
+ 	if (shmem_reliable_is_enabled()) {
+@@ -518,3 +520,14 @@ static int __init setup_reliable_debug(char *str)
+ 	return 1;
+ }
+ __setup("reliable_debug", setup_reliable_debug);
++
++#define SEQ_PUT_DEC(str, val) \
++	seq_put_decimal_ull_width(m, str, (val) << (PAGE_SHIFT-10), 8)
++void reliable_report_usage(struct seq_file *m, struct mm_struct *mm)
++{
++	if (!mem_reliable_is_enabled())
++		return;
++
++	SEQ_PUT_DEC("Reliable:\t", atomic_long_read(&mm->reliable_nr_page));
++	seq_puts(m, "kB\n");
++}
+diff --git a/mm/memory.c b/mm/memory.c
+index dbb0fb9bcf81..767888f0ef04 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -834,6 +834,7 @@ copy_present_page(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma
+ 	*prealloc = NULL;
+ 	copy_user_highpage(new_page, page, addr, src_vma);
+ 	__SetPageUptodate(new_page);
++	reliable_page_counter(new_page, dst_vma->vm_mm, 1);
+ 	page_add_new_anon_rmap(new_page, dst_vma, addr, false);
+ 	lru_cache_add_inactive_or_unevictable(new_page, dst_vma);
+ 	rss[mm_counter(new_page)]++;
+@@ -1273,6 +1274,7 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
+ 					mark_page_accessed(page);
+ 			}
+ 			rss[mm_counter(page)]--;
++			reliable_page_counter(page, mm, -1);
+ 			page_remove_rmap(page, false);
+ 			if (unlikely(page_mapcount(page) < 0))
+ 				print_bad_pte(vma, addr, ptent, page);
+@@ -1300,6 +1302,7 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
+ 			}
+ 
+ 			pte_clear_not_present_full(mm, addr, pte, tlb->fullmm);
++			reliable_page_counter(page, mm, -1);
+ 			rss[mm_counter(page)]--;
+ 			page_remove_rmap(page, false);
+ 			put_page(page);
+@@ -1664,6 +1667,7 @@ static int insert_page_into_pte_locked(struct mm_struct *mm, pte_t *pte,
+ 	/* Ok, finally just insert the thing.. */
+ 	get_page(page);
+ 	inc_mm_counter_fast(mm, mm_counter_file(page));
++	reliable_page_counter(page, mm, 1);
+ 	page_add_file_rmap(page, false);
+ 	set_pte_at(mm, addr, pte, mk_pte(page, prot));
+ 	return 0;
+@@ -2942,9 +2946,12 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
+ 						mm_counter_file(old_page));
+ 				inc_mm_counter_fast(mm, MM_ANONPAGES);
+ 			}
++			reliable_page_counter(old_page, mm, -1);
+ 		} else {
+ 			inc_mm_counter_fast(mm, MM_ANONPAGES);
+ 		}
++
++		reliable_page_counter(new_page, mm, 1);
+ 		flush_cache_page(vma, vmf->address, pte_pfn(vmf->orig_pte));
+ 		entry = mk_pte(new_page, vma->vm_page_prot);
+ 		entry = pte_sw_mkyoung(entry);
+@@ -3528,6 +3535,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 	 */
+ 
+ 	inc_mm_counter_fast(vma->vm_mm, MM_ANONPAGES);
++	reliable_page_counter(page, vma->vm_mm, 1);
+ 	dec_mm_counter_fast(vma->vm_mm, MM_SWAPENTS);
+ 	pte = mk_pte(page, vma->vm_page_prot);
+ 	if ((vmf->flags & FAULT_FLAG_WRITE) && reuse_swap_page(page, NULL)) {
+@@ -3696,6 +3704,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 	}
+ 
+ 	inc_mm_counter_fast(vma->vm_mm, MM_ANONPAGES);
++	reliable_page_counter(page, vma->vm_mm, 1);
+ 	page_add_new_anon_rmap(page, vma, vmf->address, false);
+ 	lru_cache_add_inactive_or_unevictable(page, vma);
+ setpte:
+@@ -3890,6 +3899,7 @@ static vm_fault_t do_set_pmd(struct vm_fault *vmf, struct page *page)
+ 		entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
+ 
+ 	add_mm_counter(vma->vm_mm, mm_counter_file(page), HPAGE_PMD_NR);
++	reliable_page_counter(page, vma->vm_mm, HPAGE_PMD_NR);
+ 	page_add_file_rmap(page, true);
+ 	/*
+ 	 * deposit and withdraw with pmd lock held
+@@ -3962,6 +3972,7 @@ vm_fault_t alloc_set_pte(struct vm_fault *vmf, struct page *page)
+ 	if (write)
+ 		entry = maybe_mkwrite(pte_mkdirty(entry), vma);
+ 	/* copy-on-write page */
++	reliable_page_counter(page, vma->vm_mm, 1);
+ 	if (write && !(vma->vm_flags & VM_SHARED)) {
+ 		inc_mm_counter_fast(vma->vm_mm, MM_ANONPAGES);
+ 		page_add_new_anon_rmap(page, vma, vmf->address, false);
+@@ -5443,6 +5454,7 @@ vm_fault_t do_anon_page_remap(struct vm_area_struct *vma, unsigned long address,
+ 	if (ret)
+ 		goto release;
+ 	inc_mm_counter_fast(vma->vm_mm, MM_ANONPAGES);
++	reliable_page_counter(page, vma->vm_mm, 1);
+ 	page_add_new_anon_rmap(page, vma, address, false);
+ 	lru_cache_add_inactive_or_unevictable(page, vma);
+ 
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 94210ddd3f2a..3f6c76b97989 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -269,6 +269,7 @@ static bool remove_migration_pte(struct page *page, struct vm_area_struct *vma,
+ 		{
+ 			set_pte_at(vma->vm_mm, pvmw.address, pvmw.pte, pte);
+ 
++			reliable_page_counter(new, vma->vm_mm, 1);
+ 			if (PageAnon(new))
+ 				page_add_anon_rmap(new, vma, pvmw.address, false);
+ 			else
+@@ -2212,6 +2213,7 @@ int migrate_misplaced_transhuge_page(struct mm_struct *mm,
+ 	 * new page and page_add_new_anon_rmap guarantee the copy is
+ 	 * visible before the pagetable update.
+ 	 */
++	reliable_page_counter(new_page, vma->vm_mm, HPAGE_PMD_NR);
+ 	page_add_anon_rmap(new_page, vma, start, true);
+ 	/*
+ 	 * At this point the pmd is numa/protnone (i.e. non present) and the TLB
+@@ -2229,6 +2231,7 @@ int migrate_misplaced_transhuge_page(struct mm_struct *mm,
+ 
+ 	page_ref_unfreeze(page, 2);
+ 	mlock_migrate_page(new_page, page);
++	reliable_page_counter(page, vma->vm_mm, -HPAGE_PMD_NR);
+ 	page_remove_rmap(page, true);
+ 	set_page_owner_migrate_reason(new_page, MR_NUMA_MISPLACED);
+ 
+@@ -2473,6 +2476,7 @@ static int migrate_vma_collect_pmd(pmd_t *pmdp,
+ 			 * drop page refcount. Page won't be freed, as we took
+ 			 * a reference just above.
+ 			 */
++			reliable_page_counter(page, mm, -1);
+ 			page_remove_rmap(page, false);
+ 			put_page(page);
+ 
+@@ -2967,6 +2971,7 @@ static void migrate_vma_insert_page(struct migrate_vma *migrate,
+ 		goto unlock_abort;
+ 
+ 	inc_mm_counter(mm, MM_ANONPAGES);
++	reliable_page_counter(page, mm, 1);
+ 	page_add_new_anon_rmap(page, vma, addr, false);
+ 	if (!is_zone_device_page(page))
+ 		lru_cache_add_inactive_or_unevictable(page, vma);
+diff --git a/mm/mmap.c b/mm/mmap.c
+index 7fba5d89ecde..624586bef419 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -1747,6 +1747,7 @@ do_user_swap(struct mm_struct *mm, unsigned long addr_start, unsigned long len,
+ 		set_pte(pte, swp_entry_to_pte(swp_entry(SWP_USERSWAP_ENTRY,
+ 							page_to_pfn(page))));
+ 		dec_mm_counter(mm, MM_ANONPAGES);
++		reliable_page_counter(page, mm, -1);
+ 		page_remove_rmap(page, false);
+ 		put_page(page);
+ 
+diff --git a/mm/rmap.c b/mm/rmap.c
+index d0ef90af0567..3e12d26d8c55 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1594,6 +1594,7 @@ static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
+ 						     vma_mmu_pagesize(vma));
+ 			} else {
+ 				dec_mm_counter(mm, mm_counter(page));
++				reliable_page_counter(page, mm, -1);
+ 				set_pte_at(mm, address, pvmw.pte, pteval);
+ 			}
+ 
+@@ -1609,6 +1610,7 @@ static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
+ 			 * copied pages.
+ 			 */
+ 			dec_mm_counter(mm, mm_counter(page));
++			reliable_page_counter(page, mm, -1);
+ 			/* We have to invalidate as we cleared the pte */
+ 			mmu_notifier_invalidate_range(mm, address,
+ 						      address + PAGE_SIZE);
+@@ -1688,6 +1690,7 @@ static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
+ 					mmu_notifier_invalidate_range(mm,
+ 						address, address + PAGE_SIZE);
+ 					dec_mm_counter(mm, MM_ANONPAGES);
++					reliable_page_counter(page, mm, -1);
+ 					goto discard;
+ 				}
+ 
+@@ -1721,6 +1724,7 @@ static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
+ 				spin_unlock(&mmlist_lock);
+ 			}
+ 			dec_mm_counter(mm, MM_ANONPAGES);
++			reliable_page_counter(page, mm, -1);
+ 			inc_mm_counter(mm, MM_SWAPENTS);
+ 			swp_pte = swp_entry_to_pte(entry);
+ 			if (pte_soft_dirty(pteval))
+@@ -1743,6 +1747,7 @@ static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
+ 			 * See Documentation/vm/mmu_notifier.rst
+ 			 */
+ 			dec_mm_counter(mm, mm_counter_file(page));
++			reliable_page_counter(page, mm, -1);
+ 		}
+ discard:
+ 		/*
+diff --git a/mm/shmem.c b/mm/shmem.c
+index fbddc7dfb72e..e85ac8c2150f 100644
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -2467,6 +2467,7 @@ static int shmem_mfill_atomic_pte(struct mm_struct *dst_mm,
+ 	spin_unlock_irq(&info->lock);
+ 
+ 	inc_mm_counter(dst_mm, mm_counter_file(page));
++	reliable_page_counter(page, dst_mm, 1);
+ 	page_add_file_rmap(page, false);
+ 	set_pte_at(dst_mm, dst_addr, dst_pte, _dst_pte);
+ 
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index eaf483c7c83e..7faa30f460e4 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -1935,6 +1935,8 @@ static int unuse_pte(struct vm_area_struct *vma, pmd_t *pmd,
+ 	get_page(page);
+ 	set_pte_at(vma->vm_mm, addr, pte,
+ 		   pte_mkold(mk_pte(page, vma->vm_page_prot)));
++
++	reliable_page_counter(page, vma->vm_mm, 1);
+ 	if (page == swapcache) {
+ 		page_add_anon_rmap(page, vma, addr, false);
+ 	} else { /* ksm created a completely new copy */
+diff --git a/mm/userfaultfd.c b/mm/userfaultfd.c
+index 3849b28c0952..15c46208a2ac 100644
+--- a/mm/userfaultfd.c
++++ b/mm/userfaultfd.c
+@@ -150,6 +150,7 @@ static int mcopy_atomic_pte(struct mm_struct *dst_mm,
+ #endif
+ 
+ 	inc_mm_counter(dst_mm, MM_ANONPAGES);
++	reliable_page_counter(page, dst_mm, 1);
+ 	page_add_new_anon_rmap(page, dst_vma, dst_addr, false);
+ 	lru_cache_add_inactive_or_unevictable(page, dst_vma);
+ 
+-- 
+2.33.0
+

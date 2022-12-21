@@ -1,0 +1,139 @@
+From 8a9bc410e7ccf0bcddb6a6f6ccc526bae11d0311 Mon Sep 17 00:00:00 2001
+From: Tong Tiangen <tongtiangen@huawei.com>
+Date: Fri, 18 Nov 2022 02:08:52 +0000
+Subject: [PATCH] arm64: add support for machine check error safe
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 8a9bc410e7ccf0bcddb6a6f6ccc526bae11d0311
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5GB28
+CVE: NA
+
+-------------------------------
+
+During the processing of arm64 kernel hardware memory errors(do_sea()), if
+the errors is consumed in the kernel, the current processing is panic.
+However, it is not optimal.
+
+Take uaccess for example, if the uaccess operation fails due to memory
+error, only the user process will be affected, kill the user process
+and isolate the user page with hardware memory errors is a better choice.
+
+This patch only enable machine error check framework, it add exception
+fixup before kernel panic in do_sea() and only limit the consumption of
+hardware memory errors in kernel mode triggered by user mode processes.
+If fixup successful, panic can be avoided.
+
+Signed-off-by: Tong Tiangen <tongtiangen@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/Kconfig               |  2 ++
+ arch/arm64/include/asm/extable.h |  1 +
+ arch/arm64/mm/extable.c          | 12 ++++++++++++
+ arch/arm64/mm/fault.c            | 29 ++++++++++++++++++++++++++++-
+ 4 files changed, 43 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
+index baead090bbc1..806f2a9af0ba 100644
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -11,6 +11,7 @@ config ARM64
+ 	select ACPI_PPTT if ACPI
+ 	select ARCH_HAS_DEBUG_WX
+ 	select ARCH_BINFMT_ELF_STATE
++	select ARCH_HAS_COPY_MC if ACPI_APEI_GHES
+ 	select ARCH_HAS_DEBUG_VIRTUAL
+ 	select ARCH_HAS_DEBUG_VM_PGTABLE
+ 	select ARCH_HAS_DEVMEM_IS_ALLOWED
+@@ -22,6 +23,7 @@ config ARM64
+ 	select ARCH_HAS_GIGANTIC_PAGE
+ 	select ARCH_HAS_KCOV
+ 	select ARCH_HAS_KEEPINITRD
++	select ARCH_HAS_MC_EXTABLE if ARCH_HAS_COPY_MC
+ 	select ARCH_HAS_MEMBARRIER_SYNC_CORE
+ 	select ARCH_HAS_NON_OVERLAPPING_ADDRESS_SPACE
+ 	select ARCH_HAS_PTE_DEVMAP
+diff --git a/arch/arm64/include/asm/extable.h b/arch/arm64/include/asm/extable.h
+index b15eb4a3e6b2..35c70cc4e9c5 100644
+--- a/arch/arm64/include/asm/extable.h
++++ b/arch/arm64/include/asm/extable.h
+@@ -44,4 +44,5 @@ int arm64_bpf_fixup_exception(const struct exception_table_entry *ex,
+ #endif /* !CONFIG_BPF_JIT */
+ 
+ extern int fixup_exception(struct pt_regs *regs);
++extern int fixup_exception_mc(struct pt_regs *regs);
+ #endif
+diff --git a/arch/arm64/mm/extable.c b/arch/arm64/mm/extable.c
+index aa0060178343..9f07b8f13c63 100644
+--- a/arch/arm64/mm/extable.c
++++ b/arch/arm64/mm/extable.c
+@@ -20,3 +20,15 @@ int fixup_exception(struct pt_regs *regs)
+ 	regs->pc = (unsigned long)&fixup->fixup + fixup->fixup;
+ 	return 1;
+ }
++
++int fixup_exception_mc(struct pt_regs *regs)
++{
++	const struct exception_table_entry *fixup;
++
++	fixup = search_mc_exception_tables(instruction_pointer(regs));
++	if (!fixup)
++		return 0;
++
++	regs->pc = (unsigned long)&fixup->fixup + fixup->fixup;
++	return 1;
++}
+diff --git a/arch/arm64/mm/fault.c b/arch/arm64/mm/fault.c
+index 3fc5aceb72eb..4ab0ba661657 100644
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@ -634,6 +634,31 @@ static int do_bad(unsigned long addr, unsigned int esr, struct pt_regs *regs)
+ 	return 1; /* "fault" */
+ }
+ 
++static bool arm64_do_kernel_sea(void __user *addr, unsigned int esr,
++				struct pt_regs *regs, int sig, int code)
++{
++	if (!IS_ENABLED(CONFIG_ARCH_HAS_COPY_MC))
++		return false;
++
++	if (user_mode(regs))
++		return false;
++
++	if (apei_claim_sea(regs) < 0)
++		return false;
++
++	if (!fixup_exception_mc(regs))
++		return false;
++
++	if (current->flags & PF_KTHREAD)
++		return true;
++
++	set_thread_esr(0, esr);
++	arm64_force_sig_fault(sig, code, addr,
++		"Uncorrected memory error on access to user memory\n");
++
++	return true;
++}
++
+ static int do_sea(unsigned long addr, unsigned int esr, struct pt_regs *regs)
+ {
+ 	const struct fault_info *inf;
+@@ -653,7 +678,9 @@ static int do_sea(unsigned long addr, unsigned int esr, struct pt_regs *regs)
+ 		siaddr = NULL;
+ 	else
+ 		siaddr  = (void __user *)addr;
+-	arm64_notify_die(inf->name, regs, inf->sig, inf->code, siaddr, esr);
++
++	if (!arm64_do_kernel_sea(siaddr, esr, regs, inf->sig, inf->code))
++		arm64_notify_die(inf->name, regs, inf->sig, inf->code, siaddr, esr);
+ 
+ 	return 0;
+ }
+-- 
+2.33.0
+

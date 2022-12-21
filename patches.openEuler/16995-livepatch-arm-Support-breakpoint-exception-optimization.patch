@@ -1,0 +1,124 @@
+From bdbfffd4fcc2b607fe8044b2c9f2b0ac1c49ca19 Mon Sep 17 00:00:00 2001
+From: Yang Jihong <yangjihong1@huawei.com>
+Date: Wed, 6 Jul 2022 18:05:23 +0800
+Subject: [PATCH] livepatch/arm: Support breakpoint exception optimization
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: bdbfffd4fcc2b607fe8044b2c9f2b0ac1c49ca19
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5CJ7X
+
+--------------------------------
+
+Add breakpoint exception optimization support to improve livepatch
+success rate for arm.
+
+Signed-off-by: Yang Jihong <yangjihong1@huawei.com>
+Reviewed-by: Xu Kuohai <xukuohai@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm/include/asm/livepatch.h | 10 +++++++
+ arch/arm/kernel/livepatch.c      | 45 ++++++++++++++++++++++++++++++++
+ 2 files changed, 55 insertions(+)
+
+diff --git a/arch/arm/include/asm/livepatch.h b/arch/arm/include/asm/livepatch.h
+index befa1efbbcd1..70ce2dba7134 100644
+--- a/arch/arm/include/asm/livepatch.h
++++ b/arch/arm/include/asm/livepatch.h
+@@ -23,6 +23,8 @@
+ 
+ #include <linux/module.h>
+ 
++#define KLP_ARM_BREAKPOINT_INSTRUCTION		0xe7f001f9
++
+ struct klp_patch;
+ struct klp_func;
+ 
+@@ -47,8 +49,16 @@ int klp_check_calltrace(struct klp_patch *patch, int enable);
+ 
+ struct arch_klp_data {
+ 	u32 old_insns[LJMP_INSN_SIZE];
++
++	/*
++	 * Saved opcode at the entry of the old func (which maybe replaced
++	 * with breakpoint).
++	 */
++	u32 saved_opcode;
+ };
+ 
++int arch_klp_add_breakpoint(struct arch_klp_data *arch_data, void *old_func);
++void arch_klp_remove_breakpoint(struct arch_klp_data *arch_data, void *old_func);
+ long arch_klp_save_old_code(struct arch_klp_data *arch_data, void *old_func);
+ 
+ #endif
+diff --git a/arch/arm/kernel/livepatch.c b/arch/arm/kernel/livepatch.c
+index 338222846b81..26241749cf08 100644
+--- a/arch/arm/kernel/livepatch.c
++++ b/arch/arm/kernel/livepatch.c
+@@ -28,6 +28,8 @@
+ #include <asm/stacktrace.h>
+ #include <asm/cacheflush.h>
+ #include <linux/slab.h>
++#include <linux/ptrace.h>
++#include <asm/traps.h>
+ #include <asm/insn.h>
+ #include <asm/patch.h>
+ 
+@@ -317,6 +319,49 @@ int klp_check_calltrace(struct klp_patch *patch, int enable)
+ 	free_list(&check_funcs);
+ 	return ret;
+ }
++
++int arch_klp_add_breakpoint(struct arch_klp_data *arch_data, void *old_func)
++{
++	u32 *addr = (u32 *)old_func;
++
++	arch_data->saved_opcode = le32_to_cpu(*addr);
++	patch_text(old_func, KLP_ARM_BREAKPOINT_INSTRUCTION);
++	return 0;
++}
++
++void arch_klp_remove_breakpoint(struct arch_klp_data *arch_data, void *old_func)
++{
++	patch_text(old_func, arch_data->saved_opcode);
++}
++
++static int klp_trap_handler(struct pt_regs *regs, unsigned int instr)
++{
++	void *brk_func = NULL;
++	unsigned long addr = regs->ARM_pc;
++
++	brk_func = klp_get_brk_func((void *)addr);
++	if (!brk_func) {
++		pr_warn("Unrecoverable livepatch detected.\n");
++		BUG();
++	}
++
++	regs->ARM_pc = (unsigned long)brk_func;
++	return 0;
++}
++
++static struct undef_hook klp_arm_break_hook = {
++	.instr_mask	= 0x0fffffff,
++	.instr_val	= (KLP_ARM_BREAKPOINT_INSTRUCTION & 0x0fffffff),
++	.cpsr_mask	= MODE_MASK,
++	.cpsr_val	= SVC_MODE,
++	.fn		= klp_trap_handler,
++};
++
++void arch_klp_init(void)
++{
++	register_undef_hook(&klp_arm_break_hook);
++}
++
+ #endif
+ 
+ static inline bool offset_in_range(unsigned long pc, unsigned long addr,
+-- 
+2.33.0
+

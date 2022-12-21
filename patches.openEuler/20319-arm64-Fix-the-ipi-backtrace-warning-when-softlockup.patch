@@ -1,0 +1,117 @@
+From 81ad62c3883e79f3577cb8546e6cb893644a9374 Mon Sep 17 00:00:00 2001
+From: Chen Jiahao <chenjiahao16@huawei.com>
+Date: Tue, 15 Nov 2022 23:03:57 +0800
+Subject: [PATCH] arm64: Fix the ipi backtrace warning when softlockup
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 81ad62c3883e79f3577cb8546e6cb893644a9374
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 187431, https://gitee.com/openeuler/kernel/issues/I5ZUTK
+
+--------------------------------
+
+f86d165bfe5f ("arm64: Add non nmi ipi backtrace support")
+introduced the IPI backtrace support on arm64 with NMI unsupported.
+
+However a warning message comes when triggering the non-NMI
+IPI backtrace:
+
+WARNING: CPU: 6 PID: 1121 at kernel/smp.c:680 smp_call_function_many_cond+0x78/0x3dc
+Modules linked in: soft_lockup_test(OE) [last unloaded: soft_lockup_test]
+CPU: 6 PID: 1121 Comm: loop_thread Tainted: G           OEL    5.10.0+ #9
+Hardware name: linux,dummy-virt (DT)
+pstate: 40000085 (nZcv daIf -PAN -UAO -TCO BTYPE=--)
+pc : smp_call_function_many_cond+0x78/0x3dc
+lr : smp_call_function_many+0x40/0x50
+sp : ffffffc010033c10
+x29: ffffffc010033c10 x28: 0000000000000000
+x27: ffffffd5dfe2a9a8 x26: ffffffa9bfdb4430
+x25: 0000000000000000 x24: 0000000000000000
+x23: ffffffd5dfe29000 x22: 0000000000000000
+x21: 0000000000000006 x20: ffffffd5df216418
+x19: ffffffd5dfe2a9a8 x18: 0000000000000000
+x17: 0000000000000000 x16: ffffffd5df293d78
+x15: 0000000000000000 x14: 0000000000000000
+x13: 0000000000000000 x12: 0000000000000000
+x11: 0000000000000000 x10: 0000000000000000
+x9 : 0025001680000006 x8 : 4e4d492066726f6d
+x7 : 53656e64696e6720 x6 : 0000000000000001
+x5 : ffffffa9bfdb0750 x4 : 0000000000000000
+x3 : 0000000000000000 x2 : ffffffd3e01ab000
+x1 : ffffffd5dfc03000 x0 : 0000000000010000
+Call trace:
+ smp_call_function_many_cond+0x78/0x3dc
+ smp_call_function_many+0x40/0x50
+ arm64_send_ipi+0x30/0x3c
+ nmi_trigger_cpumask_backtrace+0xfc/0x154
+ arch_trigger_cpumask_backtrace+0x3c/0x58
+ watchdog_timer_fn+0x1d4/0x220
+ __hrtimer_run_queues+0x1bc/0x2c8
+ hrtimer_run_queues+0xe4/0x110
+ run_local_timers+0x24/0x50
+ update_process_times+0x5c/0x88
+ tick_periodic+0xd0/0xec
+ tick_handle_periodic+0x38/0x8c
+ arch_timer_handler_virt+0x38/0x50
+ handle_percpu_devid_irq+0xe0/0x1e0
+ generic_handle_irq+0x34/0x4c
+ __handle_domain_irq+0xb0/0xb8
+ gic_handle_irq+0x98/0xb8
+ el1_irq+0xa8/0x140
+ loop_func+0x14/0x28 [soft_lockup_test]
+ kthread+0x120/0x130
+ ret_from_fork+0x10/0x18
+
+The cause is calling smp_call_function_many to send IPI to other CPUs
+in a softirq handling context, which is unsafe and may lead to deadlock.
+
+Use smp_call_function_single_async() instead to avoid the warning above.
+
+Fixes: f86d165bfe5f ("arm64: Add non nmi ipi backtrace support")
+Signed-off-by: Chen Jiahao <chenjiahao16@huawei.com>
+Reviewed-by: Zhang Jianhua <chris.zjh@huawei.com>
+Reviewed-by: Liao Chang <liaochang1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/kernel/ipi_nmi.c | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/kernel/ipi_nmi.c b/arch/arm64/kernel/ipi_nmi.c
+index 2cf28e511b23..9a8f7c256117 100644
+--- a/arch/arm64/kernel/ipi_nmi.c
++++ b/arch/arm64/kernel/ipi_nmi.c
+@@ -40,9 +40,25 @@ static void ipi_cpu_backtrace(void *info)
+ 	printk_safe_exit();
+ }
+ 
++static DEFINE_PER_CPU(call_single_data_t, cpu_backtrace_csd) =
++	CSD_INIT(ipi_cpu_backtrace, NULL);
++
+ static void arm64_send_ipi(cpumask_t *mask)
+ {
+-	smp_call_function_many(mask, ipi_cpu_backtrace, NULL, false);
++	call_single_data_t *csd;
++	int this_cpu = raw_smp_processor_id();
++	int cpu;
++	int ret;
++
++	for_each_online_cpu(cpu) {
++		if (cpu == this_cpu)
++			continue;
++
++		csd = &per_cpu(cpu_backtrace_csd, cpu);
++		ret = smp_call_function_single_async(cpu, csd);
++		if (ret)
++			pr_info("Sending IPI failed to CPU %d\n", cpu);
++	}
+ }
+ 
+ bool arch_trigger_cpumask_backtrace(const cpumask_t *mask, bool exclude_self)
+-- 
+2.33.0
+

@@ -1,0 +1,857 @@
+From 89f4eb95683bff7dc609b93b31937115257f2820 Mon Sep 17 00:00:00 2001
+From: Ke Chen <chenke54@huawei.com>
+Date: Wed, 9 Nov 2022 14:36:31 +0800
+Subject: [PATCH] roh/hns3: Add support for roh abnormal interruption
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 89f4eb95683bff7dc609b93b31937115257f2820
+Modified-by-SEL: No
+
+
+driver inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5WKYW
+
+-----------------------------------------------------------------------
+
+This patch adds initialization and deinitialization for roh
+interrupt. This interrupt will be used to handle link event
+reporting.
+
+The ROH core provides a mechanism for processing ROH event
+notifications, which is used by the driver to report link
+events to roh core.
+
+Signed-off-by: Ke Chen <chenke54@huawei.com>
+Reviewed-by: Gang Zhang <gang.zhang@huawei.com>
+Reviewed-by: Yefeng Yan <yanyefeng@huawei.com>
+Reviewed-by: Jingchao Dai <daijingchao1@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/roh/core/core.c           |  23 +++++
+ drivers/roh/core/core.h           |  12 +++
+ drivers/roh/hw/hns3/Makefile      |   1 +
+ drivers/roh/hw/hns3/hns3_cmdq.c   | 135 ++++++++++++++++++++++++++
+ drivers/roh/hw/hns3/hns3_cmdq.h   |  46 +++++++++
+ drivers/roh/hw/hns3/hns3_common.h |  26 +++++
+ drivers/roh/hw/hns3/hns3_device.h |  40 ++++++++
+ drivers/roh/hw/hns3/hns3_intr.c   | 136 +++++++++++++++++++++++++++
+ drivers/roh/hw/hns3/hns3_intr.h   |  13 +++
+ drivers/roh/hw/hns3/hns3_main.c   | 151 +++++++++++++++++++++++++++++-
+ 10 files changed, 582 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/roh/hw/hns3/hns3_device.h
+ create mode 100644 drivers/roh/hw/hns3/hns3_intr.c
+ create mode 100644 drivers/roh/hw/hns3/hns3_intr.h
+
+diff --git a/drivers/roh/core/core.c b/drivers/roh/core/core.c
+index df563249f5d2..945c37511c3d 100644
+--- a/drivers/roh/core/core.c
++++ b/drivers/roh/core/core.c
+@@ -574,6 +574,29 @@ enum roh_link_status roh_device_query_link_status(struct roh_device *device)
+ 	return device->link_status;
+ }
+ 
++static void roh_update_link_status(struct roh_device *device, u32 ls)
++{
++	device->link_status = ls;
++}
++
++void roh_event_notify(struct roh_event *event)
++{
++	struct roh_device *device = event->device;
++
++	switch (event->type) {
++	case ROH_EVENT_LINK_UP:
++		roh_update_link_status(device, ROH_LINK_UP);
++		break;
++	case ROH_EVENT_LINK_DOWN:
++		roh_update_link_status(device, ROH_LINK_DOWN);
++		break;
++	default:
++		pr_err("roh_core: not support event type(%d).\n", event->type);
++		break;
++	}
++}
++EXPORT_SYMBOL(roh_event_notify);
++
+ int roh_core_init(void)
+ {
+ 	int ret;
+diff --git a/drivers/roh/core/core.h b/drivers/roh/core/core.h
+index 3c528b5c6d01..bf8880945745 100644
+--- a/drivers/roh/core/core.h
++++ b/drivers/roh/core/core.h
+@@ -95,6 +95,16 @@ struct roh_device {
+ 	struct roh_mib_stats *hw_private_stats;
+ };
+ 
++enum roh_event_type {
++	ROH_EVENT_LINK_DOWN = 0,
++	ROH_EVENT_LINK_UP
++};
++
++struct roh_event {
++	struct roh_device *device;
++	enum roh_event_type type;
++};
++
+ static inline bool roh_device_try_get(struct roh_device *device)
+ {
+ 	return refcount_inc_not_zero(&device->refcount);
+@@ -108,6 +118,8 @@ void roh_dealloc_device(struct roh_device *device);
+ int roh_register_device(struct roh_device *device);
+ void roh_unregister_device(struct roh_device *device);
+ 
++void roh_event_notify(struct roh_event *event);
++
+ int roh_core_init(void);
+ void roh_core_cleanup(void);
+ 
+diff --git a/drivers/roh/hw/hns3/Makefile b/drivers/roh/hw/hns3/Makefile
+index df358c4c3464..d3d7bfb9aaf8 100644
+--- a/drivers/roh/hw/hns3/Makefile
++++ b/drivers/roh/hw/hns3/Makefile
+@@ -9,5 +9,6 @@ ccflags-y +=  -I $(srctree)/drivers/roh/hw/hns3
+ 
+ hns-roh-v1-objs := hns3_cmdq.o	\
+ 		   hns3_verbs.o	\
++		   hns3_intr.o	\
+ 		   hns3_main.o
+ obj-$(CONFIG_ROH_HNS) += hns-roh-v1.o
+diff --git a/drivers/roh/hw/hns3/hns3_cmdq.c b/drivers/roh/hw/hns3/hns3_cmdq.c
+index 325b5a20f431..fccb0c482234 100644
+--- a/drivers/roh/hw/hns3/hns3_cmdq.c
++++ b/drivers/roh/hw/hns3/hns3_cmdq.c
+@@ -8,6 +8,7 @@
+ #include <linux/delay.h>
+ 
+ #include "core.h"
++#include "hns3_device.h"
+ #include "hns3_common.h"
+ #include "hns3_cmdq.h"
+ #include "hns3_reg.h"
+@@ -315,3 +316,137 @@ int hns3_roh_cmdq_send(struct hns3_roh_device *hroh_dev, struct hns3_roh_desc *d
+ 
+ 	return ret;
+ }
++
++int hns3_roh_get_link_status(struct hns3_roh_device *hroh_dev, u32 *link_status)
++{
++	struct hns3_roh_query_link_status_info *req;
++	struct hns3_roh_desc desc;
++	u32 link_val;
++	int ret;
++
++	hns3_roh_cmdq_setup_basic_desc(&desc, HNS3_ROH_OPC_QUERY_PORT_LINK_STATUS, true);
++	ret = hns3_roh_cmdq_send(hroh_dev, &desc, 1);
++	if (ret) {
++		dev_err(hroh_dev->dev, "failed to query link status, ret = %d\n", ret);
++		return ret;
++	}
++
++	req = (struct hns3_roh_query_link_status_info *)desc.data;
++	link_val = le32_to_cpu(req->query_link_status);
++
++	*link_status = link_val ? HNS3_ROH_LINK_STATUS_UP : HNS3_ROH_LINK_STATUS_DOWN;
++
++	return 0;
++}
++
++static void hns3_roh_dispatch_event(struct hns3_roh_device *hroh_dev, enum roh_event_type type)
++{
++	struct roh_event event = {0};
++
++	event.device = &hroh_dev->roh_dev;
++	event.type = type;
++	roh_event_notify(&event);
++}
++
++void hns3_roh_update_link_status(struct hns3_roh_device *hroh_dev)
++{
++	u32 state = HNS3_ROH_LINK_STATUS_DOWN;
++	enum roh_event_type type;
++	int ret;
++
++	if (test_and_set_bit(HNS3_ROH_SW_STATE_LINK_UPDATING, &hroh_dev->state))
++		return;
++
++	ret = hns3_roh_get_link_status(hroh_dev, &state);
++	if (ret) {
++		state = HNS3_ROH_LINK_STATUS_DOWN;
++		clear_bit(HNS3_ROH_SW_STATE_LINK_UPDATING, &hroh_dev->state);
++		return;
++	}
++
++	type = (state == HNS3_ROH_LINK_STATUS_DOWN) ? ROH_EVENT_LINK_DOWN : ROH_EVENT_LINK_UP;
++	hns3_roh_dispatch_event(hroh_dev, type);
++
++	clear_bit(HNS3_ROH_SW_STATE_LINK_UPDATING, &hroh_dev->state);
++}
++
++static void hns3_roh_link_fail_parse(struct hns3_roh_device *hroh_dev,
++				     u8 link_fail_code)
++{
++	switch (link_fail_code) {
++	case HNS3_ROH_LF_REF_CLOCK_LOST:
++		dev_warn(hroh_dev->dev, "reference clock lost!\n");
++		break;
++	case HNS3_ROH_LF_XSFP_TX_DISABLE:
++		dev_warn(hroh_dev->dev, "SFP tx is disabled!\n");
++		break;
++	case HNS3_ROH_LF_XSFP_ABSENT:
++		dev_warn(hroh_dev->dev, "SFP is absent!\n");
++		break;
++	default:
++		break;
++	}
++}
++
++static void hns3_roh_handle_link_change_event(struct hns3_roh_device *hroh_dev,
++					      struct hns3_roh_mbx_vf_to_pf_cmd *req)
++{
++	int link_status = req->msg.subcode;
++
++	hns3_roh_task_schedule(hroh_dev, 0);
++
++	if (link_status == HNS3_ROH_LINK_STATUS_DOWN)
++		hns3_roh_link_fail_parse(hroh_dev, req->msg.data[0]);
++}
++
++static bool hns3_roh_cmd_crq_empty(struct hns3_roh_device *hroh_dev)
++{
++	struct hns3_roh_priv *priv = (struct hns3_roh_priv *)hroh_dev->priv;
++	u32 tail = hns3_roh_read(hroh_dev, HNS3_ROH_RX_CMDQ_TAIL_REG);
++
++	return tail == priv->cmdq.crq.next_to_use;
++}
++
++void hns3_roh_mbx_handler(struct hns3_roh_device *hroh_dev)
++{
++	struct hns3_roh_priv *priv = (struct hns3_roh_priv *)hroh_dev->priv;
++	struct hns3_roh_cmdq_ring *crq = &priv->cmdq.crq;
++	struct hns3_roh_mbx_vf_to_pf_cmd *req;
++	struct hns3_roh_desc *desc;
++	unsigned int flag;
++
++	/* handle all the mailbox requests in the queue */
++	while (!hns3_roh_cmd_crq_empty(hroh_dev)) {
++		desc = &crq->desc[crq->next_to_use];
++		req = (struct hns3_roh_mbx_vf_to_pf_cmd *)desc->data;
++
++		flag = le16_to_cpu(crq->desc[crq->next_to_use].flag);
++		if (unlikely(!hns3_roh_get_bit(flag, HNS3_ROH_CMDQ_RX_OUTVLD_B))) {
++			dev_warn(hroh_dev->dev,
++				 "dropped invalid mbx message, code = %u\n",
++				 req->msg.code);
++
++			/* dropping/not processing this invalid message */
++			crq->desc[crq->next_to_use].flag = 0;
++			hns3_roh_mbx_ring_ptr_move_crq(crq);
++			continue;
++		}
++
++		switch (req->msg.code) {
++		case HNS3_ROH_MBX_PUSH_LINK_STATUS:
++			hns3_roh_handle_link_change_event(hroh_dev, req);
++			break;
++		default:
++			dev_err(hroh_dev->dev,
++				"un-supported mbx message, code = %u\n",
++				req->msg.code);
++			break;
++		}
++
++		crq->desc[crq->next_to_use].flag = 0;
++		hns3_roh_mbx_ring_ptr_move_crq(crq);
++	}
++
++	/* write back CMDQ_RQ header ptr, M7 need this ptr */
++	hns3_roh_write(hroh_dev, HNS3_ROH_RX_CMDQ_HEAD_REG, crq->next_to_use);
++}
+diff --git a/drivers/roh/hw/hns3/hns3_cmdq.h b/drivers/roh/hw/hns3/hns3_cmdq.h
+index ca6df81c43d9..0176c93d0af1 100644
+--- a/drivers/roh/hw/hns3/hns3_cmdq.h
++++ b/drivers/roh/hw/hns3/hns3_cmdq.h
+@@ -26,6 +26,7 @@ enum { HNS3_ROH_CMDQ_CRQ = 0, HNS3_ROH_CMDQ_CSQ };
+ 
+ enum hns3_roh_opcode_type {
+ 	HNS3_ROH_OPC_GET_INTR_INFO = 0x0023,
++	HNS3_ROH_OPC_QUERY_PORT_LINK_STATUS = 0x038a,
+ 	HNS3_ROH_OPC_SET_EID = 0x9001,
+ 	HNS3_ROH_OPC_GET_GUID = 0x9002,
+ 	HNS3_ROH_OPC_QUERY_MIB_PUBLIC = 0x9005,
+@@ -44,6 +45,24 @@ enum hns3_roh_cmd_return_status {
+ 	HNS3_ROH_CMD_EXEC_TIMEOUT
+ };
+ 
++enum hns3_roh_mbx_opcode {
++	HNS3_ROH_MBX_PUSH_LINK_STATUS = 201 /* (M7 -> PF) get port link status */
++};
++
++struct hns3_roh_get_intr_info {
++	__le16 tqp_num;
++	__le16 packet_buffer_cell_cnt;
++	__le16 msixcap_localid_ba_nic;
++	__le16 msixcap_localid_number_nic;
++	__le16 pf_intr_vector_number_roce;
++	__le16 pf_own_fun_number;
++	__le16 tx_pkt_buffer_cell_cnt;
++	__le16 delay_value_cell_num;
++	__le16 tqp_number_1k;
++	__le16 pf_intr_vector_number_roh;
++	u8 rsv[4];
++};
++
+ struct hns3_roh_set_eid_info {
+ 	__le32 base_eid;
+ 	__le32 num_eid;
+@@ -55,6 +74,31 @@ struct hns3_roh_get_guid_info {
+ 	u8 rsv[8];
+ };
+ 
++struct hns3_roh_query_link_status_info {
++	__le32 query_link_status;
++	u8 rsv[20];
++};
++
++#define HNS3_ROH_MBX_MAX_MSG_SIZE 14
++
++struct hns3_roh_vf_to_pf_msg {
++	u8 code;
++	struct {
++		u8 subcode;
++		u8 data[HNS3_ROH_MBX_MAX_MSG_SIZE];
++	};
++};
++
++struct hns3_roh_mbx_vf_to_pf_cmd {
++	u8 rsv;
++	u8 mbx_src_vfid; /* Auto filled by IMP */
++	u8 mbx_need_resp;
++	u8 rsv1;
++	u8 msg_len;
++	u8 rsv2[3];
++	struct hns3_roh_vf_to_pf_msg msg;
++};
++
+ static inline void hns3_roh_mbx_ring_ptr_move_crq(struct hns3_roh_cmdq_ring *crq)
+ {
+ 	crq->next_to_use = (crq->next_to_use + 1) % crq->desc_num;
+@@ -66,5 +110,7 @@ int hns3_roh_cmdq_send(struct hns3_roh_device *hroh_dev,
+ 		       struct hns3_roh_desc *desc, int num);
+ void hns3_roh_cmdq_setup_basic_desc(struct hns3_roh_desc *desc,
+ 				    enum hns3_roh_opcode_type opcode, bool is_read);
++int hns3_roh_get_link_status(struct hns3_roh_device *hroh_dev, u32 *link_status);
++void hns3_roh_update_link_status(struct hns3_roh_device *hroh_dev);
+ 
+ #endif /* __HNS3_ROH_CMDQ_H__ */
+diff --git a/drivers/roh/hw/hns3/hns3_common.h b/drivers/roh/hw/hns3/hns3_common.h
+index 60e93fb4a243..b1c52ead765b 100644
+--- a/drivers/roh/hw/hns3/hns3_common.h
++++ b/drivers/roh/hw/hns3/hns3_common.h
+@@ -8,7 +8,10 @@
+ 
+ #define HNS3_ROH_VERSION "1.0"
+ 
++#define HNS3_ROH_MIN_VECTOR_NUM 2
++
+ #define HNS3_ROH_NAME "roh"
++#define HNS3_ROH_INT_NAME_LEN 32
+ 
+ #define HNS3_ROH_DESC_DATA_LEN 6
+ 
+@@ -54,6 +57,18 @@ struct hns3_roh_priv {
+ 	unsigned long state;
+ };
+ 
++struct hns3_roh_intr_info {
++	u16 base_vecotr;
++	u16 vector_offset;
++	u16 vector_num;
++};
++
++struct hns3_roh_abn_vector {
++	u8 __iomem *addr;
++	int vector_irq;
++	char name[HNS3_ROH_INT_NAME_LEN];
++};
++
+ struct hns3_roh_device {
+ 	struct roh_device roh_dev;
+ 	struct pci_dev *pdev;
+@@ -64,11 +79,18 @@ struct hns3_roh_device {
+ 	u8 __iomem *reg_base;
+ 	const struct hns3_roh_hw *hw;
+ 	struct hns3_roh_priv *priv;
++
++	struct hns3_roh_intr_info intr_info;
++	struct hns3_roh_abn_vector abn_vector;
++	unsigned long last_processed;
++	unsigned long state;
++	struct delayed_work srv_task;
+ };
+ 
+ struct hns3_roh_hw {
+ 	int (*cmdq_init)(struct hns3_roh_device *hroh_dev);
+ 	void (*cmdq_exit)(struct hns3_roh_device *hroh_dev);
++	int (*get_intr_cap)(struct hns3_roh_device *hroh_dev);
+ };
+ 
+ static inline struct hns3_roh_device *to_hroh_dev(struct roh_device *rohdev)
+@@ -88,4 +110,8 @@ static inline struct hns3_roh_device *to_hroh_dev(struct roh_device *rohdev)
+ #define hns3_roh_get_bit(origin, shift) \
+ 	hns3_roh_get_field(origin, 0x1 << (shift), shift)
+ 
++void hns3_roh_task_schedule(struct hns3_roh_device *hroh_dev,
++			    unsigned long delay_time);
++void hns3_roh_mbx_handler(struct hns3_roh_device *hroh_dev);
++void hns3_roh_mbx_task_schedule(struct hns3_roh_device *hroh_dev);
+ #endif
+diff --git a/drivers/roh/hw/hns3/hns3_device.h b/drivers/roh/hw/hns3/hns3_device.h
+new file mode 100644
+index 000000000000..07e46879a4b9
+--- /dev/null
++++ b/drivers/roh/hw/hns3/hns3_device.h
+@@ -0,0 +1,40 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++// Copyright (c) 2022 Hisilicon Limited.
++
++#ifndef __HNS3_ROH_DEVICE_H__
++#define __HNS3_ROH_DEVICE_H__
++
++enum hns3_roh_state {
++	HNS3_ROH_STATE_RESETTING,
++	HNS3_ROH_STATE_INIT,
++	HNS3_ROH_STATE_INITED,
++	HNS3_ROH_STATE_DOWN
++};
++
++enum { HNS3_ROH_RST_DIRECT_RETURN = 0 };
++
++enum hns3_roh_link_type {
++	HNS3_ROH_LINK_STATUS_DOWN = 0,
++	HNS3_ROH_LINK_STATUS_UP
++};
++
++enum hns3_roh_dev_sw_state {
++	HNS3_ROH_SW_STATE_MBX_SERVICE_SCHED,
++	HNS3_ROH_SW_STATE_MBX_HANDLING,
++	HNS3_ROH_SW_STATE_LINK_UPDATING,
++	HNS3_ROH_SW_STATE_MAX
++};
++
++enum hns3_roh_event_type {
++	HNS3_ROH_VECTOR0_EVENT_MBX,
++	HNS3_ROH_VECTOR0_EVENT_OTHER
++};
++
++enum hns3_roh_link_fail_code {
++	HNS3_ROH_LF_NORMAL = 0,
++	HNS3_ROH_LF_REF_CLOCK_LOST = 1,
++	HNS3_ROH_LF_XSFP_TX_DISABLE = 2,
++	HNS3_ROH_LF_XSFP_ABSENT = 3
++};
++
++#endif
+diff --git a/drivers/roh/hw/hns3/hns3_intr.c b/drivers/roh/hw/hns3/hns3_intr.c
+new file mode 100644
+index 000000000000..9a1d85287d60
+--- /dev/null
++++ b/drivers/roh/hw/hns3/hns3_intr.c
+@@ -0,0 +1,136 @@
++// SPDX-License-Identifier: GPL-2.0+
++// Copyright (c) 2020-2022 Hisilicon Limited.
++
++#include <linux/interrupt.h>
++#include <linux/pci.h>
++
++#include "hns3_device.h"
++#include "hns3_reg.h"
++#include "hns3_intr.h"
++
++static u32 hns3_roh_parse_event_type(struct hns3_roh_device *hroh_dev, u32 *clear_val)
++{
++	u32 cmdq_src_reg;
++	u32 event_type;
++
++	cmdq_src_reg = hns3_roh_read(hroh_dev, HNS3_ROH_VECTOR0_CMDQ_SRC_REG);
++	if (BIT(HNS3_ROH_VECTOR0_RX_CMDQ_INT_B) & cmdq_src_reg)
++		event_type = HNS3_ROH_VECTOR0_EVENT_MBX;
++	else
++		event_type = HNS3_ROH_VECTOR0_EVENT_OTHER;
++
++	*clear_val = cmdq_src_reg;
++
++	return event_type;
++}
++
++static void hns3_roh_clear_event_type(struct hns3_roh_device *hroh_dev,
++				      u32 event_type, u32 val)
++{
++	switch (event_type) {
++	case HNS3_ROH_VECTOR0_EVENT_MBX:
++		hns3_roh_write(hroh_dev, HNS3_ROH_VECTOR0_CMDQ_SRC_REG, val);
++		break;
++	default:
++		break;
++	}
++}
++
++void hns3_roh_enable_vector(struct hns3_roh_abn_vector *vector, bool enable)
++{
++	writel(enable ? 1 : 0, vector->addr);
++}
++
++static irqreturn_t hns3_roh_abn_irq_handle(int irq, void *data)
++{
++	struct hns3_roh_device *hroh_dev = data;
++	irqreturn_t result;
++	u32 clear_val = 0;
++	u32 event_type;
++
++	hns3_roh_enable_vector(&hroh_dev->abn_vector, false);
++
++	event_type = hns3_roh_parse_event_type(hroh_dev, &clear_val);
++	switch (event_type) {
++	case HNS3_ROH_VECTOR0_EVENT_MBX:
++		/* If we are here then,
++		 * 1. Either we are not handling any mbx task and we are not
++		 *    scheduled as well
++		 *                        OR
++		 * 2. We could be handling a mbx task but nothing more is
++		 *    scheduled.
++		 * In both cases, we should schedule mbx task as there are more
++		 * mbx messages reported by this interrupt.
++		 */
++		hns3_roh_mbx_task_schedule(hroh_dev);
++
++		result = IRQ_HANDLED;
++		break;
++	default:
++		dev_warn(hroh_dev->dev, "unknown event type, type = %u\n",
++			 event_type);
++		result = IRQ_NONE;
++		break;
++	}
++
++	hns3_roh_clear_event_type(hroh_dev, event_type, clear_val);
++
++	if (!clear_val || event_type == HNS3_ROH_VECTOR0_EVENT_MBX)
++		hns3_roh_enable_vector(&hroh_dev->abn_vector, true);
++
++	return result;
++}
++
++static void hns3_roh_abn_irq_uninit(struct hns3_roh_device *hroh_dev)
++{
++	struct hns3_roh_abn_vector *abn_vector;
++
++	abn_vector = &hroh_dev->abn_vector;
++	free_irq(abn_vector->vector_irq, hroh_dev);
++}
++
++void hns3_roh_uninit_irq(struct hns3_roh_device *hroh_dev)
++{
++	hns3_roh_abn_irq_uninit(hroh_dev);
++}
++
++static int hns3_roh_abn_irq_init(struct hns3_roh_device *hroh_dev)
++{
++	struct hns3_roh_abn_vector *abn_vector = &hroh_dev->abn_vector;
++	int vector_index = hroh_dev->intr_info.vector_offset;
++	int ret;
++
++	abn_vector->vector_irq = pci_irq_vector(hroh_dev->pdev, vector_index);
++	abn_vector->addr = hroh_dev->reg_base + HNS3_ROH_VECTOR0_INT_CTRL_REG;
++
++	ret = snprintf(abn_vector->name, HNS3_ROH_INT_NAME_LEN, "%s-%s-abn",
++		       HNS3_ROH_NAME, pci_name(hroh_dev->pdev));
++	if (ret >= HNS3_ROH_INT_NAME_LEN || ret < 0) {
++		dev_err(hroh_dev->dev, "abn vector name is too long.\n");
++		return -EINVAL;
++	}
++
++	ret = request_irq(abn_vector->vector_irq, hns3_roh_abn_irq_handle, 0,
++			  abn_vector->name, hroh_dev);
++	if (ret) {
++		dev_err(hroh_dev->dev,
++			"failed to request abn irq: %d, ret = %d\n",
++			abn_vector->vector_irq, ret);
++		return ret;
++	}
++
++	return 0;
++}
++
++int hns3_roh_init_irq(struct hns3_roh_device *hroh_dev)
++{
++	int ret;
++
++	ret = hns3_roh_abn_irq_init(hroh_dev);
++	if (ret) {
++		dev_err(hroh_dev->dev, "failed to init abn irq, ret = %d\n", ret);
++		return ret;
++	}
++
++	return 0;
++}
+diff --git a/drivers/roh/hw/hns3/hns3_intr.h b/drivers/roh/hw/hns3/hns3_intr.h
+new file mode 100644
+index 000000000000..cd4cf6d4f1a4
+--- /dev/null
++++ b/drivers/roh/hw/hns3/hns3_intr.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++// Copyright (c) 2020-2022 Hisilicon Limited.
++
++#ifndef __HNS3_ROH_INTR_H__
++#define __HNS3_ROH_INTR_H__
++
++#include "hns3_common.h"
++
++void hns3_roh_enable_vector(struct hns3_roh_abn_vector *vector, bool enable);
++int hns3_roh_init_irq(struct hns3_roh_device *hroh_dev);
++void hns3_roh_uninit_irq(struct hns3_roh_device *hroh_dev);
++
++#endif /* __HNS3_ROH_INTR_H__ */
+diff --git a/drivers/roh/hw/hns3/hns3_main.c b/drivers/roh/hw/hns3/hns3_main.c
+index 6554635e1fbe..7f9de7f48f32 100644
+--- a/drivers/roh/hw/hns3/hns3_main.c
++++ b/drivers/roh/hw/hns3/hns3_main.c
+@@ -7,9 +7,13 @@
+ 
+ #include "core.h"
+ #include "hnae3.h"
++#include "hns3_device.h"
+ #include "hns3_common.h"
+ #include "hns3_cmdq.h"
+ #include "hns3_verbs.h"
++#include "hns3_intr.h"
++
++static struct workqueue_struct *hns3_roh_wq;
+ 
+ static const struct pci_device_id hns3_roh_pci_tbl[] = {
+ 	{ PCI_VDEVICE(HUAWEI, HNAE3_DEV_ID_100G_ROH), 0 },
+@@ -21,6 +25,37 @@ static const struct pci_device_id hns3_roh_pci_tbl[] = {
+ };
+ MODULE_DEVICE_TABLE(pci, hns3_roh_pci_tbl);
+ 
++static int hns3_roh_get_intr_cap(struct hns3_roh_device *hroh_dev)
++{
++	struct hns3_roh_get_intr_info *resp;
++	struct hns3_roh_desc desc;
++	int ret;
++
++	hns3_roh_cmdq_setup_basic_desc(&desc, HNS3_ROH_OPC_GET_INTR_INFO, true);
++
++	ret = hns3_roh_cmdq_send(hroh_dev, &desc, 1);
++	if (ret) {
++		dev_err(hroh_dev->dev, "failed to get intr info, ret = %d\n", ret);
++		return ret;
++	}
++
++	resp = (struct hns3_roh_get_intr_info *)desc.data;
++
++	hroh_dev->intr_info.vector_offset =
++		le16_to_cpu(resp->msixcap_localid_number_nic) +
++		le16_to_cpu(resp->pf_intr_vector_number_roce);
++	hroh_dev->intr_info.vector_num =
++		le16_to_cpu(resp->pf_intr_vector_number_roh);
++	if (hroh_dev->intr_info.vector_num < HNS3_ROH_MIN_VECTOR_NUM) {
++		dev_err(hroh_dev->dev,
++			"just %d intr resources, not enough(min: %d).\n",
++			hroh_dev->intr_info.vector_num, HNS3_ROH_MIN_VECTOR_NUM);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
+ static void hns3_roh_unregister_device(struct hns3_roh_device *hroh_dev)
+ {
+ 	hroh_dev->active = false;
+@@ -45,6 +80,12 @@ static int hns3_roh_register_device(struct hns3_roh_device *hroh_dev)
+ 	rohdev->ops.alloc_hw_stats = hns3_roh_alloc_hw_stats;
+ 	rohdev->ops.get_hw_stats = hns3_roh_get_hw_stats;
+ 
++	ret = hns3_roh_get_link_status(hroh_dev, &rohdev->link_status);
++	if (ret) {
++		dev_err(dev, "failed to get link status, ret = %d\n", ret);
++		return ret;
++	}
++
+ 	ret = roh_register_device(rohdev);
+ 	if (ret) {
+ 		dev_err(dev, "failed to register roh device, ret = %d\n", ret);
+@@ -56,6 +97,65 @@ static int hns3_roh_register_device(struct hns3_roh_device *hroh_dev)
+ 	return 0;
+ }
+ 
++void hns3_roh_mbx_task_schedule(struct hns3_roh_device *hroh_dev)
++{
++	if (!test_and_set_bit(HNS3_ROH_SW_STATE_MBX_SERVICE_SCHED, &hroh_dev->state))
++		mod_delayed_work(hns3_roh_wq, &hroh_dev->srv_task, 0);
++}
++
++void hns3_roh_task_schedule(struct hns3_roh_device *hroh_dev, unsigned long delay_time)
++{
++	mod_delayed_work(hns3_roh_wq, &hroh_dev->srv_task, delay_time);
++}
++
++static void hns3_roh_mbx_service_task(struct hns3_roh_device *hroh_dev)
++{
++	if (!test_and_clear_bit(HNS3_ROH_SW_STATE_MBX_SERVICE_SCHED,
++				&hroh_dev->state) ||
++		test_and_set_bit(HNS3_ROH_SW_STATE_MBX_HANDLING, &hroh_dev->state))
++		return;
++
++	hns3_roh_mbx_handler(hroh_dev);
++
++	clear_bit(HNS3_ROH_SW_STATE_MBX_HANDLING, &hroh_dev->state);
++}
++
++static void hns3_roh_poll_service_task(struct hns3_roh_device *hroh_dev)
++{
++	unsigned long delta = round_jiffies_relative(HZ);
++
++	hns3_roh_update_link_status(hroh_dev);
++
++	if (time_is_after_jiffies(hroh_dev->last_processed + HZ)) {
++		delta = jiffies - hroh_dev->last_processed;
++		if (delta < round_jiffies_relative(HZ)) {
++			delta = round_jiffies_relative(HZ) - delta;
++			goto out;
++		}
++	}
++
++	hroh_dev->last_processed = jiffies;
++
++out:
++	hns3_roh_task_schedule(hroh_dev, delta);
++}
++
++static void hns3_roh_service_task(struct work_struct *work)
++{
++	struct hns3_roh_device *hroh_dev =
++		container_of(work, struct hns3_roh_device, srv_task.work);
++
++	hns3_roh_mbx_service_task(hroh_dev);
++
++	hns3_roh_poll_service_task(hroh_dev);
++}
++
++static void hns3_roh_dev_sw_state_init(struct hns3_roh_device *hroh_dev)
++{
++	clear_bit(HNS3_ROH_SW_STATE_MBX_SERVICE_SCHED, &hroh_dev->state);
++	clear_bit(HNS3_ROH_SW_STATE_MBX_HANDLING, &hroh_dev->state);
++}
++
+ static int hns3_roh_init_hw(struct hns3_roh_device *hroh_dev)
+ {
+ 	struct device *dev = hroh_dev->dev;
+@@ -67,11 +167,29 @@ static int hns3_roh_init_hw(struct hns3_roh_device *hroh_dev)
+ 		return ret;
+ 	}
+ 
++	ret = hroh_dev->hw->get_intr_cap(hroh_dev);
++	if (ret) {
++		dev_err(dev, "failed to get intr cap, ret = %d\n", ret);
++		goto err_free_cmdq;
++	}
++
++	ret = hns3_roh_init_irq(hroh_dev);
++	if (ret) {
++		dev_err(dev, "failed to init irq, ret = %d\n", ret);
++		goto err_free_cmdq;
++	}
++
+ 	return 0;
++
++err_free_cmdq:
++	hroh_dev->hw->cmdq_exit(hroh_dev);
++	return ret;
+ }
+ 
+ static void hns3_roh_uninit_hw(struct hns3_roh_device *hroh_dev)
+ {
++	hns3_roh_uninit_irq(hroh_dev);
++
+ 	hroh_dev->hw->cmdq_exit(hroh_dev);
+ }
+ 
+@@ -92,6 +210,14 @@ static int hns3_roh_init(struct hns3_roh_device *hroh_dev)
+ 		goto err_uninit_hw;
+ 	}
+ 
++	INIT_DELAYED_WORK(&hroh_dev->srv_task, hns3_roh_service_task);
++
++	hns3_roh_enable_vector(&hroh_dev->abn_vector, true);
++
++	hns3_roh_dev_sw_state_init(hroh_dev);
++
++	hns3_roh_task_schedule(hroh_dev, round_jiffies_relative(HZ));
++
+ 	dev_info(dev, "%s driver init success.\n", HNS3_ROH_NAME);
+ 
+ 	return 0;
+@@ -103,6 +229,8 @@ static int hns3_roh_init(struct hns3_roh_device *hroh_dev)
+ 
+ static void hns3_roh_exit(struct hns3_roh_device *hroh_dev)
+ {
++	cancel_delayed_work_sync(&hroh_dev->srv_task);
++
+ 	hns3_roh_unregister_device(hroh_dev);
+ 
+ 	hns3_roh_uninit_hw(hroh_dev);
+@@ -114,6 +242,7 @@ static void hns3_roh_exit(struct hns3_roh_device *hroh_dev)
+ static const struct hns3_roh_hw hns3_roh_hw = {
+ 	.cmdq_init = hns3_roh_cmdq_init,
+ 	.cmdq_exit = hns3_roh_cmdq_exit,
++	.get_intr_cap = hns3_roh_get_intr_cap,
+ };
+ 
+ static void hns3_roh_get_cfg_from_frame(struct hns3_roh_device *hroh_dev,
+@@ -172,6 +301,8 @@ static void __hns3_roh_uninit_instance(struct hnae3_handle *handle)
+ 	if (!hroh_dev)
+ 		return;
+ 
++	hns3_roh_enable_vector(&hroh_dev->abn_vector, false);
++
+ 	handle->priv = NULL;
+ 
+ 	hns3_roh_exit(hroh_dev);
+@@ -225,12 +356,30 @@ static struct hnae3_client hns3_roh_client = {
+ 
+ static int __init hns3_roh_module_init(void)
+ {
+-	return hnae3_register_client(&hns3_roh_client);
++	int ret;
++
++	hns3_roh_wq = alloc_workqueue("%s", 0, 0, HNS3_ROH_NAME);
++	if (!hns3_roh_wq) {
++		pr_err("%s: failed to create wq.\n", HNS3_ROH_NAME);
++		return -ENOMEM;
++	}
++
++	ret = hnae3_register_client(&hns3_roh_client);
++	if (ret)
++		goto out;
++
++	return 0;
++
++out:
++	destroy_workqueue(hns3_roh_wq);
++	return ret;
+ }
+ 
+ static void __exit hns3_roh_module_cleanup(void)
+ {
+ 	hnae3_unregister_client(&hns3_roh_client);
++
++	destroy_workqueue(hns3_roh_wq);
+ }
+ 
+ module_init(hns3_roh_module_init);
+-- 
+2.33.0
+

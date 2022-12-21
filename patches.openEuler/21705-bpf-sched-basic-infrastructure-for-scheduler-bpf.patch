@@ -1,0 +1,369 @@
+From b349957869de670b1163922a4d41f49b9d97fe93 Mon Sep 17 00:00:00 2001
+From: Roman Gushchin <guro@fb.com>
+Date: Fri, 25 Nov 2022 11:56:09 +0800
+Subject: [PATCH] bpf: sched: basic infrastructure for scheduler bpf
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: b349957869de670b1163922a4d41f49b9d97fe93
+Modified-by-SEL: Yes, modified due to different context, and move
+		 BPF_SCHED option to kernel/bpf/Kconfig
+
+
+maillist inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5F6X6
+CVE: NA
+
+Reference: https://lore.kernel.org/all/20210916162451.709260-1-guro@fb.com/
+
+-------------------
+
+This commit introduces basic definitions and infrastructure for
+scheduler bpf programs. It defines the BPF_PROG_TYPE_SCHED program
+type and the BPF_SCHED attachment type.
+
+The implementation is inspired by lsm bpf programs and is based on
+kretprobes. This will allow to add new hooks with a minimal changes to
+the kernel code and without any changes to libbpf/bpftool.
+It's very convenient as I anticipate a large number of private patches
+being used for a long time before (or if at all) reaching upstream.
+
+Sched programs are expected to return an int, which meaning will be
+context defined.
+
+This patch doesn't add any real scheduler hooks (only a stub), it will
+be done by following patches in the series.
+
+Scheduler bpf programs as now are very restricted in what they can do:
+only the bpf_printk() helper is available. The scheduler context can
+impose significant restrictions on what's safe and what's not. So
+let's extend their abilities on case by case basis when a need arise.
+
+Signed-off-by: Roman Gushchin <guro@fb.com>
+Signed-off-by: Chen Hui <judy.chenhui@huawei.com>
+Signed-off-by: Ren Zhijie <renzhijie2@huawei.com>
+Signed-off-by: Hui Tang <tanghui20@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/bpf_sched.h       | 26 ++++++++++++++
+ include/linux/bpf_types.h       |  5 +++
+ include/linux/sched_hook_defs.h |  2 ++
+ include/uapi/linux/bpf.h        |  2 ++
+ kernel/bpf/Kconfig              | 10 ++++++
+ kernel/bpf/btf.c                |  1 +
+ kernel/bpf/syscall.c            |  9 +++++
+ kernel/bpf/trampoline.c         |  1 +
+ kernel/bpf/verifier.c           | 11 +++++-
+ kernel/sched/Makefile           |  1 +
+ kernel/sched/bpf_sched.c        | 62 +++++++++++++++++++++++++++++++++
+ tools/include/uapi/linux/bpf.h  |  2 ++
+ 12 files changed, 131 insertions(+), 1 deletion(-)
+ create mode 100644 include/linux/bpf_sched.h
+ create mode 100644 include/linux/sched_hook_defs.h
+ create mode 100644 kernel/sched/bpf_sched.c
+
+diff --git a/include/linux/bpf_sched.h b/include/linux/bpf_sched.h
+new file mode 100644
+index 000000000000..874393e6a6aa
+--- /dev/null
++++ b/include/linux/bpf_sched.h
+@@ -0,0 +1,26 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_BPF_SCHED_H
++#define _LINUX_BPF_SCHED_H
++
++#include <linux/bpf.h>
++
++#ifdef CONFIG_BPF_SCHED
++
++#define BPF_SCHED_HOOK(RET, DEFAULT, NAME, ...) \
++	RET bpf_sched_##NAME(__VA_ARGS__);
++#include <linux/sched_hook_defs.h>
++#undef BPF_SCHED_HOOK
++
++int bpf_sched_verify_prog(struct bpf_verifier_log *vlog,
++			  const struct bpf_prog *prog);
++
++#else /* !CONFIG_BPF_SCHED */
++
++static inline int bpf_sched_verify_prog(struct bpf_verifier_log *vlog,
++			  const struct bpf_prog *prog)
++{
++	return -EOPNOTSUPP;
++}
++
++#endif /* CONFIG_BPF_SCHED */
++#endif /* _LINUX_BPF_SCHED_H */
+diff --git a/include/linux/bpf_types.h b/include/linux/bpf_types.h
+index 48a91c51c015..987cb724cfa3 100644
+--- a/include/linux/bpf_types.h
++++ b/include/linux/bpf_types.h
+@@ -80,6 +80,11 @@ BPF_PROG_TYPE(BPF_PROG_TYPE_LSM, lsm,
+ BPF_PROG_TYPE(BPF_PROG_TYPE_SYSCALL, bpf_syscall,
+ 	      void *, void *)
+ 
++#ifdef CONFIG_BPF_SCHED
++BPF_PROG_TYPE(BPF_PROG_TYPE_SCHED, bpf_sched,
++	      void *, void *)
++#endif /* CONFIG_BPF_SCHED */
++
+ BPF_MAP_TYPE(BPF_MAP_TYPE_ARRAY, array_map_ops)
+ BPF_MAP_TYPE(BPF_MAP_TYPE_PERCPU_ARRAY, percpu_array_map_ops)
+ BPF_MAP_TYPE(BPF_MAP_TYPE_PROG_ARRAY, prog_array_map_ops)
+diff --git a/include/linux/sched_hook_defs.h b/include/linux/sched_hook_defs.h
+new file mode 100644
+index 000000000000..14344004e335
+--- /dev/null
++++ b/include/linux/sched_hook_defs.h
+@@ -0,0 +1,2 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++BPF_SCHED_HOOK(int, 0, dummy, void)
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index 7c712f536b0b..abb8b22eef52 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -949,6 +949,7 @@ enum bpf_prog_type {
+ 	BPF_PROG_TYPE_EXT,
+ 	BPF_PROG_TYPE_LSM,
+ 	BPF_PROG_TYPE_SK_LOOKUP,
++	BPF_PROG_TYPE_SCHED,
+ 	BPF_PROG_TYPE_SYSCALL, /* a program that can execute syscalls */
+ };
+ 
+@@ -995,6 +996,7 @@ enum bpf_attach_type {
+ 	BPF_SK_REUSEPORT_SELECT,
+ 	BPF_SK_REUSEPORT_SELECT_OR_MIGRATE,
+ 	BPF_PERF_EVENT,
++	BPF_SCHED,
+ 	__MAX_BPF_ATTACH_TYPE
+ };
+ 
+diff --git a/kernel/bpf/Kconfig b/kernel/bpf/Kconfig
+index 502989d6132a..91e34c0f5b5d 100644
+--- a/kernel/bpf/Kconfig
++++ b/kernel/bpf/Kconfig
+@@ -23,6 +23,16 @@ config ARCH_WANT_DEFAULT_BPF_JIT
+ 
+ menu "BPF subsystem"
+ 
++config BPF_SCHED
++	bool "SCHED Instrumentation with BPF"
++	depends on BPF_EVENTS
++	depends on BPF_SYSCALL
++	help
++	  Enables instrumentation of the sched hooks with eBPF programs for
++	  implementing dynamic scheduling policies.
++
++	  If you are unsure how to answer this question, answer N.
++
+ config BPF_SYSCALL
+ 	bool "Enable bpf() system call"
+ 	select BPF
+diff --git a/kernel/bpf/btf.c b/kernel/bpf/btf.c
+index 93e800f6edec..9112695f2793 100644
+--- a/kernel/bpf/btf.c
++++ b/kernel/bpf/btf.c
+@@ -4951,6 +4951,7 @@ bool btf_ctx_access(int off, int size, enum bpf_access_type type,
+ 				return true;
+ 			t = btf_type_by_id(btf, t->type);
+ 			break;
++		case BPF_SCHED:
+ 		case BPF_MODIFY_RETURN:
+ 			/* For now the BPF_MODIFY_RETURN can only be attached to
+ 			 * functions that return an int.
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 5dd79f739625..7ba7316234cd 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -2072,6 +2072,7 @@ bpf_prog_load_check_attach(enum bpf_prog_type prog_type,
+ 		case BPF_PROG_TYPE_LSM:
+ 		case BPF_PROG_TYPE_STRUCT_OPS:
+ 		case BPF_PROG_TYPE_EXT:
++		case BPF_PROG_TYPE_SCHED:
+ 			break;
+ 		default:
+ 			return -EINVAL;
+@@ -2195,6 +2196,7 @@ static bool is_perfmon_prog_type(enum bpf_prog_type prog_type)
+ 	case BPF_PROG_TYPE_LSM:
+ 	case BPF_PROG_TYPE_STRUCT_OPS: /* has access to struct sock */
+ 	case BPF_PROG_TYPE_EXT: /* extends any prog */
++	case BPF_PROG_TYPE_SCHED:
+ 		return true;
+ 	default:
+ 		return false;
+@@ -2729,6 +2731,12 @@ static int bpf_tracing_prog_attach(struct bpf_prog *prog,
+ 			goto out_put_prog;
+ 		}
+ 		break;
++	case BPF_PROG_TYPE_SCHED:
++		if (prog->expected_attach_type != BPF_SCHED) {
++			err = -EINVAL;
++			goto out_put_prog;
++		}
++		break;
+ 	default:
+ 		err = -EINVAL;
+ 		goto out_put_prog;
+@@ -3043,6 +3051,7 @@ static int bpf_raw_tracepoint_open(const union bpf_attr *attr)
+ 	case BPF_PROG_TYPE_TRACING:
+ 	case BPF_PROG_TYPE_EXT:
+ 	case BPF_PROG_TYPE_LSM:
++	case BPF_PROG_TYPE_SCHED:
+ 		if (attr->raw_tracepoint.name) {
+ 			/* The attach point for this category of programs
+ 			 * should be specified via btf_id during program load.
+diff --git a/kernel/bpf/trampoline.c b/kernel/bpf/trampoline.c
+index a6342f4656da..56e60060ba47 100644
+--- a/kernel/bpf/trampoline.c
++++ b/kernel/bpf/trampoline.c
+@@ -402,6 +402,7 @@ static enum bpf_tramp_prog_type bpf_attach_type_to_tramp(struct bpf_prog *prog)
+ 	switch (prog->expected_attach_type) {
+ 	case BPF_TRACE_FENTRY:
+ 		return BPF_TRAMP_FENTRY;
++	case BPF_SCHED:
+ 	case BPF_MODIFY_RETURN:
+ 		return BPF_TRAMP_MODIFY_RETURN;
+ 	case BPF_TRACE_FEXIT:
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 7544a1fba993..9fdc03fd8311 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -23,6 +23,7 @@
+ #include <linux/error-injection.h>
+ #include <linux/bpf_lsm.h>
+ #include <linux/btf_ids.h>
++#include <linux/bpf_sched.h>
+ 
+ #include "disasm.h"
+ 
+@@ -14066,6 +14067,7 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
+ 	case BPF_LSM_MAC:
+ 	case BPF_TRACE_FENTRY:
+ 	case BPF_TRACE_FEXIT:
++	case BPF_SCHED:
+ 		if (!btf_type_is_func(t)) {
+ 			bpf_log(log, "attach_btf_id %u is not a function\n",
+ 				btf_id);
+@@ -14179,7 +14181,8 @@ static int check_attach_btf_id(struct bpf_verifier_env *env)
+ 
+ 	if (prog->type != BPF_PROG_TYPE_TRACING &&
+ 	    prog->type != BPF_PROG_TYPE_LSM &&
+-	    prog->type != BPF_PROG_TYPE_EXT)
++	    prog->type != BPF_PROG_TYPE_EXT &&
++	    prog->type != BPF_PROG_TYPE_SCHED)
+ 		return 0;
+ 
+ 	ret = bpf_check_attach_target(&env->log, prog, tgt_prog, btf_id, &tgt_info);
+@@ -14219,6 +14222,12 @@ static int check_attach_btf_id(struct bpf_verifier_env *env)
+ 			return ret;
+ 	}
+ 
++	if (prog->type == BPF_PROG_TYPE_SCHED) {
++		ret = bpf_sched_verify_prog(&env->log, prog);
++		if (ret < 0)
++			return ret;
++	}
++
+ 	key = bpf_trampoline_compute_key(tgt_prog, prog->aux->attach_btf, btf_id);
+ 	tr = bpf_trampoline_get(key, &tgt_info);
+ 	if (!tr)
+diff --git a/kernel/sched/Makefile b/kernel/sched/Makefile
+index 978fcfca5871..a67401cc4d5d 100644
+--- a/kernel/sched/Makefile
++++ b/kernel/sched/Makefile
+@@ -37,3 +37,4 @@ obj-$(CONFIG_MEMBARRIER) += membarrier.o
+ obj-$(CONFIG_CPU_ISOLATION) += isolation.o
+ obj-$(CONFIG_PSI) += psi.o
+ obj-$(CONFIG_SCHED_CORE) += core_sched.o
++obj-$(CONFIG_BPF_SCHED) += bpf_sched.o
+diff --git a/kernel/sched/bpf_sched.c b/kernel/sched/bpf_sched.c
+new file mode 100644
+index 000000000000..2360404d4a07
+--- /dev/null
++++ b/kernel/sched/bpf_sched.c
+@@ -0,0 +1,62 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/bpf.h>
++#include <linux/cgroup.h>
++#include <linux/bpf_verifier.h>
++#include <linux/bpf_sched.h>
++#include <linux/btf_ids.h>
++#include "sched.h"
++
++/*
++ * For every hook declare a nop function where a BPF program can be attached.
++ */
++#define BPF_SCHED_HOOK(RET, DEFAULT, NAME, ...)	\
++noinline RET bpf_sched_##NAME(__VA_ARGS__)	\
++{						\
++	return DEFAULT;				\
++}
++
++#include <linux/sched_hook_defs.h>
++#undef BPF_SCHED_HOOK
++
++#define BPF_SCHED_HOOK(RET, DEFAULT, NAME, ...) BTF_ID(func, bpf_sched_##NAME)
++BTF_SET_START(bpf_sched_hooks)
++#include <linux/sched_hook_defs.h>
++#undef BPF_SCHED_HOOK
++BTF_SET_END(bpf_sched_hooks)
++
++int bpf_sched_verify_prog(struct bpf_verifier_log *vlog,
++			  const struct bpf_prog *prog)
++{
++	if (!prog->gpl_compatible) {
++		bpf_log(vlog,
++			"sched programs must have a GPL compatible license\n");
++		return -EINVAL;
++	}
++
++	if (!btf_id_set_contains(&bpf_sched_hooks, prog->aux->attach_btf_id)) {
++		bpf_log(vlog, "attach_btf_id %u points to wrong type name %s\n",
++			prog->aux->attach_btf_id, prog->aux->attach_func_name);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static const struct bpf_func_proto *
++bpf_sched_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
++{
++	switch (func_id) {
++	case BPF_FUNC_trace_printk:
++		return bpf_get_trace_printk_proto();
++	default:
++		return bpf_base_func_proto(func_id);
++	}
++}
++
++const struct bpf_prog_ops bpf_sched_prog_ops = {
++};
++
++const struct bpf_verifier_ops bpf_sched_verifier_ops = {
++	.get_func_proto = bpf_sched_func_proto,
++	.is_valid_access = btf_ctx_access,
++};
+diff --git a/tools/include/uapi/linux/bpf.h b/tools/include/uapi/linux/bpf.h
+index 5187bb5eee22..45d2e43a4a11 100644
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -936,6 +936,7 @@ enum bpf_prog_type {
+ 	BPF_PROG_TYPE_EXT,
+ 	BPF_PROG_TYPE_LSM,
+ 	BPF_PROG_TYPE_SK_LOOKUP,
++	BPF_PROG_TYPE_SCHED,
+ 	BPF_PROG_TYPE_SYSCALL, /* a program that can execute syscalls */
+ };
+ 
+@@ -982,6 +983,7 @@ enum bpf_attach_type {
+ 	BPF_SK_REUSEPORT_SELECT,
+ 	BPF_SK_REUSEPORT_SELECT_OR_MIGRATE,
+ 	BPF_PERF_EVENT,
++	BPF_SCHED,
+ 	__MAX_BPF_ATTACH_TYPE
+ };
+ 
+-- 
+2.33.0
+

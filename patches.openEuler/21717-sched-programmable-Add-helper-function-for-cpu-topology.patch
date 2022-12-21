@@ -1,0 +1,299 @@
+From f333bd6882e79c7082fb9ce56022319be38f9ee1 Mon Sep 17 00:00:00 2001
+From: Ren Zhijie <renzhijie2@huawei.com>
+Date: Tue, 29 Nov 2022 19:11:13 +0800
+Subject: [PATCH] sched: programmable: Add helper function for cpu topology.
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: f333bd6882e79c7082fb9ce56022319be38f9ee1
+Modified-by-SEL: Yes, modified due to different context
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5KUFB
+CVE: NA
+
+--------------------------------
+
+Add bpf helper function bpf_init_cpu_topology()
+which obtains cpu topology info through the macros
+topology_* that are defined by include/linux/topology.h, and
+save it in BPF MAP.
+
+The cpu topology info are useful to select core in userspace.
+
+Signed-off-by: Chen Hui <judy.chenhui@huawei.com>
+Signed-off-by: Ren Zhijie <renzhijie2@huawei.com>
+Signed-off-by: Hui Tang <tanghui20@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/bpf_topology.h   |   46 +++++++++++++++++++++
+ include/uapi/linux/bpf.h       |   14 ++++++
+ kernel/sched/Makefile          |    1 
+ kernel/sched/bpf_sched.c       |    8 +++
+ kernel/sched/bpf_topology.c    |   89 +++++++++++++++++++++++++++++++++++++++++
+ scripts/bpf_doc.py             |    4 +
+ tools/include/uapi/linux/bpf.h |   14 ++++++
+ 7 files changed, 176 insertions(+)
+ create mode 100644 include/linux/bpf_topology.h
+ create mode 100644 kernel/sched/bpf_topology.c
+
+--- /dev/null
++++ b/include/linux/bpf_topology.h
+@@ -0,0 +1,46 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++/*
++ * Copyright (C) 2022. Huawei Technologies Co., Ltd. All rights reserved.
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 and
++ * only version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ */
++
++#ifndef _LINUX_BPF_TOPOLOGY_H
++#define _LINUX_BPF_TOPOLOGY_H
++
++#include <linux/cpumask.h>
++
++struct bpf_cpu_topology {
++		int cpu;
++		int core_id;
++		int cluster_id;
++		int die_id;
++		int physical_package_id;
++		int numa_node;
++		struct cpumask thread_siblings;
++		struct cpumask core_siblings;
++		struct cpumask cluster_cpus;
++		struct cpumask die_cpus;
++		struct cpumask package_cpus;
++		struct cpumask node_cpu_lists;
++};
++
++struct bpf_cpumask_info {
++	unsigned int nums_possible_cpus;
++	unsigned int nums_active_cpus;
++	unsigned int nums_isolate_cpus;
++	unsigned int nr_cpu_ids;
++	unsigned int bpf_nr_cpumask_bits;
++	struct cpumask cpu_possible_cpumask;
++	struct cpumask cpu_active_cpumask;
++	struct cpumask cpu_isolate_cpumask;
++};
++
++#endif /* _LINUX_BPF_TOPOLOGY_H */
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -5088,6 +5088,18 @@ union bpf_attr {
+  *		Get multiple types of *cpu* statistics and store in *ctx*.
+  *	Return
+  *		0 on success, or a negative error in case of failure.
++ *
++ * long bpf_init_cpu_topology(struct bpf_map *map)
++ *	Description
++ *		Initializing the cpu topology which used for bpf prog.
++ *	Return
++ *		0 on success, or a negative error in case of failure.
++ *
++ * int bpf_get_cpumask_info(struct bpf_map *map, struct bpf_cpumask_info *cpus)
++ *	Description
++ *		Get system cpus returned in *cpus*.
++ *	Return
++ *		0 on success, or a negative error in case of failure.
+  */
+ #define __BPF_FUNC_MAPPER(FN)		\
+ 	FN(unspec),			\
+@@ -5253,6 +5265,8 @@ union bpf_attr {
+ 	FN(sched_set_tg_tag),		\
+ 	FN(sched_set_task_tag),		\
+  	FN(sched_cpu_stats_of),		\
++ 	FN(init_cpu_topology),		\
++ 	FN(get_cpumask_info),		\
+ 	FN(task_storage_get),		\
+ 	FN(task_storage_delete),	\
+ 	FN(get_current_task_btf),	\
+--- a/kernel/sched/Makefile
++++ b/kernel/sched/Makefile
+@@ -38,3 +38,4 @@ obj-$(CONFIG_CPU_ISOLATION) += isolation
+ obj-$(CONFIG_PSI) += psi.o
+ obj-$(CONFIG_SCHED_CORE) += core_sched.o
+ obj-$(CONFIG_BPF_SCHED) += bpf_sched.o
++obj-$(CONFIG_BPF_SCHED) += bpf_topology.o
+--- a/kernel/sched/bpf_sched.c
++++ b/kernel/sched/bpf_sched.c
+@@ -4,6 +4,7 @@
+ #include <linux/bpf_verifier.h>
+ #include <linux/bpf_sched.h>
+ #include <linux/btf_ids.h>
++#include <linux/bpf_topology.h>
+ #include "sched.h"
+ 
+ DEFINE_STATIC_KEY_FALSE(bpf_sched_enabled_key);
+@@ -26,6 +27,9 @@ BTF_SET_START(bpf_sched_hooks)
+ #undef BPF_SCHED_HOOK
+ BTF_SET_END(bpf_sched_hooks)
+ 
++const struct bpf_func_proto bpf_init_cpu_topology_proto __weak;
++const struct bpf_func_proto bpf_get_cpumask_info_proto __weak;
++
+ int bpf_sched_verify_prog(struct bpf_verifier_log *vlog,
+ 			  const struct bpf_prog *prog)
+ {
+@@ -120,6 +124,10 @@ bpf_sched_func_proto(enum bpf_func_id fu
+ 		return bpf_get_trace_printk_proto();
+ 	case BPF_FUNC_sched_cpu_stats_of:
+ 		return &bpf_sched_cpu_stats_of_proto;
++	case BPF_FUNC_init_cpu_topology:
++		return &bpf_init_cpu_topology_proto;
++	case BPF_FUNC_get_cpumask_info:
++		return &bpf_get_cpumask_info_proto;
+ 	default:
+ 		return bpf_base_func_proto(func_id);
+ 	}
+--- /dev/null
++++ b/kernel/sched/bpf_topology.c
+@@ -0,0 +1,89 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/*
++ * Copyright (C) 2022. Huawei Technologies Co., Ltd. All rights reserved.
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 and
++ * only version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ */
++
++#include <linux/bpf.h>
++#include <linux/btf_ids.h>
++#include <linux/bpf_verifier.h>
++#include <linux/topology.h>
++#include <linux/cpumask.h>
++#include <linux/bpf_topology.h>
++#include <linux/sched/isolation.h>
++
++static void bpf_update_cpu_topology(struct bpf_cpu_topology *cpu_topology, int cpu)
++{
++	cpu_topology->cpu = cpu;
++	cpu_topology->core_id = topology_core_id(cpu);
++	cpu_topology->cluster_id = topology_cluster_id(cpu);
++	cpu_topology->die_id = topology_die_id(cpu);
++	cpu_topology->physical_package_id = topology_physical_package_id(cpu);
++	cpu_topology->numa_node = cpu_to_node(cpu);
++	cpumask_copy(&cpu_topology->thread_siblings, topology_sibling_cpumask(cpu));
++	cpumask_copy(&cpu_topology->core_siblings, topology_core_cpumask(cpu));
++	cpumask_copy(&cpu_topology->cluster_cpus, topology_cluster_cpumask(cpu));
++	cpumask_copy(&cpu_topology->die_cpus, topology_die_cpumask(cpu));
++	cpumask_copy(&cpu_topology->package_cpus, topology_core_cpumask(cpu));
++	cpumask_copy(&cpu_topology->node_cpu_lists, cpumask_of_node(cpu_to_node(cpu)));
++}
++
++BPF_CALL_1(bpf_init_cpu_topology, struct bpf_map *, map)
++{
++	const struct cpumask *cpu_map = cpu_active_mask;
++	struct bpf_cpu_topology *topo;
++	int i = -1;
++
++	WARN_ON_ONCE(!rcu_read_lock_held() && !rcu_read_lock_bh_held());
++	for_each_cpu(i, cpu_map) {
++		topo = map->ops->map_lookup_elem(map, &i);
++		if (!topo)
++			return -ENOMEM;
++
++		bpf_update_cpu_topology(topo, i);
++	}
++
++	return 0;
++}
++
++BTF_ID_LIST_SINGLE(bpf_cpu_topology_ids, struct, bpf_cpu_topology)
++
++const struct bpf_func_proto bpf_init_cpu_topology_proto = {
++	.func		= bpf_init_cpu_topology,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_CONST_MAP_PTR,
++};
++
++BPF_CALL_2(bpf_get_cpumask_info, struct bpf_map *, map, struct bpf_cpumask_info *, cpus)
++{
++	if (!cpus)
++		return -EINVAL;
++
++	cpumask_copy(&cpus->cpu_possible_cpumask, cpu_possible_mask);
++	cpumask_copy(&cpus->cpu_active_cpumask, cpu_active_mask);
++	cpumask_copy(&cpus->cpu_isolate_cpumask, housekeeping_cpumask(HK_FLAG_DOMAIN));
++	cpus->nums_possible_cpus = num_possible_cpus();
++	cpus->nums_active_cpus = num_active_cpus();
++	cpus->nums_isolate_cpus = cpumask_weight(&cpus->cpu_isolate_cpumask);
++	cpus->nr_cpu_ids = nr_cpu_ids;
++	cpus->bpf_nr_cpumask_bits = nr_cpumask_bits;
++
++	return 0;
++}
++
++const struct bpf_func_proto bpf_get_cpumask_info_proto = {
++	.func		= bpf_get_cpumask_info,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_CONST_MAP_PTR,
++	.arg2_type	= ARG_PTR_TO_MAP_VALUE_OR_NULL,
++};
+--- a/scripts/bpf_doc.py
++++ b/scripts/bpf_doc.py
+@@ -547,6 +547,8 @@ class PrinterHelpers(Printer):
+             'struct btf_ptr',
+             'struct task_group',
+             'struct bpf_sched_cpu_stats',
++            'struct bpf_cpu_topology',
++            'struct bpf_cpumask_info',
+             'struct inode',
+             'struct socket',
+             'struct file',
+@@ -599,6 +601,8 @@ class PrinterHelpers(Printer):
+             'struct btf_ptr',
+             'struct task_group',
+             'struct bpf_sched_cpu_stats',
++            'struct bpf_cpu_topology',
++            'struct bpf_cpumask_info',
+             'struct inode',
+             'struct socket',
+             'struct file',
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -5075,6 +5075,18 @@ union bpf_attr {
+  *		Get multiple types of *cpu* statistics and store in *ctx*.
+  *	Return
+  *		0 on success, or a negative error in case of failure.
++ *
++ * long bpf_init_cpu_topology(struct bpf_map *map)
++ *	Description
++ *		Initializing the cpu topology which used for bpf prog.
++ *	Return
++ *		0 on success, or a negative error in case of failure.
++ *
++ * int bpf_get_cpumask_info(struct bpf_map *map, struct bpf_cpumask_info *cpus)
++ *	Description
++ *		Get system cpus returned in *cpus*.
++ *	Return
++ *		0 on success, or a negative error in case of failure.
+  */
+ #define __BPF_FUNC_MAPPER(FN)		\
+ 	FN(unspec),			\
+@@ -5240,6 +5252,8 @@ union bpf_attr {
+ 	FN(sched_set_tg_tag),		\
+ 	FN(sched_set_task_tag),		\
+ 	FN(sched_cpu_stats_of),		\
++ 	FN(init_cpu_topology),		\
++ 	FN(get_cpumask_info),		\
+ 	FN(task_storage_get),		\
+ 	FN(task_storage_delete),	\
+ 	FN(get_current_task_btf),	\

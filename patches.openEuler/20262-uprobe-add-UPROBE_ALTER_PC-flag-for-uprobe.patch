@@ -1,0 +1,141 @@
+From 690ed1edbfbbb7136b065f89d677d8d42f44e972 Mon Sep 17 00:00:00 2001
+From: Longjun Luo <luolongjun@huawei.com>
+Date: Mon, 14 Nov 2022 19:29:16 +0800
+Subject: [PATCH] uprobe: add UPROBE_ALTER_PC flag for uprobe
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 690ed1edbfbbb7136b065f89d677d8d42f44e972
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I61AXT
+CVE: N/A
+
+Within uprobe handlers, the pc register could be
+modified. In this situation, there is no need to
+do a single stepping. Just like the kprobe, we
+skip it.
+
+Signed-off-by: Longjun Luo <luolongjun@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/Kconfig                         |  9 +++++++++
+ arch/x86/configs/openeuler_defconfig |  1 +
+ include/linux/uprobes.h              | 10 ++++++++--
+ kernel/events/uprobes.c              | 19 +++++++++++++++++++
+ 4 files changed, 37 insertions(+), 2 deletions(-)
+
+diff --git a/arch/Kconfig b/arch/Kconfig
+index 7800502d9b6e..b93338314f70 100644
+--- a/arch/Kconfig
++++ b/arch/Kconfig
+@@ -156,6 +156,15 @@ config UPROBES
+ 	    managed by the kernel and kept transparent to the probed
+ 	    application. )
+ 
++config UPROBES_SUPPORT_PC_ALTER
++	def_bool n
++	depends on UPROBES
++	help
++	  Add UPROBE_ALTER_PC flag for uprobe handlers. When handlers
++	  change the pc register, set this flag to let the uprobe
++	  mechanism skip the execuation of the next insturction.
++
++
+ config HAVE_64BIT_ALIGNED_ACCESS
+ 	def_bool 64BIT && !HAVE_EFFICIENT_UNALIGNED_ACCESS
+ 	help
+diff --git a/arch/x86/configs/openeuler_defconfig b/arch/x86/configs/openeuler_defconfig
+index 5e731188ab57..be1fbe84d5dc 100644
+--- a/arch/x86/configs/openeuler_defconfig
++++ b/arch/x86/configs/openeuler_defconfig
+@@ -755,6 +755,7 @@ CONFIG_JUMP_LABEL=y
+ CONFIG_OPTPROBES=y
+ CONFIG_KPROBES_ON_FTRACE=y
+ CONFIG_UPROBES=y
++CONFIG_UPROBES_SUPPORT_PC_ALTER=y
+ CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS=y
+ CONFIG_ARCH_USE_BUILTIN_BSWAP=y
+ CONFIG_KRETPROBES=y
+diff --git a/include/linux/uprobes.h b/include/linux/uprobes.h
+index f46e0ca0169c..2c693d6eb9cb 100644
+--- a/include/linux/uprobes.h
++++ b/include/linux/uprobes.h
+@@ -22,8 +22,14 @@ struct inode;
+ struct notifier_block;
+ struct page;
+ 
+-#define UPROBE_HANDLER_REMOVE		1
+-#define UPROBE_HANDLER_MASK		1
++#define UPROBE_HANDLER_REMOVE          1
++
++#ifndef CONFIG_UPROBES_SUPPORT_PC_ALTER
++#define UPROBE_HANDLER_MASK            1
++#else
++#define UPROBE_ALTER_PC                0x2
++#define UPROBE_HANDLER_MASK            0x3
++#endif
+ 
+ #define MAX_URETPROBE_DEPTH		64
+ 
+diff --git a/kernel/events/uprobes.c b/kernel/events/uprobes.c
+index e1bbb3b92921..659868861a5a 100644
+--- a/kernel/events/uprobes.c
++++ b/kernel/events/uprobes.c
+@@ -2070,10 +2070,17 @@ static struct uprobe *find_active_uprobe(unsigned long bp_vaddr, int *is_swbp)
+ 	return uprobe;
+ }
+ 
++#ifdef CONFIG_UPROBES_SUPPORT_PC_ALTER
++static bool handler_chain(struct uprobe *uprobe, struct pt_regs *regs)
++#else
+ static void handler_chain(struct uprobe *uprobe, struct pt_regs *regs)
++#endif
+ {
+ 	struct uprobe_consumer *uc;
+ 	int remove = UPROBE_HANDLER_REMOVE;
++#ifdef CONFIG_UPROBES_SUPPORT_PC_ALTER
++	bool need_skip = false;
++#endif
+ 	bool need_prep = false; /* prepare return uprobe, when needed */
+ 
+ 	down_read(&uprobe->register_rwsem);
+@@ -2090,6 +2097,10 @@ static void handler_chain(struct uprobe *uprobe, struct pt_regs *regs)
+ 			need_prep = true;
+ 
+ 		remove &= rc;
++#ifdef CONFIG_UPROBES_SUPPORT_PC_ALTER
++		if (rc & UPROBE_ALTER_PC)
++			need_skip = true;
++#endif
+ 	}
+ 
+ 	if (need_prep && !remove)
+@@ -2100,6 +2111,9 @@ static void handler_chain(struct uprobe *uprobe, struct pt_regs *regs)
+ 		unapply_uprobe(uprobe, current->mm);
+ 	}
+ 	up_read(&uprobe->register_rwsem);
++#ifdef CONFIG_UPROBES_SUPPORT_PC_ALTER
++	return need_skip;
++#endif
+ }
+ 
+ static void
+@@ -2241,7 +2255,12 @@ static void handle_swbp(struct pt_regs *regs)
+ 	if (arch_uprobe_ignore(&uprobe->arch, regs))
+ 		goto out;
+ 
++#ifdef CONFIG_UPROBES_SUPPORT_PC_ALTER
++	if (handler_chain(uprobe, regs))
++		goto out;
++#else
+ 	handler_chain(uprobe, regs);
++#endif
+ 
+ 	if (arch_uprobe_skip_sstep(&uprobe->arch, regs))
+ 		goto out;
+-- 
+2.33.0
+

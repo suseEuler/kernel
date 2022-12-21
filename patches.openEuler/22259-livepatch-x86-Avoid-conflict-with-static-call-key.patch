@@ -1,0 +1,106 @@
+From 2c3c0b3af9f9ff6275f527114d95ea611c79d413 Mon Sep 17 00:00:00 2001
+From: Zheng Yejian <zhengyejian1@huawei.com>
+Date: Wed, 30 Nov 2022 18:23:52 +0800
+Subject: [PATCH] livepatch/x86: Avoid conflict with static {call,key}
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 2c3c0b3af9f9ff6275f527114d95ea611c79d413
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I60L10
+CVE: NA
+
+--------------------------------
+
+static call and static key allow user to modify instructions on call
+site, relate configs are: CONFIG_HAVE_STATIC_CALL_INLINE for static
+call, CONFIG_JUMP_LABEL for static key.
+
+When they exist in first several instruction of an old function, and
+livepatch could also modify there, then confliction happened.
+
+To avoid the confliction, we don't allow a livepatch module of this case
+to be inserted.
+
+Fixes: c33e42836a74 ("livepatch/core: Allow implementation without ftrace")
+Signed-off-by: Zheng Yejian <zhengyejian1@huawei.com>
+Reviewed-by: Kuohai Xu <xukuohai@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/livepatch/core.c | 42 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 42 insertions(+)
+
+diff --git a/kernel/livepatch/core.c b/kernel/livepatch/core.c
+index f613e94f0e38..c8ef647c9cc4 100644
+--- a/kernel/livepatch/core.c
++++ b/kernel/livepatch/core.c
+@@ -34,6 +34,7 @@
+ #include <linux/delay.h>
+ #include <linux/stop_machine.h>
+ #endif
++#include <linux/static_call.h>
+ 
+ /*
+  * klp_mutex is a coarse lock which serializes access to klp data.  All
+@@ -1195,6 +1196,43 @@ extern int klp_static_call_register(struct module *mod);
+ static inline int klp_static_call_register(struct module *mod) { return 0; }
+ #endif
+ 
++static int check_address_conflict(struct klp_patch *patch)
++{
++	struct klp_object *obj;
++	struct klp_func *func;
++	int ret;
++	void *start;
++	void *end;
++
++	/*
++	 * Locks seem required as comment of jump_label_text_reserved() said:
++	 *   Caller must hold jump_label_mutex.
++	 * But looking into implementation of jump_label_text_reserved() and
++	 * static_call_text_reserved(), call sites of every jump_label or static_call
++	 * are checked, and they won't be changed after corresponding module inserted,
++	 * so no need to take jump_label_lock and static_call_lock here.
++	 */
++	klp_for_each_object(patch, obj) {
++		klp_for_each_func(obj, func) {
++			start = func->old_func;
++			end = start + KLP_MAX_REPLACE_SIZE - 1;
++			ret = jump_label_text_reserved(start, end);
++			if (ret) {
++				pr_err("'%s' has static key in first %zu bytes, ret=%d\n",
++				       func->old_name, KLP_MAX_REPLACE_SIZE, ret);
++				return -EINVAL;
++			}
++			ret = static_call_text_reserved(start, end);
++			if (ret) {
++				pr_err("'%s' has static call in first %zu bytes, ret=%d\n",
++				       func->old_name, KLP_MAX_REPLACE_SIZE, ret);
++				return -EINVAL;
++			}
++		}
++	}
++	return 0;
++}
++
+ static int klp_init_patch(struct klp_patch *patch)
+ {
+ 	struct klp_object *obj;
+@@ -1241,6 +1279,10 @@ static int klp_init_patch(struct klp_patch *patch)
+ 	}
+ 	module_enable_ro(patch->mod, true);
+ 
++	ret = check_address_conflict(patch);
++	if (ret)
++		return ret;
++
+ #ifdef CONFIG_LIVEPATCH_STOP_MACHINE_CONSISTENCY
+ 	klp_for_each_object(patch, obj)
+ 		klp_load_hook(obj);
+-- 
+2.33.0
+

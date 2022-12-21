@@ -1,0 +1,122 @@
+From d97994b78abab3b59f39b54a1cb8bcd056659d2d Mon Sep 17 00:00:00 2001
+From: Ke Chen <chenke54@huawei.com>
+Date: Mon, 7 Nov 2022 19:53:03 +0800
+Subject: [PATCH] net: hns3: intercept invalid MAC address setting in ROH
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: d97994b78abab3b59f39b54a1cb8bcd056659d2d
+Modified-by-SEL: No
+
+
+driver inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5WKYW
+
+-----------------------------------------------------------------------
+
+In ROH mode, MAC address is related to the EID. If an
+invalid MAC address is set, the mapping between MAC and
+EID cannot be ensured, and communication may be abnormal.
+Therefore, firmware verification is required to intercept
+invalid MAC address set by user.
+
+Signed-off-by: Yufeng Mo <moyufeng@huawei.com>
+Signed-off-by: Ke Chen <chenke54@huawei.com>
+Reviewed-by: Gang Zhang <gang.zhang@huawei.com>
+Reviewed-by: Yefeng Yan <yanyefeng@huawei.com>
+Reviewed-by: Jingchao Dai <daijingchao1@huawei.com>
+Reviewed-by: Jian Shen <shenjian15@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ .../hisilicon/hns3/hns3pf/hclge_cmd.h         |  7 ++++
+ .../hisilicon/hns3/hns3pf/hclge_main.c        | 35 +++++++++++++++++++
+ .../hisilicon/hns3/hns3pf/hclge_main.h        |  2 ++
+ 3 files changed, 44 insertions(+)
+
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_cmd.h b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_cmd.h
+index c99c7d227ebc..88110835e876 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_cmd.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_cmd.h
+@@ -410,6 +410,13 @@ struct hclge_mac_vlan_tbl_entry_cmd {
+ 	u8      rsv2[6];
+ };
+ 
++struct hclge_check_mac_addr_cmd {
++	u8	response;
++	u8	mac_addr[ETH_ALEN];
++	u8	vf_id;
++	u8	rsv[16];
++};
++
+ #define HCLGE_UMV_SPC_ALC_B	0
+ struct hclge_umv_spc_alc_cmd {
+ 	u8 allocate;
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
+index 55170897ba6a..fb357c32cd44 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
+@@ -9059,6 +9059,35 @@ static int hclge_get_mac_ethertype_cmd_status(struct hclge_dev *hdev,
+ 	return return_status;
+ }
+ 
++int hclge_check_mac_addr_valid(struct hclge_dev *hdev, u8 vf,
++			       const u8 *mac_addr)
++{
++	char format_mac_addr[HNAE3_FORMAT_MAC_ADDR_LEN];
++	struct hclge_check_mac_addr_cmd *req;
++	struct hclge_desc desc;
++	int ret;
++
++	hclge_cmd_setup_basic_desc(&desc, HCLGE_OPC_MAC_ADDR_CHECK, false);
++	req = (struct hclge_check_mac_addr_cmd *)desc.data;
++	ether_addr_copy(req->mac_addr, mac_addr);
++	req->vf_id = vf;
++	ret = hclge_cmd_send(&hdev->hw, &desc, 1);
++	if (ret) {
++		dev_err(&hdev->pdev->dev, "failed to check function %u mac addr valid, ret = %d\n",
++			vf, ret);
++		return ret;
++	}
++
++	if (req->response) {
++		hnae3_format_mac_addr(format_mac_addr, mac_addr);
++		dev_err(&hdev->pdev->dev, "invalid function %u mac addr: %s\n",
++			vf, format_mac_addr);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
+ static int hclge_set_vf_mac(struct hnae3_handle *handle, int vf,
+ 			    u8 *mac_addr)
+ {
+@@ -9213,6 +9242,12 @@ static int hclge_set_mac_addr(struct hnae3_handle *handle, void *p,
+ 		return -EINVAL;
+ 	}
+ 
++	if (hnae3_check_roh_mac_type(handle)) {
++		ret = hclge_check_mac_addr_valid(hdev, 0, new_addr);
++		if (ret)
++			return ret;
++	}
++
+ 	ret = hclge_pause_addr_cfg(hdev, new_addr);
+ 	if (ret) {
+ 		dev_err(&hdev->pdev->dev,
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.h b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.h
+index 568ad7c0c1de..f48ba1e7589c 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.h
+@@ -1124,6 +1124,8 @@ void hclge_report_hw_error(struct hclge_dev *hdev,
+ 			   enum hnae3_hw_error_type type);
+ void hclge_inform_vf_promisc_info(struct hclge_vport *vport);
+ int hclge_dbg_dump_rst_info(struct hclge_dev *hdev, char *buf, int len);
++int hclge_check_mac_addr_valid(struct hclge_dev *hdev, u8 vf,
++			       const u8 *mac_addr);
+ int hclge_push_vf_link_status(struct hclge_vport *vport);
+ int hclge_enable_vport_vlan_filter(struct hclge_vport *vport, bool request_en);
+ int hclge_mac_update_stats(struct hclge_dev *hdev);
+-- 
+2.33.0
+

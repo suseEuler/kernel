@@ -1,0 +1,153 @@
+From 9f736afbafaa0ebe6629fa24cb46069ce9dbb7e0 Mon Sep 17 00:00:00 2001
+From: Ke Chen <chenke54@huawei.com>
+Date: Mon, 7 Nov 2022 19:53:02 +0800
+Subject: [PATCH] net: hns3: add ROH MAC type definitions and support query MAC
+ type
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 9f736afbafaa0ebe6629fa24cb46069ce9dbb7e0
+Modified-by-SEL: No
+
+
+driver inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5WKYW
+
+-----------------------------------------------------------------------
+
+HNAE3 framework add MAC type definitions for NIC or RoCE or ROH clients.
+
+There are two types of MAC in Hip09, ethernet and ROH. In ROH
+type, some operations are different, such as setting MAC address.
+This type will be used as the judgment condition in subsequent
+patches.
+
+Signed-off-by: Yufeng Mo <moyufeng@huawei.com>
+Signed-off-by: Ke Chen <chenke54@huawei.com>
+Reviewed-by: Gang Zhang <gang.zhang@huawei.com>
+Reviewed-by: Yefeng Yan <yanyefeng@huawei.com>
+Reviewed-by: Jingchao Dai <daijingchao1@huawei.com>
+Reviewed-by: Jian Shen <shenjian15@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/net/ethernet/hisilicon/hns3/hnae3.h    | 12 ++++++++++++
+ .../hisilicon/hns3/hns3pf/hclge_debugfs.c      | 18 +++++++++++++++++-
+ .../hisilicon/hns3/hns3pf/hclge_main.c         | 17 ++++++++++++++++-
+ 3 files changed, 45 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hnae3.h b/drivers/net/ethernet/hisilicon/hns3/hnae3.h
+index ceb0e655d05d..c2248c516bf9 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hnae3.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hnae3.h
+@@ -204,6 +204,11 @@ enum hnae3_client_type {
+ 	HNAE3_CLIENT_ROH,
+ };
+ 
++enum hnae3_mac_type {
++	HNAE3_MAC_ETH,
++	HNAE3_MAC_ROH,
++};
++
+ /* mac media type */
+ enum hnae3_media_type {
+ 	HNAE3_MEDIA_TYPE_UNKNOWN,
+@@ -888,6 +893,8 @@ struct hnae3_handle {
+ 
+ 	unsigned long supported_pflags;
+ 	unsigned long priv_flags;
++
++	enum hnae3_mac_type mac_type;
+ };
+ 
+ #define hnae3_set_field(origin, mask, shift, val) \
+@@ -902,6 +909,11 @@ struct hnae3_handle {
+ #define hnae3_get_bit(origin, shift) \
+ 	hnae3_get_field(origin, 0x1 << (shift), shift)
+ 
++static inline bool hnae3_check_roh_mac_type(struct hnae3_handle *handle)
++{
++	return handle->mac_type == HNAE3_MAC_ROH;
++}
++
+ #define HNAE3_FORMAT_MAC_ADDR_LEN	18
+ #define HNAE3_FORMAT_MAC_ADDR_OFFSET_0	0
+ #define HNAE3_FORMAT_MAC_ADDR_OFFSET_4	4
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_debugfs.c b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_debugfs.c
+index 559e88676446..7051ea085569 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_debugfs.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_debugfs.c
+@@ -368,6 +368,16 @@ static int hclge_dbg_dump_mac_speed_duplex(struct hclge_dev *hdev, char *buf,
+ 	return 0;
+ }
+ 
++static void hclge_dbg_dump_mac_type(struct hclge_dev *hdev, char *buf, int len,
++				    int *pos)
++{
++	struct hclge_vport *vport = &hdev->vport[0];
++	struct hnae3_handle *handle = &vport->nic;
++
++	*pos += scnprintf(buf + *pos, len - *pos, "type: %s\n",
++			  handle->mac_type ? "ROH" : "Ethernet");
++}
++
+ static int hclge_dbg_dump_mac(struct hclge_dev *hdev, char *buf, int len)
+ {
+ 	int pos = 0;
+@@ -381,7 +391,13 @@ static int hclge_dbg_dump_mac(struct hclge_dev *hdev, char *buf, int len)
+ 	if (ret)
+ 		return ret;
+ 
+-	return hclge_dbg_dump_mac_speed_duplex(hdev, buf, len, &pos);
++	ret = hclge_dbg_dump_mac_speed_duplex(hdev, buf, len, &pos);
++	if (ret)
++		return ret;
++
++	hclge_dbg_dump_mac_type(hdev, buf, len, &pos);
++
++	return 0;
+ }
+ 
+ static int hclge_dbg_dump_dcb_qset(struct hclge_dev *hdev, char *buf, int len,
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
+index c0fc3916c05c..55170897ba6a 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
+@@ -1522,6 +1522,20 @@ static int hclge_query_dev_specs(struct hclge_dev *hdev)
+ 	return 0;
+ }
+ 
++static void hclge_mac_type_init(struct hclge_dev *hdev)
++{
++	struct hclge_vport *vport = &hdev->vport[0];
++	struct hnae3_handle *handle = &vport->nic;
++	u32 dev_id = hdev->pdev->device;
++
++	if (dev_id == HNAE3_DEV_ID_100G_ROH ||
++	    dev_id == HNAE3_DEV_ID_200G_ROH ||
++	    dev_id == HNAE3_DEV_ID_400G_ROH)
++		handle->mac_type = HNAE3_MAC_ROH;
++	else
++		handle->mac_type = HNAE3_MAC_ETH;
++}
++
+ static int hclge_get_cap(struct hclge_dev *hdev)
+ {
+ 	int ret;
+@@ -2848,12 +2862,13 @@ static void hclge_get_fec(struct hnae3_handle *handle, u8 *fec_ability,
+ 	if (fec_mode)
+ 		*fec_mode = mac->fec_mode;
+ }
+-
+ static int hclge_mac_init(struct hclge_dev *hdev)
+ {
+ 	struct hclge_mac *mac = &hdev->hw.mac;
+ 	int ret;
+ 
++	hclge_mac_type_init(hdev);
++
+ 	hdev->support_sfp_query = true;
+ 	hdev->hw.mac.duplex = HCLGE_MAC_FULL;
+ 	ret = hclge_cfg_mac_speed_dup_hw(hdev, hdev->hw.mac.speed,
+-- 
+2.33.0
+

@@ -1,0 +1,230 @@
+From 708634b0992b0880f34a07ad37632dd5834f4c8b Mon Sep 17 00:00:00 2001
+From: He Sheng <hesheng@wxiat.com>
+Date: Tue, 19 Jul 2022 09:00:02 +0800
+Subject: [PATCH] sw64: always use cpu_data and simplify it
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 708634b0992b0880f34a07ad37632dd5834f4c8b
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56OLG
+
+--------------------------------
+
+Make use of cpu_data no matter SMP is yes or no, and remove unused
+fields from it. After that, some function calls can be simplified.
+
+Signed-off-by: He Sheng <hesheng@wxiat.com>
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/include/asm/hw_init.h     |  7 ++-----
+ arch/sw_64/include/asm/mmu_context.h |  5 -----
+ arch/sw_64/kernel/setup.c            | 21 ++++++++++++++++-----
+ arch/sw_64/kernel/smp.c              | 27 ++-------------------------
+ arch/sw_64/kernel/time.c             |  6 +-----
+ arch/sw_64/mm/fault.c                |  9 +--------
+ 6 files changed, 22 insertions(+), 53 deletions(-)
+
+diff --git a/arch/sw_64/include/asm/hw_init.h b/arch/sw_64/include/asm/hw_init.h
+index 71b569b6ec98..de9f93f9b26e 100644
+--- a/arch/sw_64/include/asm/hw_init.h
++++ b/arch/sw_64/include/asm/hw_init.h
+@@ -23,11 +23,6 @@ struct cpuinfo_sw64 {
+ 	int need_new_asn;
+ 	int asn_lock;
+ 	unsigned long ipi_count;
+-	unsigned long prof_multiplier;
+-	unsigned long prof_counter;
+-	unsigned char mcheck_expected;
+-	unsigned char mcheck_taken;
+-	unsigned char mcheck_extra;
+ 	struct cache_desc icache; /* Primary I-cache */
+ 	struct cache_desc dcache; /* Primary D or combined I/D cache */
+ 	struct cache_desc scache; /* Secondary cache */
+@@ -73,6 +68,8 @@ struct memmap_entry {
+ };
+ 
+ extern struct cpuinfo_sw64 cpu_data[NR_CPUS];
++extern void store_cpu_data(int cpu);
++
+ extern struct cpu_desc_t cpu_desc;
+ extern struct socket_desc_t socket_desc[MAX_NUMSOCKETS];
+ extern int memmap_nr;
+diff --git a/arch/sw_64/include/asm/mmu_context.h b/arch/sw_64/include/asm/mmu_context.h
+index d6cd01d55712..a797673273af 100644
+--- a/arch/sw_64/include/asm/mmu_context.h
++++ b/arch/sw_64/include/asm/mmu_context.h
+@@ -60,12 +60,7 @@ __reload_thread(struct pcb_struct *pcb)
+  */
+ 
+ #include <asm/hw_init.h>
+-#ifdef CONFIG_SMP
+ #define cpu_last_asn(cpuid)	(cpu_data[cpuid].last_asn)
+-#else
+-extern unsigned long last_asn;
+-#define cpu_last_asn(cpuid)	last_asn
+-#endif /* CONFIG_SMP */
+ 
+ #define ASN_FIRST_VERSION	(1UL << WIDTH_HARDWARE_ASN)
+ #define HARDWARE_ASN_MASK	((1UL << WIDTH_HARDWARE_ASN) - 1)
+diff --git a/arch/sw_64/kernel/setup.c b/arch/sw_64/kernel/setup.c
+index 0e93643539d3..39103e4edee4 100644
+--- a/arch/sw_64/kernel/setup.c
++++ b/arch/sw_64/kernel/setup.c
+@@ -28,9 +28,10 @@
+ #include <linux/genalloc.h>
+ #include <linux/acpi.h>
+ 
+-#include <asm/sw64_init.h>
+ #include <asm/efi.h>
+ #include <asm/kvm_cma.h>
++#include <asm/mmu_context.h>
++#include <asm/sw64_init.h>
+ 
+ #include "proto.h"
+ #include "pci_impl.h"
+@@ -137,6 +138,17 @@ struct screen_info screen_info = {
+ };
+ EXPORT_SYMBOL(screen_info);
+ 
++/*
++ * Move global data into per-processor storage.
++ */
++void store_cpu_data(int cpu)
++{
++	cpu_data[cpu].loops_per_jiffy = loops_per_jiffy;
++	cpu_data[cpu].last_asn = ASN_FIRST_VERSION;
++	cpu_data[cpu].need_new_asn = 0;
++	cpu_data[cpu].asn_lock = 0;
++}
++
+ #ifdef CONFIG_KEXEC
+ 
+ void *kexec_control_page;
+@@ -859,13 +871,12 @@ setup_arch(char **cmdline_p)
+ 	/* Default root filesystem to sda2.  */
+ 	ROOT_DEV = Root_SDA2;
+ 
+-	/*
+-	 * Identify the flock of penguins.
+-	 */
+-
+ #ifdef CONFIG_SMP
+ 	setup_smp();
++#else
++	store_cpu_data(0);
+ #endif
++
+ #ifdef CONFIG_NUMA
+ 	cpu_set_node();
+ #endif
+diff --git a/arch/sw_64/kernel/smp.c b/arch/sw_64/kernel/smp.c
+index fb915d166069..1004e9e3be27 100644
+--- a/arch/sw_64/kernel/smp.c
++++ b/arch/sw_64/kernel/smp.c
+@@ -59,29 +59,6 @@ EXPORT_SYMBOL(smp_num_cpus);
+ #define send_sleep_interrupt(cpu)	send_ipi((cpu), II_SLEEP)
+ #define send_wakeup_interrupt(cpu)	send_ipi((cpu), II_WAKE)
+ 
+-/*
+- * Called by both boot and secondaries to move global data into
+- *  per-processor storage.
+- */
+-static inline void __init
+-smp_store_cpu_info(int cpuid)
+-{
+-	cpu_data[cpuid].loops_per_jiffy = loops_per_jiffy;
+-	cpu_data[cpuid].last_asn = ASN_FIRST_VERSION;
+-	cpu_data[cpuid].need_new_asn = 0;
+-	cpu_data[cpuid].asn_lock = 0;
+-}
+-
+-/*
+- * Ideally sets up per-cpu profiling hooks.  Doesn't do much now...
+- */
+-static inline void __init
+-smp_setup_percpu_timer(int cpuid)
+-{
+-	setup_timer();
+-	cpu_data[cpuid].prof_counter = 1;
+-	cpu_data[cpuid].prof_multiplier = 1;
+-}
+ 
+ static void __init wait_boot_cpu_to_stop(int cpuid)
+ {
+@@ -128,7 +105,7 @@ void smp_callin(void)
+ 	wrent(entInt, 0);
+ 
+ 	/* Get our local ticker going. */
+-	smp_setup_percpu_timer(cpuid);
++	setup_timer();
+ 
+ 	/* All kernel threads share the same mm context.  */
+ 	mmgrab(&init_mm);
+@@ -298,7 +275,7 @@ void __init setup_smp(void)
+ 			__cpu_to_rcid[num] = i;
+ 			__rcid_to_cpu[i] = num;
+ 			set_cpu_possible(num, true);
+-			smp_store_cpu_info(num);
++			store_cpu_data(num);
+ 			if (!cpumask_test_cpu(i, &cpu_offline))
+ 				set_cpu_present(num, true);
+ 			num++;
+diff --git a/arch/sw_64/kernel/time.c b/arch/sw_64/kernel/time.c
+index 0be676c80be4..6a4c8a31465c 100644
+--- a/arch/sw_64/kernel/time.c
++++ b/arch/sw_64/kernel/time.c
+@@ -96,10 +96,6 @@ void setup_clocksource(void)
+ }
+ #endif /* !CONFIG_SMP */
+ 
+-void __init common_init_rtc(void)
+-{
+-	setup_timer();
+-}
+ 
+ void __init
+ time_init(void)
+@@ -114,7 +110,7 @@ time_init(void)
+ 	setup_clocksource();
+ 	of_clk_init(NULL);
+ 	/* Startup the timer source. */
+-	common_init_rtc();
++	setup_timer();
+ }
+ 
+ void calibrate_delay(void)
+diff --git a/arch/sw_64/mm/fault.c b/arch/sw_64/mm/fault.c
+index 15fd65b1b754..3255de5f0019 100644
+--- a/arch/sw_64/mm/fault.c
++++ b/arch/sw_64/mm/fault.c
+@@ -64,13 +64,7 @@ void show_all_vma(void)
+ /*
+  * Force a new ASN for a task.
+  */
+-
+-#ifndef CONFIG_SMP
+-unsigned long last_asn = ASN_FIRST_VERSION;
+-#endif
+-
+-void
+-__load_new_mm_context(struct mm_struct *next_mm)
++void __load_new_mm_context(struct mm_struct *next_mm)
+ {
+ 	unsigned long mmc;
+ 	struct pcb_struct *pcb;
+@@ -85,7 +79,6 @@ __load_new_mm_context(struct mm_struct *next_mm)
+ 	__reload_thread(pcb);
+ }
+ 
+-
+ /*
+  * This routine handles page faults.  It determines the address,
+  * and the problem, and then passes it off to handle_mm_fault().
+-- 
+2.33.0
+

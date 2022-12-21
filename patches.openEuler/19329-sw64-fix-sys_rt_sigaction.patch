@@ -1,0 +1,121 @@
+From 87368f61a121d799bb9236372ba57840f8f5078e Mon Sep 17 00:00:00 2001
+From: Mao Minkai <maominkai@wxiat.com>
+Date: Fri, 5 Aug 2022 08:52:26 +0800
+Subject: [PATCH] sw64: fix sys_rt_sigaction
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 87368f61a121d799bb9236372ba57840f8f5078e
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56XYC
+
+--------------------------------
+
+__ARCH_HAS_SA_RESTORER was defined to fix compile error in the past.
+However, this changed the offset of sa_mask in struct sigaction and
+made sys_rt_sigaction unable to get sa_mask passed from user.
+
+To fix this problem, the old sigaction and the related structs are
+added back, macro define __ARCH_HAS_SA_RESTORER is removed.
+
+Signed-off-by: Mao Minkai <maominkai@wxiat.com>
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/Kconfig                     |  1 -
+ arch/sw_64/include/asm/signal.h        |  8 ++++---
+ arch/sw_64/kernel/signal.c             | 30 ++++++++++++++++++++++++++
+ arch/sw_64/kernel/syscalls/syscall.tbl |  2 +-
+ 4 files changed, 36 insertions(+), 5 deletions(-)
+
+diff --git a/arch/sw_64/Kconfig b/arch/sw_64/Kconfig
+index deefaf312628..392f7806afcb 100644
+--- a/arch/sw_64/Kconfig
++++ b/arch/sw_64/Kconfig
+@@ -23,7 +23,6 @@ config SW64
+ 	select HAVE_ARCH_TRANSPARENT_HUGEPAGE
+ 	select HAVE_ARCH_AUDITSYSCALL
+ 	select HAVE_ARCH_SECCOMP_FILTER
+-	select OLD_SIGACTION
+ 	select OLD_SIGSUSPEND
+ 	select GENERIC_STRNCPY_FROM_USER
+ 	select GENERIC_STRNLEN_USER
+diff --git a/arch/sw_64/include/asm/signal.h b/arch/sw_64/include/asm/signal.h
+index 3e91b72c0b0a..0d846c1aa571 100644
+--- a/arch/sw_64/include/asm/signal.h
++++ b/arch/sw_64/include/asm/signal.h
+@@ -14,9 +14,11 @@ typedef struct {
+ 	unsigned long sig[_NSIG_WORDS];
+ } sigset_t;
+ 
+-#ifdef CONFIG_OLD_SIGACTION
+-#define __ARCH_HAS_SA_RESTORER
+-#endif
++struct odd_sigaction {
++	__sighandler_t	sa_handler;
++	old_sigset_t	sa_mask;
++	int		sa_flags;
++};
+ 
+ #include <asm/sigcontext.h>
+ #endif
+diff --git a/arch/sw_64/kernel/signal.c b/arch/sw_64/kernel/signal.c
+index 6a6203ccb04f..a1edc5300742 100644
+--- a/arch/sw_64/kernel/signal.c
++++ b/arch/sw_64/kernel/signal.c
+@@ -38,6 +38,36 @@ SYSCALL_DEFINE2(odd_sigprocmask, int, how, unsigned long, newmask)
+ 	return res;
+ }
+ 
++SYSCALL_DEFINE3(odd_sigaction, int, sig,
++		const struct odd_sigaction __user *, act,
++		struct odd_sigaction __user *, oact)
++{
++	struct k_sigaction new_ka, old_ka;
++	old_sigset_t mask;
++	int ret;
++
++	if (act) {
++		if (!access_ok(act, sizeof(*act)) ||
++		    __get_user(new_ka.sa.sa_handler, &act->sa_handler) ||
++		    __get_user(new_ka.sa.sa_flags, &act->sa_flags) ||
++		    __get_user(mask, &act->sa_mask))
++			return -EFAULT;
++		siginitset(&new_ka.sa.sa_mask, mask);
++	}
++
++	ret = do_sigaction(sig, act ? &new_ka : NULL, oact ? &old_ka : NULL);
++
++	if (!ret && oact) {
++		if (!access_ok(oact, sizeof(*oact)) ||
++		    __put_user(old_ka.sa.sa_handler, &oact->sa_handler) ||
++		    __put_user(old_ka.sa.sa_flags, &oact->sa_flags) ||
++		    __put_user(old_ka.sa.sa_mask.sig[0], &oact->sa_mask))
++			return -EFAULT;
++	}
++
++	return ret;
++}
++
+ /*
+  * Do a signal return; undo the signal stack.
+  */
+diff --git a/arch/sw_64/kernel/syscalls/syscall.tbl b/arch/sw_64/kernel/syscalls/syscall.tbl
+index 42a179422b6b..35d108b49a61 100644
+--- a/arch/sw_64/kernel/syscalls/syscall.tbl
++++ b/arch/sw_64/kernel/syscalls/syscall.tbl
+@@ -163,7 +163,7 @@
+ #153 is unused
+ #154 is unused
+ #155 is unused
+-156	common	sigaction			sys_sigaction
++156	common	sigaction			sys_odd_sigaction
+ #157 is unused
+ #158 is unused
+ #159 is unused
+-- 
+2.33.0
+

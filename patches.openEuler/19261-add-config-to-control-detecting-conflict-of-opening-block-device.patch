@@ -1,0 +1,141 @@
+From 8e5d03d8d9ff3232afb61c44c2b1462893d88636 Mon Sep 17 00:00:00 2001
+From: Li Lingfeng <lilingfeng3@huawei.com>
+Date: Wed, 19 Oct 2022 12:27:16 +0800
+Subject: [PATCH] add config to control detecting conflict of opening block
+ device
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 8e5d03d8d9ff3232afb61c44c2b1462893d88636
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I53Q6M
+CVE: NA
+
+--------------------------------
+
+We have a feature to add info when opening a write opend block
+device exclusively. Now we need to add switch to control it.
+
+Signed-off-by: Li Lingfeng <lilingfeng3@huawei.com>
+Reviewed-by: Zhang Yi <yi.zhang@huawei.com>
+Reviewed-by: Chao Liu <liuchao173@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ block/Kconfig             |  7 +++++++
+ fs/block_dev.c            | 10 ++++++++++
+ include/linux/blk_types.h |  2 +-
+ 3 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/block/Kconfig b/block/Kconfig
+index a2297edfdde8..e5c965f1ea25 100644
+--- a/block/Kconfig
++++ b/block/Kconfig
+@@ -202,6 +202,13 @@ config BLK_INLINE_ENCRYPTION_FALLBACK
+ 	  by falling back to the kernel crypto API when inline
+ 	  encryption hardware is not present.
+ 
++config BLK_DEV_DUMPINFO
++	bool "Enable detecting conflict of opening block device"
++	default n
++	help
++	  Dump info when open an write opened block device exclusively
++	  or open an exclusive opened device for write
++
+ menu "Partition Types"
+ 
+ source "block/partitions/Kconfig"
+diff --git a/fs/block_dev.c b/fs/block_dev.c
+index c8a3c93cc256..c55181b4a665 100644
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@ -1479,6 +1479,7 @@ int bdev_disk_changed(struct block_device *bdev, bool invalidate)
+  */
+ EXPORT_SYMBOL_GPL(bdev_disk_changed);
+ 
++#ifdef CONFIG_BLK_DEV_DUMPINFO
+ static void blkdev_dump_conflict_opener(struct block_device *bdev, char *msg)
+ {
+ 	char name[BDEVNAME_SIZE];
+@@ -1512,6 +1513,7 @@ static bool is_conflict_excl_open(struct block_device *bdev, struct block_device
+ 
+ 	return !!whole->bd_write_openers;
+ }
++#endif
+ /*
+  * bd_mutex locking:
+  *
+@@ -1631,6 +1633,7 @@ static int __blkdev_get(struct block_device *bdev, fmode_t mode, void *holder,
+ 	if (for_part)
+ 		bdev->bd_part_count++;
+ 
++#ifdef CONFIG_BLK_DEV_DUMPINFO
+ 	if (!for_part && (mode & FMODE_WRITE)) {
+ 		spin_lock(&bdev_lock);
+ 		bdev->bd_write_openers++;
+@@ -1638,9 +1641,11 @@ static int __blkdev_get(struct block_device *bdev, fmode_t mode, void *holder,
+ 			bdev->bd_contains->bd_part_write_openers++;
+ 		spin_unlock(&bdev_lock);
+ 	}
++#endif
+ 
+ 	if (claiming) {
+ 		spin_lock(&bdev_lock);
++#ifdef CONFIG_BLK_DEV_DUMPINFO
+ 		/*
+ 		 * Open an write opened block device exclusively, the
+ 		 * writing process may probability corrupt the device,
+@@ -1649,8 +1654,10 @@ static int __blkdev_get(struct block_device *bdev, fmode_t mode, void *holder,
+ 		if (is_conflict_excl_open(bdev, claiming, mode))
+ 			blkdev_dump_conflict_opener(bdev, "VFS: Open an write opened "
+ 				"block device exclusively");
++#endif
+ 		bd_finish_claiming(bdev, claiming, holder);
+ 		spin_unlock(&bdev_lock);
++#ifdef CONFIG_BLK_DEV_DUMPINFO
+ 	} else if (!for_part && (mode & FMODE_WRITE)) {
+ 		spin_lock(&bdev_lock);
+ 		/*
+@@ -1663,6 +1670,7 @@ static int __blkdev_get(struct block_device *bdev, fmode_t mode, void *holder,
+ 			blkdev_dump_conflict_opener(bdev, "VFS: Open an exclusive opened "
+ 				"block device for write");
+ 		spin_unlock(&bdev_lock);
++#endif
+ 	}
+ 
+ 	/*
+@@ -1881,6 +1889,7 @@ static void __blkdev_put(struct block_device *bdev, fmode_t mode, int for_part)
+ 	if (for_part)
+ 		bdev->bd_part_count--;
+ 
++#ifdef CONFIG_BLK_DEV_DUMPINFO
+ 	if (!for_part && (mode & FMODE_WRITE)) {
+ 		spin_lock(&bdev_lock);
+ 		bdev->bd_write_openers--;
+@@ -1888,6 +1897,7 @@ static void __blkdev_put(struct block_device *bdev, fmode_t mode, int for_part)
+ 			bdev->bd_contains->bd_part_write_openers--;
+ 		spin_unlock(&bdev_lock);
+ 	}
++#endif
+ 
+ 	if (!--bdev->bd_openers) {
+ 		WARN_ON_ONCE(bdev->bd_holders);
+diff --git a/include/linux/blk_types.h b/include/linux/blk_types.h
+index bbb62ff84601..fbea6b0aef3e 100644
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@ -48,7 +48,7 @@ struct block_device {
+ 	int			bd_fsfreeze_count;
+ 	/* Mutex for freeze */
+ 	struct mutex		bd_fsfreeze_mutex;
+-#ifndef __GENKSYMS__
++#if defined(CONFIG_BLK_DEV_DUMPINFO) && !defined(__GENKSYMS__)
+ 	KABI_USE2(1, int bd_write_openers, int bd_part_write_openers);
+ #else
+ 	KABI_RESERVE(1)
+-- 
+2.33.0
+

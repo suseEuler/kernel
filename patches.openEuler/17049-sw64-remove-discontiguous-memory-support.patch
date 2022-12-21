@@ -1,0 +1,176 @@
+From 8d384996f080b31d8e7c0f3337952bf32921aa3a Mon Sep 17 00:00:00 2001
+From: He Sheng <hesheng@wxiat.com>
+Date: Tue, 17 May 2022 17:32:12 +0800
+Subject: [PATCH] sw64: remove discontiguous memory support
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 8d384996f080b31d8e7c0f3337952bf32921aa3a
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56OLG
+
+--------------------------------
+
+Since sparse memory support works fine so far, discontiguous
+memory support can be removed to avoid confusion.
+
+Signed-off-by: He Sheng <hesheng@wxiat.com>
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/Kconfig               |  9 --------
+ arch/sw_64/include/asm/mmzone.h  |  7 -------
+ arch/sw_64/include/asm/pgtable.h |  7 -------
+ arch/sw_64/kernel/Makefile       |  3 +--
+ arch/sw_64/kernel/core.c         | 35 --------------------------------
+ arch/sw_64/mm/init.c             | 12 -----------
+ 6 files changed, 1 insertion(+), 72 deletions(-)
+ delete mode 100644 arch/sw_64/kernel/core.c
+
+diff --git a/arch/sw_64/Kconfig b/arch/sw_64/Kconfig
+index 8c5e87cb9b84..2d7721acb529 100644
+--- a/arch/sw_64/Kconfig
++++ b/arch/sw_64/Kconfig
+@@ -649,15 +649,6 @@ config ARCH_SPARSEMEM_ENABLE
+ 	depends on SMP
+ 	select SPARSEMEM_VMEMMAP_ENABLE
+ 
+-config ARCH_DISCONTIGMEM_ENABLE
+-	bool "Discontiguous Memory Support"
+-	depends on SMP
+-	help
+-	  Say Y to support efficient handling of discontiguous physical memory,
+-	  for architectures which are either NUMA (Non-Uniform Memory Access)
+-	  or have huge holes in the physical address space for other reasons.
+-	  See <file:Documentation/vm/numa> for more.
+-
+ config NUMA
+ 	bool "NUMA Support"
+ 	depends on SMP && !FLATMEM
+diff --git a/arch/sw_64/include/asm/mmzone.h b/arch/sw_64/include/asm/mmzone.h
+index 4219015c5cfc..3849d26e3890 100644
+--- a/arch/sw_64/include/asm/mmzone.h
++++ b/arch/sw_64/include/asm/mmzone.h
+@@ -14,11 +14,4 @@ extern pg_data_t *node_data[];
+ #define NODE_DATA(nid)		(node_data[(nid)])
+ #endif
+ 
+-#ifdef CONFIG_DISCONTIGMEM
+-extern int pa_to_nid(unsigned long pa);
+-extern int pfn_valid(unsigned long pfn);
+-
+-#define pfn_to_nid(pfn)		pa_to_nid(((u64)(pfn) << PAGE_SHIFT))
+-#endif /* CONFIG_DISCONTIGMEM */
+-
+ #endif /* _ASM_SW64_MMZONE_H */
+diff --git a/arch/sw_64/include/asm/pgtable.h b/arch/sw_64/include/asm/pgtable.h
+index 67637b4ddf1d..76c782baf242 100644
+--- a/arch/sw_64/include/asm/pgtable.h
++++ b/arch/sw_64/include/asm/pgtable.h
+@@ -596,14 +596,7 @@ extern pgd_t swapper_pg_dir[1024];
+ #define __pte_to_swp_entry(pte)	((swp_entry_t) { pte_val(pte) })
+ #define __swp_entry_to_pte(x)	((pte_t) { (x).val })
+ 
+-#if defined(CONFIG_FLATMEM)
+ #define kern_addr_valid(addr)	(1)
+-#elif defined(CONFIG_DISCONTIGMEM)
+-/* XXX: FIXME -- wli */
+-#define kern_addr_valid(kaddr)	(0)
+-#elif defined(CONFIG_SPARSEMEM)
+-#define kern_addr_valid(addr)	(1)
+-#endif
+ 
+ #define pte_ERROR(e) \
+ 	pr_err("%s: %d: bad pte %016lx.\n", __FILE__, __LINE__, pte_val(e))
+diff --git a/arch/sw_64/kernel/Makefile b/arch/sw_64/kernel/Makefile
+index 293b360626f7..c1e461e0ac56 100644
+--- a/arch/sw_64/kernel/Makefile
++++ b/arch/sw_64/kernel/Makefile
+@@ -15,7 +15,7 @@ endif
+ 
+ obj-y    := entry.o fpu.o traps.o process.o sys_sw64.o irq.o \
+ 	    irq_sw64.o signal.o setup.o ptrace.o time.o \
+-	    systbls.o dup_print.o tc.o \
++	    systbls.o dup_print.o tc.o timer.o \
+ 	    insn.o early_init.o topology.o cacheinfo.o \
+ 	    vdso.o vdso/
+ 
+@@ -43,7 +43,6 @@ obj-y += kvm_cma.o
+ endif
+ 
+ # Core logic support
+-obj-$(CONFIG_SW64)	+= core.o timer.o
+ obj-$(CONFIG_SW64_CPUFREQ) += platform.o clock.o
+ obj-$(CONFIG_SW64_CPUAUTOPLUG) += cpuautoplug.o
+ 
+diff --git a/arch/sw_64/kernel/core.c b/arch/sw_64/kernel/core.c
+deleted file mode 100644
+index e26b3a5faab2..000000000000
+--- a/arch/sw_64/kernel/core.c
++++ /dev/null
+@@ -1,35 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0
+-#include <linux/types.h>
+-#include <linux/memblock.h>
+-
+-#ifdef CONFIG_DISCONTIGMEM
+-#ifdef CONFIG_NUMA
+-int pa_to_nid(unsigned long pa)
+-{
+-	int i = 0;
+-	phys_addr_t pfn_base, pfn_size, pfn;
+-
+-	pfn = pa >> PAGE_SHIFT;
+-	for (i = 0; i < MAX_NUMNODES; i++) {
+-		if (!NODE_DATA(i))
+-			continue;
+-
+-		pfn_base = NODE_DATA(i)->node_start_pfn;
+-		pfn_size = NODE_DATA(i)->node_spanned_pages;
+-
+-		if (pfn >= pfn_base && pfn < pfn_base + pfn_size)
+-			return i;
+-	}
+-
+-	pr_err("%s: pa %#lx does not belong to any node, return node 0\n", __func__, pa);
+-	return 0;
+-}
+-EXPORT_SYMBOL(pa_to_nid);
+-#else /* !CONFIG_NUMA */
+-int pa_to_nid(unsigned long pa)
+-{
+-	return 0;
+-}
+-EXPORT_SYMBOL(pa_to_nid);
+-#endif /* CONFIG_NUMA */
+-#endif /* CONFIG_DISCONTIGMEM */
+diff --git a/arch/sw_64/mm/init.c b/arch/sw_64/mm/init.c
+index cd3c0551b8f8..16d3da7beebe 100644
+--- a/arch/sw_64/mm/init.c
++++ b/arch/sw_64/mm/init.c
+@@ -244,18 +244,6 @@ void vmemmap_free(unsigned long start, unsigned long end,
+ }
+ #endif
+ 
+-#ifdef CONFIG_DISCONTIGMEM
+-int pfn_valid(unsigned long pfn)
+-{
+-	phys_addr_t addr = pfn << PAGE_SHIFT;
+-
+-	if ((addr >> PAGE_SHIFT) != pfn)
+-		return 0;
+-	return memblock_is_map_memory(addr);
+-}
+-EXPORT_SYMBOL(pfn_valid);
+-#endif
+-
+ #ifdef CONFIG_HAVE_MEMBLOCK
+ #ifndef MIN_MEMBLOCK_ADDR
+ #define MIN_MEMBLOCK_ADDR       __pa(PAGE_OFFSET)
+-- 
+2.33.0
+

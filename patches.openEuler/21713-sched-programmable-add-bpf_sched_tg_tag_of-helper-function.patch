@@ -1,0 +1,164 @@
+From cb9a695e495cb31cd1d8c4bd9b5e547fa4b003e7 Mon Sep 17 00:00:00 2001
+From: Ren Zhijie <renzhijie2@huawei.com>
+Date: Fri, 25 Nov 2022 11:56:17 +0800
+Subject: [PATCH] sched: programmable: add bpf_sched_tg_tag_of helper function
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: cb9a695e495cb31cd1d8c4bd9b5e547fa4b003e7
+Modified-by-SEL: Yes, modified due to different context
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5KUFB
+CVE: NA
+
+--------------------------------
+
+This helper function read the task group tag for a task.
+The bpf prog obtains the tags to detect different workloads.
+
+Signed-off-by: Ren Zhijie <renzhijie2@huawei.com>
+Signed-off-by: Chen Hui <judy.chenhui@huawei.com>
+Signed-off-by: Hui Tang <tanghui20@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/uapi/linux/bpf.h       |    9 +++++++++
+ kernel/bpf/helpers.c           |    3 +++
+ kernel/bpf/verifier.c          |    4 ++--
+ kernel/sched/bpf_sched.c       |   23 +++++++++++++++++++++++
+ scripts/bpf_doc.py             |    2 ++
+ tools/include/uapi/linux/bpf.h |    9 +++++++++
+ 6 files changed, 48 insertions(+), 2 deletions(-)
+
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -5055,6 +5055,14 @@ union bpf_attr {
+  *		Dynamically cast a *sk* pointer to a *mptcp_sock* pointer.
+  *	Return
+  *		*sk* if casting is valid, or **NULL** otherwise.
++ *
++ * long bpf_sched_tg_tag_of(struct task_group *tg)
++ *	Description
++ *		Return task group tag of *tg* if CONFIG_CGROUP_SCHED enabled.
++ *		The bpf prog obtains the tags to detect different workloads.
++ *	Return
++ *		Task group tag, if CONFIG_CGROUP_SCHED enabled, 0 as default tag, or
++ *		a negative error in case of failure.
+  */
+ #define __BPF_FUNC_MAPPER(FN)		\
+ 	FN(unspec),			\
+@@ -5215,6 +5223,7 @@ union bpf_attr {
+ 	FN(redirect_peer),		\
+ 	FN(get_sockops_uid_gid),	\
+ 	FN(sk_original_addr),		\
++ 	FN(sched_tg_tag_of),		\
+ 	FN(task_storage_get),		\
+ 	FN(task_storage_delete),	\
+ 	FN(get_current_task_btf),	\
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -1349,6 +1349,7 @@ const struct bpf_func_proto bpf_probe_re
+ const struct bpf_func_proto bpf_probe_read_user_str_proto __weak;
+ const struct bpf_func_proto bpf_probe_read_kernel_proto __weak;
+ const struct bpf_func_proto bpf_probe_read_kernel_str_proto __weak;
++const struct bpf_func_proto bpf_sched_tg_tag_of_proto __weak;
+ const struct bpf_func_proto bpf_task_pt_regs_proto __weak;
+ 
+ const struct bpf_func_proto *
+@@ -1389,6 +1390,8 @@ bpf_base_func_proto(enum bpf_func_id fun
+ 		return &bpf_ringbuf_discard_proto;
+ 	case BPF_FUNC_ringbuf_query:
+ 		return &bpf_ringbuf_query_proto;
++	case BPF_FUNC_sched_tg_tag_of:
++		return &bpf_sched_tg_tag_of_proto;
+ 	case BPF_FUNC_for_each_map_elem:
+ 		return &bpf_for_each_map_elem_proto;
+ 	case BPF_FUNC_loop:
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -5949,10 +5949,10 @@ static bool check_btf_id_ok(const struct
+ 	int i;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(fn->arg_type); i++) {
+-		if (fn->arg_type[i] == ARG_PTR_TO_BTF_ID && !fn->arg_btf_id[i])
++		if (base_type(fn->arg_type[i]) == ARG_PTR_TO_BTF_ID && !fn->arg_btf_id[i])
+ 			return false;
+ 
+-		if (fn->arg_type[i] != ARG_PTR_TO_BTF_ID && fn->arg_btf_id[i])
++		if (base_type(fn->arg_type[i]) != ARG_PTR_TO_BTF_ID && fn->arg_btf_id[i])
+ 			return false;
+ 	}
+ 
+--- a/kernel/sched/bpf_sched.c
++++ b/kernel/sched/bpf_sched.c
+@@ -62,3 +62,26 @@ const struct bpf_verifier_ops bpf_sched_
+ 	.get_func_proto = bpf_sched_func_proto,
+ 	.is_valid_access = btf_ctx_access,
+ };
++
++BPF_CALL_1(bpf_sched_tg_tag_of, struct task_group *, tg)
++{
++	int ret = 0;
++
++#ifdef CONFIG_CGROUP_SCHED
++	if (tg == NULL)
++		return -EINVAL;
++	ret = tg->tag;
++#endif
++
++	return ret;
++}
++
++BTF_ID_LIST_SINGLE(btf_sched_tg_ids, struct, task_group)
++
++const struct bpf_func_proto bpf_sched_tg_tag_of_proto = {
++	.func		= bpf_sched_tg_tag_of,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= PTR_MAYBE_NULL | ARG_PTR_TO_BTF_ID,
++	.arg1_btf_id	= &btf_sched_tg_ids[0],
++};
+--- a/scripts/bpf_doc.py
++++ b/scripts/bpf_doc.py
+@@ -545,6 +545,7 @@ class PrinterHelpers(Printer):
+             'struct xdp_md',
+             'struct path',
+             'struct btf_ptr',
++            'struct task_group',
+             'struct inode',
+             'struct socket',
+             'struct file',
+@@ -595,6 +596,7 @@ class PrinterHelpers(Printer):
+             'struct task_struct',
+             'struct path',
+             'struct btf_ptr',
++            'struct task_group',
+             'struct inode',
+             'struct socket',
+             'struct file',
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -5042,6 +5042,14 @@ union bpf_attr {
+  *		Dynamically cast a *sk* pointer to a *mptcp_sock* pointer.
+  *	Return
+  *		*sk* if casting is valid, or **NULL** otherwise.
++ *
++ * long bpf_sched_tg_tag_of(struct task_group *tg)
++ *	Description
++ *		Return task group tag of *tg* if CONFIG_CGROUP_SCHED enabled.
++ *		The bpf prog obtains the tags to detect different workloads.
++ *	Return
++ *		Task group tag, if CONFIG_CGROUP_SCHED enabled, 0 as default tag, or
++ *		a negative error in case of failure.
+  */
+ #define __BPF_FUNC_MAPPER(FN)		\
+ 	FN(unspec),			\
+@@ -5202,6 +5210,7 @@ union bpf_attr {
+ 	FN(redirect_peer),		\
+ 	FN(get_sockops_uid_gid),	\
+ 	FN(sk_original_addr),		\
++ 	FN(sched_tg_tag_of),		\
+ 	FN(task_storage_get),		\
+ 	FN(task_storage_delete),	\
+ 	FN(get_current_task_btf),	\

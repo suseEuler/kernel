@@ -1,0 +1,195 @@
+From 78c82ea5f509ee7c114b5ecd1fe08ec67107628c Mon Sep 17 00:00:00 2001
+From: Guo Mengqi <guomengqi3@huawei.com>
+Date: Thu, 3 Nov 2022 06:41:43 +0000
+Subject: [PATCH] mm/sharepool: fix deadlock in sp_check_mmap_addr
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 78c82ea5f509ee7c114b5ecd1fe08ec67107628c
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5OE1J
+CVE: NA
+
+--------------------------------
+
+Fix a deadlock indicated below:
+
+[  171.669844] Chain exists of:
+[  171.669844]   &mm->mmap_lock --> sp_group_sem --> &spg->rw_lock
+[  171.669844]
+[  171.671469]  Possible unsafe locking scenario:
+[  171.671469]
+[  171.672121]        CPU0                    CPU1
+[  171.672415]        ----                    ----
+[  171.672706]   lock(&spg->rw_lock);
+[  171.673114]                                lock(sp_group_sem);
+[  171.673706]                                lock(&spg->rw_lock);
+[  171.674208]   lock(&mm->mmap_lock);
+[  171.674863]
+[  171.674863]  *** DEADLOCK ***
+
+sharepool use lock in order:
+sp_group_sem --> &spg->rw_lock --> mm->mmap_lock
+However, in sp_check_mmap_addr(), when mm->mmap_lock is held, it
+requested sp_group_sem, which is: mm->mmap_lock --> sp_group_sem.
+This causes ABBA problem.
+
+This happens in:
+
+[  171.642687] the existing dependency chain (in reverse order) is:
+[  171.643745]
+[  171.643745] -> #2 (&spg->rw_lock){++++}-{3:3}:
+[  171.644639]        __lock_acquire+0x6f4/0xc40
+[  171.645189]        lock_acquire+0x2f0/0x3c8
+[  171.645631]        down_read+0x64/0x2d8
+[  171.646075]        proc_usage_by_group+0x50/0x258 (spg->rw_lock)
+[  171.646542]        idr_for_each+0x6c/0xf0
+[  171.647011]        proc_group_usage_show+0x140/0x178
+[  171.647629]        seq_read_iter+0xe4/0x498
+[  171.648217]        proc_reg_read_iter+0xa8/0xe0
+[  171.648776]        new_sync_read+0xfc/0x1a0
+[  171.649002]        vfs_read+0x1ac/0x1c8
+[  171.649217]        ksys_read+0x74/0xf8
+[  171.649596]        __arm64_sys_read+0x24/0x30
+[  171.649934]        el0_svc_common.constprop.0+0x8c/0x270
+[  171.650528]        do_el0_svc+0x34/0xb8
+[  171.651069]        el0_svc+0x1c/0x28
+[  171.651278]        el0_sync_handler+0x8c/0xb0
+[  171.651636]        el0_sync+0x168/0x180
+[  171.652118]
+[  171.652118] -> #1 (sp_group_sem){++++}-{3:3}:
+[  171.652692]        __lock_acquire+0x6f4/0xc40
+[  171.653059]        lock_acquire+0x2f0/0x3c8
+[  171.653303]        down_read+0x64/0x2d8
+[  171.653704]        mg_is_sharepool_addr+0x184/0x340 (&sp_group_sem)
+[  171.654085]        sp_check_mmap_addr+0x64/0x108
+[  171.654668]        arch_get_unmapped_area_topdown+0x9c/0x528
+[  171.655370]        thp_get_unmapped_area+0x54/0x68
+[  171.656170]        get_unmapped_area+0x94/0x160
+[  171.656415]        __do_mmap_mm+0xd4/0x540
+[  171.656629]        do_mmap+0x98/0x648
+[  171.656838]        vm_mmap_pgoff+0xc0/0x188
+[  171.657129]        vm_mmap+0x6c/0x98
+[  171.657619]        elf_map+0xe0/0x118
+[  171.657835]        load_elf_binary+0x4ec/0xfd8
+[  171.658103]        bprm_execve.part.9+0x3ec/0x840
+[  171.658448]        bprm_execve+0x7c/0xb0
+[  171.658919]        kernel_execve+0x18c/0x198
+[  171.659500]        run_init_process+0xf0/0x108
+[  171.660073]        try_to_run_init_process+0x20/0x58
+[  171.660558]        kernel_init+0xcc/0x120
+[  171.660862]        ret_from_fork+0x10/0x18
+[  171.661273]
+[  171.661273] -> #0 (&mm->mmap_lock){++++}-{3:3}:
+[  171.661885]        check_prev_add+0xa4/0xbd8
+[  171.662229]        validate_chain+0xf54/0x14b8
+[  171.662705]        __lock_acquire+0x6f4/0xc40
+[  171.663310]        lock_acquire+0x2f0/0x3c8
+[  171.663658]        down_write+0x60/0x208
+[  171.664179]        mg_sp_alloc+0x24c/0x1150 (mm->mmap_lock)
+[  171.665245]        dev_ioctl+0x1128/0x1fb8 [sharepool_dev]
+[  171.665688]        __arm64_sys_ioctl+0xb0/0xe8
+[  171.666250]        el0_svc_common.constprop.0+0x8c/0x270
+[  171.667255]        do_el0_svc+0x34/0xb8
+[  171.667806]        el0_svc+0x1c/0x28
+[  171.668249]        el0_sync_handler+0x8c/0xb0
+[  171.668661]        el0_sync+0x168/0x180
+
+Signed-off-by: Guo Mengqi <guomengqi3@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/share_pool.c | 42 +++++++++++++++++-------------------------
+ 1 file changed, 17 insertions(+), 25 deletions(-)
+
+diff --git a/mm/share_pool.c b/mm/share_pool.c
+index 11e82c2a40e0..0176076c30b1 100644
+--- a/mm/share_pool.c
++++ b/mm/share_pool.c
+@@ -73,6 +73,9 @@
+ 
+ #define PF_DOMAIN_CORE		0x10000000	/* AOS CORE processes in sched.h */
+ 
++#define MMAP_SHARE_POOL_DVPP_BASE	0x100000000000ULL
++#define MMAP_SHARE_POOL_DVPP_END	(MMAP_SHARE_POOL_DVPP_BASE + MMAP_SHARE_POOL_16G_SIZE * 64)
++
+ static int system_group_count;
+ 
+ /* idr of all sp_groups */
+@@ -500,7 +503,9 @@ static int sp_init_group_master_locked(struct task_struct *tsk, struct mm_struct
+ 	return 0;
+ 
+ free_master:
++	mutex_lock(&master_list_lock);
+ 	list_del(&master->list_node);
++	mutex_unlock(&master_list_lock);
+ 	mm->sp_group_master = NULL;
+ 	kfree(master);
+ 
+@@ -3550,6 +3555,7 @@ int sp_unregister_notifier(struct notifier_block *nb)
+ }
+ EXPORT_SYMBOL_GPL(sp_unregister_notifier);
+ 
++static bool is_sp_dvpp_addr(unsigned long addr);
+ /**
+  * mg_sp_config_dvpp_range() - User can config the share pool start address
+  *                          of each Da-vinci device.
+@@ -3577,7 +3583,8 @@ bool mg_sp_config_dvpp_range(size_t start, size_t size, int device_id, int pid)
+ 
+ 	/* NOTE: check the start address */
+ 	if (pid < 0 || size <= 0 || size > MMAP_SHARE_POOL_16G_SIZE ||
+-	    device_id < 0 || device_id >= MAX_DEVID || !is_online_node_id(device_id))
++	    device_id < 0 || device_id >= MAX_DEVID || !is_online_node_id(device_id)
++		|| !is_sp_dvpp_addr(start) || !is_sp_dvpp_addr(start + size))
+ 		return false;
+ 
+ 	ret = get_task(pid, &tsk);
+@@ -3621,34 +3628,19 @@ static bool is_sp_normal_addr(unsigned long addr)
+ 			MAX_DEVID * MMAP_SHARE_POOL_16G_SIZE;
+ }
+ 
++/*
++ *	| 16G host | 16G device | ... |     |
++ *	^
++ *	|
++ *	MMAP_SHARE_POOL_DVPP_BASE + 16G * 64
++ *	We only check the device regions.
++ */
+ static bool is_sp_dvpp_addr(unsigned long addr)
+ {
+-	int i;
+-	struct mm_struct *mm;
+-	struct sp_group_master *master;
+-	struct sp_mapping *spm_dvpp;
+-
+-	mm = current->mm;
+-	if (!mm)
++	if (addr < MMAP_SHARE_POOL_DVPP_BASE || addr >= MMAP_SHARE_POOL_DVPP_END)
+ 		return false;
+ 
+-	down_read(&sp_group_sem);
+-	master = mm->sp_group_master;
+-	if (!master) {
+-		up_read(&sp_group_sem);
+-		return false;
+-	}
+-
+-	/* master->local and master->local->dvpp won't be NULL*/
+-	spm_dvpp = master->local->dvpp;
+-	for (i = 0; i < MAX_DEVID; i++) {
+-		if (addr >= spm_dvpp->start[i] && addr < spm_dvpp->end[i]) {
+-			up_read(&sp_group_sem);
+-			return true;
+-		}
+-	}
+-	up_read(&sp_group_sem);
+-	return false;
++	return (addr - MMAP_SHARE_POOL_DVPP_BASE) & MMAP_SHARE_POOL_16G_SIZE;
+ }
+ 
+ /**
+-- 
+2.33.0
+

@@ -1,0 +1,223 @@
+From 32be46d7e9d4a83468b5de1d40b3e6540fc628cd Mon Sep 17 00:00:00 2001
+From: Zhou Guanghui <zhouguanghui1@huawei.com>
+Date: Fri, 11 Nov 2022 09:32:36 +0800
+Subject: [PATCH] shmem: Count and show reliable shmem info
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 32be46d7e9d4a83468b5de1d40b3e6540fc628cd
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I4SK3S
+CVE: NA
+
+--------------------------------
+
+Count reliable shmem usage based on NR_SHMEM.
+Add ReliableShmem in /proc/meminfo to show reliable memory info
+used by shmem.
+
+- ReliableShmem: reliable memory used by shmem
+
+Signed-off-by: Zhou Guanghui <zhouguanghui1@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ Documentation/filesystems/proc.rst |  3 +++
+ include/linux/mem_reliable.h       |  9 +++++++++
+ mm/filemap.c                       |  9 +++++++--
+ mm/khugepaged.c                    |  6 +++++-
+ mm/mem_reliable.c                  | 13 ++++++++++++-
+ mm/migrate.c                       |  5 +++++
+ mm/shmem.c                         |  2 ++
+ 7 files changed, 43 insertions(+), 4 deletions(-)
+
+diff --git a/Documentation/filesystems/proc.rst b/Documentation/filesystems/proc.rst
+index 6ae531ee4de9..a57d96cf4644 100644
+--- a/Documentation/filesystems/proc.rst
++++ b/Documentation/filesystems/proc.rst
+@@ -972,6 +972,7 @@ varies by architecture and compile options.  The following is from a
+     ReliableTotal: 7340032 kB
+     ReliableUsed:   418824 kB
+     ReliableBuddyMem: 418824 kB
++    ReliableShmem:        96 kB
+ 
+ MemTotal
+               Total usable RAM (i.e. physical RAM minus a few reserved
+@@ -1107,6 +1108,8 @@ ReliableUsed
+               The used amount of reliable memory
+ ReliableBuddyMem
+               Size of unused mirrored memory in buddy system
++ReliableShmem
++              Total reliable memory used by share memory
+ 
+ vmallocinfo
+ ~~~~~~~~~~~
+diff --git a/include/linux/mem_reliable.h b/include/linux/mem_reliable.h
+index 1cc4a9460bcf..453b3237e305 100644
+--- a/include/linux/mem_reliable.h
++++ b/include/linux/mem_reliable.h
+@@ -16,6 +16,7 @@ DECLARE_STATIC_KEY_FALSE(mem_reliable);
+ 
+ extern bool reliable_enabled;
+ extern bool shmem_reliable;
++extern struct percpu_counter reliable_shmem_used_nr_page;
+ extern bool reliable_allow_fallback;
+ extern bool pagecache_use_reliable_mem;
+ extern struct percpu_counter pagecache_reliable_pages;
+@@ -81,6 +82,12 @@ static inline bool page_reliable(struct page *page)
+ 	return page_zonenum(page) < ZONE_MOVABLE;
+ }
+ 
++static inline void shmem_reliable_page_counter(struct page *page, int nr_page)
++{
++	if (shmem_reliable_is_enabled() && page_reliable(page))
++		percpu_counter_add(&reliable_shmem_used_nr_page, nr_page);
++}
++
+ static inline u64 task_reliable_used_pages(void)
+ {
+ 	s64 nr_pages;
+@@ -126,6 +133,8 @@ static inline bool skip_none_movable_zone(gfp_t gfp, struct zoneref *z)
+ }
+ static inline void reliable_report_meminfo(struct seq_file *m) {}
+ static inline bool shmem_reliable_is_enabled(void) { return false; }
++static inline void shmem_reliable_page_counter(struct page *page,
++					       int nr_page) {}
+ static inline void page_cache_prepare_alloc(gfp_t *gfp) {}
+ static inline bool mem_reliable_status(void) { return false; }
+ static inline bool page_reliable(struct page *page) { return false; }
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 4f9cd18f9197..6480600cf0ea 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -192,6 +192,7 @@ static void unaccount_page_cache_page(struct address_space *mapping,
+ 	__mod_lruvec_page_state(page, NR_FILE_PAGES, -nr);
+ 	if (PageSwapBacked(page)) {
+ 		__mod_lruvec_page_state(page, NR_SHMEM, -nr);
++		shmem_reliable_page_counter(page, -nr);
+ 		if (PageTransHuge(page))
+ 			__dec_node_page_state(page, NR_SHMEM_THPS);
+ 	} else if (PageTransHuge(page)) {
+@@ -800,10 +801,14 @@ int replace_page_cache_page(struct page *old, struct page *new, gfp_t gfp_mask)
+ 		__dec_lruvec_page_state(old, NR_FILE_PAGES);
+ 	if (!PageHuge(new))
+ 		__inc_lruvec_page_state(new, NR_FILE_PAGES);
+-	if (PageSwapBacked(old))
++	if (PageSwapBacked(old)) {
+ 		__dec_lruvec_page_state(old, NR_SHMEM);
+-	if (PageSwapBacked(new))
++		shmem_reliable_page_counter(old, -1);
++	}
++	if (PageSwapBacked(new)) {
+ 		__inc_lruvec_page_state(new, NR_SHMEM);
++		shmem_reliable_page_counter(new, 1);
++	}
+ 	xas_unlock_irqrestore(&xas, flags);
+ 	if (freepage)
+ 		freepage(old);
+diff --git a/mm/khugepaged.c b/mm/khugepaged.c
+index 254211e56153..c1346c933586 100644
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@ -1910,6 +1910,8 @@ static void collapse_file(struct mm_struct *mm,
+ 			ClearPageActive(page);
+ 			ClearPageUnevictable(page);
+ 			unlock_page(page);
++			if (is_shmem)
++				shmem_reliable_page_counter(page, -1);
+ 			put_page(page);
+ 			index++;
+ 		}
+@@ -1920,8 +1922,10 @@ static void collapse_file(struct mm_struct *mm,
+ 
+ 		SetPageUptodate(new_page);
+ 		page_ref_add(new_page, HPAGE_PMD_NR - 1);
+-		if (is_shmem)
++		if (is_shmem) {
+ 			set_page_dirty(new_page);
++			shmem_reliable_page_counter(new_page, 1 << HPAGE_PMD_ORDER);
++		}
+ 		lru_cache_add(new_page);
+ 
+ 		/*
+diff --git a/mm/mem_reliable.c b/mm/mem_reliable.c
+index 5fdda01c708f..f9458a805952 100644
+--- a/mm/mem_reliable.c
++++ b/mm/mem_reliable.c
+@@ -16,6 +16,7 @@ EXPORT_SYMBOL_GPL(mem_reliable);
+ 
+ bool reliable_enabled;
+ bool shmem_reliable __read_mostly = true;
++struct percpu_counter reliable_shmem_used_nr_page;
+ bool reliable_allow_fallback __read_mostly = true;
+ bool pagecache_use_reliable_mem __read_mostly = true;
+ struct percpu_counter pagecache_reliable_pages;
+@@ -147,8 +148,12 @@ void mem_reliable_init(bool has_unmirrored_mem, unsigned long *zone_movable_pfn,
+ 
+ void shmem_reliable_init(void)
+ {
+-	if (!mem_reliable_is_enabled() || !shmem_reliable_is_enabled())
++	if (!mem_reliable_is_enabled() || !shmem_reliable_is_enabled()) {
+ 		shmem_reliable = false;
++		return;
++	}
++
++	percpu_counter_init(&reliable_shmem_used_nr_page, 0, GFP_KERNEL);
+ }
+ 
+ static void show_val_kb(struct seq_file *m, const char *s, unsigned long num)
+@@ -166,6 +171,12 @@ void reliable_report_meminfo(struct seq_file *m)
+ 	show_val_kb(m, "ReliableUsed:     ", used_reliable_pages());
+ 	show_val_kb(m, "ReliableBuddyMem: ", free_reliable_pages());
+ 
++	if (shmem_reliable_is_enabled()) {
++		unsigned long shmem_pages = (unsigned long)percpu_counter_sum(
++			&reliable_shmem_used_nr_page);
++		show_val_kb(m, "ReliableShmem:    ", shmem_pages);
++	}
++
+ 	if (pagecache_reliable_is_enabled()) {
+ 		s64 nr_pagecache_pages = 0;
+ 		unsigned long num = 0;
+diff --git a/mm/migrate.c b/mm/migrate.c
+index ebbc34d7c509..94210ddd3f2a 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -481,6 +481,11 @@ int migrate_page_move_mapping(struct address_space *mapping,
+ 	xas_unlock(&xas);
+ 	/* Leave irq disabled to prevent preemption while updating stats */
+ 
++	if (PageSwapBacked(page) && !PageSwapCache(page)) {
++		shmem_reliable_page_counter(page, -nr);
++		shmem_reliable_page_counter(newpage, nr);
++	}
++
+ 	/*
+ 	 * If moved to a different zone then also account
+ 	 * the page for that zone. Other VM counters will be
+diff --git a/mm/shmem.c b/mm/shmem.c
+index ad2d68150ed2..626f5510b319 100644
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -752,6 +752,7 @@ static int shmem_add_to_page_cache(struct page *page,
+ 		mapping->nrpages += nr;
+ 		__mod_lruvec_page_state(page, NR_FILE_PAGES, nr);
+ 		__mod_lruvec_page_state(page, NR_SHMEM, nr);
++		shmem_reliable_page_counter(page, nr);
+ unlock:
+ 		xas_unlock_irq(&xas);
+ 	} while (xas_nomem(&xas, gfp));
+@@ -784,6 +785,7 @@ static void shmem_delete_from_page_cache(struct page *page, void *radswap)
+ 	mapping->nrpages--;
+ 	__dec_lruvec_page_state(page, NR_FILE_PAGES);
+ 	__dec_lruvec_page_state(page, NR_SHMEM);
++	shmem_reliable_page_counter(page, -1);
+ 	xa_unlock_irq(&mapping->i_pages);
+ 	put_page(page);
+ 	BUG_ON(error);
+-- 
+2.33.0
+

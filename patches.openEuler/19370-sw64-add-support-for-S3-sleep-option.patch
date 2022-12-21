@@ -1,0 +1,347 @@
+From 36b92f77301be29ab3ff2419ff489fdf95bc6081 Mon Sep 17 00:00:00 2001
+From: Xu Chenjiao <xuchenjiao@wxiat.com>
+Date: Fri, 16 Sep 2022 09:34:33 +0800
+Subject: [PATCH] sw64: add support for S3 sleep option
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 36b92f77301be29ab3ff2419ff489fdf95bc6081
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5XTK7
+
+--------------------------------
+
+The S3 sleeping state is a low wake latency sleeping state where all
+system context is lost except system memory. This state will put memory
+device controller into self-refresh mode in which the memory device
+maintains its stored data without any active command from the memory
+controller.
+
+At present, only SW831 supports S3 sleep option and has been tested
+successfully on SW831 CRB. BTW, one should upgrade SROM, HMCode and
+BIOS firmwares to enable this function.
+
+Signed-off-by: Xu Chenjiao <xuchenjiao@wxiat.com>
+Reviewed-by: He Sheng <hesheng@wxiat.com>
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/Kconfig                 |   6 ++
+ arch/sw_64/chip/chip3/chip.c       | 167 +++++++++++++++++++++++++++++
+ arch/sw_64/include/asm/chip3_io.h  |   3 +
+ arch/sw_64/include/asm/pci.h       |   7 ++
+ arch/sw_64/include/asm/sw64_init.h |   2 +-
+ arch/sw_64/kernel/smp.c            |   1 +
+ arch/sw_64/kernel/suspend.c        |  13 +++
+ 7 files changed, 198 insertions(+), 1 deletion(-)
+
+diff --git a/arch/sw_64/Kconfig b/arch/sw_64/Kconfig
+index 17b48c7e5fc1..b37a4f4e093e 100644
+--- a/arch/sw_64/Kconfig
++++ b/arch/sw_64/Kconfig
+@@ -876,6 +876,12 @@ config SW64_SUSPEND_DEEPSLEEP_BOOTCORE
+ 	bool "SW64 bootcore suspend into deep sleep mode"
+ 	default n
+ 
++config SW64_SUPPORT_S3_SLEEPING_STATE
++	depends on SUSPEND
++	bool "SW64 support S3 sleeping state"
++	default n
++	help
++	  Only SW831 support S3 sleep option and needs SROM, HMCode and BIOS support.
+ 
+ source "drivers/cpuidle/Kconfig"
+ 
+diff --git a/arch/sw_64/chip/chip3/chip.c b/arch/sw_64/chip/chip3/chip.c
+index 105389d5989f..d0b1c1c1c6df 100644
+--- a/arch/sw_64/chip/chip3/chip.c
++++ b/arch/sw_64/chip/chip3/chip.c
+@@ -493,6 +493,172 @@ static void chip3_device_interrupt(unsigned long irq_info)
+ 	}
+ }
+ 
++static void chip3_i2c_srst(void)
++{
++	sw64_io_write(0, I2C0_SRST_L, 0x0);
++	sw64_io_write(0, I2C0_SRST_L, 0x1);
++
++	sw64_io_write(0, I2C1_SRST_L, 0x0);
++	sw64_io_write(0, I2C1_SRST_L, 0x1);
++
++	sw64_io_write(0, I2C2_SRST_L, 0x0);
++	sw64_io_write(0, I2C2_SRST_L, 0x1);
++}
++
++static void chip3_pcie_save(void)
++{
++	struct pci_controller *hose;
++	struct piu_saved *piu_save;
++	unsigned long node, index;
++	unsigned long i;
++
++	for (hose = hose_head; hose; hose = hose->next) {
++		piu_save = kzalloc(sizeof(*piu_save), GFP_KERNEL);
++
++		node = hose->node;
++		index = hose->index;
++		hose->sysdata = piu_save;
++
++		piu_save->piuconfig0 = read_piu_ior0(node, index, PIUCONFIG0);
++		piu_save->piuconfig1 = read_piu_ior1(node, index, PIUCONFIG1);
++		piu_save->epdmabar = read_piu_ior0(node, index, EPDMABAR);
++		piu_save->msiaddr = read_piu_ior0(node, index, MSIADDR);
++
++		for (i = 0; i < 256; i++) {
++			piu_save->msiconfig[i] = read_piu_ior0(node, index,
++					MSICONFIG0 + (i << 7));
++		}
++	}
++}
++
++static void chip3_pcie_restore(void)
++{
++	struct pci_controller *hose;
++	struct piu_saved *piu_save;
++	unsigned long node, index;
++	u32 rc_misc_ctrl;
++	unsigned int value;
++	unsigned long i;
++
++	for (hose = hose_head; hose; hose = hose->next) {
++		node = hose->node;
++		index = hose->index;
++		piu_save = hose->sysdata;
++
++		write_piu_ior0(node, index, PIUCONFIG0, piu_save->piuconfig0);
++		write_piu_ior1(node, index, PIUCONFIG1, piu_save->piuconfig1);
++		write_piu_ior0(node, index, EPDMABAR, piu_save->epdmabar);
++		write_piu_ior0(node, index, MSIADDR, piu_save->msiaddr);
++
++		for (i = 0; i < 256; i++) {
++			write_piu_ior0(node, index, MSICONFIG0 + (i << 7),
++					piu_save->msiconfig[i]);
++		}
++
++		/* Enable DBI_RO_WR_EN */
++		rc_misc_ctrl = read_rc_conf(node, index, RC_MISC_CONTROL_1);
++		write_rc_conf(node, index, RC_MISC_CONTROL_1, rc_misc_ctrl | 0x1);
++
++		/* Fix up DEVICE_ID_VENDOR_ID register */
++		value = (PCI_DEVICE_ID_CHIP3 << 16) | PCI_VENDOR_ID_JN;
++		write_rc_conf(node, index, RC_VENDOR_ID, value);
++
++		/* Set PCI-E root class code */
++		value = read_rc_conf(node, index, RC_REVISION_ID);
++		write_rc_conf(node, index, RC_REVISION_ID, (PCI_CLASS_BRIDGE_HOST << 16) | value);
++
++		/* Disable DBI_RO_WR_EN */
++		write_rc_conf(node, index, RC_MISC_CONTROL_1, rc_misc_ctrl);
++	}
++
++}
++
++static unsigned long saved_dvc_int, saved_long_time;
++
++static inline void chip3_intpu_save(void)
++{
++	saved_long_time = sw64_io_read(0, LONG_TIME);
++}
++
++static inline void chip3_intpu_restore(void)
++{
++	switch (cpu_desc.model) {
++	case CPU_SW831:
++		sw64_io_write(0, LONG_TIME, saved_long_time);
++		sw64_io_write(0, LONG_TIME_START_EN, 0x1);
++		break;
++	default:
++		pr_info("long time start is disable!");
++		break;
++	}
++}
++
++static inline void chip3_spbu_save(void)
++{
++	saved_dvc_int = sw64_io_read(0, MCU_DVC_INT_EN);
++}
++
++static inline void chip3_spbu_restore(void)
++{
++	chip3_i2c_srst();
++	sw64_io_write(0, MCU_DVC_INT_EN, saved_dvc_int);
++}
++
++#define BIOS_SECBIN	0x2F00000UL
++#define BIOS_SECSIZE	0x40000UL
++#define	BOUNCE_BUFFER	((1UL<<32) - BIOS_SECSIZE)
++#define	BIOS_MEMSAVE	((1UL<<32) - 2 * BIOS_SECSIZE)
++
++/*
++ * Due to specific architecture PCI MEM32 addressing, we reserve 512M memory
++ * size at PCI_32BIT_MEMIO (0xE000_0000) on SW64 platform.
++ *
++ * Since this memory region is still usable by OS, we implement a interface
++ * contract between BIOS and kernel:
++ *
++ * Firstly BIOS should back up SEC relative code segment to BIOS_MEMSAVE region
++ * with the length BIOS_SECSIZE in order to restore BIOS SEC phase binary during
++ * S3 sleep.
++ *
++ * Secondly kernel should use a bounce buffer to save memory region which may be
++ * overwritten by BIOS on resume from S3 sleep.
++ */
++static void chip3_mem_restore(void)
++{
++	void *dst, *src;
++	unsigned long size = BIOS_SECSIZE;
++
++	/* Firstly kernel back up to a bounce buffer */
++	src = __va(BIOS_SECBIN);
++	dst = __va(BOUNCE_BUFFER);
++	memcpy(dst, src, size);
++
++	/* Secondly restore BIOS SEC phase binary */
++	src = __va(BIOS_MEMSAVE);
++	dst = __va(BIOS_SECBIN);
++	memcpy(dst, src, size);
++}
++
++extern void cpld_write(uint8_t slave_addr, uint8_t reg, uint8_t data);
++
++static void chip3_suspend(bool wakeup)
++{
++
++	if (wakeup) {
++		chip3_pcie_restore();
++		chip3_intpu_restore();
++		chip3_spbu_restore();
++	} else {
++		/* Set S3 flag */
++		cpld_write(0x64, 0x34, 0x33);
++
++		chip3_spbu_save();
++		chip3_intpu_save();
++		chip3_pcie_save();
++		chip3_mem_restore();
++	}
++}
++
+ static void chip3_hose_init(struct pci_controller *hose)
+ {
+ 	unsigned long pci_io_base;
+@@ -574,6 +740,7 @@ static struct sw64_chip_init_ops chip3_chip_init_ops = {
+ 
+ static struct sw64_chip_ops chip3_chip_ops = {
+ 	.get_cpu_num = chip3_get_cpu_nums,
++	.suspend = chip3_suspend,
+ 	.fixup = chip3_ops_fixup,
+ };
+ 
+diff --git a/arch/sw_64/include/asm/chip3_io.h b/arch/sw_64/include/asm/chip3_io.h
+index 3bfbc2bdafe7..18e79cf2a36b 100644
+--- a/arch/sw_64/include/asm/chip3_io.h
++++ b/arch/sw_64/include/asm/chip3_io.h
+@@ -165,6 +165,9 @@ enum {
+ 	MC_CAP_CFG =		MCU_BASE | 0x1180UL,
+ 	IO_START =		MCU_BASE | 0x1300UL,
+ 	UART_ONLINE =		MCU_BASE | 0x1780UL,
++	I2C0_SRST_L =		MCU_BASE | 0x1900UL,
++	I2C1_SRST_L =		MCU_BASE | 0x1980UL,
++	I2C2_SRST_L =		MCU_BASE | 0x1a00UL,
+ 	MCU_DVC_INT =		MCU_BASE | 0x3000UL,
+ 	MCU_DVC_INT_EN =	MCU_BASE | 0x3080UL,
+ 	SI_FAULT_STAT =		MCU_BASE | 0x3100UL,
+diff --git a/arch/sw_64/include/asm/pci.h b/arch/sw_64/include/asm/pci.h
+index a90f80152470..ab79d503b84d 100644
+--- a/arch/sw_64/include/asm/pci.h
++++ b/arch/sw_64/include/asm/pci.h
+@@ -18,6 +18,13 @@ struct resource;
+ struct sunway_iommu;
+ struct page;
+ 
++struct piu_saved {
++	unsigned long piuconfig0;
++	unsigned long piuconfig1;
++	unsigned long epdmabar;
++	unsigned long msiaddr;
++	unsigned long msiconfig[256];
++};
+ 
+ /* A controller.  Used to manage multiple PCI busses.  */
+ 
+diff --git a/arch/sw_64/include/asm/sw64_init.h b/arch/sw_64/include/asm/sw64_init.h
+index aae82f4163e0..893bac1c621b 100644
+--- a/arch/sw_64/include/asm/sw64_init.h
++++ b/arch/sw_64/include/asm/sw64_init.h
+@@ -32,7 +32,7 @@ struct sw64_chip_init_ops {
+ struct sw64_chip_ops {
+ 	int (*get_cpu_num)(void);
+ 	void (*device_interrupt)(unsigned long irq_info);
+-	void (*suspend)(int wake);
++	void (*suspend)(bool wake);
+ 	void (*fixup)(void);
+ };
+ 
+diff --git a/arch/sw_64/kernel/smp.c b/arch/sw_64/kernel/smp.c
+index c0936d119c4e..b467562bce9e 100644
+--- a/arch/sw_64/kernel/smp.c
++++ b/arch/sw_64/kernel/smp.c
+@@ -616,6 +616,7 @@ void native_cpu_die(unsigned int cpu)
+ 		if (per_cpu(cpu_state, cpu) == CPU_DEAD) {
+ 			if (system_state == SYSTEM_RUNNING)
+ 				pr_info("CPU %u is now offline\n", cpu);
++			smp_rcb->ready = 0;
+ 			return;
+ 		}
+ 		msleep(100);
+diff --git a/arch/sw_64/kernel/suspend.c b/arch/sw_64/kernel/suspend.c
+index 994d8e245878..b9798baa2467 100644
+--- a/arch/sw_64/kernel/suspend.c
++++ b/arch/sw_64/kernel/suspend.c
+@@ -23,6 +23,8 @@ void disable_local_timer(void)
+ 	wrtimer(0);
+ }
+ 
++extern struct pci_controller *hose_head;
++
+ /*
+  * Boot Core will enter suspend stat here.
+  */
+@@ -32,6 +34,11 @@ void sw64_suspend_enter(void)
+ 	 * After wake up  boot processor, pc will go here
+ 	 */
+ 
++#ifdef CONFIG_SW64_SUPPORT_S3_SLEEPING_STATE
++	if (sw64_chip->suspend)
++		sw64_chip->suspend(false);
++#endif
++
+ 	disable_local_timer();
+ 	current_thread_info()->pcb.tp = rtid();
+ 
+@@ -43,6 +50,11 @@ void sw64_suspend_enter(void)
+ #endif
+ 	wrtp(current_thread_info()->pcb.tp);
+ 
++#ifdef CONFIG_SW64_SUPPORT_S3_SLEEPING_STATE
++	if (sw64_chip->suspend)
++		sw64_chip->suspend(true);
++#endif
++
+ 	disable_local_timer();
+ }
+ 
+@@ -57,6 +69,7 @@ static const struct platform_suspend_ops native_suspend_ops = {
+ 	.valid = native_suspend_state_valid,
+ 	.enter = native_suspend_enter,
+ };
++
+ static int __init sw64_pm_init(void)
+ {
+ 	suspend_set_ops(&native_suspend_ops);
+-- 
+2.33.0
+

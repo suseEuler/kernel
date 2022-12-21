@@ -1,0 +1,895 @@
+From aa4a5ce04fa5b234610291ed9958b8ef7b9042a0 Mon Sep 17 00:00:00 2001
+From: Ke Chen <chenke54@huawei.com>
+Date: Wed, 9 Nov 2022 14:36:30 +0800
+Subject: [PATCH] roh/core: Add roh device sysfs node
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: aa4a5ce04fa5b234610291ed9958b8ef7b9042a0
+Modified-by-SEL: No
+
+
+driver inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5WKYW
+
+-----------------------------------------------------------------------
+
+Provide roh device sysfs file operation node, include querying
+the EID, GUID, link status and roh mib statistics.
+The hns dirver provides some verbs for the roh core to set or
+query the hardware information.
+
+Signed-off-by: Ke Chen <chenke54@huawei.com>
+Reviewed-by: Gang Zhang <gang.zhang@huawei.com>
+Reviewed-by: Yefeng Yan <yanyefeng@huawei.com>
+Reviewed-by: Jingchao Dai <daijingchao1@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/roh/core/Makefile         |   2 +-
+ drivers/roh/core/core.c           | 116 +++++++++++++
+ drivers/roh/core/core.h           |  11 ++
+ drivers/roh/core/core_priv.h      |   9 +
+ drivers/roh/core/sysfs.c          | 270 ++++++++++++++++++++++++++++++
+ drivers/roh/hw/hns3/Makefile      |   1 +
+ drivers/roh/hw/hns3/hns3_common.h |   3 +
+ drivers/roh/hw/hns3/hns3_main.c   |   6 +
+ drivers/roh/hw/hns3/hns3_verbs.c  | 270 ++++++++++++++++++++++++++++++
+ drivers/roh/hw/hns3/hns3_verbs.h  |  16 ++
+ 10 files changed, 703 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/roh/core/sysfs.c
+ create mode 100644 drivers/roh/hw/hns3/hns3_verbs.c
+ create mode 100644 drivers/roh/hw/hns3/hns3_verbs.h
+
+diff --git a/drivers/roh/core/Makefile b/drivers/roh/core/Makefile
+index 1c5ab1fc08ea..3b5f8e09ba34 100644
+--- a/drivers/roh/core/Makefile
++++ b/drivers/roh/core/Makefile
+@@ -3,5 +3,5 @@
+ # Makefile for the Linux kernel ROH Core drivers.
+ #
+ 
+-roh_core-objs := main.o core.o
++roh_core-objs := main.o core.o sysfs.o
+ obj-$(CONFIG_ROH) += roh_core.o
+diff --git a/drivers/roh/core/core.c b/drivers/roh/core/core.c
+index 2883d605e9bc..df563249f5d2 100644
+--- a/drivers/roh/core/core.c
++++ b/drivers/roh/core/core.c
+@@ -77,6 +77,8 @@ struct roh_device *roh_alloc_device(size_t size)
+ 
+ 	mutex_init(&device->unregistration_lock);
+ 
++	mutex_init(&device->eid_mutex);
++
+ 	xa_init_flags(&device->client_data, XA_FLAGS_ALLOC);
+ 	init_rwsem(&device->client_data_rwsem);
+ 	init_completion(&device->unreg_completion);
+@@ -191,6 +193,20 @@ static int assign_name(struct roh_device *device)
+ 	return ret;
+ }
+ 
++static int setup_device(struct roh_device *device)
++{
++	int ret;
++
++	/* Query GUID */
++	ret = device->ops.query_guid(device, &device->node_guid);
++	if (ret) {
++		pr_err("failed to query guid, ret = %d\n", ret);
++		return ret;
++	}
++
++	return 0;
++}
++
+ static void disable_device(struct roh_device *device)
+ {
+ 	u32 cid;
+@@ -247,6 +263,12 @@ int roh_register_device(struct roh_device *device)
+ 		return ret;
+ 	}
+ 
++	ret = setup_device(device);
++	if (ret) {
++		pr_err("roh_core: failed to setup device, ret = %d\n", ret);
++		return ret;
++	}
++
+ 	dev_set_uevent_suppress(&device->dev, true);
+ 	ret = device_add(&device->dev);
+ 	if (ret) {
+@@ -254,6 +276,10 @@ int roh_register_device(struct roh_device *device)
+ 		goto out;
+ 	}
+ 
++	ret = roh_device_register_sysfs(device);
++	if (ret)
++		goto err_dev_cleanup;
++
+ 	ret = enable_device_and_get(device);
+ 	dev_set_uevent_suppress(&device->dev, false);
+ 	kobject_uevent(&device->dev.kobj, KOBJ_ADD);
+@@ -266,6 +292,9 @@ int roh_register_device(struct roh_device *device)
+ 	roh_device_put(device);
+ 
+ 	return 0;
++
++err_dev_cleanup:
++	device_del(&device->dev);
+ out:
+ 	dev_set_uevent_suppress(&device->dev, false);
+ 	return ret;
+@@ -279,6 +308,7 @@ static void __roh_unregister_device(struct roh_device *device)
+ 		goto out;
+ 
+ 	disable_device(device);
++	roh_device_unregister_sysfs(device);
+ 	device_del(&device->dev);
+ 
+ out:
+@@ -458,6 +488,92 @@ void roh_unregister_client(struct roh_client *client)
+ 	remove_client_id(client);
+ }
+ 
++static int roh_set_pf_mac_by_eid(struct roh_device *device,
++				 struct roh_eid_attr *eid_attr)
++{
++	const struct net_device_ops *ndev_ops;
++	u32 eid = eid_attr->base;
++	struct net_device *ndev;
++	struct sockaddr s_addr;
++	u8 mac[ETH_ALEN];
++	int ret;
++
++	ndev = device->netdev;
++	if (!ndev)
++		return -EINVAL;
++
++	ndev_ops = ndev->netdev_ops;
++	if (!ndev_ops->ndo_set_mac_address)
++		return -EOPNOTSUPP;
++
++	convert_eid_to_mac(mac, eid);
++
++	s_addr.sa_family = ndev->type;
++	memcpy(s_addr.sa_data, mac, ndev->addr_len);
++
++	ret = dev_set_mac_address(ndev, &s_addr, NULL);
++	if (ret) {
++		netdev_err(ndev, "failed to set dev %s mac, ret = %d\n",
++			   ndev->name, ret);
++		return ret;
++	}
++
++	return 0;
++}
++
++static int roh_set_mac_by_eid(struct roh_device *device,
++			      struct roh_eid_attr *eid_attr)
++{
++	int ret;
++
++	ret = roh_set_pf_mac_by_eid(device, eid_attr);
++	if (ret) {
++		pr_err("failed to set pf mac, ret = %d\n", ret);
++		return ret;
++	}
++
++	return 0;
++}
++
++int roh_device_set_eid(struct roh_device *device, struct roh_eid_attr *attr)
++{
++	int ret;
++
++	if (!device->ops.set_eid)
++		return -EPROTONOSUPPORT;
++
++	mutex_lock(&device->eid_mutex);
++	/* Update current EID */
++	ret = device->ops.set_eid(device, attr);
++	if (ret) {
++		mutex_unlock(&device->eid_mutex);
++		return ret;
++	}
++
++	device->eid = *attr;
++	ret = roh_set_mac_by_eid(device, attr);
++	mutex_unlock(&device->eid_mutex);
++
++	return ret;
++}
++
++void roh_device_get_eid(struct roh_device *device, struct roh_eid_attr *attr)
++{
++	mutex_lock(&device->eid_mutex);
++	memcpy(attr, &device->eid, sizeof(*attr));
++	mutex_unlock(&device->eid_mutex);
++}
++
++void roh_device_query_guid(struct roh_device *device, struct roh_guid_attr *attr)
++{
++	memcpy(attr, &device->node_guid, sizeof(*attr));
++}
++
++enum roh_link_status roh_device_query_link_status(struct roh_device *device)
++{
++	return device->link_status;
++}
++
+ int roh_core_init(void)
+ {
+ 	int ret;
+diff --git a/drivers/roh/core/core.h b/drivers/roh/core/core.h
+index 85f676a7a075..3c528b5c6d01 100644
+--- a/drivers/roh/core/core.h
++++ b/drivers/roh/core/core.h
+@@ -19,6 +19,8 @@ enum roh_dev_tx {
+ 	ROHDEV_TX_LOCKED = 0x20 /* driver tx lock was already taken */
+ };
+ 
++enum roh_link_status { ROH_LINK_DOWN = 0, ROH_LINK_UP };
++
+ enum roh_mib_type { ROH_MIB_PUBLIC = 0, ROH_MIB_PRIVATE };
+ 
+ static inline void convert_eid_to_mac(u8 mac[6], u32 eid)
+@@ -82,6 +84,15 @@ struct roh_device {
+ 	refcount_t refcount;
+ 	struct completion unreg_completion;
+ 	struct mutex unregistration_lock; /* lock for unregiste */
++
++	struct roh_guid_attr node_guid;
++	struct roh_eid_attr eid;
++	struct mutex eid_mutex; /* operate eid needs to be mutexed */
++	u32 link_status;
++
++	struct attribute_group *hw_stats_ag;
++	struct roh_mib_stats *hw_public_stats;
++	struct roh_mib_stats *hw_private_stats;
+ };
+ 
+ static inline bool roh_device_try_get(struct roh_device *device)
+diff --git a/drivers/roh/core/core_priv.h b/drivers/roh/core/core_priv.h
+index 7e21cc807044..b8337636fdb2 100644
+--- a/drivers/roh/core/core_priv.h
++++ b/drivers/roh/core/core_priv.h
+@@ -18,4 +18,13 @@ void roh_unregister_client(struct roh_client *client);
+ void roh_set_client_data(struct roh_device *device,
+ 			 struct roh_client *client, void *data);
+ 
++int roh_device_register_sysfs(struct roh_device *device);
++void roh_device_unregister_sysfs(struct roh_device *device);
++
++int roh_device_set_eid(struct roh_device *device, struct roh_eid_attr *attr);
++void roh_device_get_eid(struct roh_device *device, struct roh_eid_attr *attr);
++
++void roh_device_query_guid(struct roh_device *device, struct roh_guid_attr *attr);
++enum roh_link_status roh_device_query_link_status(struct roh_device *device);
++
+ #endif /* __CORE_PRIV_H__ */
+diff --git a/drivers/roh/core/sysfs.c b/drivers/roh/core/sysfs.c
+new file mode 100644
+index 000000000000..a502b9f4f522
+--- /dev/null
++++ b/drivers/roh/core/sysfs.c
+@@ -0,0 +1,270 @@
++// SPDX-License-Identifier: GPL-2.0+
++// Copyright (c) 2020-2022 Hisilicon Limited.
++
++#include <linux/sysfs.h>
++#include <linux/stat.h>
++#include <net/sock.h>
++
++#include "core.h"
++#include "core_priv.h"
++
++#define ROH_MIB_STATS_TYPE_NUM 2
++
++static ssize_t node_eid_show(struct device *device,
++			     struct device_attribute *attr, char *buf)
++{
++	struct roh_device *dev = container_of(device, struct roh_device, dev);
++	struct roh_eid_attr eid;
++
++	roh_device_get_eid(dev, &eid);
++
++	return sprintf(buf, "base:%u num:%u\n", eid.base, eid.num);
++}
++
++static ssize_t node_guid_show(struct device *device,
++			      struct device_attribute *attr, char *buf)
++{
++	struct roh_device *dev = container_of(device, struct roh_device, dev);
++	struct roh_guid_attr guid;
++	u32 *val = (u32 *)guid.data;
++
++	roh_device_query_guid(dev, &guid);
++
++	return sprintf(buf, "%08x:%08x:%08x:%08x\n", val[0], val[1], val[2], val[3]);
++}
++
++static ssize_t node_link_status_show(struct device *device,
++				     struct device_attribute *attr, char *buf)
++{
++	struct roh_device *dev = container_of(device, struct roh_device, dev);
++
++	return sprintf(buf, "%s\n",
++		       (roh_device_query_link_status(dev) == ROH_LINK_UP) ?
++		       "UP" : "DOWN");
++}
++
++static DEVICE_ATTR_RO(node_eid);
++static DEVICE_ATTR_RO(node_guid);
++static DEVICE_ATTR_RO(node_link_status);
++
++static struct device_attribute *roh_class_attr[] = {
++	&dev_attr_node_eid,
++	&dev_attr_node_guid,
++	&dev_attr_node_link_status,
++};
++
++struct roh_hw_stats_attribute {
++	struct attribute attr;
++	ssize_t (*show)(struct kobject *kobj,
++			struct attribute *attr, char *buf);
++	ssize_t (*store)(struct kobject *kobj,
++			 struct attribute *attr,
++			 const char *buf,
++			 size_t count);
++};
++
++static void remove_device_sysfs(struct roh_device *device)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(roh_class_attr); i++)
++		device_remove_file(&device->dev, roh_class_attr[i]);
++}
++
++static const char * const roh_hw_stats_name[ROH_MIB_STATS_TYPE_NUM] = {
++	"mib_public",
++	"mib_private",
++};
++
++static ssize_t print_hw_stat(struct roh_device *dev,
++			     struct roh_mib_stats *stats, char *buf)
++{
++	int offset = 0;
++	int i;
++
++	for (i = 0; i < stats->num_counters; i++)
++		offset += sprintf(buf + offset, "%s: %llu\n",
++				  stats->names[i], stats->value[i]);
++	return offset;
++}
++
++static ssize_t node_public_mib_stats_show(struct kobject *kobj,
++					  struct attribute *attr, char *buf)
++{
++	struct roh_hw_stats_attribute *hsa;
++	struct roh_mib_stats *public_stats;
++	struct roh_device *dev;
++	int ret;
++
++	hsa = container_of(attr, struct roh_hw_stats_attribute, attr);
++	dev = container_of(kobj, struct roh_device, dev.kobj);
++	public_stats = dev->hw_public_stats;
++	mutex_lock(&public_stats->lock);
++	ret = dev->ops.get_hw_stats(dev, public_stats, ROH_MIB_PUBLIC);
++	if (ret)
++		goto unlock;
++
++	ret = print_hw_stat(dev, public_stats, buf);
++
++unlock:
++	mutex_unlock(&public_stats->lock);
++	return ret;
++}
++
++static ssize_t node_private_mib_stats_show(struct kobject *kobj,
++					   struct attribute *attr, char *buf)
++{
++	struct roh_mib_stats *private_stats;
++	struct roh_hw_stats_attribute *hsa;
++	struct roh_device *dev;
++	int ret;
++
++	hsa = container_of(attr, struct roh_hw_stats_attribute, attr);
++	dev = container_of(kobj, struct roh_device, dev.kobj);
++	private_stats = dev->hw_private_stats;
++	mutex_lock(&private_stats->lock);
++	ret = dev->ops.get_hw_stats(dev, private_stats, ROH_MIB_PRIVATE);
++	if (ret)
++		goto unlock;
++
++	ret = print_hw_stat(dev, private_stats, buf);
++
++unlock:
++	mutex_unlock(&private_stats->lock);
++	return ret;
++}
++
++static ssize_t (*show_roh_mib_hw_stats[ROH_MIB_STATS_TYPE_NUM])
++	(struct kobject *, struct attribute *, char *) = {
++	node_public_mib_stats_show,
++	node_private_mib_stats_show
++};
++
++static void free_hsag(struct kobject *kobj, struct attribute_group *attr_group)
++{
++	struct attribute **attr;
++
++	sysfs_remove_group(kobj, attr_group);
++
++	for (attr = attr_group->attrs; *attr; attr++)
++		kfree(*attr);
++	kfree(attr_group);
++}
++
++static struct attribute *alloc_hsa(const char *name,
++				   ssize_t (*show_roh_mib_hw_stats)
++				   (struct kobject *, struct attribute *, char *))
++{
++	struct roh_hw_stats_attribute *hsa;
++
++	hsa = kmalloc(sizeof(*hsa), GFP_KERNEL);
++	if (!hsa)
++		return NULL;
++
++	hsa->attr.name = (char *)name;
++	hsa->attr.mode = 0444;
++	hsa->show = show_roh_mib_hw_stats;
++	hsa->store = NULL;
++	return &hsa->attr;
++}
++
++static void setup_mib_stats(struct roh_device *device)
++{
++	struct roh_mib_stats *privite_stats, *public_stats;
++	struct attribute_group *hsag;
++	struct kobject *kobj;
++	int i, j;
++	int ret;
++
++	public_stats = device->ops.alloc_hw_stats(device, ROH_MIB_PUBLIC);
++	if (!public_stats)
++		return;
++
++	privite_stats = device->ops.alloc_hw_stats(device, ROH_MIB_PRIVATE);
++	if (!privite_stats) {
++		kfree(public_stats);
++		return;
++	}
++
++	hsag = kzalloc(sizeof(*hsag) +
++		       sizeof(void *) * (ARRAY_SIZE(roh_hw_stats_name)),
++		       GFP_KERNEL);
++	if (!hsag)
++		goto err_free_stats;
++
++	ret = device->ops.get_hw_stats(device, public_stats, ROH_MIB_PUBLIC);
++	if (ret)
++		goto err_free_hsag;
++
++	ret = device->ops.get_hw_stats(device, privite_stats, ROH_MIB_PRIVATE);
++	if (ret)
++		goto err_free_hsag;
++
++	hsag->name = "node_mib_stats";
++	hsag->attrs = (void *)hsag + sizeof(*hsag);
++
++	for (i = 0; i < ARRAY_SIZE(roh_hw_stats_name); i++) {
++		hsag->attrs[i] = alloc_hsa(roh_hw_stats_name[i],
++					   show_roh_mib_hw_stats[i]);
++		if (!hsag->attrs[i])
++			goto err;
++		sysfs_attr_init(hsag->attrs[i]);
++	}
++
++	mutex_init(&privite_stats->lock);
++	mutex_init(&public_stats->lock);
++
++	kobj = &device->dev.kobj;
++	ret = sysfs_create_group(kobj, hsag);
++	if (ret)
++		goto err;
++	device->hw_stats_ag = hsag;
++	device->hw_public_stats = public_stats;
++	device->hw_private_stats = privite_stats;
++
++	return;
++
++err:
++	for (j = i - 1; j >= 0; j--)
++		kfree(hsag->attrs[j]);
++err_free_hsag:
++	kfree(hsag);
++err_free_stats:
++	kfree(public_stats);
++	kfree(privite_stats);
++}
++
++int roh_device_register_sysfs(struct roh_device *device)
++{
++	int ret;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(roh_class_attr); i++) {
++		ret = device_create_file(&device->dev, roh_class_attr[i]);
++		if (ret) {
++			pr_err("failed to create node %s, ret = %d.\n",
++			       roh_class_attr[i]->attr.name, ret);
++			goto err;
++		}
++	}
++
++	if (device->ops.alloc_hw_stats)
++		setup_mib_stats(device);
++
++	return 0;
++
++err:
++	remove_device_sysfs(device);
++	return ret;
++}
++
++void roh_device_unregister_sysfs(struct roh_device *device)
++{
++	if (device->hw_stats_ag)
++		free_hsag(&device->dev.kobj, device->hw_stats_ag);
++
++	kfree(device->hw_private_stats);
++	kfree(device->hw_public_stats);
++
++	remove_device_sysfs(device);
++}
+diff --git a/drivers/roh/hw/hns3/Makefile b/drivers/roh/hw/hns3/Makefile
+index 3a7fb499fddb..df358c4c3464 100644
+--- a/drivers/roh/hw/hns3/Makefile
++++ b/drivers/roh/hw/hns3/Makefile
+@@ -8,5 +8,6 @@ ccflags-y +=  -I $(srctree)/drivers/roh/core
+ ccflags-y +=  -I $(srctree)/drivers/roh/hw/hns3
+ 
+ hns-roh-v1-objs := hns3_cmdq.o	\
++		   hns3_verbs.o	\
+ 		   hns3_main.o
+ obj-$(CONFIG_ROH_HNS) += hns-roh-v1.o
+diff --git a/drivers/roh/hw/hns3/hns3_common.h b/drivers/roh/hw/hns3/hns3_common.h
+index 5109b3aefb97..60e93fb4a243 100644
+--- a/drivers/roh/hw/hns3/hns3_common.h
++++ b/drivers/roh/hw/hns3/hns3_common.h
+@@ -12,6 +12,9 @@
+ 
+ #define HNS3_ROH_DESC_DATA_LEN 6
+ 
++#define HNS3_ROH_RD_FIRST_STATS_NUM 3
++#define HNS3_ROH_RD_OTHER_STATS_NUM 4
++
+ struct hns3_roh_desc {
+ 	__le16 opcode;
+ 
+diff --git a/drivers/roh/hw/hns3/hns3_main.c b/drivers/roh/hw/hns3/hns3_main.c
+index 85ff9b15bd4b..6554635e1fbe 100644
+--- a/drivers/roh/hw/hns3/hns3_main.c
++++ b/drivers/roh/hw/hns3/hns3_main.c
+@@ -9,6 +9,7 @@
+ #include "hnae3.h"
+ #include "hns3_common.h"
+ #include "hns3_cmdq.h"
++#include "hns3_verbs.h"
+ 
+ static const struct pci_device_id hns3_roh_pci_tbl[] = {
+ 	{ PCI_VDEVICE(HUAWEI, HNAE3_DEV_ID_100G_ROH), 0 },
+@@ -39,6 +40,11 @@ static int hns3_roh_register_device(struct hns3_roh_device *hroh_dev)
+ 	rohdev->dev.parent = dev;
+ 	rohdev->netdev = hroh_dev->netdev;
+ 
++	rohdev->ops.set_eid = hns3_roh_set_eid;
++	rohdev->ops.query_guid = hns3_roh_query_guid;
++	rohdev->ops.alloc_hw_stats = hns3_roh_alloc_hw_stats;
++	rohdev->ops.get_hw_stats = hns3_roh_get_hw_stats;
++
+ 	ret = roh_register_device(rohdev);
+ 	if (ret) {
+ 		dev_err(dev, "failed to register roh device, ret = %d\n", ret);
+diff --git a/drivers/roh/hw/hns3/hns3_verbs.c b/drivers/roh/hw/hns3/hns3_verbs.c
+new file mode 100644
+index 000000000000..8171f97563a1
+--- /dev/null
++++ b/drivers/roh/hw/hns3/hns3_verbs.c
+@@ -0,0 +1,270 @@
++// SPDX-License-Identifier: GPL-2.0+
++// Copyright (c) 2020-2022 Hisilicon Limited.
++
++#include "core.h"
++
++#include "hns3_verbs.h"
++#include "hns3_cmdq.h"
++
++int hns3_roh_set_eid(struct roh_device *rohdev, struct roh_eid_attr *eid_attr)
++{
++	struct hns3_roh_device *hroh_dev = to_hroh_dev(rohdev);
++	struct hns3_roh_set_eid_info *req;
++	struct hns3_roh_desc desc;
++	int ret;
++
++	hns3_roh_cmdq_setup_basic_desc(&desc, HNS3_ROH_OPC_SET_EID, false);
++
++	req = (struct hns3_roh_set_eid_info *)desc.data;
++	req->base_eid = cpu_to_le32(eid_attr->base);
++	req->num_eid = cpu_to_le32(eid_attr->num);
++
++	ret = hns3_roh_cmdq_send(hroh_dev, &desc, 1);
++	if (ret) {
++		dev_err(hroh_dev->dev, "failed to set eid, ret = %d\n", ret);
++		return ret;
++	}
++
++	return 0;
++}
++
++int hns3_roh_query_guid(struct roh_device *rohdev, struct roh_guid_attr *guid_attr)
++{
++	struct hns3_roh_device *hroh_dev = to_hroh_dev(rohdev);
++	struct hns3_roh_get_guid_info *req;
++	struct hns3_roh_desc desc;
++	int ret;
++
++	hns3_roh_cmdq_setup_basic_desc(&desc, HNS3_ROH_OPC_GET_GUID, true);
++	ret = hns3_roh_cmdq_send(hroh_dev, &desc, 1);
++	if (ret) {
++		dev_err(hroh_dev->dev, "failed to query guid, ret = %d\n", ret);
++		return ret;
++	}
++
++	req = (struct hns3_roh_get_guid_info *)desc.data;
++	memcpy(guid_attr->data, req->guid, sizeof(req->guid));
++
++	return 0;
++}
++
++static const char * const hns3_roh_hw_stats_name_public[] = {
++	"mac_tx_packet_num",
++	"mac_rx_packet_num",
++	"reserved",
++	"mac_tx_0_min_pkt_num",
++	"mac_tx_min_64_pkt_num",
++	"mac_tx_65_127_pkt_num",
++	"mac_tx_128_255_pkt_num",
++	"mac_tx_256_511_pkt_num",
++	"mac_tx_512_1023_pkt_num",
++	"mac_tx_1024_1518_pkt_num",
++	"mac_tx_1519_2047_pkt_num",
++	"mac_tx_2048_4095_pkt_num",
++	"mac_tx_4096_max_pkt_num",
++	"mac_tx_over_max_pkt_num",
++	"mac_tx_err_pkt_num",
++	"mac_tx_tc0_pkt_num",
++	"mac_tx_tc1_pkt_num",
++	"mac_tx_tc2_pkt_num",
++	"mac_tx_tc3_pkt_num",
++	"mac_tx_tc4_pkt_num",
++	"mac_tx_tc5_pkt_num",
++	"mac_tx_tc6_pkt_num",
++	"mac_tx_tc7_pkt_num",
++	"mac_tx_tc0_oct_num",
++	"mac_tx_tc1_oct_num",
++	"mac_tx_tc2_oct_num",
++	"mac_tx_tc3_oct_num",
++	"mac_tx_tc4_oct_num",
++	"mac_tx_tc5_oct_num",
++	"mac_tx_tc6_oct_num",
++	"mac_tx_tc7_oct_num",
++	"mac_tx_rdma_pkt_num",
++	"mac_tx_ip_pkt_num",
++	"mac_tx_udmp_eid_pkt_num",
++	"mac_tx_udmp_dr_pkt_num",
++	"mac_tx_rdma_oct_num",
++	"mac_tx_ip_oct_num",
++	"mac_tx_udmp_eid_oct_num",
++	"mac_tx_udmp_dr_oct_num",
++	"mac_tx_udmp_uap_pkt_num",
++	"mac_tx_udmp_uap_oct_num",
++	"mac_rx_udmp_uap_pkt_num",
++	"mac_rx_udmp_uap_oct_num",
++	"mac_rx_0_min_pkt_num",
++	"mac_rx_min_64_pkt_num",
++	"mac_rx_65_127_pkt_num",
++	"mac_rx_128_255_pkt_num",
++	"mac_rx_256_511_pkt_num",
++	"mac_rx_512_1023_pkt_num",
++	"mac_rx_1024_1518_pkt_num",
++	"mac_rx_1519_2047_pkt_num",
++	"mac_rx_2048_4095_pkt_num",
++	"mac_rx_4096_max_pkt_num",
++	"mac_rx_over_max_pkt_num",
++	"mac_rx_err_pkt_num",
++	"mac_rx_tc0_pkt_num",
++	"mac_rx_tc1_pkt_num",
++	"mac_rx_tc2_pkt_num",
++	"mac_rx_tc3_pkt_num",
++	"mac_rx_tc4_pkt_num",
++	"mac_rx_tc5_pkt_num",
++	"mac_rx_tc6_pkt_num",
++	"mac_rx_tc7_pkt_num",
++	"mac_rx_tc0_oct_num",
++	"mac_rx_tc1_oct_num",
++	"mac_rx_tc2_oct_num",
++	"mac_rx_tc3_oct_num",
++	"mac_rx_tc4_oct_num",
++	"mac_rx_tc5_oct_num",
++	"mac_rx_tc6_oct_num",
++	"mac_rx_tc7_oct_num",
++	"mac_rx_rdma_pkt_num",
++	"mac_rx_ip_pkt_num",
++	"mac_rx_udmp_eid_pkt_num",
++	"mac_rx_udmp_dr_pkt_num",
++	"mac_rx_rdma_oct_num",
++	"mac_rx_ip_oct_num",
++	"mac_rx_udmp_eid_oct_num",
++	"mac_rx_udmp_dr_oct_num",
++};
++
++static const char * const hns3_roh_hw_stats_name_private[] = {
++	"mac_tx_block_num",
++	"mac_tx_flit_num",
++	"mac_tx_icrd_vna_total_used",
++	"mac_tx_icrd_vna_total_released",
++	"mac_tx_tc0_icrd_vn_total_used",
++	"mac_tx_tc1_icrd_vn_total_used",
++	"mac_tx_tc2_icrd_vn_total_used",
++	"mac_tx_tc3_icrd_vn_total_used",
++	"mac_tx_tc4_icrd_vn_total_used",
++	"mac_tx_tc5_icrd_vn_total_used",
++	"mac_tx_tc6_icrd_vn_total_used",
++	"mac_tx_tc7_icrd_vn_total_used",
++	"mac_tx_tc0_icrd_vn_total_released",
++	"mac_tx_tc1_icrd_vn_total_released",
++	"mac_tx_tc2_icrd_vn_total_released",
++	"mac_tx_tc3_icrd_vn_total_released",
++	"mac_tx_tc4_icrd_vn_total_released",
++	"mac_tx_tc5_icrd_vn_total_released",
++	"mac_tx_tc6_icrd_vn_total_released",
++	"mac_tx_tc7_icrd_vn_total_released",
++	"mac_tx_rdma_inc_pkt_num",
++	"mac_tx_rdma_inc_oct_num",
++	"mac_rx_rdma_inc_pkt_num",
++	"mac_rx_rdma_inc_oct_num",
++	"mac_rx_block_num",
++	"mac_rx_flit_num",
++	"mac_rx_icrd_vna_total_used",
++	"mac_rx_icrd_vna_total_released",
++	"mac_rx_tc0_icrd_vn_total_used",
++	"mac_rx_tc1_icrd_vn_total_used",
++	"mac_rx_tc2_icrd_vn_total_used",
++	"mac_rx_tc3_icrd_vn_total_used",
++	"mac_rx_tc4_icrd_vn_total_used",
++	"mac_rx_tc5_icrd_vn_total_used",
++	"mac_rx_tc6_icrd_vn_total_used",
++	"mac_rx_tc7_icrd_vn_total_used",
++	"mac_rx_tc0_icrd_vn_total_released",
++	"mac_rx_tc1_icrd_vn_total_released",
++	"mac_rx_tc2_icrd_vn_total_released",
++	"mac_rx_tc3_icrd_vn_total_released",
++	"mac_rx_tc4_icrd_vn_total_released",
++	"mac_rx_tc5_icrd_vn_total_released",
++	"mac_rx_tc6_icrd_vn_total_released",
++	"mac_rx_tc7_icrd_vn_total_released",
++};
++
++struct roh_mib_stats *hns3_roh_alloc_hw_stats(struct roh_device *rohdev, enum roh_mib_type mib_type)
++{
++	struct roh_mib_stats *stats = NULL;
++	int num_counters;
++
++	switch (mib_type) {
++	case ROH_MIB_PUBLIC:
++		num_counters = ARRAY_SIZE(hns3_roh_hw_stats_name_public);
++		stats = kzalloc(sizeof(*stats) + num_counters * sizeof(u64), GFP_KERNEL);
++		if (!stats)
++			return NULL;
++		stats->names = hns3_roh_hw_stats_name_public;
++		stats->num_counters = num_counters;
++		break;
++	case ROH_MIB_PRIVATE:
++		num_counters = ARRAY_SIZE(hns3_roh_hw_stats_name_private);
++		stats = kzalloc(sizeof(*stats) + num_counters * sizeof(u64), GFP_KERNEL);
++		if (!stats)
++			return NULL;
++		stats->names = hns3_roh_hw_stats_name_private;
++		stats->num_counters = num_counters;
++		break;
++	default:
++		break;
++	}
++
++	return stats;
++}
++
++int hns3_roh_get_hw_stats(struct roh_device *rohdev, struct roh_mib_stats *stats,
++			  enum roh_mib_type mib_type)
++{
++	struct hns3_roh_device *hroh_dev = to_hroh_dev(rohdev);
++	u64 *data = (u64 *)(stats->value);
++	enum hns3_roh_opcode_type opcode;
++	struct hns3_roh_desc *desc;
++	int start, stats_num;
++	__le64 *desc_data;
++	u32 desc_num;
++	int i, j;
++	int ret;
++
++	if (mib_type != ROH_MIB_PUBLIC && mib_type != ROH_MIB_PRIVATE) {
++		ret = -EINVAL;
++		goto err_out;
++	}
++
++	if (mib_type == ROH_MIB_PUBLIC)
++		desc_num = 1 + DIV_ROUND_UP(stats->num_counters - HNS3_ROH_RD_FIRST_STATS_NUM,
++			HNS3_ROH_RD_OTHER_STATS_NUM);
++	else
++		desc_num = 1 + DIV_ROUND_UP(stats->num_counters, HNS3_ROH_RD_OTHER_STATS_NUM);
++	desc = kcalloc(desc_num, sizeof(struct hns3_roh_desc), GFP_KERNEL);
++	if (!desc) {
++		ret = -ENOMEM;
++		goto err_out;
++	}
++
++	opcode = (mib_type == ROH_MIB_PUBLIC) ?
++		HNS3_ROH_OPC_QUERY_MIB_PUBLIC : HNS3_ROH_OPC_QUERY_MIB_PRIVATE;
++	hns3_roh_cmdq_setup_basic_desc(&desc[0], opcode, true);
++
++	ret = hns3_roh_cmdq_send(hroh_dev, desc, desc_num);
++	if (ret)
++		goto err_send_cmd;
++
++	start = (mib_type == ROH_MIB_PUBLIC) ? 0 : 1;
++	for (i = start; i < desc_num; i++) {
++		/* HNS3_ROH_OPC_QUERY_MIB_PUBLIC: only the first desc has the head
++		 * HNS3_ROH_OPC_QUERY_MIB_PRIVATE: start from command1, no head
++		 */
++		if (i == 0) {
++			desc_data = (__le64 *)(&desc[i].data[0]);
++			stats_num = HNS3_ROH_RD_FIRST_STATS_NUM;
++		} else {
++			desc_data = (__le64 *)(&desc[i]);
++			stats_num = HNS3_ROH_RD_OTHER_STATS_NUM;
++		}
++
++		for (j = 0; j < stats_num; j++) {
++			*data = le64_to_cpu(*desc_data);
++			data++;
++			desc_data++;
++		}
++	}
++
++err_send_cmd:
++	kfree(desc);
++err_out:
++	return ret;
++}
+diff --git a/drivers/roh/hw/hns3/hns3_verbs.h b/drivers/roh/hw/hns3/hns3_verbs.h
+new file mode 100644
+index 000000000000..152d9b162574
+--- /dev/null
++++ b/drivers/roh/hw/hns3/hns3_verbs.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++// Copyright (c) 2020-2022 Hisilicon Limited.
++#ifndef __HNS3_ROH_VERBS_H__
++#define __HNS3_ROH_VERBS_H__
++
++#include "core.h"
++#include "hns3_common.h"
++
++int hns3_roh_set_eid(struct roh_device *rohdev, struct roh_eid_attr *eid_attr);
++int hns3_roh_query_guid(struct roh_device *rohdev, struct roh_guid_attr *guid_attr);
++struct roh_mib_stats *hns3_roh_alloc_hw_stats(struct roh_device *rohdev,
++					      enum roh_mib_type mib_type);
++int hns3_roh_get_hw_stats(struct roh_device *rohdev, struct roh_mib_stats *stats,
++			  enum roh_mib_type mib_type);
++
++#endif /* __HNS3_ROH_VERBS_H__ */
+-- 
+2.33.0
+

@@ -1,0 +1,152 @@
+From df00532d7039f7f36c0d227ac50c41e5c533e3ab Mon Sep 17 00:00:00 2001
+From: Hang Xiaoqian <hangxiaoqian@wxiat.com>
+Date: Wed, 24 Aug 2022 17:32:11 +0800
+Subject: [PATCH] sw64: switch to generic calibrate_delay()
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: df00532d7039f7f36c0d227ac50c41e5c533e3ab
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56OLG
+
+--------------------------------
+
+There is no need to use per cpu loops_per_jiffy, so we
+remove loops_per_jiffy from struct cpuinfo_sw64.
+
+Signed-off-by: Hang Xiaoqian <hangxiaoqian@wxiat.com>
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/Kconfig               |  4 ++++
+ arch/sw_64/include/asm/hw_init.h |  1 -
+ arch/sw_64/kernel/setup.c        |  1 -
+ arch/sw_64/kernel/smp.c          | 12 +-----------
+ arch/sw_64/kernel/time.c         | 10 ++--------
+ arch/sw_64/lib/udelay.c          |  6 ------
+ drivers/cpufreq/sw64_cpufreq.c   |  4 +---
+ 7 files changed, 8 insertions(+), 30 deletions(-)
+
+diff --git a/arch/sw_64/Kconfig b/arch/sw_64/Kconfig
+index 392f7806afcb..36cddefb1ad4 100644
+--- a/arch/sw_64/Kconfig
++++ b/arch/sw_64/Kconfig
+@@ -142,6 +142,10 @@ config ARCH_HAS_ILOG2_U64
+ config GENERIC_GPIO
+ 	bool
+ 
++config GENERIC_CALIBRATE_DELAY
++	bool
++	default y
++
+ config ZONE_DMA32
+ 	bool
+ 	default y
+diff --git a/arch/sw_64/include/asm/hw_init.h b/arch/sw_64/include/asm/hw_init.h
+index a36c811839ea..e0a5706710cd 100644
+--- a/arch/sw_64/include/asm/hw_init.h
++++ b/arch/sw_64/include/asm/hw_init.h
+@@ -18,7 +18,6 @@ struct cache_desc {
+ };
+ 
+ struct cpuinfo_sw64 {
+-	unsigned long loops_per_jiffy;
+ 	unsigned long last_asn;
+ 	unsigned long ipi_count;
+ 	struct cache_desc icache; /* Primary I-cache */
+diff --git a/arch/sw_64/kernel/setup.c b/arch/sw_64/kernel/setup.c
+index cb04aaa0cb97..2d2a8c6d4b4e 100644
+--- a/arch/sw_64/kernel/setup.c
++++ b/arch/sw_64/kernel/setup.c
+@@ -143,7 +143,6 @@ EXPORT_SYMBOL(screen_info);
+  */
+ void store_cpu_data(int cpu)
+ {
+-	cpu_data[cpu].loops_per_jiffy = loops_per_jiffy;
+ 	cpu_data[cpu].last_asn = ASN_FIRST_VERSION;
+ }
+ 
+diff --git a/arch/sw_64/kernel/smp.c b/arch/sw_64/kernel/smp.c
+index f74b172ecb25..c0936d119c4e 100644
+--- a/arch/sw_64/kernel/smp.c
++++ b/arch/sw_64/kernel/smp.c
+@@ -374,18 +374,8 @@ int native_cpu_up(unsigned int cpu, struct task_struct *tidle)
+ 
+ void __init native_smp_cpus_done(unsigned int max_cpus)
+ {
+-	int cpu;
+-	unsigned long bogosum = 0;
+-
+-	for (cpu = 0; cpu < NR_CPUS; cpu++)
+-		if (cpu_online(cpu))
+-			bogosum += cpu_data[cpu].loops_per_jiffy;
+-
+ 	smp_booted = 1;
+-	pr_info("SMP: Total of %d processors activated (%lu.%02lu BogoMIPS).\n",
+-		num_online_cpus(),
+-		(bogosum + 2500) / (500000/HZ),
+-		((bogosum + 2500) / (5000/HZ)) % 100);
++	pr_info("SMP: Total of %d processors activated.\n", num_online_cpus());
+ }
+ 
+ int setup_profiling_timer(unsigned int multiplier)
+diff --git a/arch/sw_64/kernel/time.c b/arch/sw_64/kernel/time.c
+index 6a4c8a31465c..3aa55c886e38 100644
+--- a/arch/sw_64/kernel/time.c
++++ b/arch/sw_64/kernel/time.c
+@@ -111,14 +111,8 @@ time_init(void)
+ 	of_clk_init(NULL);
+ 	/* Startup the timer source. */
+ 	setup_timer();
+-}
+-
+-void calibrate_delay(void)
+-{
+-	loops_per_jiffy = get_cpu_freq() / HZ;
+-	pr_info("Clock rate yields %lu.%02lu BogoMIPS (lpj=%lu)\n",
+-			loops_per_jiffy / (500000 / HZ),
+-			(loops_per_jiffy / (5000 / HZ)) % 100, loops_per_jiffy);
++	/* Calibrate the delay loop directly */
++	lpj_fine = cycle_freq / HZ;
+ }
+ 
+ static void __init calibrate_sched_clock(void)
+diff --git a/arch/sw_64/lib/udelay.c b/arch/sw_64/lib/udelay.c
+index 48356ab8872f..59ca8a97d748 100644
+--- a/arch/sw_64/lib/udelay.c
++++ b/arch/sw_64/lib/udelay.c
+@@ -28,12 +28,6 @@ void __delay(unsigned long loops)
+ }
+ EXPORT_SYMBOL(__delay);
+ 
+-#ifdef CONFIG_SMP
+-#define LPJ	 cpu_data[smp_processor_id()].loops_per_jiffy
+-#else
+-#define LPJ	 loops_per_jiffy
+-#endif
+-
+ void udelay(unsigned long usecs)
+ {
+ 	unsigned long loops = usecs * get_cpu_freq() / 1000000;
+diff --git a/drivers/cpufreq/sw64_cpufreq.c b/drivers/cpufreq/sw64_cpufreq.c
+index b8cd37dac0d9..71f944de934b 100644
+--- a/drivers/cpufreq/sw64_cpufreq.c
++++ b/drivers/cpufreq/sw64_cpufreq.c
+@@ -40,10 +40,8 @@ static int sw64_cpu_freq_notifier(struct notifier_block *nb,
+ 	unsigned long cpu;
+ 
+ 	for_each_online_cpu(cpu) {
+-		if (val == CPUFREQ_POSTCHANGE) {
++		if (val == CPUFREQ_POSTCHANGE)
+ 			sw64_update_clockevents(cpu, freqs->new * 1000);
+-			current_cpu_data.loops_per_jiffy = loops_per_jiffy;
+-		}
+ 	}
+ 
+ 	return 0;
+-- 
+2.33.0
+

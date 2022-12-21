@@ -1,0 +1,175 @@
+From 12c7518ac680c0cf551d9fc14d9d87bd14d10863 Mon Sep 17 00:00:00 2001
+From: Kefeng Wang <wangkefeng.wang@huawei.com>
+Date: Thu, 3 Nov 2022 18:49:21 +0800
+Subject: [PATCH] arm64: memmap: fix request_resource return error
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 12c7518ac680c0cf551d9fc14d9d87bd14d10863
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: 187483, https://gitee.com/openeuler/kernel/issues/I5MH9N
+CVE: NA
+
+--------------------------------
+
+When support memmap=nn[KMG]$ss[KMG], it will request resource to show
+reserved memory in iomem, but with memblock_setclr_flag() called
+memblock_mark_memmap() leads to split memblock region and then
+request_resource() could return -EBUSY when passed unaligned address.
+
+Let's directly use memblock_reserve() and drop membloc_setclr_flag()
+and show error if request_resource() in request_memmap_resource()
+return error code.
+
+Signed-off-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Liu Shixin <liushixin2@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/kernel/setup.c | 37 +++++++++++++++++++++++++++----------
+ arch/arm64/mm/init.c      | 30 +++++++++++++++---------------
+ arch/arm64/mm/internal.h  |  4 ++++
+ 3 files changed, 46 insertions(+), 25 deletions(-)
+
+diff --git a/arch/arm64/kernel/setup.c b/arch/arm64/kernel/setup.c
+index ddca8d27fca6..940e237009e9 100644
+--- a/arch/arm64/kernel/setup.c
++++ b/arch/arm64/kernel/setup.c
+@@ -219,17 +219,34 @@ static void __init setup_machine_fdt(phys_addr_t dt_phys)
+ static void __init request_memmap_resources(struct resource *res)
+ {
+ 	struct resource *memmap_res;
++	phys_addr_t base, size;
++	int i;
++
++	for (i = 0; i < MAX_RES_REGIONS; i++) {
++		base = mbk_memmap_regions[i].base;
++		size = mbk_memmap_regions[i].size;
++		if (!size)
++			continue;
++
++		if ((base < res->start) || (base + size - 1 > res->end))
++			continue;
+ 
+-	memmap_res = memblock_alloc(sizeof(*memmap_res), SMP_CACHE_BYTES);
+-	if (!memmap_res)
+-		panic("%s: Failed to allocate memmap_res\n", __func__);
++		memmap_res = memblock_alloc(sizeof(*memmap_res), SMP_CACHE_BYTES);
++		if (!memmap_res)
++			panic("%s: Failed to allocate memmap_res\n", __func__);
+ 
+-	memmap_res->name = "memmap reserved";
+-	memmap_res->flags = IORESOURCE_MEM;
+-	memmap_res->start = res->start;
+-	memmap_res->end = res->end;
++		memmap_res->name = "memmap reserved";
++		memmap_res->flags = IORESOURCE_MEM;
++		memmap_res->start = base;
++		memmap_res->end = base + size - 1;
+ 
+-	request_resource(res, memmap_res);
++		if (request_resource(res, memmap_res)) {
++			pr_warn("memmap reserve: [%llx, %llx] request resource fail\n",
++				memmap_res->start, memmap_res->end);
++			memblock_free_early(virt_to_phys(memmap_res),
++					    sizeof(*memmap_res));
++		}
++	}
+ }
+ 
+ static void __init request_standard_resources(void)
+@@ -270,8 +287,8 @@ static void __init request_standard_resources(void)
+ 		if (kernel_data.start >= res->start &&
+ 		    kernel_data.end <= res->end)
+ 			request_resource(res, &kernel_data);
+-		if (memblock_is_memmap(region))
+-			request_memmap_resources(res);
++
++		request_memmap_resources(res);
+ 
+ #ifdef CONFIG_KEXEC_CORE
+ 		/* Userspace will find "Crash kernel" region in /proc/iomem. */
+diff --git a/arch/arm64/mm/init.c b/arch/arm64/mm/init.c
+index 5023c7e1f754..7ef7c0e7ee7c 100644
+--- a/arch/arm64/mm/init.c
++++ b/arch/arm64/mm/init.c
+@@ -297,10 +297,8 @@ static void __init fdt_enforce_memory_region(void)
+ 		memblock_add(usable_rgns[1].base, usable_rgns[1].size);
+ }
+ 
+-#define MAX_RES_REGIONS 32
+-
+-static struct memblock_region mbk_memmap_regions[MAX_RES_REGIONS] __initdata_memblock;
+-static int mbk_memmap_cnt __initdata;
++struct memblock_region mbk_memmap_regions[MAX_RES_REGIONS] __initdata_memblock;
++int mbk_memmap_cnt __initdata;
+ 
+ static void __init setup_mbk_memmap_regions(phys_addr_t base, phys_addr_t size)
+ {
+@@ -317,6 +315,7 @@ static void __init setup_mbk_memmap_regions(phys_addr_t base, phys_addr_t size)
+ static void __init reserve_memmap_regions(void)
+ {
+ 	phys_addr_t base, size;
++	const char *str;
+ 	int i;
+ 
+ 	for (i = 0; i < mbk_memmap_cnt; i++) {
+@@ -324,26 +323,27 @@ static void __init reserve_memmap_regions(void)
+ 		size = mbk_memmap_regions[i].size;
+ 
+ 		if (!memblock_is_region_memory(base, size)) {
+-			pr_warn("memmap reserve: 0x%08llx - 0x%08llx is not a memory region - ignore\n",
+-				base, base + size);
+-			continue;
++			str = "is not a memory region - ignore";
++			goto err;
+ 		}
+ 
+ 		if (memblock_is_region_reserved(base, size)) {
+-			pr_warn("memmap reserve: 0x%08llx - 0x%08llx overlaps in-use memory region - ignore\n",
+-				base, base + size);
+-			continue;
++			str = "overlaps in-use memory region - ignore";
++			goto err;
+ 		}
+ 
+ 		if (memblock_reserve(base, size)) {
+-			pr_warn("memmap reserve: 0x%08llx - 0x%08llx failed\n",
+-				base, base + size);
+-			continue;
++			str = "failed";
++			goto err;
+ 		}
+ 
+ 		pr_info("memmap reserved: 0x%08llx - 0x%08llx (%lld MB)",
+-			base, base + size, size >> 20);
+-		memblock_mark_memmap(base, size);
++			base, base + size - 1, size >> 20);
++		continue;
++err:
++		mbk_memmap_regions[i].size = 0;
++		pr_warn("memmap reserve: 0x%08llx - 0x%08llx %s\n",
++			base, base + size - 1, str);
+ 	}
+ }
+ 
+diff --git a/arch/arm64/mm/internal.h b/arch/arm64/mm/internal.h
+index 9b8e20d87172..2af98d110668 100644
+--- a/arch/arm64/mm/internal.h
++++ b/arch/arm64/mm/internal.h
+@@ -22,4 +22,8 @@ static inline void __init reserve_quick_kexec(void) {}
+ static inline void __init request_quick_kexec_res(struct resource *res) {}
+ #endif
+ 
++#define MAX_RES_REGIONS 32
++extern struct memblock_region mbk_memmap_regions[MAX_RES_REGIONS];
++extern int mbk_memmap_cnt;
++
+ #endif /* ifndef _ARM64_MM_INTERNAL_H */
+-- 
+2.33.0
+

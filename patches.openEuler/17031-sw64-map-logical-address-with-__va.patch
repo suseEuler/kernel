@@ -1,0 +1,364 @@
+From 96259d7012ceb2b857d2f53c9921498365bd212e Mon Sep 17 00:00:00 2001
+From: He Sheng <hesheng@wxiat.com>
+Date: Thu, 12 May 2022 11:22:07 +0800
+Subject: [PATCH] sw64: map logical address with __va()
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 96259d7012ceb2b857d2f53c9921498365bd212e
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5G5YB
+
+--------------------------------
+
+Although kmem and IO space are accessed with direct mapping on sw64,
+it's not a standard method to or PAGE_OFFSET and access it directly
+everywhere. This patch maps PA to VA with __va(). Besides, we change
+type of some variables to pointer to make the code clearer.
+
+Signed-off-by: He Sheng <hesheng@wxiat.com>
+
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/chip/chip3/chip.c           |  4 +-
+ arch/sw_64/chip/chip3/i2c-lib.c        | 24 +++++------
+ arch/sw_64/include/asm/pci.h           |  4 +-
+ arch/sw_64/include/asm/sw64io.h        | 56 +++++++++++++-------------
+ arch/sw_64/kernel/dup_print.c          | 10 +++--
+ arch/sw_64/kernel/pci.c                |  5 +--
+ arch/sw_64/kvm/kvm-sw64.c              | 11 +++--
+ arch/sw_64/platform/platform_xuelang.c |  2 +-
+ 8 files changed, 59 insertions(+), 57 deletions(-)
+
+diff --git a/arch/sw_64/chip/chip3/chip.c b/arch/sw_64/chip/chip3/chip.c
+index 704588d7c3e1..acd25fe99669 100644
+--- a/arch/sw_64/chip/chip3/chip.c
++++ b/arch/sw_64/chip/chip3/chip.c
+@@ -480,8 +480,8 @@ static void chip3_hose_init(struct pci_controller *hose)
+ 
+ 	hose->dense_mem_base = pci_io_base;
+ 	hose->dense_io_base = pci_io_base | PCI_LEGACY_IO;
+-	hose->ep_config_space_base = PAGE_OFFSET | pci_io_base | PCI_EP_CFG;
+-	hose->rc_config_space_base = PAGE_OFFSET | pci_io_base | PCI_RC_CFG;
++	hose->ep_config_space_base = __va(pci_io_base | PCI_EP_CFG);
++	hose->rc_config_space_base = __va(pci_io_base | PCI_RC_CFG);
+ 
+ 	hose->mem_space->start = pci_io_base + PCI_32BIT_MEMIO;
+ 	hose->mem_space->end = hose->mem_space->start + PCI_32BIT_MEMIO_SIZE - 1;
+diff --git a/arch/sw_64/chip/chip3/i2c-lib.c b/arch/sw_64/chip/chip3/i2c-lib.c
+index 39b815022e69..b3dcdcd32735 100644
+--- a/arch/sw_64/chip/chip3/i2c-lib.c
++++ b/arch/sw_64/chip/chip3/i2c-lib.c
+@@ -96,7 +96,7 @@ enum i2c_bus_operation {
+ 	I2C_BUS_WRITE,
+ };
+ 
+-static uint64_t m_i2c_base_address;
++static void __iomem *m_i2c_base_address;
+ 
+ /*
+  * This function get I2Cx controller base address
+@@ -104,18 +104,18 @@ static uint64_t m_i2c_base_address;
+  * @param i2c_controller_index  Bus Number of I2C controller.
+  * @return I2C BAR.
+  */
+-uint64_t get_i2c_bar_addr(uint8_t i2c_controller_index)
++void __iomem *get_i2c_bar_addr(uint8_t i2c_controller_index)
+ {
+-	uint64_t base_addr = 0;
+-
+-	if (i2c_controller_index == 0)
+-		base_addr = PAGE_OFFSET | IO_BASE | IIC0_BASE;
+-	else if (i2c_controller_index == 1)
+-		base_addr = PAGE_OFFSET | IO_BASE | IIC1_BASE;
+-	else if (i2c_controller_index == 2)
+-		base_addr = PAGE_OFFSET | IO_BASE | IIC2_BASE;
+-
+-	return base_addr;
++	switch (i2c_controller_index) {
++	case 0:
++		return __va(IO_BASE | IIC0_BASE);
++	case 1:
++		return __va(IO_BASE | IIC1_BASE);
++	case 2:
++		return __va(IO_BASE | IIC2_BASE);
++	default:
++		return NULL;
++	}
+ }
+ 
+ void write_cpu_i2c_controller(uint64_t offset, uint32_t data)
+diff --git a/arch/sw_64/include/asm/pci.h b/arch/sw_64/include/asm/pci.h
+index ed875e0c3162..a90f80152470 100644
+--- a/arch/sw_64/include/asm/pci.h
++++ b/arch/sw_64/include/asm/pci.h
+@@ -34,8 +34,8 @@ struct pci_controller {
+ 	unsigned long dense_io_base;
+ 
+ 	/* This one's for the kernel only.  It's in KSEG somewhere.  */
+-	unsigned long ep_config_space_base;
+-	unsigned long rc_config_space_base;
++	void __iomem *ep_config_space_base;
++	void __iomem *rc_config_space_base;
+ 
+ 	unsigned long index;
+ 	unsigned long node;
+diff --git a/arch/sw_64/include/asm/sw64io.h b/arch/sw_64/include/asm/sw64io.h
+index 7c032070acf0..e66aba66932b 100644
+--- a/arch/sw_64/include/asm/sw64io.h
++++ b/arch/sw_64/include/asm/sw64io.h
+@@ -11,20 +11,20 @@ extern void setup_chip_clocksource(void);
+ #endif
+ 
+ #define MK_RC_CFG(nid, idx) \
+-	(PAGE_OFFSET | SW64_PCI_IO_BASE((nid), (idx)) | PCI_RC_CFG)
++	(SW64_PCI_IO_BASE((nid), (idx)) | PCI_RC_CFG)
+ #define MK_PIU_IOR0(nid, idx) \
+-	(PAGE_OFFSET | SW64_PCI_IO_BASE((nid), (idx)) | PCI_IOR0_BASE)
++	(SW64_PCI_IO_BASE((nid), (idx)) | PCI_IOR0_BASE)
+ #define MK_PIU_IOR1(nid, idx) \
+-	(PAGE_OFFSET | SW64_PCI_IO_BASE((nid), (idx)) | PCI_IOR1_BASE)
++	(SW64_PCI_IO_BASE((nid), (idx)) | PCI_IOR1_BASE)
+ 
+ static inline  unsigned int
+-read_rc_conf(unsigned long node, unsigned long rc_index,
+-		unsigned int conf_offset)
++read_rc_conf(unsigned long node, unsigned long rc,
++		unsigned int offset)
+ {
+-	unsigned long addr;
++	void __iomem *addr;
+ 	unsigned int value;
+ 
+-	addr = MK_RC_CFG(node, rc_index) | conf_offset;
++	addr = __va(MK_RC_CFG(node, rc) | offset);
+ 	value = *(volatile unsigned int *)addr;
+ 	mb();
+ 
+@@ -32,24 +32,24 @@ read_rc_conf(unsigned long node, unsigned long rc_index,
+ }
+ 
+ static inline void
+-write_rc_conf(unsigned long node, unsigned long rc_index,
+-		unsigned int conf_offset, unsigned int data)
++write_rc_conf(unsigned long node, unsigned long rc,
++		unsigned int offset, unsigned int data)
+ {
+-	unsigned long addr;
++	void __iomem *addr;
+ 
+-	addr = MK_RC_CFG(node, rc_index) | conf_offset;
++	addr = __va(MK_RC_CFG(node, rc) | offset);
+ 	*(unsigned int *)addr = data;
+ 	mb();
+ }
+ 
+ static inline  unsigned long
+-read_piu_ior0(unsigned long node, unsigned long rc_index,
++read_piu_ior0(unsigned long node, unsigned long rc,
+ 		unsigned int reg)
+ {
+-	unsigned long addr;
++	void __iomem *addr;
+ 	unsigned long value;
+ 
+-	addr = MK_PIU_IOR0(node, rc_index) + reg;
++	addr = __va(MK_PIU_IOR0(node, rc) + reg);
+ 	value = *(volatile unsigned long __iomem *)addr;
+ 	mb();
+ 
+@@ -57,23 +57,24 @@ read_piu_ior0(unsigned long node, unsigned long rc_index,
+ }
+ 
+ static inline void
+-write_piu_ior0(unsigned long node, unsigned long rc_index,
++write_piu_ior0(unsigned long node, unsigned long rc,
+ 		unsigned int reg, unsigned long data)
+ {
+-	unsigned long addr;
++	void __iomem *addr;
+ 
+-	addr = MK_PIU_IOR0(node, rc_index) + reg;
++	addr = __va(MK_PIU_IOR0(node, rc) + reg);
+ 	*(unsigned long __iomem *)addr = data;
+ 	mb();
+ }
+ 
+ static inline  unsigned long
+-read_piu_ior1(unsigned long node, unsigned long rc_index,
++read_piu_ior1(unsigned long node, unsigned long rc,
+ 		unsigned int reg)
+ {
+-	unsigned long addr, value;
++	void __iomem *addr;
++	unsigned long value;
+ 
+-	addr = MK_PIU_IOR1(node, rc_index) + reg;
++	addr = __va(MK_PIU_IOR1(node, rc) + reg);
+ 	value = *(volatile unsigned long __iomem *)addr;
+ 	mb();
+ 
+@@ -81,12 +82,12 @@ read_piu_ior1(unsigned long node, unsigned long rc_index,
+ }
+ 
+ static inline void
+-write_piu_ior1(unsigned long node, unsigned long rc_index,
++write_piu_ior1(unsigned long node, unsigned long rc,
+ 		unsigned int reg, unsigned long data)
+ {
+-	unsigned long addr;
++	void __iomem *addr;
+ 
+-	addr = MK_PIU_IOR1(node, rc_index) + reg;
++	addr = __va(MK_PIU_IOR1(node, rc) + reg);
+ 	*(volatile unsigned long __iomem *)addr = data;
+ 	mb();
+ }
+@@ -94,9 +95,10 @@ write_piu_ior1(unsigned long node, unsigned long rc_index,
+ static inline unsigned long
+ sw64_io_read(unsigned long node, unsigned long reg)
+ {
+-	unsigned long addr, value;
++	void __iomem *addr;
++	unsigned long value;
+ 
+-	addr = PAGE_OFFSET | SW64_IO_BASE(node) | reg;
++	addr = __va(SW64_IO_BASE(node) | reg);
+ 	value = *(volatile unsigned long __iomem *)addr;
+ 	mb();
+ 
+@@ -106,9 +108,9 @@ sw64_io_read(unsigned long node, unsigned long reg)
+ static inline void
+ sw64_io_write(unsigned long node, unsigned long reg, unsigned long data)
+ {
+-	unsigned long addr;
++	void __iomem *addr;
+ 
+-	addr = PAGE_OFFSET | SW64_IO_BASE(node) | reg;
++	addr = __va(SW64_IO_BASE(node) | reg);
+ 	*(volatile unsigned long __iomem *)addr = data;
+ 	mb();
+ }
+diff --git a/arch/sw_64/kernel/dup_print.c b/arch/sw_64/kernel/dup_print.c
+index 1aa7710b5092..02639f40a4bc 100644
+--- a/arch/sw_64/kernel/dup_print.c
++++ b/arch/sw_64/kernel/dup_print.c
+@@ -4,6 +4,7 @@
+ #include <linux/spinlock.h>
+ 
+ #include <asm/chip3_io.h>
++#include <asm/io.h>
+ 
+ #ifdef CONFIG_SW64_RRK
+ 
+@@ -18,7 +19,7 @@ unsigned long sw64_printk_offset;
+  * For output the kernel message on the console
+  * with full-system emulator.
+  */
+-#define QEMU_PRINTF_BUFF_BASE	(IO_BASE | MCU_BASE | 0x40000UL | PAGE_OFFSET)
++#define QEMU_PRINTF_BUFF_BASE	(IO_BASE | MCU_BASE | 0x40000UL)
+ 
+ int sw64_printk(const char *fmt, va_list args)
+ {
+@@ -38,9 +39,10 @@ int sw64_printk(const char *fmt, va_list args)
+ 	} else {
+ 		printed_len += vscnprintf(sw64_printk_buf, 1024, fmt, args);
+ 		if (is_in_emul()) {
+-			unsigned long write_addr = QEMU_PRINTF_BUFF_BASE;
+-			*(unsigned long *)write_addr = (unsigned long)((((unsigned long)sw64_printk_buf) & 0xffffffffUL)
+-					| ((unsigned long)printed_len << 32));
++			void __iomem *addr = __va(QEMU_PRINTF_BUFF_BASE);
++			u64 data = ((u64)sw64_printk_buf & 0xffffffffUL)
++					| ((u64)printed_len << 32);
++			*(u64 *)addr = data;
+ 		}
+ 	}
+ 	sw64_printk_offset += printed_len;
+diff --git a/arch/sw_64/kernel/pci.c b/arch/sw_64/kernel/pci.c
+index 77bbd1b68176..401ee0b781be 100644
+--- a/arch/sw_64/kernel/pci.c
++++ b/arch/sw_64/kernel/pci.c
+@@ -398,7 +398,7 @@ int sw6_pcie_read_rc_cfg(struct pci_bus *bus, unsigned int devfn,
+ {
+ 	u32 data;
+ 	struct pci_controller *hose = bus->sysdata;
+-	void __iomem *cfg_iobase = (void *)hose->rc_config_space_base;
++	void __iomem *cfg_iobase = hose->rc_config_space_base;
+ 
+ 	if (IS_ENABLED(CONFIG_PCI_DEBUG))
+ 		pr_debug("rc read addr:%px bus %d, devfn %#x, where %#x size=%d\t",
+@@ -549,9 +549,8 @@ static void __iomem *sw6_pcie_map_bus(struct pci_bus *bus,
+ 		return NULL;
+ 
+ 	relbus = (bus->number << 24) | (devfn << 16) | where;
+-	relbus |= PCI_EP_CFG;
+ 
+-	cfg_iobase = (void *)(hose->ep_config_space_base | relbus);
++	cfg_iobase = hose->ep_config_space_base + relbus;
+ 
+ 	if (IS_ENABLED(CONFIG_PCI_DEBUG))
+ 		pr_debug("addr:%px bus %d, devfn %d, where %d\n",
+diff --git a/arch/sw_64/kvm/kvm-sw64.c b/arch/sw_64/kvm/kvm-sw64.c
+index d651d26a957a..839ee83d57d5 100644
+--- a/arch/sw_64/kvm/kvm-sw64.c
++++ b/arch/sw_64/kvm/kvm-sw64.c
+@@ -311,7 +311,7 @@ int kvm_arch_prepare_memory_region(struct kvm *kvm,
+ 	kvm->arch.host_phys_addr = (u64)addr;
+ 	kvm->arch.size = round_up(mem->memory_size, 8<<20);
+ 
+-	memset((void *)(PAGE_OFFSET + addr), 0, 0x2000000);
++	memset(__va(addr), 0, 0x2000000);
+ 
+ 	return 0;
+ }
+@@ -344,7 +344,7 @@ int kvm_arch_vcpu_reset(struct kvm_vcpu *vcpu)
+ 	memset(&vcpu->arch.irqs_pending, 0, sizeof(vcpu->arch.irqs_pending));
+ 
+ 	if (vcpu->vcpu_id == 0)
+-		memset((void *)(PAGE_OFFSET + addr), 0, 0x2000000);
++		memset(__va(addr), 0, 0x2000000);
+ 
+ 	return 0;
+ }
+@@ -432,18 +432,17 @@ void _debug_printk_vcpu(struct kvm_vcpu *vcpu)
+ {
+ 	unsigned long pc = vcpu->arch.regs.pc;
+ 	unsigned long offset = vcpu->kvm->arch.host_phys_addr;
+-	unsigned long pc_phys = PAGE_OFFSET | ((pc & 0x7fffffffUL) + offset);
++	unsigned int *pc_phys = __va((pc & 0x7fffffffUL) + offset);
+ 	unsigned int insn;
+ 	int opc, ra, disp16;
+ 
+-	insn = *(unsigned int *)pc_phys;
+-
++	insn = *pc_phys;
+ 	opc = (insn >> 26) & 0x3f;
+ 	ra = (insn >> 21) & 0x1f;
+ 	disp16 = insn & 0xffff;
+ 
+ 	if (opc == 0x06 && disp16 == 0x1000) /* RD_F */
+-		pr_info("vcpu exit: pc = %#lx (%#lx), insn[%x] : rd_f r%d [%#lx]\n",
++		pr_info("vcpu exit: pc = %#lx (%px), insn[%x] : rd_f r%d [%#lx]\n",
+ 				pc, pc_phys, insn, ra, vcpu_get_reg(vcpu, ra));
+ }
+ 
+diff --git a/arch/sw_64/platform/platform_xuelang.c b/arch/sw_64/platform/platform_xuelang.c
+index f0e33c664b0e..63a4b163e43e 100644
+--- a/arch/sw_64/platform/platform_xuelang.c
++++ b/arch/sw_64/platform/platform_xuelang.c
+@@ -54,7 +54,7 @@ static inline void __iomem *xuelang_ioportmap(unsigned long addr)
+ 		addr = addr | io_offset;
+ 	}
+ 
+-	return (void __iomem *)(addr | PAGE_OFFSET);
++	return __va(addr);
+ }
+ 
+ struct sw64_platform_ops xuelang_ops = {
+-- 
+2.33.0
+

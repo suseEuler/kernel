@@ -1,0 +1,1013 @@
+From 76da209d121c95a3dbabd43d062c4d1e83ccfec0 Mon Sep 17 00:00:00 2001
+From: Mao Minkai <maominkai@wxiat.com>
+Date: Tue, 26 Jul 2022 10:02:06 +0800
+Subject: [PATCH] sw64: fix deep-copy_user by deep-copy_template
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 76da209d121c95a3dbabd43d062c4d1e83ccfec0
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5PNSZ
+
+--------------------------------
+
+Some fp registers are clobbered in deep-copy_user() because this
+function was assumed to be used only in normal task context and to be
+safe to clobber caller-save fp registers. However, these assumptions
+have been proven wrong.
+
+Since deep-copy_user() is basically a deep-memcpy() with exception
+handling, a deep-copy_template() is now used to implement these two
+functions. Different macro defines and entry/exit code are used by
+deep-copy_user() and deep-memcpy().
+
+Signed-off-by: Mao Minkai <maominkai@wxiat.com>
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/lib/deep-copy_template.S | 299 +++++++++++++++++++++++++
+ arch/sw_64/lib/deep-copy_user.S     | 332 +---------------------------
+ arch/sw_64/lib/deep-memcpy.S        | 297 +------------------------
+ 3 files changed, 309 insertions(+), 619 deletions(-)
+ create mode 100644 arch/sw_64/lib/deep-copy_template.S
+
+diff --git a/arch/sw_64/lib/deep-copy_template.S b/arch/sw_64/lib/deep-copy_template.S
+new file mode 100644
+index 000000000000..8355ecf8a905
+--- /dev/null
++++ b/arch/sw_64/lib/deep-copy_template.S
+@@ -0,0 +1,299 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++/*
++ * template for memcpy and copy_user with SIMD
++ *
++ * $16: current store address
++ * $17: current load address
++ * $18: current bytes left to copy
++ *
++ */
++
++#define NC_STORE_THRESHOLD	2048
++
++#define SAVE_SIMD_REGS \
++	ldi	$sp, -0x60($sp); \
++	addl	$sp, 0x1f, $23; \
++	bic	$23, 0x1f, $23; \
++	vstd	$f1, 0($23); \
++	vstd	$f2, 0x20($23)
++
++#define RESTORE_SIMD_REGS \
++	addl	$sp, 0x1f, $23; \
++	bic	$23, 0x1f, $23; \
++	vldd	$f1, 0($23); \
++	vldd	$f2, 0x20($23); \
++	ldi	$sp, 0x60($sp)
++
++#define SAVE_SIMD_U_REGS \
++	ldi	$sp, -0x120($sp); \
++	addl	$sp, 0x1f, $23; \
++	bic	$23, 0x1f, $23; \
++	vstd	$f1, 0($23); \
++	vstd	$f2, 0x20($23); \
++	vstd	$f4, 0x40($23); \
++	vstd	$f5, 0x60($23); \
++	vstd	$f10, 0x80($23); \
++	vstd	$f11, 0xa0($23); \
++	vstd	$f20, 0xc0($23); \
++	vstd	$f21, 0xe0($23)
++
++#define RESTORE_SIMD_U_REGS \
++	addl	$sp, 0x1f, $23; \
++	bic	$23, 0x1f, $23; \
++	vldd	$f1, 0($23); \
++	vldd	$f2, 0x20($23); \
++	vldd	$f4, 0x40($23); \
++	vldd	$f5, 0x60($23); \
++	vldd	$f10, 0x80($23); \
++	vldd	$f11, 0xa0($23); \
++	vldd	$f20, 0xc0($23); \
++	vldd	$f21, 0xe0($23); \
++	ldi	$sp, 0x120($sp)
++
++	ble	$18, $out
++	and	$16, 7, $1
++	beq	$1, $dest_aligned_8
++
++	.align 4
++$byte_loop_head:
++	FIXUP_LDST( ldbu $2, 0($17) )
++	subl	$18, 1, $18
++	addl	$17, 1, $17
++	FIXUP_LDST( stb $2, 0($16) )
++	addl	$16, 1, $16
++	ble	$18, $out
++	and	$16, 7, $1
++	bne	$1, $byte_loop_head
++
++$dest_aligned_8:
++	and	$17, 7, $4
++	subl	$18, 16, $18
++	blt	$18, $quad_end
++	subl	$18, 64, $18
++	blt	$18, $simd_end
++	and	$16, 31, $1
++	beq	$1, $dest_aligned_32
++	bne	$4, $quad_u_loop_head
++
++	.align 5
++$quad_loop_head:
++	FIXUP_LDST( ldl $2, 0($17) )
++	subl	$18, 8, $18
++	addl	$17, 8, $17
++	FIXUP_LDST( stl $2, 0($16) )
++	addl	$16, 8, $16
++	and	$16, 31, $1
++	blt	$18, $simd_end
++	beq	$16, $dest_aligned_32
++	br	$31, $quad_loop_head
++
++$dest_aligned_32:
++	and	$17, 31, $5
++	bne	$5, $prep_simd_u_loop
++
++$prep_simd_loop:
++	SAVE_SIMD_REGS
++	ldi	$1, NC_STORE_THRESHOLD($31)
++	cmple	$18, $1, $1
++	bne	$1, $simd_loop
++
++	.align 5
++$simd_loop_nc:
++	fillcs	128 * 5($17)
++	FIXUP_LDST( vldd $f1, 0($17) )
++	FIXUP_LDST( vldd $f2, 32($17) )
++	subl	$18, 64, $18
++	addl	$17, 64, $17
++	FIXUP_LDST( vstd_nc $f1, 0($16) )
++	FIXUP_LDST( vstd_nc $f2, 32($16) )
++	addl	$16, 64, $16
++	bge	$18, $simd_loop_nc
++	memb			# required for _nc store instructions
++	br	$31, $simd_loop_end
++
++	.align 5
++$simd_loop:
++	fillcs	128 * 5($17)
++	FIXUP_LDST( vldd $f1, 0($17) )
++	FIXUP_LDST( vldd $f2, 32($17) )
++	subl	$18, 64, $18
++	addl	$17, 64, $17
++	FIXUP_LDST( vstd $f1, 0($16) )
++	FIXUP_LDST( vstd $f2, 32($16) )
++	addl	$16, 64, $16
++	bge	$18, $simd_loop
++
++$simd_loop_end:
++	addl	$18, 64, $1
++	cmplt	$1, 32, $1
++	bne	$1, $no_more_simd
++	FIXUP_LDST( vldd $f1, 0($17) )
++	subl	$18, 32, $18
++	addl	$17, 32, $17
++	FIXUP_LDST( vstd $f1, 0($16) )
++	addl	$16, 32, $16
++
++$no_more_simd:
++	RESTORE_SIMD_REGS
++
++$simd_end:
++	addl	$18, 64, $18
++	blt	$18, $quad_end
++	bne	$4, $prep_quad_u_loop_tail
++
++	.align 4
++$quad_loop_tail:
++	FIXUP_LDST( ldl $2, 0($17) )
++	FIXUP_LDST( ldl $3, 8($17) )
++	subl	$18, 16, $18
++	addl	$17, 16, $17
++	FIXUP_LDST( stl $2, 0($16) )
++	FIXUP_LDST( stl $3, 8($16) )
++	addl	$16, 16, $16
++	bge	$18, $quad_loop_tail
++
++$quad_end:
++	addl	$18, 16, $18
++	ble	$18, $out
++	cmplt	$18, 8, $1
++	bne	$1, $byte_loop_tail
++	bne	$4, $move_one_quad_u
++
++$move_one_quad:
++	FIXUP_LDST( ldl $2, 0($17) )
++	subl	$18, 8, $18
++	addl	$17, 8, $17
++	FIXUP_LDST( stl $2, 0($16) )
++	addl	$16, 8, $16
++	ble	$18, $out
++
++	.align 4
++$byte_loop_tail:
++	FIXUP_LDST( ldbu $2, 0($17) )
++	subl	$18, 1, $18
++	addl	$17, 1, $17
++	FIXUP_LDST( stb $2, 0($16) )
++	addl	$16, 1, $16
++	bgt	$18, $byte_loop_tail
++	br	$31, $out
++
++/* misaligned src and dst */
++	.align 5
++$quad_u_loop_head:
++	FIXUP_LDST( ldl_u $2, 0($17) )
++	FIXUP_LDST( ldl_u $3, 7($17) )
++	subl	$18, 8, $18
++	addl	$17, 8, $17
++	extll	$2, $4, $2
++	exthl	$3, $4, $3
++	bis	$2, $3, $2
++	FIXUP_LDST( stl $2, 0($16) )
++	addl	$16, 8, $16
++	blt	$18, $simd_end
++	beq	$16, $dest_aligned_32
++	br	$31, $quad_u_loop_head
++
++$prep_simd_u_loop:
++	SAVE_SIMD_U_REGS
++	andnot	$17, 31, $3
++	ldi	$2, 256($31)
++	sll	$5, 3, $1
++	subl	$2, $1, $2
++	sll	$1, 29, $1
++	sll	$2, 29, $2
++	ifmovd	$1, $f1
++	ifmovd	$2, $f2
++	FIXUP_LDST( vldd $f4, 0($3) )
++	ldi	$1, NC_STORE_THRESHOLD($31)
++	cmple	$18, $1, $1
++	bne	$1, $simd_u_loop
++
++	.align 5
++$simd_u_loop_nc:
++	FIXUP_LDST( vldd $f5, 32($3) )
++	fillcs	128 * 5($3)
++	srlow	$f4, $f1, $f10
++	sllow	$f5, $f2, $f11
++	vlogfc	$f10, $f11, $f31, $f10
++	FIXUP_LDST( vldd $f4, 64($3) )
++	srlow	$f5, $f1, $f20
++	sllow	$f4, $f2, $f21
++	vlogfc	$f20, $f21, $f31, $f20
++	FIXUP_LDST( vstd_nc $f10, 0($16) )
++	FIXUP_LDST( vstd_nc $f20, 32($16) )
++	subl	$18, 64, $18
++	addl	$3, 64, $3
++	addl	$16, 64, $16
++	bge	$18, $simd_u_loop_nc
++	memb			# required for _nc store instructions
++	br	$31, $simd_u_loop_end
++
++	.align 5
++$simd_u_loop:
++	FIXUP_LDST( vldd $f5, 32($3) )
++	fillcs	128 * 5($3)
++	srlow	$f4, $f1, $f10
++	sllow	$f5, $f2, $f11
++	vlogfc	$f10, $f11, $f31, $f10
++	FIXUP_LDST( vldd $f4, 64($3) )
++	srlow	$f5, $f1, $f20
++	sllow	$f4, $f2, $f21
++	vlogfc	$f20, $f21, $f31, $f20
++	FIXUP_LDST( vstd $f10, 0($16) )
++	FIXUP_LDST( vstd $f20, 32($16) )
++	subl	$18, 64, $18
++	addl	$3, 64, $3
++	addl	$16, 64, $16
++	bge	$18, $simd_u_loop
++
++$simd_u_loop_end:
++	addl	$18, 64, $1
++	cmplt	$1, 32, $1
++	bne	$1, $no_more_simd_u
++	FIXUP_LDST( vldd $f5, 32($3) )
++	srlow	$f4, $f1, $f10
++	sllow	$f5, $f2, $f11
++	vlogfc	$f10, $f11, $f31, $f10
++	FIXUP_LDST( vstd $f10, 0($16) )
++	subl	$18, 32, $18
++	addl	$3, 32, $3
++	addl	$16, 32, $16
++
++$no_more_simd_u:
++	RESTORE_SIMD_U_REGS
++	bis	$3, $5, $17
++	br	$31, $simd_end
++
++$prep_quad_u_loop_tail:
++	FIXUP_LDST( ldl_u $2, 0($17) )
++	.align 5
++$quad_u_loop_tail:
++	FIXUP_LDST( ldl_u $3, 8($17) )
++	extll	$2, $4, $22
++	exthl	$3, $4, $23
++	bis	$22, $23, $22
++	FIXUP_LDST( stl $22, 0($16) )
++	FIXUP_LDST( ldl_u $2, 16($17) )
++	extll	$3, $4, $24
++	exthl	$2, $4, $25
++	bis	$24, $25, $24
++	FIXUP_LDST( stl $24, 8($16) )
++	subl	$18, 16, $18
++	addl	$17, 16, $17
++	addl	$16, 16, $16
++	bge	$18, $quad_u_loop_tail
++	br	$31, $quad_end
++
++$move_one_quad_u:
++	FIXUP_LDST( ldl_u $2, 0($17) )
++	FIXUP_LDST( ldl_u $3, 8($17) )
++	subl	$18, 8, $18
++	addl	$17, 8, $17
++	extll	$2, $4, $22
++	exthl	$3, $4, $23
++	bis	$22, $23, $22
++	FIXUP_LDST( stl $22, 0($16) )
++	addl	$16, 8, $16
++	ble	$18, $out
++	br	$31, $byte_loop_tail
+diff --git a/arch/sw_64/lib/deep-copy_user.S b/arch/sw_64/lib/deep-copy_user.S
+index 631246c68bab..145e1cc6ba18 100644
+--- a/arch/sw_64/lib/deep-copy_user.S
++++ b/arch/sw_64/lib/deep-copy_user.S
+@@ -1,342 +1,22 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
+-/*
+- * Copy to/from user space, handling exceptions as we go..  This
+- * isn't exactly pretty.
+- *
+- * This is essentially the same as "memcpy()", but with a few twists.
+- * Notably, we have to make sure that $18 is always up-to-date and
+- * contains the right "bytes left to copy" value (and that it is updated
+- * only _after_ a successful copy). There is also some rather minor
+- * exception setup stuff..
+- *
+- * Inputs:
+- *	length in $18
+- *	destination address in $16
+- *	source address in $17
+- *	return address in $26
+- *
+- * Outputs:
+- *	bytes left to copy in $0
+- *
+- * Clobbers:
+- *	$1,$2,$3,$4,$5,$16,$17
+- *
+- */
+ 
+-/* Author: Copy_user simd version 1.1 (20190904) by Gao Xiuwu.
+-*/
+ #include <asm/export.h>
+ 
+ /* Allow an exception for an insn; exit if we get one.  */
+-#define EXI(x, y...)			\
+-	99: x, ##y;			\
++#define FIXUP_LDST(x, y)			\
++	99: x, y;			\
+ 	.section __ex_table, "a";	\
+ 	.long 99b - .;			\
+-	ldi $31, $exitin-99b($31);	\
++	ldi $31, $out-99b($31);		\
+ 	.previous
+ 
+-#define EXO(x,y...)			\
+-	99: x, ##y;			\
+-	.section __ex_table, "a";	\
+-	.long 99b - .;			\
+-	ldi $31, $exitout-99b($31);	\
+-	.previous
+-
+-	.set noat
+-	.align 4
+ 	.globl __copy_user
+ 	.ent __copy_user
+-
+ __copy_user:
+ 	.prologue 0
+-	subl	$18, 32, $1
+-	beq	$18, $zerolength
+-
+-	and	$16, 7, $3
+-	ble	$1, $onebyteloop
+-	beq	$3, $destaligned
+-	subl	$3, 8, $3
+-/*
+- * The fetcher stall also hides the 1 cycle cross-cluster stall for $3 (L --> U)
+- * This loop aligns the destination a byte at a time
+- * We know we have at least one trip through this loop
+- */
+-$aligndest:
+-	EXI(ldbu $1, 0($17))
+-	addl	$16, 1, $16
+-	addl	$3, 1, $3
+-
+-/*
+- * the -1 is to compensate for the inc($16) done in a previous quadpack
+- * which allows us zero dependencies within either quadpack in the loop
+- */
+-	EXO(stb $1, -1($16))
+-	addl	$17, 1, $17
+-	subl	$18, 1, $18
+-	bne	$3, $aligndest
+-
+-/*
+- * If we fell through into here, we have a minimum of 33 - 7 bytes
+- * If we arrived via branch, we have a minimum of 32 bytes
+- */
+-$destaligned:
+-	and	$17, 7, $1
+-	bic	$18, 7, $4
+-	#EXI(ldl_u $3, 0($17))
+-	beq	$1, $quadaligned
+-
+-#ifndef MISQUAD_SCALAR
+-$misquad:
+-	and	$16, 31, $1
+-	beq	$1, $dest32Baligned
+-
+-$align_32B:
+-	EXI(ldbu $1, 0($17))
+-	addl	$17, 1, $17
+-	EXO(stb $1, 0($16))
+-	subl	$18, 1, $18
+-	addl	$16, 1, $16
+-	and	$16, 31, $1
+-	beq	$18, $exitout
+-	bne	$1, $align_32B
+-
+-$dest32Baligned:
+-	ldi	$2, 256($31)
+-	andnot	$17, 31, $3
+-	EXI(vldd  $f10, 0($3))
+-	and	$17, 31, $5
+-	sll	$5, 3, $5
+-	subw	$2, $5, $4
+-	ifmovs	$5, $f15
+-	ifmovs	$4, $f14
+-
+-	cmple $18, 63, $1
+-	bne $1, $misalign_tail_simd
+-
+-$misalign_body_simd:
+-	EXI(vldd $f11, 32($3))
+-	fillcs	128*5($3)
+-
+-	srlow	$f10, $f15, $f12
+-	sllow	$f11, $f14, $f13
+-	#fillde	128*5($16)
+-	vlogfc	$f12, $f13, $f31, $f12
+-
+-	EXI(vldd $f10, 64($3))
+-	srlow	$f11, $f15, $f22
+-	sllow	$f10, $f14, $f23
+-	vlogfc	$f22, $f23, $f31, $f22
+-
+-	EXO(vstd  $f12, 0($16))
+-	EXO(vstd  $f22, 32($16))
+-
+-	addl	$16, 64, $16
+-	addl	$3, 64, $3
+-	subl	$18, 64, $18
+-
+-	cmple	$18, 63, $1
+-	beq	$1, $misalign_body_simd
+-	br	$misalign_tail_simd
+-
+-$misalign_tail_simd:
+-	cmple	$18, 31, $1
+-	bne	$1, $before_misalign_tail_quads
+-
+-	EXI(vldd $f11, 32($3))
+-	srlow	$f10, $f15, $f12
+-	sllow	$f11, $f14, $f13
+-	vlogfc	$f12, $f13, $f31, $f12
+-
+-	EXO(vstd $f12, 0($16))
+-
+-	subl	$18, 32, $18
+-	addl	$16, 32, $16
+-	addl	$3, 32, $3
+-	vfmov	$f11, $f10
+-
+-$before_misalign_tail_quads:
+-	srlow	$f10, $f15, $f12
+-	s8subl	$18, $4, $1
+-	ble	$1, $tail_quads
+-
+-	EXI(vldd $f11, 32($3))
+-	sllow	$f11, $f14, $f13
+-	vlogfc	$f12, $f13, $f31, $f12
+-
+-$tail_quads:
+-	subl	$18, 8, $1
+-	blt	$1, $less_than_8
+-
+-$move_a_quad:
+-	fimovd	$f12, $1
+-	srlow	$f12, 64, $f12
+-
+-	EXO(stl $1, 0($16))
+-	subl	$18, 8, $18
+-	addl	$16, 8, $16
+-	subl	$18, 8, $1
+-	bge	$1, $move_a_quad
+-
+-$less_than_8:
+-	.align 4
+-	beq	$18, $exitout
+-	fimovd	$f12, $1
+-
+-$tail_bytes:
+-	EXO(stb $1, 0($16))
+-	subl	$18, 1, $18
+-	srl	$1, 8, $1
+-	addl	$16, 1, $16
+-	bgt	$18, $tail_bytes
+-	br	$exitout
+-#else
+-
+-/*
+- * In the worst case, we've just executed an ldl_u here from 0($17)
+- * and we'll repeat it once if we take the branch
+- */
+-
+-/* Misaligned quadword loop - not unrolled.  Leave it that way. */
+-$misquad:
+-	EXI(ldl_u $2, 8($17))
+-	subl	$4, 8, $4
+-	extll	$3, $17, $3
+-	exthl	$2, $17, $1
+-
+-	bis	$3, $1, $1
+-	EXO(stl $1, 0($16))
+-	addl	$17, 8, $17
+-	subl	$18, 8, $18
+-
+-	addl	$16, 8, $16
+-	bis	$2, $2, $3
+-	bne	$4, $misquad
+-
+-	beq	$18, $zerolength
+-
+-/* We know we have at least one trip through the byte loop */
+-	EXI(ldbu $2, 0($17))
+-	addl	$16, 1, $16
+-	br	$31, $dirtyentry
+-#endif
+-/* Do the trailing byte loop load, then hop into the store part of the loop */
+-
+-/*
+- * A minimum of (33 - 7) bytes to do a quad at a time.
+- * Based upon the usage context, it's worth the effort to unroll this loop
+- * $18 - number of bytes to be moved
+- * $4 - number of bytes to move as quadwords
+- * $16 is current destination address
+- * $17 is current source address
+- */
+-
+-$quadaligned:
+-	and	$16, 31, $1
+-	beq	$1, $quadaligned_dest32Baligned
+-
+-$quadaligned_align_32B:
+-	EXI(ldl $1, 0($17))
+-	addl	$17, 8, $17
+-	EXO(stl $1, 0($16))
+-	subl	$18, 8, $18
+-	subl	$4, 8, $4
+-	addl	$16, 8, $16
+-	and	$16, 31, $1
+-	beq	$4, $onebyteloop
+-	bne	$1, $quadaligned_align_32B
+-
+-$quadaligned_dest32Baligned:
+-	and	$17, 31, $2
+-	bne	$2, $dest32Baligned
+-
+-$quad32Bailgned:
+-	subl	$4, 64, $2
+-	blt	$2, $onequad
+-
+-/*
+- * There is a significant assumption here that the source and destination
+- * addresses differ by more than 32 bytes.  In this particular case, a
+- * sparsity of registers further bounds this to be a minimum of 8 bytes.
+- * But if this isn't met, then the output result will be incorrect.
+- * Furthermore, due to a lack of available registers, we really can't
+- * unroll this to be an 8x loop (which would enable us to use the wh64
+- * instruction memory hint instruction).
+- */
+-
+-$simd_quadalign_unroll2:
+-	fillcs 128 * 5($17)
+-	EXI(vldd $f22, 0($17))
+-	EXI(vldd $f23, 32($17))
+-	EXO(vstd $f22, 0($16))
+-	EXO(vstd $f23, 32($16))
+-	#fillde 128 * 5($16)
+-	subl	$4, 64, $4
+-	subl	$18, 64, $18
+-	addl	$17, 64, $17
+-	addl	$16, 64, $16
+-	subl	$4, 64, $3
+-	bge	$3, $simd_quadalign_unroll2
+-	bne	$4, $onequad
+-	br	$31, $noquads
+-
+-$onequad:
+-	EXI(ldl $1, 0($17))
+-	subl	$4, 8, $4
+-	addl	$17, 8, $17
+-
+-	EXO(stl $1, 0($16))
+-	subl	$18, 8, $18
+-	addl	$16, 8, $16
+-	bne	$4, $onequad
+-
+-$noquads:
+-	beq	$18, $zerolength
+-
+-/*
+- * For small copies (or the tail of a larger copy), do a very simple byte loop.
+- * There's no point in doing a lot of complex alignment calculations to try to
+- * to quadword stuff for a small amount of data.
+- *	$18 - remaining number of bytes left to copy
+- *	$16 - current dest addr
+- *	$17 - current source addr
+- */
+-
+-$onebyteloop:
+-	EXI(ldbu $2, 0($17))
+-	addl	$16, 1, $16
+-
+-$dirtyentry:
+-/*
+- * the -1 is to compensate for the inc($16) done in a previous quadpack
+- * which allows us zero dependencies within either quadpack in the loop
+- */
+-	EXO(stb $2, -1($16))
+-	addl	$17, 1, $17
+-	subl	$18, 1, $18
+-	bgt	$18, $onebyteloop
+-
+-$zerolength:
+-$exitout:
++#include "deep-copy_template.S"
++$out:
+ 	bis	$31, $18, $0
+-	ret	$31, ($26), 1
+-
+-$exitin:
+-
+-	/* A stupid byte-by-byte zeroing of the rest of the output
+-	 * buffer.  This cures security holes by never leaving
+-	 * random kernel data around to be copied elsewhere.
+-	 */
+-
+-	mov	$18, $1
+-
+-$101:
+-	EXO(stb $31, 0($16))
+-	subl	$1, 1, $1
+-	addl	$16, 1, $16
+-	bgt	$1, $101
+-
+-	bis	$31, $18, $0
+-	ret	$31, ($26), 1
+-
++	ret
+ 	.end __copy_user
+ 	EXPORT_SYMBOL(__copy_user)
+diff --git a/arch/sw_64/lib/deep-memcpy.S b/arch/sw_64/lib/deep-memcpy.S
+index 83c726d42778..c4b5bf3d26df 100644
+--- a/arch/sw_64/lib/deep-memcpy.S
++++ b/arch/sw_64/lib/deep-memcpy.S
+@@ -2,307 +2,18 @@
+ 
+ #include <asm/export.h>
+ 
+-#define NC_STORE_THRESHOLD	2048
++#define FIXUP_LDST(x, y)	\
++	x, y
+ 
+-#define SAVE_SIMD_REGS \
+-	ldi	$sp, -0x60($sp); \
+-	addl	$sp, 0x1f, $23; \
+-	bic	$23, 0x1f, $23; \
+-	vstd	$f1, 0($23); \
+-	vstd	$f2, 0x20($23)
+-
+-#define RESTORE_SIMD_REGS \
+-	addl	$sp, 0x1f, $23; \
+-	bic	$23, 0x1f, $23; \
+-	vldd	$f1, 0($23); \
+-	vldd	$f2, 0x20($23); \
+-	ldi	$sp, 0x60($sp)
+-
+-#define SAVE_SIMD_U_REGS \
+-	ldi	$sp, -0x120($sp); \
+-	addl	$sp, 0x1f, $23; \
+-	bic	$23, 0x1f, $23; \
+-	vstd	$f1, 0($23); \
+-	vstd	$f2, 0x20($23); \
+-	vstd	$f4, 0x40($23); \
+-	vstd	$f5, 0x60($23); \
+-	vstd	$f10, 0x80($23); \
+-	vstd	$f11, 0xa0($23); \
+-	vstd	$f20, 0xc0($23); \
+-	vstd	$f21, 0xe0($23)
+-
+-#define RESTORE_SIMD_U_REGS \
+-	addl	$sp, 0x1f, $23; \
+-	bic	$23, 0x1f, $23; \
+-	vldd	$f1, 0($23); \
+-	vldd	$f2, 0x20($23); \
+-	vldd	$f4, 0x40($23); \
+-	vldd	$f5, 0x60($23); \
+-	vldd	$f10, 0x80($23); \
+-	vldd	$f11, 0xa0($23); \
+-	vldd	$f20, 0xc0($23); \
+-	vldd	$f21, 0xe0($23); \
+-	ldi	$sp, 0x120($sp)
+-
+-	.set noat
+-	.align 4
+ 	.globl memcpy
+ 	.ent memcpy
+ memcpy:
+ 	.frame $30, 0, $26, 0
+ 	.prologue 0
+-
+ 	mov	$16, $0
+-	ble	$18, $out
+-	and	$16, 7, $1
+-	beq	$1, $dest_aligned_8
+-
+-	.align 4
+-$byte_loop_head:
+-	ldbu	$2, 0($17)
+-	subl	$18, 1, $18
+-	addl	$17, 1, $17
+-	stb	$2, 0($16)
+-	addl	$16, 1, $16
+-	ble	$18, $out
+-	and	$16, 7, $1
+-	bne	$1, $byte_loop_head
+-
+-$dest_aligned_8:
+-	and	$17, 7, $4
+-	subl	$18, 16, $18
+-	blt	$18, $quad_end
+-	subl	$18, 64, $18
+-	blt	$18, $simd_end
+-	and	$16, 31, $1
+-	beq	$1, $dest_aligned_32
+-	bne	$4, $quad_u_loop_head
+-
+-	.align 5
+-$quad_loop_head:
+-	ldl	$2, 0($17)
+-	subl	$18, 8, $18
+-	addl	$17, 8, $17
+-	stl	$2, 0($16)
+-	addl	$16, 8, $16
+-	and	$16, 31, $1
+-	blt	$18, $simd_end
+-	beq	$16, $dest_aligned_32
+-	br	$31, $quad_loop_head
+-
+-$dest_aligned_32:
+-	and	$17, 31, $5
+-	bne	$5, $prep_simd_u_loop
+-
+-$prep_simd_loop:
+-	SAVE_SIMD_REGS
+-	ldi	$1, NC_STORE_THRESHOLD($31)
+-	cmple	$18, $1, $1
+-	bne	$1, $simd_loop
+-
+-	.align 5
+-$simd_loop_nc:
+-	fillcs	128 * 5($17)
+-	vldd	$f1, 0($17)
+-	vldd	$f2, 32($17)
+-	subl	$18, 64, $18
+-	addl	$17, 64, $17
+-	vstd_nc	$f1, 0($16)
+-	vstd_nc	$f2, 32($16)
+-	addl	$16, 64, $16
+-	bge	$18, $simd_loop_nc
+-	memb			# required for _nc store instructions
+-	br	$31, $simd_loop_end
+-
+-	.align 5
+-$simd_loop:
+-	fillcs	128 * 5($17)
+-	vldd	$f1, 0($17)
+-	vldd	$f2, 32($17)
+-	subl	$18, 64, $18
+-	addl	$17, 64, $17
+-	vstd	$f1, 0($16)
+-	vstd	$f2, 32($16)
+-	addl	$16, 64, $16
+-	bge	$18, $simd_loop
+-
+-$simd_loop_end:
+-	addl	$18, 64, $1
+-	cmplt	$1, 32, $1
+-	bne	$1, $no_more_simd
+-	vldd	$f1, 0($17)
+-	subl	$18, 32, $18
+-	addl	$17, 32, $17
+-	vstd	$f1, 0($16)
+-	addl	$16, 32, $16
+-
+-$no_more_simd:
+-	RESTORE_SIMD_REGS
+-
+-$simd_end:
+-	addl	$18, 64, $18
+-	blt	$18, $quad_end
+-	bne	$4, $prep_quad_u_loop_tail
+-
+-	.align 4
+-$quad_loop_tail:
+-	ldl	$2, 0($17)
+-	ldl	$3, 8($17)
+-	subl	$18, 16, $18
+-	addl	$17, 16, $17
+-	stl	$2, 0($16)
+-	stl	$3, 8($16)
+-	addl	$16, 16, $16
+-	bge	$18, $quad_loop_tail
+-
+-$quad_end:
+-	addl	$18, 16, $18
+-	ble	$18, $out
+-	cmplt	$18, 8, $1
+-	bne	$1, $byte_loop_tail
+-	bne	$4, $move_one_quad_u
+-
+-$move_one_quad:
+-	ldl	$2, 0($17)
+-	subl	$18, 8, $18
+-	addl	$17, 8, $17
+-	stl	$2, 0($16)
+-	addl	$16, 8, $16
+-	ble	$18, $out
+-
+-	.align 4
+-$byte_loop_tail:
+-	ldbu	$2, 0($17)
+-	subl	$18, 1, $18
+-	addl	$17, 1, $17
+-	stb	$2, 0($16)
+-	addl	$16, 1, $16
+-	bgt	$18, $byte_loop_tail
+-
++#include "deep-copy_template.S"
+ $out:
+-	ret	$31, ($26), 1
+-
+-
+-
+-	.align 5
+-$quad_u_loop_head:
+-	ldl_u	$2, 0($17)
+-	ldl_u	$3, 7($17)
+-	subl	$18, 8, $18
+-	addl	$17, 8, $17
+-	extll	$2, $4, $2
+-	exthl	$3, $4, $3
+-	bis	$2, $3, $2
+-	stl	$2, 0($16)
+-	addl	$16, 8, $16
+-	blt	$18, $simd_end
+-	beq	$16, $dest_aligned_32
+-	br	$31, $quad_u_loop_head
+-
+-$prep_simd_u_loop:
+-	SAVE_SIMD_U_REGS
+-	andnot	$17, 31, $3
+-	ldi	$2, 256($31)
+-	sll	$5, 3, $1
+-	subl	$2, $1, $2
+-	sll	$1, 29, $1
+-	sll	$2, 29, $2
+-	ifmovd	$1, $f1
+-	ifmovd	$2, $f2
+-	vldd	$f4, 0($3)
+-	ldi	$1, NC_STORE_THRESHOLD($31)
+-	cmple	$18, $1, $1
+-	bne	$1, $simd_u_loop
+-
+-	.align 5
+-$simd_u_loop_nc:
+-	vldd	$f5, 32($3)
+-	fillcs	128 * 5($3)
+-	srlow	$f4, $f1, $f10
+-	sllow	$f5, $f2, $f11
+-	vlogfc	$f10, $f11, $f31, $f10
+-	vldd	$f4, 64($3)
+-	srlow	$f5, $f1, $f20
+-	sllow	$f4, $f2, $f21
+-	vlogfc	$f20, $f21, $f31, $f20
+-	vstd_nc	$f10, 0($16)
+-	vstd_nc	$f20, 32($16)
+-	subl	$18, 64, $18
+-	addl	$3, 64, $3
+-	addl	$16, 64, $16
+-	bge	$18, $simd_u_loop_nc
+-	memb			# required for _nc store instructions
+-	br	$31, $simd_u_loop_end
+-
+-	.align 5
+-$simd_u_loop:
+-	vldd	$f5, 32($3)
+-	fillcs	128 * 5($3)
+-	srlow	$f4, $f1, $f10
+-	sllow	$f5, $f2, $f11
+-	vlogfc	$f10, $f11, $f31, $f10
+-	vldd	$f4, 64($3)
+-	srlow	$f5, $f1, $f20
+-	sllow	$f4, $f2, $f21
+-	vlogfc	$f20, $f21, $f31, $f20
+-	vstd	$f10, 0($16)
+-	vstd	$f20, 32($16)
+-	subl	$18, 64, $18
+-	addl	$3, 64, $3
+-	addl	$16, 64, $16
+-	bge	$18, $simd_u_loop
+-
+-$simd_u_loop_end:
+-	addl	$18, 64, $1
+-	cmplt	$1, 32, $1
+-	bne	$1, $no_more_simd_u
+-	vldd	$f5, 32($3)
+-	srlow	$f4, $f1, $f10
+-	sllow	$f5, $f2, $f11
+-	vlogfc	$f10, $f11, $f31, $f10
+-	vstd	$f10, 0($16)
+-	subl	$18, 32, $18
+-	addl	$3, 32, $3
+-	addl	$16, 32, $16
+-
+-$no_more_simd_u:
+-	RESTORE_SIMD_U_REGS
+-	bis	$3, $5, $17
+-	br	$31, $simd_end
+-
+-$prep_quad_u_loop_tail:
+-	ldl_u	$2, 0($17)
+-	.align 5
+-$quad_u_loop_tail:
+-	ldl_u	$3, 8($17)
+-	extll	$2, $4, $22
+-	exthl	$3, $4, $23
+-	bis	$22, $23, $22
+-	stl	$22, 0($16)
+-	ldl_u	$2, 16($17)
+-	extll	$3, $4, $24
+-	exthl	$2, $4, $25
+-	bis	$24, $25, $24
+-	stl	$24, 8($16)
+-	subl	$18, 16, $18
+-	addl	$17, 16, $17
+-	addl	$16, 16, $16
+-	bge	$18, $quad_u_loop_tail
+-	br	$31, $quad_end
+-
+-$move_one_quad_u:
+-	ldl_u	$2, 0($17)
+-	ldl_u	$3, 8($17)
+-	subl	$18, 8, $18
+-	addl	$17, 8, $17
+-	extll	$2, $4, $22
+-	exthl	$3, $4, $23
+-	bis	$22, $23, $22
+-	stl	$22, 0($16)
+-	addl	$16, 8, $16
+-	ble	$18, $out
+-	br	$31, $byte_loop_tail
+-
++	ret
+ 	.end memcpy
+ 	EXPORT_SYMBOL(memcpy)
+ __memcpy = memcpy
+-- 
+2.33.0
+

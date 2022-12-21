@@ -1,0 +1,488 @@
+From 644547a908b523a80482d0f7d8a1c3d202b18f03 Mon Sep 17 00:00:00 2001
+From: Lu Jialin <lujialin4@huawei.com>
+Date: Fri, 4 Nov 2022 12:28:01 +0800
+Subject: [PATCH] cgroup: support cgroup writeback on cgroupv1
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 644547a908b523a80482d0f7d8a1c3d202b18f03
+Modified-by-SEL: Yes, modified due to different context
+
+
+hulkl inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5ZG61
+
+-------------------------------
+
+In cgroupv1, cgroup writeback is not supproted for two problems:
+1) Blkcg_css and memcg_css are mounted on different cgroup trees.
+   Therefore, blkcg_css cannot be found according to a certain memcg_css.
+2) Buffer I/O is worked by kthread, which is in the root_blkcg.
+   Therefore, blkcg cannot limit wbps and wiops of buffer I/O.
+
+We solve the two problems to support cgroup writeback on cgroupv1.
+1) A memcg is attached to the blkcg_root css when the memcg was created.
+2) We add a member "wb_blkio_ino" in mem_cgroup_legacy_files.
+   User can attach a memcg to a cerntain blkcg through echo the file
+   inode of the blkcg into the wb_blkio of the memcg.
+3) inode_cgwb_enabled() return true when memcg and io are both mounted
+   on cgroupv2 or both on cgroupv1.
+4) Buffer I/O can find a blkcg according to its memcg.
+
+Thus, a memcg can find a certain blkcg, and cgroup writeback can be
+supported on cgroupv1.
+
+Signed-off-by: Lu Jialin <lujialin4@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/configs/openeuler_defconfig |    1 
+ arch/x86/configs/openeuler_defconfig   |    1 
+ block/blk-cgroup.c                     |    3 
+ include/linux/backing-dev.h            |   29 +++++++-
+ include/linux/blk-cgroup.h             |    5 +
+ include/linux/cgroup.h                 |    2 
+ include/linux/memcontrol.h             |    8 ++
+ init/Kconfig                           |    5 +
+ kernel/cgroup/cgroup.c                 |    5 +
+ mm/backing-dev.c                       |  116 ++++++++++++++++++++++++++++++++-
+ mm/memcontrol.c                        |   82 +++++++++++++++++++++++
+ 11 files changed, 249 insertions(+), 8 deletions(-)
+
+--- a/arch/arm64/configs/openeuler_defconfig
++++ b/arch/arm64/configs/openeuler_defconfig
+@@ -135,6 +135,7 @@ CONFIG_MEMCG_SWAP=y
+ CONFIG_MEMCG_KMEM=y
+ CONFIG_BLK_CGROUP=y
+ CONFIG_CGROUP_WRITEBACK=y
++CONFIG_CGROUP_V1_WRITEBACK=y
+ CONFIG_CGROUP_SCHED=y
+ CONFIG_FAIR_GROUP_SCHED=y
+ CONFIG_CFS_BANDWIDTH=y
+--- a/arch/x86/configs/openeuler_defconfig
++++ b/arch/x86/configs/openeuler_defconfig
+@@ -154,6 +154,7 @@ CONFIG_MEMCG_SWAP=y
+ CONFIG_MEMCG_KMEM=y
+ CONFIG_BLK_CGROUP=y
+ CONFIG_CGROUP_WRITEBACK=y
++CONFIG_CGROUP_V1_WRITEBACK=y
+ CONFIG_CGROUP_SCHED=y
+ CONFIG_FAIR_GROUP_SCHED=y
+ CONFIG_CFS_BANDWIDTH=y
+--- a/block/blk-cgroup.c
++++ b/block/blk-cgroup.c
+@@ -1147,6 +1147,9 @@ blkcg_css_alloc(struct cgroup_subsys_sta
+ #ifdef CONFIG_CGROUP_WRITEBACK
+ 	INIT_LIST_HEAD(&blkcg->cgwb_list);
+ #endif
++#ifdef CONFIG_CGROUP_V1_WRITEBACK
++	INIT_LIST_HEAD(&blkcg->memcg_list);
++#endif
+ 	list_add_tail(&blkcg->all_blkcgs_node, &all_blkcgs);
+ 
+ 	mutex_unlock(&blkcg_pol_mutex);
+--- a/include/linux/backing-dev.h
++++ b/include/linux/backing-dev.h
+@@ -167,6 +167,26 @@ static inline int bdi_sched_wait(void *w
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_CGROUP_V1_WRITEBACK
++void wb_kill_memcg_blkcg(struct cgroup_subsys_state *css);
++void wb_attach_memcg_to_blkcg(struct cgroup_subsys_state *memcg_css,
++			      struct cgroup_subsys_state *blkcg_css);
++bool cgroup1_writeback_enabled(void);
++#else
++static inline void wb_kill_memcg_blkcg(struct cgroup_subsys_state *css)
++{
++}
++static inline void
++wb_attach_memcg_to_blkcg(struct cgroup_subsys_state *memcg_css,
++			 struct cgroup_subsys_state *blkcg_css)
++{
++}
++static inline bool cgroup1_writeback_enabled(void)
++{
++	return false;
++}
++#endif	/* CONFIG_CGROUP_V1_WRITEBACK */
++
+ #ifdef CONFIG_CGROUP_WRITEBACK
+ 
+ struct bdi_writeback *wb_get_lookup(struct backing_dev_info *bdi,
+@@ -193,10 +213,11 @@ static inline bool inode_cgwb_enabled(st
+ {
+ 	struct backing_dev_info *bdi = inode_to_bdi(inode);
+ 
+-	return cgroup_subsys_on_dfl(memory_cgrp_subsys) &&
+-		cgroup_subsys_on_dfl(io_cgrp_subsys) &&
+-		(bdi->capabilities & BDI_CAP_WRITEBACK) &&
+-		(inode->i_sb->s_iflags & SB_I_CGROUPWB);
++	return ((cgroup_subsys_on_dfl(memory_cgrp_subsys) &&
++	       cgroup_subsys_on_dfl(io_cgrp_subsys)) ||
++	       cgroup1_writeback_enabled()) &&
++	       (bdi->capabilities & BDI_CAP_WRITEBACK) &&
++	       (inode->i_sb->s_iflags & SB_I_CGROUPWB);
+ }
+ 
+ /**
+--- a/include/linux/blk-cgroup.h
++++ b/include/linux/blk-cgroup.h
+@@ -64,9 +64,12 @@ struct blkcg {
+ #ifdef CONFIG_CGROUP_WRITEBACK
+ 	struct list_head		cgwb_list;
+ #endif
+-
++#if defined(CONFIG_CGROUP_V1_WRITEBACK) && !defined(__GENKSYMS__)
++	struct list_head		memcg_list;
++#else
+ 	KABI_RESERVE(1)
+ 	KABI_RESERVE(2)
++#endif
+ 	KABI_RESERVE(3)
+ 	KABI_RESERVE(4)
+ };
+--- a/include/linux/cgroup.h
++++ b/include/linux/cgroup.h
+@@ -696,7 +696,9 @@ static inline void cgroup_kthread_ready(
+ }
+ 
+ void cgroup_path_from_kernfs_id(u64 id, char *buf, size_t buflen);
++#ifdef CONFIG_CGROUP_V1_WRITEBACK
+ struct cgroup *cgroup1_get_from_id(struct cgroup_root *root, u64 id);
++#endif
+ struct cgroup *cgroup_get_from_id(u64 id);
+ #else /* !CONFIG_CGROUPS */
+ 
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -381,9 +381,17 @@ struct mem_cgroup {
+ #else
+ 	KABI_RESERVE(1)
+ #endif
++#ifdef CONFIG_CGROUP_V1_WRITEBACK
++	KABI_USE(2, struct cgroup_subsys_state *wb_blk_css)
++#else
+ 	KABI_RESERVE(2)
++#endif
++#if defined(CONFIG_CGROUP_V1_WRITEBACK) && !defined(__GENKSYMS__)
++	struct list_head memcg_node;
++#else
+ 	KABI_RESERVE(3)
+ 	KABI_RESERVE(4)
++#endif
+ 	KABI_RESERVE(5)
+ 	KABI_RESERVE(6)
+ 	KABI_RESERVE(7)
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -956,6 +956,11 @@ config CGROUP_WRITEBACK
+ 	depends on MEMCG && BLK_CGROUP
+ 	default y
+ 
++config CGROUP_V1_WRITEBACK
++	bool "Support Cgroup Writeback On Cgroupv1"
++	depends on CGROUP_WRITEBACK
++	default n
++
+ menuconfig CGROUP_SCHED
+ 	bool "CPU controller"
+ 	default n
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@ -60,6 +60,7 @@
+ #include <linux/psi.h>
+ #include <linux/dynamic_hugetlb.h>
+ #include <net/sock.h>
++#include <linux/backing-dev.h>
+ 
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/cgroup.h>
+@@ -5432,6 +5433,7 @@ err_list_del:
+ 	list_del_rcu(&css->sibling);
+ err_free_css:
+ 	list_del_rcu(&css->rstat_css_node);
++	wb_kill_memcg_blkcg(css);
+ 	INIT_RCU_WORK(&css->destroy_rwork, css_free_rwork_fn);
+ 	queue_rcu_work(cgroup_destroy_wq, &css->destroy_rwork);
+ 	return ERR_PTR(err);
+@@ -5702,6 +5704,7 @@ static void kill_css(struct cgroup_subsy
+ 	 */
+ 	css_get(css);
+ 
++	wb_kill_memcg_blkcg(css);
+ 	/*
+ 	 * cgroup core guarantees that, by the time ->css_offline() is
+ 	 * invoked, no new css reference will be given out via
+@@ -6187,6 +6190,7 @@ out:
+ 	return retval;
+ }
+ 
++#ifdef CONFIG_CGROUP_V1_WRITEBACK
+ struct cgroup *cgroup1_get_from_id(struct cgroup_root *root, u64 id)
+ {
+ 	struct kernfs_node *kn;
+@@ -6223,6 +6227,7 @@ struct cgroup *cgroup1_get_from_id(struc
+ 
+ 	return cgrp;
+ }
++#endif
+ 
+ /**
+  * cgroup_fork - initialize cgroup related fields during copy_process()
+--- a/mm/backing-dev.c
++++ b/mm/backing-dev.c
+@@ -424,6 +424,29 @@ static void cgwb_remove_from_bdi_list(st
+ 	spin_unlock_irq(&cgwb_lock);
+ }
+ 
++#ifdef CONFIG_CGROUP_V1_WRITEBACK
++static struct cgroup_subsys_state *cgwbv1_get_blkcss(struct mem_cgroup *memcg)
++{
++	struct cgroup_subsys_state *blkcg_css;
++
++	rcu_read_lock();
++	blkcg_css = memcg->wb_blk_css;
++	if (!css_tryget_online(blkcg_css)) {
++		blkcg_css = blkcg_root_css;
++		css_get(blkcg_css);
++	}
++	rcu_read_unlock();
++
++	return blkcg_css;
++}
++#else
++static inline struct cgroup_subsys_state *
++cgwbv1_get_blkcss(struct mem_cgroup *memcg)
++{
++	return NULL;
++}
++#endif
++
+ static int cgwb_create(struct backing_dev_info *bdi,
+ 		       struct cgroup_subsys_state *memcg_css, gfp_t gfp)
+ {
+@@ -436,7 +459,11 @@ static int cgwb_create(struct backing_de
+ 	int ret = 0;
+ 
+ 	memcg = mem_cgroup_from_css(memcg_css);
+-	blkcg_css = cgroup_get_e_css(memcg_css->cgroup, &io_cgrp_subsys);
++	if (cgroup1_writeback_enabled())
++		blkcg_css = cgwbv1_get_blkcss(memcg);
++	else
++		blkcg_css = cgroup_get_e_css(memcg_css->cgroup,
++					     &io_cgrp_subsys);
+ 	blkcg = css_to_blkcg(blkcg_css);
+ 	memcg_cgwb_list = &memcg->cgwb_list;
+ 	blkcg_cgwb_list = &blkcg->cgwb_list;
+@@ -553,9 +580,14 @@ struct bdi_writeback *wb_get_lookup(stru
+ 	wb = radix_tree_lookup(&bdi->cgwb_tree, memcg_css->id);
+ 	if (wb) {
+ 		struct cgroup_subsys_state *blkcg_css;
++		struct mem_cgroup *memcg = mem_cgroup_from_css(memcg_css);
+ 
+ 		/* see whether the blkcg association has changed */
+-		blkcg_css = cgroup_get_e_css(memcg_css->cgroup, &io_cgrp_subsys);
++		if (cgroup1_writeback_enabled())
++			blkcg_css = cgwbv1_get_blkcss(memcg);
++		else
++			blkcg_css = cgroup_get_e_css(memcg_css->cgroup,
++						     &io_cgrp_subsys);
+ 		if (unlikely(wb->blkcg_css != blkcg_css || !wb_tryget(wb)))
+ 			wb = NULL;
+ 		css_put(blkcg_css);
+@@ -1021,3 +1053,83 @@ out:
+ 	return ret;
+ }
+ EXPORT_SYMBOL(wait_iff_congested);
++
++#ifdef CONFIG_CGROUP_V1_WRITEBACK
++
++#include "../kernel/cgroup/cgroup-internal.h"
++
++static bool cgroup1_writeback __read_mostly;
++
++bool cgroup1_writeback_enabled(void)
++{
++	return !cgroup_subsys_on_dfl(memory_cgrp_subsys) &&
++	       !cgroup_subsys_on_dfl(io_cgrp_subsys) && cgroup1_writeback;
++}
++
++static void wb_kill_memcg(struct cgroup_subsys_state *memcg_css)
++{
++	struct mem_cgroup *memcg = mem_cgroup_from_css(memcg_css);
++
++	list_del_init(&memcg->memcg_node);
++	css_put(memcg->wb_blk_css);
++}
++
++static void wb_kill_blkcg(struct cgroup_subsys_state *blkcg_css)
++{
++	struct mem_cgroup *memcg, *tmp;
++	struct blkcg *blkcg = css_to_blkcg(blkcg_css);
++	struct blkcg *root_blkcg = css_to_blkcg(blkcg_root_css);
++
++	list_for_each_entry_safe(memcg, tmp, &blkcg->memcg_list, memcg_node) {
++		css_get(blkcg_root_css);
++		memcg->wb_blk_css = blkcg_root_css;
++		list_move(&memcg->memcg_node, &root_blkcg->memcg_list);
++		css_put(blkcg_css);
++	}
++}
++
++void wb_kill_memcg_blkcg(struct cgroup_subsys_state *css)
++{
++	struct cgroup_subsys *ss = css->ss;
++
++	if (!cgroup1_writeback)
++		return;
++
++	lockdep_assert_held(&cgroup_mutex);
++
++	if (ss->id == io_cgrp_id)
++		wb_kill_blkcg(css);
++	else if (ss->id == memory_cgrp_id)
++		wb_kill_memcg(css);
++}
++
++void wb_attach_memcg_to_blkcg(struct cgroup_subsys_state *memcg_css,
++			      struct cgroup_subsys_state *blkcg_css)
++{
++	struct mem_cgroup *memcg = mem_cgroup_from_css(memcg_css);
++	struct cgroup_subsys_state *pre_blkcss = memcg->wb_blk_css;
++	struct blkcg *blkcg = css_to_blkcg(blkcg_css);
++
++	if (!cgroup1_writeback)
++		return;
++
++	lockdep_assert_held(&cgroup_mutex);
++
++	css_get(blkcg_css);
++	memcg->wb_blk_css = blkcg_css;
++	if (pre_blkcss == NULL)
++		list_add(&memcg->memcg_node, &blkcg->memcg_list);
++	else {
++		list_move(&memcg->memcg_node, &blkcg->memcg_list);
++		css_put(pre_blkcss);
++	}
++}
++
++static int __init enable_cgroup1_writeback(char *s)
++{
++	cgroup1_writeback = true;
++
++	return 1;
++}
++__setup("cgroup1_writeback", enable_cgroup1_writeback);
++#endif
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -434,7 +434,8 @@ struct cgroup_subsys_state *mem_cgroup_c
+ 
+ 	memcg = page_memcg(page);
+ 
+-	if (!memcg || !cgroup_subsys_on_dfl(memory_cgrp_subsys))
++	if (!memcg || !(cgroup_subsys_on_dfl(memory_cgrp_subsys) ||
++	    cgroup1_writeback_enabled()))
+ 		memcg = root_mem_cgroup;
+ 
+ 	return &memcg->css;
+@@ -5369,6 +5370,76 @@ static ssize_t memcg_high_async_ratio_wr
+ 	return nbytes;
+ }
+ 
++#ifdef CONFIG_CGROUP_V1_WRITEBACK
++#include "../kernel/cgroup/cgroup-internal.h"
++
++static int wb_blkio_show(struct seq_file *m, void *v)
++{
++	char *path;
++	ino_t blkcg_id;
++	struct cgroup *blkcg_cgroup;
++	struct cgroup_subsys_state *blkcg_css;
++	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
++
++	if (!cgroup1_writeback_enabled())
++		return -EOPNOTSUPP;
++
++	path = kzalloc(PATH_MAX, GFP_KERNEL);
++	if (!path)
++		return -ENOMEM;
++
++	mutex_lock(&cgroup_mutex);
++	blkcg_css = memcg->wb_blk_css;
++	blkcg_cgroup = blkcg_css->cgroup;
++	blkcg_id = cgroup_ino(blkcg_cgroup);
++	cgroup_path(blkcg_cgroup, path, PATH_MAX);
++	mutex_unlock(&cgroup_mutex);
++	seq_printf(m, "wb_blkio_path:%s\n", path);
++	seq_printf(m, "wb_blkio_ino:%lu\n", blkcg_id);
++	kfree(path);
++
++	return 0;
++}
++
++static ssize_t wb_blkio_write(struct kernfs_open_file *of, char *buf,
++			      size_t nbytes, loff_t off)
++{
++	int ret = 0;
++	u64 cgrp_id;
++	struct cgroup_root *root;
++	struct cgroup *blk_cgroup;
++	struct cgroup_subsys_state *blkcg_css;
++	struct cgroup_subsys_state *memcg_css = of_css(of);
++
++	if (!cgroup1_writeback_enabled())
++		return -EOPNOTSUPP;
++
++	buf = strstrip(buf);
++	ret = kstrtou64(buf, 0, &cgrp_id);
++	if (ret)
++		return ret;
++
++	mutex_lock(&cgroup_mutex);
++	root = blkcg_root_css->cgroup->root;
++	blk_cgroup = cgroup1_get_from_id(root, cgrp_id);
++	if (IS_ERR(blk_cgroup)) {
++		mutex_unlock(&cgroup_mutex);
++		return -EINVAL;
++	}
++	blkcg_css = cgroup_tryget_css(blk_cgroup, &io_cgrp_subsys);
++	if (!blkcg_css)
++		goto out_unlock;
++	wb_attach_memcg_to_blkcg(memcg_css, blkcg_css);
++	css_put(blkcg_css);
++
++out_unlock:
++	cgroup_put(blk_cgroup);
++	mutex_unlock(&cgroup_mutex);
++
++	return ret < 0 ? ret : nbytes;
++}
++#endif
++
+ static struct cftype mem_cgroup_legacy_files[] = {
+ 	{
+ 		.name = "usage_in_bytes",
+@@ -5576,6 +5647,14 @@ static struct cftype mem_cgroup_legacy_f
+ 		.seq_show = memcg_high_async_ratio_show,
+ 		.write = memcg_high_async_ratio_write,
+ 	},
++#ifdef CONFIG_CGROUP_V1_WRITEBACK
++	{
++		.name = "wb_blkio_ino",
++		.flags = CFTYPE_NOT_ON_ROOT,
++		.seq_show = wb_blkio_show,
++		.write = wb_blkio_write,
++	},
++#endif
+ 	{ },	/* terminate */
+ };
+ 
+@@ -5824,6 +5903,7 @@ mem_cgroup_css_alloc(struct cgroup_subsy
+ 	if (cgroup_subsys_on_dfl(memory_cgrp_subsys) && !cgroup_memory_nosocket)
+ 		static_branch_inc(&memcg_sockets_enabled_key);
+ 
++	wb_attach_memcg_to_blkcg(&memcg->css, blkcg_root_css);
+ 	return &memcg->css;
+ fail:
+ 	mem_cgroup_id_remove(memcg);

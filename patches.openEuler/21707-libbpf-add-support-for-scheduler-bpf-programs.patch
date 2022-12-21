@@ -1,0 +1,170 @@
+From e63dc65700ef603c66a1c241899e3c1314e073e9 Mon Sep 17 00:00:00 2001
+From: Roman Gushchin <guro@fb.com>
+Date: Fri, 25 Nov 2022 11:56:11 +0800
+Subject: [PATCH] libbpf: add support for scheduler bpf programs
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: e63dc65700ef603c66a1c241899e3c1314e073e9
+Modified-by-SEL: Yes, heavily modified due to different context
+
+
+maillist inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5F6X6
+CVE: NA
+
+Reference: https://lore.kernel.org/all/20210916162451.709260-1-guro@fb.com/
+
+-------------------
+
+This patch adds a support for loading and attaching scheduler bpf
+programs.
+
+Signed-off-by: Roman Gushchin <guro@fb.com>
+Signed-off-by: Chen Hui <judy.chenhui@huawei.com>
+Signed-off-by: Ren Zhijie <renzhijie2@huawei.com>
+Signed-off-by: Hui Tang <tanghui20@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ tools/lib/bpf/libbpf.c   |   26 +++++++++++++++++++++++---
+ tools/lib/bpf/libbpf.h   |    4 ++++
+ tools/lib/bpf/libbpf.map |    3 +++
+ 3 files changed, 30 insertions(+), 3 deletions(-)
+
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@ -2878,7 +2878,8 @@ static int bpf_object__finalize_btf(stru
+ static bool prog_needs_vmlinux_btf(struct bpf_program *prog)
+ {
+ 	if (prog->type == BPF_PROG_TYPE_STRUCT_OPS ||
+-	    prog->type == BPF_PROG_TYPE_LSM)
++	    prog->type == BPF_PROG_TYPE_LSM ||
++	    prog->type == BPF_PROG_TYPE_SCHED)
+ 		return true;
+ 
+ 	/* BPF_PROG_TYPE_TRACING programs which do not attach to other programs
+@@ -6580,7 +6581,8 @@ static int libbpf_preload_prog(struct bp
+ 
+ 	if ((prog->type == BPF_PROG_TYPE_TRACING ||
+ 	     prog->type == BPF_PROG_TYPE_LSM ||
+-	     prog->type == BPF_PROG_TYPE_EXT) && !prog->attach_btf_id) {
++	     prog->type == BPF_PROG_TYPE_EXT ||
++	     BPF_PROG_TYPE_SCHED) && !prog->attach_btf_id) {
+ 		int btf_obj_fd = 0, btf_type_id = 0, err;
+ 		const char *attach_name;
+ 
+@@ -8513,6 +8515,7 @@ BPF_PROG_TYPE_FNS(tracing, BPF_PROG_TYPE
+ BPF_PROG_TYPE_FNS(struct_ops, BPF_PROG_TYPE_STRUCT_OPS);
+ BPF_PROG_TYPE_FNS(extension, BPF_PROG_TYPE_EXT);
+ BPF_PROG_TYPE_FNS(sk_lookup, BPF_PROG_TYPE_SK_LOOKUP);
++BPF_PROG_TYPE_FNS(sched, BPF_PROG_TYPE_SCHED);
+ 
+ enum bpf_attach_type
+ bpf_program__get_expected_attach_type(const struct bpf_program *prog)
+@@ -8589,6 +8592,7 @@ static struct bpf_link *attach_raw_tp(co
+ static struct bpf_link *attach_trace(const struct bpf_program *prog, long cookie);
+ static struct bpf_link *attach_lsm(const struct bpf_program *prog, long cookie);
+ static struct bpf_link *attach_iter(const struct bpf_program *prog, long cookie);
++static struct bpf_link *attach_sched(const struct bpf_program *prog, long cookie);
+ 
+ static const struct bpf_sec_def section_defs[] = {
+ 	SEC_DEF("socket",		SOCKET_FILTER, 0, SEC_NONE | SEC_SLOPPY_PFX),
+@@ -8618,6 +8622,7 @@ static const struct bpf_sec_def section_
+ 	SEC_DEF("lsm/",			LSM, BPF_LSM_MAC, SEC_ATTACH_BTF, attach_lsm),
+ 	SEC_DEF("lsm.s/",		LSM, BPF_LSM_MAC, SEC_ATTACH_BTF | SEC_SLEEPABLE, attach_lsm),
+ 	SEC_DEF("iter/",		TRACING, BPF_TRACE_ITER, SEC_ATTACH_BTF, attach_iter),
++	SEC_DEF("sched/",		SCHED, BPF_SCHED, SEC_ATTACH_BTF, attach_sched),
+ 	SEC_DEF("syscall",		SYSCALL, 0, SEC_SLEEPABLE),
+ 	SEC_DEF("xdp_devmap/",		XDP, BPF_XDP_DEVMAP, SEC_ATTACHABLE),
+ 	SEC_DEF("xdp_cpumap/",		XDP, BPF_XDP_CPUMAP, SEC_ATTACHABLE),
+@@ -8662,7 +8667,7 @@ static const struct bpf_sec_def section_
+ 	SEC_DEF("sk_lookup",		SK_LOOKUP, BPF_SK_LOOKUP, SEC_ATTACHABLE | SEC_SLOPPY_PFX),
+ };
+ 
+-#define MAX_TYPE_NAME_SIZE 32
++#define MAX_TYPE_NAME_SIZE 31
+ 
+ static const struct bpf_sec_def *find_sec_def(const char *sec_name)
+ {
+@@ -8915,6 +8920,7 @@ static int bpf_object__collect_st_ops_re
+ #define BTF_TRACE_PREFIX "btf_trace_"
+ #define BTF_LSM_PREFIX "bpf_lsm_"
+ #define BTF_ITER_PREFIX "bpf_iter_"
++#define BTF_SCHED_PREFIX "bpf_sched_"
+ #define BTF_MAX_NAME_SIZE 128
+ 
+ void btf_get_kernel_prefix_kind(enum bpf_attach_type attach_type,
+@@ -8933,6 +8939,10 @@ void btf_get_kernel_prefix_kind(enum bpf
+ 		*prefix = BTF_ITER_PREFIX;
+ 		*kind = BTF_KIND_FUNC;
+ 		break;
++	case BPF_SCHED:
++		*prefix = BTF_SCHED_PREFIX;
++		*kind = BTF_KIND_FUNC;
++		break;
+ 	default:
+ 		*prefix = "";
+ 		*kind = BTF_KIND_FUNC;
+@@ -10498,6 +10508,11 @@ struct bpf_link *bpf_program__attach_tra
+ 	return bpf_program__attach_btf_id(prog);
+ }
+ 
++struct bpf_link *bpf_program__attach_sched(const struct bpf_program *prog)
++{
++	return bpf_program__attach_btf_id(prog);
++}
++
+ struct bpf_link *bpf_program__attach_lsm(const struct bpf_program *prog)
+ {
+ 	return bpf_program__attach_btf_id(prog);
+@@ -10508,6 +10523,11 @@ static struct bpf_link *attach_trace(con
+ 	return bpf_program__attach_trace(prog);
+ }
+ 
++static struct bpf_link *attach_sched(const struct bpf_program *prog, long cookie)
++{
++	return bpf_program__attach_sched(prog);
++}
++
+ static struct bpf_link *attach_lsm(const struct bpf_program *prog, long cookie)
+ {
+ 	return bpf_program__attach_lsm(prog);
+--- a/tools/lib/bpf/libbpf.h
++++ b/tools/lib/bpf/libbpf.h
+@@ -508,6 +508,8 @@ bpf_program__attach_xdp(const struct bpf
+ LIBBPF_API struct bpf_link *
+ bpf_program__attach_freplace(const struct bpf_program *prog,
+ 			     int target_fd, const char *attach_func_name);
++LIBBPF_API struct bpf_link *
++bpf_program__attach_sched(const struct bpf_program *prog);
+ 
+ struct bpf_map;
+ 
+@@ -603,6 +605,7 @@ LIBBPF_API int bpf_program__set_tracing(
+ LIBBPF_API int bpf_program__set_struct_ops(struct bpf_program *prog);
+ LIBBPF_API int bpf_program__set_extension(struct bpf_program *prog);
+ LIBBPF_API int bpf_program__set_sk_lookup(struct bpf_program *prog);
++LIBBPF_API int bpf_program__set_sched(struct bpf_program *prog);
+ 
+ LIBBPF_API enum bpf_prog_type bpf_program__get_type(const struct bpf_program *prog);
+ LIBBPF_API void bpf_program__set_type(struct bpf_program *prog,
+@@ -643,6 +646,7 @@ LIBBPF_API bool bpf_program__is_tracing(
+ LIBBPF_API bool bpf_program__is_struct_ops(const struct bpf_program *prog);
+ LIBBPF_API bool bpf_program__is_extension(const struct bpf_program *prog);
+ LIBBPF_API bool bpf_program__is_sk_lookup(const struct bpf_program *prog);
++LIBBPF_API bool bpf_program__is_sched(const struct bpf_program *prog);
+ 
+ /*
+  * No need for __attribute__((packed)), all members of 'bpf_map_def'
+--- a/tools/lib/bpf/libbpf.map
++++ b/tools/lib/bpf/libbpf.map
+@@ -336,6 +336,9 @@ LIBBPF_0.2.0 {
+ 		perf_buffer__epoll_fd;
+ 		perf_buffer__consume_buffer;
+ 		xsk_socket__create_shared;
++		bpf_program__attach_sched;
++		bpf_program__is_sched;
++		bpf_program__set_sched;
+ } LIBBPF_0.1.0;
+ 
+ LIBBPF_0.3.0 {

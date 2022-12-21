@@ -1,0 +1,130 @@
+From f19f1ca6a9844f2dc30b6a43f365f4c2af52722b Mon Sep 17 00:00:00 2001
+From: Ke Chen <chenke54@huawei.com>
+Date: Wed, 9 Nov 2022 14:36:36 +0800
+Subject: [PATCH] RDMA/hns: Add ROH basic configuration and check
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: f19f1ca6a9844f2dc30b6a43f365f4c2af52722b
+Modified-by-SEL: No
+
+
+driver inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5WKYW
+
+-----------------------------------------------------------------------
+
+ROH MAC do not support ROCEv1 and ROCEv2@IPv6.
+ROCE driver adapts to these limiations.
+
+Signed-off-by: Lang Cheng <chenglang@huawei.com>
+Signed-off-by: Ke Chen <chenke54@huawei.com>
+Reviewed-by: Yangyang Li <liyangyang20@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/infiniband/hw/hns/hns_roce_device.h |  1 +
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.c  | 26 +++++++++++++++++++++
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.h  |  1 +
+ drivers/infiniband/hw/hns/hns_roce_main.c   | 11 ++++++---
+ 4 files changed, 36 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/infiniband/hw/hns/hns_roce_device.h b/drivers/infiniband/hw/hns/hns_roce_device.h
+index 51e59084f875..a93d9a7fa8c9 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_device.h
++++ b/drivers/infiniband/hw/hns/hns_roce_device.h
+@@ -950,6 +950,7 @@ struct hns_roce_dev {
+ 	struct hns_roce_hem_table  gmv_table;
+ 
+ 	int			cmd_mod;
++	u8			mac_type;
+ 	int			loop_idc;
+ 	u32			sdb_offset;
+ 	u32			odb_offset;
+diff --git a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+index 52f621c36672..59eaa6b52347 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+@@ -2342,6 +2342,28 @@ static int hns_roce_query_pf_caps(struct hns_roce_dev *hr_dev)
+ 	return 0;
+ }
+ 
++static void hns_roce_set_mac_type(struct hns_roce_dev *hr_dev)
++{
++	struct hns_roce_cmq_desc desc;
++	int ret;
++
++	if (hr_dev->pci_dev->revision == PCI_REVISION_ID_HIP08)
++		return;
++
++	hns_roce_cmq_setup_basic_desc(&desc, HNS_QUERY_MAC_TYPE, true);
++	ret = hns_roce_cmq_send(hr_dev, &desc, 1);
++	if (ret == CMD_NOT_EXIST)
++		return;
++
++	if (ret) {
++		dev_err(hr_dev->dev, "failed to get mac mod, ret = %d.\n", ret);
++		return;
++	}
++
++	if (le32_to_cpu(desc.data[0]))
++		hr_dev->mac_type = HNAE3_MAC_ROH;
++}
++
+ static int config_hem_entry_size(struct hns_roce_dev *hr_dev, u32 type, u32 val)
+ {
+ 	struct hns_roce_cmq_desc desc;
+@@ -2989,6 +3011,8 @@ static int hns_roce_v2_init(struct hns_roce_dev *hr_dev)
+ 	if (ret)
+ 		return ret;
+ 
++	hns_roce_set_mac_type(hr_dev);
++
+ 	ret = get_hem_table(hr_dev);
+ 	if (ret)
+ 		return ret;
+@@ -3221,6 +3245,8 @@ static int hns_roce_v2_set_gid(struct hns_roce_dev *hr_dev, int gid_index,
+ 			else
+ 				sgid_type = GID_TYPE_FLAG_ROCE_V2_IPV6;
+ 		} else if (attr->gid_type == IB_GID_TYPE_ROCE) {
++			if (hr_dev->mac_type == HNAE3_MAC_ROH)
++				return -EPERM;
+ 			sgid_type = GID_TYPE_FLAG_ROCE_V1;
+ 		}
+ 	}
+diff --git a/drivers/infiniband/hw/hns/hns_roce_hw_v2.h b/drivers/infiniband/hw/hns/hns_roce_hw_v2.h
+index 39641b449a42..fd45753a06b6 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.h
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.h
+@@ -226,6 +226,7 @@ enum {
+ /* CMQ command */
+ enum hns_roce_opcode_type {
+ 	HNS_QUERY_FW_VER				= 0x0001,
++	HNS_QUERY_MAC_TYPE				= 0x0389,
+ 	HNS_ROCE_OPC_QUERY_HW_VER			= 0x8000,
+ 	HNS_ROCE_OPC_CFG_GLOBAL_PARAM			= 0x8001,
+ 	HNS_ROCE_OPC_ALLOC_PF_RES			= 0x8004,
+diff --git a/drivers/infiniband/hw/hns/hns_roce_main.c b/drivers/infiniband/hw/hns/hns_roce_main.c
+index 9f30e242d23a..42037598d11c 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_main.c
++++ b/drivers/infiniband/hw/hns/hns_roce_main.c
+@@ -506,9 +506,14 @@ static int hns_roce_port_immutable(struct ib_device *ib_dev, u8 port_num,
+ 	immutable->gid_tbl_len = attr.gid_tbl_len;
+ 
+ 	immutable->max_mad_size = IB_MGMT_MAD_SIZE;
+-	immutable->core_cap_flags = RDMA_CORE_PORT_IBA_ROCE;
+-	if (to_hr_dev(ib_dev)->caps.flags & HNS_ROCE_CAP_FLAG_ROCE_V1_V2)
+-		immutable->core_cap_flags |= RDMA_CORE_PORT_IBA_ROCE_UDP_ENCAP;
++
++	if (to_hr_dev(ib_dev)->mac_type == HNAE3_MAC_ROH)
++		immutable->core_cap_flags = RDMA_CORE_PORT_IBA_ROCE_UDP_ENCAP;
++	else if (to_hr_dev(ib_dev)->caps.flags & HNS_ROCE_CAP_FLAG_ROCE_V1_V2)
++		immutable->core_cap_flags = RDMA_CORE_PORT_IBA_ROCE |
++					    RDMA_CORE_PORT_IBA_ROCE_UDP_ENCAP;
++	else
++		immutable->core_cap_flags = RDMA_CORE_PORT_IBA_ROCE;
+ 
+ 	return 0;
+ }
+-- 
+2.33.0
+

@@ -1,0 +1,161 @@
+From cf93127d8cd8eac660929413317221847ca89f90 Mon Sep 17 00:00:00 2001
+From: He Sheng <hesheng@wxiat.com>
+Date: Mon, 15 Aug 2022 17:16:09 +0800
+Subject: [PATCH] sw64: remove trap_a* and hae from pt_regs
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: cf93127d8cd8eac660929413317221847ca89f90
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56OLG
+
+--------------------------------
+
+At present, glibc dumps `trap_a*` when a segmentation fault is caught,
+but no user knows what they mean. That is, nobody care about them, so
+remove them to reduce overhead of SAVE_COMMON_REGS.
+
+Besides, `hae` is legacy code which should be deprecated too.
+
+Signed-off-by: He Sheng <hesheng@wxiat.com>
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/include/asm/ptrace.h          |  7 +------
+ arch/sw_64/include/uapi/asm/sigcontext.h | 15 +++++++--------
+ arch/sw_64/kernel/asm-offsets.c          |  3 ---
+ arch/sw_64/kernel/entry.S                |  8 ++------
+ arch/sw_64/kernel/ptrace.c               |  4 ----
+ arch/sw_64/kernel/signal.c               |  4 ----
+ 6 files changed, 10 insertions(+), 31 deletions(-)
+
+diff --git a/arch/sw_64/include/asm/ptrace.h b/arch/sw_64/include/asm/ptrace.h
+index c7267b1432dd..b5afebf82939 100644
+--- a/arch/sw_64/include/asm/ptrace.h
++++ b/arch/sw_64/include/asm/ptrace.h
+@@ -40,12 +40,7 @@ struct pt_regs {
+ 	unsigned long r26;
+ 	unsigned long r27;
+ 	unsigned long r28;
+-	unsigned long hae;
+-/* JRP - These are the values provided to a0-a2 by HMcode */
+-	unsigned long trap_a0;
+-	unsigned long trap_a1;
+-	unsigned long trap_a2;
+-/* These are saved by HMcode: */
++	/* These are saved by HMcode: */
+ 	unsigned long ps;
+ 	unsigned long pc;
+ 	unsigned long gp;
+diff --git a/arch/sw_64/include/uapi/asm/sigcontext.h b/arch/sw_64/include/uapi/asm/sigcontext.h
+index facbf34e920d..11d7eece86ef 100644
+--- a/arch/sw_64/include/uapi/asm/sigcontext.h
++++ b/arch/sw_64/include/uapi/asm/sigcontext.h
+@@ -2,15 +2,13 @@
+ #ifndef _UAPI_ASM_SW64_SIGCONTEXT_H
+ #define _UAPI_ASM_SW64_SIGCONTEXT_H
+ 
++/*
++ * Signal context structure
++ *
++ * The context is saved before a signal handler is invoked, and it is
++ * restored by sys_sigreturn / sys_rt_sigreturn.
++ */
+ struct sigcontext {
+-	/*
+-	 * What should we have here? I'd probably better use the same
+-	 * stack layout as DEC Unix, just in case we ever want to try
+-	 * running their binaries..
+-	 *
+-	 * This is the basic layout, but I don't know if we'll ever
+-	 * actually fill in all the values..
+-	 */
+ 	long		sc_onstack;
+ 	long		sc_mask;
+ 	long		sc_pc;
+@@ -19,6 +17,7 @@ struct sigcontext {
+ 	long		sc_ownedfp;
+ 	long		sc_fpregs[128];	/* SIMD-FP */
+ 	unsigned long	sc_fpcr;
++	/* TODO: Following are unused, to be removed and synced with libc */
+ 	unsigned long	sc_fp_control;
+ 	unsigned long	sc_reserved1, sc_reserved2;
+ 	unsigned long	sc_ssize;
+diff --git a/arch/sw_64/kernel/asm-offsets.c b/arch/sw_64/kernel/asm-offsets.c
+index 56c5daaa413c..86ed5b8c216e 100644
+--- a/arch/sw_64/kernel/asm-offsets.c
++++ b/arch/sw_64/kernel/asm-offsets.c
+@@ -88,9 +88,6 @@ void foo(void)
+ 	DEFINE(PT_REGS_R26, offsetof(struct pt_regs, r26));
+ 	DEFINE(PT_REGS_R27, offsetof(struct pt_regs, r27));
+ 	DEFINE(PT_REGS_R28, offsetof(struct pt_regs, r28));
+-	DEFINE(PT_REGS_TRAP_A0, offsetof(struct pt_regs, trap_a0));
+-	DEFINE(PT_REGS_TRAP_A1, offsetof(struct pt_regs, trap_a1));
+-	DEFINE(PT_REGS_TRAP_A2, offsetof(struct pt_regs, trap_a2));
+ 	DEFINE(PT_REGS_PS, offsetof(struct pt_regs, ps));
+ 	DEFINE(PT_REGS_PC, offsetof(struct pt_regs, pc));
+ 	DEFINE(PT_REGS_GP, offsetof(struct pt_regs, gp));
+diff --git a/arch/sw_64/kernel/entry.S b/arch/sw_64/kernel/entry.S
+index 01896128ed23..a52665c3bb08 100644
+--- a/arch/sw_64/kernel/entry.S
++++ b/arch/sw_64/kernel/entry.S
+@@ -14,11 +14,10 @@
+ /*
+  * This defines the normal kernel pt-regs layout.
+  *
+- * regs 9-15 preserved by C code
++ * regs 9-15 preserved by C code, saving to pt_regs will make
++ * them easier to be accessed in an unified way.
+  * regs 16-18 saved by HMcode
+  * regs 29-30 saved and set up by HMcode
+- * JRP - Save regs 16-18 in a special area of the stack, so that
+- * the hmcode-provided values are available to the signal handler.
+  */
+ 
+ 	.macro SAVE_COMMON_REGS
+@@ -42,9 +41,6 @@
+ 	stl	$25, PT_REGS_R25($sp)
+ 	stl	$26, PT_REGS_R26($sp)
+ 	stl	$27, PT_REGS_R27($sp)
+-	stl	$16, PT_REGS_TRAP_A0($sp)
+-	stl	$17, PT_REGS_TRAP_A1($sp)
+-	stl	$18, PT_REGS_TRAP_A2($sp)
+ 	.endm
+ 
+ 	.macro RESTORE_COMMON_REGS
+diff --git a/arch/sw_64/kernel/ptrace.c b/arch/sw_64/kernel/ptrace.c
+index e8b9ec104e3b..f3bc1020eaff 100644
+--- a/arch/sw_64/kernel/ptrace.c
++++ b/arch/sw_64/kernel/ptrace.c
+@@ -504,10 +504,6 @@ static const struct pt_regs_offset regoffset_table[] = {
+ 	REG_OFFSET_NAME(r26),
+ 	REG_OFFSET_NAME(r27),
+ 	REG_OFFSET_NAME(r28),
+-	REG_OFFSET_NAME(hae),
+-	REG_OFFSET_NAME(trap_a0),
+-	REG_OFFSET_NAME(trap_a1),
+-	REG_OFFSET_NAME(trap_a2),
+ 	REG_OFFSET_NAME(ps),
+ 	REG_OFFSET_NAME(pc),
+ 	REG_OFFSET_NAME(gp),
+diff --git a/arch/sw_64/kernel/signal.c b/arch/sw_64/kernel/signal.c
+index 5b3664ab6591..32c9484d2aa2 100644
+--- a/arch/sw_64/kernel/signal.c
++++ b/arch/sw_64/kernel/signal.c
+@@ -255,10 +255,6 @@ setup_sigcontext(struct sigcontext __user *sc, struct pt_regs *regs,
+ 				offsetof(struct user_fpsimd_state, fpcr));
+ 	err |= __put_user(current->thread.fpstate.fpcr, &sc->sc_fpcr);
+ 
+-	err |= __put_user(regs->trap_a0, &sc->sc_traparg_a0);
+-	err |= __put_user(regs->trap_a1, &sc->sc_traparg_a1);
+-	err |= __put_user(regs->trap_a2, &sc->sc_traparg_a2);
+-
+ 	return err;
+ }
+ 
+-- 
+2.33.0
+

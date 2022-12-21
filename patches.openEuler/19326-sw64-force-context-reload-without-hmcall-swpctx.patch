@@ -1,0 +1,255 @@
+From 2e88067254f5cc046c2bbac843a41541f31f90c1 Mon Sep 17 00:00:00 2001
+From: He Sheng <hesheng@wxiat.com>
+Date: Mon, 27 Jun 2022 15:02:03 +0800
+Subject: [PATCH] sw64: force context reload without hmcall swpctx
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 2e88067254f5cc046c2bbac843a41541f31f90c1
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56OLG
+
+--------------------------------
+
+The hmcall swpctx is a bit heavyweight for context reload, and
+we have provided some other hmcalls to do this:
+  - wrfen: enable fpu.
+  - wrptbr: update CSR:PTBR only.
+  - load_mm: force update CSR:PTBR and CSR:UPN to switch mm.
+
+For smp setup, hmcall swpctx is also heavy because boot CPU only
+has to prepare stack pointer for secondary CPUs. So we remove the
+tidle_pcb[], and take tidle_ksp[] to hold target idle task's ksp.
+Each secondary CPU loads its ksp and update CSR:PTBR at boot time.
+
+With this patch, most hmcall swpctx invocations are removed.
+
+Signed-off-by: He Sheng <hesheng@wxiat.com>
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/include/asm/hmcall.h      |  5 +++++
+ arch/sw_64/include/asm/mmu_context.h | 31 ++++------------------------
+ arch/sw_64/kernel/head.S             | 11 ++++------
+ arch/sw_64/kernel/process.c          |  1 -
+ arch/sw_64/kernel/smp.c              | 20 +++++-------------
+ arch/sw_64/kernel/traps.c            |  2 +-
+ arch/sw_64/mm/fault.c                |  2 +-
+ arch/sw_64/mm/init.c                 | 11 +---------
+ 8 files changed, 21 insertions(+), 62 deletions(-)
+
+diff --git a/arch/sw_64/include/asm/hmcall.h b/arch/sw_64/include/asm/hmcall.h
+index 0e609e9cade7..30afc542039c 100644
+--- a/arch/sw_64/include/asm/hmcall.h
++++ b/arch/sw_64/include/asm/hmcall.h
+@@ -62,6 +62,11 @@
+ extern void halt(void) __attribute__((noreturn));
+ #define __halt() __asm__ __volatile__ ("sys_call %0 #halt" : : "i" (HMC_halt))
+ 
++#define fpu_enable()						\
++{								\
++	__asm__ __volatile__("sys_call %0" : : "i" (HMC_wrfen));\
++}
++
+ #define imb() \
+ 	__asm__ __volatile__ ("sys_call %0 #imb" : : "i" (HMC_imb) : "memory")
+ 
+diff --git a/arch/sw_64/include/asm/mmu_context.h b/arch/sw_64/include/asm/mmu_context.h
+index 762ffbf72dbb..3e75f34895bf 100644
+--- a/arch/sw_64/include/asm/mmu_context.h
++++ b/arch/sw_64/include/asm/mmu_context.h
+@@ -14,37 +14,14 @@
+ 
+ /*
+  * Force a context reload. This is needed when we change the page
+- * table pointer or when we update the ASN of the current process.
++ * table pointer or when we update the ASID of the current process.
++ *
++ * CSR:UPN holds ASID and CSR:PTBR holds page table pointer.
+  */
+-
+-static inline unsigned long
+-__reload_thread(struct pcb_struct *pcb)
+-{
+-	register unsigned long a0 __asm__("$16");
+-	register unsigned long v0 __asm__("$0");
+-
+-	a0 = virt_to_phys(pcb);
+-	__asm__ __volatile__(
+-		"sys_call %2 #__reload_thread"
+-		: "=r"(v0), "=r"(a0)
+-		: "i"(HMC_swpctx), "r"(a0)
+-		: "$1", "$22", "$23", "$24", "$25");
+-
+-	return v0;
+-}
+-
+ #define load_asn_ptbr   load_mm
+ 
+ /*
+- * The maximum ASN's the processor supports.
+- *
+- * If a processor implements address space numbers (ASNs), and the old
+- * PTE has the Address Space Match (ASM) bit clear (ASNs in use) and
+- * the Valid bit set, then entries can also effectively be made coherent
+- * by assigning a new, unused ASN to the currently running process and
+- * not reusing the previous ASN before calling the appropriate HMcode
+- * routine to invalidate the translation buffer (TB).
+- *
++ * The maximum ASN's the processor supports. ASN is called ASID too.
+  */
+ 
+ #ifdef CONFIG_SUBARCH_C3B
+diff --git a/arch/sw_64/kernel/head.S b/arch/sw_64/kernel/head.S
+index e43499d18357..4b2db3891dcb 100644
+--- a/arch/sw_64/kernel/head.S
++++ b/arch/sw_64/kernel/head.S
+@@ -76,17 +76,14 @@ __smp_callin:
+ 
+ 	sys_call HMC_whami	# Get hard cid
+ 
+-	sll	$0, 2, $0
+ 	ldi	$1, __rcid_to_cpu
+-	addl	$1, $0, $1
++	s4addl	$0, $1, $1
+ 	ldw	$0, 0($1)	# Get logical cpu number
+ 
+-	sll	$0, 3, $0
+-	ldi	$1, tidle_pcb
+-	addl	$1, $0, $1
+-	ldl	$16, 0($1)	# Get PCBB of idle thread
++	ldi	$2, tidle_ksp
++	s8addl	$0, $2, $2
++	ldl	$30, 0($2)	# Get ksp of idle thread
+ 
+-	sys_call HMC_swpctx
+ 	ldi	$8, 0x3fff	# Find "current".
+ 	bic	$30, $8, $8
+ 
+diff --git a/arch/sw_64/kernel/process.c b/arch/sw_64/kernel/process.c
+index 4d223a7255bb..f5525a194072 100644
+--- a/arch/sw_64/kernel/process.c
++++ b/arch/sw_64/kernel/process.c
+@@ -156,7 +156,6 @@ copy_thread(unsigned long clone_flags, unsigned long usp,
+ 	struct pt_regs *childregs = task_pt_regs(p);
+ 	struct pt_regs *regs = current_pt_regs();
+ 
+-	childti->pcb.ksp = (unsigned long) childregs;
+ 	childti->pcb.flags = 7;	/* set FEN, clear everything else */
+ 	p->thread.sp = (unsigned long) childregs;
+ 
+diff --git a/arch/sw_64/kernel/smp.c b/arch/sw_64/kernel/smp.c
+index b95873a2696d..43d803c49545 100644
+--- a/arch/sw_64/kernel/smp.c
++++ b/arch/sw_64/kernel/smp.c
+@@ -34,7 +34,7 @@ EXPORT_SYMBOL(__cpu_to_rcid);
+ int __rcid_to_cpu[NR_CPUS];		/* Map physical to logical */
+ EXPORT_SYMBOL(__rcid_to_cpu);
+ 
+-unsigned long tidle_pcb[NR_CPUS];
++void *tidle_ksp[NR_CPUS];
+ 
+ /* State of each CPU */
+ DEFINE_PER_CPU(int, cpu_state) = { 0 };
+@@ -110,6 +110,8 @@ void smp_callin(void)
+ 	/* All kernel threads share the same mm context.  */
+ 	mmgrab(&init_mm);
+ 	current->active_mm = &init_mm;
++	/* update csr:ptbr */
++	wrptbr(PFN_PHYS(current_thread_info()->pcb.ptbr));
+ 
+ 	/* inform the notifiers about the new cpu */
+ 	notify_cpu_starting(cpuid);
+@@ -153,23 +155,11 @@ static inline void set_secondary_ready(int cpuid)
+  */
+ static int secondary_cpu_start(int cpuid, struct task_struct *idle)
+ {
+-	struct pcb_struct *ipcb;
+ 	unsigned long timeout;
+-
+-	ipcb = &task_thread_info(idle)->pcb;
+-
+ 	/*
+-	 * Initialize the idle's PCB to something just good enough for
+-	 * us to get started.  Immediately after starting, we'll swpctx
+-	 * to the target idle task's pcb.  Reuse the stack in the mean
+-	 * time.  Precalculate the target PCBB.
++	 * Precalculate the target ksp.
+ 	 */
+-	ipcb->ksp = (unsigned long)ipcb + sizeof(union thread_union) - 16;
+-	ipcb->usp = 0;
+-	ipcb->pcc = 0;
+-	ipcb->asn = 0;
+-	tidle_pcb[cpuid] = ipcb->unique = virt_to_phys(ipcb);
+-	ipcb->dv_match = ipcb->dv_mask = 0;
++	tidle_ksp[cpuid] = idle->stack + sizeof(union thread_union) - 16;
+ 
+ 	DBGS("Starting secondary cpu %d: state 0x%lx\n", cpuid, idle->state);
+ 
+diff --git a/arch/sw_64/kernel/traps.c b/arch/sw_64/kernel/traps.c
+index 9915160d95d2..ff32330d73ab 100644
+--- a/arch/sw_64/kernel/traps.c
++++ b/arch/sw_64/kernel/traps.c
+@@ -284,7 +284,7 @@ do_entIF(unsigned long inst_type, struct pt_regs *regs)
+ 		 * with it.
+ 		 */
+ 		current_thread_info()->pcb.flags |= 1;
+-		__reload_thread(&current_thread_info()->pcb);
++		fpu_enable();
+ 		return;
+ 
+ 	case 5: /* illoc */
+diff --git a/arch/sw_64/mm/fault.c b/arch/sw_64/mm/fault.c
+index 541e30b4b84c..b7fc2c816698 100644
+--- a/arch/sw_64/mm/fault.c
++++ b/arch/sw_64/mm/fault.c
+@@ -76,7 +76,7 @@ void __load_new_mm_context(struct mm_struct *next_mm)
+ 	pcb->asn = mmc & HARDWARE_ASN_MASK;
+ 	pcb->ptbr = virt_to_pfn(next_mm->pgd);
+ 
+-	__reload_thread(pcb);
++	load_asn_ptbr(pcb->asn, pcb->ptbr);
+ }
+ 
+ /*
+diff --git a/arch/sw_64/mm/init.c b/arch/sw_64/mm/init.c
+index 6ed1ef8e020c..ef8e45ece0ff 100644
+--- a/arch/sw_64/mm/init.c
++++ b/arch/sw_64/mm/init.c
+@@ -77,21 +77,12 @@ pgd_alloc(struct mm_struct *mm)
+ 	return ret;
+ }
+ 
+-static inline unsigned long
+-load_PCB(struct pcb_struct *pcb)
+-{
+-	register unsigned long sp __asm__("$30");
+-	pcb->ksp = sp;
+-	return __reload_thread(pcb);
+-}
+-
+ /* Set up initial PCB, VPTB, and other such nicities.  */
+ 
+ static inline void
+ switch_to_system_map(void)
+ {
+ 	unsigned long newptbr;
+-	unsigned long original_pcb_ptr;
+ 
+ 	/*
+ 	 * Initialize the kernel's page tables.  Linux puts the vptb in
+@@ -103,7 +94,7 @@ switch_to_system_map(void)
+ 	/* Also set up the real kernel PCB while we're at it.  */
+ 	init_thread_info.pcb.ptbr = newptbr;
+ 	init_thread_info.pcb.flags = 1;	/* set FEN, clear everything else */
+-	original_pcb_ptr = load_PCB(&init_thread_info.pcb);
++	wrptbr(PFN_PHYS(newptbr));
+ 	tbiv();
+ }
+ 
+-- 
+2.33.0
+

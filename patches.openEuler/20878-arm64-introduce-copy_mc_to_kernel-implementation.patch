@@ -1,0 +1,185 @@
+From ee7b5d7559e6f2ca633f8ab6fbd23c06991595ad Mon Sep 17 00:00:00 2001
+From: Tong Tiangen <tongtiangen@huawei.com>
+Date: Fri, 18 Nov 2022 02:08:56 +0000
+Subject: [PATCH] arm64: introduce copy_mc_to_kernel() implementation
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: ee7b5d7559e6f2ca633f8ab6fbd23c06991595ad
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5GB28
+CVE: NA
+
+-------------------------------
+
+The copy_mc_to_kernel() helper is memory copy implementation that handles
+source exceptions. It can be used in memory copy scenarios that tolerate
+hardware memory errors(e.g: pmem_read/dax_copy_to_iter).
+
+Currnently, only x86 and ppc suuport this helper, after arm64 support
+machine check safe framework, we introduce copy_mc_to_kernel()
+implementation.
+
+Signed-off-by: Tong Tiangen <tongtiangen@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/string.h  |  5 +++
+ arch/arm64/include/asm/uaccess.h | 19 +++++++++
+ arch/arm64/lib/Makefile          |  8 ++--
+ arch/arm64/lib/memcpy_mc.S       | 73 ++++++++++++++++++++++++++++++++
+ 4 files changed, 101 insertions(+), 4 deletions(-)
+ create mode 100644 arch/arm64/lib/memcpy_mc.S
+
+diff --git a/arch/arm64/include/asm/string.h b/arch/arm64/include/asm/string.h
+index b31e8e87a0db..08e0327a1719 100644
+--- a/arch/arm64/include/asm/string.h
++++ b/arch/arm64/include/asm/string.h
+@@ -35,6 +35,10 @@ extern void *memchr(const void *, int, __kernel_size_t);
+ extern void *memcpy(void *, const void *, __kernel_size_t);
+ extern void *__memcpy(void *, const void *, __kernel_size_t);
+ 
++#define __HAVE_ARCH_MEMCPY_MC
++extern unsigned long *memcpy_mcs(void *, const void *, __kernel_size_t);
++extern unsigned long *__memcpy_mcs(void *, const void *, __kernel_size_t);
++
+ #define __HAVE_ARCH_MEMMOVE
+ extern void *memmove(void *, const void *, __kernel_size_t);
+ extern void *__memmove(void *, const void *, __kernel_size_t);
+@@ -56,6 +60,7 @@ void memcpy_flushcache(void *dst, const void *src, size_t cnt);
+  */
+ 
+ #define memcpy(dst, src, len) __memcpy(dst, src, len)
++#define memcpy_mcs(dst, src, len) __memcpy_mcs(dst, src, len)
+ #define memmove(dst, src, len) __memmove(dst, src, len)
+ #define memset(s, c, n) __memset(s, c, n)
+ 
+diff --git a/arch/arm64/include/asm/uaccess.h b/arch/arm64/include/asm/uaccess.h
+index 832ffbe2218a..635436bd8712 100644
+--- a/arch/arm64/include/asm/uaccess.h
++++ b/arch/arm64/include/asm/uaccess.h
+@@ -432,4 +432,23 @@ static inline int __copy_from_user_flushcache(void *dst, const void __user *src,
+ }
+ #endif
+ 
++#ifdef CONFIG_ARCH_HAS_COPY_MC
++/**
++ * copy_mc_to_kernel - memory copy that handles source exceptions
++ *
++ * @dst:	destination address
++ * @src:	source address
++ * @len:	number of bytes to copy
++ *
++ * Return 0 for success, or number of bytes not copied if there was an
++ * exception.
++ */
++static inline unsigned long __must_check
++copy_mc_to_kernel(void *to, const void *from, unsigned long size)
++{
++	return (unsigned long)memcpy_mcs(to, from, size);
++}
++#define copy_mc_to_kernel copy_mc_to_kernel
++#endif
++
+ #endif /* __ASM_UACCESS_H */
+diff --git a/arch/arm64/lib/Makefile b/arch/arm64/lib/Makefile
+index d35d99771016..e2dbef587c9b 100644
+--- a/arch/arm64/lib/Makefile
++++ b/arch/arm64/lib/Makefile
+@@ -1,8 +1,8 @@
+ # SPDX-License-Identifier: GPL-2.0
+-lib-y		:= clear_user.o delay.o copy_from_user.o		\
+-		   copy_to_user.o copy_in_user.o copy_page.o		\
+-		   clear_page.o csum.o memchr.o memcpy.o memmove.o	\
+-		   memset.o memcmp.o strcmp.o strncmp.o strlen.o	\
++lib-y		:= clear_user.o delay.o copy_from_user.o			\
++		   copy_to_user.o copy_in_user.o copy_page.o			\
++		   clear_page.o csum.o memchr.o memcpy.o memcpy_mc.o memmove.o	\
++		   memset.o memcmp.o strcmp.o strncmp.o strlen.o		\
+ 		   strnlen.o strchr.o strrchr.o tishift.o
+ 
+ ifeq ($(CONFIG_KERNEL_MODE_NEON), y)
+diff --git a/arch/arm64/lib/memcpy_mc.S b/arch/arm64/lib/memcpy_mc.S
+new file mode 100644
+index 000000000000..1e76a0d1cc43
+--- /dev/null
++++ b/arch/arm64/lib/memcpy_mc.S
+@@ -0,0 +1,73 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright (C) 2013 ARM Ltd.
++ * Copyright (C) 2013 Linaro.
++ *
++ * This code is based on glibc cortex strings work originally authored by Linaro
++ * be found @
++ *
++ * http://bazaar.launchpad.net/~linaro-toolchain-dev/cortex-strings/trunk/
++ * files/head:/src/aarch64/
++ */
++
++#include <linux/linkage.h>
++#include <asm/assembler.h>
++#include <asm/cache.h>
++
++/*
++ * Copy a buffer from src to dest (alignment handled by the hardware)
++ * with machine check safe.
++ *
++ * Parameters:
++ *	x0 - dest
++ *	x1 - src
++ *	x2 - n
++ * Returns:
++ *	x0 - bytes not copied
++ */
++	.macro ldrb1 reg, ptr, val
++	CPY_MC(9998f, ldrb  \reg, [\ptr], \val)
++	.endm
++
++	.macro strb1 reg, ptr, val
++	CPY_MC(9998f, strb \reg, [\ptr], \val)
++	.endm
++
++	.macro ldrh1 reg, ptr, val
++	CPY_MC(9998f, ldrh  \reg, [\ptr], \val)
++	.endm
++
++	.macro strh1 reg, ptr, val
++	CPY_MC(9998f, strh \reg, [\ptr], \val)
++	.endm
++
++	.macro ldr1 reg, ptr, val
++	CPY_MC(9998f, ldr \reg, [\ptr], \val)
++	.endm
++
++	.macro str1 reg, ptr, val
++	CPY_MC(9998f, str \reg, [\ptr], \val)
++	.endm
++
++	.macro ldp1 reg1, reg2, ptr, val
++	CPY_MC(9998f, ldp \reg1, \reg2, [\ptr], \val)
++	.endm
++
++	.macro stp1 reg1, reg2, ptr, val
++	CPY_MC(9998f, stp \reg1, \reg2, [\ptr], \val)
++	.endm
++
++end	.req	x5
++SYM_FUNC_START_ALIAS(__memcpy_mcs)
++SYM_FUNC_START_WEAK_PI(memcpy_mcs)
++	add end, x0, x2
++#include "copy_template.S"
++	mov x0, #0
++	ret
++
++9998:	sub x0, end, dst
++	ret
++SYM_FUNC_END_PI(memcpy_mcs)
++EXPORT_SYMBOL(memcpy_mcs)
++SYM_FUNC_END_ALIAS(__memcpy_mcs)
++EXPORT_SYMBOL(__memcpy_mcs)
+-- 
+2.33.0
+

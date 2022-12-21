@@ -1,0 +1,113 @@
+From 1a1339853c20d1c6b28cd5582c0a95866f86da5e Mon Sep 17 00:00:00 2001
+From: Mao Minkai <maominkai@wxiat.com>
+Date: Mon, 10 Oct 2022 15:57:11 +0800
+Subject: [PATCH] sw64: fix incorrect gp after uretprobe triggered
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 1a1339853c20d1c6b28cd5582c0a95866f86da5e
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56OLG
+
+--------------------------------
+
+SW64 use r26 to calculate gp after function return, so r26 needs to be
+restored when uretprobe trampoline is hit.
+
+Since uretprobe is handled in generic code, we will modify r26 before we
+return to user space.
+
+Signed-off-by: Mao Minkai <maominkai@wxiat.com>
+Reviewed-by: He Sheng <hesheng@wxiat.com>
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/include/asm/uprobes.h |  2 ++
+ arch/sw_64/kernel/traps.c        |  6 +++--
+ arch/sw_64/kernel/uprobes.c      | 38 ++++++++++++++++++++++++++++++++
+ 3 files changed, 44 insertions(+), 2 deletions(-)
+
+diff --git a/arch/sw_64/include/asm/uprobes.h b/arch/sw_64/include/asm/uprobes.h
+index 97b67af25bce..2a5b268cb88f 100644
+--- a/arch/sw_64/include/asm/uprobes.h
++++ b/arch/sw_64/include/asm/uprobes.h
+@@ -35,4 +35,6 @@ struct arch_uprobe_task {
+ 	unsigned long saved_trap_nr;
+ };
+ 
++extern void sw64_fix_uretprobe(struct pt_regs *regs);
++
+ #endif /* _ASM_SW64_UPROBES_H */
+diff --git a/arch/sw_64/kernel/traps.c b/arch/sw_64/kernel/traps.c
+index 5fac85c29bf6..9362fcd922c5 100644
+--- a/arch/sw_64/kernel/traps.c
++++ b/arch/sw_64/kernel/traps.c
+@@ -267,12 +267,14 @@ do_entIF(unsigned long inst_type, struct pt_regs *regs)
+ 		case BREAK_KPROBE_SS:
+ 			if (notify_die(DIE_SSTEPBP, "single_step", regs, 0, 0, SIGTRAP) == NOTIFY_STOP)
+ 				return;
++#ifdef CONFIG_UPROBES
+ 		case UPROBE_BRK_UPROBE:
+ 			if (notify_die(DIE_UPROBE, "uprobe", regs, 0, 0, SIGTRAP) == NOTIFY_STOP)
+-				return;
++				return sw64_fix_uretprobe(regs);
+ 		case UPROBE_BRK_UPROBE_XOL:
+ 			if (notify_die(DIE_UPROBE_XOL, "uprobe_xol", regs, 0, 0, SIGTRAP) == NOTIFY_STOP)
+-				return;
++				return sw64_fix_uretprobe(regs);
++#endif
+ 		}
+ 
+ 		if (user_mode(regs))
+diff --git a/arch/sw_64/kernel/uprobes.c b/arch/sw_64/kernel/uprobes.c
+index 786f2e38a59f..1160ca1e836a 100644
+--- a/arch/sw_64/kernel/uprobes.c
++++ b/arch/sw_64/kernel/uprobes.c
+@@ -151,3 +151,41 @@ bool arch_uprobe_skip_sstep(struct arch_uprobe *auprobe, struct pt_regs *regs)
+ {
+ 	return 0;
+ }
++
++/*
++ * struct xol_area and get_trampoline_vaddr() are copied from
++ * kernel/events/uprobes.c to avoid modifying arch-independent
++ * code.
++ */
++struct xol_area {
++	wait_queue_head_t		wq;
++	atomic_t			slot_count;
++	unsigned long			*bitmap;
++	struct vm_special_mapping	xol_mapping;
++	struct page			*pages[2];
++	unsigned long			vaddr;
++};
++
++static unsigned long get_trampoline_vaddr(void)
++{
++	struct xol_area *area;
++	unsigned long trampoline_vaddr = -1;
++
++	area = READ_ONCE(current->mm->uprobes_state.xol_area);
++	if (area)
++		trampoline_vaddr = area->vaddr;
++
++	return trampoline_vaddr;
++}
++
++void sw64_fix_uretprobe(struct pt_regs *regs)
++{
++	unsigned long bp_vaddr;
++
++	bp_vaddr = uprobe_get_swbp_addr(regs);
++	/*
++	 * regs->pc has been changed to orig_ret_vaddr in handle_trampoline().
++	 */
++	if (bp_vaddr == get_trampoline_vaddr())
++		regs->r26 = regs->pc;
++}
+-- 
+2.33.0
+

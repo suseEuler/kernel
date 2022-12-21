@@ -1,0 +1,79 @@
+From 87544d70732fa297c4b9315f5f41266b2a1d0e0c Mon Sep 17 00:00:00 2001
+From: Li Huafei <lihuafei1@huawei.com>
+Date: Wed, 6 Jul 2022 18:05:16 +0800
+Subject: [PATCH] livepatch: Narrow the scope of the 'text_mutex' lock
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 87544d70732fa297c4b9315f5f41266b2a1d0e0c
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5CJ7X
+
+--------------------------------
+
+Currently, arch_klp_code_modify_{prepare, post_process} is implemented
+only in the x86 architecture. It is used to hold the 'text_mutex' lock
+before entering the stop_machine and modifying the code, and to release
+the lock after exiting the stop_machine. klp_mem_prepare() needs to hold
+the 'text_mutex' lock only when saving old instruction code on x86 to
+ensure that it holds valid instructions.
+
+Place klp_mem_prepare() before arch_klp_code_modify_prepare() and lock the
+save instruction action separately to narrow the 'text_mutex' lock.
+
+Signed-off-by: Li Huafei <lihuafei1@huawei.com>
+Reviewed-by: Xu Kuohai <xukuohai@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/kernel/livepatch.c | 11 +++++++++--
+ kernel/livepatch/core.c     |  6 ++----
+ 2 files changed, 11 insertions(+), 6 deletions(-)
+
+diff --git a/arch/x86/kernel/livepatch.c b/arch/x86/kernel/livepatch.c
+index fe34183826d3..0a2ba5c8ba4e 100644
+--- a/arch/x86/kernel/livepatch.c
++++ b/arch/x86/kernel/livepatch.c
+@@ -386,8 +386,15 @@ void arch_klp_code_modify_post_process(void)
+ 
+ long arch_klp_save_old_code(struct arch_klp_data *arch_data, void *old_func)
+ {
+-	return copy_from_kernel_nofault(arch_data->old_code,
+-					old_func, JMP_E9_INSN_SIZE);
++	long ret;
++
++	/* Prevent text modification */
++	mutex_lock(&text_mutex);
++	ret = copy_from_kernel_nofault(arch_data->old_code,
++			old_func, JMP_E9_INSN_SIZE);
++	mutex_unlock(&text_mutex);
++
++	return ret;
+ }
+ 
+ int arch_klp_patch_func(struct klp_func *func)
+diff --git a/kernel/livepatch/core.c b/kernel/livepatch/core.c
+index 4d79543d9155..957f16f6c6c4 100644
+--- a/kernel/livepatch/core.c
++++ b/kernel/livepatch/core.c
+@@ -1696,12 +1696,10 @@ static int __klp_enable_patch(struct klp_patch *patch)
+ 	}
+ #endif
+ 
+-	arch_klp_code_modify_prepare();
+ 	ret = klp_mem_prepare(patch);
+-	if (ret) {
+-		arch_klp_code_modify_post_process();
++	if (ret)
+ 		return ret;
+-	}
++	arch_klp_code_modify_prepare();
+ 	ret = stop_machine(klp_try_enable_patch, &patch_data, cpu_online_mask);
+ 	arch_klp_code_modify_post_process();
+ 	if (ret) {
+-- 
+2.33.0
+

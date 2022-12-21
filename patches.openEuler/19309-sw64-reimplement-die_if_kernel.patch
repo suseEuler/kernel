@@ -1,0 +1,169 @@
+From 7a4c401b0925baeff8dcec8feac87757424ec1fe Mon Sep 17 00:00:00 2001
+From: Wu Liliu <wuliliu@wxiat.com>
+Date: Tue, 12 Jul 2022 14:49:24 +0800
+Subject: [PATCH] sw64: reimplement die_if_kernel()
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 7a4c401b0925baeff8dcec8feac87757424ec1fe
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56OLG
+
+--------------------------------
+
+In the original implementation, incorrent printing may occur when
+multiple processes die at the same time. To fix this, we use lock.
+
+Signed-off-by: Wu Liliu <wuliliu@wxiat.com>
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/kernel/proto.h |  2 +-
+ arch/sw_64/kernel/traps.c | 50 ++++++++++++++++++++++++++-------------
+ arch/sw_64/mm/fault.c     |  4 ++--
+ 3 files changed, 37 insertions(+), 19 deletions(-)
+
+diff --git a/arch/sw_64/kernel/proto.h b/arch/sw_64/kernel/proto.h
+index 189074f8bd5c..f2b77d370da1 100644
+--- a/arch/sw_64/kernel/proto.h
++++ b/arch/sw_64/kernel/proto.h
+@@ -13,7 +13,7 @@ extern int ptrace_cancel_bpt(struct task_struct *child);
+ 
+ /* traps.c */
+ extern void dik_show_regs(struct pt_regs *regs);
+-extern void die_if_kernel(char *str, struct pt_regs *regs, long err);
++extern void die(char *str, struct pt_regs *regs, long err);
+ 
+ /* timer.c */
+ extern void setup_timer(void);
+diff --git a/arch/sw_64/kernel/traps.c b/arch/sw_64/kernel/traps.c
+index 8c7fdeeef491..5f2348dd087f 100644
+--- a/arch/sw_64/kernel/traps.c
++++ b/arch/sw_64/kernel/traps.c
+@@ -17,6 +17,8 @@
+ #include <linux/kallsyms.h>
+ #include <linux/sched/task_stack.h>
+ #include <linux/sched/debug.h>
++#include <linux/spinlock.h>
++#include <linux/module.h>
+ 
+ #include <asm/gentrap.h>
+ #include <asm/mmu_context.h>
+@@ -75,33 +77,47 @@ dik_show_code(unsigned int *pc)
+ 	printk("\n");
+ }
+ 
+-void die_if_kernel(char *str, struct pt_regs *regs, long err)
++static DEFINE_SPINLOCK(die_lock);
++
++void die(char *str, struct pt_regs *regs, long err)
+ {
+-	if (user_mode(regs))
+-		return;
++	static int die_counter;
++	unsigned long flags;
++	int ret;
++
++	oops_enter();
++
++	spin_lock_irqsave(&die_lock, flags);
++	console_verbose();
++	bust_spinlocks(1);
++
++	pr_emerg("%s [#%d]\n", str, ++die_counter);
++
+ #ifdef CONFIG_SMP
+ 	printk("CPU %d ", hard_smp_processor_id());
+ #endif
+ 	printk("%s(%d): %s %ld\n", current->comm, task_pid_nr(current), str, err);
++
++	ret = notify_die(DIE_OOPS, str, regs, err, 0, SIGSEGV);
++
++	print_modules();
+ 	dik_show_regs(regs);
+-	add_taint(TAINT_DIE, LOCKDEP_NOW_UNRELIABLE);
+ 	show_stack(current, NULL, KERN_EMERG);
+-	dik_show_code((unsigned int *)regs->pc);
+ 
+-	if (test_and_set_thread_flag(TIF_DIE_IF_KERNEL)) {
+-		printk("die_if_kernel recursion detected.\n");
+-		local_irq_enable();
+-		while (1)
+-			asm("nop");
+-	}
++	bust_spinlocks(0);
++	add_taint(TAINT_DIE, LOCKDEP_NOW_UNRELIABLE);
++	spin_unlock_irqrestore(&die_lock, flags);
++	oops_exit();
+ 
+ 	if (kexec_should_crash(current))
+ 		crash_kexec(regs);
+-
++	if (in_interrupt())
++		panic("Fatal exception in interrupt");
+ 	if (panic_on_oops)
+ 		panic("Fatal exception");
+ 
+-	do_exit(SIGSEGV);
++	if (ret != NOTIFY_STOP)
++		do_exit(SIGSEGV);
+ }
+ 
+ #ifndef CONFIG_MATHEMU
+@@ -135,7 +151,9 @@ do_entArith(unsigned long summary, unsigned long write_mask,
+ 		if (si_code == 0)
+ 			return;
+ 	}
+-	die_if_kernel("Arithmetic fault", regs, 0);
++
++	if (!user_mode(regs))
++		die("Arithmetic fault", regs, 0);
+ 
+ 	force_sig_fault(SIGFPE, si_code, (void __user *)regs->pc, 0);
+ }
+@@ -161,7 +179,7 @@ do_entIF(unsigned long inst_type, struct pt_regs *regs)
+ 			notify_die(0, "kgdb trap", regs, 0, 0, SIGTRAP);
+ 			return;
+ 		}
+-		die_if_kernel((type == 1 ? "Kernel Bug" : "Instruction fault"),
++		die((type == 1 ? "Kernel Bug" : "Instruction fault"),
+ 				regs, type);
+ 	}
+ 
+@@ -254,7 +272,7 @@ do_entIF(unsigned long inst_type, struct pt_regs *regs)
+ 				return;
+ 		}
+ 		if (!user_mode(regs))
+-			die_if_kernel("Instruction fault", regs, type);
++			die("Instruction fault", regs, type);
+ 		break;
+ 
+ 	case 3: /* FEN fault */
+diff --git a/arch/sw_64/mm/fault.c b/arch/sw_64/mm/fault.c
+index d596fc50772d..15fd65b1b754 100644
+--- a/arch/sw_64/mm/fault.c
++++ b/arch/sw_64/mm/fault.c
+@@ -31,7 +31,7 @@ static inline int notify_page_fault(struct pt_regs *regs, unsigned long mmcsr)
+ }
+ #endif
+ 
+-extern void die_if_kernel(char *, struct pt_regs *, long);
++extern void die(char *, struct pt_regs *, long);
+ extern void dik_show_regs(struct pt_regs *regs);
+ 
+ void show_all_vma(void)
+@@ -301,7 +301,7 @@ do_page_fault(unsigned long address, unsigned long mmcsr,
+ 	 */
+ 	pr_alert("Unable to handle kernel paging request at virtual address %016lx\n",
+ 	       address);
+-	die_if_kernel("Oops", regs, cause);
++	die("Oops", regs, cause);
+ 	do_exit(SIGKILL);
+ 
+ 	/*
+-- 
+2.33.0
+

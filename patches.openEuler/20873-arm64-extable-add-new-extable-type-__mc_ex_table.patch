@@ -1,0 +1,382 @@
+From bab26fe2244cb5dc24e5a15d777a36ddd39561e7 Mon Sep 17 00:00:00 2001
+From: Tong Tiangen <tongtiangen@huawei.com>
+Date: Fri, 18 Nov 2022 02:08:51 +0000
+Subject: [PATCH] arm64: extable: add new extable type "__mc_ex_table"
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: bab26fe2244cb5dc24e5a15d777a36ddd39561e7
+Modified-by-SEL: Yes, refreshed due to different context
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5GB28
+CVE: NA
+
+-------------------------------
+
+A new type of extable is added, which is specially used fixup for machine
+check safe.
+In order to keep kabi consistency, we cannot add type and data members to
+struct exception_table_entry(d6e2cc564775 arm64: extable: add `type` and
+`data` fields), so we put the fixup entry to new extable separately.
+
+Signed-off-by: Tong Tiangen <tongtiangen@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/Kconfig                 |    3 ++
+ arch/arm64/include/asm/assembler.h |   15 ++++++++++++++
+ arch/arm64/include/asm/uaccess.h   |   10 +++++++++
+ include/asm-generic/vmlinux.lds.h  |   19 +++++++++++++++++-
+ include/linux/extable.h            |   23 ++++++++++++++++++++++
+ include/linux/module.h             |   11 ++++++++++
+ kernel/extable.c                   |   29 ++++++++++++++++++++++++++++
+ kernel/module.c                    |   38 +++++++++++++++++++++++++++++++++++++
+ scripts/sorttable.h                |   27 ++++++++++++++++++++++++++
+ 9 files changed, 174 insertions(+), 1 deletion(-)
+
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -1200,6 +1200,9 @@ config ARCH_LLC_128_LINE_SIZE
+ 	  128 bytes, gaining performance improvement from fitting
+ 	  128 Bytes LLC cache aligned.
+ 
++config ARCH_HAS_MC_EXTABLE
++	bool
++
+ config ARCH_ENABLE_SPLIT_PMD_PTLOCK
+ 	def_bool y if PGTABLE_LEVELS > 2
+ 
+--- a/arch/arm64/include/asm/assembler.h
++++ b/arch/arm64/include/asm/assembler.h
+@@ -145,6 +145,21 @@ alternative_endif
+ 	.popsection
+ 	.endm
+ 
++/*
++ * Emit an entry into the machine check exception table
++ */
++#ifdef CONFIG_ARCH_HAS_MC_EXTABLE
++	.macro		_asm_mc_extable, from, to
++	.pushsection	__mc_ex_table, "a"
++	.align		3
++	.long		(\from - .), (\to - .)
++	.popsection
++	.endm
++#else
++	.macro		_asm_mc_extable, from, to
++	.endm
++#endif
++
+ #define USER(l, x...)				\
+ 9999:	x;					\
+ 	_asm_extable	9999b, l
+--- a/arch/arm64/include/asm/uaccess.h
++++ b/arch/arm64/include/asm/uaccess.h
+@@ -75,6 +75,16 @@ static inline unsigned long __range_ok(c
+ 	"	.long		(" #from " - .), (" #to " - .)\n"	\
+ 	"	.popsection\n"
+ 
++#ifdef CONFIG_ARCH_HAS_MC_EXTABLE
++#define _ASM_MC_EXTABLE(from, to)					\
++	"	.pushsection	__mc_ex_table, \"a\"\n"			\
++	"	.align		3\n"					\
++	"	.long		(" #from " - .), (" #to " - .)\n"	\
++	"	.popsection\n"
++#else
++#define _ASM_MC_EXTABLE(from, to)
++#endif
++
+ /*
+  * User access enabling/disabling.
+  */
+--- a/include/asm-generic/vmlinux.lds.h
++++ b/include/asm-generic/vmlinux.lds.h
+@@ -76,7 +76,9 @@
+  * alignment.
+  */
+ #ifdef RO_EXCEPTION_TABLE_ALIGN
+-#define RO_EXCEPTION_TABLE	EXCEPTION_TABLE(RO_EXCEPTION_TABLE_ALIGN)
++#define RO_EXCEPTION_TABLE					\
++	EXCEPTION_TABLE(RO_EXCEPTION_TABLE_ALIGN)		\
++	MC_EXCEPTION_TABLE(RO_EXCEPTION_TABLE_ALIGN)
+ #else
+ #define RO_EXCEPTION_TABLE
+ #endif
+@@ -676,6 +678,21 @@
+ 		__stop___ex_table = .;					\
+ 	}
+ 
++#ifdef CONFIG_ARCH_HAS_MC_EXTABLE
++/*
++ * Machine Check Exception table
++ */
++#define MC_EXCEPTION_TABLE(align)					\
++	. = ALIGN(align);						\
++	__mc_ex_table : AT(ADDR(__mc_ex_table) - LOAD_OFFSET) {		\
++		__start___mc_ex_table = .;				\
++		KEEP(*(__mc_ex_table))					\
++		__stop___mc_ex_table = .;				\
++	}
++#else
++#define MC_EXCEPTION_TABLE(align)
++#endif
++
+ /*
+  * .BTF
+  */
+--- a/include/linux/extable.h
++++ b/include/linux/extable.h
+@@ -19,18 +19,41 @@ void trim_init_extable(struct module *m)
+ 
+ /* Given an address, look for it in the exception tables */
+ const struct exception_table_entry *search_exception_tables(unsigned long add);
++#ifdef CONFIG_ARCH_HAS_MC_EXTABLE
++const struct exception_table_entry *search_mc_exception_tables(unsigned long add);
++#else
++static inline const struct exception_table_entry *
++search_mc_exception_tables(unsigned long add)
++{
++	return NULL;
++}
++#endif
+ const struct exception_table_entry *
+ search_kernel_exception_table(unsigned long addr);
+ 
+ #ifdef CONFIG_MODULES
+ /* For extable.c to search modules' exception tables. */
+ const struct exception_table_entry *search_module_extables(unsigned long addr);
++#ifdef CONFIG_ARCH_HAS_MC_EXTABLE
++const struct exception_table_entry *search_module_mc_extables(unsigned long addr);
++#else
++static inline const struct exception_table_entry *
++search_module_mc_extables(unsigned long addr)
++{
++	return NULL;
++}
++#endif
+ #else
+ static inline const struct exception_table_entry *
+ search_module_extables(unsigned long addr)
+ {
+ 	return NULL;
+ }
++static inline const struct exception_table_entry *
++search_module_mc_extables(unsigned long addr)
++{
++	return NULL;
++}
+ #endif /*CONFIG_MODULES*/
+ 
+ #ifdef CONFIG_BPF_JIT
+--- a/include/linux/module.h
++++ b/include/linux/module.h
+@@ -429,6 +429,11 @@ struct module {
+ 	/* Startup function. */
+ 	int (*init)(void);
+ 
++#ifdef CONFIG_ARCH_HAS_MC_EXTABLE
++	/* there is 8-byte hole on all platforms */
++	KABI_FILL_HOLE(unsigned int num_mc_exentries)
++#endif
++
+ 	/* Core layout: rbtree is accessed frequently, so keep together. */
+ 	struct module_layout core_layout __module_layout_align;
+ 	struct module_layout init_layout;
+@@ -557,7 +562,13 @@ struct module {
+ 	struct error_injection_entry *ei_funcs;
+ 	unsigned int num_ei_funcs;
+ #endif
++
++#ifdef CONFIG_ARCH_HAS_MC_EXTABLE
++	KABI_USE(1, struct exception_table_entry *mc_extable)
++#else
+ 	KABI_RESERVE(1)
++#endif
++
+ 	KABI_RESERVE(2)
+ 	KABI_RESERVE(3)
+ 	KABI_RESERVE(4)
+--- a/kernel/extable.c
++++ b/kernel/extable.c
+@@ -28,6 +28,11 @@ DEFINE_MUTEX(text_mutex);
+ extern struct exception_table_entry __start___ex_table[];
+ extern struct exception_table_entry __stop___ex_table[];
+ 
++#ifdef CONFIG_ARCH_HAS_MC_EXTABLE
++extern struct exception_table_entry __start___mc_ex_table[];
++extern struct exception_table_entry __stop___mc_ex_table[];
++#endif
++
+ /* Cleared by build time tools if the table is already sorted. */
+ u32 __initdata __visible main_extable_sort_needed = 1;
+ 
+@@ -39,6 +44,14 @@ void __init sort_main_extable(void)
+ 		pr_notice("Sorting __ex_table...\n");
+ 		sort_extable(__start___ex_table, __stop___ex_table);
+ 	}
++
++#ifdef CONFIG_ARCH_HAS_MC_EXTABLE
++	if (main_extable_sort_needed &&
++	    &__stop___mc_ex_table > &__start___mc_ex_table) {
++		pr_notice("Sorting __mc_ex_table...\n");
++		sort_extable(__start___mc_ex_table, __stop___mc_ex_table);
++	}
++#endif
+ }
+ 
+ /* Given an address, look for it in the kernel exception table */
+@@ -62,6 +75,22 @@ const struct exception_table_entry *sear
+ 	return e;
+ }
+ 
++#ifdef CONFIG_ARCH_HAS_MC_EXTABLE
++/* Given an address, look for it in the machine check exception table */
++const
++struct exception_table_entry *search_mc_exception_tables(unsigned long addr)
++{
++	const struct exception_table_entry *e;
++
++	e = search_extable(__start___mc_ex_table,
++			   __stop___mc_ex_table - __start___mc_ex_table, addr);
++	if (!e)
++		e = search_module_mc_extables(addr);
++
++	return e;
++}
++#endif
++
+ int init_kernel_text(unsigned long addr)
+ {
+ 	if (addr >= (unsigned long)_sinittext &&
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@ -3455,6 +3455,11 @@ static int find_module_sections(struct m
+ 	mod->extable = section_objs(info, "__ex_table",
+ 				    sizeof(*mod->extable), &mod->num_exentries);
+ 
++#ifdef CONFIG_ARCH_HAS_MC_EXTABLE
++	mod->mc_extable = section_objs(info, "__mc_ex_table",
++				    sizeof(*mod->mc_extable), &mod->num_mc_exentries);
++#endif
++
+ 	if (section_addr(info, "__obsparm"))
+ 		pr_warn("%s: Ignoring obsolete parameters\n", mod->name);
+ 
+@@ -3692,6 +3697,10 @@ static int post_relocation(struct module
+ 	/* Sort exception table now relocations are done. */
+ 	sort_extable(mod->extable, mod->extable + mod->num_exentries);
+ 
++#ifdef CONFIG_ARCH_HAS_MC_EXTABLE
++	sort_extable(mod->mc_extable, mod->mc_extable + mod->num_mc_exentries);
++#endif
++
+ 	/* Copy relocated percpu area over. */
+ 	percpu_modcopy(mod, (void *)info->sechdrs[info->index.pcpu].sh_addr,
+ 		       info->sechdrs[info->index.pcpu].sh_size);
+@@ -4667,6 +4676,35 @@ out:
+ 	return e;
+ }
+ 
++#ifdef CONFIG_ARCH_HAS_MC_EXTABLE
++/* Given an address, look for it in the module machine check safe exception tables. */
++const struct exception_table_entry *search_module_mc_extables(unsigned long addr)
++{
++	const struct exception_table_entry *e = NULL;
++	struct module *mod;
++
++	preempt_disable();
++	mod = __module_address(addr);
++	if (!mod)
++		goto out;
++
++	if (!mod->num_mc_exentries)
++		goto out;
++
++	e = search_extable(mod->mc_extable,
++			   mod->num_mc_exentries,
++			   addr);
++out:
++	preempt_enable();
++
++	/*
++	 * Now, if we found one, we are running inside it now, hence
++	 * we cannot unload the module, hence no refcnt needed.
++	 */
++	return e;
++}
++#endif
++
+ /*
+  * is_module_address - is this address inside a module?
+  * @addr: the address to check.
+--- a/scripts/sorttable.h
++++ b/scripts/sorttable.h
+@@ -223,6 +223,11 @@ static int do_sort(Elf_Ehdr *ehdr,
+ 	unsigned int orc_num_entries = 0;
+ #endif
+ 
++	Elf_Shdr *mc_extab_sec = NULL;
++	Elf_Rel *mc_relocs = NULL;
++	int mc_relocs_size = 0;
++	char *mc_extab_image = NULL;
++
+ 	shstrndx = r2(&ehdr->e_shstrndx);
+ 	if (shstrndx == SHN_XINDEX)
+ 		shstrndx = r(&shdr[0].sh_link);
+@@ -238,6 +243,7 @@ static int do_sort(Elf_Ehdr *ehdr,
+ 			extab_sec = s;
+ 			extab_index = i;
+ 		}
++
+ 		if (!strcmp(secstrings + idx, ".symtab"))
+ 			symtab_sec = s;
+ 		if (!strcmp(secstrings + idx, ".strtab"))
+@@ -249,6 +255,18 @@ static int do_sort(Elf_Ehdr *ehdr,
+ 			relocs = (void *)ehdr + _r(&s->sh_offset);
+ 			relocs_size = _r(&s->sh_size);
+ 		}
++
++		if (!strcmp(secstrings + idx, "__mc_ex_table")) {
++			mc_extab_sec = s;
++
++			if ((r(&s->sh_type) == SHT_REL ||
++				r(&s->sh_type) == SHT_RELA) &&
++				r(&s->sh_info) == i) {
++				mc_relocs = (void *)ehdr + _r(&s->sh_offset);
++				mc_relocs_size = _r(&s->sh_size);
++			}
++		}
++
+ 		if (r(&s->sh_type) == SHT_SYMTAB_SHNDX)
+ 			symtab_shndx = (Elf32_Word *)((const char *)ehdr +
+ 						      _r(&s->sh_offset));
+@@ -310,12 +328,18 @@ static int do_sort(Elf_Ehdr *ehdr,
+ 	}
+ 
+ 	extab_image = (void *)ehdr + _r(&extab_sec->sh_offset);
++
++	if (mc_extab_sec)
++		mc_extab_image = (void *)ehdr + _r(&mc_extab_sec->sh_offset);
++
+ 	strtab = (const char *)ehdr + _r(&strtab_sec->sh_offset);
+ 	symtab = (const Elf_Sym *)((const char *)ehdr +
+ 						  _r(&symtab_sec->sh_offset));
+ 
+ 	if (custom_sort) {
+ 		custom_sort(extab_image, _r(&extab_sec->sh_size));
++		if (mc_extab_image)
++			custom_sort(mc_extab_image, _r(&mc_extab_sec->sh_size));
+ 	} else {
+ 		int num_entries = _r(&extab_sec->sh_size) / extable_ent_size;
+ 		qsort(extab_image, num_entries,
+@@ -326,6 +350,9 @@ static int do_sort(Elf_Ehdr *ehdr,
+ 	if (relocs)
+ 		memset(relocs, 0, relocs_size);
+ 
++	if (mc_relocs)
++		memset(mc_relocs, 0, mc_relocs_size);
++
+ 	/* find the flag main_extable_sort_needed */
+ 	for (sym = (void *)ehdr + _r(&symtab_sec->sh_offset);
+ 	     sym < sym + _r(&symtab_sec->sh_size) / sizeof(Elf_Sym);

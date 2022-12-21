@@ -1,0 +1,76 @@
+From 306d609d6ba15679c77ed5fce1fa7af7fb967ed8 Mon Sep 17 00:00:00 2001
+From: Ziyang Xuan <william.xuanziyang@huawei.com>
+Date: Wed, 30 Nov 2022 18:23:27 +0800
+Subject: [PATCH] bpf, sockmap: fix sk_rmem_alloc underflow for sockmap
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 306d609d6ba15679c77ed5fce1fa7af7fb967ed8
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I61PL4
+CVE: NA
+
+--------------------------------
+
+Under sockmap redirect scenario, destroy sock when psock->ingress_msg
+is not empty. Get a warning as following:
+
+=================================================
+WARNING: CPU: 0 PID: 0 at net/ipv4/af_inet.c:154 inet_sock_destruct+0x408/0x430
+...
+Call Trace:
+ <IRQ>
+ __sk_destruct+0x3d/0x590 net/core/sock.c:1784
+ sk_destruct net/core/sock.c:1829 [inline]
+ __sk_free+0x106/0x2a0 net/core/sock.c:1840
+ sk_free+0x7d/0xb0 net/core/sock.c:1851
+ sock_put include/net/sock.h:1813 [inline]
+ tcp_v4_rcv+0x23af/0x26e0 net/ipv4/tcp_ipv4.c:2085
+ ip_protocol_deliver_rcu+0xe5/0x440 net/ipv4/ip_input.c:204
+ ip_local_deliver_finish+0xd2/0x110 net/ipv4/ip_input.c:231
+ NF_HOOK include/linux/netfilter.h:304 [inline]
+ ip_local_deliver+0x10a/0x260 net/ipv4/ip_input.c:252
+ dst_input include/net/dst.h:459 [inline]
+ ip_rcv_finish+0x126/0x160 net/ipv4/ip_input.c:428
+ NF_HOOK include/linux/netfilter.h:304 [inline]
+ ip_rcv+0xbf/0x1d0 net/ipv4/ip_input.c:539
+ __netif_receive_skb_one_core+0x15f/0x190 net/core/dev.c:5366
+ __netif_receive_skb+0x2e/0xe0 net/core/dev.c:5480
+ process_backlog+0x132/0x2c0 net/core/dev.c:6386
+ napi_poll+0x17e/0x4f0 net/core/dev.c:6837
+ net_rx_action+0x183/0x3c0 net/core/dev.c:6907
+
+That is because commit 7e41dfae18b1 ("[Huawei] bpf, sockmap: Add
+sk_rmem_alloc check for sockmap") does not consider redirect scenario,
+reduce sk_rmem_alloc without increasing sk_rmem_alloc. That would result
+in sk_rmem_alloc underflow.
+
+Fixes: 8818e269f18d ("bpf, sockmap: Add sk_rmem_alloc check for sockmap")
+Signed-off-by: Ziyang Xuan <william.xuanziyang@huawei.com>
+Reviewed-by: Yue Haibing <yuehaibing@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ net/core/skmsg.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index 9dec3d35af79..448a0d24a734 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -659,7 +659,8 @@ void __sk_psock_purge_ingress_msg(struct sk_psock *psock)
+ 
+ 	list_for_each_entry_safe(msg, tmp, &psock->ingress_msg, list) {
+ 		list_del(&msg->list);
+-		atomic_sub(msg->sg.size, &psock->sk->sk_rmem_alloc);
++		if (!msg->skb)
++			atomic_sub(msg->sg.size, &psock->sk->sk_rmem_alloc);
+ 		sk_msg_free(psock->sk, msg);
+ 		kfree(msg);
+ 	}
+-- 
+2.33.0
+

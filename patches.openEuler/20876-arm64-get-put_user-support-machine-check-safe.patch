@@ -1,0 +1,158 @@
+From 26e697df2f1b95d056da61d4ca06c7923251bb2a Mon Sep 17 00:00:00 2001
+From: Tong Tiangen <tongtiangen@huawei.com>
+Date: Fri, 18 Nov 2022 02:08:54 +0000
+Subject: [PATCH] arm64: get/put_user support machine check safe
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 26e697df2f1b95d056da61d4ca06c7923251bb2a
+Modified-by-SEL: Yes, modifiedd due to different context
+
+
+hulk inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5GB28
+CVE: NA
+
+-------------------------------
+
+Add {get, put}_user() to machine check safe.
+
+If get/put fail due to hardware memory error, only the relevant processes
+are affected, so killing the user process and isolate the user page with
+hardware memory errors is a more reasonable choice than kernel panic.
+
+Signed-off-by: Tong Tiangen <tongtiangen@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/uaccess.h |   41 +++++++++++++++++++++------------------
+ 1 file changed, 23 insertions(+), 18 deletions(-)
+
+--- a/arch/arm64/include/asm/uaccess.h
++++ b/arch/arm64/include/asm/uaccess.h
+@@ -85,6 +85,11 @@ static inline unsigned long __range_ok(c
+ #define _ASM_MC_EXTABLE(from, to)
+ #endif
+ 
++#define _ASM_KACCESS_EXTABLE(from, to)	_ASM_EXTABLE(from, to)
++#define _ASM_UACCESS_EXTABLE(from, to)		\
++		_ASM_EXTABLE(from, to)		\
++		_ASM_MC_EXTABLE(from, to)
++
+ /*
+  * User access enabling/disabling.
+  */
+@@ -215,7 +220,7 @@ static inline void __user *__uaccess_mas
+  * The "__xxx_error" versions set the third argument to -EFAULT if an error
+  * occurs, and leave it unchanged on success.
+  */
+-#define __get_mem_asm(load, reg, x, addr, err)				\
++#define __get_mem_asm(load, reg, x, addr, err, type)			\
+ 	asm volatile(							\
+ 	"1:	" load "	" reg "1, [%2]\n"			\
+ 	"2:\n"								\
+@@ -225,25 +230,25 @@ static inline void __user *__uaccess_mas
+ 	"	mov	%1, #0\n"					\
+ 	"	b	2b\n"						\
+ 	"	.previous\n"						\
+-	_ASM_EXTABLE(1b, 3b)						\
++	_ASM_##type##ACCESS_EXTABLE(1b, 3b)				\
+ 	: "+r" (err), "=&r" (x)						\
+ 	: "r" (addr), "i" (-EFAULT))
+ 
+-#define __raw_get_mem(ldr, x, ptr, err)					\
++#define __raw_get_mem(ldr, x, ptr, err, type)				\
+ do {									\
+ 	unsigned long __gu_val;						\
+ 	switch (sizeof(*(ptr))) {					\
+ 	case 1:								\
+-		__get_mem_asm(ldr "b", "%w", __gu_val, (ptr), (err));	\
++		__get_mem_asm(ldr "b", "%w", __gu_val, (ptr), (err), type);	\
+ 		break;							\
+ 	case 2:								\
+-		__get_mem_asm(ldr "h", "%w", __gu_val, (ptr), (err));	\
++		__get_mem_asm(ldr "h", "%w", __gu_val, (ptr), (err), type);	\
+ 		break;							\
+ 	case 4:								\
+-		__get_mem_asm(ldr, "%w", __gu_val, (ptr), (err));	\
++		__get_mem_asm(ldr, "%w", __gu_val, (ptr), (err), type);	\
+ 		break;							\
+ 	case 8:								\
+-		__get_mem_asm(ldr, "%x",  __gu_val, (ptr), (err));	\
++		__get_mem_asm(ldr, "%x",  __gu_val, (ptr), (err), type);	\
+ 		break;							\
+ 	default:							\
+ 		BUILD_BUG();						\
+@@ -263,7 +268,7 @@ do {									\
+ 	__chk_user_ptr(ptr);						\
+ 									\
+ 	uaccess_ttbr0_enable();						\
+-	__raw_get_mem("ldtr", __rgu_val, __rgu_ptr, err);		\
++	__raw_get_mem("ldtr", __rgu_val, __rgu_ptr, err, U);		\
+ 	uaccess_ttbr0_disable();					\
+ 									\
+ 	(x) = __rgu_val;						\
+@@ -302,12 +307,12 @@ do {									\
+ 	int __gkn_err = 0;						\
+ 									\
+ 	__raw_get_mem("ldr", *((type *)(__gkn_dst)),			\
+-		      (__force type *)(__gkn_src), __gkn_err);		\
++		      (__force type *)(__gkn_src), __gkn_err, K);	\
+ 	if (unlikely(__gkn_err))					\
+ 		goto err_label;						\
+ } while (0)
+ 
+-#define __put_mem_asm(store, reg, x, addr, err)				\
++#define __put_mem_asm(store, reg, x, addr, err, type)			\
+ 	asm volatile(							\
+ 	"1:	" store "	" reg "1, [%2]\n"			\
+ 	"2:\n"								\
+@@ -316,25 +321,25 @@ do {									\
+ 	"3:	mov	%w0, %3\n"					\
+ 	"	b	2b\n"						\
+ 	"	.previous\n"						\
+-	_ASM_EXTABLE(1b, 3b)						\
++	_ASM_##type##ACCESS_EXTABLE(1b, 3b)				\
+ 	: "+r" (err)							\
+ 	: "r" (x), "r" (addr), "i" (-EFAULT))
+ 
+-#define __raw_put_mem(str, x, ptr, err)					\
++#define __raw_put_mem(str, x, ptr, err, type)				\
+ do {									\
+ 	__typeof__(*(ptr)) __pu_val = (x);				\
+ 	switch (sizeof(*(ptr))) {					\
+ 	case 1:								\
+-		__put_mem_asm(str "b", "%w", __pu_val, (ptr), (err));	\
++		__put_mem_asm(str "b", "%w", __pu_val, (ptr), (err), type);	\
+ 		break;							\
+ 	case 2:								\
+-		__put_mem_asm(str "h", "%w", __pu_val, (ptr), (err));	\
++		__put_mem_asm(str "h", "%w", __pu_val, (ptr), (err), type);	\
+ 		break;							\
+ 	case 4:								\
+-		__put_mem_asm(str, "%w", __pu_val, (ptr), (err));	\
++		__put_mem_asm(str, "%w", __pu_val, (ptr), (err), type);	\
+ 		break;							\
+ 	case 8:								\
+-		__put_mem_asm(str, "%x", __pu_val, (ptr), (err));	\
++		__put_mem_asm(str, "%x", __pu_val, (ptr), (err), type);	\
+ 		break;							\
+ 	default:							\
+ 		BUILD_BUG();						\
+@@ -353,7 +358,7 @@ do {									\
+ 	__chk_user_ptr(__rpu_ptr);					\
+ 									\
+ 	uaccess_ttbr0_enable();						\
+-	__raw_put_mem("sttr", __rpu_val, __rpu_ptr, err);		\
++	__raw_put_mem("sttr", __rpu_val, __rpu_ptr, err, U);		\
+ 	uaccess_ttbr0_disable();					\
+ } while (0)
+ 
+@@ -389,7 +394,7 @@ do {									\
+ 	int __pkn_err = 0;						\
+ 									\
+ 	__raw_put_mem("str", *((type *)(__pkn_src)),			\
+-		      (__force type *)(__pkn_dst), __pkn_err);		\
++		      (__force type *)(__pkn_dst), __pkn_err, K);	\
+ 	if (unlikely(__pkn_err))					\
+ 		goto err_label;						\
+ } while(0)

@@ -1,0 +1,131 @@
+From fd0f25ef86d5bb7eaec120b9dfffc658ae4ececf Mon Sep 17 00:00:00 2001
+From: Ke Chen <chenke54@huawei.com>
+Date: Wed, 9 Nov 2022 14:36:33 +0800
+Subject: [PATCH] roh/hns3: Add support for roh reset
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: fd0f25ef86d5bb7eaec120b9dfffc658ae4ececf
+Modified-by-SEL: No
+
+
+driver inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5WKYW
+
+-----------------------------------------------------------------------
+
+Hook up the reset notify interface to adapt to the ROH reset process.
+
+Signed-off-by: Ke Chen <chenke54@huawei.com>
+Reviewed-by: Gang Zhang <gang.zhang@huawei.com>
+Reviewed-by: Yefeng Yan <yanyefeng@huawei.com>
+Reviewed-by: Jingchao Dai <daijingchao1@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/roh/hw/hns3/hns3_common.h |  2 ++
+ drivers/roh/hw/hns3/hns3_main.c   | 50 ++++++++++++++++++++++++++++++-
+ 2 files changed, 51 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/roh/hw/hns3/hns3_common.h b/drivers/roh/hw/hns3/hns3_common.h
+index b1c52ead765b..494639563073 100644
+--- a/drivers/roh/hw/hns3/hns3_common.h
++++ b/drivers/roh/hw/hns3/hns3_common.h
+@@ -18,6 +18,8 @@
+ #define HNS3_ROH_RD_FIRST_STATS_NUM 3
+ #define HNS3_ROH_RD_OTHER_STATS_NUM 4
+ 
++#define HNS3_ROH_HW_RST_UNINT_DELAY 100
++
+ struct hns3_roh_desc {
+ 	__le16 opcode;
+ 
+diff --git a/drivers/roh/hw/hns3/hns3_main.c b/drivers/roh/hw/hns3/hns3_main.c
+index 7f9de7f48f32..d099d125cf16 100644
+--- a/drivers/roh/hw/hns3/hns3_main.c
++++ b/drivers/roh/hw/hns3/hns3_main.c
+@@ -4,7 +4,6 @@
+ #include <linux/acpi.h>
+ #include <linux/module.h>
+ #include <linux/pci.h>
+-
+ #include "core.h"
+ #include "hnae3.h"
+ #include "hns3_device.h"
+@@ -283,8 +282,11 @@ static int __hns3_roh_init_instance(struct hnae3_handle *handle)
+ 		dev_err(hroh_dev->dev, "failed to init roh, ret = %d\n", ret);
+ 		goto err_kzalloc;
+ 	}
++
+ 	handle->priv = hroh_dev;
+ 
++	set_bit(HNS3_ROH_STATE_INITED, &handle->rohinfo.reset_state);
++
+ 	return 0;
+ 
+ err_kzalloc:
+@@ -301,6 +303,9 @@ static void __hns3_roh_uninit_instance(struct hnae3_handle *handle)
+ 	if (!hroh_dev)
+ 		return;
+ 
++	if (!test_and_clear_bit(HNS3_ROH_STATE_INITED, &handle->rohinfo.reset_state))
++		netdev_warn(hroh_dev->netdev, "already uninitialized\n");
++
+ 	hns3_roh_enable_vector(&hroh_dev->abn_vector, false);
+ 
+ 	handle->priv = NULL;
+@@ -343,9 +348,52 @@ static void hns3_roh_uninit_instance(struct hnae3_handle *handle, bool reset)
+ 	__hns3_roh_uninit_instance(handle);
+ }
+ 
++static int hns3_roh_reset_notify_init(struct hnae3_handle *handle)
++{
++	struct device *dev = &handle->pdev->dev;
++	int ret;
++
++	ret = __hns3_roh_init_instance(handle);
++	if (ret) {
++		dev_err(dev, "failed to reinit in roh reset process, ret = %d\n", ret);
++		handle->priv = NULL;
++		clear_bit(HNS3_ROH_STATE_INITED, &handle->rohinfo.reset_state);
++	}
++
++	return 0;
++}
++
++static int hns3_roh_reset_notify_uninit(struct hnae3_handle *handle)
++{
++	msleep(HNS3_ROH_HW_RST_UNINT_DELAY);
++	__hns3_roh_uninit_instance(handle);
++
++	return 0;
++}
++
++static int hns3_roh_reset_notify(struct hnae3_handle *handle,
++				 enum hnae3_reset_notify_type type)
++{
++	int ret = 0;
++
++	switch (type) {
++	case HNAE3_INIT_CLIENT:
++		ret = hns3_roh_reset_notify_init(handle);
++		break;
++	case HNAE3_UNINIT_CLIENT:
++		ret = hns3_roh_reset_notify_uninit(handle);
++		break;
++	default:
++		break;
++	}
++
++	return ret;
++}
++
+ static const struct hnae3_client_ops hns3_roh_ops = {
+ 	.init_instance = hns3_roh_init_instance,
+ 	.uninit_instance = hns3_roh_uninit_instance,
++	.reset_notify = hns3_roh_reset_notify,
+ };
+ 
+ static struct hnae3_client hns3_roh_client = {
+-- 
+2.33.0
+

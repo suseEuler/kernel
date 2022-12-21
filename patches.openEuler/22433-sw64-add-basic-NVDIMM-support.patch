@@ -1,0 +1,244 @@
+From a6cb5b28f2ffd958e9ed5c27a023334223dda4bf Mon Sep 17 00:00:00 2001
+From: Cui Mingrui <cuimingrui@wxiat.com>
+Date: Tue, 22 Nov 2022 16:46:42 +0800
+Subject: [PATCH] sw64: add basic NVDIMM support
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: a6cb5b28f2ffd958e9ed5c27a023334223dda4bf
+Modified-by-SEL: No
+
+
+Sunway inclusion
+category: feature
+bugzilla: https://gitee.com/openeuler/kernel/issues/I56OLG
+
+--------------------------------
+
+This patch introduces basic NVDIMM support for sw64:
+  - Select ARCH_HAS_PMEM_API, ARCH_HAS_UACCESS_FLUSHCACHE and
+    ARCH_HAS_ZONE_DEVICE in Kconfig.
+  - Take bit 22 of pte as _PAGE_DEVMAP to support DAX.
+  - Add some necessary functions for memory copy and cache flush.
+
+Signed-off-by: Cui Mingrui <cuimingrui@wxiat.com>
+Reviewed-by: He Sheng <hesheng@wxiat.com>
+Signed-off-by: Gu Zitao <guzitao@wxiat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/sw_64/Kconfig                  |  4 +++
+ arch/sw_64/include/asm/pgtable.h    | 45 +++++++++++++++++++++++++++++
+ arch/sw_64/include/asm/string.h     |  5 ++++
+ arch/sw_64/include/asm/uaccess.h    | 15 ++++++++++
+ arch/sw_64/lib/Makefile             |  2 ++
+ arch/sw_64/lib/uaccess_flushcache.c | 42 +++++++++++++++++++++++++++
+ 6 files changed, 113 insertions(+)
+ create mode 100644 arch/sw_64/lib/uaccess_flushcache.c
+
+diff --git a/arch/sw_64/Kconfig b/arch/sw_64/Kconfig
+index 47dc877c03f3..47a191e27aab 100644
+--- a/arch/sw_64/Kconfig
++++ b/arch/sw_64/Kconfig
+@@ -6,8 +6,12 @@ config SW64
+ 	select ACPI_REDUCED_HARDWARE_ONLY
+ 	select ARCH_HAS_ELF_RANDOMIZE
+ 	select ARCH_HAS_PHYS_TO_DMA
++	select ARCH_HAS_PMEM_API
++	select ARCH_HAS_PTE_DEVMAP
+ 	select ARCH_HAS_PTE_SPECIAL
+ 	select ARCH_HAS_SG_CHAIN
++	select ARCH_HAS_UACCESS_FLUSHCACHE
++	select ARCH_HAS_ZONE_DEVICE
+ 	select ARCH_HAVE_NMI_SAFE_CMPXCHG
+ 	select ARCH_INLINE_READ_LOCK
+ 	select ARCH_INLINE_READ_LOCK_BH
+diff --git a/arch/sw_64/include/asm/pgtable.h b/arch/sw_64/include/asm/pgtable.h
+index b451bc94e737..0c312f8c1bd7 100644
+--- a/arch/sw_64/include/asm/pgtable.h
++++ b/arch/sw_64/include/asm/pgtable.h
+@@ -13,6 +13,7 @@
+  * in <asm/page.h> (currently 8192).
+  */
+ #include <linux/mmzone.h>
++#include <linux/mm_types.h>
+ 
+ #include <asm/page.h>
+ #include <asm/processor.h>	/* For TASK_SIZE */
+@@ -103,6 +104,7 @@ static inline void set_pmd_at(struct mm_struct *mm, unsigned long addr,
+ #define _PAGE_BIT_FOW		2		/* bit of _PAGE_FOW */
+ #define _PAGE_SPLITTING		0x200000	/* For Transparent Huge Page */
+ #define _PAGE_BIT_SPLITTING	21		/* bit of _PAGE_SPLITTING */
++#define _PAGE_BIT_DEVMAP	22		/* bit of _PAGE_DEVMAP */
+ 
+ /*
+  * NOTE! The "accessed" bit isn't necessarily exact:  it can be kept exactly
+@@ -234,6 +236,7 @@ static inline unsigned long pmd_page_vaddr(pmd_t pmd)
+  */
+ #define page_to_pa(page)	(page_to_pfn(page) << PAGE_SHIFT)
+ 
++#define pud_pfn(pud)		(pud_val(pud) >> _PFN_SHIFT)
+ #define pmd_pfn(pmd)		(pmd_val(pmd) >> _PFN_SHIFT)
+ #define pte_pfn(pte)		(pte_val(pte) >> _PFN_SHIFT)
+ 
+@@ -487,6 +490,12 @@ static inline pte_t pte_mkspecial(pte_t pte)
+ 	return pte;
+ }
+ 
++static inline pte_t pte_mkdevmap(pte_t pte)
++{
++	pte_val(pte) |= _PAGE_SPECIAL;
++	return pte;
++}
++
+ #ifdef CONFIG_NUMA_BALANCING
+ /*
+  * See the comment in include/asm-generic/pgtable.h
+@@ -524,8 +533,44 @@ static inline int has_transparent_hugepage(void)
+ {
+ 	return 1;
+ }
++
++#ifdef CONFIG_ARCH_HAS_PTE_DEVMAP
++#define _PAGE_DEVMAP	(_AT(u64, 1) << _PAGE_BIT_DEVMAP)
++static inline int pte_devmap(pte_t a)
++{
++	return (pte_val(a) & _PAGE_DEVMAP) == _PAGE_DEVMAP;
++}
++
++static inline int pmd_devmap(pmd_t pmd)
++{
++	return !!(pmd_val(pmd) & _PAGE_DEVMAP);
++}
++
++#ifdef CONFIG_HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD
++static inline int pud_devmap(pud_t pud)
++{
++	return !!(pud_val(pud) & _PAGE_DEVMAP);
++}
++#else
++static inline int pud_devmap(pud_t pud)
++{
++	return 0;
++}
++#endif
++
++static inline int pgd_devmap(pgd_t pgd)
++{
++	return 0;
++}
++#endif
+ #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+ 
++static inline pmd_t pmd_mkdevmap(pmd_t pmd)
++{
++	pmd_val(pmd) |= _PAGE_DEVMAP;
++	return pmd;
++}
++
+ #define __HAVE_ARCH_PMDP_GET_AND_CLEAR
+ static inline pmd_t pmdp_get_and_clear(struct mm_struct *mm,
+ 				       unsigned long addr, pmd_t *pmdp)
+diff --git a/arch/sw_64/include/asm/string.h b/arch/sw_64/include/asm/string.h
+index 4f4a4687d8d0..c7bda9aed4e8 100644
+--- a/arch/sw_64/include/asm/string.h
++++ b/arch/sw_64/include/asm/string.h
+@@ -45,6 +45,11 @@ extern void *__memsetw(void *dest, unsigned short c, size_t count);
+ 	? __constant_c_memset((s), 0x0001000100010001UL * (unsigned short)(c), (n)) \
+ 	: __memsetw((s), (c), (n)))
+ 
++#ifdef CONFIG_ARCH_HAS_UACCESS_FLUSHCACHE
++#define __HAVE_ARCH_MEMCPY_FLUSHCACHE
++void memcpy_flushcache(void *dst, const void *src, size_t cnt);
++#endif
++
+ #endif /* __KERNEL__ */
+ 
+ #endif /* _ASM_SW64_STRING_H */
+diff --git a/arch/sw_64/include/asm/uaccess.h b/arch/sw_64/include/asm/uaccess.h
+index 730121aad184..49d0b4c11c74 100644
+--- a/arch/sw_64/include/asm/uaccess.h
++++ b/arch/sw_64/include/asm/uaccess.h
+@@ -311,5 +311,20 @@ extern long strncpy_from_user(char *dest, const char __user *src, long count);
+ extern __must_check long strlen_user(const char __user *str);
+ extern __must_check long strnlen_user(const char __user *str, long n);
+ 
++#ifdef CONFIG_ARCH_HAS_UACCESS_FLUSHCACHE
++struct page;
++void memcpy_page_flushcache(char *to, struct page *page, size_t offset,
++			    size_t len);
++extern unsigned long __must_check __copy_user_flushcache(void *to,
++		const void __user *from, unsigned long n);
++
++static inline int
++__copy_from_user_flushcache(void *dst, const void __user *src, unsigned size)
++{
++	kasan_check_write(dst, size);
++	return __copy_user_flushcache(dst, src, size);
++}
++#endif
++
+ #include <asm/extable.h>
+ #endif /* _ASM_SW64_UACCESS_H */
+diff --git a/arch/sw_64/lib/Makefile b/arch/sw_64/lib/Makefile
+index e4727dce3655..e6455bb51139 100644
+--- a/arch/sw_64/lib/Makefile
++++ b/arch/sw_64/lib/Makefile
+@@ -35,6 +35,8 @@ lib-memcpy-$(CONFIG_DEEP_MEMCPY) := deep-memcpy.o
+ lib-memset-y := memset.o
+ lib-memset-$(CONFIG_DEEP_MEMSET) := deep-memset.o
+ 
++lib-$(CONFIG_ARCH_HAS_UACCESS_FLUSHCACHE) += uaccess_flushcache.o
++
+ lib-y += $(lib-clear_page-y) $(lib-clear_user-y) $(lib-copy_page-y) $(lib-copy_user-y) $(lib-memcpy-y) $(lib-memset-y)
+ 
+ obj-y = iomap.o
+diff --git a/arch/sw_64/lib/uaccess_flushcache.c b/arch/sw_64/lib/uaccess_flushcache.c
+new file mode 100644
+index 000000000000..353d5ac15248
+--- /dev/null
++++ b/arch/sw_64/lib/uaccess_flushcache.c
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include <linux/uaccess.h>
++#include <linux/mm.h>
++#include <asm/barrier.h>
++#include <asm/cacheflush.h>
++
++void memcpy_flushcache(void *dst, const void *src, size_t cnt)
++{
++	memcpy(dst, src, cnt);
++	flush_cache_all();
++}
++EXPORT_SYMBOL_GPL(memcpy_flushcache);
++
++void memcpy_page_flushcache(char *to, struct page *page, size_t offset,
++			    size_t len)
++{
++	memcpy_flushcache(to, page_address(page) + offset, len);
++}
++
++unsigned long __copy_user_flushcache(void *to, const void __user *from,
++				     unsigned long n)
++{
++	unsigned long rc = __copy_from_user(to, from, n);
++
++	flush_cache_all();
++	return rc;
++}
++
++#ifdef CONFIG_ARCH_HAS_PMEM_API
++void arch_wb_cache_pmem(void *addr, size_t size)
++{
++	flush_cache_all();
++}
++EXPORT_SYMBOL_GPL(arch_wb_cache_pmem);
++
++void arch_invalidate_pmem(void *addr, size_t size)
++{
++	flush_cache_all();
++}
++EXPORT_SYMBOL_GPL(arch_invalidate_pmem);
++#endif
+-- 
+2.33.0
+

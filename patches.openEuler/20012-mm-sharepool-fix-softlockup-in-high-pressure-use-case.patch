@@ -1,0 +1,117 @@
+From 8b19f5e0c44a89e1dc45fe11b9092170d081197e Mon Sep 17 00:00:00 2001
+From: Guo Mengqi <guomengqi3@huawei.com>
+Date: Thu, 3 Nov 2022 06:41:41 +0000
+Subject: [PATCH] mm/sharepool: fix softlockup in high pressure use case.
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 8b19f5e0c44a89e1dc45fe11b9092170d081197e
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5ODCT
+CVE: NA
+
+--------------------------------
+
+When there are a large number of groups in the system, or with a large
+number of processes in each group, "cat /proc/sharepool/proc_stat"
+will encounter softlockup before all prints finished.
+This is because there are too many loops in the callback function.
+Remove one of the loops to reduce time cost and add a cond_resched() to
+avoid this.
+
+root@buildroot:~/install# cat /proc/sharepool/proc_stat
+[ 1250.647469] watchdog: BUG: soft lockup - CPU#0 stuck for 22s! [cat:309]
+[ 1250.648610] Modules linked in: sharepool_dev(OE)
+[ 1250.650795] CPU: 0 PID: 309 Comm: cat Tainted: G     OE     5.10.0+ #43
+[ 1250.651216] Hardware name: linux,dummy-virt (DT)
+[ 1250.651721] pstate: 80000005 (Nzcv daif -PAN -UAO -TCO BTYPE=--)
+[ 1250.652426] pc : get_process_sp_res+0x40/0x90
+[ 1250.652747] lr : proc_usage_by_group+0x158/0x218
+    ...
+[ 1250.657903] Call trace:
+[ 1250.658376]  get_process_sp_res+0x40/0x90
+[ 1250.658602]  proc_usage_by_group+0x158/0x218
+[ 1250.658838]  idr_for_each+0x6c/0xf0
+[ 1250.659027]  proc_group_usage_show+0x104/0x120
+[ 1250.659263]  seq_read_iter+0xe0/0x498
+[ 1250.659462]  proc_reg_read_iter+0xa8/0xe0
+[ 1250.659660]  generic_file_splice_read+0xf0/0x1b0
+[ 1250.659865]  do_splice_to+0x7c/0xd0
+[ 1250.660029]  splice_direct_to_actor+0xe0/0x2a8
+[ 1250.660353]  do_splice_direct+0xa4/0xf8
+[ 1250.660902]  do_sendfile+0x1bc/0x420
+[ 1250.661079]  __arm64_sys_sendfile64+0x170/0x178
+[ 1250.661298]  el0_svc_common.constprop.0+0x88/0x268
+[ 1250.661505]  do_el0_svc+0x34/0xb8
+[ 1250.661686]  el0_svc+0x1c/0x28
+[ 1250.661836]  el0_sync_handler+0x8c/0xb0
+[ 1250.662033]  el0_sync+0x168/0x180
+
+Signed-off-by: Guo Mengqi <guomengqi3@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/share_pool.c | 21 +++++++--------------
+ 1 file changed, 7 insertions(+), 14 deletions(-)
+
+diff --git a/mm/share_pool.c b/mm/share_pool.c
+index 963cac4734ac..4a6933a16551 100644
+--- a/mm/share_pool.c
++++ b/mm/share_pool.c
+@@ -4023,7 +4023,6 @@ static int proc_usage_by_group(int id, void *p, void *data)
+ 	struct sp_group_master *master;
+ 	int tgid;
+ 	unsigned long anon, file, shmem, total_rss;
+-	long sp_res, sp_res_nsize, non_sp_res, non_sp_shm;
+ 
+ 	down_read(&spg->rw_lock);
+ 	list_for_each_entry(spg_node, &spg->procs, proc_node) {
+@@ -4038,26 +4037,20 @@ static int proc_usage_by_group(int id, void *p, void *data)
+ 		tgid = master->instat.tgid;
+ 
+ 		get_mm_rss_info(mm, &anon, &file, &shmem, &total_rss);
+-		get_process_sp_res(master, &sp_res, &sp_res_nsize);
+-		get_process_non_sp_res(total_rss, shmem, sp_res_nsize,
+-				&non_sp_res, &non_sp_shm);
+ 
+ 		seq_printf(seq, "%-8d ", tgid);
+-		if (id == 0)
+-			seq_printf(seq, "%-8c ", '-');
+-		else
+-			seq_printf(seq, "%-8d ", id);
+-		seq_printf(seq, "%-9ld %-9ld %-9ld %-10ld %-10ld %-8ld %-7ld %-7ld %-10ld ",
++		seq_printf(seq, "%-8d ", id);
++		seq_printf(seq, "%-9ld %-9ld %-9ld %-8ld %-7ld %-7ld ",
+ 				get_spg_proc_alloc(spg_node),
+ 				get_spg_proc_k2u(spg_node),
+ 				get_sp_res_by_spg_proc(spg_node),
+-				sp_res, non_sp_res,
+ 				page2kb(mm->total_vm), page2kb(total_rss),
+-				page2kb(shmem), non_sp_shm);
++				page2kb(shmem));
+ 		print_process_prot(seq, spg_node->prot);
+ 		seq_putc(seq, '\n');
+ 	}
+ 	up_read(&spg->rw_lock);
++	cond_resched();
+ 
+ 	return 0;
+ }
+@@ -4068,9 +4061,9 @@ static int proc_group_usage_show(struct seq_file *seq, void *offset)
+ 	spa_overview_show(seq);
+ 
+ 	/* print the file header */
+-	seq_printf(seq, "%-8s %-8s %-9s %-9s %-9s %-10s %-10s %-8s %-7s %-7s %-10s %-4s\n",
+-			"PID", "Group_ID", "SP_ALLOC", "SP_K2U", "SP_RES", "SP_RES_T",
+-			"Non-SP_RES", "VIRT", "RES", "Shm", "Non-SP_Shm", "PROT");
++	seq_printf(seq, "%-8s %-8s %-9s %-9s %-9s %-8s %-7s %-7s %-4s\n",
++			"PID", "Group_ID", "SP_ALLOC", "SP_K2U", "SP_RES",
++			"VIRT", "RES", "Shm", "PROT");
+ 	/* print kthread buff_module_guard_work */
+ 	seq_printf(seq, "%-8s %-8s %-9lld %-9lld\n",
+ 			"guard", "-",
+-- 
+2.33.0
+
