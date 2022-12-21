@@ -1,0 +1,113 @@
+From 3c81b3bb0a33e2b555edb8d7eb99a7ae4f17d8bb Mon Sep 17 00:00:00 2001
+From: huangshaobo <huangshaobo6@huawei.com>
+Date: Mon, 9 May 2022 18:20:51 -0700
+Subject: [PATCH] kfence: enable check kfence canary on panic via boot param
+Git-commit: 3c81b3bb0a33e2b555edb8d7eb99a7ae4f17d8bb
+Patch-mainline: v5.19-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified per openEuler commit d3ce9eb5
+
+
+Out-of-bounds accesses that aren't caught by a guard page will result in
+corruption of canary memory.  In pathological cases, where an object has
+certain alignment requirements, an out-of-bounds access might never be
+caught by the guard page.  Such corruptions, however, are only detected on
+kfree() normally.  If the bug causes the kernel to panic before kfree(),
+KFENCE has no opportunity to report the issue.  Such corruptions may also
+indicate failing memory or other faults.
+
+To provide some more information in such cases, add the option to check
+canary bytes on panic.  This might help narrow the search for the panic
+cause; but, due to only having the allocation stack trace, such reports
+are difficult to use to diagnose an issue alone.  In most cases, such
+reports are inactionable, and is therefore an opt-in feature (disabled by
+default).
+
+[akpm@linux-foundation.org: add __read_mostly, per Marco]
+Link: https://lkml.kernel.org/r/20220425022456.44300-1-huangshaobo6@huawei.com
+Signed-off-by: huangshaobo <huangshaobo6@huawei.com>
+Suggested-by: chenzefeng <chenzefeng2@huawei.com>
+Reviewed-by: Marco Elver <elver@google.com>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Xiaoming Ni <nixiaoming@huawei.com>
+Cc: Wangbing <wangbing6@huawei.com>
+Cc: Jubin Zhong <zhongjubin@huawei.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/kfence/core.c |   35 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+
+--- a/mm/kfence/core.c
++++ b/mm/kfence/core.c
+@@ -14,6 +14,7 @@
+ #include <linux/irq_work.h>
+ #include <linux/jhash.h>
+ #include <linux/kcsan-checks.h>
++#include <linux/kernel.h>
+ #include <linux/kfence.h>
+ #include <linux/kmemleak.h>
+ #include <linux/list.h>
+@@ -21,6 +22,7 @@
+ #include <linux/log2.h>
+ #include <linux/memblock.h>
+ #include <linux/moduleparam.h>
++#include <linux/notifier.h>
+ #include <linux/random.h>
+ #include <linux/rcupdate.h>
+ #include <linux/sched/clock.h>
+@@ -94,6 +96,10 @@ module_param_cb(sample_interval, &sample
+ static unsigned long kfence_skip_covered_thresh __read_mostly = 75;
+ module_param_named(skip_covered_thresh, kfence_skip_covered_thresh, ulong, 0644);
+ 
++/* If true, check all canary bytes on panic. */
++static bool kfence_check_on_panic __read_mostly;
++module_param_named(check_on_panic, kfence_check_on_panic, bool, 0444);
++
+ /* The pool of pages used for guard pages and objects. */
+ char *__kfence_pool __read_mostly;
+ EXPORT_SYMBOL(__kfence_pool); /* Export for test modules. */
+@@ -752,6 +758,31 @@ static int __init kfence_debugfs_init(vo
+ 
+ late_initcall(kfence_debugfs_init);
+ 
++/* === Panic Notifier ====================================================== */
++
++static void kfence_check_all_canary(void)
++{
++	int i;
++
++	for (i = 0; i < CONFIG_KFENCE_NUM_OBJECTS; i++) {
++		struct kfence_metadata *meta = &kfence_metadata[i];
++
++		if (meta->state == KFENCE_OBJECT_ALLOCATED)
++			for_each_canary(meta, check_canary_byte);
++	}
++}
++
++static int kfence_check_canary_callback(struct notifier_block *nb,
++					unsigned long reason, void *arg)
++{
++	kfence_check_all_canary();
++	return NOTIFY_OK;
++}
++
++static struct notifier_block kfence_check_canary_notifier = {
++	.notifier_call = kfence_check_canary_callback,
++};
++
+ /* === Allocation Gate Timer ================================================ */
+ 
+ #ifdef CONFIG_KFENCE_STATIC_KEYS
+@@ -823,6 +854,10 @@ static void kfence_init_enable(void)
+ {
+ 	if (!IS_ENABLED(CONFIG_KFENCE_STATIC_KEYS))
+ 		static_branch_enable(&kfence_allocation_key);
++
++	if (kfence_check_on_panic)
++		atomic_notifier_chain_register(&panic_notifier_list, &kfence_check_canary_notifier);
++
+ 	WRITE_ONCE(kfence_enabled, true);
+ 	queue_delayed_work(system_unbound_wq, &kfence_timer, 0);
+ 	pr_info("initialized - using %lu bytes for %d objects at 0x%p-0x%p\n", KFENCE_POOL_SIZE,

@@ -1,0 +1,117 @@
+From 03ca4589fabcc66b27e4cb8f8e95d64cf43badd0 Mon Sep 17 00:00:00 2001
+From: Sean Christopherson <seanjc@google.com>
+Date: Wed, 5 May 2021 13:42:21 -0700
+Subject: [PATCH] KVM: x86: Prevent KVM SVM from loading on kernels with
+ 5-level paging
+Git-commit: 03ca4589fabcc66b27e4cb8f8e95d64cf43badd0
+Patch-mainline: v5.13-rc2
+References: bsn#12
+Modified-by-SEL: Yes, modified per openEuler commit 4438c55e
+
+
+Disallow loading KVM SVM if 5-level paging is supported.  In theory, NPT
+for L1 should simply work, but there unknowns with respect to how the
+guest's MAXPHYADDR will be handled by hardware.
+
+Nested NPT is more problematic, as running an L1 VMM that is using
+2-level page tables requires stacking single-entry PDP and PML4 tables in
+KVM's NPT for L2, as there are no equivalent entries in L1's NPT to
+shadow.  Barring hardware magic, for 5-level paging, KVM would need stack
+another layer to handle PML5.
+
+Opportunistically rename the lm_root pointer, which is used for the
+aforementioned stacking when shadowing 2-level L1 NPT, to pml4_root to
+call out that it's specifically for PML4.
+
+Suggested-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20210505204221.1934471-1-seanjc@google.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/include/asm/kvm_host.h |  2 +-
+ arch/x86/kvm/mmu/mmu.c          | 18 +++++++++---------
+ arch/x86/kvm/svm/svm.c          |  5 +++++
+ 3 files changed, 15 insertions(+), 10 deletions(-)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index c54e81d2a409..723af2b1f578 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -386,7 +386,7 @@ struct kvm_mmu {
+ 	u32 pkru_mask;
+ 
+ 	u64 *pae_root;
+-	u64 *lm_root;
++	u64 *pml4_root;
+ 
+ 	/*
+ 	 * check zero bits on shadow page table entries, these
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index 6096d0f1a62a..0dad71f72c64 100755
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -3311,7 +3311,7 @@ static int mmu_alloc_shadow_roots(struct kvm_vcpu *vcpu)
+ 		/*
+ 		 * Allocate the page for the PDPTEs when shadowing 32-bit NPT
+ 		 * with 64-bit only when needed.  Unlike 32-bit NPT, it doesn't
+-		 * need to be in low mem.  See also lm_root below.
++		 * need to be in low mem.  See also pml4_root below.
+ 		 */
+ 		if (!vcpu->arch.mmu->pae_root) {
+ 			WARN_ON_ONCE(!tdp_enabled);
+@@ -3351,19 +3351,19 @@ static int mmu_alloc_shadow_roots(struct kvm_vcpu *vcpu)
+ 	 * handled above (to share logic with PAE), deal with the PML4 here.
+ 	 */
+ 	if (vcpu->arch.mmu->shadow_root_level == PT64_ROOT_4LEVEL) {
+-		if (vcpu->arch.mmu->lm_root == NULL) {
+-			u64 *lm_root;
++		if (vcpu->arch.mmu->pml4_root == NULL) {
++			u64 *pml4_root;
+ 
+-			lm_root = (void*)get_zeroed_page(GFP_KERNEL_ACCOUNT);
+-			if (!lm_root)
++			pml4_root = (void*)get_zeroed_page(GFP_KERNEL_ACCOUNT);
++			if (!pml4_root)
+ 				return -ENOMEM;
+ 
+-			lm_root[0] = __pa(vcpu->arch.mmu->pae_root) | pm_mask;
++			pml4_root[0] = __pa(vcpu->arch.mmu->pae_root) | pm_mask;
+ 
+-			vcpu->arch.mmu->lm_root = lm_root;
++			vcpu->arch.mmu->pml4_root = pml4_root;
+ 		}
+ 
+-		vcpu->arch.mmu->root_hpa = __pa(vcpu->arch.mmu->lm_root);
++		vcpu->arch.mmu->root_hpa = __pa(vcpu->arch.mmu->pml4_root);
+ 	}
+ 
+ set_root_pgd:
+@@ -5302,7 +5302,7 @@ slot_handle_leaf(struct kvm *kvm, struct kvm_memory_slot *memslot,
+ static void free_mmu_pages(struct kvm_mmu *mmu)
+ {
+ 	free_page((unsigned long)mmu->pae_root);
+-	free_page((unsigned long)mmu->lm_root);
++	free_page((unsigned long)mmu->pml4_root);
+ }
+ 
+ static int __kvm_mmu_create(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu)
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index 5231f40e8312..8e2d45753bf1 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -443,6 +443,11 @@ static int has_svm(void)
+ 		return 0;
+ 	}
+ 
++	if (pgtable_l5_enabled()) {
++		pr_info("KVM doesn't yet support 5-level paging on AMD SVM\n");
++		return 0;
++	}
++
+ 	return 1;
+ }
+ 
+-- 
+2.33.0
+

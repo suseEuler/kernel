@@ -1,0 +1,104 @@
+From 30c9cf49270423f8cb0d2c152486e248f375cccb Mon Sep 17 00:00:00 2001
+From: Aili Yao <yaoaili@kingsoft.com>
+Date: Wed, 24 Feb 2021 12:06:39 -0800
+Subject: [PATCH] mm,hwpoison: send SIGBUS to PF_MCE_EARLY processes on action
+ required events
+Git-commit: 30c9cf49270423f8cb0d2c152486e248f375cccb
+Patch-mainline: v5.12-rc2
+References: bsn#12
+Modified-by-SEL: No
+
+
+When a memory uncorrected error is triggered by process who accessed the
+address with error, It's Action Required Case for only current process
+which triggered this; This Action Required case means Action optional to
+other process who share the same page.  Usually killing current process
+will be sufficient, other processes sharing the same page will get be
+signaled when they really touch the poisoned page.
+
+But there is another scenario that other processes sharing the same page
+want to be signaled early with PF_MCE_EARLY set.  In this case, we should
+get them into kill list and signal BUS_MCEERR_AO to them.
+
+So in this patch, task_early_kill will check current process if
+force_early is set, and if not current,the code will fallback to
+find_early_kill_thread() to check if there is PF_MCE_EARLY process who
+cares the error.
+
+In kill_proc(), BUS_MCEERR_AR is only send to current, other processes in
+kill list will be signaled with BUS_MCEERR_AO.
+
+Link: https://lkml.kernel.org/r/20210122132424.313c8f5f.yaoaili@kingsoft.com
+Signed-off-by: Aili Yao <yaoaili@kingsoft.com>
+Reviewed-by: Oscar Salvador <osalvador@suse.de>
+Acked-by: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/memory-failure.c | 34 +++++++++++++++++++---------------
+ 1 file changed, 19 insertions(+), 15 deletions(-)
+
+diff --git a/mm/memory-failure.c b/mm/memory-failure.c
+index e9481632fcd1..55c671904aac 100644
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@ -243,9 +243,13 @@ static int kill_proc(struct to_kill *tk, unsigned long pfn, int flags)
+ 			pfn, t->comm, t->pid);
+ 
+ 	if (flags & MF_ACTION_REQUIRED) {
+-		WARN_ON_ONCE(t != current);
+-		ret = force_sig_mceerr(BUS_MCEERR_AR,
++		if (t == current)
++			ret = force_sig_mceerr(BUS_MCEERR_AR,
+ 					 (void __user *)tk->addr, addr_lsb);
++		else
++			/* Signal other processes sharing the page if they have PF_MCE_EARLY set. */
++			ret = send_sig_mceerr(BUS_MCEERR_AO, (void __user *)tk->addr,
++				addr_lsb, t);
+ 	} else {
+ 		/*
+ 		 * Don't use force here, it's convenient if the signal
+@@ -440,26 +444,26 @@ static struct task_struct *find_early_kill_thread(struct task_struct *tsk)
+  * Determine whether a given process is "early kill" process which expects
+  * to be signaled when some page under the process is hwpoisoned.
+  * Return task_struct of the dedicated thread (main thread unless explicitly
+- * specified) if the process is "early kill," and otherwise returns NULL.
++ * specified) if the process is "early kill" and otherwise returns NULL.
+  *
+- * Note that the above is true for Action Optional case, but not for Action
+- * Required case where SIGBUS should sent only to the current thread.
++ * Note that the above is true for Action Optional case. For Action Required
++ * case, it's only meaningful to the current thread which need to be signaled
++ * with SIGBUS, this error is Action Optional for other non current
++ * processes sharing the same error page,if the process is "early kill", the
++ * task_struct of the dedicated thread will also be returned.
+  */
+ static struct task_struct *task_early_kill(struct task_struct *tsk,
+ 					   int force_early)
+ {
+ 	if (!tsk->mm)
+ 		return NULL;
+-	if (force_early) {
+-		/*
+-		 * Comparing ->mm here because current task might represent
+-		 * a subthread, while tsk always points to the main thread.
+-		 */
+-		if (tsk->mm == current->mm)
+-			return current;
+-		else
+-			return NULL;
+-	}
++	/*
++	 * Comparing ->mm here because current task might represent
++	 * a subthread, while tsk always points to the main thread.
++	 */
++	if (force_early && tsk->mm == current->mm)
++		return current;
++
+ 	return find_early_kill_thread(tsk);
+ }
+ 
+-- 
+2.33.0
+

@@ -1,0 +1,84 @@
+From 875feb41fd20f6bd6054c9e79a5bcd9da6d8d2b2 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Mon, 29 Mar 2021 10:08:58 +0200
+Subject: [PATCH] sched: Allow sched_core_put() from atomic context
+Git-commit: 875feb41fd20f6bd6054c9e79a5bcd9da6d8d2b2
+Patch-mainline: v5.14-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+Stuff the meat of sched_core_put() into a work such that we can use
+sched_core_put() from atomic context.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Tested-by: Don Hiatt <dhiatt@digitalocean.com>
+Tested-by: Hongyu Ning <hongyu.ning@linux.intel.com>
+Tested-by: Vincent Guittot <vincent.guittot@linaro.org>
+Link: https://lkml.kernel.org/r/20210422123308.377455632@infradead.org
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/sched/core.c | 33 +++++++++++++++++++++++++++------
+ 1 file changed, 27 insertions(+), 6 deletions(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 42c1c88741c0..85147bea9d93 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -102,7 +102,7 @@ DEFINE_STATIC_KEY_FALSE(__sched_core_enabled);
+  */
+ 
+ static DEFINE_MUTEX(sched_core_mutex);
+-static int sched_core_count;
++static atomic_t sched_core_count;
+ static struct cpumask sched_core_mask;
+ 
+ static void __sched_core_flip(bool enabled)
+@@ -170,18 +170,39 @@ static void __sched_core_disable(void)
+ 
+ void sched_core_get(void)
+ {
++	if (atomic_inc_not_zero(&sched_core_count))
++		return;
++
+ 	mutex_lock(&sched_core_mutex);
+-	if (!sched_core_count++)
++	if (!atomic_read(&sched_core_count))
+ 		__sched_core_enable();
++
++	smp_mb__before_atomic();
++	atomic_inc(&sched_core_count);
+ 	mutex_unlock(&sched_core_mutex);
+ }
+ 
+-void sched_core_put(void)
++static void __sched_core_put(struct work_struct *work)
+ {
+-	mutex_lock(&sched_core_mutex);
+-	if (!--sched_core_count)
++	if (atomic_dec_and_mutex_lock(&sched_core_count, &sched_core_mutex)) {
+ 		__sched_core_disable();
+-	mutex_unlock(&sched_core_mutex);
++		mutex_unlock(&sched_core_mutex);
++	}
++}
++
++void sched_core_put(void)
++{
++	static DECLARE_WORK(_work, __sched_core_put);
++
++	/*
++	 * "There can be only one"
++	 *
++	 * Either this is the last one, or we don't actually need to do any
++	 * 'work'. If it is the last *again*, we rely on
++	 * WORK_STRUCT_PENDING_BIT.
++	 */
++	if (!atomic_add_unless(&sched_core_count, -1, 1))
++		schedule_work(&_work);
+ }
+ 
+ #endif /* CONFIG_SCHED_CORE */
+-- 
+2.33.0
+

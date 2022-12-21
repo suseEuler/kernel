@@ -1,0 +1,149 @@
+From c47a5599eda324bacdacd125227a0925d6c50fbe Mon Sep 17 00:00:00 2001
+From: Jin Yao <yao.jin@linux.intel.com>
+Date: Thu, 1 Jul 2021 14:42:53 +0800
+Subject: [PATCH] perf tools: Fix pattern matching for same substring in
+ different PMU type
+Git-commit: c47a5599eda324bacdacd125227a0925d6c50fbe
+Patch-mainline: v5.14-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified per openEuler commit 288460dd
+
+
+Some different PMU types may have the same substring. For example, on
+Icelake server we have PMU types "uncore_imc" and
+"uncore_imc_free_running". Both PMU types have the substring
+"uncore_imc".  But the parser wrongly thinks they are the same PMU type.
+
+We enable an imc event,
+perf stat -e uncore_imc/event=0xe3/ -a -- sleep 1
+
+Perf actually expands the event to:
+
+  uncore_imc_0/event=0xe3/
+  uncore_imc_1/event=0xe3/
+  uncore_imc_2/event=0xe3/
+  uncore_imc_3/event=0xe3/
+  uncore_imc_4/event=0xe3/
+  uncore_imc_5/event=0xe3/
+  uncore_imc_6/event=0xe3/
+  uncore_imc_7/event=0xe3/
+  uncore_imc_free_running_0/event=0xe3/
+  uncore_imc_free_running_1/event=0xe3/
+  uncore_imc_free_running_3/event=0xe3/
+  uncore_imc_free_running_4/event=0xe3/
+
+That's because the "uncore_imc_free_running" matches the
+pattern "uncore_imc*".
+
+Now we check that the last characters of PMU name is '_<digit>'.
+
+For example, for pattern "uncore_imc*", "uncore_imc_0" is parsed ok, but
+"uncore_imc_free_running_0" fails.
+
+Fixes: b2b9d3a3f0211c5d ("perf pmu: Support wildcards on pmu name in dynamic pmu events")
+Signed-off-by: Jin Yao <yao.jin@linux.intel.com>
+Reviewed-by: Kan Liang <kan.liang@linux.intel.com>
+Acked-by: Jiri Olsa <jolsa@redhat.com>
+Cc: Agustin Vega-Frias <agustinv@codeaurora.org>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lore.kernel.org/lkml/20210701064253.1175-1-yao.jin@linux.intel.com
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ tools/perf/util/parse-events.y |    2 +-
+ tools/perf/util/pmu.c          |   36 +++++++++++++++++++++++++++++++++++-
+ tools/perf/util/pmu.h          |    2 ++
+ 3 files changed, 38 insertions(+), 2 deletions(-)
+
+--- a/tools/perf/util/parse-events.y
++++ b/tools/perf/util/parse-events.y
+@@ -312,7 +312,7 @@ PE_NAME opt_pmu_config
+ 			if (!strncmp(name, "uncore_", 7) &&
+ 			    strncmp($1, "uncore_", 7))
+ 				name += 7;
+-			if (!fnmatch(pattern, name, 0)) {
++			if (!perf_pmu__match(pattern, name, $1)) {
+ 				if (parse_events_copy_term_list(orig_terms, &terms))
+ 					CLEANUP_YYABORT;
+ 				if (!parse_events_add_pmu(_parse_state, list, pmu->name, terms, true, false))
+--- a/tools/perf/util/pmu.c
++++ b/tools/perf/util/pmu.c
+@@ -3,6 +3,7 @@
+ #include <linux/compiler.h>
+ #include <linux/string.h>
+ #include <linux/zalloc.h>
++#include <linux/ctype.h>
+ #include <subcmd/pager.h>
+ #include <sys/types.h>
+ #include <errno.h>
+@@ -17,6 +18,7 @@
+ #include <locale.h>
+ #include <regex.h>
+ #include <perf/cpumap.h>
++#include <fnmatch.h>
+ #include "debug.h"
+ #include "evsel.h"
+ #include "pmu.h"
+@@ -723,6 +725,27 @@ struct pmu_events_map *perf_pmu__find_ma
+ 	return map;
+ }
+ 
++static bool perf_pmu__valid_suffix(char *pmu_name, char *tok)
++{
++	char *p;
++
++	if (strncmp(pmu_name, tok, strlen(tok)))
++		return false;
++
++	p = pmu_name + strlen(tok);
++	if (*p == 0)
++		return true;
++
++	if (*p != '_')
++		return false;
++
++	++p;
++	if (*p == 0 || !isdigit(*p))
++		return false;
++
++	return true;
++}
++
+ struct pmu_events_map *__weak pmu_events_map__find(void)
+ {
+ 	return perf_pmu__find_map(NULL);
+@@ -756,7 +779,7 @@ bool pmu_uncore_alias_match(const char *
+ 	 */
+ 	for (; tok; name += strlen(tok), tok = strtok_r(NULL, ",", &tmp)) {
+ 		name = strstr(name, tok);
+-		if (!name) {
++		if (!name || !perf_pmu__valid_suffix((char *)name, tok)) {
+ 			res = false;
+ 			goto out;
+ 		}
+@@ -1873,3 +1896,14 @@ void perf_pmu__warn_invalid_config(struc
+ 		   "'%llx' not supported by kernel)!\n",
+ 		   name ?: "N/A", buf, config);
+ }
++
++int perf_pmu__match(char *pattern, char *name, char *tok)
++{
++	if (fnmatch(pattern, name, 0))
++		return -1;
++
++	if (tok && !perf_pmu__valid_suffix(name, tok))
++		return -1;
++
++	return 0;
++}
+--- a/tools/perf/util/pmu.h
++++ b/tools/perf/util/pmu.h
+@@ -130,4 +130,6 @@ void perf_pmu__warn_invalid_config(struc
+ 				   char *name);
+ void perf_pmu__warn_invalid_formats(struct perf_pmu *pmu);
+ 
++int perf_pmu__match(char *pattern, char *name, char *tok);
++
+ #endif /* __PMU_H */

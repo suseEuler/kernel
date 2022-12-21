@@ -1,0 +1,154 @@
+From 9dc00b25eadf2908ae76ac0607b55a9f4e0e0cdc Mon Sep 17 00:00:00 2001
+From: Barry Song <song.bao.hua@hisilicon.com>
+Date: Sat, 6 Feb 2021 00:33:25 +1300
+Subject: [PATCH] dma-mapping: benchmark: pretend DMA is transmitting
+Git-commit: 9dc00b25eadf2908ae76ac0607b55a9f4e0e0cdc
+Patch-mainline: v5.12-rc2
+References: bsn#12
+Modified-by-SEL: No
+
+
+In a real dma mapping user case, after dma_map is done, data will be
+transmit. Thus, in multi-threaded user scenario, IOMMU contention
+should not be that severe. For example, if users enable multiple
+threads to send network packets through 1G/10G/100Gbps NIC, usually
+the steps will be: map -> transmission -> unmap.  Transmission delay
+reduces the contention of IOMMU.
+
+Here a delay is added to simulate the transmission between map and unmap
+so that the tested result could be more accurate for TX and simple RX.
+A typical TX transmission for NIC would be like: map -> TX -> unmap
+since the socket buffers come from OS. Simple RX model eg. disk driver,
+is also map -> RX -> unmap, but real RX model in a NIC could be more
+complicated considering packets can come spontaneously and many drivers
+are using pre-mapped buffers pool. This is in the TBD list.
+
+Signed-off-by: Barry Song <song.bao.hua@hisilicon.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/dma/map_benchmark.c                    | 12 ++++++++++-
+ .../testing/selftests/dma/dma_map_benchmark.c | 21 ++++++++++++++++---
+ 2 files changed, 29 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/dma/map_benchmark.c b/kernel/dma/map_benchmark.c
+index da95df381483..e0e64f8b0739 100644
+--- a/kernel/dma/map_benchmark.c
++++ b/kernel/dma/map_benchmark.c
+@@ -21,6 +21,7 @@
+ #define DMA_MAP_BENCHMARK	_IOWR('d', 1, struct map_benchmark)
+ #define DMA_MAP_MAX_THREADS	1024
+ #define DMA_MAP_MAX_SECONDS	300
++#define DMA_MAP_MAX_TRANS_DELAY	(10 * NSEC_PER_MSEC)
+ 
+ #define DMA_MAP_BIDIRECTIONAL	0
+ #define DMA_MAP_TO_DEVICE	1
+@@ -36,7 +37,8 @@ struct map_benchmark {
+ 	__s32 node; /* which numa node this benchmark will run on */
+ 	__u32 dma_bits; /* DMA addressing capability */
+ 	__u32 dma_dir; /* DMA data direction */
+-	__u8 expansion[84];	/* For future use */
++	__u32 dma_trans_ns; /* time for DMA transmission in ns */
++	__u8 expansion[80];	/* For future use */
+ };
+ 
+ struct map_benchmark_data {
+@@ -87,6 +89,9 @@ static int map_benchmark_thread(void *data)
+ 		map_etime = ktime_get();
+ 		map_delta = ktime_sub(map_etime, map_stime);
+ 
++		/* Pretend DMA is transmitting */
++		ndelay(map->bparam.dma_trans_ns);
++
+ 		unmap_stime = ktime_get();
+ 		dma_unmap_single(map->dev, dma_addr, PAGE_SIZE, map->dir);
+ 		unmap_etime = ktime_get();
+@@ -218,6 +223,11 @@ static long map_benchmark_ioctl(struct file *file, unsigned int cmd,
+ 			return -EINVAL;
+ 		}
+ 
++		if (map->bparam.dma_trans_ns > DMA_MAP_MAX_TRANS_DELAY) {
++			pr_err("invalid transmission delay\n");
++			return -EINVAL;
++		}
++
+ 		if (map->bparam.node != NUMA_NO_NODE &&
+ 		    !node_possible(map->bparam.node)) {
+ 			pr_err("invalid numa node\n");
+diff --git a/tools/testing/selftests/dma/dma_map_benchmark.c b/tools/testing/selftests/dma/dma_map_benchmark.c
+index 537d65968c48..fb23ce9617ea 100644
+--- a/tools/testing/selftests/dma/dma_map_benchmark.c
++++ b/tools/testing/selftests/dma/dma_map_benchmark.c
+@@ -12,9 +12,12 @@
+ #include <sys/mman.h>
+ #include <linux/types.h>
+ 
++#define NSEC_PER_MSEC	1000000L
++
+ #define DMA_MAP_BENCHMARK	_IOWR('d', 1, struct map_benchmark)
+ #define DMA_MAP_MAX_THREADS	1024
+ #define DMA_MAP_MAX_SECONDS     300
++#define DMA_MAP_MAX_TRANS_DELAY	(10 * NSEC_PER_MSEC)
+ 
+ #define DMA_MAP_BIDIRECTIONAL	0
+ #define DMA_MAP_TO_DEVICE	1
+@@ -36,7 +39,8 @@ struct map_benchmark {
+ 	__s32 node; /* which numa node this benchmark will run on */
+ 	__u32 dma_bits; /* DMA addressing capability */
+ 	__u32 dma_dir; /* DMA data direction */
+-	__u8 expansion[84];	/* For future use */
++	__u32 dma_trans_ns; /* time for DMA transmission in ns */
++	__u8 expansion[80];	/* For future use */
+ };
+ 
+ int main(int argc, char **argv)
+@@ -46,12 +50,12 @@ int main(int argc, char **argv)
+ 	/* default single thread, run 20 seconds on NUMA_NO_NODE */
+ 	int threads = 1, seconds = 20, node = -1;
+ 	/* default dma mask 32bit, bidirectional DMA */
+-	int bits = 32, dir = DMA_MAP_BIDIRECTIONAL;
++	int bits = 32, xdelay = 0, dir = DMA_MAP_BIDIRECTIONAL;
+ 
+ 	int cmd = DMA_MAP_BENCHMARK;
+ 	char *p;
+ 
+-	while ((opt = getopt(argc, argv, "t:s:n:b:d:")) != -1) {
++	while ((opt = getopt(argc, argv, "t:s:n:b:d:x:")) != -1) {
+ 		switch (opt) {
+ 		case 't':
+ 			threads = atoi(optarg);
+@@ -68,6 +72,9 @@ int main(int argc, char **argv)
+ 		case 'd':
+ 			dir = atoi(optarg);
+ 			break;
++		case 'x':
++			xdelay = atoi(optarg);
++			break;
+ 		default:
+ 			return -1;
+ 		}
+@@ -85,6 +92,12 @@ int main(int argc, char **argv)
+ 		exit(1);
+ 	}
+ 
++	if (xdelay < 0 || xdelay > DMA_MAP_MAX_TRANS_DELAY) {
++		fprintf(stderr, "invalid transmit delay, must be in 0-%ld\n",
++			DMA_MAP_MAX_TRANS_DELAY);
++		exit(1);
++	}
++
+ 	/* suppose the mininum DMA zone is 1MB in the world */
+ 	if (bits < 20 || bits > 64) {
+ 		fprintf(stderr, "invalid dma mask bit, must be in 20-64\n");
+@@ -109,6 +122,8 @@ int main(int argc, char **argv)
+ 	map.node = node;
+ 	map.dma_bits = bits;
+ 	map.dma_dir = dir;
++	map.dma_trans_ns = xdelay;
++
+ 	if (ioctl(fd, cmd, &map)) {
+ 		perror("ioctl");
+ 		exit(1);
+-- 
+2.33.0
+

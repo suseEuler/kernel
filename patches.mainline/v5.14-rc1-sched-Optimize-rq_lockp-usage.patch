@@ -1,0 +1,233 @@
+From 9ef7e7e33bcdb57be1afb28884053c28b5f05240 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Wed, 3 Mar 2021 16:45:41 +0100
+Subject: [PATCH] sched: Optimize rq_lockp() usage
+Git-commit: 9ef7e7e33bcdb57be1afb28884053c28b5f05240
+Patch-mainline: v5.14-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified per openEuler commit 727a6989
+
+
+rq_lockp() includes a static_branch(), which is asm-goto, which is
+asm volatile which defeats regular CSE. This means that:
+
+	if (!static_branch(&foo))
+		return simple;
+
+	if (static_branch(&foo) && cond)
+		return complex;
+
+Doesn't fold and we get horrible code. Introduce __rq_lockp() without
+the static_branch() on.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Tested-by: Don Hiatt <dhiatt@digitalocean.com>
+Tested-by: Hongyu Ning <hongyu.ning@linux.intel.com>
+Tested-by: Vincent Guittot <vincent.guittot@linaro.org>
+Link: https://lkml.kernel.org/r/20210422123308.316696988@infradead.org
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/sched/core.c     | 16 ++++++++--------
+ kernel/sched/deadline.c |  4 ++--
+ kernel/sched/fair.c     |  2 +-
+ kernel/sched/sched.h    | 33 +++++++++++++++++++++++++--------
+ 4 files changed, 36 insertions(+), 19 deletions(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index c549e584aea5..89f34366fd74 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -291,9 +291,9 @@ void raw_spin_rq_lock_nested(struct rq *rq, int subclass)
+ 	}
+ 
+ 	for (;;) {
+-		lock = rq_lockp(rq);
++		lock = __rq_lockp(rq);
+ 		raw_spin_lock_nested(lock, subclass);
+-		if (likely(lock == rq_lockp(rq))) {
++		if (likely(lock == __rq_lockp(rq))) {
+ 			/* preempt_count *MUST* be > 1 */
+ 			preempt_enable_no_resched();
+ 			return;
+@@ -316,9 +316,9 @@ bool raw_spin_rq_trylock(struct rq *rq)
+ 	}
+ 
+ 	for (;;) {
+-		lock = rq_lockp(rq);
++		lock = __rq_lockp(rq);
+ 		ret = raw_spin_trylock(lock);
+-		if (!ret || (likely(lock == rq_lockp(rq)))) {
++		if (!ret || (likely(lock == __rq_lockp(rq)))) {
+ 			preempt_enable();
+ 			return ret;
+ 		}
+@@ -343,7 +343,7 @@ void double_rq_lock(struct rq *rq1, struct rq *rq2)
+ 		swap(rq1, rq2);
+ 
+ 	raw_spin_rq_lock(rq1);
+-	if (rq_lockp(rq1) == rq_lockp(rq2))
++	if (__rq_lockp(rq1) == __rq_lockp(rq2))
+ 		return;
+ 
+ 	raw_spin_rq_lock_nested(rq2, SINGLE_DEPTH_NESTING);
+@@ -2164,7 +2164,7 @@ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
+ 	 * task_rq_lock().
+ 	 */
+ 	WARN_ON_ONCE(debug_locks && !(lockdep_is_held(&p->pi_lock) ||
+-				      lockdep_is_held(rq_lockp(task_rq(p)))));
++				      lockdep_is_held(__rq_lockp(task_rq(p)))));
+ #endif
+ 	/*
+ 	 * Clearly, migrating tasks to offline CPUs is a fairly daft thing.
+@@ -3725,7 +3725,7 @@ prepare_lock_switch(struct rq *rq, struct task_struct *next, struct rq_flags *rf
+ 	 * do an early lockdep release here:
+ 	 */
+ 	rq_unpin_lock(rq, rf);
+-	spin_release(&rq_lockp(rq)->dep_map, _THIS_IP_);
++	spin_release(&__rq_lockp(rq)->dep_map, _THIS_IP_);
+ #ifdef CONFIG_DEBUG_SPINLOCK
+ 	/* this is a valid case when another task releases the spinlock */
+ 	rq_lockp(rq)->owner = next;
+@@ -3739,7 +3739,7 @@ static inline void finish_lock_switch(struct rq *rq)
+ 	 * fix up the runqueue lock - which gets 'carried over' from
+ 	 * prev into current:
+ 	 */
+-	spin_acquire(&rq_lockp(rq)->dep_map, 0, 0, _THIS_IP_);
++	spin_acquire(&__rq_lockp(rq)->dep_map, 0, 0, _THIS_IP_);
+ 	raw_spin_rq_unlock_irq(rq);
+ }
+ 
+diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
+index 990bffb1443d..6453bf1ddf7e 100644
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -1095,9 +1095,9 @@ static enum hrtimer_restart dl_task_timer(struct hrtimer *timer)
+ 		 * If the runqueue is no longer available, migrate the
+ 		 * task elsewhere. This necessarily changes rq.
+ 		 */
+-		lockdep_unpin_lock(rq_lockp(rq), rf.cookie);
++		lockdep_unpin_lock(__rq_lockp(rq), rf.cookie);
+ 		rq = dl_task_offline_migration(rq, p);
+-		rf.cookie = lockdep_pin_lock(rq_lockp(rq));
++		rf.cookie = lockdep_pin_lock(__rq_lockp(rq));
+ 		update_rq_clock(rq);
+ 
+ 		/*
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 5aa269fbb068..a596d87a39de 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -1131,7 +1131,7 @@ struct numa_group {
+ static struct numa_group *deref_task_numa_group(struct task_struct *p)
+ {
+ 	return rcu_dereference_check(p->numa_group, p == current ||
+-		(lockdep_is_held(rq_lockp(task_rq(p))) && !READ_ONCE(p->on_cpu)));
++		(lockdep_is_held(__rq_lockp(task_rq(p))) && !READ_ONCE(p->on_cpu)));
+ }
+ 
+ static struct numa_group *deref_curr_numa_group(struct task_struct *p)
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 6b56c90f5d10..3a9296fbc458 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1171,6 +1171,10 @@ static inline bool sched_core_disabled(void)
+ 	return !static_branch_unlikely(&__sched_core_enabled);
+ }
+ 
++/*
++ * Be careful with this function; not for general use. The return value isn't
++ * stable unless you actually hold a relevant rq->__lock.
++ */
+ static inline raw_spinlock_t *rq_lockp(struct rq *rq)
+ {
+ 	if (sched_core_enabled(rq))
+@@ -1179,6 +1183,14 @@ static inline raw_spinlock_t *rq_lockp(struct rq *rq)
+ 	return &rq->__lock;
+ }
+ 
++static inline raw_spinlock_t *__rq_lockp(struct rq *rq)
++{
++	if (rq->core_enabled)
++		return &rq->core->__lock;
++
++	return &rq->__lock;
++}
++
+ #else /* !CONFIG_SCHED_CORE */
+ 
+ static inline bool sched_core_enabled(struct rq *rq)
+@@ -1196,11 +1208,16 @@ static inline raw_spinlock_t *rq_lockp(struct rq *rq)
+ 	return &rq->__lock;
+ }
+ 
++static inline raw_spinlock_t *__rq_lockp(struct rq *rq)
++{
++	return &rq->__lock;
++}
++
+ #endif /* CONFIG_SCHED_CORE */
+ 
+ static inline void lockdep_assert_rq_held(struct rq *rq)
+ {
+-	lockdep_assert_held(rq_lockp(rq));
++	lockdep_assert_held(__rq_lockp(rq));
+ }
+ 
+ extern void raw_spin_rq_lock_nested(struct rq *rq, int subclass);
+@@ -1382,7 +1399,7 @@ struct rq_flags {
+  */
+ static inline void rq_pin_lock(struct rq *rq, struct rq_flags *rf)
+ {
+-	rf->cookie = lockdep_pin_lock(rq_lockp(rq));
++	rf->cookie = lockdep_pin_lock(__rq_lockp(rq));
+ 
+ #ifdef CONFIG_SCHED_DEBUG
+ 	rq->clock_update_flags &= (RQCF_REQ_SKIP|RQCF_ACT_SKIP);
+@@ -1397,12 +1414,12 @@ static inline void rq_unpin_lock(struct rq *rq, struct rq_flags *rf)
+ 		rf->clock_update_flags = RQCF_UPDATED;
+ #endif
+ 
+-	lockdep_unpin_lock(rq_lockp(rq), rf->cookie);
++	lockdep_unpin_lock(__rq_lockp(rq), rf->cookie);
+ }
+ 
+ static inline void rq_repin_lock(struct rq *rq, struct rq_flags *rf)
+ {
+-	lockdep_repin_lock(rq_lockp(rq), rf->cookie);
++	lockdep_repin_lock(__rq_lockp(rq), rf->cookie);
+ 
+ #ifdef CONFIG_SCHED_DEBUG
+ 	/*
+@@ -2310,7 +2327,7 @@ static inline int _double_lock_balance(struct rq *this_rq, struct rq *busiest)
+ 	__acquires(busiest->lock)
+ 	__acquires(this_rq->lock)
+ {
+-	if (rq_lockp(this_rq) == rq_lockp(busiest))
++	if (__rq_lockp(this_rq) == __rq_lockp(busiest))
+ 		return 0;
+ 
+ 	if (likely(raw_spin_rq_trylock(busiest)))
+@@ -2342,9 +2359,9 @@ static inline int double_lock_balance(struct rq *this_rq, struct rq *busiest)
+ static inline void double_unlock_balance(struct rq *this_rq, struct rq *busiest)
+ 	__releases(busiest->lock)
+ {
+-	if (rq_lockp(this_rq) != rq_lockp(busiest))
++	if (__rq_lockp(this_rq) != __rq_lockp(busiest))
+ 		raw_spin_rq_unlock(busiest);
+-	lock_set_subclass(&rq_lockp(this_rq)->dep_map, 0, _RET_IP_);
++	lock_set_subclass(&__rq_lockp(this_rq)->dep_map, 0, _RET_IP_);
+ }
+ 
+ static inline void double_lock(spinlock_t *l1, spinlock_t *l2)
+@@ -2384,7 +2401,7 @@ static inline void double_rq_unlock(struct rq *rq1, struct rq *rq2)
+ 	__releases(rq1->lock)
+ 	__releases(rq2->lock)
+ {
+-	if (rq_lockp(rq1) != rq_lockp(rq2))
++	if (__rq_lockp(rq1) != __rq_lockp(rq2))
+ 		raw_spin_rq_unlock(rq2);
+ 	else
+ 		__release(rq2->lock);
+-- 
+2.33.0
+

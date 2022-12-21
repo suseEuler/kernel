@@ -1,0 +1,219 @@
+From 97886d9dcd86820bdbc1fa73b455982809cbc8c2 Mon Sep 17 00:00:00 2001
+From: Aubrey Li <aubrey.li@linux.intel.com>
+Date: Wed, 24 Mar 2021 17:40:13 -0400
+Subject: [PATCH] sched: Migration changes for core scheduling
+Git-commit: 97886d9dcd86820bdbc1fa73b455982809cbc8c2
+Patch-mainline: v5.14-rc1
+References: bsn#12
+Modified-by-SEL: Yes, refreshed due to different context
+
+
+ - Don't migrate if there is a cookie mismatch
+     Load balance tries to move task from busiest CPU to the
+     destination CPU. When core scheduling is enabled, if the
+     task's cookie does not match with the destination CPU's
+     core cookie, this task may be skipped by this CPU. This
+     mitigates the forced idle time on the destination CPU.
+
+ - Select cookie matched idle CPU
+     In the fast path of task wakeup, select the first cookie matched
+     idle CPU instead of the first idle CPU.
+
+ - Find cookie matched idlest CPU
+     In the slow path of task wakeup, find the idlest CPU whose core
+     cookie matches with task's cookie
+
+Signed-off-by: Aubrey Li <aubrey.li@linux.intel.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Tested-by: Don Hiatt <dhiatt@digitalocean.com>
+Tested-by: Hongyu Ning <hongyu.ning@linux.intel.com>
+Tested-by: Vincent Guittot <vincent.guittot@linaro.org>
+Link: https://lkml.kernel.org/r/20210422123308.860083871@infradead.org
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/sched/fair.c  |   29 ++++++++++++++++----
+ kernel/sched/sched.h |   73 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 96 insertions(+), 6 deletions(-)
+
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -5879,11 +5879,15 @@ find_idlest_group_cpu(struct sched_group
+ 
+ 	/* Traverse only the allowed CPUs */
+ 	for_each_cpu_and(i, sched_group_span(group), p->cpus_ptr) {
++		struct rq *rq = cpu_rq(i);
++
++		if (!sched_core_cookie_match(rq, p))
++			continue;
++
+ 		if (sched_idle_cpu(i))
+ 			return i;
+ 
+ 		if (available_idle_cpu(i)) {
+-			struct rq *rq = cpu_rq(i);
+ 			struct cpuidle_state *idle = idle_get_state(rq);
+ 			if (idle && idle->exit_latency < min_exit_latency) {
+ 				/*
+@@ -5969,9 +5973,10 @@ static inline int find_idlest_cpu(struct
+ 	return new_cpu;
+ }
+ 
+-static inline int __select_idle_cpu(int cpu)
++static inline int __select_idle_cpu(int cpu, struct task_struct *p)
+ {
+-	if (available_idle_cpu(cpu) || sched_idle_cpu(cpu))
++	if ((available_idle_cpu(cpu) || sched_idle_cpu(cpu)) &&
++	    sched_cpu_cookie_match(cpu_rq(cpu), p))
+ 		return cpu;
+ 
+ 	return -1;
+@@ -6041,7 +6046,7 @@ static int select_idle_core(struct task_
+ 	int cpu;
+ 
+ 	if (!static_branch_likely(&sched_smt_present))
+-		return __select_idle_cpu(core);
++		return __select_idle_cpu(core, p);
+ 
+ 	for_each_cpu(cpu, cpu_smt_mask(core)) {
+ 		if (!available_idle_cpu(cpu)) {
+@@ -6079,7 +6084,7 @@ static inline bool test_idle_cores(int c
+ 
+ static inline int select_idle_core(struct task_struct *p, int core, struct cpumask *cpus, int *idle_cpu)
+ {
+-	return __select_idle_cpu(core);
++	return __select_idle_cpu(core, p);
+ }
+ 
+ #endif /* CONFIG_SCHED_SMT */
+@@ -6132,7 +6137,7 @@ static int select_idle_cpu(struct task_s
+ 		} else {
+ 			if (!--nr)
+ 				return -1;
+-			idle_cpu = __select_idle_cpu(cpu);
++			idle_cpu = __select_idle_cpu(cpu, p);
+ 			if ((unsigned int)idle_cpu < nr_cpumask_bits)
+ 				break;
+ 		}
+@@ -7460,6 +7465,14 @@ static int task_hot(struct task_struct *
+ 
+ 	if (sysctl_sched_migration_cost == -1)
+ 		return 1;
++
++	/*
++	 * Don't migrate task if the task's cookie does not match
++	 * with the destination CPU's core cookie.
++	 */
++	if (!sched_core_cookie_match(cpu_rq(env->dst_cpu), p))
++		return 1;
++
+ 	if (sysctl_sched_migration_cost == 0)
+ 		return 0;
+ 
+@@ -8814,6 +8827,10 @@ find_idlest_group(struct sched_domain *s
+ 					p->cpus_ptr))
+ 			continue;
+ 
++		/* Skip over this group if no cookie matched */
++		if (!sched_group_cookie_match(cpu_rq(this_cpu), p, group))
++			continue;
++
+ 		local_group = cpumask_test_cpu(this_cpu,
+ 					       sched_group_span(group));
+ 
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1100,7 +1100,9 @@ static inline int cpu_of(struct rq *rq)
+ }
+ 
+ 
++struct sched_group;
+ #ifdef CONFIG_SCHED_CORE
++static inline struct cpumask *sched_group_span(struct sched_group *sg);
+ 
+ DECLARE_STATIC_KEY_FALSE(__sched_core_enabled);
+ 
+@@ -1136,6 +1138,61 @@ static inline raw_spinlock_t *__rq_lockp
+ 
+ bool cfs_prio_less(struct task_struct *a, struct task_struct *b, bool fi);
+ 
++/*
++ * Helpers to check if the CPU's core cookie matches with the task's cookie
++ * when core scheduling is enabled.
++ * A special case is that the task's cookie always matches with CPU's core
++ * cookie if the CPU is in an idle core.
++ */
++static inline bool sched_cpu_cookie_match(struct rq *rq, struct task_struct *p)
++{
++	/* Ignore cookie match if core scheduler is not enabled on the CPU. */
++	if (!sched_core_enabled(rq))
++		return true;
++
++	return rq->core->core_cookie == p->core_cookie;
++}
++
++static inline bool sched_core_cookie_match(struct rq *rq, struct task_struct *p)
++{
++	bool idle_core = true;
++	int cpu;
++
++	/* Ignore cookie match if core scheduler is not enabled on the CPU. */
++	if (!sched_core_enabled(rq))
++		return true;
++
++	for_each_cpu(cpu, cpu_smt_mask(cpu_of(rq))) {
++		if (!available_idle_cpu(cpu)) {
++			idle_core = false;
++			break;
++		}
++	}
++
++	/*
++	 * A CPU in an idle core is always the best choice for tasks with
++	 * cookies.
++	 */
++	return idle_core || rq->core->core_cookie == p->core_cookie;
++}
++
++static inline bool sched_group_cookie_match(struct rq *rq,
++					    struct task_struct *p,
++					    struct sched_group *group)
++{
++	int cpu;
++
++	/* Ignore cookie match if core scheduler is not enabled on the CPU. */
++	if (!sched_core_enabled(rq))
++		return true;
++
++	for_each_cpu_and(cpu, sched_group_span(group), p->cpus_ptr) {
++		if (sched_core_cookie_match(rq, p))
++			return true;
++	}
++	return false;
++}
++
+ extern void queue_core_balance(struct rq *rq);
+ 
+ #else /* !CONFIG_SCHED_CORE */
+@@ -1164,6 +1221,22 @@ static inline void queue_core_balance(st
+ {
+ }
+ 
++static inline bool sched_cpu_cookie_match(struct rq *rq, struct task_struct *p)
++{
++	return true;
++}
++
++static inline bool sched_core_cookie_match(struct rq *rq, struct task_struct *p)
++{
++	return true;
++}
++
++static inline bool sched_group_cookie_match(struct rq *rq,
++					    struct task_struct *p,
++					    struct sched_group *group)
++{
++	return true;
++}
+ #endif /* CONFIG_SCHED_CORE */
+ 
+ static inline void lockdep_assert_rq_held(struct rq *rq)

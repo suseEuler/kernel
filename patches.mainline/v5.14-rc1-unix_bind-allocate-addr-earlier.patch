@@ -1,0 +1,96 @@
+From c34d4582518ff83a4848c2d33a46be82e2499a5b Mon Sep 17 00:00:00 2001
+From: Al Viro <viro@zeniv.linux.org.uk>
+Date: Sat, 19 Jun 2021 03:50:27 +0000
+Subject: [PATCH] unix_bind(): allocate addr earlier
+Git-commit: c34d4582518ff83a4848c2d33a46be82e2499a5b
+Patch-mainline: v5.14-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+makes it easier to massage; we do pay for that by extra work
+(kmalloc+memcpy+kfree) in some error cases, but those are not
+on the hot paths anyway.
+
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ net/unix/af_unix.c | 28 +++++++++++++++-------------
+ 1 file changed, 15 insertions(+), 13 deletions(-)
+
+diff --git a/net/unix/af_unix.c b/net/unix/af_unix.c
+index 91447624a364..a984cf3d946d 100644
+--- a/net/unix/af_unix.c
++++ b/net/unix/af_unix.c
+@@ -1040,6 +1040,15 @@ static int unix_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
+ 	if (err < 0)
+ 		goto out;
+ 	addr_len = err;
++	err = -ENOMEM;
++	addr = kmalloc(sizeof(*addr)+addr_len, GFP_KERNEL);
++	if (!addr)
++		goto out;
++
++	memcpy(addr->name, sunaddr, addr_len);
++	addr->len = addr_len;
++	addr->hash = hash ^ sk->sk_type;
++	refcount_set(&addr->refcnt, 1);
+ 
+ 	if (sun_path[0]) {
+ 		umode_t mode = S_IFSOCK |
+@@ -1048,7 +1057,7 @@ static int unix_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
+ 		if (err) {
+ 			if (err == -EEXIST)
+ 				err = -EADDRINUSE;
+-			goto out;
++			goto out_addr;
+ 		}
+ 	}
+ 
+@@ -1060,16 +1069,6 @@ static int unix_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
+ 	if (u->addr)
+ 		goto out_up;
+ 
+-	err = -ENOMEM;
+-	addr = kmalloc(sizeof(*addr)+addr_len, GFP_KERNEL);
+-	if (!addr)
+-		goto out_up;
+-
+-	memcpy(addr->name, sunaddr, addr_len);
+-	addr->len = addr_len;
+-	addr->hash = hash ^ sk->sk_type;
+-	refcount_set(&addr->refcnt, 1);
+-
+ 	if (sun_path[0]) {
+ 		addr->hash = UNIX_HASH_SIZE;
+ 		hash = d_backing_inode(path.dentry)->i_ino & (UNIX_HASH_SIZE - 1);
+@@ -1081,20 +1080,23 @@ static int unix_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
+ 		if (__unix_find_socket_byname(net, sunaddr, addr_len,
+ 					      sk->sk_type, hash)) {
+ 			spin_unlock(&unix_table_lock);
+-			unix_release_addr(addr);
+ 			goto out_up;
+ 		}
+ 		hash = addr->hash;
+ 	}
+ 
+-	err = 0;
+ 	__unix_set_addr(sk, addr, hash);
+ 	spin_unlock(&unix_table_lock);
++	addr = NULL;
++	err = 0;
+ out_up:
+ 	mutex_unlock(&u->bindlock);
+ out_put:
+ 	if (err)
+ 		path_put(&path);
++out_addr:
++	if (addr)
++		unix_release_addr(addr);
+ out:
+ 	return err;
+ }
+-- 
+2.33.0
+

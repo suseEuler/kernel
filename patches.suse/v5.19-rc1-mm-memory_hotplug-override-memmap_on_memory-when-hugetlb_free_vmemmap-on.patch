@@ -1,0 +1,101 @@
+From 6e02c46b4d970f24eb51197d451b00f08a8a4186 Mon Sep 17 00:00:00 2001
+From: Muchun Song <songmuchun@bytedance.com>
+Date: Fri, 13 May 2022 16:48:56 -0700
+Subject: [PATCH] mm: memory_hotplug: override memmap_on_memory when
+ hugetlb_free_vmemmap=on
+Git-commit: 6e02c46b4d970f24eb51197d451b00f08a8a4186
+Patch-mainline: v5.19-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified due to different context
+
+
+Optimizing HugeTLB vmemmap pages is not compatible with allocating memmap
+on hot added memory.  If "hugetlb_free_vmemmap=on" and
+memory_hotplug.memmap_on_memory" are both passed on the kernel command
+line, optimizing hugetlb pages takes precedence.  However, the global
+variable memmap_on_memory will still be set to 1, even though we will not
+try to allocate memmap on hot added memory.
+
+Also introduce mhp_memmap_on_memory() helper to move the definition of
+"memmap_on_memory" to the scope of CONFIG_MHP_MEMMAP_ON_MEMORY.  In the
+next patch, mhp_memmap_on_memory() will also be exported to be used in
+hugetlb_vmemmap.c.
+
+Link: https://lkml.kernel.org/r/20220512041142.39501-3-songmuchun@bytedance.com
+Signed-off-by: Muchun Song <songmuchun@bytedance.com>
+Acked-by: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Iurii Zaikin <yzaikin@google.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Kees Cook <keescook@chromium.org>
+Cc: Luis Chamberlain <mcgrof@kernel.org>
+Cc: Masahiro Yamada <masahiroy@kernel.org>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Xiongchun Duan <duanxiongchun@bytedance.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/memory_hotplug.c |   32 ++++++++++++++++++++++++++------
+ 1 file changed, 26 insertions(+), 6 deletions(-)
+
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@ -43,14 +43,36 @@
+ #include "internal.h"
+ #include "shuffle.h"
+ 
++#ifdef CONFIG_MHP_MEMMAP_ON_MEMORY
++static int memmap_on_memory_set(const char *val, const struct kernel_param *kp)
++{
++	if (hugetlb_optimize_vmemmap_enabled())
++		return 0;
++	return param_set_bool(val, kp);
++}
++
++static const struct kernel_param_ops memmap_on_memory_ops = {
++	.flags	= KERNEL_PARAM_OPS_FL_NOARG,
++	.set	= memmap_on_memory_set,
++	.get	= param_get_bool,
++};
+ 
+ /*
+  * memory_hotplug.memmap_on_memory parameter
+  */
+ static bool memmap_on_memory __ro_after_init;
+-#ifdef CONFIG_MHP_MEMMAP_ON_MEMORY
+-module_param(memmap_on_memory, bool, 0444);
++module_param_cb(memmap_on_memory, &memmap_on_memory_ops, &memmap_on_memory, 0444);
+ MODULE_PARM_DESC(memmap_on_memory, "Enable memmap on memory for memory hotplug");
++
++static inline bool mhp_memmap_on_memory(void)
++{
++	return memmap_on_memory;
++}
++#else
++static inline bool mhp_memmap_on_memory(void)
++{
++	return false;
++}
+ #endif
+ 
+ /*
+@@ -1020,9 +1042,7 @@ bool mhp_supports_memmap_on_memory(unsig
+ 	 *       altmap as an alternative source of memory, and we do not exactly
+ 	 *       populate a single PMD.
+ 	 */
+-	return memmap_on_memory &&
+-	       !hugetlb_free_vmemmap_enabled &&
+-	       IS_ENABLED(CONFIG_MHP_MEMMAP_ON_MEMORY) &&
++	return mhp_memmap_on_memory() &&
+ 	       size == memory_block_size_bytes() &&
+ 	       IS_ALIGNED(vmemmap_size, PMD_SIZE) &&
+ 	       IS_ALIGNED(remaining_size, (pageblock_nr_pages << PAGE_SHIFT));
+@@ -1773,7 +1793,7 @@ static int __ref try_remove_memory(int n
+ 	 * We only support removing memory added with MHP_MEMMAP_ON_MEMORY in
+ 	 * the same granularity it was added - a single memory block.
+ 	 */
+-	if (memmap_on_memory) {
++	if (mhp_memmap_on_memory()) {
+ 		nr_vmemmap_pages = walk_memory_blocks(start, size, NULL,
+ 						      get_nr_vmemmap_pages_cb);
+ 		if (nr_vmemmap_pages) {

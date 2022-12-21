@@ -1,0 +1,145 @@
+From 1e63ac088f20f7a4425c430c31ecd3cf167fb3f2 Mon Sep 17 00:00:00 2001
+From: Muchun Song <songmuchun@bytedance.com>
+Date: Thu, 28 Apr 2022 23:16:03 -0700
+Subject: [PATCH] arm64: mm: hugetlb: enable HUGETLB_PAGE_FREE_VMEMMAP for
+ arm64
+Git-commit: 1e63ac088f20f7a4425c430c31ecd3cf167fb3f2
+Patch-mainline: v5.19-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified per openEuler commit de126e06
+
+
+The feature of minimizing overhead of struct page associated with each
+HugeTLB page aims to free its vmemmap pages (used as struct page) to save
+memory, where is ~14GB/16GB per 1TB HugeTLB pages (2MB/1GB type).  In
+short, when a HugeTLB page is allocated or freed, the vmemmap array
+representing the range associated with the page will need to be remapped.
+When a page is allocated, vmemmap pages are freed after remapping.  When a
+page is freed, previously discarded vmemmap pages must be allocated before
+remapping.  More implementations and details can be found here [1].
+
+The infrastructure of freeing vmemmap pages associated with each HugeTLB
+page is already there, we can easily enable HUGETLB_PAGE_FREE_VMEMMAP for
+arm64, the only thing to be fixed is flush_dcache_page() .
+
+flush_dcache_page() need to be adapted to operate on the head page's flags
+since the tail vmemmap pages are mapped with read-only after the feature
+is enabled (clear operation is not permitted).
+
+There was some discussions about this in the thread [2], but there was no
+conclusion in the end.  And I copied the concern proposed by Anshuman to
+here and explain why those concern is superfluous.  It is safe to enable
+it for x86_64 as well as arm64.
+
+1st concern:
+'''
+But what happens when a hot remove section's vmemmap area (which is
+being teared down) is nearby another vmemmap area which is either created
+or being destroyed for HugeTLB alloc/free purpose. As you mentioned
+HugeTLB pages inside the hot remove section might be safe. But what about
+other HugeTLB areas whose vmemmap area shares page table entries with
+vmemmap entries for a section being hot removed ? Massive HugeTLB alloc
+/use/free test cycle using memory just adjacent to a memory hotplug area,
+which is always added and removed periodically, should be able to expose
+this problem.
+'''
+
+Answer: At the time memory is removed, all HugeTLB pages either have been
+migrated away or dissolved.  So there is no race between memory hot remove
+and free_huge_page_vmemmap().  Therefore, HugeTLB pages inside the hot
+remove section is safe.  Let's talk your question "what about other
+HugeTLB areas whose vmemmap area shares page table entries with vmemmap
+entries for a section being hot removed ?", the question is not
+established.  The minimal granularity size of hotplug memory 128MB (on
+arm64, 4k base page), any HugeTLB smaller than 128MB is within a section,
+then, there is no share PTE page tables between HugeTLB in this section
+and ones in other sections and a HugeTLB page could not cross two
+sections.  In this case, the section cannot be freed.  Any HugeTLB bigger
+than 128MB (section size) whose vmemmap pages is an integer multiple of
+2MB (PMD-mapped).  As long as:
+
+  1) HugeTLBs are naturally aligned, power-of-two sizes
+  2) The HugeTLB size >= the section size
+  3) The HugeTLB size >= the vmemmap leaf mapping size
+
+Then a HugeTLB will not share any leaf page table entries with *anything
+else*, but will share intermediate entries.  In this case, at the time
+memory is removed, all HugeTLB pages either have been migrated away or
+dissolved.  So there is also no race between memory hot remove and
+free_huge_page_vmemmap().
+
+2nd concern:
+'''
+differently, not sure if ptdump would require any synchronization.
+
+Dumping an wrong value is probably okay but crashing because a page table
+entry is being freed after ptdump acquired the pointer is bad. On arm64,
+ptdump() is protected against hotremove via [get|put]_online_mems().
+'''
+
+Answer: The ptdump should be fine since vmemmap_remap_free() only
+exchanges PTEs or splits the PMD entry (which means allocating a PTE page
+table).  Both operations do not free any page tables (PTE), so ptdump
+cannot run into a UAF on any page tables.  The worst case is just dumping
+an wrong value.
+
+[1] https://lore.kernel.org/all/20210510030027.56044-1-songmuchun@bytedance.com/
+[2] https://lore.kernel.org/all/20210518091826.36937-1-songmuchun@bytedance.com/
+
+[songmuchun@bytedance.com: restructure the code comment inside flush_dcache_page()]
+  Link: https://lkml.kernel.org/r/20220414072646.21910-1-songmuchun@bytedance.com
+Link: https://lkml.kernel.org/r/20220331065640.5777-2-songmuchun@bytedance.com
+Signed-off-by: Muchun Song <songmuchun@bytedance.com>
+Reviewed-by: Barry Song <baohua@kernel.org>
+Tested-by: Barry Song <baohua@kernel.org>
+Cc: Will Deacon <will@kernel.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Bodeddula Balasubramaniam <bodeddub@amazon.com>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: James Morse <james.morse@arm.com>
+Cc: Xiongchun Duan <duanxiongchun@bytedance.com>
+Cc: Fam Zheng <fam.zheng@bytedance.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/Kconfig    |    1 +
+ arch/arm64/mm/flush.c |   14 ++++++++++++++
+ 2 files changed, 15 insertions(+)
+
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -82,6 +82,7 @@ config ARM64
+ 	select ARCH_WANT_DEFAULT_TOPDOWN_MMAP_LAYOUT
+ 	select ARCH_WANT_FRAME_POINTERS
+ 	select ARCH_WANT_HUGE_PMD_SHARE if ARM64_4K_PAGES || (ARM64_16K_PAGES && !ARM64_VA_BITS_36)
++	select ARCH_WANT_HUGETLB_PAGE_FREE_VMEMMAP
+ 	select ARCH_WANT_LD_ORPHAN_WARN
+ 	select ARCH_HAS_UBSAN_SANITIZE_ALL
+ 	select ARM_AMBA
+--- a/arch/arm64/mm/flush.c
++++ b/arch/arm64/mm/flush.c
+@@ -76,6 +76,20 @@ EXPORT_SYMBOL_GPL(__sync_icache_dcache);
+  */
+ void flush_dcache_page(struct page *page)
+ {
++	/*
++	 * Only the head page's flags of HugeTLB can be cleared since the tail
++	 * vmemmap pages associated with each HugeTLB page are mapped with
++	 * read-only when CONFIG_HUGETLB_PAGE_FREE_VMEMMAP is enabled (more
++	 * details can refer to vmemmap_remap_pte()).  Although
++	 * __sync_icache_dcache() only set PG_dcache_clean flag on the head
++	 * page struct, there is more than one page struct with PG_dcache_clean
++	 * associated with the HugeTLB page since the head vmemmap page frame
++	 * is reused (more details can refer to the comments above
++	 * page_fixed_fake_head()).
++	 */
++	if (hugetlb_free_vmemmap_enabled() && PageHuge(page))
++		page = compound_head(page);
++
+ 	if (test_bit(PG_dcache_clean, &page->flags))
+ 		clear_bit(PG_dcache_clean, &page->flags);
+ }

@@ -1,0 +1,164 @@
+From 779f414a4849fb3e650cad8525c84e76fdd3c0ea Mon Sep 17 00:00:00 2001
+From: James Clark <james.clark@arm.com>
+Date: Fri, 6 Aug 2021 14:41:07 +0100
+Subject: [PATCH] perf cs-etm: Create ETE decoder
+Git-commit: 779f414a4849fb3e650cad8525c84e76fdd3c0ea
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+If the magic number indicates ETE instantiate a OCSD_BUILTIN_DCD_ETE
+decoder instead of OCSD_BUILTIN_DCD_ETMV4I. ETE is the new trace feature
+for Armv9.
+
+Testing performed
+=================
+
+* Old files with v0 and v1 headers for ETMv4 still open correctly
+* New files with new magic number open on new versions of perf
+* New files with new magic number fail to open on old versions of perf
+* Decoding with the ETE decoder results in the same output as the ETMv4
+  decoder as long as there are no new ETE packet types
+
+Reviewed-by: Leo Yan <leo.yan@linaro.org>
+Signed-off-by: James Clark <james.clark@arm.com>
+Acked-by: Suzuki Poulouse <suzuki.poulose@arm.com>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Jiri Olsa <jolsa@redhat.com>
+Cc: John Garry <john.garry@huawei.com>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Mathieu Poirier <mathieu.poirier@linaro.org>
+Cc: Mike Leach <mike.leach@linaro.org>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Cc: Will Deacon <will@kernel.org>
+Cc: coresight@lists.linaro.org
+Cc: linux-arm-kernel@lists.infradead.org
+Link: https //lore.kernel.org/r/20210806134109.1182235-8-james.clark@arm.com
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ .../perf/util/cs-etm-decoder/cs-etm-decoder.c | 20 +++++++++++++++++++
+ .../perf/util/cs-etm-decoder/cs-etm-decoder.h | 12 +++++++++++
+ tools/perf/util/cs-etm.c                      | 18 +++++++++++++++++
+ 3 files changed, 50 insertions(+)
+
+diff --git a/tools/perf/util/cs-etm-decoder/cs-etm-decoder.c b/tools/perf/util/cs-etm-decoder/cs-etm-decoder.c
+index 741f8f39752f..e2a7eca7ee90 100644
+--- a/tools/perf/util/cs-etm-decoder/cs-etm-decoder.c
++++ b/tools/perf/util/cs-etm-decoder/cs-etm-decoder.c
+@@ -157,6 +157,20 @@ static void cs_etm_decoder__gen_etmv4_config(struct cs_etm_trace_params *params,
+ 	config->core_prof = profile_CortexA;
+ }
+ 
++static void cs_etm_decoder__gen_ete_config(struct cs_etm_trace_params *params,
++					   ocsd_ete_cfg *config)
++{
++	config->reg_configr = params->ete.reg_configr;
++	config->reg_traceidr = params->ete.reg_traceidr;
++	config->reg_idr0 = params->ete.reg_idr0;
++	config->reg_idr1 = params->ete.reg_idr1;
++	config->reg_idr2 = params->ete.reg_idr2;
++	config->reg_idr8 = params->ete.reg_idr8;
++	config->reg_devarch = params->ete.reg_devarch;
++	config->arch_ver = ARCH_AA64;
++	config->core_prof = profile_CortexA;
++}
++
+ static void cs_etm_decoder__print_str_cb(const void *p_context,
+ 					 const char *msg,
+ 					 const int str_len)
+@@ -604,6 +618,7 @@ cs_etm_decoder__create_etm_decoder(struct cs_etm_decoder_params *d_params,
+ 	const char *decoder_name;
+ 	ocsd_etmv3_cfg config_etmv3;
+ 	ocsd_etmv4_cfg trace_config_etmv4;
++	ocsd_ete_cfg trace_config_ete;
+ 	void *trace_config;
+ 	u8 csid;
+ 
+@@ -621,6 +636,11 @@ cs_etm_decoder__create_etm_decoder(struct cs_etm_decoder_params *d_params,
+ 		decoder_name = OCSD_BUILTIN_DCD_ETMV4I;
+ 		trace_config = &trace_config_etmv4;
+ 		break;
++	case CS_ETM_PROTO_ETE:
++		cs_etm_decoder__gen_ete_config(t_params, &trace_config_ete);
++		decoder_name = OCSD_BUILTIN_DCD_ETE;
++		trace_config = &trace_config_ete;
++		break;
+ 	default:
+ 		return -1;
+ 	}
+diff --git a/tools/perf/util/cs-etm-decoder/cs-etm-decoder.h b/tools/perf/util/cs-etm-decoder/cs-etm-decoder.h
+index 11f3391d06f2..0102ece5ca3e 100644
+--- a/tools/perf/util/cs-etm-decoder/cs-etm-decoder.h
++++ b/tools/perf/util/cs-etm-decoder/cs-etm-decoder.h
+@@ -37,11 +37,22 @@ struct cs_etmv4_trace_params {
+ 	u32 reg_traceidr;
+ };
+ 
++struct cs_ete_trace_params {
++	u32 reg_idr0;
++	u32 reg_idr1;
++	u32 reg_idr2;
++	u32 reg_idr8;
++	u32 reg_configr;
++	u32 reg_traceidr;
++	u32 reg_devarch;
++};
++
+ struct cs_etm_trace_params {
+ 	int protocol;
+ 	union {
+ 		struct cs_etmv3_trace_params etmv3;
+ 		struct cs_etmv4_trace_params etmv4;
++		struct cs_ete_trace_params ete;
+ 	};
+ };
+ 
+@@ -65,6 +76,7 @@ enum {
+ 	CS_ETM_PROTO_ETMV4i,
+ 	CS_ETM_PROTO_ETMV4d,
+ 	CS_ETM_PROTO_PTM,
++	CS_ETM_PROTO_ETE
+ };
+ 
+ enum cs_etm_decoder_operation {
+diff --git a/tools/perf/util/cs-etm.c b/tools/perf/util/cs-etm.c
+index a1c0a74cc89a..3b9c283e3992 100644
+--- a/tools/perf/util/cs-etm.c
++++ b/tools/perf/util/cs-etm.c
+@@ -460,6 +460,21 @@ static void cs_etm__set_trace_param_etmv4(struct cs_etm_trace_params *t_params,
+ 	t_params[idx].etmv4.reg_traceidr = metadata[idx][CS_ETMV4_TRCTRACEIDR];
+ }
+ 
++static void cs_etm__set_trace_param_ete(struct cs_etm_trace_params *t_params,
++					  struct cs_etm_auxtrace *etm, int idx)
++{
++	u64 **metadata = etm->metadata;
++
++	t_params[idx].protocol = CS_ETM_PROTO_ETE;
++	t_params[idx].ete.reg_idr0 = metadata[idx][CS_ETMV4_TRCIDR0];
++	t_params[idx].ete.reg_idr1 = metadata[idx][CS_ETMV4_TRCIDR1];
++	t_params[idx].ete.reg_idr2 = metadata[idx][CS_ETMV4_TRCIDR2];
++	t_params[idx].ete.reg_idr8 = metadata[idx][CS_ETMV4_TRCIDR8];
++	t_params[idx].ete.reg_configr = metadata[idx][CS_ETMV4_TRCCONFIGR];
++	t_params[idx].ete.reg_traceidr = metadata[idx][CS_ETMV4_TRCTRACEIDR];
++	t_params[idx].ete.reg_devarch = metadata[idx][CS_ETE_TRCDEVARCH];
++}
++
+ static int cs_etm__init_trace_params(struct cs_etm_trace_params *t_params,
+ 				     struct cs_etm_auxtrace *etm,
+ 				     int decoders)
+@@ -479,6 +494,9 @@ static int cs_etm__init_trace_params(struct cs_etm_trace_params *t_params,
+ 		case __perf_cs_etmv4_magic:
+ 			cs_etm__set_trace_param_etmv4(t_params, etm, i);
+ 			break;
++		case __perf_cs_ete_magic:
++			cs_etm__set_trace_param_ete(t_params, etm, i);
++			break;
+ 		default:
+ 			return -EINVAL;
+ 		}
+-- 
+2.33.0
+

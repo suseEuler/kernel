@@ -1,0 +1,192 @@
+From c696de9f12b7ddeddc05d378fc4dc0f66e9a8c95 Mon Sep 17 00:00:00 2001
+From: Andrey Konovalov <andreyknvl@google.com>
+Date: Tue, 22 Dec 2020 12:02:31 -0800
+Subject: [PATCH] kasan: simplify quarantine_put call site
+Git-commit: c696de9f12b7ddeddc05d378fc4dc0f66e9a8c95
+Patch-mainline: v5.11-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+Patch series "kasan: boot parameters for hardware tag-based mode", v4.
+
+=== Overview
+
+Hardware tag-based KASAN mode [1] is intended to eventually be used in
+production as a security mitigation. Therefore there's a need for finer
+control over KASAN features and for an existence of a kill switch.
+
+This patchset adds a few boot parameters for hardware tag-based KASAN that
+allow to disable or otherwise control particular KASAN features, as well
+as provides some initial optimizations for running KASAN in production.
+
+There's another planned patchset what will further optimize hardware
+tag-based KASAN, provide proper benchmarking and tests, and will fully
+enable tag-based KASAN for production use.
+
+Hardware tag-based KASAN relies on arm64 Memory Tagging Extension (MTE)
+[2] to perform memory and pointer tagging. Please see [3] and [4] for
+detailed analysis of how MTE helps to fight memory safety problems.
+
+The features that can be controlled are:
+
+1. Whether KASAN is enabled at all.
+2. Whether KASAN collects and saves alloc/free stacks.
+3. Whether KASAN panics on a detected bug or not.
+
+The patch titled "kasan: add and integrate kasan boot parameters" of this
+series adds a few new boot parameters.
+
+kasan.mode allows to choose one of three main modes:
+
+- kasan.mode=off - KASAN is disabled, no tag checks are performed
+- kasan.mode=prod - only essential production features are enabled
+- kasan.mode=full - all KASAN features are enabled
+
+The chosen mode provides default control values for the features mentioned
+above. However it's also possible to override the default values by
+providing:
+
+- kasan.stacktrace=off/on - enable stacks collection
+                            (default: on for mode=full, otherwise off)
+- kasan.fault=report/panic - only report tag fault or also panic
+                             (default: report)
+
+If kasan.mode parameter is not provided, it defaults to full when
+CONFIG_DEBUG_KERNEL is enabled, and to prod otherwise.
+
+It is essential that switching between these modes doesn't require
+rebuilding the kernel with different configs, as this is required by
+the Android GKI (Generic Kernel Image) initiative.
+
+=== Benchmarks
+
+For now I've only performed a few simple benchmarks such as measuring
+kernel boot time and slab memory usage after boot. There's an upcoming
+patchset which will optimize KASAN further and include more detailed
+benchmarking results.
+
+The benchmarks were performed in QEMU and the results below exclude the
+slowdown caused by QEMU memory tagging emulation (as it's different from
+the slowdown that will be introduced by hardware and is therefore
+irrelevant).
+
+KASAN_HW_TAGS=y + kasan.mode=off introduces no performance or memory
+impact compared to KASAN_HW_TAGS=n.
+
+kasan.mode=prod (manually excluding tagging) introduces 3% of performance
+and no memory impact (except memory used by hardware to store tags)
+compared to kasan.mode=off.
+
+kasan.mode=full has about 40% performance and 30% memory impact over
+kasan.mode=prod. Both come from alloc/free stack collection.
+
+=== Notes
+
+This patchset is available here:
+
+https://github.com/xairy/linux/tree/up-boot-mte-v4
+
+This patchset is based on v11 of "kasan: add hardware tag-based mode for
+arm64" patchset [1].
+
+For testing in QEMU hardware tag-based KASAN requires:
+
+1. QEMU built from master [6] (use "-machine virt,mte=on -cpu max" arguments
+   to run).
+2. GCC version 10.
+
+[1] https://lore.kernel.org/linux-arm-kernel/cover.1606161801.git.andreyknvl@google.com/T/#t
+[2] https://community.arm.com/developer/ip-products/processors/b/processors-ip-blog/posts/enhancing-memory-safety
+[3] https://arxiv.org/pdf/1802.09517.pdf
+[4] https://github.com/microsoft/MSRC-Security-Research/blob/master/papers/2020/Security%20analysis%20of%20memory%20tagging.pdf
+[5] https://source.android.com/devices/architecture/kernel/generic-kernel-image
+[6] https://github.com/qemu/qemu
+
+=== Tags
+
+Tested-by: Vincenzo Frascino <vincenzo.frascino@arm.com>
+
+This patch (of 19):
+
+Move get_free_info() call into quarantine_put() to simplify the call site.
+
+No functional changes.
+
+Link: https://lkml.kernel.org/r/cover.1606162397.git.andreyknvl@google.com
+Link: https://lkml.kernel.org/r/312d0a3ef92cc6dc4fa5452cbc1714f9393ca239.1606162397.git.andreyknvl@google.com
+Link: https://linux-review.googlesource.com/id/Iab0f04e7ebf8d83247024b7190c67c3c34c7940f
+Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+Reviewed-by: Dmitry Vyukov <dvyukov@google.com>
+Reviewed-by: Marco Elver <elver@google.com>
+Tested-by: Vincenzo Frascino <vincenzo.frascino@arm.com>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Will Deacon <will.deacon@arm.com>
+Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Evgenii Stepanov <eugenis@google.com>
+Cc: Branislav Rankov <Branislav.Rankov@arm.com>
+Cc: Kevin Brodsky <kevin.brodsky@arm.com>
+Cc: Vasily Gorbik <gor@linux.ibm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/kasan/common.c     | 2 +-
+ mm/kasan/kasan.h      | 5 ++---
+ mm/kasan/quarantine.c | 3 ++-
+ 3 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/mm/kasan/common.c b/mm/kasan/common.c
+index 02613883846e..34a9d4a8a5ff 100644
+--- a/mm/kasan/common.c
++++ b/mm/kasan/common.c
+@@ -313,7 +313,7 @@ static bool __kasan_slab_free(struct kmem_cache *cache, void *object,
+ 
+ 	kasan_set_free_info(cache, object, tag);
+ 
+-	quarantine_put(get_free_info(cache, object), cache);
++	quarantine_put(cache, object);
+ 
+ 	return IS_ENABLED(CONFIG_KASAN_GENERIC);
+ }
+diff --git a/mm/kasan/kasan.h b/mm/kasan/kasan.h
+index 64560cc71191..13c511e85d5f 100644
+--- a/mm/kasan/kasan.h
++++ b/mm/kasan/kasan.h
+@@ -216,12 +216,11 @@ struct kasan_track *kasan_get_free_track(struct kmem_cache *cache,
+ 
+ #if defined(CONFIG_KASAN_GENERIC) && \
+ 	(defined(CONFIG_SLAB) || defined(CONFIG_SLUB))
+-void quarantine_put(struct kasan_free_meta *info, struct kmem_cache *cache);
++void quarantine_put(struct kmem_cache *cache, void *object);
+ void quarantine_reduce(void);
+ void quarantine_remove_cache(struct kmem_cache *cache);
+ #else
+-static inline void quarantine_put(struct kasan_free_meta *info,
+-				struct kmem_cache *cache) { }
++static inline void quarantine_put(struct kmem_cache *cache, void *object) { }
+ static inline void quarantine_reduce(void) { }
+ static inline void quarantine_remove_cache(struct kmem_cache *cache) { }
+ #endif
+diff --git a/mm/kasan/quarantine.c b/mm/kasan/quarantine.c
+index 693b05e2c2aa..88fab9ff2d6e 100644
+--- a/mm/kasan/quarantine.c
++++ b/mm/kasan/quarantine.c
+@@ -163,11 +163,12 @@ static void qlist_free_all(struct qlist_head *q, struct kmem_cache *cache)
+ 	qlist_init(q);
+ }
+ 
+-void quarantine_put(struct kasan_free_meta *info, struct kmem_cache *cache)
++void quarantine_put(struct kmem_cache *cache, void *object)
+ {
+ 	unsigned long flags;
+ 	struct qlist_head *q;
+ 	struct qlist_head temp = QLIST_INIT;
++	struct kasan_free_meta *info = get_free_info(cache, object);
+ 
+ 	/*
+ 	 * Note: irq must be disabled until after we move the batch to the
+-- 
+2.33.0
+

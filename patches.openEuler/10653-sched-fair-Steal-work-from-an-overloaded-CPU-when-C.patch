@@ -6,6 +6,7 @@ Subject: [PATCH] sched/fair: Steal work from an overloaded CPU when CPU goes
 Patch-mainline: Not yet, from openEuler
 References: bsn#22
 openEuler-commit: 6864cf0161bad8aafc8d4d3a9db9d37115d71aa7
+Modified-by-Sel: Yes, refreshed due to different context
 
 
 hulk inclusion
@@ -217,15 +218,13 @@ Reviewed-by: Chen Hui <judy.chenhui@huawei.com>
 Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
 Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
 ---
- kernel/sched/fair.c     | 164 ++++++++++++++++++++++++++++++++++++++--
- kernel/sched/features.h |   6 ++
+ kernel/sched/fair.c     |  164 ++++++++++++++++++++++++++++++++++++++++++++++--
+ kernel/sched/features.h |    6 +
  2 files changed, 165 insertions(+), 5 deletions(-)
 
-diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index f44da26d09f0..aeaa954de4aa 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
-@@ -4113,6 +4113,9 @@ static void overload_clear(struct rq *rq)
+@@ -4108,6 +4108,9 @@ static void overload_set(struct rq *rq)
  {
  	struct sparsemask *overload_cpus;
  
@@ -235,17 +234,7 @@ index f44da26d09f0..aeaa954de4aa 100644
  	rcu_read_lock();
  	overload_cpus = rcu_dereference(rq->cfs_overload_cpus);
  	if (overload_cpus)
-@@ -4124,6 +4127,9 @@ static void overload_set(struct rq *rq)
- {
- 	struct sparsemask *overload_cpus;
- 
-+	if (!sched_feat(STEAL))
-+		return;
-+
- 	rcu_read_lock();
- 	overload_cpus = rcu_dereference(rq->cfs_overload_cpus);
- 	if (overload_cpus)
-@@ -4131,6 +4137,8 @@ static void overload_set(struct rq *rq)
+@@ -4115,6 +4118,8 @@ static void overload_set(struct rq *rq)
  	rcu_read_unlock();
  }
  
@@ -254,7 +243,17 @@ index f44da26d09f0..aeaa954de4aa 100644
  #else /* CONFIG_SMP */
  
  #define UPDATE_TG	0x0
-@@ -7357,21 +7365,23 @@ done: __maybe_unused;
+@@ -4981,6 +4986,9 @@ static void distribute_cfs_runtime(struc
+ 	struct cfs_rq *cfs_rq;
+ 	u64 runtime, remaining = 1;
+ 
++	if (!sched_feat(STEAL))
++		return;
++
+ 	rcu_read_lock();
+ 	list_for_each_entry_rcu(cfs_rq, &cfs_b->throttled_cfs_rq,
+ 				throttled_list) {
+@@ -7415,21 +7423,23 @@ idle:
  		return NULL;
  
  	/*
@@ -283,7 +282,7 @@ index f44da26d09f0..aeaa954de4aa 100644
  	 */
  	if (new_tasks < 0)
  		return RETRY_TASK;
-@@ -10998,6 +11008,150 @@ void trigger_load_balance(struct rq *rq)
+@@ -11097,6 +11107,150 @@ void trigger_load_balance(struct rq *rq)
  	nohz_balancer_kick(rq);
  }
  
@@ -299,7 +298,7 @@ index f44da26d09f0..aeaa954de4aa 100644
 +	struct task_struct *p;
 +	struct rq *rq = rq_of(cfs_rq);
 +
-+	lockdep_assert_held(&rq_of(cfs_rq)->lock);
++	lockdep_assert_rq_held(rq_of(cfs_rq));
 +
 +	list_for_each_entry_reverse(p, &rq->cfs_tasks, se.group_node) {
 +		if (can_migrate_task_llc(p, rq, dst_rq)) {
@@ -331,7 +330,7 @@ index f44da26d09f0..aeaa954de4aa 100644
 +
 +	if (*locked) {
 +		rq_unpin_lock(dst_rq, dst_rf);
-+		raw_spin_unlock(&dst_rq->lock);
++		raw_spin_rq_unlock(dst_rq);
 +		*locked = false;
 +	}
 +	rq_lock_irqsave(src_rq, &rf);
@@ -345,7 +344,7 @@ index f44da26d09f0..aeaa954de4aa 100644
 +	rq_unlock(src_rq, &rf);
 +
 +	if (p) {
-+		raw_spin_lock(&dst_rq->lock);
++		raw_spin_rq_lock(dst_rq);
 +		rq_repin_lock(dst_rq, dst_rf);
 +		*locked = true;
 +		update_rq_clock(dst_rq);
@@ -422,7 +421,7 @@ index f44da26d09f0..aeaa954de4aa 100644
 +out:
 +	rcu_read_unlock();
 +	if (!locked) {
-+		raw_spin_lock(&dst_rq->lock);
++		raw_spin_rq_lock(dst_rq);
 +		rq_repin_lock(dst_rq, dst_rf);
 +	}
 +	stolen |= (dst_rq->cfs.h_nr_running > 0);
@@ -434,23 +433,18 @@ index f44da26d09f0..aeaa954de4aa 100644
  static void rq_online_fair(struct rq *rq)
  {
  	update_sysctl();
-diff --git a/kernel/sched/features.h b/kernel/sched/features.h
-index 129ca8f50cf5..98925e29b1b9 100644
 --- a/kernel/sched/features.h
 +++ b/kernel/sched/features.h
-@@ -56,6 +56,12 @@ SCHED_FEAT(TTWU_QUEUE, true)
-  */
- SCHED_FEAT(SIS_PROP, true)
+@@ -58,6 +58,12 @@ SCHED_FEAT(SIS_PROP, false)
+ SCHED_FEAT(SIS_UTIL, true)
  
-+/*
+ /*
 + * Steal a CFS task from another CPU when going idle.
 + * Improves CPU utilization.
 + */
 +SCHED_FEAT(STEAL, true)
 +
- /*
++/*
   * Issue a WARN when we do multiple update_rq_clock() calls
   * in a single rq->lock section. Default disabled because the
--- 
-2.26.2
-
+  * annotations are not complete.

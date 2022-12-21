@@ -1,0 +1,120 @@
+From c803b3c8b3b70f306ee6300bf8acdd70ffd1441a Mon Sep 17 00:00:00 2001
+From: Mike Rapoport <rppt@linux.ibm.com>
+Date: Thu, 2 Sep 2021 14:58:02 -0700
+Subject: [PATCH] mm: introduce memmap_alloc() to unify memory map allocation
+Git-commit: c803b3c8b3b70f306ee6300bf8acdd70ffd1441a
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified per openEuler commit 25837227
+
+
+There are several places that allocate memory for the memory map:
+alloc_node_mem_map() for FLATMEM, sparse_buffer_init() and
+__populate_section_memmap() for SPARSEMEM.
+
+The memory allocated in the FLATMEM case is zeroed and it is never
+poisoned, regardless of CONFIG_PAGE_POISON setting.
+
+The memory allocated in the SPARSEMEM cases is not zeroed and it is
+implicitly poisoned inside memblock if CONFIG_PAGE_POISON is set.
+
+Introduce memmap_alloc() wrapper for memblock allocators that will be used
+for both FLATMEM and SPARSEMEM cases and will makei memory map zeroing and
+poisoning consistent for different memory models.
+
+Link: https://lkml.kernel.org/r/20210714123739.16493-4-rppt@kernel.org
+Signed-off-by: Mike Rapoport <rppt@linux.ibm.com>
+Cc: Michal Simek <monstr@monstr.eu>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/internal.h   |  4 ++++
+ mm/page_alloc.c | 24 ++++++++++++++++++++++--
+ mm/sparse.c     |  6 ++----
+ 3 files changed, 28 insertions(+), 6 deletions(-)
+
+diff --git a/mm/internal.h b/mm/internal.h
+index 917b86b2870c..8ef8cdd929fa 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -208,6 +208,10 @@ extern void zone_pcp_reset(struct zone *zone);
+ extern void zone_pcp_disable(struct zone *zone);
+ extern void zone_pcp_enable(struct zone *zone);
+ 
++extern void *memmap_alloc(phys_addr_t size, phys_addr_t align,
++			  phys_addr_t min_addr,
++			  int nid, bool exact_nid);
++
+ #if defined CONFIG_COMPACTION || defined CONFIG_CMA
+ 
+ /*
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index d6085d48cb63..ff6fffec8770 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -6564,6 +6564,26 @@ void __meminit __weak arch_memmap_init(unsigned long size, int nid,
+ {
+ }
+ 
++void __init *memmap_alloc(phys_addr_t size, phys_addr_t align,
++			  phys_addr_t min_addr, int nid, bool exact_nid)
++{
++	void *ptr;
++
++	if (exact_nid)
++		ptr = memblock_alloc_exact_nid_raw(size, align, min_addr,
++						   MEMBLOCK_ALLOC_ACCESSIBLE,
++						   nid);
++	else
++		ptr = memblock_alloc_try_nid_raw(size, align, min_addr,
++						 MEMBLOCK_ALLOC_ACCESSIBLE,
++						 nid);
++
++	if (ptr && size > 0)
++		page_init_poison(ptr, size);
++
++	return ptr;
++}
++
+ static int zone_batchsize(struct zone *zone)
+ {
+ #ifdef CONFIG_MMU
+@@ -7297,8 +7317,8 @@ static void __ref alloc_node_mem_map(struct pglist_data *pgdat)
+ 		end = pgdat_end_pfn(pgdat);
+ 		end = ALIGN(end, MAX_ORDER_NR_PAGES);
+ 		size =  (end - start) * sizeof(struct page);
+-		map = memblock_alloc_node(size, SMP_CACHE_BYTES,
+-					  pgdat->node_id);
++		map = memmap_alloc(size, SMP_CACHE_BYTES, MEMBLOCK_LOW_LIMIT,
++				   pgdat->node_id, false);
+ 		if (!map)
+ 			panic("Failed to allocate %ld bytes for node %d memory map\n",
+ 			      size, pgdat->node_id);
+diff --git a/mm/sparse.c b/mm/sparse.c
+index 5a48ea3e9968..d92a29000d66 100644
+--- a/mm/sparse.c
++++ b/mm/sparse.c
+@@ -453,8 +453,7 @@ struct page __init *__populate_section_memmap(unsigned long pfn,
+ 	if (map)
+ 		return map;
+ 
+-	map = memblock_alloc_try_nid_raw(size, size, addr,
+-					  MEMBLOCK_ALLOC_ACCESSIBLE, nid);
++	map = memmap_alloc(size, size, addr, nid, false);
+ 	if (!map)
+ 		panic("%s: Failed to allocate %lu bytes align=0x%lx nid=%d from=%pa\n",
+ 		      __func__, size, PAGE_SIZE, nid, &addr);
+@@ -481,8 +480,7 @@ static void __init sparse_buffer_init(unsigned long size, int nid)
+ 	 * and we want it to be properly aligned to the section size - this is
+ 	 * especially the case for VMEMMAP which maps memmap to PMDs
+ 	 */
+-	sparsemap_buf = memblock_alloc_exact_nid_raw(size, section_map_size(),
+-					addr, MEMBLOCK_ALLOC_ACCESSIBLE, nid);
++	sparsemap_buf = memmap_alloc(size, section_map_size(), addr, nid, true);
+ 	sparsemap_buf_end = sparsemap_buf + size;
+ }
+ 
+-- 
+2.33.0
+

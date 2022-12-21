@@ -1,0 +1,265 @@
+From 78f39084b41d287aedb2ea55f2c1895cfa11d61a Mon Sep 17 00:00:00 2001
+From: Muchun Song <songmuchun@bytedance.com>
+Date: Fri, 13 May 2022 16:48:56 -0700
+Subject: [PATCH] mm: hugetlb_vmemmap: add hugetlb_optimize_vmemmap sysctl
+Git-commit: 78f39084b41d287aedb2ea55f2c1895cfa11d61a
+Patch-mainline: v5.19-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified per openEuler commit 6b2239c2
+
+
+We must add hugetlb_free_vmemmap=on (or "off") to the boot cmdline and
+reboot the server to enable or disable the feature of optimizing vmemmap
+pages associated with HugeTLB pages.  However, rebooting usually takes a
+long time.  So add a sysctl to enable or disable the feature at runtime
+without rebooting.  Why we need this?  There are 3 use cases.
+
+1) The feature of minimizing overhead of struct page associated with
+   each HugeTLB is disabled by default without passing
+   "hugetlb_free_vmemmap=on" to the boot cmdline.  When we (ByteDance)
+   deliver the servers to the users who want to enable this feature, they
+   have to configure the grub (change boot cmdline) and reboot the
+   servers, whereas rebooting usually takes a long time (we have thousands
+   of servers).  It's a very bad experience for the users.  So we need a
+   approach to enable this feature after rebooting.  This is a use case in
+   our practical environment.
+
+2) Some use cases are that HugeTLB pages are allocated 'on the fly'
+   instead of being pulled from the HugeTLB pool, those workloads would be
+   affected with this feature enabled.  Those workloads could be
+   identified by the characteristics of they never explicitly allocating
+   huge pages with 'nr_hugepages' but only set 'nr_overcommit_hugepages'
+   and then let the pages be allocated from the buddy allocator at fault
+   time.  We can confirm it is a real use case from the commit
+   099730d67417.  For those workloads, the page fault time could be ~2x
+   slower than before.  We suspect those users want to disable this
+   feature if the system has enabled this before and they don't think the
+   memory savings benefit is enough to make up for the performance drop.
+
+3) If the workload which wants vmemmap pages to be optimized and the
+   workload which wants to set 'nr_overcommit_hugepages' and does not want
+   the extera overhead at fault time when the overcommitted pages be
+   allocated from the buddy allocator are deployed in the same server.
+   The user could enable this feature and set 'nr_hugepages' and
+   'nr_overcommit_hugepages', then disable the feature.  In this case, the
+   overcommited HugeTLB pages will not encounter the extra overhead at
+   fault time.
+
+Link: https://lkml.kernel.org/r/20220512041142.39501-5-songmuchun@bytedance.com
+Signed-off-by: Muchun Song <songmuchun@bytedance.com>
+Reviewed-by: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Luis Chamberlain <mcgrof@kernel.org>
+Cc: Kees Cook <keescook@chromium.org>
+Cc: Iurii Zaikin <yzaikin@google.com>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Masahiro Yamada <masahiroy@kernel.org>
+Cc: Xiongchun Duan <duanxiongchun@bytedance.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ Documentation/admin-guide/sysctl/vm.rst | 39 +++++++++++
+ mm/hugetlb_vmemmap.c                    | 92 ++++++++++++++++++++++---
+ 2 files changed, 122 insertions(+), 9 deletions(-)
+
+diff --git a/Documentation/admin-guide/sysctl/vm.rst b/Documentation/admin-guide/sysctl/vm.rst
+index a5fbef4740c2..5de629b932ae 100644
+--- a/Documentation/admin-guide/sysctl/vm.rst
++++ b/Documentation/admin-guide/sysctl/vm.rst
+@@ -560,6 +560,45 @@ Change the minimum size of the hugepage pool.
+ See Documentation/admin-guide/mm/hugetlbpage.rst
+ 
+ 
++hugetlb_optimize_vmemmap
++========================
++
++This knob is not available when memory_hotplug.memmap_on_memory (kernel parameter)
++is configured or the size of 'struct page' (a structure defined in
++include/linux/mm_types.h) is not power of two (an unusual system config could
++result in this).
++
++Enable (set to 1) or disable (set to 0) the feature of optimizing vmemmap pages
++associated with each HugeTLB page.
++
++Once enabled, the vmemmap pages of subsequent allocation of HugeTLB pages from
++buddy allocator will be optimized (7 pages per 2MB HugeTLB page and 4095 pages
++per 1GB HugeTLB page), whereas already allocated HugeTLB pages will not be
++optimized.  When those optimized HugeTLB pages are freed from the HugeTLB pool
++to the buddy allocator, the vmemmap pages representing that range needs to be
++remapped again and the vmemmap pages discarded earlier need to be rellocated
++again.  If your use case is that HugeTLB pages are allocated 'on the fly' (e.g.
++never explicitly allocating HugeTLB pages with 'nr_hugepages' but only set
++'nr_overcommit_hugepages', those overcommitted HugeTLB pages are allocated 'on
++the fly') instead of being pulled from the HugeTLB pool, you should weigh the
++benefits of memory savings against the more overhead (~2x slower than before)
++of allocation or freeing HugeTLB pages between the HugeTLB pool and the buddy
++allocator.  Another behavior to note is that if the system is under heavy memory
++pressure, it could prevent the user from freeing HugeTLB pages from the HugeTLB
++pool to the buddy allocator since the allocation of vmemmap pages could be
++failed, you have to retry later if your system encounter this situation.
++
++Once disabled, the vmemmap pages of subsequent allocation of HugeTLB pages from
++buddy allocator will not be optimized meaning the extra overhead at allocation
++time from buddy allocator disappears, whereas already optimized HugeTLB pages
++will not be affected.  If you want to make sure there are no optimized HugeTLB
++pages, you can set "nr_hugepages" to 0 first and then disable this.  Note that
++writing 0 to nr_hugepages will make any "in use" HugeTLB pages become surplus
++pages.  So, those surplus pages are still optimized until they are no longer
++in use.  You would need to wait for those surplus pages to be released before
++there are no optimized pages in the system.
++
++
+ nr_hugepages_mempolicy
+ ======================
+ 
+diff --git a/mm/hugetlb_vmemmap.c b/mm/hugetlb_vmemmap.c
+index 112e74504905..4340bf6c5551 100644
+--- a/mm/hugetlb_vmemmap.c
++++ b/mm/hugetlb_vmemmap.c
+@@ -188,21 +188,40 @@
+ #define RESERVE_VMEMMAP_NR		1U
+ #define RESERVE_VMEMMAP_SIZE		(RESERVE_VMEMMAP_NR << PAGE_SHIFT)
+ 
++enum vmemmap_optimize_mode {
++	VMEMMAP_OPTIMIZE_OFF,
++	VMEMMAP_OPTIMIZE_ON,
++};
++
+ DEFINE_STATIC_KEY_MAYBE(CONFIG_HUGETLB_PAGE_OPTIMIZE_VMEMMAP_DEFAULT_ON,
+ 			hugetlb_optimize_vmemmap_key);
+ EXPORT_SYMBOL(hugetlb_optimize_vmemmap_key);
+ 
++static enum vmemmap_optimize_mode vmemmap_optimize_mode =
++	IS_ENABLED(CONFIG_HUGETLB_PAGE_FREE_VMEMMAP_DEFAULT_ON);
++
++static void vmemmap_optimize_mode_switch(enum vmemmap_optimize_mode to)
++{
++	if (vmemmap_optimize_mode == to)
++		return;
++
++	if (to == VMEMMAP_OPTIMIZE_OFF)
++		static_branch_dec(&hugetlb_optimize_vmemmap_key);
++	else
++		static_branch_inc(&hugetlb_optimize_vmemmap_key);
++	WRITE_ONCE(vmemmap_optimize_mode, to);
++}
++
+ static int __init hugetlb_vmemmap_early_param(char *buf)
+ {
+ 	bool enable;
++	enum vmemmap_optimize_mode mode;
+ 
+ 	if (kstrtobool(buf, &enable))
+ 		return -EINVAL;
+ 
+-	if (enable)
+-		static_branch_enable(&hugetlb_optimize_vmemmap_key);
+-	else
+-		static_branch_disable(&hugetlb_optimize_vmemmap_key);
++	mode = enable ? VMEMMAP_OPTIMIZE_ON : VMEMMAP_OPTIMIZE_OFF;
++	vmemmap_optimize_mode_switch(mode);
+ 
+ 	return 0;
+ }
+@@ -235,8 +254,10 @@ int hugetlb_vmemmap_alloc(struct hstate *h, struct page *head)
+ 	 */
+ 	ret = vmemmap_remap_alloc(vmemmap_addr, vmemmap_end, vmemmap_reuse,
+ 				  GFP_KERNEL | __GFP_NORETRY | __GFP_THISNODE);
+-	if (!ret)
++	if (!ret) {
+ 		ClearHPageVmemmapOptimized(head);
++		static_branch_dec(&hugetlb_optimize_vmemmap_key);
++	}
+ 
+ 	return ret;
+ }
+@@ -250,6 +271,11 @@ void hugetlb_vmemmap_free(struct hstate *h, struct page *head)
+ 	if (!vmemmap_pages)
+ 		return;
+ 
++	if (READ_ONCE(vmemmap_optimize_mode) == VMEMMAP_OPTIMIZE_OFF)
++		return;
++
++	static_branch_inc(&hugetlb_optimize_vmemmap_key);
++
+ 	vmemmap_addr	+= RESERVE_VMEMMAP_SIZE;
+ 	vmemmap_end	= vmemmap_addr + (vmemmap_pages << PAGE_SHIFT);
+ 	vmemmap_reuse	= vmemmap_addr - PAGE_SIZE;
+@@ -259,7 +285,9 @@ void hugetlb_vmemmap_free(struct hstate *h, struct page *head)
+ 	 * to the page which @vmemmap_reuse is mapped to, then free the pages
+ 	 * which the range [@vmemmap_addr, @vmemmap_end] is mapped to.
+ 	 */
+-	if (!vmemmap_remap_free(vmemmap_addr, vmemmap_end, vmemmap_reuse))
++	if (vmemmap_remap_free(vmemmap_addr, vmemmap_end, vmemmap_reuse))
++		static_branch_dec(&hugetlb_optimize_vmemmap_key);
++	else
+ 		SetHPageVmemmapOptimized(head);
+ }
+ 
+@@ -276,9 +304,6 @@ void __init hugetlb_vmemmap_init(struct hstate *h)
+ 	BUILD_BUG_ON(__NR_USED_SUBPAGE >=
+ 		     RESERVE_VMEMMAP_SIZE / sizeof(struct page));
+ 
+-	if (!hugetlb_optimize_vmemmap_enabled())
+-		return;
+-
+ 	if (!is_power_of_2(sizeof(struct page))) {
+ 		pr_warn_once("cannot optimize vmemmap pages because \"struct page\" crosses page boundaries\n");
+ 		static_branch_disable(&hugetlb_optimize_vmemmap_key);
+@@ -300,3 +325,52 @@ void __init hugetlb_vmemmap_init(struct hstate *h)
+ 	pr_info("can optimize %d vmemmap pages for %s\n",
+ 		h->optimize_vmemmap_pages, h->name);
+ }
++
++#ifdef CONFIG_PROC_SYSCTL
++static int hugetlb_optimize_vmemmap_handler(struct ctl_table *table, int write,
++					    void *buffer, size_t *length,
++					    loff_t *ppos)
++{
++	int ret;
++	enum vmemmap_optimize_mode mode;
++	static DEFINE_MUTEX(sysctl_mutex);
++
++	if (write && !capable(CAP_SYS_ADMIN))
++		return -EPERM;
++
++	mutex_lock(&sysctl_mutex);
++	mode = vmemmap_optimize_mode;
++	table->data = &mode;
++	ret = proc_dointvec_minmax(table, write, buffer, length, ppos);
++	if (write && !ret)
++		vmemmap_optimize_mode_switch(mode);
++	mutex_unlock(&sysctl_mutex);
++
++	return ret;
++}
++
++static struct ctl_table hugetlb_vmemmap_sysctls[] = {
++	{
++		.procname	= "hugetlb_optimize_vmemmap",
++		.maxlen		= sizeof(enum vmemmap_optimize_mode),
++		.mode		= 0644,
++		.proc_handler	= hugetlb_optimize_vmemmap_handler,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
++	},
++	{ }
++};
++
++static __init int hugetlb_vmemmap_sysctls_init(void)
++{
++	/*
++	 * If "memory_hotplug.memmap_on_memory" is enabled or "struct page"
++	 * crosses page boundaries, the vmemmap pages cannot be optimized.
++	 */
++	if (is_power_of_2(sizeof(struct page)))
++		register_sysctl_init("vm", hugetlb_vmemmap_sysctls);
++
++	return 0;
++}
++late_initcall(hugetlb_vmemmap_sysctls_init);
++#endif /* CONFIG_PROC_SYSCTL */
+-- 
+2.33.0
+

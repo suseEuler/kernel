@@ -1,0 +1,97 @@
+From 0da8aa00bfcfeb3f4e6537dd8e2001e0727ba549 Mon Sep 17 00:00:00 2001
+From: Sun Shouxin <sunshouxin@chinatelecom.cn>
+Date: Fri, 28 Jan 2022 09:44:42 -0500
+Subject: [PATCH] net: bonding: Add support for IPV6 ns/na to
+ balance-alb/balance-tlb mode
+Git-commit: 0da8aa00bfcfeb3f4e6537dd8e2001e0727ba549
+Patch-mainline: v5.18-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified per openEuler commit cd268427
+
+
+Since ipv6 neighbor solicitation and advertisement messages
+isn't handled gracefully in bond6 driver, we can see packet
+drop due to inconsistency between mac address in the option
+message and source MAC .
+
+Another examples is ipv6 neighbor solicitation and advertisement
+messages from VM via tap attached to host bridge, the src mac
+might be changed through balance-alb mode, but it is not synced
+with Link-layer address in the option message.
+
+The patch implements bond6's tx handle for ipv6 neighbor
+solicitation and advertisement messages.
+
+Suggested-by: Hu Yadi <huyd12@chinatelecom.cn>
+Acked-by: Jay Vosburgh <jay.vosburgh@canonical.com>
+Signed-off-by: Sun Shouxin <sunshouxin@chinatelecom.cn>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/net/bonding/bond_alb.c | 30 ++++++++++++++++++++++++++++--
+ 1 file changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/bonding/bond_alb.c b/drivers/net/bonding/bond_alb.c
+index 0436aef9c9ef..c540a8fe9d01 100644
+--- a/drivers/net/bonding/bond_alb.c
++++ b/drivers/net/bonding/bond_alb.c
+@@ -1268,6 +1268,27 @@ static int alb_set_mac_address(struct bonding *bond, void *addr)
+ 	return res;
+ }
+ 
++/* determine if the packet is NA or NS */
++static bool alb_determine_nd(struct sk_buff *skb, struct bonding *bond)
++{
++	struct ipv6hdr *ip6hdr;
++	struct icmp6hdr *hdr;
++
++	if (!pskb_network_may_pull(skb, sizeof(*ip6hdr)))
++		return true;
++
++	ip6hdr = ipv6_hdr(skb);
++	if (ip6hdr->nexthdr != IPPROTO_ICMPV6)
++		return false;
++
++	if (!pskb_network_may_pull(skb, sizeof(*ip6hdr) + sizeof(*hdr)))
++		return true;
++
++	hdr = icmp6_hdr(skb);
++	return hdr->icmp6_type == NDISC_NEIGHBOUR_ADVERTISEMENT ||
++		hdr->icmp6_type == NDISC_NEIGHBOUR_SOLICITATION;
++}
++
+ /************************ exported alb funcions ************************/
+ 
+ int bond_alb_initialize(struct bonding *bond, int rlb_enabled)
+@@ -1347,10 +1368,13 @@ struct slave *bond_xmit_tlb_slave_get(struct bonding *bond,
+ 	/* Do not TX balance any multicast or broadcast */
+ 	if (!is_multicast_ether_addr(eth_data->h_dest)) {
+ 		switch (skb->protocol) {
++		 case htons(ETH_P_IPV6):
++			if (alb_determine_nd(skb, bond))
++				break;
++			fallthrough;
+ 		case htons(ETH_P_IP):
+ 		case htons(ETH_P_IPX):
+ 		    /* In case of IPX, it will falback to L2 hash */
+-		case htons(ETH_P_IPV6):
+ 			hash_index = bond_xmit_hash(bond, skb);
+ 			if (bond->params.tlb_dynamic_lb) {
+ 				tx_slave = tlb_choose_channel(bond,
+@@ -1433,10 +1457,12 @@ struct slave *bond_xmit_alb_slave_get(struct bonding *bond,
+ 			break;
+ 		}
+ 
+-		if (!pskb_network_may_pull(skb, sizeof(*ip6hdr))) {
++		if (alb_determine_nd(skb, bond)) {
+ 			do_tx_balance = false;
+ 			break;
+ 		}
++
++		/* The IPv6 header is pulled by alb_determine_nd */
+ 		/* Additionally, DAD probes should not be tx-balanced as that
+ 		 * will lead to false positives for duplicate addresses and
+ 		 * prevent address configuration from working.
+-- 
+2.33.0
+

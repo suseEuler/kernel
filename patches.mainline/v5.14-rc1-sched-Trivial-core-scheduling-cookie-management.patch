@@ -1,0 +1,241 @@
+From 6e33cad0af49336952e5541464bd02f5b5fd433e Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Fri, 26 Mar 2021 18:55:06 +0100
+Subject: [PATCH] sched: Trivial core scheduling cookie management
+Git-commit: 6e33cad0af49336952e5541464bd02f5b5fd433e
+Patch-mainline: v5.14-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+In order to not have to use pid_struct, create a new, smaller,
+structure to manage task cookies for core scheduling.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Tested-by: Don Hiatt <dhiatt@digitalocean.com>
+Tested-by: Hongyu Ning <hongyu.ning@linux.intel.com>
+Tested-by: Vincent Guittot <vincent.guittot@linaro.org>
+Link: https://lkml.kernel.org/r/20210422123308.919768100@infradead.org
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/sched.h     |   6 +++
+ kernel/fork.c             |   1 +
+ kernel/sched/Makefile     |   1 +
+ kernel/sched/core.c       |   7 +--
+ kernel/sched/core_sched.c | 109 ++++++++++++++++++++++++++++++++++++++
+ kernel/sched/sched.h      |  16 ++++++
+ 6 files changed, 137 insertions(+), 3 deletions(-)
+ create mode 100644 kernel/sched/core_sched.c
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 9b822e383212..eab3f7c4251b 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -2179,4 +2179,10 @@ int sched_trace_rq_nr_running(struct rq *rq);
+ 
+ const struct cpumask *sched_trace_rd_span(struct root_domain *rd);
+ 
++#ifdef CONFIG_SCHED_CORE
++extern void sched_core_free(struct task_struct *tsk);
++#else
++static inline void sched_core_free(struct task_struct *tsk) { }
++#endif
++
+ #endif
+diff --git a/kernel/fork.c b/kernel/fork.c
+index dc06afd725cb..d16c60c9daca 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -742,6 +742,7 @@ void __put_task_struct(struct task_struct *tsk)
+ 	exit_creds(tsk);
+ 	delayacct_tsk_free(tsk);
+ 	put_signal_struct(tsk->signal);
++	sched_core_free(tsk);
+ 
+ 	if (!profile_handoff_task(tsk))
+ 		free_task(tsk);
+diff --git a/kernel/sched/Makefile b/kernel/sched/Makefile
+index 5fc9c9b70862..978fcfca5871 100644
+--- a/kernel/sched/Makefile
++++ b/kernel/sched/Makefile
+@@ -36,3 +36,4 @@ obj-$(CONFIG_CPU_FREQ_GOV_SCHEDUTIL) += cpufreq_schedutil.o
+ obj-$(CONFIG_MEMBARRIER) += membarrier.o
+ obj-$(CONFIG_CPU_ISOLATION) += isolation.o
+ obj-$(CONFIG_PSI) += psi.o
++obj-$(CONFIG_SCHED_CORE) += core_sched.o
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index b4988887510f..55b2d9399e12 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -167,7 +167,7 @@ static inline int rb_sched_core_cmp(const void *key, const struct rb_node *node)
+ 	return 0;
+ }
+ 
+-static void sched_core_enqueue(struct rq *rq, struct task_struct *p)
++void sched_core_enqueue(struct rq *rq, struct task_struct *p)
+ {
+ 	rq->core->core_task_seq++;
+ 
+@@ -177,14 +177,15 @@ static void sched_core_enqueue(struct rq *rq, struct task_struct *p)
+ 	rb_add(&p->core_node, &rq->core_tree, rb_sched_core_less);
+ }
+ 
+-static void sched_core_dequeue(struct rq *rq, struct task_struct *p)
++void sched_core_dequeue(struct rq *rq, struct task_struct *p)
+ {
+ 	rq->core->core_task_seq++;
+ 
+-	if (!p->core_cookie)
++	if (!sched_core_enqueued(p))
+ 		return;
+ 
+ 	rb_erase(&p->core_node, &rq->core_tree);
++	RB_CLEAR_NODE(&p->core_node);
+ }
+ 
+ /*
+diff --git a/kernel/sched/core_sched.c b/kernel/sched/core_sched.c
+new file mode 100644
+index 000000000000..8d0869a9eb8c
+--- /dev/null
++++ b/kernel/sched/core_sched.c
+@@ -0,0 +1,109 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include "sched.h"
++
++/*
++ * A simple wrapper around refcount. An allocated sched_core_cookie's
++ * address is used to compute the cookie of the task.
++ */
++struct sched_core_cookie {
++	refcount_t refcnt;
++};
++
++unsigned long sched_core_alloc_cookie(void)
++{
++	struct sched_core_cookie *ck = kmalloc(sizeof(*ck), GFP_KERNEL);
++	if (!ck)
++		return 0;
++
++	refcount_set(&ck->refcnt, 1);
++	sched_core_get();
++
++	return (unsigned long)ck;
++}
++
++void sched_core_put_cookie(unsigned long cookie)
++{
++	struct sched_core_cookie *ptr = (void *)cookie;
++
++	if (ptr && refcount_dec_and_test(&ptr->refcnt)) {
++		kfree(ptr);
++		sched_core_put();
++	}
++}
++
++unsigned long sched_core_get_cookie(unsigned long cookie)
++{
++	struct sched_core_cookie *ptr = (void *)cookie;
++
++	if (ptr)
++		refcount_inc(&ptr->refcnt);
++
++	return cookie;
++}
++
++/*
++ * sched_core_update_cookie - replace the cookie on a task
++ * @p: the task to update
++ * @cookie: the new cookie
++ *
++ * Effectively exchange the task cookie; caller is responsible for lifetimes on
++ * both ends.
++ *
++ * Returns: the old cookie
++ */
++unsigned long sched_core_update_cookie(struct task_struct *p, unsigned long cookie)
++{
++	unsigned long old_cookie;
++	struct rq_flags rf;
++	struct rq *rq;
++	bool enqueued;
++
++	rq = task_rq_lock(p, &rf);
++
++	/*
++	 * Since creating a cookie implies sched_core_get(), and we cannot set
++	 * a cookie until after we've created it, similarly, we cannot destroy
++	 * a cookie until after we've removed it, we must have core scheduling
++	 * enabled here.
++	 */
++	SCHED_WARN_ON((p->core_cookie || cookie) && !sched_core_enabled(rq));
++
++	enqueued = sched_core_enqueued(p);
++	if (enqueued)
++		sched_core_dequeue(rq, p);
++
++	old_cookie = p->core_cookie;
++	p->core_cookie = cookie;
++
++	if (enqueued)
++		sched_core_enqueue(rq, p);
++
++	/*
++	 * If task is currently running, it may not be compatible anymore after
++	 * the cookie change, so enter the scheduler on its CPU to schedule it
++	 * away.
++	 */
++	if (task_running(rq, p))
++		resched_curr(rq);
++
++	task_rq_unlock(rq, p, &rf);
++
++	return old_cookie;
++}
++
++static unsigned long sched_core_clone_cookie(struct task_struct *p)
++{
++	unsigned long cookie, flags;
++
++	raw_spin_lock_irqsave(&p->pi_lock, flags);
++	cookie = sched_core_get_cookie(p->core_cookie);
++	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
++
++	return cookie;
++}
++
++void sched_core_free(struct task_struct *p)
++{
++	sched_core_put_cookie(p->core_cookie);
++}
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 3878386a0a02..904c52b560d1 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1229,6 +1229,22 @@ static inline bool sched_group_cookie_match(struct rq *rq,
+ 
+ extern void queue_core_balance(struct rq *rq);
+ 
++static inline bool sched_core_enqueued(struct task_struct *p)
++{
++	return !RB_EMPTY_NODE(&p->core_node);
++}
++
++extern void sched_core_enqueue(struct rq *rq, struct task_struct *p);
++extern void sched_core_dequeue(struct rq *rq, struct task_struct *p);
++
++extern void sched_core_get(void);
++extern void sched_core_put(void);
++
++extern unsigned long sched_core_alloc_cookie(void);
++extern void sched_core_put_cookie(unsigned long cookie);
++extern unsigned long sched_core_get_cookie(unsigned long cookie);
++extern unsigned long sched_core_update_cookie(struct task_struct *p, unsigned long cookie);
++
+ #else /* !CONFIG_SCHED_CORE */
+ 
+ static inline bool sched_core_enabled(struct rq *rq)
+-- 
+2.33.0
+

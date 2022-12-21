@@ -1,0 +1,408 @@
+From d310dc2554a5296a338f974d2b4e4f9af2687558 Mon Sep 17 00:00:00 2001
+From: Zhiqi Song <songzhiqi1@huawei.com>
+Date: Fri, 9 Sep 2022 17:47:04 +0800
+Subject: [PATCH] crypto: hisilicon - support get algs by the capability
+ register
+Git-commit: d310dc2554a5296a338f974d2b4e4f9af2687558
+Patch-mainline: v6.1-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified due to different context
+
+
+The value of qm algorithm can change dynamically according to the
+value of the capability register.
+
+Add xxx_set_qm_algs() function to obtain the algs that the
+hardware device supported from the capability register and set
+them into usr mode attribute files.
+
+Signed-off-by: Zhiqi Song <songzhiqi1@huawei.com>
+Signed-off-by: Wenkai Lin <linwenkai6@hisilicon.com>
+Signed-off-by: Weili Qian <qianweili@huawei.com>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/crypto/hisilicon/hpre/hpre_crypto.c |   10 +--
+ drivers/crypto/hisilicon/hpre/hpre_main.c   |   83 ++++++++++++++++++++++++++--
+ drivers/crypto/hisilicon/qm.c               |    1 
+ drivers/crypto/hisilicon/sec2/sec_main.c    |   71 +++++++++++++++++++++++
+ drivers/crypto/hisilicon/zip/zip_main.c     |   72 +++++++++++++++++++++++-
+ 5 files changed, 222 insertions(+), 15 deletions(-)
+
+--- a/drivers/crypto/hisilicon/hpre/hpre_crypto.c
++++ b/drivers/crypto/hisilicon/hpre/hpre_crypto.c
+@@ -51,11 +51,11 @@ struct hpre_ctx;
+ #define HPRE_ECC_HW256_KSZ_B	32
+ #define HPRE_ECC_HW384_KSZ_B	48
+ 
+-/* capability register mask */
+-#define HPRE_DRV_RSA_MASK_CAP          BIT(0)
+-#define HPRE_DRV_DH_MASK_CAP           BIT(1)
+-#define HPRE_DRV_ECDH_MASK_CAP         BIT(2)
+-#define HPRE_DRV_X25519_MASK_CAP       BIT(5)
++/* capability register mask of driver */
++#define HPRE_DRV_RSA_MASK_CAP		BIT(0)
++#define HPRE_DRV_DH_MASK_CAP		BIT(1)
++#define HPRE_DRV_ECDH_MASK_CAP		BIT(2)
++#define HPRE_DRV_X25519_MASK_CAP	BIT(5)
+ 
+ typedef void (*hpre_cb)(struct hpre_ctx *ctx, void *sqe);
+ 
+--- a/drivers/crypto/hisilicon/hpre/hpre_main.c
++++ b/drivers/crypto/hisilicon/hpre/hpre_main.c
+@@ -118,6 +118,8 @@
+ #define HPRE_DFX_COMMON2_LEN		0xE
+ #define HPRE_DFX_CORE_LEN		0x43
+ 
++#define HPRE_DEV_ALG_MAX_LEN	256
++
+ static const char hpre_name[] = "hisi_hpre";
+ static struct dentry *hpre_debugfs_root;
+ static const struct pci_device_id hpre_dev_ids[] = {
+@@ -133,6 +135,38 @@ struct hpre_hw_error {
+ 	const char *msg;
+ };
+ 
++struct hpre_dev_alg {
++	u32 alg_msk;
++	const char *alg;
++};
++
++static const struct hpre_dev_alg hpre_dev_algs[] = {
++	{
++		.alg_msk = BIT(0),
++		.alg = "rsa\n"
++	}, {
++		.alg_msk = BIT(1),
++		.alg = "dh\n"
++	}, {
++		.alg_msk = BIT(2),
++		.alg = "ecdh\n"
++	}, {
++		.alg_msk = BIT(3),
++		.alg = "ecdsa\n"
++	}, {
++		.alg_msk = BIT(4),
++		.alg = "sm2\n"
++	}, {
++		.alg_msk = BIT(5),
++		.alg = "x25519\n"
++	}, {
++		.alg_msk = BIT(6),
++		.alg = "x448\n"
++	}, {
++		/* sentinel */
++	}
++};
++
+ static struct hisi_qm_list hpre_devices = {
+ 	.register_to_crypto	= hpre_algs_register,
+ 	.unregister_from_crypto	= hpre_algs_unregister,
+@@ -325,6 +359,35 @@ bool hpre_check_alg_support(struct hisi_
+ 	return false;
+ }
+ 
++static int hpre_set_qm_algs(struct hisi_qm *qm)
++{
++	struct device *dev = &qm->pdev->dev;
++	char *algs, *ptr;
++	u32 alg_msk;
++	int i;
++
++	if (!qm->use_sva)
++		return 0;
++
++	algs = devm_kzalloc(dev, HPRE_DEV_ALG_MAX_LEN * sizeof(char), GFP_KERNEL);
++	if (!algs)
++		return -ENOMEM;
++
++	alg_msk = hisi_qm_get_hw_info(qm, hpre_basic_info, HPRE_DEV_ALG_BITMAP_CAP, qm->cap_ver);
++
++	for (i = 0; i < ARRAY_SIZE(hpre_dev_algs); i++)
++		if (alg_msk & hpre_dev_algs[i].alg_msk)
++			strcat(algs, hpre_dev_algs[i].alg);
++
++	ptr = strrchr(algs, '\n');
++	if (ptr)
++		*ptr = '\0';
++
++	qm->uacce->algs = algs;
++
++	return 0;
++}
++
+ static int hpre_diff_regs_show(struct seq_file *s, void *unused)
+ {
+ 	struct hisi_qm *qm = s->private;
+@@ -1073,15 +1136,13 @@ static void hpre_debugfs_exit(struct his
+ 
+ static int hpre_qm_init(struct hisi_qm *qm, struct pci_dev *pdev)
+ {
++	int ret;
++
+ 	if (pdev->revision == QM_HW_V1) {
+ 		pci_warn(pdev, "HPRE version 1 is not supported!\n");
+ 		return -EINVAL;
+ 	}
+ 
+-	if (pdev->revision >= QM_HW_V3)
+-		qm->algs = "rsa\ndh\necdh\nx25519\nx448\necdsa\nsm2";
+-	else
+-		qm->algs = "rsa\ndh";
+ 	qm->mode = uacce_mode;
+ 	qm->pdev = pdev;
+ 	qm->ver = pdev->revision;
+@@ -1097,7 +1158,19 @@ static int hpre_qm_init(struct hisi_qm *
+ 		qm->qm_list = &hpre_devices;
+ 	}
+ 
+-	return hisi_qm_init(qm);
++	ret = hisi_qm_init(qm);
++	if (ret) {
++		pci_err(pdev, "Failed to init hpre qm configures!\n");
++		return ret;
++	}
++
++	ret = hpre_set_qm_algs(qm);
++	if (ret) {
++		pci_err(pdev, "Failed to set hpre algs!\n");
++		hisi_qm_uninit(qm);
++	}
++
++	return ret;
+ }
+ 
+ static int hpre_show_last_regs_init(struct hisi_qm *qm)
+--- a/drivers/crypto/hisilicon/qm.c
++++ b/drivers/crypto/hisilicon/qm.c
+@@ -3485,7 +3485,6 @@ static int qm_alloc_uacce(struct hisi_qm
+ 
+ 	uacce->is_vf = pdev->is_virtfn;
+ 	uacce->priv = qm;
+-	uacce->algs = qm->algs;
+ 
+ 	if (qm->ver == QM_HW_V1)
+ 		uacce->api_ver = HISI_QM_API_VER_BASE;
+--- a/drivers/crypto/hisilicon/sec2/sec_main.c
++++ b/drivers/crypto/hisilicon/sec2/sec_main.c
+@@ -115,6 +115,14 @@
+ 
+ #define SEC_ALG_BITMAP_SHIFT		32
+ 
++#define SEC_CIPHER_BITMAP		(GENMASK_ULL(5, 0) | GENMASK_ULL(16, 12) | \
++					GENMASK(24, 21))
++#define SEC_DIGEST_BITMAP		(GENMASK_ULL(11, 8) | GENMASK_ULL(20, 19) | \
++					GENMASK_ULL(42, 25))
++#define SEC_AEAD_BITMAP			(GENMASK_ULL(7, 6) | GENMASK_ULL(18, 17) | \
++					GENMASK_ULL(45, 43))
++#define SEC_DEV_ALG_MAX_LEN		256
++
+ struct sec_hw_error {
+ 	u32 int_msk;
+ 	const char *msg;
+@@ -125,6 +133,11 @@ struct sec_dfx_item {
+ 	u32 offset;
+ };
+ 
++struct sec_dev_alg {
++	u64 alg_msk;
++	const char *algs;
++};
++
+ static const char sec_name[] = "hisi_sec2";
+ static struct dentry *sec_debugfs_root;
+ 
+@@ -161,6 +174,18 @@ static const struct hisi_qm_cap_info sec
+ 	{SEC_CORE4_ALG_BITMAP_HIGH, 0x3170, 0, GENMASK(31, 0), 0x3FFF, 0x3FFF, 0x3FFF},
+ };
+ 
++static const struct sec_dev_alg sec_dev_algs[] = { {
++		.alg_msk = SEC_CIPHER_BITMAP,
++		.algs = "cipher\n",
++	}, {
++		.alg_msk = SEC_DIGEST_BITMAP,
++		.algs = "digest\n",
++	}, {
++		.alg_msk = SEC_AEAD_BITMAP,
++		.algs = "aead\n",
++	},
++};
++
+ static const struct sec_hw_error sec_hw_errors[] = {
+ 	{
+ 		.int_msk = BIT(0),
+@@ -1052,11 +1077,41 @@ static int sec_pf_probe_init(struct sec_
+ 	return ret;
+ }
+ 
++static int sec_set_qm_algs(struct hisi_qm *qm)
++{
++	struct device *dev = &qm->pdev->dev;
++	char *algs, *ptr;
++	u64 alg_mask;
++	int i;
++
++	if (!qm->use_sva)
++		return 0;
++
++	algs = devm_kzalloc(dev, SEC_DEV_ALG_MAX_LEN * sizeof(char), GFP_KERNEL);
++	if (!algs)
++		return -ENOMEM;
++
++	alg_mask = sec_get_alg_bitmap(qm, SEC_DEV_ALG_BITMAP_HIGH, SEC_DEV_ALG_BITMAP_LOW);
++
++	for (i = 0; i < ARRAY_SIZE(sec_dev_algs); i++)
++		if (alg_mask & sec_dev_algs[i].alg_msk)
++			strcat(algs, sec_dev_algs[i].algs);
++
++	ptr = strrchr(algs, '\n');
++	if (ptr)
++		*ptr = '\0';
++
++	qm->uacce->algs = algs;
++
++	return 0;
++}
++
+ static int sec_qm_init(struct hisi_qm *qm, struct pci_dev *pdev)
+ {
++	int ret;
++
+ 	qm->pdev = pdev;
+ 	qm->ver = pdev->revision;
+-	qm->algs = "cipher\ndigest\naead";
+ 	qm->mode = uacce_mode;
+ 	qm->sqe_size = SEC_SQE_SIZE;
+ 	qm->dev_name = sec_name;
+@@ -1079,7 +1134,19 @@ static int sec_qm_init(struct hisi_qm *q
+ 		qm->qp_num = SEC_QUEUE_NUM_V1 - SEC_PF_DEF_Q_NUM;
+ 	}
+ 
+-	return hisi_qm_init(qm);
++	ret = hisi_qm_init(qm);
++	if (ret) {
++		pci_err(qm->pdev, "Failed to init sec qm configures!\n");
++		return ret;
++	}
++
++	ret = sec_set_qm_algs(qm);
++	if (ret) {
++		pci_err(qm->pdev, "Failed to set sec algs!\n");
++		hisi_qm_uninit(qm);
++	}
++
++	return ret;
+ }
+ 
+ static void sec_qm_uninit(struct hisi_qm *qm)
+--- a/drivers/crypto/hisilicon/zip/zip_main.c
++++ b/drivers/crypto/hisilicon/zip/zip_main.c
+@@ -74,6 +74,12 @@
+ #define HZIP_AXI_SHUTDOWN_ENABLE	BIT(14)
+ #define HZIP_WR_PORT			BIT(11)
+ 
++#define HZIP_DEV_ALG_MAX_LEN		256
++#define HZIP_ALG_ZLIB_BIT		GENMASK(1, 0)
++#define HZIP_ALG_GZIP_BIT		GENMASK(3, 2)
++#define HZIP_ALG_DEFLATE_BIT		GENMASK(5, 4)
++#define HZIP_ALG_LZ77_BIT		GENMASK(7, 6)
++
+ #define HZIP_BUF_SIZE			22
+ #define HZIP_SQE_MASK_OFFSET		64
+ #define HZIP_SQE_MASK_LEN		48
+@@ -114,6 +120,26 @@ struct zip_dfx_item {
+ 	u32 offset;
+ };
+ 
++struct zip_dev_alg {
++	u32 alg_msk;
++	const char *algs;
++};
++
++static const struct zip_dev_alg zip_dev_algs[] = { {
++		.alg_msk = HZIP_ALG_ZLIB_BIT,
++		.algs = "zlib\n",
++	}, {
++		.alg_msk = HZIP_ALG_GZIP_BIT,
++		.algs = "gzip\n",
++	}, {
++		.alg_msk = HZIP_ALG_DEFLATE_BIT,
++		.algs = "deflate\n",
++	}, {
++		.alg_msk = HZIP_ALG_LZ77_BIT,
++		.algs = "lz77_zstd\n",
++	},
++};
++
+ static struct hisi_qm_list zip_devices = {
+ 	.register_to_crypto	= hisi_zip_register_to_crypto,
+ 	.unregister_from_crypto	= hisi_zip_unregister_from_crypto,
+@@ -388,6 +414,35 @@ bool hisi_zip_alg_support(struct hisi_qm
+ 	return false;
+ }
+ 
++static int hisi_zip_set_qm_algs(struct hisi_qm *qm)
++{
++	struct device *dev = &qm->pdev->dev;
++	char *algs, *ptr;
++	u32 alg_mask;
++	int i;
++
++	if (!qm->use_sva)
++		return 0;
++
++	algs = devm_kzalloc(dev, HZIP_DEV_ALG_MAX_LEN * sizeof(char), GFP_KERNEL);
++	if (!algs)
++		return -ENOMEM;
++
++	alg_mask = hisi_qm_get_hw_info(qm, zip_basic_cap_info, ZIP_DEV_ALG_BITMAP, qm->cap_ver);
++
++	for (i = 0; i < ARRAY_SIZE(zip_dev_algs); i++)
++		if (alg_mask & zip_dev_algs[i].alg_msk)
++			strcat(algs, zip_dev_algs[i].algs);
++
++	ptr = strrchr(algs, '\n');
++	if (ptr)
++		*ptr = '\0';
++
++	qm->uacce->algs = algs;
++
++	return 0;
++}
++
+ static void hisi_zip_open_sva_prefetch(struct hisi_qm *qm)
+ {
+ 	u32 val;
+@@ -1070,9 +1125,10 @@ static int hisi_zip_pf_probe_init(struct
+ 
+ static int hisi_zip_qm_init(struct hisi_qm *qm, struct pci_dev *pdev)
+ {
++	int ret;
++
+ 	qm->pdev = pdev;
+ 	qm->ver = pdev->revision;
+-	qm->algs = "zlib\ngzip";
+ 	qm->mode = uacce_mode;
+ 	qm->sqe_size = HZIP_SQE_SIZE;
+ 	qm->dev_name = hisi_zip_name;
+@@ -1096,7 +1152,19 @@ static int hisi_zip_qm_init(struct hisi_
+ 		qm->qp_num = HZIP_QUEUE_NUM_V1 - HZIP_PF_DEF_Q_NUM;
+ 	}
+ 
+-	return hisi_qm_init(qm);
++	ret = hisi_qm_init(qm);
++	if (ret) {
++		pci_err(qm->pdev, "Failed to init zip qm configures!\n");
++		return ret;
++	}
++
++	ret = hisi_zip_set_qm_algs(qm);
++	if (ret) {
++		pci_err(qm->pdev, "Failed to set zip algs!\n");
++		hisi_qm_uninit(qm);
++	}
++
++	return ret;
+ }
+ 
+ static void hisi_zip_qm_uninit(struct hisi_qm *qm)

@@ -1,0 +1,130 @@
+From 450d0e74d886c172ac2f72518b797a18ee8d1327 Mon Sep 17 00:00:00 2001
+From: Zhou Guanghui <zhouguanghui1@huawei.com>
+Date: Wed, 15 Jun 2022 10:27:42 +0000
+Subject: [PATCH] memblock,arm64: expand the static memblock memory table
+Git-commit: 450d0e74d886c172ac2f72518b797a18ee8d1327
+Patch-mainline: v6.0-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+In a system(Huawei Ascend ARM64 SoC) using HBM, a multi-bit ECC error
+occurs, and the BIOS will mark the corresponding area (for example, 2 MB)
+as unusable.  When the system restarts next time, these areas are not
+reported or reported as EFI_UNUSABLE_MEMORY.  Both cases lead to an
+increase in the number of memblocks, whereas EFI_UNUSABLE_MEMORY leads to
+a larger number of memblocks.
+
+For example, if the EFI_UNUSABLE_MEMORY type is reported:
+...
+memory[0x92]    [0x0000200834a00000-0x0000200835bfffff], 0x0000000001200000 bytes on node 7 flags: 0x0
+memory[0x93]    [0x0000200835c00000-0x0000200835dfffff], 0x0000000000200000 bytes on node 7 flags: 0x4
+memory[0x94]    [0x0000200835e00000-0x00002008367fffff], 0x0000000000a00000 bytes on node 7 flags: 0x0
+memory[0x95]    [0x0000200836800000-0x00002008369fffff], 0x0000000000200000 bytes on node 7 flags: 0x4
+memory[0x96]    [0x0000200836a00000-0x0000200837bfffff], 0x0000000001200000 bytes on node 7 flags: 0x0
+memory[0x97]    [0x0000200837c00000-0x0000200837dfffff], 0x0000000000200000 bytes on node 7 flags: 0x4
+memory[0x98]    [0x0000200837e00000-0x000020087fffffff], 0x0000000048200000 bytes on node 7 flags: 0x0
+memory[0x99]    [0x0000200880000000-0x0000200bcfffffff], 0x0000000350000000 bytes on node 6 flags: 0x0
+memory[0x9a]    [0x0000200bd0000000-0x0000200bd01fffff], 0x0000000000200000 bytes on node 6 flags: 0x4
+memory[0x9b]    [0x0000200bd0200000-0x0000200bd07fffff], 0x0000000000600000 bytes on node 6 flags: 0x0
+memory[0x9c]    [0x0000200bd0800000-0x0000200bd09fffff], 0x0000000000200000 bytes on node 6 flags: 0x4
+memory[0x9d]    [0x0000200bd0a00000-0x0000200fcfffffff], 0x00000003ff600000 bytes on node 6 flags: 0x0
+memory[0x9e]    [0x0000200fd0000000-0x0000200fd01fffff], 0x0000000000200000 bytes on node 6 flags: 0x4
+memory[0x9f]    [0x0000200fd0200000-0x0000200fffffffff], 0x000000002fe00000 bytes on node 6 flags: 0x0
+...
+
+The EFI memory map is parsed to construct the memblock arrays before the
+memblock arrays can be resized.  As the result, memory regions beyond
+INIT_MEMBLOCK_REGIONS are lost.
+
+Add a new macro INIT_MEMBLOCK_MEMORY_REGIONS to replace
+INIT_MEMBLOCK_REGTIONS to define the size of the static memblock.memory
+array.
+
+Allow overriding memblock.memory array size with architecture defined
+INIT_MEMBLOCK_MEMORY_REGIONS and make arm64 to set
+INIT_MEMBLOCK_MEMORY_REGIONS to 1024 when CONFIG_EFI is enabled.
+
+Link: https://lkml.kernel.org/r/20220615102742.96450-1-zhouguanghui1@huawei.com
+Signed-off-by: Zhou Guanghui <zhouguanghui1@huawei.com>
+Acked-by: Mike Rapoport <rppt@linux.ibm.com>
+Tested-by: Darren Hart <darren@os.amperecomputing.com>
+Acked-by: Will Deacon <will@kernel.org>		[arm64]
+Reviewed-by: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: Xu Qiang <xuqiang36@huawei.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/memory.h |  9 +++++++++
+ mm/memblock.c                   | 14 +++++++++-----
+ 2 files changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/arch/arm64/include/asm/memory.h b/arch/arm64/include/asm/memory.h
+index 0af70d9abede..ce8614fa376a 100644
+--- a/arch/arm64/include/asm/memory.h
++++ b/arch/arm64/include/asm/memory.h
+@@ -364,6 +364,15 @@ void dump_mem_limit(void);
+ # define INIT_MEMBLOCK_RESERVED_REGIONS	(INIT_MEMBLOCK_REGIONS + NR_CPUS + 1)
+ #endif
+ 
++/*
++ * memory regions which marked with flag MEMBLOCK_NOMAP(for example, the memory
++ * of the EFI_UNUSABLE_MEMORY type) may divide a continuous memory block into
++ * multiple parts. As a result, the number of memory regions is large.
++ */
++#ifdef CONFIG_EFI
++#define INIT_MEMBLOCK_MEMORY_REGIONS	(INIT_MEMBLOCK_REGIONS * 8)
++#endif
++
+ #include <asm-generic/memory_model.h>
+ 
+ #endif /* __ASM_MEMORY_H */
+diff --git a/mm/memblock.c b/mm/memblock.c
+index 749abd2685c4..b7ebf4b7e9d9 100644
+--- a/mm/memblock.c
++++ b/mm/memblock.c
+@@ -29,6 +29,10 @@
+ # define INIT_MEMBLOCK_RESERVED_REGIONS		INIT_MEMBLOCK_REGIONS
+ #endif
+ 
++#ifndef INIT_MEMBLOCK_MEMORY_REGIONS
++#define INIT_MEMBLOCK_MEMORY_REGIONS		INIT_MEMBLOCK_REGIONS
++#endif
++
+ /**
+  * DOC: memblock overview
+  *
+@@ -55,9 +59,9 @@
+  * the allocator metadata. The "memory" and "reserved" types are nicely
+  * wrapped with struct memblock. This structure is statically
+  * initialized at build time. The region arrays are initially sized to
+- * %INIT_MEMBLOCK_REGIONS for "memory" and %INIT_MEMBLOCK_RESERVED_REGIONS
+- * for "reserved". The region array for "physmem" is initially sized to
+- * %INIT_PHYSMEM_REGIONS.
++ * %INIT_MEMBLOCK_MEMORY_REGIONS for "memory" and
++ * %INIT_MEMBLOCK_RESERVED_REGIONS for "reserved". The region array
++ * for "physmem" is initially sized to %INIT_PHYSMEM_REGIONS.
+  * The memblock_allow_resize() enables automatic resizing of the region
+  * arrays during addition of new regions. This feature should be used
+  * with care so that memory allocated for the region array will not
+@@ -102,7 +106,7 @@ unsigned long min_low_pfn;
+ unsigned long max_pfn;
+ unsigned long long max_possible_pfn;
+ 
+-static struct memblock_region memblock_memory_init_regions[INIT_MEMBLOCK_REGIONS] __initdata_memblock;
++static struct memblock_region memblock_memory_init_regions[INIT_MEMBLOCK_MEMORY_REGIONS] __initdata_memblock;
+ static struct memblock_region memblock_reserved_init_regions[INIT_MEMBLOCK_RESERVED_REGIONS] __initdata_memblock;
+ #ifdef CONFIG_HAVE_MEMBLOCK_PHYS_MAP
+ static struct memblock_region memblock_physmem_init_regions[INIT_PHYSMEM_REGIONS];
+@@ -111,7 +115,7 @@ static struct memblock_region memblock_physmem_init_regions[INIT_PHYSMEM_REGIONS
+ struct memblock memblock __initdata_memblock = {
+ 	.memory.regions		= memblock_memory_init_regions,
+ 	.memory.cnt		= 1,	/* empty dummy entry */
+-	.memory.max		= INIT_MEMBLOCK_REGIONS,
++	.memory.max		= INIT_MEMBLOCK_MEMORY_REGIONS,
+ 	.memory.name		= "memory",
+ 
+ 	.reserved.regions	= memblock_reserved_init_regions,
+-- 
+2.33.0
+

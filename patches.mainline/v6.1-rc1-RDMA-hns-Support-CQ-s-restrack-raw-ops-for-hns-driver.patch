@@ -1,0 +1,115 @@
+From f2b070f36d1bb4e4c2290f5bab52cb1f2dc82cf9 Mon Sep 17 00:00:00 2001
+From: Wenpeng Liang <liangwenpeng@huawei.com>
+Date: Mon, 22 Aug 2022 18:44:51 +0800
+Subject: [PATCH] RDMA/hns: Support CQ's restrack raw ops for hns driver
+Git-commit: f2b070f36d1bb4e4c2290f5bab52cb1f2dc82cf9
+Patch-mainline: v6.1-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+The CQ raw restrack attributes come from the queue context maintained by
+the ROCEE.
+
+For example:
+
+$ rdma res show cq dev hns_0 cqn 14 -dd -jp -r
+[ {
+        "ifindex": 4,
+        "ifname": "hns_0",
+        "data": [ 1,0,0,0,7,0,0,0,0,0,0,0,0,82,6,0,0,82,6,0,0,82,6,0,
+		  1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,
+		  6,0,0,0,0,0,0,0 ]
+    } ]
+
+Link: https://lore.kernel.org/r/20220822104455.2311053-4-liangwenpeng@huawei.com
+Signed-off-by: Wenpeng Liang <liangwenpeng@huawei.com>
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/infiniband/hw/hns/hns_roce_device.h   |  1 +
+ drivers/infiniband/hw/hns/hns_roce_main.c     |  1 +
+ drivers/infiniband/hw/hns/hns_roce_restrack.c | 39 +++++++++++++++++++
+ 3 files changed, 41 insertions(+)
+
+diff --git a/drivers/infiniband/hw/hns/hns_roce_device.h b/drivers/infiniband/hw/hns/hns_roce_device.h
+index 103d50564b89..c73adc0d3555 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_device.h
++++ b/drivers/infiniband/hw/hns/hns_roce_device.h
+@@ -1224,6 +1224,7 @@ void hns_roce_handle_device_err(struct hns_roce_dev *hr_dev);
+ int hns_roce_init(struct hns_roce_dev *hr_dev);
+ void hns_roce_exit(struct hns_roce_dev *hr_dev);
+ int hns_roce_fill_res_cq_entry(struct sk_buff *msg, struct ib_cq *ib_cq);
++int hns_roce_fill_res_cq_entry_raw(struct sk_buff *msg, struct ib_cq *ib_cq);
+ struct hns_user_mmap_entry *
+ hns_roce_user_mmap_entry_insert(struct ib_ucontext *ucontext, u64 address,
+ 				size_t length,
+diff --git a/drivers/infiniband/hw/hns/hns_roce_main.c b/drivers/infiniband/hw/hns/hns_roce_main.c
+index caf73e8f4bbe..1b66ed45350e 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_main.c
++++ b/drivers/infiniband/hw/hns/hns_roce_main.c
+@@ -567,6 +567,7 @@ static const struct ib_device_ops hns_roce_dev_xrcd_ops = {
+ 
+ static const struct ib_device_ops hns_roce_dev_restrack_ops = {
+ 	.fill_res_cq_entry = hns_roce_fill_res_cq_entry,
++	.fill_res_cq_entry_raw = hns_roce_fill_res_cq_entry_raw,
+ };
+ 
+ static int hns_roce_register_device(struct hns_roce_dev *hr_dev)
+diff --git a/drivers/infiniband/hw/hns/hns_roce_restrack.c b/drivers/infiniband/hw/hns/hns_roce_restrack.c
+index 2e8299784bc2..3f9c2f9dfdf6 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_restrack.c
++++ b/drivers/infiniband/hw/hns/hns_roce_restrack.c
+@@ -9,6 +9,8 @@
+ #include "hns_roce_device.h"
+ #include "hns_roce_hw_v2.h"
+ 
++#define MAX_ENTRY_NUM 256
++
+ int hns_roce_fill_res_cq_entry(struct sk_buff *msg, struct ib_cq *ib_cq)
+ {
+ 	struct hns_roce_cq *hr_cq = to_hr_cq(ib_cq);
+@@ -39,3 +41,40 @@ int hns_roce_fill_res_cq_entry(struct sk_buff *msg, struct ib_cq *ib_cq)
+ 
+ 	return -EMSGSIZE;
+ }
++
++int hns_roce_fill_res_cq_entry_raw(struct sk_buff *msg, struct ib_cq *ib_cq)
++{
++	struct hns_roce_dev *hr_dev = to_hr_dev(ib_cq->device);
++	struct hns_roce_cq *hr_cq = to_hr_cq(ib_cq);
++	struct hns_roce_v2_cq_context context;
++	u32 data[MAX_ENTRY_NUM] = {};
++	int offset = 0;
++	int ret;
++
++	if (!hr_dev->hw->query_cqc)
++		return -EINVAL;
++
++	ret = hr_dev->hw->query_cqc(hr_dev, hr_cq->cqn, &context);
++	if (ret)
++		return -EINVAL;
++
++	data[offset++] = hr_reg_read(&context, CQC_CQ_ST);
++	data[offset++] = hr_reg_read(&context, CQC_SHIFT);
++	data[offset++] = hr_reg_read(&context, CQC_CQE_SIZE);
++	data[offset++] = hr_reg_read(&context, CQC_CQE_CNT);
++	data[offset++] = hr_reg_read(&context, CQC_CQ_PRODUCER_IDX);
++	data[offset++] = hr_reg_read(&context, CQC_CQ_CONSUMER_IDX);
++	data[offset++] = hr_reg_read(&context, CQC_DB_RECORD_EN);
++	data[offset++] = hr_reg_read(&context, CQC_ARM_ST);
++	data[offset++] = hr_reg_read(&context, CQC_CMD_SN);
++	data[offset++] = hr_reg_read(&context, CQC_CEQN);
++	data[offset++] = hr_reg_read(&context, CQC_CQ_MAX_CNT);
++	data[offset++] = hr_reg_read(&context, CQC_CQ_PERIOD);
++	data[offset++] = hr_reg_read(&context, CQC_CQE_HOP_NUM);
++	data[offset++] = hr_reg_read(&context, CQC_CQE_BAR_PG_SZ);
++	data[offset++] = hr_reg_read(&context, CQC_CQE_BUF_PG_SZ);
++
++	ret = nla_put(msg, RDMA_NLDEV_ATTR_RES_RAW, offset * sizeof(u32), data);
++
++	return ret;
++}
+-- 
+2.33.0
+

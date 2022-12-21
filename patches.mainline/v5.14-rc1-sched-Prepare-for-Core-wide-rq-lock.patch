@@ -1,0 +1,204 @@
+From d66f1b06b5b438cd20ba3664b8eef1f9c79e84bf Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Tue, 2 Mar 2021 12:16:48 +0100
+Subject: [PATCH] sched: Prepare for Core-wide rq->lock
+Git-commit: d66f1b06b5b438cd20ba3664b8eef1f9c79e84bf
+Patch-mainline: v5.14-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified per openEuler commit 026e3779
+
+
+When switching on core-sched, CPUs need to agree which lock to use for
+their RQ.
+
+The new rule will be that rq->core_enabled will be toggled while
+holding all rq->__locks that belong to a core. This means we need to
+double check the rq->core_enabled value after each lock acquire and
+retry if it changed.
+
+This also has implications for those sites that take multiple RQ
+locks, they need to be careful that the second lock doesn't end up
+being the first lock.
+
+Verify the lock pointer after acquiring the first lock, because if
+they're on the same core, holding any of the rq->__lock instances will
+pin the core state.
+
+While there, change the rq->__lock order to CPU number, instead of rq
+address, this greatly simplifies the next patch.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Tested-by: Don Hiatt <dhiatt@digitalocean.com>
+Tested-by: Hongyu Ning <hongyu.ning@linux.intel.com>
+Tested-by: Vincent Guittot <vincent.guittot@linaro.org>
+Link: https://lkml.kernel.org/r/YJUNY0dmrJMD/BIm@hirez.programming.kicks-ass.net
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/sched/core.c  |   48 ++++++++++++++++++++++++++++++++++++++++++++++--
+ kernel/sched/sched.h |   48 +++++++++++++++++-------------------------------
+ 2 files changed, 63 insertions(+), 33 deletions(-)
+
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -177,12 +177,37 @@ int sysctl_sched_rt_runtime = 950000;
+ 
+ void raw_spin_rq_lock_nested(struct rq *rq, int subclass)
+ {
+-	raw_spin_lock_nested(rq_lockp(rq), subclass);
++	raw_spinlock_t *lock;
++
++	if (sched_core_disabled()) {
++		raw_spin_lock_nested(&rq->__lock, subclass);
++		return;
++	}
++
++	for (;;) {
++		lock = rq_lockp(rq);
++		raw_spin_lock_nested(lock, subclass);
++		if (likely(lock == rq_lockp(rq)))
++			return;
++		raw_spin_unlock(lock);
++	}
+ }
+ 
+ bool raw_spin_rq_trylock(struct rq *rq)
+ {
+-	return raw_spin_trylock(rq_lockp(rq));
++	raw_spinlock_t *lock;
++	bool ret;
++
++	if (sched_core_disabled())
++		return raw_spin_trylock(&rq->__lock);
++
++	for (;;) {
++		lock = rq_lockp(rq);
++		ret = raw_spin_trylock(lock);
++		if (!ret || (likely(lock == rq_lockp(rq))))
++			return ret;
++		raw_spin_unlock(lock);
++	}
+ }
+ 
+ void raw_spin_rq_unlock(struct rq *rq)
+@@ -190,6 +215,25 @@ void raw_spin_rq_unlock(struct rq *rq)
+ 	raw_spin_unlock(rq_lockp(rq));
+ }
+ 
++#ifdef CONFIG_SMP
++/*
++ * double_rq_lock - safely lock two runqueues
++ */
++void double_rq_lock(struct rq *rq1, struct rq *rq2)
++{
++	lockdep_assert_irqs_disabled();
++
++	if (rq_order_less(rq2, rq1))
++		swap(rq1, rq2);
++
++	raw_spin_rq_lock(rq1);
++	if (rq_lockp(rq1) == rq_lockp(rq2))
++		return;
++
++	raw_spin_rq_lock_nested(rq2, SINGLE_DEPTH_NESTING);
++}
++#endif
++
+ /*
+  * __task_rq_lock - lock the rq @p resides on.
+  */
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1079,6 +1079,11 @@ static inline int cpu_of(struct rq *rq)
+ }
+ 
+ 
++static inline bool sched_core_disabled(void)
++{
++	return true;
++}
++
+ static inline raw_spinlock_t *rq_lockp(struct rq *rq)
+ {
+ 	return &rq->__lock;
+@@ -2126,10 +2131,17 @@ unsigned long arch_scale_freq_capacity(i
+ }
+ #endif
+ 
++
+ #ifdef CONFIG_SMP
+-#ifdef CONFIG_PREEMPTION
+ 
+-static inline void double_rq_lock(struct rq *rq1, struct rq *rq2);
++static inline bool rq_order_less(struct rq *rq1, struct rq *rq2)
++{
++	return rq1->cpu < rq2->cpu;
++}
++
++extern void double_rq_lock(struct rq *rq1, struct rq *rq2);
++
++#ifdef CONFIG_PREEMPTION
+ 
+ /*
+  * fair double_lock_balance: Safely acquires both rq->locks in a fair
+@@ -2169,14 +2181,13 @@ static inline int _double_lock_balance(s
+ 	if (likely(raw_spin_rq_trylock(busiest)))
+ 		return 0;
+ 
+-	if (rq_lockp(busiest) >= rq_lockp(this_rq)) {
++	if (rq_order_less(this_rq, busiest)) {
+ 		raw_spin_rq_lock_nested(busiest, SINGLE_DEPTH_NESTING);
+ 		return 0;
+ 	}
+ 
+ 	raw_spin_rq_unlock(this_rq);
+-	raw_spin_rq_lock(busiest);
+-	raw_spin_rq_lock_nested(this_rq, SINGLE_DEPTH_NESTING);
++	double_rq_lock(this_rq, busiest);
+ 
+ 	return 1;
+ }
+@@ -2229,31 +2240,6 @@ static inline void double_raw_lock(raw_s
+ }
+ 
+ /*
+- * double_rq_lock - safely lock two runqueues
+- *
+- * Note this does not disable interrupts like task_rq_lock,
+- * you need to do so manually before calling.
+- */
+-static inline void double_rq_lock(struct rq *rq1, struct rq *rq2)
+-	__acquires(rq1->lock)
+-	__acquires(rq2->lock)
+-{
+-	BUG_ON(!irqs_disabled());
+-	if (rq_lockp(rq1) == rq_lockp(rq2)) {
+-		raw_spin_rq_lock(rq1);
+-		__acquire(rq2->lock);	/* Fake it out ;) */
+-	} else {
+-		if (rq_lockp(rq1) < rq_lockp(rq2)) {
+-			raw_spin_rq_lock(rq1);
+-			raw_spin_rq_lock_nested(rq2, SINGLE_DEPTH_NESTING);
+-		} else {
+-			raw_spin_rq_lock(rq2);
+-			raw_spin_rq_lock_nested(rq1, SINGLE_DEPTH_NESTING);
+-		}
+-	}
+-}
+-
+-/*
+  * double_rq_unlock - safely unlock two runqueues
+  *
+  * Note this does not restore interrupts like task_rq_unlock,
+@@ -2263,11 +2249,11 @@ static inline void double_rq_unlock(stru
+ 	__releases(rq1->lock)
+ 	__releases(rq2->lock)
+ {
+-	raw_spin_rq_unlock(rq1);
+ 	if (rq_lockp(rq1) != rq_lockp(rq2))
+ 		raw_spin_rq_unlock(rq2);
+ 	else
+ 		__release(rq2->lock);
++	raw_spin_rq_unlock(rq1);
+ }
+ 
+ extern void set_rq_online (struct rq *rq);

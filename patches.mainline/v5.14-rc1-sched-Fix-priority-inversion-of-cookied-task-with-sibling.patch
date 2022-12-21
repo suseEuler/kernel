@@ -1,0 +1,156 @@
+From 7afbba119f0da09824d723f8081608ea1f74ff57 Mon Sep 17 00:00:00 2001
+From: "Joel Fernandes (Google)" <joel@joelfernandes.org>
+Date: Tue, 17 Nov 2020 18:19:42 -0500
+Subject: [PATCH] sched: Fix priority inversion of cookied task with sibling
+Git-commit: 7afbba119f0da09824d723f8081608ea1f74ff57
+Patch-mainline: v5.14-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+The rationale is as follows. In the core-wide pick logic, even if
+need_sync == false, we need to go look at other CPUs (non-local CPUs)
+to see if they could be running RT.
+
+Say the RQs in a particular core look like this:
+
+Let CFS1 and CFS2 be 2 tagged CFS tags.
+Let RT1 be an untagged RT task.
+
+	rq0		rq1
+	CFS1 (tagged)	RT1 (no tag)
+	CFS2 (tagged)
+
+Say schedule() runs on rq0. Now, it will enter the above loop and
+pick_task(RT) will return NULL for 'p'. It will enter the above if()
+block and see that need_sync == false and will skip RT entirely.
+
+The end result of the selection will be (say prio(CFS1) > prio(CFS2)):
+
+	rq0             rq1
+	CFS1            IDLE
+
+When it should have selected:
+
+	rq0             rq1
+	IDLE            RT
+
+Suggested-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Joel Fernandes (Google) <joel@joelfernandes.org>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Tested-by: Don Hiatt <dhiatt@digitalocean.com>
+Tested-by: Hongyu Ning <hongyu.ning@linux.intel.com>
+Tested-by: Vincent Guittot <vincent.guittot@linaro.org>
+Link: https://lkml.kernel.org/r/20210422123308.678425748@infradead.org
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/sched/core.c | 65 ++++++++++++++++++---------------------------
+ 1 file changed, 26 insertions(+), 39 deletions(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index f5e1e6f96411..e506d9de16fc 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -5443,6 +5443,15 @@ pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+ 	put_prev_task_balance(rq, prev, rf);
+ 
+ 	smt_mask = cpu_smt_mask(cpu);
++	need_sync = !!rq->core->core_cookie;
++
++	/* reset state */
++	rq->core->core_cookie = 0UL;
++	if (rq->core->core_forceidle) {
++		need_sync = true;
++		fi_before = true;
++		rq->core->core_forceidle = false;
++	}
+ 
+ 	/*
+ 	 * core->core_task_seq, core->core_pick_seq, rq->core_sched_seq
+@@ -5455,14 +5464,25 @@ pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+ 	 * 'Fix' this by also increasing @task_seq for every pick.
+ 	 */
+ 	rq->core->core_task_seq++;
+-	need_sync = !!rq->core->core_cookie;
+ 
+-	/* reset state */
+-	rq->core->core_cookie = 0UL;
+-	if (rq->core->core_forceidle) {
++	/*
++	 * Optimize for common case where this CPU has no cookies
++	 * and there are no cookied tasks running on siblings.
++	 */
++	if (!need_sync) {
++		for_each_class(class) {
++			next = class->pick_task(rq);
++			if (next)
++				break;
++		}
++
++		if (!next->core_cookie) {
++			rq->core_pick = NULL;
++			goto done;
++		}
+ 		need_sync = true;
+-		rq->core->core_forceidle = false;
+ 	}
++
+ 	for_each_cpu(i, smt_mask) {
+ 		struct rq *rq_i = cpu_rq(i);
+ 
+@@ -5492,31 +5512,8 @@ pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+ 			 * core.
+ 			 */
+ 			p = pick_task(rq_i, class, max);
+-			if (!p) {
+-				/*
+-				 * If there weren't no cookies; we don't need to
+-				 * bother with the other siblings.
+-				 * If the rest of the core is not running a tagged
+-				 * task, i.e.  need_sync == 0, and the current CPU
+-				 * which called into the schedule() loop does not
+-				 * have any tasks for this class, skip selecting for
+-				 * other siblings since there's no point. We don't skip
+-				 * for RT/DL because that could make CFS force-idle RT.
+-				 */
+-				if (i == cpu && !need_sync && class == &fair_sched_class)
+-					goto next_class;
+-
++			if (!p)
+ 				continue;
+-			}
+-
+-			/*
+-			 * Optimize the 'normal' case where there aren't any
+-			 * cookies and we don't need to sync up.
+-			 */
+-			if (i == cpu && !need_sync && !p->core_cookie) {
+-				next = p;
+-				goto done;
+-			}
+ 
+ 			rq_i->core_pick = p;
+ 
+@@ -5544,19 +5541,9 @@ pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+ 						cpu_rq(j)->core_pick = NULL;
+ 					}
+ 					goto again;
+-				} else {
+-					/*
+-					 * Once we select a task for a cpu, we
+-					 * should not be doing an unconstrained
+-					 * pick because it might starve a task
+-					 * on a forced idle cpu.
+-					 */
+-					need_sync = true;
+ 				}
+-
+ 			}
+ 		}
+-next_class:;
+ 	}
+ 
+ 	rq->core->core_pick_seq = rq->core->core_task_seq;
+-- 
+2.33.0
+

@@ -1,0 +1,133 @@
+From 0739cd28f2645e814586c7536ba5da9825cb8029 Mon Sep 17 00:00:00 2001
+From: Cong Wang <cong.wang@bytedance.com>
+Date: Tue, 30 Mar 2021 19:32:24 -0700
+Subject: [PATCH] net: Introduce skb_send_sock() for sock_map
+Git-commit: 0739cd28f2645e814586c7536ba5da9825cb8029
+Patch-mainline: v5.13-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+We only have skb_send_sock_locked() which requires callers
+to use lock_sock(). Introduce a variant skb_send_sock()
+which locks on its own, callers do not need to lock it
+any more. This will save us from adding a ->sendmsg_locked
+for each protocol.
+
+To reuse the code, pass function pointers to __skb_send_sock()
+and build skb_send_sock() and skb_send_sock_locked() on top.
+
+Signed-off-by: Cong Wang <cong.wang@bytedance.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Reviewed-by: Jakub Sitnicki <jakub@cloudflare.com>
+Link: https://lore.kernel.org/bpf/20210331023237.41094-4-xiyou.wangcong@gmail.com
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/skbuff.h |  1 +
+ net/core/skbuff.c      | 55 ++++++++++++++++++++++++++++++++++++------
+ 2 files changed, 49 insertions(+), 7 deletions(-)
+
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index c8def85fcc22..dbf820a50a39 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -3626,6 +3626,7 @@ int skb_splice_bits(struct sk_buff *skb, struct sock *sk, unsigned int offset,
+ 		    unsigned int flags);
+ int skb_send_sock_locked(struct sock *sk, struct sk_buff *skb, int offset,
+ 			 int len);
++int skb_send_sock(struct sock *sk, struct sk_buff *skb, int offset, int len);
+ void skb_copy_and_csum_dev(const struct sk_buff *skb, u8 *to);
+ unsigned int skb_zerocopy_headlen(const struct sk_buff *from);
+ int skb_zerocopy(struct sk_buff *to, struct sk_buff *from,
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index e8320b5d651a..3ad9e8425ab2 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -2500,9 +2500,32 @@ int skb_splice_bits(struct sk_buff *skb, struct sock *sk, unsigned int offset,
+ }
+ EXPORT_SYMBOL_GPL(skb_splice_bits);
+ 
+-/* Send skb data on a socket. Socket must be locked. */
+-int skb_send_sock_locked(struct sock *sk, struct sk_buff *skb, int offset,
+-			 int len)
++static int sendmsg_unlocked(struct sock *sk, struct msghdr *msg,
++			    struct kvec *vec, size_t num, size_t size)
++{
++	struct socket *sock = sk->sk_socket;
++
++	if (!sock)
++		return -EINVAL;
++	return kernel_sendmsg(sock, msg, vec, num, size);
++}
++
++static int sendpage_unlocked(struct sock *sk, struct page *page, int offset,
++			     size_t size, int flags)
++{
++	struct socket *sock = sk->sk_socket;
++
++	if (!sock)
++		return -EINVAL;
++	return kernel_sendpage(sock, page, offset, size, flags);
++}
++
++typedef int (*sendmsg_func)(struct sock *sk, struct msghdr *msg,
++			    struct kvec *vec, size_t num, size_t size);
++typedef int (*sendpage_func)(struct sock *sk, struct page *page, int offset,
++			     size_t size, int flags);
++static int __skb_send_sock(struct sock *sk, struct sk_buff *skb, int offset,
++			   int len, sendmsg_func sendmsg, sendpage_func sendpage)
+ {
+ 	unsigned int orig_len = len;
+ 	struct sk_buff *head = skb;
+@@ -2522,7 +2545,8 @@ int skb_send_sock_locked(struct sock *sk, struct sk_buff *skb, int offset,
+ 		memset(&msg, 0, sizeof(msg));
+ 		msg.msg_flags = MSG_DONTWAIT;
+ 
+-		ret = kernel_sendmsg_locked(sk, &msg, &kv, 1, slen);
++		ret = INDIRECT_CALL_2(sendmsg, kernel_sendmsg_locked,
++				      sendmsg_unlocked, sk, &msg, &kv, 1, slen);
+ 		if (ret <= 0)
+ 			goto error;
+ 
+@@ -2553,9 +2577,11 @@ int skb_send_sock_locked(struct sock *sk, struct sk_buff *skb, int offset,
+ 		slen = min_t(size_t, len, skb_frag_size(frag) - offset);
+ 
+ 		while (slen) {
+-			ret = kernel_sendpage_locked(sk, skb_frag_page(frag),
+-						     skb_frag_off(frag) + offset,
+-						     slen, MSG_DONTWAIT);
++			ret = INDIRECT_CALL_2(sendpage, kernel_sendpage_locked,
++					      sendpage_unlocked, sk,
++					      skb_frag_page(frag),
++					      skb_frag_off(frag) + offset,
++					      slen, MSG_DONTWAIT);
+ 			if (ret <= 0)
+ 				goto error;
+ 
+@@ -2587,8 +2613,23 @@ int skb_send_sock_locked(struct sock *sk, struct sk_buff *skb, int offset,
+ error:
+ 	return orig_len == len ? ret : orig_len - len;
+ }
++
++/* Send skb data on a socket. Socket must be locked. */
++int skb_send_sock_locked(struct sock *sk, struct sk_buff *skb, int offset,
++			 int len)
++{
++	return __skb_send_sock(sk, skb, offset, len, kernel_sendmsg_locked,
++			       kernel_sendpage_locked);
++}
+ EXPORT_SYMBOL_GPL(skb_send_sock_locked);
+ 
++/* Send skb data on a socket. Socket must be unlocked. */
++int skb_send_sock(struct sock *sk, struct sk_buff *skb, int offset, int len)
++{
++	return __skb_send_sock(sk, skb, offset, len, sendmsg_unlocked,
++			       sendpage_unlocked);
++}
++
+ /**
+  *	skb_store_bits - store bits from kernel buffer to skb
+  *	@skb: destination buffer
+-- 
+2.33.0
+

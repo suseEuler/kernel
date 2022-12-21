@@ -1,0 +1,171 @@
+From 6d9a899557c8751372da99d137eaaa9cdbe81f41 Mon Sep 17 00:00:00 2001
+From: Yang Shen <shenyang39@huawei.com>
+Date: Sat, 13 Aug 2022 18:19:39 +0800
+Subject: [PATCH] crypto: hisilicon/zip - some misc cleanup
+Git-commit: 6d9a899557c8751372da99d137eaaa9cdbe81f41
+Patch-mainline: v6.1-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+Some cleanup for code:
+1. Change names for easy to understand.
+2. Unify the variables type.
+3. Use the right return value.
+
+Signed-off-by: Yang Shen <shenyang39@huawei.com>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/crypto/hisilicon/zip/zip.h        |  2 +-
+ drivers/crypto/hisilicon/zip/zip_crypto.c | 30 +++++++++++------------
+ drivers/crypto/hisilicon/zip/zip_main.c   | 10 +++++---
+ 3 files changed, 23 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/crypto/hisilicon/zip/zip.h b/drivers/crypto/hisilicon/zip/zip.h
+index 3dfd3bac5a33..f289656e9ac0 100644
+--- a/drivers/crypto/hisilicon/zip/zip.h
++++ b/drivers/crypto/hisilicon/zip/zip.h
+@@ -81,7 +81,7 @@ struct hisi_zip_sqe {
+ 	u32 rsvd1[4];
+ };
+ 
+-int zip_create_qps(struct hisi_qp **qps, int ctx_num, int node);
++int zip_create_qps(struct hisi_qp **qps, int qp_num, int node);
+ int hisi_zip_register_to_crypto(struct hisi_qm *qm);
+ void hisi_zip_unregister_from_crypto(struct hisi_qm *qm);
+ #endif
+diff --git a/drivers/crypto/hisilicon/zip/zip_crypto.c b/drivers/crypto/hisilicon/zip/zip_crypto.c
+index 6b3f8da150ad..a6c914d527eb 100644
+--- a/drivers/crypto/hisilicon/zip/zip_crypto.c
++++ b/drivers/crypto/hisilicon/zip/zip_crypto.c
+@@ -135,7 +135,7 @@ static u16 sgl_sge_nr = HZIP_SGL_SGE_NR;
+ module_param_cb(sgl_sge_nr, &sgl_sge_nr_ops, &sgl_sge_nr, 0444);
+ MODULE_PARM_DESC(sgl_sge_nr, "Number of sge in sgl(1-255)");
+ 
+-static u16 get_extra_field_size(const u8 *start)
++static u32 get_extra_field_size(const u8 *start)
+ {
+ 	return *((u16 *)start) + GZIP_HEAD_FEXTRA_XLEN;
+ }
+@@ -167,7 +167,7 @@ static u32 __get_gzip_head_size(const u8 *src)
+ 	return size;
+ }
+ 
+-static size_t __maybe_unused get_gzip_head_size(struct scatterlist *sgl)
++static u32 __maybe_unused get_gzip_head_size(struct scatterlist *sgl)
+ {
+ 	char buf[HZIP_GZIP_HEAD_BUF];
+ 
+@@ -497,7 +497,7 @@ static int hisi_zip_adecompress(struct acomp_req *acomp_req)
+ 	return ret;
+ }
+ 
+-static int hisi_zip_start_qp(struct hisi_qp *qp, struct hisi_zip_qp_ctx *ctx,
++static int hisi_zip_start_qp(struct hisi_qp *qp, struct hisi_zip_qp_ctx *qp_ctx,
+ 			     int alg_type, int req_type)
+ {
+ 	struct device *dev = &qp->qm->pdev->dev;
+@@ -505,7 +505,7 @@ static int hisi_zip_start_qp(struct hisi_qp *qp, struct hisi_zip_qp_ctx *ctx,
+ 
+ 	qp->req_type = req_type;
+ 	qp->alg_type = alg_type;
+-	qp->qp_ctx = ctx;
++	qp->qp_ctx = qp_ctx;
+ 
+ 	ret = hisi_qm_start_qp(qp, 0);
+ 	if (ret < 0) {
+@@ -513,15 +513,15 @@ static int hisi_zip_start_qp(struct hisi_qp *qp, struct hisi_zip_qp_ctx *ctx,
+ 		return ret;
+ 	}
+ 
+-	ctx->qp = qp;
++	qp_ctx->qp = qp;
+ 
+ 	return 0;
+ }
+ 
+-static void hisi_zip_release_qp(struct hisi_zip_qp_ctx *ctx)
++static void hisi_zip_release_qp(struct hisi_zip_qp_ctx *qp_ctx)
+ {
+-	hisi_qm_stop_qp(ctx->qp);
+-	hisi_qm_free_qps(&ctx->qp, 1);
++	hisi_qm_stop_qp(qp_ctx->qp);
++	hisi_qm_free_qps(&qp_ctx->qp, 1);
+ }
+ 
+ static const struct hisi_zip_sqe_ops hisi_zip_ops_v1 = {
+@@ -593,7 +593,7 @@ static void hisi_zip_ctx_exit(struct hisi_zip_ctx *hisi_zip_ctx)
+ {
+ 	int i;
+ 
+-	for (i = 1; i >= 0; i--)
++	for (i = 0; i < HZIP_CTX_Q_NUM; i++)
+ 		hisi_zip_release_qp(&hisi_zip_ctx->qp_ctx[i]);
+ }
+ 
+@@ -612,7 +612,7 @@ static int hisi_zip_create_req_q(struct hisi_zip_ctx *ctx)
+ 			if (i == 0)
+ 				return ret;
+ 
+-			goto err_free_loop0;
++			goto err_free_comp_q;
+ 		}
+ 		rwlock_init(&req_q->req_lock);
+ 
+@@ -621,19 +621,19 @@ static int hisi_zip_create_req_q(struct hisi_zip_ctx *ctx)
+ 		if (!req_q->q) {
+ 			ret = -ENOMEM;
+ 			if (i == 0)
+-				goto err_free_bitmap;
++				goto err_free_comp_bitmap;
+ 			else
+-				goto err_free_loop1;
++				goto err_free_decomp_bitmap;
+ 		}
+ 	}
+ 
+ 	return 0;
+ 
+-err_free_loop1:
++err_free_decomp_bitmap:
+ 	bitmap_free(ctx->qp_ctx[HZIP_QPC_DECOMP].req_q.req_bitmap);
+-err_free_loop0:
++err_free_comp_q:
+ 	kfree(ctx->qp_ctx[HZIP_QPC_COMP].req_q.q);
+-err_free_bitmap:
++err_free_comp_bitmap:
+ 	bitmap_free(ctx->qp_ctx[HZIP_QPC_COMP].req_q.req_bitmap);
+ 	return ret;
+ }
+diff --git a/drivers/crypto/hisilicon/zip/zip_main.c b/drivers/crypto/hisilicon/zip/zip_main.c
+index c3303d99acac..04c8a4c65d77 100644
+--- a/drivers/crypto/hisilicon/zip/zip_main.c
++++ b/drivers/crypto/hisilicon/zip/zip_main.c
+@@ -586,8 +586,9 @@ static ssize_t hisi_zip_ctrl_debug_write(struct file *filp,
+ 		return len;
+ 
+ 	tbuf[len] = '\0';
+-	if (kstrtoul(tbuf, 0, &val))
+-		return -EFAULT;
++	ret = kstrtoul(tbuf, 0, &val);
++	if (ret)
++		return ret;
+ 
+ 	ret = hisi_qm_get_dfx_access(qm);
+ 	if (ret)
+@@ -976,7 +977,10 @@ static int hisi_zip_pf_probe_init(struct hisi_zip *hisi_zip)
+ 	qm->err_ini = &hisi_zip_err_ini;
+ 	qm->err_ini->err_info_init(qm);
+ 
+-	hisi_zip_set_user_domain_and_cache(qm);
++	ret = hisi_zip_set_user_domain_and_cache(qm);
++	if (ret)
++		return ret;
++
+ 	hisi_zip_open_sva_prefetch(qm);
+ 	hisi_qm_dev_err_init(qm);
+ 	hisi_zip_debug_regs_clear(qm);
+-- 
+2.33.0
+

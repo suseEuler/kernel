@@ -1,0 +1,66 @@
+From 71453bd9d1bfa2a75f742ac8ad75c084097e9a50 Mon Sep 17 00:00:00 2001
+From: John Garry <john.garry@huawei.com>
+Date: Thu, 12 May 2022 19:15:33 +0800
+Subject: [PATCH] scsi: hisi_sas: Use sas_ata_wait_after_reset() in IT nexus
+ reset
+Git-commit: 71453bd9d1bfa2a75f742ac8ad75c084097e9a50
+Patch-mainline: v5.19-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+We have seen errors like this when a SATA device is probed:
+
+[524.566298] hisi_sas_v3_hw 0000L74:02.0: erroneous completion iptt=4096 ...
+[524.582827] sas: TMF task open reject failed 500e004aaaaaaaa00
+
+Since commit 21c7e972475e ("scsi: hisi_sas: Disable SATA disk phy for
+severe I_T nexus reset failure"), we issue an ATA softreset to disks after
+a phy reset to ensure that they are in sound working order. If the
+softreset is issued before the remote phy has come back up then the
+softreset will fail (errors as above). Remedy this by waiting for the phy
+to come back up after the reset.
+
+Link: https://lore.kernel.org/r/1652354134-171343-3-git-send-email-john.garry@huawei.com
+Tested-by: Yihang Li <liyihang6@hisilicon.com>
+Reviewed-by: Xiang Chen <chenxiang66@hisilicon.com>
+Signed-off-by: John Garry <john.garry@huawei.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/scsi/hisi_sas/hisi_sas_main.c | 19 ++++++++++++-------
+ 1 file changed, 12 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/scsi/hisi_sas/hisi_sas_main.c b/drivers/scsi/hisi_sas/hisi_sas_main.c
+index 4bda2f6cb352..997f27e2f1e5 100644
+--- a/drivers/scsi/hisi_sas/hisi_sas_main.c
++++ b/drivers/scsi/hisi_sas/hisi_sas_main.c
+@@ -1710,13 +1710,18 @@ static int hisi_sas_debug_I_T_nexus_reset(struct domain_device *device)
+ 		/* report PHY down if timed out */
+ 		if (rc == -ETIMEDOUT)
+ 			hisi_sas_phy_down(hisi_hba, sas_phy->id, 0, GFP_KERNEL);
+-	} else if (sas_dev->dev_status != HISI_SAS_DEV_INIT) {
+-		/*
+-		 * If in init state, we rely on caller to wait for link to be
+-		 * ready; otherwise, except phy reset is fail, delay.
+-		 */
+-		if (!rc)
+-			msleep(2000);
++		return rc;
++	}
++
++	if (rc)
++		return rc;
++
++	/* Remote phy */
++	if (dev_is_sata(device)) {
++		rc = sas_ata_wait_after_reset(device,
++					HISI_SAS_WAIT_PHYUP_TIMEOUT);
++	} else {
++		msleep(2000);
+ 	}
+ 
+ 	return rc;
+-- 
+2.33.0
+

@@ -1,0 +1,223 @@
+From b33f778bba5ef3f76fe6708c611346c1ea03acd4 Mon Sep 17 00:00:00 2001
+From: Tianchen Ding <dtcccc@linux.alibaba.com>
+Date: Tue, 22 Mar 2022 14:48:13 -0700
+Subject: [PATCH] kfence: alloc kfence_pool after system startup
+Git-commit: b33f778bba5ef3f76fe6708c611346c1ea03acd4
+Patch-mainline: v5.18-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+Allow enabling KFENCE after system startup by allocating its pool via the
+page allocator. This provides the flexibility to enable KFENCE even if it
+wasn't enabled at boot time.
+
+Link: https://lkml.kernel.org/r/20220307074516.6920-3-dtcccc@linux.alibaba.com
+Signed-off-by: Tianchen Ding <dtcccc@linux.alibaba.com>
+Reviewed-by: Marco Elver <elver@google.com>
+Tested-by: Peng Liu <liupeng256@huawei.com>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/kfence/core.c | 111 ++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 90 insertions(+), 21 deletions(-)
+
+diff --git a/mm/kfence/core.c b/mm/kfence/core.c
+index caa4e84c8b79..f126b53b9b85 100644
+--- a/mm/kfence/core.c
++++ b/mm/kfence/core.c
+@@ -96,7 +96,7 @@ static unsigned long kfence_skip_covered_thresh __read_mostly = 75;
+ module_param_named(skip_covered_thresh, kfence_skip_covered_thresh, ulong, 0644);
+ 
+ /* The pool of pages used for guard pages and objects. */
+-char *__kfence_pool __ro_after_init;
++char *__kfence_pool __read_mostly;
+ EXPORT_SYMBOL(__kfence_pool); /* Export for test modules. */
+ 
+ /*
+@@ -537,17 +537,19 @@ static void rcu_guarded_free(struct rcu_head *h)
+ 	kfence_guarded_free((void *)meta->addr, meta, false);
+ }
+ 
+-static bool __init kfence_init_pool(void)
++/*
++ * Initialization of the KFENCE pool after its allocation.
++ * Returns 0 on success; otherwise returns the address up to
++ * which partial initialization succeeded.
++ */
++static unsigned long kfence_init_pool(void)
+ {
+ 	unsigned long addr = (unsigned long)__kfence_pool;
+ 	struct page *pages;
+ 	int i;
+ 
+-	if (!__kfence_pool)
+-		return false;
+-
+ 	if (!arch_kfence_init_pool())
+-		goto err;
++		return addr;
+ 
+ 	pages = virt_to_page(addr);
+ 
+@@ -565,7 +567,7 @@ static bool __init kfence_init_pool(void)
+ 
+ 		/* Verify we do not have a compound head page. */
+ 		if (WARN_ON(compound_head(&pages[i]) != &pages[i]))
+-			goto err;
++			return addr;
+ 
+ 		__SetPageSlab(&pages[i]);
+ 	}
+@@ -578,7 +580,7 @@ static bool __init kfence_init_pool(void)
+ 	 */
+ 	for (i = 0; i < 2; i++) {
+ 		if (unlikely(!kfence_protect(addr)))
+-			goto err;
++			return addr;
+ 
+ 		addr += PAGE_SIZE;
+ 	}
+@@ -595,7 +597,7 @@ static bool __init kfence_init_pool(void)
+ 
+ 		/* Protect the right redzone. */
+ 		if (unlikely(!kfence_protect(addr + PAGE_SIZE)))
+-			goto err;
++			return addr;
+ 
+ 		addr += 2 * PAGE_SIZE;
+ 	}
+@@ -608,9 +610,21 @@ static bool __init kfence_init_pool(void)
+ 	 */
+ 	kmemleak_free(__kfence_pool);
+ 
+-	return true;
++	return 0;
++}
++
++static bool __init kfence_init_pool_early(void)
++{
++	unsigned long addr;
++
++	if (!__kfence_pool)
++		return false;
++
++	addr = kfence_init_pool();
++
++	if (!addr)
++		return true;
+ 
+-err:
+ 	/*
+ 	 * Only release unprotected pages, and do not try to go back and change
+ 	 * page attributes due to risk of failing to do so as well. If changing
+@@ -623,6 +637,26 @@ static bool __init kfence_init_pool(void)
+ 	return false;
+ }
+ 
++static bool kfence_init_pool_late(void)
++{
++	unsigned long addr, free_size;
++
++	addr = kfence_init_pool();
++
++	if (!addr)
++		return true;
++
++	/* Same as above. */
++	free_size = KFENCE_POOL_SIZE - (addr - (unsigned long)__kfence_pool);
++#ifdef CONFIG_CONTIG_ALLOC
++	free_contig_range(page_to_pfn(virt_to_page(addr)), free_size / PAGE_SIZE);
++#else
++	free_pages_exact((void *)addr, free_size);
++#endif
++	__kfence_pool = NULL;
++	return false;
++}
++
+ /* === DebugFS Interface ==================================================== */
+ 
+ static int stats_show(struct seq_file *seq, void *v)
+@@ -771,31 +805,66 @@ void __init kfence_alloc_pool(void)
+ 		pr_err("failed to allocate pool\n");
+ }
+ 
++static void kfence_init_enable(void)
++{
++	if (!IS_ENABLED(CONFIG_KFENCE_STATIC_KEYS))
++		static_branch_enable(&kfence_allocation_key);
++	WRITE_ONCE(kfence_enabled, true);
++	queue_delayed_work(system_unbound_wq, &kfence_timer, 0);
++	pr_info("initialized - using %lu bytes for %d objects at 0x%p-0x%p\n", KFENCE_POOL_SIZE,
++		CONFIG_KFENCE_NUM_OBJECTS, (void *)__kfence_pool,
++		(void *)(__kfence_pool + KFENCE_POOL_SIZE));
++}
++
+ void __init kfence_init(void)
+ {
++	stack_hash_seed = (u32)random_get_entropy();
++
+ 	/* Setting kfence_sample_interval to 0 on boot disables KFENCE. */
+ 	if (!kfence_sample_interval)
+ 		return;
+ 
+-	stack_hash_seed = (u32)random_get_entropy();
+-	if (!kfence_init_pool()) {
++	if (!kfence_init_pool_early()) {
+ 		pr_err("%s failed\n", __func__);
+ 		return;
+ 	}
+ 
+-	if (!IS_ENABLED(CONFIG_KFENCE_STATIC_KEYS))
+-		static_branch_enable(&kfence_allocation_key);
+-	WRITE_ONCE(kfence_enabled, true);
+-	queue_delayed_work(system_unbound_wq, &kfence_timer, 0);
+-	pr_info("initialized - using %lu bytes for %d objects at 0x%p-0x%p\n", KFENCE_POOL_SIZE,
+-		CONFIG_KFENCE_NUM_OBJECTS, (void *)__kfence_pool,
+-		(void *)(__kfence_pool + KFENCE_POOL_SIZE));
++	kfence_init_enable();
++}
++
++static int kfence_init_late(void)
++{
++	const unsigned long nr_pages = KFENCE_POOL_SIZE / PAGE_SIZE;
++#ifdef CONFIG_CONTIG_ALLOC
++	struct page *pages;
++
++	pages = alloc_contig_pages(nr_pages, GFP_KERNEL, first_online_node, NULL);
++	if (!pages)
++		return -ENOMEM;
++	__kfence_pool = page_to_virt(pages);
++#else
++	if (nr_pages > MAX_ORDER_NR_PAGES) {
++		pr_warn("KFENCE_NUM_OBJECTS too large for buddy allocator\n");
++		return -EINVAL;
++	}
++	__kfence_pool = alloc_pages_exact(KFENCE_POOL_SIZE, GFP_KERNEL);
++	if (!__kfence_pool)
++		return -ENOMEM;
++#endif
++
++	if (!kfence_init_pool_late()) {
++		pr_err("%s failed\n", __func__);
++		return -EBUSY;
++	}
++
++	kfence_init_enable();
++	return 0;
+ }
+ 
+ static int kfence_enable_late(void)
+ {
+ 	if (!__kfence_pool)
+-		return -EINVAL;
++		return kfence_init_late();
+ 
+ 	WRITE_ONCE(kfence_enabled, true);
+ 	queue_delayed_work(system_unbound_wq, &kfence_timer, 0);
+-- 
+2.33.0
+

@@ -1,0 +1,121 @@
+From 08aa17a0c18562a08981e5b103105c1798fa2bfd Mon Sep 17 00:00:00 2001
+From: Guangbin Huang <huangguangbin2@huawei.com>
+Date: Tue, 30 Aug 2022 19:11:17 +0800
+Subject: [PATCH] net: hns3: net: hns3: add querying and setting fec off mode
+ from firmware
+Git-commit: 08aa17a0c18562a08981e5b103105c1798fa2bfd
+Patch-mainline: v6.1-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+For some new devices, the FEC mode can not be set to OFF in speed 200G.
+In order to flexibly adapt to all types of devices, driver queries
+fec ability from firmware to decide whether OFF mode can be supported.
+
+Signed-off-by: Guangbin Huang <huangguangbin2@huawei.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/net/ethernet/hisilicon/hns3/hnae3.h      |  1 +
+ .../net/ethernet/hisilicon/hns3/hns3_ethtool.c   | 11 +++++------
+ .../ethernet/hisilicon/hns3/hns3pf/hclge_main.c  | 16 ++++++++++------
+ 3 files changed, 16 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hnae3.h b/drivers/net/ethernet/hisilicon/hns3/hnae3.h
+index d7754b180f53..795df7111119 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hnae3.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hnae3.h
+@@ -224,6 +224,7 @@ enum hnae3_fec_mode {
+ 	HNAE3_FEC_BASER,
+ 	HNAE3_FEC_RS,
+ 	HNAE3_FEC_LLRS,
++	HNAE3_FEC_NONE,
+ 	HNAE3_FEC_USER_DEF,
+ };
+ 
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3_ethtool.c b/drivers/net/ethernet/hisilicon/hns3/hns3_ethtool.c
+index 82a48ec20618..3ca9c2b67da4 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3_ethtool.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3_ethtool.c
+@@ -1625,10 +1625,8 @@ static unsigned int loc_to_eth_fec(u8 loc_fec)
+ 		eth_fec |= ETHTOOL_FEC_LLRS;
+ 	if (loc_fec & BIT(HNAE3_FEC_BASER))
+ 		eth_fec |= ETHTOOL_FEC_BASER;
+-
+-	/* if nothing is set, then FEC is off */
+-	if (!eth_fec)
+-		eth_fec = ETHTOOL_FEC_OFF;
++	if (loc_fec & BIT(HNAE3_FEC_NONE))
++		eth_fec |= ETHTOOL_FEC_OFF;
+ 
+ 	return eth_fec;
+ }
+@@ -1639,8 +1637,7 @@ static unsigned int eth_to_loc_fec(unsigned int eth_fec)
+ 	u32 loc_fec = 0;
+ 
+ 	if (eth_fec & ETHTOOL_FEC_OFF)
+-		return loc_fec;
+-
++		loc_fec |= BIT(HNAE3_FEC_NONE);
+ 	if (eth_fec & ETHTOOL_FEC_AUTO)
+ 		loc_fec |= BIT(HNAE3_FEC_AUTO);
+ 	if (eth_fec & ETHTOOL_FEC_RS)
+@@ -1672,6 +1669,8 @@ static int hns3_get_fecparam(struct net_device *netdev,
+ 
+ 	fec->fec = loc_to_eth_fec(fec_ability);
+ 	fec->active_fec = loc_to_eth_fec(fec_mode);
++	if (!fec->active_fec)
++		fec->active_fec = ETHTOOL_FEC_OFF;
+ 
+ 	return 0;
+ }
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
+index 5cc19ff56121..fcdc978379ff 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
+@@ -1008,6 +1008,7 @@ static void hclge_update_fec_support(struct hclge_mac *mac)
+ 	linkmode_clear_bit(ETHTOOL_LINK_MODE_FEC_BASER_BIT, mac->supported);
+ 	linkmode_clear_bit(ETHTOOL_LINK_MODE_FEC_RS_BIT, mac->supported);
+ 	linkmode_clear_bit(ETHTOOL_LINK_MODE_FEC_LLRS_BIT, mac->supported);
++	linkmode_clear_bit(ETHTOOL_LINK_MODE_FEC_NONE_BIT, mac->supported);
+ 
+ 	if (mac->fec_ability & BIT(HNAE3_FEC_BASER))
+ 		linkmode_set_bit(ETHTOOL_LINK_MODE_FEC_BASER_BIT,
+@@ -1018,6 +1019,9 @@ static void hclge_update_fec_support(struct hclge_mac *mac)
+ 	if (mac->fec_ability & BIT(HNAE3_FEC_LLRS))
+ 		linkmode_set_bit(ETHTOOL_LINK_MODE_FEC_LLRS_BIT,
+ 				 mac->supported);
++	if (mac->fec_ability & BIT(HNAE3_FEC_NONE))
++		linkmode_set_bit(ETHTOOL_LINK_MODE_FEC_NONE_BIT,
++				 mac->supported);
+ }
+ 
+ static void hclge_convert_setting_sr(u16 speed_ability,
+@@ -1125,17 +1129,17 @@ static void hclge_convert_setting_fec(struct hclge_mac *mac)
+ 	switch (mac->speed) {
+ 	case HCLGE_MAC_SPEED_10G:
+ 	case HCLGE_MAC_SPEED_40G:
+-		mac->fec_ability =
+-			BIT(HNAE3_FEC_BASER) | BIT(HNAE3_FEC_AUTO);
++		mac->fec_ability = BIT(HNAE3_FEC_BASER) | BIT(HNAE3_FEC_AUTO) |
++				   BIT(HNAE3_FEC_NONE);
+ 		break;
+ 	case HCLGE_MAC_SPEED_25G:
+ 	case HCLGE_MAC_SPEED_50G:
+-		mac->fec_ability =
+-			BIT(HNAE3_FEC_BASER) | BIT(HNAE3_FEC_RS) |
+-			BIT(HNAE3_FEC_AUTO);
++		mac->fec_ability = BIT(HNAE3_FEC_BASER) | BIT(HNAE3_FEC_RS) |
++				   BIT(HNAE3_FEC_AUTO) | BIT(HNAE3_FEC_NONE);
+ 		break;
+ 	case HCLGE_MAC_SPEED_100G:
+-		mac->fec_ability = BIT(HNAE3_FEC_RS) | BIT(HNAE3_FEC_AUTO);
++		mac->fec_ability = BIT(HNAE3_FEC_RS) | BIT(HNAE3_FEC_AUTO) |
++				   BIT(HNAE3_FEC_NONE);
+ 		break;
+ 	case HCLGE_MAC_SPEED_200G:
+ 		mac->fec_ability = BIT(HNAE3_FEC_RS) | BIT(HNAE3_FEC_AUTO) |
+-- 
+2.33.0
+

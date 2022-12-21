@@ -1,0 +1,147 @@
+From f4bd73b5a950866f6c6fc98a7b684d307c5d586a Mon Sep 17 00:00:00 2001
+From: Kuniyuki Iwashima <kuniyu@amazon.co.jp>
+Date: Tue, 28 Sep 2021 09:42:27 +0900
+Subject: [PATCH] af_unix: Return errno instead of NULL in unix_create1().
+Git-commit: f4bd73b5a950866f6c6fc98a7b684d307c5d586a
+Patch-mainline: v5.15-rc4
+References: bsn#12
+Modified-by-SEL: Yes, modified per openEuler commit 2ae0412d
+
+
+unix_create1() returns NULL on error, and the callers assume that it never
+fails for reasons other than out of memory.  So, the callers always return
+-ENOMEM when unix_create1() fails.
+
+However, it also returns NULL when the number of af_unix sockets exceeds
+twice the limit controlled by sysctl: fs.file-max.  In this case, the
+callers should return -ENFILE like alloc_empty_file().
+
+This patch changes unix_create1() to return the correct error value instead
+of NULL on error.
+
+Out of curiosity, the assumption has been wrong since 1999 due to this
+change introduced in 2.2.4 [0].
+
+  diff -u --recursive --new-file v2.2.3/linux/net/unix/af_unix.c linux/net/unix/af_unix.c
+  -- v2.2.3/linux/net/unix/af_unix.c	Tue Jan 19 11:32:53 1999
+  ++ linux/net/unix/af_unix.c	Sun Mar 21 07:22:00 1999
+  @@ -388,6 +413,9 @@
+   {
+   	struct sock *sk;
+
+  +	if (atomic_read(&unix_nr_socks) >= 2*max_files)
+  +		return NULL;
+  +
+   	MOD_INC_USE_COUNT;
+   	sk = sk_alloc(PF_UNIX, GFP_KERNEL, 1);
+   	if (!sk) {
+
+[0]: https://cdn.kernel.org/pub/linux/kernel/v2.2/patch-2.2.4.gz
+
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+Signed-off-by: Kuniyuki Iwashima <kuniyu@amazon.co.jp>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ net/unix/af_unix.c | 50 ++++++++++++++++++++++++++++++----------------
+ 1 file changed, 33 insertions(+), 17 deletions(-)
+
+diff --git a/net/unix/af_unix.c b/net/unix/af_unix.c
+index e66551d6a43d..9589e54bd3c9 100644
+--- a/net/unix/af_unix.c
++++ b/net/unix/af_unix.c
+@@ -821,16 +821,22 @@ static struct proto unix_proto = {
+ 
+ static struct sock *unix_create1(struct net *net, struct socket *sock, int kern)
+ {
+-	struct sock *sk = NULL;
+ 	struct unix_sock *u;
++	struct sock *sk;
++	int err;
+ 
+ 	atomic_long_inc(&unix_nr_socks);
+-	if (atomic_long_read(&unix_nr_socks) > 2 * get_max_files())
+-		goto out;
++	if (atomic_long_read(&unix_nr_socks) > 2 * get_max_files()) {
++		err = -ENFILE;
++		goto err;
++	}
+ 
+ 	sk = sk_alloc(net, PF_UNIX, GFP_KERNEL, &unix_proto, kern);
+-	if (!sk)
+-		goto out;
++
++	if (!sk) {
++		err = -ENOMEM;
++		goto err;
++	}
+ 
+ 	sock_init_data(sock, sk);
+ 
+@@ -850,20 +856,23 @@ static struct sock *unix_create1(struct net *net, struct socket *sock, int kern)
+ 	init_waitqueue_func_entry(&u->peer_wake, unix_dgram_peer_wake_relay);
+ 	memset(&u->scm_stat, 0, sizeof(struct scm_stat));
+ 	unix_insert_socket(unix_sockets_unbound(sk), sk);
+-out:
+-	if (sk == NULL)
+-		atomic_long_dec(&unix_nr_socks);
+-	else {
+-		local_bh_disable();
+-		sock_prot_inuse_add(sock_net(sk), sk->sk_prot, 1);
+-		local_bh_enable();
+-	}
++
++	local_bh_disable();
++	sock_prot_inuse_add(sock_net(sk), sk->sk_prot, 1);
++	local_bh_enable();
++
+ 	return sk;
++
++err:
++	atomic_long_dec(&unix_nr_socks);
++	return ERR_PTR(err);
+ }
+ 
+ static int unix_create(struct net *net, struct socket *sock, int protocol,
+ 		       int kern)
+ {
++	struct sock *sk;
++
+ 	if (protocol && protocol != PF_UNIX)
+ 		return -EPROTONOSUPPORT;
+ 
+@@ -890,7 +899,11 @@ static int unix_create(struct net *net, struct socket *sock, int protocol,
+ 		return -ESOCKTNOSUPPORT;
+ 	}
+ 
+-	return unix_create1(net, sock, kern) ? 0 : -ENOMEM;
++	sk = unix_create1(net, sock, kern);
++	if (IS_ERR(sk))
++		return PTR_ERR(sk);
++
++	return 0;
+ }
+ 
+ static int unix_release(struct socket *sock)
+@@ -1336,12 +1349,15 @@ static int unix_stream_connect(struct socket *sock, struct sockaddr *uaddr,
+ 	   we will have to recheck all again in any case.
+ 	 */
+ 
+-	err = -ENOMEM;
+-
+ 	/* create new sock for complete connection */
+ 	newsk = unix_create1(sock_net(sk), NULL, 0);
+-	if (newsk == NULL)
++	if (IS_ERR(newsk)) {
++		err = PTR_ERR(newsk);
++		newsk = NULL;
+ 		goto out;
++	}
++
++	err = -ENOMEM;
+ 
+ 	/* Allocate skb for sending to listening sock */
+ 	skb = sock_wmalloc(newsk, 1, 0, GFP_KERNEL);
+-- 
+2.33.0
+

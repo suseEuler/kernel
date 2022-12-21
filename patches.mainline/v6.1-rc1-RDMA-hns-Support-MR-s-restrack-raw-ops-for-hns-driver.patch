@@ -1,0 +1,171 @@
+From 3d67e7e236adb4965ff9834bb7125686ecf9654a Mon Sep 17 00:00:00 2001
+From: Wenpeng Liang <liangwenpeng@huawei.com>
+Date: Mon, 22 Aug 2022 18:44:55 +0800
+Subject: [PATCH] RDMA/hns: Support MR's restrack raw ops for hns driver
+Git-commit: 3d67e7e236adb4965ff9834bb7125686ecf9654a
+Patch-mainline: v6.1-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+The MR raw restrack attributes come from the queue context maintained by
+the ROCEE.
+
+For example:
+
+$ rdma res show mr dev hns_0 mrn 6 -dd -jp -r
+[ {
+        "ifindex": 4,
+        "ifname": "hns_0",
+        "data": [ 1,0,0,0,2,0,0,0,0,3,0,0,0,0,2,0,0,0,0,0,32,0,0,0,2,0,0,0,
+		  2,0,0,0,0,0,0,0 ]
+    } ]
+
+Link: https://lore.kernel.org/r/20220822104455.2311053-8-liangwenpeng@huawei.com
+Signed-off-by: Wenpeng Liang <liangwenpeng@huawei.com>
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/infiniband/hw/hns/hns_roce_device.h   |  2 ++
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.c    | 30 ++++++++++++++++++
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.h    |  3 +-
+ drivers/infiniband/hw/hns/hns_roce_main.c     |  1 +
+ drivers/infiniband/hw/hns/hns_roce_restrack.c | 31 +++++++++++++++++++
+ 5 files changed, 66 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/infiniband/hw/hns/hns_roce_device.h b/drivers/infiniband/hw/hns/hns_roce_device.h
+index 30a67bc70f1a..1bcecc5589fa 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_device.h
++++ b/drivers/infiniband/hw/hns/hns_roce_device.h
+@@ -896,6 +896,7 @@ struct hns_roce_hw {
+ 	int (*write_srqc)(struct hns_roce_srq *srq, void *mb_buf);
+ 	int (*query_cqc)(struct hns_roce_dev *hr_dev, u32 cqn, void *buffer);
+ 	int (*query_qpc)(struct hns_roce_dev *hr_dev, u32 qpn, void *buffer);
++	int (*query_mpt)(struct hns_roce_dev *hr_dev, u32 key, void *buffer);
+ 	const struct ib_device_ops *hns_roce_dev_ops;
+ 	const struct ib_device_ops *hns_roce_dev_srq_ops;
+ };
+@@ -1229,6 +1230,7 @@ int hns_roce_fill_res_cq_entry_raw(struct sk_buff *msg, struct ib_cq *ib_cq);
+ int hns_roce_fill_res_qp_entry(struct sk_buff *msg, struct ib_qp *ib_qp);
+ int hns_roce_fill_res_qp_entry_raw(struct sk_buff *msg, struct ib_qp *ib_qp);
+ int hns_roce_fill_res_mr_entry(struct sk_buff *msg, struct ib_mr *ib_mr);
++int hns_roce_fill_res_mr_entry_raw(struct sk_buff *msg, struct ib_mr *ib_mr);
+ struct hns_user_mmap_entry *
+ hns_roce_user_mmap_entry_insert(struct ib_ucontext *ucontext, u64 address,
+ 				size_t length,
+diff --git a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+index 319de9a4d2ef..fa78b141dff2 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+@@ -5802,6 +5802,35 @@ static int hns_roce_v2_query_cqc(struct hns_roce_dev *hr_dev, u32 cqn,
+ 	return ret;
+ }
+ 
++static int hns_roce_v2_query_mpt(struct hns_roce_dev *hr_dev, u32 key,
++				 void *buffer)
++{
++	struct hns_roce_v2_mpt_entry *context;
++	struct hns_roce_cmd_mailbox *mailbox;
++	int ret;
++
++	mailbox = hns_roce_alloc_cmd_mailbox(hr_dev);
++	if (IS_ERR(mailbox))
++		return PTR_ERR(mailbox);
++
++	context = mailbox->buf;
++	ret = hns_roce_cmd_mbox(hr_dev, 0, mailbox->dma, HNS_ROCE_CMD_QUERY_MPT,
++				key_to_hw_index(key));
++	if (ret) {
++		ibdev_err(&hr_dev->ib_dev,
++			  "failed to process cmd when querying MPT, ret = %d.\n",
++			  ret);
++		goto err_mailbox;
++	}
++
++	memcpy(buffer, context, sizeof(*context));
++
++err_mailbox:
++	hns_roce_free_cmd_mailbox(hr_dev, mailbox);
++
++	return ret;
++}
++
+ static void hns_roce_irq_work_handle(struct work_struct *work)
+ {
+ 	struct hns_roce_work *irq_work =
+@@ -6645,6 +6674,7 @@ static const struct hns_roce_hw hns_roce_hw_v2 = {
+ 	.write_srqc = hns_roce_v2_write_srqc,
+ 	.query_cqc = hns_roce_v2_query_cqc,
+ 	.query_qpc = hns_roce_v2_query_qpc,
++	.query_mpt = hns_roce_v2_query_mpt,
+ 	.hns_roce_dev_ops = &hns_roce_v2_dev_ops,
+ 	.hns_roce_dev_srq_ops = &hns_roce_v2_dev_srq_ops,
+ };
+diff --git a/drivers/infiniband/hw/hns/hns_roce_hw_v2.h b/drivers/infiniband/hw/hns/hns_roce_hw_v2.h
+index 49ec29973ed7..ae29780dd63a 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.h
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.h
+@@ -758,7 +758,8 @@ struct hns_roce_v2_mpt_entry {
+ #define MPT_INNER_PA_VLD MPT_FIELD_LOC(71, 71)
+ #define MPT_MW_BIND_QPN MPT_FIELD_LOC(95, 72)
+ #define MPT_BOUND_LKEY MPT_FIELD_LOC(127, 96)
+-#define MPT_LEN MPT_FIELD_LOC(191, 128)
++#define MPT_LEN_L MPT_FIELD_LOC(159, 128)
++#define MPT_LEN_H MPT_FIELD_LOC(191, 160)
+ #define MPT_LKEY MPT_FIELD_LOC(223, 192)
+ #define MPT_VA MPT_FIELD_LOC(287, 224)
+ #define MPT_PBL_SIZE MPT_FIELD_LOC(319, 288)
+diff --git a/drivers/infiniband/hw/hns/hns_roce_main.c b/drivers/infiniband/hw/hns/hns_roce_main.c
+index ff4386b5c064..9de3a522980a 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_main.c
++++ b/drivers/infiniband/hw/hns/hns_roce_main.c
+@@ -571,6 +571,7 @@ static const struct ib_device_ops hns_roce_dev_restrack_ops = {
+ 	.fill_res_qp_entry = hns_roce_fill_res_qp_entry,
+ 	.fill_res_qp_entry_raw = hns_roce_fill_res_qp_entry_raw,
+ 	.fill_res_mr_entry = hns_roce_fill_res_mr_entry,
++	.fill_res_mr_entry_raw = hns_roce_fill_res_mr_entry_raw,
+ };
+ 
+ static int hns_roce_register_device(struct hns_roce_dev *hr_dev)
+diff --git a/drivers/infiniband/hw/hns/hns_roce_restrack.c b/drivers/infiniband/hw/hns/hns_roce_restrack.c
+index 84f942e19743..989a2af2e938 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_restrack.c
++++ b/drivers/infiniband/hw/hns/hns_roce_restrack.c
+@@ -198,3 +198,34 @@ int hns_roce_fill_res_mr_entry(struct sk_buff *msg, struct ib_mr *ib_mr)
+ 
+ 	return -EMSGSIZE;
+ }
++
++int hns_roce_fill_res_mr_entry_raw(struct sk_buff *msg, struct ib_mr *ib_mr)
++{
++	struct hns_roce_dev *hr_dev = to_hr_dev(ib_mr->device);
++	struct hns_roce_mr *hr_mr = to_hr_mr(ib_mr);
++	struct hns_roce_v2_mpt_entry context;
++	u32 data[MAX_ENTRY_NUM] = {};
++	int offset = 0;
++	int ret;
++
++	if (!hr_dev->hw->query_mpt)
++		return -EINVAL;
++
++	ret = hr_dev->hw->query_mpt(hr_dev, hr_mr->key, &context);
++	if (ret)
++		return -EINVAL;
++
++	data[offset++] = hr_reg_read(&context, MPT_ST);
++	data[offset++] = hr_reg_read(&context, MPT_PD);
++	data[offset++] = hr_reg_read(&context, MPT_LKEY);
++	data[offset++] = hr_reg_read(&context, MPT_LEN_L);
++	data[offset++] = hr_reg_read(&context, MPT_LEN_H);
++	data[offset++] = hr_reg_read(&context, MPT_PBL_SIZE);
++	data[offset++] = hr_reg_read(&context, MPT_PBL_HOP_NUM);
++	data[offset++] = hr_reg_read(&context, MPT_PBL_BA_PG_SZ);
++	data[offset++] = hr_reg_read(&context, MPT_PBL_BUF_PG_SZ);
++
++	ret = nla_put(msg, RDMA_NLDEV_ATTR_RES_RAW, offset * sizeof(u32), data);
++
++	return ret;
++}
+-- 
+2.33.0
+

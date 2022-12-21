@@ -1,0 +1,103 @@
+From cb0f722aff6e9ba970a9fee9263c7821bbe811de Mon Sep 17 00:00:00 2001
+From: Wei Huang <wei.huang2@amd.com>
+Date: Wed, 18 Aug 2021 11:55:48 -0500
+Subject: [PATCH] KVM: x86/mmu: Support shadowing NPT when 5-level paging is
+ enabled in host
+Git-commit: cb0f722aff6e9ba970a9fee9263c7821bbe811de
+Patch-mainline: v5.15-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified per openEuler commit 66592e53
+
+
+When the 5-level page table CPU flag is set in the host, but the guest
+has CR4.LA57=0 (including the case of a 32-bit guest), the top level of
+the shadow NPT page tables will be fixed, consisting of one pointer to
+a lower-level table and 511 non-present entries.  Extend the existing
+code that creates the fixed PML4 or PDP table, to provide a fixed PML5
+table if needed.
+
+This is not needed on EPT because the number of layers in the tables
+is specified in the EPTP instead of depending on the host CR4.
+
+Suggested-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Wei Huang <wei.huang2@amd.com>
+Message-Id: <20210818165549.3771014-3-wei.huang2@amd.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/x86/include/asm/kvm_host.h |  1 +
+ arch/x86/kvm/mmu/mmu.c          | 32 +++++++++++++++++++++++++++++++-
+ 2 files changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 723af2b1f578..27942364d1df 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -387,6 +387,7 @@ struct kvm_mmu {
+ 
+ 	u64 *pae_root;
+ 	u64 *pml4_root;
++	u64 *pml5_root;
+ 
+ 	/*
+ 	 * check zero bits on shadow page table entries, these
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index 0dad71f72c64..8a887a557b93 100755
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -3305,7 +3305,7 @@ static int mmu_alloc_shadow_roots(struct kvm_vcpu *vcpu)
+ 	 * the shadow page table may be a PAE or a long mode page table.
+ 	 */
+ 	pm_mask = PT_PRESENT_MASK;
+-	if (vcpu->arch.mmu->shadow_root_level == PT64_ROOT_4LEVEL) {
++	if (vcpu->arch.mmu->shadow_root_level >= PT64_ROOT_4LEVEL) {
+ 		pm_mask |= PT_ACCESSED_MASK | PT_WRITABLE_MASK | PT_USER_MASK;
+ 
+ 		/*
+@@ -3365,6 +3365,33 @@ static int mmu_alloc_shadow_roots(struct kvm_vcpu *vcpu)
+ 
+ 		vcpu->arch.mmu->root_hpa = __pa(vcpu->arch.mmu->pml4_root);
+ 	}
++#ifdef CONFIG_X86_64
++	if (vcpu->arch.mmu->shadow_root_level == PT64_ROOT_5LEVEL) {
++		if (vcpu->arch.mmu->pml4_root == NULL) {
++			u64 *pml4_root;
++
++			pml4_root = (void*)get_zeroed_page(GFP_KERNEL_ACCOUNT);
++			if (!pml4_root)
++				return -ENOMEM;
++
++			pml4_root[0] = __pa(vcpu->arch.mmu->pae_root) | pm_mask;
++
++			vcpu->arch.mmu->pml4_root = pml4_root;
++		}
++		if (vcpu->arch.mmu->pml5_root == NULL) {
++			u64 *pml5_root;
++
++			pml5_root = (void*)get_zeroed_page(GFP_KERNEL_ACCOUNT);
++			if (!pml5_root)
++				return -ENOMEM;
++
++			pml5_root[0] = __pa(vcpu->arch.mmu->pml4_root) | pm_mask;
++
++			vcpu->arch.mmu->pml5_root = pml5_root;
++		}
++		vcpu->arch.mmu->root_hpa = __pa(vcpu->arch.mmu->pml5_root);
++	}
++#endif
+ 
+ set_root_pgd:
+ 	vcpu->arch.mmu->root_pgd = root_pgd;
+@@ -5303,6 +5330,9 @@ static void free_mmu_pages(struct kvm_mmu *mmu)
+ {
+ 	free_page((unsigned long)mmu->pae_root);
+ 	free_page((unsigned long)mmu->pml4_root);
++#ifdef CONFIG_X86_64
++	free_page((unsigned long)mmu->pml5_root);
++#endif
+ }
+ 
+ static int __kvm_mmu_create(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu)
+-- 
+2.33.0
+

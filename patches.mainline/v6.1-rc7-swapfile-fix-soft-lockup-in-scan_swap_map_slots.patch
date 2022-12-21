@@ -1,0 +1,134 @@
+From de1ccfb648243a031cfbdc2d5571dfdaf5023106 Mon Sep 17 00:00:00 2001
+From: Chen Wandun <chenwandun@huawei.com>
+Date: Fri, 18 Nov 2022 21:38:50 +0800
+Subject: [PATCH] swapfile: fix soft lockup in scan_swap_map_slots
+Git-commit: de1ccfb648243a031cfbdc2d5571dfdaf5023106
+Patch-mainline: v6.1-rc7
+References: bsn#12
+Modified-by-SEL: Yes, modified per openEuler commit b2b6c3df
+
+
+A softlockup occurs in scan free swap slot under huge memory pressure.
+The test scenario is: 64 CPU cores, 64GB memory, and 28 zram devices, the
+disksize of each zram device is 50MB.
+
+LATENCY_LIMIT is used to prevent softlockups in scan_swap_map_slots(), but
+the real loop number would more than LATENCY_LIMIT because of "goto checks
+and goto scan" repeatly without decreasing latency limit.
+
+In order to fix it, decrease latency_ration in advance.
+
+There is also a suspicious place that will cause softlockups in
+get_swap_pages().  In this function, the "goto start_over" may result in
+continuous scanning of the swap partition.  If there is no cond_sched in
+scan_swap_map_slots(), it would cause a softlockup (I am not sure about
+this).
+
+WARN: soft lockup - CPU#11 stuck for 11s! [kswapd0:466]
+CPU: 11 PID: 466 Comm: kswapd@ Kdump: loaded Tainted: G
+dump backtrace+0x0/0x1le4
+show stack+0x20/@x2c
+dump_stack+0xd8/0x140
+watchdog print_info+0x48/0x54
+watchdog_process_before_softlockup+0x98/0xa0
+watchdog_timer_fn+0xlac/0x2d0
+hrtimer_rum_queues+0xb0/0x130
+hrtimer_interrupt+0x13c/0x3c0
+arch_timer_handler_virt+0x3c/0x50
+handLe_percpu_devid_irq+0x90/0x1f4
+handle domain irq+0x84/0x100
+gic_handle_irq+0x88/0x2b0
+e11 ira+0xhB/Bx140
+scan_swap_map_slots+0x678/0x890
+get_swap_pages+0x29c/0x440
+get_swap_page+0x120/0x2e0
+add_to_swap+UX2U/0XyC
+shrink_page_list+0x5d0/0x152c
+shrink_inactive_list+0xl6c/Bx500
+shrink_lruvec+0x270/0x304
+
+WARN: soft lockup - CPU#32 stuck for 11s! [stress-ng:309915]
+watchdog_timer_fn+0x1ac/0x2d0
+__run_hrtimer+0x98/0x2a0
+__hrtimer_run_queues+0xb0/0x130
+hrtimer_interrupt+0x13c/0x3c0
+arch_timer_handler_virt+0x3c/0x50
+handle_percpu_devid_irq+0x90/0x1f4
+__handle_domain_irq+0x84/0x100
+gic_handle_irq+0x88/0x2b0
+el1_irq+0xb8/0x140
+get_swap_pages+0x1e8/0x440
+get_swap_page+0x1c8/0x2e0
+add_to_swap+0x20/0x9c
+shrink_page_list+0x5d0/0x152c
+reclaim_pages+0x160/0x310
+madvise_cold_or_pageout_pte_range+0x7bc/0xe3c
+walk_pmd_range.isra.0+0xac/0x22c
+walk_pud_range+0xfc/0x1c0
+walk_pgd_range+0x158/0x1b0
+__walk_page_range+0x64/0x100
+walk_page_range+0x104/0x150
+
+Link: https://lkml.kernel.org/r/20221118133850.3360369-1-chenwandun@huawei.com
+Fixes: 048c27fd7281 ("[PATCH] swap: scan_swap_map latency breaks")
+Signed-off-by: Chen Wandun <chenwandun@huawei.com>
+Reviewed-by: "Huang, Ying" <ying.huang@intel.com>
+Cc: Hugh Dickins <hugh@veritas.com>
+Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
+Cc: Nanyong Sun <sunnanyong@huawei.com>
+Cc: <xialonglong1@huawei.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/swapfile.c | 16 ++++++++--------
+ 1 file changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index 7faa30f460e4..f4e45e84061c 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -944,6 +944,11 @@ static int scan_swap_map_slots(struct swap_info_struct *si,
+ scan:
+ 	spin_unlock(&si->lock);
+ 	while (++offset <= READ_ONCE(si->highest_bit)) {
++		if (unlikely(--latency_ration < 0)) {
++			cond_resched();
++			latency_ration = LATENCY_LIMIT;
++			scanned_many = true;
++		}
+ 		if (data_race(!si->swap_map[offset])) {
+ 			spin_lock(&si->lock);
+ 			goto checks;
+@@ -953,14 +958,14 @@ static int scan_swap_map_slots(struct swap_info_struct *si,
+ 			spin_lock(&si->lock);
+ 			goto checks;
+ 		}
++	}
++	offset = si->lowest_bit;
++	while (offset < scan_base) {
+ 		if (unlikely(--latency_ration < 0)) {
+ 			cond_resched();
+ 			latency_ration = LATENCY_LIMIT;
+ 			scanned_many = true;
+ 		}
+-	}
+-	offset = si->lowest_bit;
+-	while (offset < scan_base) {
+ 		if (data_race(!si->swap_map[offset])) {
+ 			spin_lock(&si->lock);
+ 			goto checks;
+@@ -970,11 +975,6 @@ static int scan_swap_map_slots(struct swap_info_struct *si,
+ 			spin_lock(&si->lock);
+ 			goto checks;
+ 		}
+-		if (unlikely(--latency_ration < 0)) {
+-			cond_resched();
+-			latency_ration = LATENCY_LIMIT;
+-			scanned_many = true;
+-		}
+ 		offset++;
+ 	}
+ 	spin_lock(&si->lock);
+-- 
+2.33.0
+

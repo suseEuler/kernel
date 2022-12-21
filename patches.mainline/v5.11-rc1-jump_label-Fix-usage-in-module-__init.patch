@@ -1,0 +1,72 @@
+From 55d2eba8e7cd439c11cdb204898c2d384227629b Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Wed, 16 Dec 2020 12:21:36 +0100
+Subject: [PATCH] jump_label: Fix usage in module __init
+Git-commit: 55d2eba8e7cd439c11cdb204898c2d384227629b
+Patch-mainline: v5.11-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+When the static_key is part of the module, and the module calls
+static_key_inc/enable() from it's __init section *AND* has a
+static_branch_*() user in that very same __init section, things go
+wobbly.
+
+If the static_key lives outside the module, jump_label_add_module()
+would append this module's sites to the key and jump_label_update()
+would take the static_key_linked() branch and all would be fine.
+
+If all the sites are outside of __init, then everything will be fine
+too.
+
+However, when all is aligned just as described above,
+jump_label_update() calls __jump_label_update(.init = false) and we'll
+not update sites in __init text.
+
+Fixes: 19483677684b ("jump_label: Annotate entries that operate on __init code earlier")
+Reported-by: Dexuan Cui <decui@microsoft.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Acked-by: Josh Poimboeuf <jpoimboe@redhat.com>
+Tested-by: Jessica Yu <jeyu@kernel.org>
+Link: https://lkml.kernel.org/r/20201216135435.GV3092@hirez.programming.kicks-ass.net
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/jump_label.c | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/jump_label.c b/kernel/jump_label.c
+index 015ef903ce8c..c6a39d662935 100644
+--- a/kernel/jump_label.c
++++ b/kernel/jump_label.c
+@@ -793,6 +793,7 @@ int jump_label_text_reserved(void *start, void *end)
+ static void jump_label_update(struct static_key *key)
+ {
+ 	struct jump_entry *stop = __stop___jump_table;
++	bool init = system_state < SYSTEM_RUNNING;
+ 	struct jump_entry *entry;
+ #ifdef CONFIG_MODULES
+ 	struct module *mod;
+@@ -804,15 +805,16 @@ static void jump_label_update(struct static_key *key)
+ 
+ 	preempt_disable();
+ 	mod = __module_address((unsigned long)key);
+-	if (mod)
++	if (mod) {
+ 		stop = mod->jump_entries + mod->num_jump_entries;
++		init = mod->state == MODULE_STATE_COMING;
++	}
+ 	preempt_enable();
+ #endif
+ 	entry = static_key_entries(key);
+ 	/* if there are no users, entry can be NULL */
+ 	if (entry)
+-		__jump_label_update(key, entry, stop,
+-				    system_state < SYSTEM_RUNNING);
++		__jump_label_update(key, entry, stop, init);
+ }
+ 
+ #ifdef CONFIG_STATIC_KEYS_SELFTEST
+-- 
+2.33.0
+

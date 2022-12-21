@@ -1,0 +1,236 @@
+From 5981611d0a006472d367d7a8e6ead8afaecf17c7 Mon Sep 17 00:00:00 2001
+From: Muchun Song <songmuchun@bytedance.com>
+Date: Thu, 28 Apr 2022 23:16:14 -0700
+Subject: [PATCH] mm: hugetlb_vmemmap: cleanup hugetlb_vmemmap related
+ functions
+Git-commit: 5981611d0a006472d367d7a8e6ead8afaecf17c7
+Patch-mainline: v5.19-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified per openEuler commit b8dfc94b
+
+
+Patch series "cleanup hugetlb_vmemmap".
+
+The word of "free" is not expressive enough to express the feature of
+optimizing vmemmap pages associated with each HugeTLB, rename this keywork
+to "optimize" is more clear.  In this series, cheanup related codes to
+make it more clear and expressive.  This is suggested by David.
+
+This patch (of 3):
+
+The word of "free" is not expressive enough to express the feature of
+optimizing vmemmap pages associated with each HugeTLB, rename this keywork
+to "optimize".  And some function names are prefixed with "huge_page"
+instead of "hugetlb", it is easily to be confused with THP.  In this
+patch, cheanup related functions to make code more clear and expressive.
+
+Link: https://lkml.kernel.org/r/20220404074652.68024-1-songmuchun@bytedance.com
+Link: https://lkml.kernel.org/r/20220404074652.68024-2-songmuchun@bytedance.com
+Signed-off-by: Muchun Song <songmuchun@bytedance.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/hugetlb.h |    2 +-
+ mm/hugetlb.c            |    8 ++++----
+ mm/hugetlb_vmemmap.c    |   42 ++++++++++++++++++++----------------------
+ mm/hugetlb_vmemmap.h    |   20 ++++++++++----------
+ 4 files changed, 35 insertions(+), 37 deletions(-)
+
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -583,7 +583,7 @@ struct hstate {
+ 	unsigned int free_huge_pages_node[MAX_NUMNODES];
+ 	unsigned int surplus_huge_pages_node[MAX_NUMNODES];
+ #ifdef CONFIG_HUGETLB_PAGE_FREE_VMEMMAP
+-	unsigned int nr_free_vmemmap_pages;
++	unsigned int optimize_vmemmap_pages;
+ #endif
+ #ifdef CONFIG_CGROUP_HUGETLB
+ 	/* cgroup control files */
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -1427,7 +1427,7 @@ static void __update_and_free_page(struc
+ 	if (hstate_is_gigantic(h) && !gigantic_page_runtime_supported())
+ 		return;
+ 
+-	if (alloc_huge_page_vmemmap(h, page)) {
++	if (hugetlb_vmemmap_alloc(h, page)) {
+ 		spin_lock_irq(&hugetlb_lock);
+ 		/*
+ 		 * If we cannot allocate vmemmap pages, just refuse to free the
+@@ -1498,7 +1498,7 @@ static DECLARE_WORK(free_hpage_work, fre
+ 
+ static inline void flush_free_hpage_work(struct hstate *h)
+ {
+-	if (free_vmemmap_pages_per_hpage(h))
++	if (hugetlb_optimize_vmemmap_pages(h))
+ 		flush_work(&free_hpage_work);
+ }
+ 
+@@ -1618,7 +1618,7 @@ static void __prep_account_new_huge_page
+ 
+ static void __prep_new_huge_page(struct hstate *h, struct page *page)
+ {
+-	free_huge_page_vmemmap(h, page);
++	hugetlb_vmemmap_free(h, page);
+ 	INIT_LIST_HEAD(&page->lru);
+ 	set_compound_page_dtor(page, HUGETLB_PAGE_DTOR);
+ 	hugetlb_set_page_subpool(page, NULL);
+@@ -1974,7 +1974,7 @@ retry:
+ 		 * Attempt to allocate vmemmmap here so that we can take
+ 		 * appropriate action on failure.
+ 		 */
+-		rc = alloc_huge_page_vmemmap(h, head);
++		rc = hugetlb_vmemmap_alloc(h, head);
+ 		if (!rc) {
+ 			/*
+ 			 * Move PageHWPoison flag from head page to the raw
+--- a/mm/hugetlb_vmemmap.c
++++ b/mm/hugetlb_vmemmap.c
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /*
+- * Free some vmemmap pages of HugeTLB
++ * Optimize vmemmap pages associated with HugeTLB
+  *
+  * Copyright (c) 2020, Bytedance. All rights reserved.
+  *
+@@ -192,7 +192,7 @@ DEFINE_STATIC_KEY_MAYBE(CONFIG_HUGETLB_P
+ 			hugetlb_free_vmemmap_enabled_key);
+ EXPORT_SYMBOL(hugetlb_free_vmemmap_enabled_key);
+ 
+-static int __init early_hugetlb_free_vmemmap_param(char *buf)
++static int __init hugetlb_vmemmap_early_param(char *buf)
+ {
+ 	/* We cannot optimize if a "struct page" crosses page boundaries. */
+ 	if (!is_power_of_2(sizeof(struct page))) {
+@@ -212,29 +212,26 @@ static int __init early_hugetlb_free_vme
+ 
+ 	return 0;
+ }
+-early_param("hugetlb_free_vmemmap", early_hugetlb_free_vmemmap_param);
+-
+-static inline unsigned long free_vmemmap_pages_size_per_hpage(struct hstate *h)
+-{
+-	return (unsigned long)free_vmemmap_pages_per_hpage(h) << PAGE_SHIFT;
+-}
++early_param("hugetlb_free_vmemmap", hugetlb_vmemmap_early_param);
+ 
+ /*
+  * Previously discarded vmemmap pages will be allocated and remapping
+  * after this function returns zero.
+  */
+-int alloc_huge_page_vmemmap(struct hstate *h, struct page *head)
++int hugetlb_vmemmap_alloc(struct hstate *h, struct page *head)
+ {
+ 	int ret;
+ 	unsigned long vmemmap_addr = (unsigned long)head;
+-	unsigned long vmemmap_end, vmemmap_reuse;
++	unsigned long vmemmap_end, vmemmap_reuse, vmemmap_pages;
+ 
+ 	if (!HPageVmemmapOptimized(head))
+ 		return 0;
+ 
+-	vmemmap_addr += RESERVE_VMEMMAP_SIZE;
+-	vmemmap_end = vmemmap_addr + free_vmemmap_pages_size_per_hpage(h);
+-	vmemmap_reuse = vmemmap_addr - PAGE_SIZE;
++	vmemmap_addr	+= RESERVE_VMEMMAP_SIZE;
++	vmemmap_pages	= hugetlb_optimize_vmemmap_pages(h);
++	vmemmap_end	= vmemmap_addr + (vmemmap_pages << PAGE_SHIFT);
++	vmemmap_reuse	= vmemmap_addr - PAGE_SIZE;
++
+ 	/*
+ 	 * The pages which the vmemmap virtual address range [@vmemmap_addr,
+ 	 * @vmemmap_end) are mapped to are freed to the buddy allocator, and
+@@ -250,17 +247,18 @@ int alloc_huge_page_vmemmap(struct hstat
+ 	return ret;
+ }
+ 
+-void free_huge_page_vmemmap(struct hstate *h, struct page *head)
++void hugetlb_vmemmap_free(struct hstate *h, struct page *head)
+ {
+ 	unsigned long vmemmap_addr = (unsigned long)head;
+-	unsigned long vmemmap_end, vmemmap_reuse;
++	unsigned long vmemmap_end, vmemmap_reuse, vmemmap_pages;
+ 
+-	if (!free_vmemmap_pages_per_hpage(h))
++	vmemmap_pages = hugetlb_optimize_vmemmap_pages(h);
++	if (!vmemmap_pages)
+ 		return;
+ 
+-	vmemmap_addr += RESERVE_VMEMMAP_SIZE;
+-	vmemmap_end = vmemmap_addr + free_vmemmap_pages_size_per_hpage(h);
+-	vmemmap_reuse = vmemmap_addr - PAGE_SIZE;
++	vmemmap_addr	+= RESERVE_VMEMMAP_SIZE;
++	vmemmap_end	= vmemmap_addr + (vmemmap_pages << PAGE_SHIFT);
++	vmemmap_reuse	= vmemmap_addr - PAGE_SIZE;
+ 
+ 	/*
+ 	 * Remap the vmemmap virtual address range [@vmemmap_addr, @vmemmap_end)
+@@ -297,8 +295,8 @@ void __init hugetlb_vmemmap_init(struct
+ 	 * hugetlbpage.rst for more details.
+ 	 */
+ 	if (likely(vmemmap_pages > RESERVE_VMEMMAP_NR))
+-		h->nr_free_vmemmap_pages = vmemmap_pages - RESERVE_VMEMMAP_NR;
++		h->optimize_vmemmap_pages = vmemmap_pages - RESERVE_VMEMMAP_NR;
+ 
+-	pr_info("can free %d vmemmap pages for %s\n", h->nr_free_vmemmap_pages,
+-		h->name);
++	pr_info("can optimize %d vmemmap pages for %s\n",
++		h->optimize_vmemmap_pages, h->name);
+ }
+--- a/mm/hugetlb_vmemmap.h
++++ b/mm/hugetlb_vmemmap.h
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /*
+- * Free some vmemmap pages of HugeTLB
++ * Optimize vmemmap pages associated with HugeTLB
+  *
+  * Copyright (c) 2020, Bytedance. All rights reserved.
+  *
+@@ -11,25 +11,25 @@
+ #include <linux/hugetlb.h>
+ 
+ #ifdef CONFIG_HUGETLB_PAGE_FREE_VMEMMAP
+-int alloc_huge_page_vmemmap(struct hstate *h, struct page *head);
+-void free_huge_page_vmemmap(struct hstate *h, struct page *head);
++int hugetlb_vmemmap_alloc(struct hstate *h, struct page *head);
++void hugetlb_vmemmap_free(struct hstate *h, struct page *head);
+ void hugetlb_vmemmap_init(struct hstate *h);
+ 
+ /*
+- * How many vmemmap pages associated with a HugeTLB page that can be freed
+- * to the buddy allocator.
++ * How many vmemmap pages associated with a HugeTLB page that can be
++ * optimized and freed to the buddy allocator.
+  */
+-static inline unsigned int free_vmemmap_pages_per_hpage(struct hstate *h)
++static inline unsigned int hugetlb_optimize_vmemmap_pages(struct hstate *h)
+ {
+-	return h->nr_free_vmemmap_pages;
++	return h->optimize_vmemmap_pages;
+ }
+ #else
+-static inline int alloc_huge_page_vmemmap(struct hstate *h, struct page *head)
++static inline int hugetlb_vmemmap_alloc(struct hstate *h, struct page *head)
+ {
+ 	return 0;
+ }
+ 
+-static inline void free_huge_page_vmemmap(struct hstate *h, struct page *head)
++static inline void hugetlb_vmemmap_free(struct hstate *h, struct page *head)
+ {
+ }
+ 
+@@ -37,7 +37,7 @@ static inline void hugetlb_vmemmap_init(
+ {
+ }
+ 
+-static inline unsigned int free_vmemmap_pages_per_hpage(struct hstate *h)
++static inline unsigned int hugetlb_optimize_vmemmap_pages(struct hstate *h)
+ {
+ 	return 0;
+ }

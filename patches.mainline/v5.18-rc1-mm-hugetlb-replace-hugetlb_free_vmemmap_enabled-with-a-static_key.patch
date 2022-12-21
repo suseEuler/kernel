@@ -1,0 +1,139 @@
+From a6b40850c442bf996e729e1d441d3dbc37cea171 Mon Sep 17 00:00:00 2001
+From: Muchun Song <songmuchun@bytedance.com>
+Date: Tue, 22 Mar 2022 14:45:03 -0700
+Subject: [PATCH] mm: hugetlb: replace hugetlb_free_vmemmap_enabled with a
+ static_key
+Git-commit: a6b40850c442bf996e729e1d441d3dbc37cea171
+Patch-mainline: v5.18-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified per openEuler commit 9b4aa808
+
+
+The page_fixed_fake_head() is used throughout memory management and the
+conditional check requires checking a global variable, although the
+overhead of this check may be small, it increases when the memory cache
+comes under pressure.  Also, the global variable will not be modified
+after system boot, so it is very appropriate to use static key machanism.
+
+Link: https://lkml.kernel.org/r/20211101031651.75851-3-songmuchun@bytedance.com
+Signed-off-by: Muchun Song <songmuchun@bytedance.com>
+Reviewed-by: Barry Song <song.bao.hua@hisilicon.com>
+Cc: Bodeddula Balasubramaniam <bodeddub@amazon.com>
+Cc: Chen Huang <chenhuang5@huawei.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Fam Zheng <fam.zheng@bytedance.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Qi Zheng <zhengqi.arch@bytedance.com>
+Cc: Xiongchun Duan <duanxiongchun@bytedance.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/hugetlb.h    |  6 ------
+ include/linux/page-flags.h | 16 ++++++++++++++--
+ mm/hugetlb_vmemmap.c       | 12 ++++++------
+ 3 files changed, 20 insertions(+), 14 deletions(-)
+
+diff --git a/include/linux/hugetlb.h b/include/linux/hugetlb.h
+index 634630ebc8a7..fd1dc8d29436 100644
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -1103,12 +1103,6 @@ static inline int hugetlb_insert_hugepage_pte_by_pa(struct mm_struct *mm,
+ }
+ #endif	/* CONFIG_HUGETLB_PAGE */
+ 
+-#ifdef CONFIG_HUGETLB_PAGE_FREE_VMEMMAP
+-extern bool hugetlb_free_vmemmap_enabled;
+-#else
+-#define hugetlb_free_vmemmap_enabled	false
+-#endif
+-
+ static inline spinlock_t *huge_pte_lock(struct hstate *h,
+ 					struct mm_struct *mm, pte_t *pte)
+ {
+diff --git a/include/linux/page-flags.h b/include/linux/page-flags.h
+index 7b31a81be7e1..81061122af68 100644
+--- a/include/linux/page-flags.h
++++ b/include/linux/page-flags.h
+@@ -195,7 +195,14 @@ enum pageflags {
+ #ifndef __GENERATING_BOUNDS_H
+ 
+ #ifdef CONFIG_HUGETLB_PAGE_FREE_VMEMMAP
+-extern bool hugetlb_free_vmemmap_enabled;
++DECLARE_STATIC_KEY_MAYBE(CONFIG_HUGETLB_PAGE_FREE_VMEMMAP_DEFAULT_ON,
++			 hugetlb_free_vmemmap_enabled_key);
++
++static __always_inline bool hugetlb_free_vmemmap_enabled(void)
++{
++	return static_branch_maybe(CONFIG_HUGETLB_PAGE_FREE_VMEMMAP_DEFAULT_ON,
++				   &hugetlb_free_vmemmap_enabled_key);
++}
+ 
+ /*
+  * If the feature of freeing some vmemmap pages associated with each HugeTLB
+@@ -215,7 +222,7 @@ extern bool hugetlb_free_vmemmap_enabled;
+  */
+ static __always_inline const struct page *page_fixed_fake_head(const struct page *page)
+ {
+-	if (!hugetlb_free_vmemmap_enabled)
++	if (!hugetlb_free_vmemmap_enabled())
+ 		return page;
+ 
+ 	/*
+@@ -243,6 +250,11 @@ static inline const struct page *page_fixed_fake_head(const struct page *page)
+ {
+ 	return page;
+ }
++
++static inline bool hugetlb_free_vmemmap_enabled(void)
++{
++	return false;
++}
+ #endif
+ 
+ static __always_inline int page_is_fake_head(struct page *page)
+diff --git a/mm/hugetlb_vmemmap.c b/mm/hugetlb_vmemmap.c
+index 4977f5a520c2..791626983c2e 100644
+--- a/mm/hugetlb_vmemmap.c
++++ b/mm/hugetlb_vmemmap.c
+@@ -188,9 +188,9 @@
+ #define RESERVE_VMEMMAP_NR		1U
+ #define RESERVE_VMEMMAP_SIZE		(RESERVE_VMEMMAP_NR << PAGE_SHIFT)
+ 
+-bool hugetlb_free_vmemmap_enabled __read_mostly =
+-	IS_ENABLED(CONFIG_HUGETLB_PAGE_FREE_VMEMMAP_DEFAULT_ON);
+-EXPORT_SYMBOL(hugetlb_free_vmemmap_enabled);
++DEFINE_STATIC_KEY_MAYBE(CONFIG_HUGETLB_PAGE_FREE_VMEMMAP_DEFAULT_ON,
++			hugetlb_free_vmemmap_enabled_key);
++EXPORT_SYMBOL(hugetlb_free_vmemmap_enabled_key);
+ 
+ static int __init early_hugetlb_free_vmemmap_param(char *buf)
+ {
+@@ -204,9 +204,9 @@ static int __init early_hugetlb_free_vmemmap_param(char *buf)
+ 		return -EINVAL;
+ 
+ 	if (!strcmp(buf, "on"))
+-		hugetlb_free_vmemmap_enabled = true;
++		static_branch_enable(&hugetlb_free_vmemmap_enabled_key);
+ 	else if (!strcmp(buf, "off"))
+-		hugetlb_free_vmemmap_enabled = false;
++		static_branch_disable(&hugetlb_free_vmemmap_enabled_key);
+ 	else
+ 		return -EINVAL;
+ 
+@@ -284,7 +284,7 @@ void __init hugetlb_vmemmap_init(struct hstate *h)
+ 	BUILD_BUG_ON(__NR_USED_SUBPAGE >=
+ 		     RESERVE_VMEMMAP_SIZE / sizeof(struct page));
+ 
+-	if (!hugetlb_free_vmemmap_enabled)
++	if (!hugetlb_free_vmemmap_enabled())
+ 		return;
+ 
+ 	vmemmap_pages = (nr_pages * sizeof(struct page)) >> PAGE_SHIFT;
+-- 
+2.33.0
+

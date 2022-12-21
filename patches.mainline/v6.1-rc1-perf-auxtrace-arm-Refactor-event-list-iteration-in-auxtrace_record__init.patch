@@ -1,0 +1,129 @@
+From 45a3975f8e4c56829ada20f7a6a29095ca05e375 Mon Sep 17 00:00:00 2001
+From: Qi Liu <liuqi115@huawei.com>
+Date: Tue, 27 Sep 2022 16:13:58 +0800
+Subject: [PATCH] perf auxtrace arm: Refactor event list iteration in
+ auxtrace_record__init()
+Git-commit: 45a3975f8e4c56829ada20f7a6a29095ca05e375
+Patch-mainline: v6.1-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+Add find_pmu_for_event() and use to simplify logic in
+auxtrace_record_init(). find_pmu_for_event() will be reused in
+subsequent patches.
+
+Reviewed-by: John Garry <john.garry@huawei.com>
+Reviewed-by: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+Reviewed-by: Leo Yan <leo.yan@linaro.org>
+Signed-off-by: Qi Liu <liuqi115@huawei.com>
+Signed-off-by: Yicong Yang <yangyicong@hisilicon.com>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Bjorn Helgaas <helgaas@kernel.org>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: James Clark <james.clark@arm.com>
+Cc: Lorenzo Pieralisi <lorenzo.pieralisi@arm.com>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Mathieu Poirier <mathieu.poirier@linaro.org>
+Cc: Mike Leach <mike.leach@linaro.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Qi Liu <liuqi6124@gmail.com>
+Cc: Shameerali Kolothum Thodi <shameerali.kolothum.thodi@huawei.com>
+Cc: Shaokun Zhang <zhangshaokun@hisilicon.com>
+Cc: Suzuki Poulouse <suzuki.poulose@arm.com>
+Cc: Will Deacon <will@kernel.org>
+Cc: Zeng Prime <prime.zeng@huawei.com>
+Cc: linux-arm-kernel@lists.infradead.org
+Cc: linux-pci@vger.kernel.org
+Cc: linuxarm@huawei.com
+Link: https://lore.kernel.org/r/20220927081400.14364-2-yangyicong@huawei.com
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ tools/perf/arch/arm/util/auxtrace.c | 53 ++++++++++++++++++-----------
+ 1 file changed, 34 insertions(+), 19 deletions(-)
+
+diff --git a/tools/perf/arch/arm/util/auxtrace.c b/tools/perf/arch/arm/util/auxtrace.c
+index 5fc6a2a3dbc5..384c7cfda0fd 100644
+--- a/tools/perf/arch/arm/util/auxtrace.c
++++ b/tools/perf/arch/arm/util/auxtrace.c
+@@ -50,16 +50,32 @@ static struct perf_pmu **find_all_arm_spe_pmus(int *nr_spes, int *err)
+ 	return arm_spe_pmus;
+ }
+ 
++static struct perf_pmu *find_pmu_for_event(struct perf_pmu **pmus,
++					   int pmu_nr, struct evsel *evsel)
++{
++	int i;
++
++	if (!pmus)
++		return NULL;
++
++	for (i = 0; i < pmu_nr; i++) {
++		if (evsel->core.attr.type == pmus[i]->type)
++			return pmus[i];
++	}
++
++	return NULL;
++}
++
+ struct auxtrace_record
+ *auxtrace_record__init(struct evlist *evlist, int *err)
+ {
+-	struct perf_pmu	*cs_etm_pmu;
++	struct perf_pmu	*cs_etm_pmu = NULL;
++	struct perf_pmu **arm_spe_pmus = NULL;
+ 	struct evsel *evsel;
+-	bool found_etm = false;
++	struct perf_pmu *found_etm = NULL;
+ 	struct perf_pmu *found_spe = NULL;
+-	struct perf_pmu **arm_spe_pmus = NULL;
++	int auxtrace_event_cnt = 0;
+ 	int nr_spes = 0;
+-	int i = 0;
+ 
+ 	if (!evlist)
+ 		return NULL;
+@@ -68,24 +84,23 @@ struct auxtrace_record
+ 	arm_spe_pmus = find_all_arm_spe_pmus(&nr_spes, err);
+ 
+ 	evlist__for_each_entry(evlist, evsel) {
+-		if (cs_etm_pmu &&
+-		    evsel->core.attr.type == cs_etm_pmu->type)
+-			found_etm = true;
+-
+-		if (!nr_spes || found_spe)
+-			continue;
+-
+-		for (i = 0; i < nr_spes; i++) {
+-			if (evsel->core.attr.type == arm_spe_pmus[i]->type) {
+-				found_spe = arm_spe_pmus[i];
+-				break;
+-			}
+-		}
++		if (cs_etm_pmu && !found_etm)
++			found_etm = find_pmu_for_event(&cs_etm_pmu, 1, evsel);
++
++		if (arm_spe_pmus && !found_spe)
++			found_spe = find_pmu_for_event(arm_spe_pmus, nr_spes, evsel);
+ 	}
++
+ 	free(arm_spe_pmus);
+ 
+-	if (found_etm && found_spe) {
+-		pr_err("Concurrent ARM Coresight ETM and SPE operation not currently supported\n");
++	if (found_etm)
++		auxtrace_event_cnt++;
++
++	if (found_spe)
++		auxtrace_event_cnt++;
++
++	if (auxtrace_event_cnt > 1) {
++		pr_err("Concurrent AUX trace operation not currently supported\n");
+ 		*err = -EOPNOTSUPP;
+ 		return NULL;
+ 	}
+-- 
+2.33.0
+

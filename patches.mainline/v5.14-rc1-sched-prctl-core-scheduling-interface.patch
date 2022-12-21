@@ -1,0 +1,244 @@
+From 7ac592aa35a684ff1858fb9ec282886b9e3575ac Mon Sep 17 00:00:00 2001
+From: Chris Hyser <chris.hyser@oracle.com>
+Date: Wed, 24 Mar 2021 17:40:15 -0400
+Subject: [PATCH] sched: prctl() core-scheduling interface
+Git-commit: 7ac592aa35a684ff1858fb9ec282886b9e3575ac
+Patch-mainline: v5.14-rc1
+References: bsn#12
+Modified-by-SEL: Yes, refreshed due to different context
+
+
+This patch provides support for setting and copying core scheduling
+'task cookies' between threads (PID), processes (TGID), and process
+groups (PGID).
+
+The value of core scheduling isn't that tasks don't share a core,
+'nosmt' can do that. The value lies in exploiting all the sharing
+opportunities that exist to recover possible lost performance and that
+requires a degree of flexibility in the API.
+
+From a security perspective (and there are others), the thread,
+process and process group distinction is an existent hierarchal
+categorization of tasks that reflects many of the security concerns
+about 'data sharing'. For example, protecting against cache-snooping
+by a thread that can just read the memory directly isn't all that
+useful.
+
+With this in mind, subcommands to CREATE/SHARE (TO/FROM) provide a
+mechanism to create and share cookies. CREATE/SHARE_TO specify a
+target pid with enum pidtype used to specify the scope of the targeted
+tasks. For example, PIDTYPE_TGID will share the cookie with the
+process and all of it's threads as typically desired in a security
+scenario.
+
+API:
+
+  prctl(PR_SCHED_CORE, PR_SCHED_CORE_GET, tgtpid, pidtype, &cookie)
+  prctl(PR_SCHED_CORE, PR_SCHED_CORE_CREATE, tgtpid, pidtype, NULL)
+  prctl(PR_SCHED_CORE, PR_SCHED_CORE_SHARE_TO, tgtpid, pidtype, NULL)
+  prctl(PR_SCHED_CORE, PR_SCHED_CORE_SHARE_FROM, srcpid, pidtype, NULL)
+
+where 'tgtpid/srcpid == 0' implies the current process and pidtype is
+kernel enum pid_type {PIDTYPE_PID, PIDTYPE_TGID, PIDTYPE_PGID, ...}.
+
+For return values, EINVAL, ENOMEM are what they say. ESRCH means the
+tgtpid/srcpid was not found. EPERM indicates lack of PTRACE permission
+access to tgtpid/srcpid. ENODEV indicates your machines lacks SMT.
+
+[peterz: complete rewrite]
+Signed-off-by: Chris Hyser <chris.hyser@oracle.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Tested-by: Don Hiatt <dhiatt@digitalocean.com>
+Tested-by: Hongyu Ning <hongyu.ning@linux.intel.com>
+Tested-by: Vincent Guittot <vincent.guittot@linaro.org>
+Link: https://lkml.kernel.org/r/20210422123309.039845339@infradead.org
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/sched.h            |    2 
+ include/uapi/linux/prctl.h       |    8 ++
+ kernel/sched/core_sched.c        |  114 +++++++++++++++++++++++++++++++++++++++
+ kernel/sys.c                     |    5 +
+ tools/include/uapi/linux/prctl.h |    8 ++
+ 5 files changed, 137 insertions(+)
+
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -2123,6 +2123,8 @@ const struct cpumask *sched_trace_rd_spa
+ #ifdef CONFIG_SCHED_CORE
+ extern void sched_core_free(struct task_struct *tsk);
+ extern void sched_core_fork(struct task_struct *p);
++extern int sched_core_share_pid(unsigned int cmd, pid_t pid, enum pid_type type,
++				unsigned long uaddr);
+ #else
+ static inline void sched_core_free(struct task_struct *tsk) { }
+ static inline void sched_core_fork(struct task_struct *p) { }
+--- a/include/uapi/linux/prctl.h
++++ b/include/uapi/linux/prctl.h
+@@ -247,4 +247,12 @@ struct prctl_mm_map {
+ #define PR_SET_IO_FLUSHER		57
+ #define PR_GET_IO_FLUSHER		58
+ 
++/* Request the scheduler to share a core */
++#define PR_SCHED_CORE			62
++# define PR_SCHED_CORE_GET		0
++# define PR_SCHED_CORE_CREATE		1 /* create unique core_sched cookie */
++# define PR_SCHED_CORE_SHARE_TO		2 /* push core_sched cookie to pid */
++# define PR_SCHED_CORE_SHARE_FROM	3 /* pull core_sched cookie to pid */
++# define PR_SCHED_CORE_MAX		4
++
+ #endif /* _LINUX_PRCTL_H */
+--- a/kernel/sched/core_sched.c
++++ b/kernel/sched/core_sched.c
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ 
++#include <linux/prctl.h>
+ #include "sched.h"
+ 
+ /*
+@@ -113,3 +114,116 @@ void sched_core_free(struct task_struct
+ {
+ 	sched_core_put_cookie(p->core_cookie);
+ }
++
++static void __sched_core_set(struct task_struct *p, unsigned long cookie)
++{
++	cookie = sched_core_get_cookie(cookie);
++	cookie = sched_core_update_cookie(p, cookie);
++	sched_core_put_cookie(cookie);
++}
++
++/* Called from prctl interface: PR_SCHED_CORE */
++int sched_core_share_pid(unsigned int cmd, pid_t pid, enum pid_type type,
++			 unsigned long uaddr)
++{
++	unsigned long cookie = 0, id = 0;
++	struct task_struct *task, *p;
++	struct pid *grp;
++	int err = 0;
++
++	if (!static_branch_likely(&sched_smt_present))
++		return -ENODEV;
++
++	if (type > PIDTYPE_PGID || cmd >= PR_SCHED_CORE_MAX || pid < 0 ||
++	    (cmd != PR_SCHED_CORE_GET && uaddr))
++		return -EINVAL;
++
++	rcu_read_lock();
++	if (pid == 0) {
++		task = current;
++	} else {
++		task = find_task_by_vpid(pid);
++		if (!task) {
++			rcu_read_unlock();
++			return -ESRCH;
++		}
++	}
++	get_task_struct(task);
++	rcu_read_unlock();
++
++	/*
++	 * Check if this process has the right to modify the specified
++	 * process. Use the regular "ptrace_may_access()" checks.
++	 */
++	if (!ptrace_may_access(task, PTRACE_MODE_READ_REALCREDS)) {
++		err = -EPERM;
++		goto out;
++	}
++
++	switch (cmd) {
++	case PR_SCHED_CORE_GET:
++		if (type != PIDTYPE_PID || uaddr & 7) {
++			err = -EINVAL;
++			goto out;
++		}
++		cookie = sched_core_clone_cookie(task);
++		if (cookie) {
++			/* XXX improve ? */
++			ptr_to_hashval((void *)cookie, &id);
++		}
++		err = put_user(id, (u64 __user *)uaddr);
++		goto out;
++
++	case PR_SCHED_CORE_CREATE:
++		cookie = sched_core_alloc_cookie();
++		if (!cookie) {
++			err = -ENOMEM;
++			goto out;
++		}
++		break;
++
++	case PR_SCHED_CORE_SHARE_TO:
++		cookie = sched_core_clone_cookie(current);
++		break;
++
++	case PR_SCHED_CORE_SHARE_FROM:
++		if (type != PIDTYPE_PID) {
++			err = -EINVAL;
++			goto out;
++		}
++		cookie = sched_core_clone_cookie(task);
++		__sched_core_set(current, cookie);
++		goto out;
++
++	default:
++		err = -EINVAL;
++		goto out;
++	};
++
++	if (type == PIDTYPE_PID) {
++		__sched_core_set(task, cookie);
++		goto out;
++	}
++
++	read_lock(&tasklist_lock);
++	grp = task_pid_type(task, type);
++
++	do_each_pid_thread(grp, type, p) {
++		if (!ptrace_may_access(p, PTRACE_MODE_READ_REALCREDS)) {
++			err = -EPERM;
++			goto out_tasklist;
++		}
++	} while_each_pid_thread(grp, type, p);
++
++	do_each_pid_thread(grp, type, p) {
++		__sched_core_set(p, cookie);
++	} while_each_pid_thread(grp, type, p);
++out_tasklist:
++	read_unlock(&tasklist_lock);
++
++out:
++	sched_core_put_cookie(cookie);
++	put_task_struct(task);
++	return err;
++}
++
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -2523,6 +2523,11 @@ SYSCALL_DEFINE5(prctl, int, option, unsi
+ 
+ 		error = (current->flags & PR_IO_FLUSHER) == PR_IO_FLUSHER;
+ 		break;
++#ifdef CONFIG_SCHED_CORE
++	case PR_SCHED_CORE:
++		error = sched_core_share_pid(arg2, arg3, arg4, arg5);
++		break;
++#endif
+ 	default:
+ 		error = -EINVAL;
+ 		break;
+--- a/tools/include/uapi/linux/prctl.h
++++ b/tools/include/uapi/linux/prctl.h
+@@ -247,4 +247,12 @@ struct prctl_mm_map {
+ #define PR_SET_IO_FLUSHER		57
+ #define PR_GET_IO_FLUSHER		58
+ 
++/* Request the scheduler to share a core */
++#define PR_SCHED_CORE			62
++# define PR_SCHED_CORE_GET		0
++# define PR_SCHED_CORE_CREATE		1 /* create unique core_sched cookie */
++# define PR_SCHED_CORE_SHARE_TO		2 /* push core_sched cookie to pid */
++# define PR_SCHED_CORE_SHARE_FROM	3 /* pull core_sched cookie to pid */
++# define PR_SCHED_CORE_MAX		4
++
+ #endif /* _LINUX_PRCTL_H */

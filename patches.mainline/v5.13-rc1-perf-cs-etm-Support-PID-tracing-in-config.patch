@@ -1,0 +1,144 @@
+From 30cb76aabfb4deab4ffef54882f86df319b4d862 Mon Sep 17 00:00:00 2001
+From: Suzuki K Poulose <suzuki.poulose@arm.com>
+Date: Wed, 24 Feb 2021 09:48:33 -0700
+Subject: [PATCH] perf cs-etm: Support PID tracing in config
+Git-commit: 30cb76aabfb4deab4ffef54882f86df319b4d862
+Patch-mainline: v5.13-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified due to different context
+
+
+If the kernel is running at EL2, the pid of a task is exposed via VMID
+instead of the CONTEXTID.  Add support for this in the perf tool.
+
+This patch respects user setting if user has specified any configs
+from "contextid", "contextid1" or "contextid2"; otherwise, it
+dynamically sets config based on PMU format "contextid".
+
+Signed-off-by: Suzuki K Poulose <suzuki.poulose@arm.com>
+Co-developed-by: Leo Yan <leo.yan@linaro.org>
+Signed-off-by: Leo Yan <leo.yan@linaro.org>
+Reviewed-by: Mike Leach <mike.leach@linaro.org>
+Reviewed-by: Mathieu Poirier <mathieu.poirier@linaro.org>
+Cc: Al Grant <al.grant@arm.com>
+Link: https://lore.kernel.org/r/20210213113220.292229-4-leo.yan@linaro.org
+Link: https://lore.kernel.org/r/20210224164835.3497311-5-mathieu.poirier@linaro.org
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ tools/include/linux/coresight-pmu.h |    3 +
+ tools/perf/arch/arm/util/cs-etm.c   |   61 ++++++++++++++++++++++++++++--------
+ 2 files changed, 52 insertions(+), 12 deletions(-)
+
+--- a/tools/include/linux/coresight-pmu.h
++++ b/tools/include/linux/coresight-pmu.h
+@@ -13,14 +13,17 @@
+ /* ETMv3.5/PTM's ETMCR config bit */
+ #define ETM_OPT_CYCACC  12
+ #define ETM_OPT_CTXTID	14
++#define ETM_OPT_CTXTID2	15
+ #define ETM_OPT_TS      28
+ #define ETM_OPT_RETSTK	29
+ 
+ /* ETMv4 CONFIGR programming bits for the ETM OPTs */
+ #define ETM4_CFG_BIT_CYCACC	4
+ #define ETM4_CFG_BIT_CTXTID	6
++#define ETM4_CFG_BIT_VMID	7
+ #define ETM4_CFG_BIT_TS		11
+ #define ETM4_CFG_BIT_RETSTK	12
++#define ETM4_CFG_BIT_VMID_OPT	15
+ 
+ static inline int coresight_get_trace_id(int cpu)
+ {
+--- a/tools/perf/arch/arm/util/cs-etm.c
++++ b/tools/perf/arch/arm/util/cs-etm.c
+@@ -67,6 +67,7 @@ static int cs_etm_set_context_id(struct
+ 	char path[PATH_MAX];
+ 	int err = -EINVAL;
+ 	u32 val;
++	u64 contextid;
+ 
+ 	ptr = container_of(itr, struct cs_etm_recording, itr);
+ 	cs_etm_pmu = ptr->cs_etm_pmu;
+@@ -86,25 +87,59 @@ static int cs_etm_set_context_id(struct
+ 		goto out;
+ 	}
+ 
++	/* User has configured for PID tracing, respects it. */
++	contextid = evsel->core.attr.config &
++			(BIT(ETM_OPT_CTXTID) | BIT(ETM_OPT_CTXTID2));
++
+ 	/*
+-	 * TRCIDR2.CIDSIZE, bit [9-5], indicates whether contextID tracing
+-	 * is supported:
+-	 *  0b00000 Context ID tracing is not supported.
+-	 *  0b00100 Maximum of 32-bit Context ID size.
+-	 *  All other values are reserved.
++	 * If user doesn't configure the contextid format, parse PMU format and
++	 * enable PID tracing according to the "contextid" format bits:
++	 *
++	 *   If bit ETM_OPT_CTXTID is set, trace CONTEXTIDR_EL1;
++	 *   If bit ETM_OPT_CTXTID2 is set, trace CONTEXTIDR_EL2.
+ 	 */
+-	val = BMVAL(val, 5, 9);
+-	if (!val || val != 0x4) {
+-		err = -EINVAL;
+-		goto out;
++	if (!contextid)
++		contextid = perf_pmu__format_bits(&cs_etm_pmu->format,
++						  "contextid");
++
++	if (contextid & BIT(ETM_OPT_CTXTID)) {
++		/*
++		 * TRCIDR2.CIDSIZE, bit [9-5], indicates whether contextID
++		 * tracing is supported:
++		 *  0b00000 Context ID tracing is not supported.
++		 *  0b00100 Maximum of 32-bit Context ID size.
++		 *  All other values are reserved.
++		 */
++		val = BMVAL(val, 5, 9);
++		if (!val || val != 0x4) {
++			pr_err("%s: CONTEXTIDR_EL1 isn't supported\n",
++			       CORESIGHT_ETM_PMU_NAME);
++			err = -EINVAL;
++			goto out;
++		}
++	}
++
++	if (contextid & BIT(ETM_OPT_CTXTID2)) {
++		/*
++		 * TRCIDR2.VMIDOPT[30:29] != 0 and
++		 * TRCIDR2.VMIDSIZE[14:10] == 0b00100 (32bit virtual contextid)
++		 * We can't support CONTEXTIDR in VMID if the size of the
++		 * virtual context id is < 32bit.
++		 * Any value of VMIDSIZE >= 4 (i.e, > 32bit) is fine for us.
++		 */
++		if (!BMVAL(val, 29, 30) || BMVAL(val, 10, 14) < 4) {
++			pr_err("%s: CONTEXTIDR_EL2 isn't supported\n",
++			       CORESIGHT_ETM_PMU_NAME);
++			err = -EINVAL;
++			goto out;
++		}
+ 	}
+ 
+ 	/* All good, let the kernel know */
+-	evsel->core.attr.config |= (1 << ETM_OPT_CTXTID);
++	evsel->core.attr.config |= contextid;
+ 	err = 0;
+ 
+ out:
+-
+ 	return err;
+ }
+ 
+@@ -489,7 +524,9 @@ static u64 cs_etmv4_get_config(struct au
+ 		config |= BIT(ETM4_CFG_BIT_TS);
+ 	if (config_opts & BIT(ETM_OPT_RETSTK))
+ 		config |= BIT(ETM4_CFG_BIT_RETSTK);
+-
++	if (config_opts & BIT(ETM_OPT_CTXTID2))
++		config |= BIT(ETM4_CFG_BIT_VMID) |
++			  BIT(ETM4_CFG_BIT_VMID_OPT);
+ 	return config;
+ }
+ 
