@@ -1,0 +1,178 @@
+From 9981c33db4da79bd5d5a78cef4b6370992801500 Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Mon, 12 Dec 2022 20:27:53 +0800
+Subject: [PATCH] blk-mq: don't access request_wrapper if request is not
+ allocated from block layer
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 9981c33db4da79bd5d5a78cef4b6370992801500
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I65K8D
+CVE: NA
+
+--------------------------------
+
+request_wrapper is used to fix kabi broken for request, it's only for
+internal use. This patch make sure out-of-tree drivers won't access
+request_wrapper if request is not managed by block layer.
+
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Hou Tao <houtao1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ block/blk-core.c       | 49 +++++++++++++++++++++++-------------------
+ block/blk-flush.c      |  2 +-
+ block/blk-mq-debugfs.c |  5 +++--
+ block/blk-mq.c         |  5 ++---
+ include/linux/blkdev.h |  2 ++
+ 5 files changed, 35 insertions(+), 28 deletions(-)
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index a18cfc467d41..df24a463f2ef 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -1304,6 +1304,32 @@ static void blk_account_io_completion(struct request *req, unsigned int bytes)
+ 	}
+ }
+ 
++static void blk_account_io_latency(struct request *req, u64 now, const int sgrp)
++{
++	u64 stat_time;
++	struct request_wrapper *rq_wrapper;
++
++	if (!IS_ENABLED(CONFIG_64BIT) || !(req->rq_flags & RQF_FROM_BLOCK)) {
++		part_stat_add(req->part, nsecs[sgrp], now - req->start_time_ns);
++		return;
++	}
++
++	rq_wrapper = request_to_wrapper(req);
++	stat_time = READ_ONCE(rq_wrapper->stat_time_ns);
++	/*
++	 * This might fail if 'stat_time_ns' is updated
++	 * in blk_mq_check_inflight_with_stat().
++	 */
++	if (likely(now > stat_time &&
++		   cmpxchg64(&rq_wrapper->stat_time_ns, stat_time, now)
++		   == stat_time)) {
++		u64 duration = stat_time ? now - stat_time :
++			now - req->start_time_ns;
++
++		part_stat_add(req->part, nsecs[sgrp], duration);
++	}
++}
++
+ void blk_account_io_done(struct request *req, u64 now)
+ {
+ 	/*
+@@ -1315,36 +1341,15 @@ void blk_account_io_done(struct request *req, u64 now)
+ 	    !(req->rq_flags & RQF_FLUSH_SEQ)) {
+ 		const int sgrp = op_stat_group(req_op(req));
+ 		struct hd_struct *part;
+-#ifdef CONFIG_64BIT
+-		u64 stat_time;
+-		struct request_wrapper *rq_wrapper = request_to_wrapper(req);
+-#endif
+ 
+ 		part_stat_lock();
+ 		part = req->part;
+ 		update_io_ticks(part, jiffies, true);
+ 		part_stat_inc(part, ios[sgrp]);
+-#ifdef CONFIG_64BIT
+-		stat_time = READ_ONCE(rq_wrapper->stat_time_ns);
+-		/*
+-		 * This might fail if 'stat_time_ns' is updated
+-		 * in blk_mq_check_inflight_with_stat().
+-		 */
+-		if (likely(now > stat_time &&
+-			   cmpxchg64(&rq_wrapper->stat_time_ns, stat_time, now)
+-			   == stat_time)) {
+-			u64 duation = stat_time ? now - stat_time :
+-				now - req->start_time_ns;
+-
+-			part_stat_add(req->part, nsecs[sgrp], duation);
+-		}
+-#else
+-		part_stat_add(part, nsecs[sgrp], now - req->start_time_ns);
+-#endif
++		blk_account_io_latency(req, now, sgrp);
+ 		if (precise_iostat)
+ 			part_stat_local_dec(part, in_flight[rq_data_dir(req)]);
+ 		part_stat_unlock();
+-
+ 		hd_struct_put(part);
+ 	}
+ }
+diff --git a/block/blk-flush.c b/block/blk-flush.c
+index 767624910270..65753f781c20 100644
+--- a/block/blk-flush.c
++++ b/block/blk-flush.c
+@@ -333,7 +333,7 @@ static void blk_kick_flush(struct request_queue *q, struct blk_flush_queue *fq,
+ 
+ 	flush_rq->cmd_flags = REQ_OP_FLUSH | REQ_PREFLUSH;
+ 	flush_rq->cmd_flags |= (flags & REQ_DRV) | (flags & REQ_FAILFAST_MASK);
+-	flush_rq->rq_flags |= RQF_FLUSH_SEQ;
++	flush_rq->rq_flags |= RQF_FLUSH_SEQ | RQF_FROM_BLOCK;
+ 	flush_rq->rq_disk = first_rq->rq_disk;
+ 	flush_rq->end_io = flush_end_io;
+ 	/*
+diff --git a/block/blk-mq-debugfs.c b/block/blk-mq-debugfs.c
+index 8a86fa590db1..a879f94782e4 100644
+--- a/block/blk-mq-debugfs.c
++++ b/block/blk-mq-debugfs.c
+@@ -360,8 +360,9 @@ int __blk_mq_debugfs_rq_show(struct seq_file *m, struct request *rq)
+ 	blk_flags_show(m, rq->cmd_flags & ~REQ_OP_MASK, cmd_flag_name,
+ 		       ARRAY_SIZE(cmd_flag_name));
+ 	seq_puts(m, ", .rq_flags=");
+-	blk_flags_show(m, (__force unsigned int)rq->rq_flags, rqf_name,
+-		       ARRAY_SIZE(rqf_name));
++	blk_flags_show(m,
++		       (__force unsigned int)(rq->rq_flags & ~RQF_FROM_BLOCK),
++		       rqf_name, ARRAY_SIZE(rqf_name));
+ 	seq_printf(m, ", .state=%s", blk_mq_rq_state_name(blk_mq_rq_state(rq)));
+ 	seq_printf(m, ", .tag=%d, .internal_tag=%d", rq->tag,
+ 		   rq->internal_tag);
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 21ea971094e2..a7e87451ce43 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -115,9 +115,8 @@ static bool blk_mq_check_inflight_with_stat(struct blk_mq_hw_ctx *hctx,
+ 		struct request_wrapper *rq_wrapper;
+ 
+ 		mi->inflight[rq_data_dir(rq)]++;
+-		if (!rq->part)
++		if (!rq->part || !(rq->rq_flags & RQF_FROM_BLOCK))
+ 			return true;
+-
+ 		/*
+ 		 * If the request is started after 'part->stat_time' is set,
+ 		 * don't update 'nsces' here.
+@@ -375,7 +374,7 @@ static struct request *blk_mq_rq_ctx_init(struct blk_mq_alloc_data *data,
+ 	rq->q = data->q;
+ 	rq->mq_ctx = data->ctx;
+ 	rq->mq_hctx = data->hctx;
+-	rq->rq_flags = 0;
++	rq->rq_flags = RQF_FROM_BLOCK;
+ 	rq->cmd_flags = data->cmd_flags;
+ 	if (data->flags & BLK_MQ_REQ_PM)
+ 		rq->rq_flags |= RQF_PM;
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index e4bcb11d6202..eed319e5d192 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -115,6 +115,8 @@ typedef __u32 __bitwise req_flags_t;
+ #define RQF_MQ_POLL_SLEPT	((__force req_flags_t)(1 << 20))
+ /* ->timeout has been called, don't expire again */
+ #define RQF_TIMED_OUT		((__force req_flags_t)(1 << 21))
++/* The rq is allocated from block layer */
++#define RQF_FROM_BLOCK		((__force req_flags_t)(1 << 22))
+ 
+ /* flags that prevent us from merging requests: */
+ #define RQF_NOMERGE_FLAGS \
+-- 
+2.33.0
+

@@ -1,0 +1,266 @@
+From 01a2ee3e7ccfba7fb9b49557784149c7ab6c89a2 Mon Sep 17 00:00:00 2001
+From: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Date: Tue, 13 Dec 2022 21:38:27 +0800
+Subject: [PATCH] arm64/mpam: remove kernfs_get() calls() and add kernfs_put()
+ calls to prevent refcount leak
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 01a2ee3e7ccfba7fb9b49557784149c7ab6c89a2
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I61CPK
+CVE: NA
+
+--------------------------------
+
+Refer to the two commits:
+
+  commit fd8d9db3559a ("x86/resctrl: Remove superfluous kernfs_get() calls
+  to prevent refcount leak")
+
+  commit 758999246965 ("x86/resctrl: Add necessary kernfs_put() calls to
+  prevent refcount leak")
+
+there are some places where a kernfs_node reference is obtained
+without a corresponding release. The excessive amount of reference
+count on kernfs nodes will never be dropped to 0 and the kernfs nodes
+will never be freed in the call paths of rmdir and umount.
+It leads to reference count leak and kernfs_node_cache memory leak.
+
+For example, reference count leak is observed in these two cases:
+
+  (1) mount -t resctrl none /sys/fs/resctrl
+      mkdir /sys/fs/resctrl/c1
+      mkdir /sys/fs/resctrl/c1/mon_groups/m1
+      umount /sys/fs/resctrl
+
+  (2) mkdir /sys/fs/resctrl/c1
+      mkdir /sys/fs/resctrl/c1/mon_groups/m1
+      rmdir /sys/fs/resctrl/c1
+
+Superfluous kernfs_get() calls are removed from two areas:
+
+  (1) In call paths of mount and mkdir, when kernfs nodes for "info",
+  "mon_groups" and "mon_data" directories and sub-directories are
+  created, the reference count of newly created kernfs node is set to 1.
+  But after kernfs_create_dir() returns, superfluous kernfs_get() are
+  called to take an additional reference.
+
+  (2) kernfs_get() calls in rmdir call paths.
+
+Necessary kernfs_put() calls are added by following changes:
+
+  (1) Introduce rdtgroup removal helper rdtgroup_remove() to wrap up
+  kernfs_put() and kfree().
+
+  (2) Call rdtgroup_remove() in rdtgroup removal path where the rdtgroup
+  structure is about to be freed by kfree().
+
+  (3) Call rdtgroup_remove() or kernfs_put() as appropriate in the error
+  exit paths of mkdir where an extra reference is taken by kernfs_get().
+
+Signed-off-by: Wang ShaoBo <bobo.shaobowang@huawei.com>
+Signed-off-by: Jialin Zhang <zhangjialin11@huawei.com>
+Reviewed-by: Xie XiuQi <xiexiuqi@huawei.com>
+Reviewed-by: Xie XiuQi <xiexiuqi@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/resctrl.h      | 18 ++++++++++++++++
+ arch/arm64/kernel/mpam/mpam_ctrlmon.c |  8 -------
+ arch/arm64/kernel/mpam/mpam_resctrl.c |  2 +-
+ fs/resctrlfs.c                        | 31 ++++++---------------------
+ 4 files changed, 25 insertions(+), 34 deletions(-)
+
+diff --git a/arch/arm64/include/asm/resctrl.h b/arch/arm64/include/asm/resctrl.h
+index 1175c3515c92..d3bdb43b662f 100644
+--- a/arch/arm64/include/asm/resctrl.h
++++ b/arch/arm64/include/asm/resctrl.h
+@@ -545,5 +545,23 @@ DEFINE_INLINE_CTRL_FEATURE_ENABLE_FUNC(caPbm);
+ DEFINE_INLINE_CTRL_FEATURE_ENABLE_FUNC(caMax);
+ DEFINE_INLINE_CTRL_FEATURE_ENABLE_FUNC(caPrio);
+ 
++/**
++ * rdtgroup_remove - the helper to remove resource group safely
++ * @rdtgrp: resource group to remove
++ *
++ * On resource group creation via a mkdir, an extra kernfs_node reference is
++ * taken to ensure that the rdtgroup structure remains accessible for the
++ * rdtgroup_kn_unlock() calls where it is removed.
++ *
++ * Drop the extra reference here, then free the rdtgroup structure.
++ *
++ * Return: void
++ */
++static inline void rdtgroup_remove(struct rdtgroup *rdtgrp)
++{
++	kernfs_put(rdtgrp->kn);
++	kfree(rdtgrp);
++}
++
+ #endif
+ #endif /* _ASM_ARM64_RESCTRL_H */
+diff --git a/arch/arm64/kernel/mpam/mpam_ctrlmon.c b/arch/arm64/kernel/mpam/mpam_ctrlmon.c
+index 724bed6a8e2c..8abbf2823269 100644
+--- a/arch/arm64/kernel/mpam/mpam_ctrlmon.c
++++ b/arch/arm64/kernel/mpam/mpam_ctrlmon.c
+@@ -804,7 +804,6 @@ static int resctrl_group_mkdir_info_resdir(struct resctrl_resource *r,
+ 	if (IS_ERR(kn_subdir))
+ 		return PTR_ERR(kn_subdir);
+ 
+-	kernfs_get(kn_subdir);
+ 	ret = resctrl_group_kn_set_ugid(kn_subdir);
+ 	if (ret)
+ 		return ret;
+@@ -830,7 +829,6 @@ int resctrl_group_create_info_dir(struct kernfs_node *parent_kn,
+ 	*kn_info = kernfs_create_dir(parent_kn, "info", parent_kn->mode, NULL);
+ 	if (IS_ERR(*kn_info))
+ 		return PTR_ERR(*kn_info);
+-	kernfs_get(*kn_info);
+ 
+ 	ret = resctrl_group_add_files(*kn_info, RF_TOP_INFO);
+ 	if (ret)
+@@ -865,12 +863,6 @@ int resctrl_group_create_info_dir(struct kernfs_node *parent_kn,
+ 		}
+ 	}
+ 
+-	/*
+-	 m This extra ref will be put in kernfs_remove() and guarantees
+-	 * that @rdtgrp->kn is always accessible.
+-	 */
+-	kernfs_get(*kn_info);
+-
+ 	ret = resctrl_group_kn_set_ugid(*kn_info);
+ 	if (ret)
+ 		goto out_destroy;
+diff --git a/arch/arm64/kernel/mpam/mpam_resctrl.c b/arch/arm64/kernel/mpam/mpam_resctrl.c
+index f9a360a4c718..7370f4dcecce 100644
+--- a/arch/arm64/kernel/mpam/mpam_resctrl.c
++++ b/arch/arm64/kernel/mpam/mpam_resctrl.c
+@@ -1331,7 +1331,7 @@ static void move_myself(struct callback_head *head)
+ 	    (rdtgrp->flags & RDT_DELETED)) {
+ 		current->closid = 0;
+ 		current->rmid = 0;
+-		kfree(rdtgrp);
++		rdtgroup_remove(rdtgrp);
+ 	}
+ 
+ 	preempt_disable();
+diff --git a/fs/resctrlfs.c b/fs/resctrlfs.c
+index c0a84f40dcc0..e02e4769edc0 100644
+--- a/fs/resctrlfs.c
++++ b/fs/resctrlfs.c
+@@ -211,8 +211,7 @@ void resctrl_group_kn_unlock(struct kernfs_node *kn)
+ 	if (atomic_dec_and_test(&rdtgrp->waitcount) &&
+ 	    (rdtgrp->flags & RDT_DELETED)) {
+ 		kernfs_unbreak_active_protection(kn);
+-		kernfs_put(rdtgrp->kn);
+-		kfree(rdtgrp);
++		rdtgroup_remove(rdtgrp);
+ 	} else {
+ 		kernfs_unbreak_active_protection(kn);
+ 	}
+@@ -272,12 +271,6 @@ mongroup_create_dir(struct kernfs_node *parent_kn, struct resctrl_group *prgrp,
+ 	if (dest_kn)
+ 		*dest_kn = kn;
+ 
+-	/*
+-	 * This extra ref will be put in kernfs_remove() and guarantees
+-	 * that @rdtgrp->kn is always accessible.
+-	 */
+-	kernfs_get(kn);
+-
+ 	ret = resctrl_group_kn_set_ugid(kn);
+ 	if (ret)
+ 		goto out_destroy;
+@@ -399,8 +392,6 @@ static int resctrl_get_tree(struct fs_context *fc)
+ 		if (ret)
+ 			goto out_info;
+ 
+-		kernfs_get(kn_mongrp);
+-
+ 		ret = mkdir_mondata_all_prepare(&resctrl_group_default);
+ 		if (ret < 0)
+ 			goto out_mongrp;
+@@ -410,7 +401,6 @@ static int resctrl_get_tree(struct fs_context *fc)
+ 		if (ret)
+ 			goto out_mongrp;
+ 
+-		kernfs_get(kn_mondata);
+ 		resctrl_group_default.mon.mon_data_kn = kn_mondata;
+ 	}
+ 
+@@ -495,7 +485,7 @@ static void free_all_child_rdtgrp(struct resctrl_group *rdtgrp)
+ 		/* rmid may not be used */
+ 		rmid_free(sentry->mon.rmid);
+ 		list_del(&sentry->mon.crdtgrp_list);
+-		kfree(sentry);
++		rdtgroup_remove(sentry);
+ 	}
+ }
+ 
+@@ -529,7 +519,7 @@ static void rmdir_all_sub(void)
+ 
+ 		kernfs_remove(rdtgrp->kn);
+ 		list_del(&rdtgrp->resctrl_group_list);
+-		kfree(rdtgrp);
++		rdtgroup_remove(rdtgrp);
+ 	}
+ 	/* Notify online CPUs to update per cpu storage and PQR_ASSOC MSR */
+ 	update_closid_rmid(cpu_online_mask, &resctrl_group_default);
+@@ -775,7 +765,7 @@ static int mkdir_resctrl_prepare(struct kernfs_node *parent_kn,
+ 	 * kernfs_remove() will drop the reference count on "kn" which
+ 	 * will free it. But we still need it to stick around for the
+ 	 * resctrl_group_kn_unlock(kn} call below. Take one extra reference
+-	 * here, which will be dropped inside resctrl_group_kn_unlock().
++	 * here, which will be dropped inside rdtgroup_remove().
+ 	 */
+ 	kernfs_get(kn);
+ 
+@@ -815,6 +805,7 @@ static int mkdir_resctrl_prepare(struct kernfs_node *parent_kn,
+ out_prepare_clean:
+ 	mkdir_mondata_all_prepare_clean(rdtgrp);
+ out_destroy:
++	kernfs_put(rdtgrp->kn);
+ 	kernfs_remove(rdtgrp->kn);
+ out_free_rmid:
+ 	rmid_free(rdtgrp->mon.rmid);
+@@ -831,7 +822,7 @@ static int mkdir_resctrl_prepare(struct kernfs_node *parent_kn,
+ static void mkdir_resctrl_prepare_clean(struct resctrl_group *rgrp)
+ {
+ 	kernfs_remove(rgrp->kn);
+-	kfree(rgrp);
++	rdtgroup_remove(rgrp);
+ }
+ 
+ /*
+@@ -996,11 +987,6 @@ static int resctrl_group_rmdir_mon(struct kernfs_node *kn, struct resctrl_group
+ {
+ 	resctrl_group_rm_mon(rdtgrp, tmpmask);
+ 
+-	/*
+-	 * one extra hold on this, will drop when we kfree(rdtgrp)
+-	 * in resctrl_group_kn_unlock()
+-	 */
+-	kernfs_get(kn);
+ 	kernfs_remove(rdtgrp->kn);
+ 
+ 	return 0;
+@@ -1049,11 +1035,6 @@ static int resctrl_group_rmdir_ctrl(struct kernfs_node *kn, struct resctrl_group
+ {
+ 	resctrl_group_rm_ctrl(rdtgrp, tmpmask);
+ 
+-	/*
+-	 * one extra hold on this, will drop when we kfree(rdtgrp)
+-	 * in resctrl_group_kn_unlock()
+-	 */
+-	kernfs_get(kn);
+ 	kernfs_remove(rdtgrp->kn);
+ 
+ 	return 0;
+-- 
+2.33.0
+
