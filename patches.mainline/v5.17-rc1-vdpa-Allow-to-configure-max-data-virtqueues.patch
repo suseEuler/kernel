@@ -1,0 +1,141 @@
+From aba21aff772b8622e08f07219069be793429a48f Mon Sep 17 00:00:00 2001
+From: Eli Cohen <elic@nvidia.com>
+Date: Wed, 5 Jan 2022 13:46:37 +0200
+Subject: [PATCH] vdpa: Allow to configure max data virtqueues
+Git-commit: aba21aff772b8622e08f07219069be793429a48f
+Patch-mainline: v5.17-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+Add netlink support to configure the max virtqueue pairs for a device.
+At least one pair is required. The maximum is dictated by the device.
+
+Example:
+$ vdpa dev add name vdpa-a mgmtdev auxiliary/mlx5_core.sf.1 max_vqp 4
+
+Signed-off-by: Eli Cohen <elic@nvidia.com>
+Link: https://lore.kernel.org/r/20220105114646.577224-6-elic@nvidia.com
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/vdpa/vdpa.c          | 15 +++++++++++++--
+ drivers/vhost/vdpa.c         |  2 +-
+ drivers/virtio/virtio_vdpa.c |  2 +-
+ include/linux/vdpa.h         | 19 ++++++++++++++++---
+ 4 files changed, 31 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/vdpa/vdpa.c b/drivers/vdpa/vdpa.c
+index 4494325cae91..96d31b80fdce 100644
+--- a/drivers/vdpa/vdpa.c
++++ b/drivers/vdpa/vdpa.c
+@@ -404,7 +404,7 @@ static void vdpa_get_config_unlocked(struct vdpa_device *vdev,
+ 	 * If it does happen we assume a legacy guest.
+ 	 */
+ 	if (!vdev->features_valid)
+-		vdpa_set_features(vdev, 0);
++		vdpa_set_features(vdev, 0, true);
+ 	ops->get_config(vdev, offset, buf, len);
+ }
+ 
+@@ -581,7 +581,8 @@ vdpa_nl_cmd_mgmtdev_get_dumpit(struct sk_buff *msg, struct netlink_callback *cb)
+ }
+ 
+ #define VDPA_DEV_NET_ATTRS_MASK ((1 << VDPA_ATTR_DEV_NET_CFG_MACADDR) | \
+-				 (1 << VDPA_ATTR_DEV_NET_CFG_MTU))
++				 (1 << VDPA_ATTR_DEV_NET_CFG_MTU) | \
++				 (1 << VDPA_ATTR_DEV_NET_CFG_MAX_VQP))
+ 
+ static int vdpa_nl_cmd_dev_add_set_doit(struct sk_buff *skb, struct genl_info *info)
+ {
+@@ -607,6 +608,16 @@ static int vdpa_nl_cmd_dev_add_set_doit(struct sk_buff *skb, struct genl_info *i
+ 			nla_get_u16(nl_attrs[VDPA_ATTR_DEV_NET_CFG_MTU]);
+ 		config.mask |= (1 << VDPA_ATTR_DEV_NET_CFG_MTU);
+ 	}
++	if (nl_attrs[VDPA_ATTR_DEV_NET_CFG_MAX_VQP]) {
++		config.net.max_vq_pairs =
++			nla_get_u16(nl_attrs[VDPA_ATTR_DEV_NET_CFG_MAX_VQP]);
++		if (!config.net.max_vq_pairs) {
++			NL_SET_ERR_MSG_MOD(info->extack,
++					   "At least one pair of VQs is required");
++			return -EINVAL;
++		}
++		config.mask |= BIT_ULL(VDPA_ATTR_DEV_NET_CFG_MAX_VQP);
++	}
+ 
+ 	/* Skip checking capability if user didn't prefer to configure any
+ 	 * device networking attributes. It is likely that user might have used
+diff --git a/drivers/vhost/vdpa.c b/drivers/vhost/vdpa.c
+index 293c51fdf9ab..6e7edaf2472b 100644
+--- a/drivers/vhost/vdpa.c
++++ b/drivers/vhost/vdpa.c
+@@ -285,7 +285,7 @@ static long vhost_vdpa_set_features(struct vhost_vdpa *v, u64 __user *featurep)
+ 	if (copy_from_user(&features, featurep, sizeof(features)))
+ 		return -EFAULT;
+ 
+-	if (vdpa_set_features(vdpa, features))
++	if (vdpa_set_features(vdpa, features, false))
+ 		return -EINVAL;
+ 
+ 	return 0;
+diff --git a/drivers/virtio/virtio_vdpa.c b/drivers/virtio/virtio_vdpa.c
+index 76504559bc25..7767a7f0119b 100644
+--- a/drivers/virtio/virtio_vdpa.c
++++ b/drivers/virtio/virtio_vdpa.c
+@@ -317,7 +317,7 @@ static int virtio_vdpa_finalize_features(struct virtio_device *vdev)
+ 	/* Give virtio_ring a chance to accept features. */
+ 	vring_transport_features(vdev);
+ 
+-	return vdpa_set_features(vdpa, vdev->features);
++	return vdpa_set_features(vdpa, vdev->features, false);
+ }
+ 
+ static const char *virtio_vdpa_bus_name(struct virtio_device *vdev)
+diff --git a/include/linux/vdpa.h b/include/linux/vdpa.h
+index ae047fae2603..6d4d7e4fe208 100644
+--- a/include/linux/vdpa.h
++++ b/include/linux/vdpa.h
+@@ -101,6 +101,7 @@ struct vdpa_dev_set_config {
+ 	struct {
+ 		u8 mac[ETH_ALEN];
+ 		u16 mtu;
++		u16 max_vq_pairs;
+ 	} net;
+ 	u64 mask;
+ };
+@@ -391,17 +392,29 @@ static inline struct device *vdpa_get_dma_dev(struct vdpa_device *vdev)
+ static inline int vdpa_reset(struct vdpa_device *vdev)
+ {
+ 	const struct vdpa_config_ops *ops = vdev->config;
++	int ret;
+ 
++	mutex_lock(&vdev->cf_mutex);
+ 	vdev->features_valid = false;
+-	return ops->reset(vdev);
++	ret = ops->reset(vdev);
++	mutex_unlock(&vdev->cf_mutex);
++	return ret;
+ }
+ 
+-static inline int vdpa_set_features(struct vdpa_device *vdev, u64 features)
++static inline int vdpa_set_features(struct vdpa_device *vdev, u64 features, bool locked)
+ {
+ 	const struct vdpa_config_ops *ops = vdev->config;
++	int ret;
++
++	if (!locked)
++		mutex_lock(&vdev->cf_mutex);
+ 
+ 	vdev->features_valid = true;
+-	return ops->set_driver_features(vdev, features);
++	ret = ops->set_driver_features(vdev, features);
++	if (!locked)
++		mutex_unlock(&vdev->cf_mutex);
++
++	return ret;
+ }
+ 
+ void vdpa_get_config(struct vdpa_device *vdev, unsigned int offset,
+-- 
+2.33.0
+

@@ -1,0 +1,180 @@
+From a39f16a15b67cd9daa7388338218773ef4bad959 Mon Sep 17 00:00:00 2001
+From: Junxian Huang <huangjunxian6@hisilicon.com>
+Date: Thu, 15 Dec 2022 21:02:19 +0800
+Subject: [PATCH] RDMA/hns: fix the error of RoCE VF based on RoCE Bonding PF
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: a39f16a15b67cd9daa7388338218773ef4bad959
+Modified-by-SEL: No
+
+
+driver inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I665OG
+
+---------------------------------------------------------------
+
+In this patch, the following constraints are added:
+1. RoCE Bonding cannot be set with a PF which enables VF;
+2. A PF in RoCE Bonding cannot enable RoCE VF.
+
+Fixes: 6ba084e0f031 ("RDMA/hns: add constraints for bonding-unsupported situations")
+Signed-off-by: Junxian Huang <huangjunxian6@hisilicon.com>
+Reviewed-by: Yangyang Li <liyangyang20@huawei.com>
+Reviewed-by: Yue Haibing <yuehaibing@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/infiniband/hw/hns/Makefile         |  2 ++
+ drivers/infiniband/hw/hns/hns_roce_bond.c  | 13 +++-----
+ drivers/infiniband/hw/hns/hns_roce_bond.h  |  1 +
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.c | 38 ++++++++++++++++++++++
+ 4 files changed, 46 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/infiniband/hw/hns/Makefile b/drivers/infiniband/hw/hns/Makefile
+index c92dd14dc717..77d8e41ffe7b 100644
+--- a/drivers/infiniband/hw/hns/Makefile
++++ b/drivers/infiniband/hw/hns/Makefile
+@@ -4,6 +4,8 @@
+ #
+ 
+ ccflags-y :=  -I $(srctree)/drivers/net/ethernet/hisilicon/hns3
++ccflags-y +=  -I $(srctree)/drivers/net/ethernet/hisilicon/hns3/hns3pf
++ccflags-y +=  -I $(srctree)/drivers/net/ethernet/hisilicon/hns3/hns3_common
+ 
+ hns-roce-objs := hns_roce_main.o hns_roce_cmd.o hns_roce_pd.o \
+ 	hns_roce_ah.o hns_roce_hem.o hns_roce_mr.o hns_roce_qp.o \
+diff --git a/drivers/infiniband/hw/hns/hns_roce_bond.c b/drivers/infiniband/hw/hns/hns_roce_bond.c
+index dcaa329fb989..c1e35792246e 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_bond.c
++++ b/drivers/infiniband/hw/hns/hns_roce_bond.c
+@@ -26,12 +26,15 @@ static struct hns_roce_dev *hns_roce_get_hrdev_by_netdev(struct net_device *net_
+ 	return hr_dev;
+ }
+ 
+-static struct hns_roce_bond_group *hns_roce_get_bond_grp(struct hns_roce_dev *hr_dev)
++struct hns_roce_bond_group *hns_roce_get_bond_grp(struct hns_roce_dev *hr_dev)
+ {
+ 	struct hns_roce_bond_group *bond_grp = NULL;
+ 	struct net_device *upper_dev;
+ 	struct net_device *net_dev;
+ 
++	if (!netif_is_lag_port(hr_dev->iboe.netdevs[0]))
++		return NULL;
++
+ 	rcu_read_lock();
+ 
+ 	upper_dev = netdev_master_upper_dev_get_rcu(hr_dev->iboe.netdevs[0]);
+@@ -53,9 +56,6 @@ bool hns_roce_bond_is_active(struct hns_roce_dev *hr_dev)
+ {
+ 	struct hns_roce_bond_group *bond_grp;
+ 
+-	if (!netif_is_lag_port(hr_dev->iboe.netdevs[0]))
+-		return false;
+-
+ 	bond_grp = hns_roce_get_bond_grp(hr_dev);
+ 
+ 	if (bond_grp &&
+@@ -75,9 +75,6 @@ struct net_device *hns_roce_get_bond_netdev(struct hns_roce_dev *hr_dev)
+ 	if (!(hr_dev->caps.flags & HNS_ROCE_CAP_FLAG_BOND))
+ 		return NULL;
+ 
+-	if (!netif_is_lag_port(hr_dev->iboe.netdevs[0]))
+-		return NULL;
+-
+ 	if (!bond_grp) {
+ 		bond_grp = hns_roce_get_bond_grp(hr_dev);
+ 		if (!bond_grp)
+@@ -644,7 +641,7 @@ static enum bond_support_type
+ 			slave_num++;
+ 			if (bus_num == -1)
+ 				bus_num = hr_dev->pci_dev->bus->number;
+-			if (hr_dev->is_vf ||
++			if (hr_dev->is_vf || pci_num_vf(hr_dev->pci_dev) > 0 ||
+ 			    bus_num != hr_dev->pci_dev->bus->number) {
+ 				support = false;
+ 				break;
+diff --git a/drivers/infiniband/hw/hns/hns_roce_bond.h b/drivers/infiniband/hw/hns/hns_roce_bond.h
+index 3c5a8a770f6c..6fccf4762e86 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_bond.h
++++ b/drivers/infiniband/hw/hns/hns_roce_bond.h
+@@ -75,5 +75,6 @@ int hns_roce_bond_event(struct notifier_block *self,
+ void hns_roce_cleanup_bond(struct hns_roce_dev *hr_dev);
+ bool hns_roce_bond_is_active(struct hns_roce_dev *hr_dev);
+ struct net_device *hns_roce_get_bond_netdev(struct hns_roce_dev *hr_dev);
++struct hns_roce_bond_group *hns_roce_get_bond_grp(struct hns_roce_dev *hr_dev);
+ 
+ #endif
+diff --git a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+index 16c3b9ca1869..6e53864938c6 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+@@ -43,6 +43,7 @@
+ #include <rdma/uverbs_ioctl.h>
+ 
+ #include "hnae3.h"
++#include "hclge_main.h"
+ #include "hns_roce_common.h"
+ #include "hns_roce_device.h"
+ #include "hns_roce_cmd.h"
+@@ -7198,6 +7199,34 @@ static void hns_roce_hw_v2_get_cfg(struct hns_roce_dev *hr_dev,
+ 	priv->handle = handle;
+ }
+ 
++static bool check_vf_support(struct pci_dev *vf)
++{
++	struct hns_roce_bond_group *bond_grp;
++	struct pci_dev *pf = pci_physfn(vf);
++	struct hnae3_ae_dev *ae_dev;
++	struct hnae3_handle *handle;
++	struct hns_roce_dev *hr_dev;
++	struct hclge_dev *hdev;
++
++	/* pf == vf means that the driver is running in VM. */
++	if (pf == vf)
++		return true;
++
++	ae_dev = pci_get_drvdata(pf);
++	hdev = ae_dev->priv;
++	handle = &hdev->vport[0].roce;
++	hr_dev = handle->priv;
++
++	if (!hr_dev)
++		return false;
++
++	bond_grp = hns_roce_get_bond_grp(hr_dev);
++	if (bond_grp)
++		return false;
++
++	return true;
++}
++
+ static int __hns_roce_hw_v2_init_instance(struct hnae3_handle *handle)
+ {
+ 	struct hns_roce_dev *hr_dev;
+@@ -7215,6 +7244,11 @@ static int __hns_roce_hw_v2_init_instance(struct hnae3_handle *handle)
+ 
+ 	hns_roce_hw_v2_get_cfg(hr_dev, handle);
+ 
++	if (hr_dev->is_vf && !check_vf_support(hr_dev->pci_dev)) {
++		ret = -EOPNOTSUPP;
++		goto error_failed_kzalloc;
++	}
++
+ 	ret = hns_roce_init(hr_dev);
+ 	if (ret) {
+ 		dev_err(hr_dev->dev, "RoCE Engine init failed!\n");
+@@ -7290,6 +7324,10 @@ int hns_roce_hw_v2_init_instance(struct hnae3_handle *handle)
+ 	ret = __hns_roce_hw_v2_init_instance(handle);
+ 	if (ret) {
+ 		handle->rinfo.instance_state = HNS_ROCE_STATE_NON_INIT;
++
++		if (ret == -EOPNOTSUPP)
++			return ret;
++
+ 		dev_err(dev, "RoCE instance init failed! ret = %d\n", ret);
+ 		if (ops->ae_dev_resetting(handle) ||
+ 		    ops->get_hw_reset_stat(handle))
+-- 
+2.33.0
+

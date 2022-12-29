@@ -1,0 +1,193 @@
+From a4814b31ebfbbd37bcb84e1a686d61fb1e7cc5b5 Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Mon, 12 Dec 2022 20:27:52 +0800
+Subject: [PATCH] blk-mq: fix kabi broken due to request_wrapper
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: a4814b31ebfbbd37bcb84e1a686d61fb1e7cc5b5
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I65K8D
+CVE: NA
+
+--------------------------------
+
+Before commit f60df4a0a6ad ("blk-mq: fix kabi broken in struct
+request"), drivers will got cmd address right after request, however,
+after this commit, drivers will got cmd address after request_wrapper
+instead, which is bigger than request and will cause compatibility
+issues.
+
+Fix the problem by placing request_wrapper behind cmd, so that the
+cmd address for drivers will stay the same.
+
+Before commit:		|request|cmd|
+After commit:		|request|request_wrapper|cmd|
+With this patch:	|request|cmd|request_wrapper|
+
+Performance test: arm64 Kunpeng-920 96 core
+
+1) null_blk setup:
+modprobe null_blk nr_devices=0 &&
+    udevadm settle &&
+    cd /sys/kernel/config/nullb &&
+    mkdir nullb0 &&
+    cd nullb0 &&
+    echo 0 > completion_nsec &&
+    echo 512 > blocksize &&
+    echo 0 > home_node &&
+    echo 0 > irqmode &&
+    echo 1024 > size &&
+    echo 0 > memory_backed &&
+    echo 2 > queue_mode &&
+	echo 4096 > hw_queue_depth &&
+	echo 96 > submit_queues &&
+    echo 1 > power
+
+2) fio test script:
+[global]
+ioengine=libaio
+direct=1
+numjobs=96
+iodepth=32
+bs=4k
+rw=randwrite
+allow_mounted_write=0
+time_based
+runtime=60
+group_reporting=1
+ioscheduler=none
+cpus_allowed_policy=split
+cpus_allowed=0-95
+
+[test]
+filename=/dev/nullb0
+
+3) iops test result:
+
+without this patch:	23.9M
+with this patch:	24.1M
+
+Fixes: f60df4a0a6ad ("blk-mq: fix kabi broken in struct request")
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Hou Tao <houtao1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ block/blk-flush.c         |  2 +-
+ block/blk-mq.c            |  5 +++--
+ block/blk-mq.h            | 13 +++++++++++++
+ drivers/scsi/scsi_error.c |  2 +-
+ include/linux/blk-mq.h    | 13 ++-----------
+ 5 files changed, 20 insertions(+), 15 deletions(-)
+
+diff --git a/block/blk-flush.c b/block/blk-flush.c
+index 71faf07a626f..767624910270 100644
+--- a/block/blk-flush.c
++++ b/block/blk-flush.c
+@@ -470,7 +470,7 @@ struct blk_flush_queue *blk_alloc_flush_queue(int node, int cmd_size,
+ 					      gfp_t flags)
+ {
+ 	struct blk_flush_queue *fq;
+-	int rq_sz = sizeof(struct request_wrapper);
++	int rq_sz = sizeof(struct request) + sizeof(struct request_wrapper);
+ 
+ 	fq = kzalloc_node(sizeof(*fq), flags, node);
+ 	if (!fq)
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index b9b2d9412b02..4c719469ba8e 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -2601,8 +2601,9 @@ static int blk_mq_alloc_rqs(struct blk_mq_tag_set *set,
+ 	 * rq_size is the size of the request plus driver payload, rounded
+ 	 * to the cacheline size
+ 	 */
+-	rq_size = round_up(sizeof(struct request_wrapper) + set->cmd_size,
+-				cache_line_size());
++	rq_size = round_up(sizeof(struct request) +
++			   sizeof(struct request_wrapper) + set->cmd_size,
++			   cache_line_size());
+ 	left = rq_size * depth;
+ 
+ 	for (i = 0; i < depth; ) {
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index 1c86f7d56e72..6254abe9c112 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -37,6 +37,19 @@ struct blk_mq_ctx {
+ 	struct kobject		kobj;
+ } ____cacheline_aligned_in_smp;
+ 
++struct request_wrapper {
++	/* Time that I/O was counted in part_get_stat_info(). */
++	u64 stat_time_ns;
++};
++
++static inline struct request_wrapper *request_to_wrapper(struct request *rq)
++{
++	unsigned long addr = (unsigned long)rq;
++
++	addr += sizeof(*rq) + rq->q->tag_set->cmd_size;
++	return (struct request_wrapper *)addr;
++}
++
+ void blk_mq_exit_queue(struct request_queue *q);
+ int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr);
+ void blk_mq_wake_waiters(struct request_queue *q);
+diff --git a/drivers/scsi/scsi_error.c b/drivers/scsi/scsi_error.c
+index bcbeadb2d0f0..f11f51e2465f 100644
+--- a/drivers/scsi/scsi_error.c
++++ b/drivers/scsi/scsi_error.c
+@@ -2359,7 +2359,7 @@ scsi_ioctl_reset(struct scsi_device *dev, int __user *arg)
+ 		return -EIO;
+ 
+ 	error = -EIO;
+-	rq = kzalloc(sizeof(struct request_wrapper) + sizeof(struct scsi_cmnd) +
++	rq = kzalloc(sizeof(struct request) + sizeof(struct scsi_cmnd) +
+ 			shost->hostt->cmd_size, GFP_KERNEL);
+ 	if (!rq)
+ 		goto out_put_autopm_host;
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index aa0c8ef9a50f..f3d78b939e01 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -303,15 +303,6 @@ struct blk_mq_queue_data {
+ 	KABI_RESERVE(1)
+ };
+ 
+-struct request_wrapper {
+-	struct request rq;
+-
+-	/* Time that I/O was counted in part_get_stat_info(). */
+-	u64 stat_time_ns;
+-};
+-
+-#define request_to_wrapper(_rq) container_of(_rq, struct request_wrapper, rq)
+-
+ typedef bool (busy_iter_fn)(struct blk_mq_hw_ctx *, struct request *, void *,
+ 		bool);
+ typedef bool (busy_tag_iter_fn)(struct request *, void *, bool);
+@@ -606,7 +597,7 @@ static inline bool blk_should_fake_timeout(struct request_queue *q)
+  */
+ static inline struct request *blk_mq_rq_from_pdu(void *pdu)
+ {
+-	return pdu - sizeof(struct request_wrapper);
++	return pdu - sizeof(struct request);
+ }
+ 
+ /**
+@@ -620,7 +611,7 @@ static inline struct request *blk_mq_rq_from_pdu(void *pdu)
+  */
+ static inline void *blk_mq_rq_to_pdu(struct request *rq)
+ {
+-	return request_to_wrapper(rq) + 1;
++	return rq + 1;
+ }
+ 
+ static inline struct blk_mq_hw_ctx *queue_hctx(struct request_queue *q, int id)
+-- 
+2.33.0
+

@@ -1,0 +1,81 @@
+From eefa11fa08258683c19569e31477fbc718bbac10 Mon Sep 17 00:00:00 2001
+From: Liu Shixin <liushixin2@huawei.com>
+Date: Mon, 19 Dec 2022 17:46:51 +0800
+Subject: [PATCH] mm/dynamic_hugetlb: fix clear PagePool without lock
+ protection
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: eefa11fa08258683c19569e31477fbc718bbac10
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I66OCA
+CVE: NA
+
+--------------------------------
+
+Since free_pages_prepare() will clear the PagePool without lock in
+free_page_to_dhugetlb_pool() and free_page_list_to_dhugetlb_pool(),
+it is unreliable to check whether a page is freed by PagePool in
+hpool_merge_page().
+Move free_pages_prepare() after ClearPagePool(), which can guarantee
+all allocated page has PagePool flag.
+
+Fixes: 71197c63bfe9 ("mm/dynamic_hugetlb: free pages to dhugetlb_pool")
+Signed-off-by: Liu Shixin <liushixin2@huawei.com>
+Reviewed-by: Tong Tiangen <tongtiangen@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/dynamic_hugetlb.c | 12 +++++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/mm/dynamic_hugetlb.c b/mm/dynamic_hugetlb.c
+index ca728450a341..6b615009c3a4 100644
+--- a/mm/dynamic_hugetlb.c
++++ b/mm/dynamic_hugetlb.c
+@@ -577,6 +577,10 @@ static void __free_page_to_dhugetlb_pool(struct page *page)
+ 	spin_lock_irqsave(&percpu_pool->lock, flags);
+ 
+ 	ClearPagePool(page);
++	if (!free_pages_prepare(page, 0, true)) {
++		SetPagePool(page);
++		goto out;
++	}
+ 	list_add(&page->lru, &percpu_pool->head_page);
+ 	percpu_pool->free_pages++;
+ 	percpu_pool->used_pages--;
+@@ -585,7 +589,7 @@ static void __free_page_to_dhugetlb_pool(struct page *page)
+ 		reclaim_pages_from_percpu_pool(hpool, percpu_pool, PERCPU_POOL_PAGE_BATCH);
+ 		spin_unlock(&hpool->lock);
+ 	}
+-
++out:
+ 	spin_unlock_irqrestore(&percpu_pool->lock, flags);
+ 	put_hpool(hpool);
+ }
+@@ -595,8 +599,7 @@ bool free_page_to_dhugetlb_pool(struct page *page)
+ 	if (!dhugetlb_enabled || !PagePool(page))
+ 		return false;
+ 
+-	if (free_pages_prepare(page, 0, true))
+-		__free_page_to_dhugetlb_pool(page);
++	__free_page_to_dhugetlb_pool(page);
+ 	return true;
+ }
+ 
+@@ -610,8 +613,7 @@ void free_page_list_to_dhugetlb_pool(struct list_head *list)
+ 	list_for_each_entry_safe(page, next, list, lru) {
+ 		if (PagePool(page)) {
+ 			list_del(&page->lru);
+-			if (free_pages_prepare(page, 0, true))
+-				__free_page_to_dhugetlb_pool(page);
++			__free_page_to_dhugetlb_pool(page);
+ 		}
+ 	}
+ }
+-- 
+2.33.0
+

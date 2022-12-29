@@ -1,0 +1,92 @@
+From 56bdc06139404b3b06ed75ec99b93445d7e0b8c3 Mon Sep 17 00:00:00 2001
+From: Xuan Zhuo <xuanzhuo@linux.alibaba.com>
+Date: Mon, 1 Aug 2022 14:38:51 +0800
+Subject: [PATCH] virtio_pci: extract the logic of active vq for modern pci
+Git-commit: 56bdc06139404b3b06ed75ec99b93445d7e0b8c3
+Patch-mainline: v6.0-rc1
+References: bsn#12
+Modified-by-SEL: Yes, refreshed due to different context
+
+
+Introduce vp_active_vq() to configure vring to backend after vq attach
+vring. And configure vq vector if necessary.
+
+Signed-off-by: Xuan Zhuo <xuanzhuo@linux.alibaba.com>
+Acked-by: Jason Wang <jasowang@redhat.com>
+Message-Id: <20220801063902.129329-32-xuanzhuo@linux.alibaba.com>
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/virtio/virtio_pci_modern.c |   46 ++++++++++++++++++++++---------------
+ 1 file changed, 28 insertions(+), 18 deletions(-)
+
+--- a/drivers/virtio/virtio_pci_modern.c
++++ b/drivers/virtio/virtio_pci_modern.c
+@@ -176,6 +176,29 @@ static void vp_reset(struct virtio_devic
+ 	vp_synchronize_vectors(vdev);
+ }
+ 
++static int vp_active_vq(struct virtqueue *vq, u16 msix_vec)
++{
++	struct virtio_pci_device *vp_dev = to_vp_device(vq->vdev);
++	struct virtio_pci_modern_device *mdev = &vp_dev->mdev;
++	unsigned long index;
++
++	index = vq->index;
++
++	/* activate the queue */
++	vp_modern_set_queue_size(mdev, index, virtqueue_get_vring_size(vq));
++	vp_modern_queue_address(mdev, index, virtqueue_get_desc_addr(vq),
++				virtqueue_get_avail_addr(vq),
++				virtqueue_get_used_addr(vq));
++
++	if (msix_vec != VIRTIO_MSI_NO_VECTOR) {
++		msix_vec = vp_modern_queue_vector(mdev, index, msix_vec);
++		if (msix_vec == VIRTIO_MSI_NO_VECTOR)
++			return -EBUSY;
++	}
++
++	return 0;
++}
++
+ static u16 vp_config_vector(struct virtio_pci_device *vp_dev, u16 vector)
+ {
+ 	return vp_modern_config_vector(&vp_dev->mdev, vector);
+@@ -218,32 +241,19 @@ static struct virtqueue *setup_vq(struct
+ 	if (!vq)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	/* activate the queue */
+-	vp_modern_set_queue_size(mdev, index, virtqueue_get_vring_size(vq));
+-	vp_modern_queue_address(mdev, index, virtqueue_get_desc_addr(vq),
+-				virtqueue_get_avail_addr(vq),
+-				virtqueue_get_used_addr(vq));
++	err = vp_active_vq(vq, msix_vec);
++	if (err)
++		goto err;
+ 
+ 	vq->priv = (void __force *)vp_modern_map_vq_notify(mdev, index, NULL);
+ 	if (!vq->priv) {
+ 		err = -ENOMEM;
+-		goto err_map_notify;
+-	}
+-
+-	if (msix_vec != VIRTIO_MSI_NO_VECTOR) {
+-		msix_vec = vp_modern_queue_vector(mdev, index, msix_vec);
+-		if (msix_vec == VIRTIO_MSI_NO_VECTOR) {
+-			err = -EBUSY;
+-			goto err_assign_vector;
+-		}
++		goto err;
+ 	}
+ 
+ 	return vq;
+ 
+-err_assign_vector:
+-	if (!mdev->notify_base)
+-		pci_iounmap(mdev->pci_dev, (void __iomem __force *)vq->priv);
+-err_map_notify:
++err:
+ 	vring_del_virtqueue(vq);
+ 	return ERR_PTR(err);
+ }

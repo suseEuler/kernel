@@ -1,0 +1,76 @@
+From 36e1d5c047a9ae327fea5b86ce0d34f9f94e6d6c Mon Sep 17 00:00:00 2001
+From: ruanjinjie <ruanjinjie@huawei.com>
+Date: Tue, 13 Dec 2022 22:27:57 +0800
+Subject: [PATCH] arm64: fix a concurrency issue in emulation_proc_handler()
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 36e1d5c047a9ae327fea5b86ce0d34f9f94e6d6c
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/src-openeuler/kernel/issues/I65RG3?from=project-issue
+CVE: NA
+
+-------------------------------
+
+In emulation_proc_handler(), read and write operations are performed on
+insn->current_mode. In the concurrency scenario, mutex only protects
+writing insn->current_mode, and not protects the read. Suppose there are
+two concurrent tasks, task1 updates insn->current_mode to INSN_EMULATE
+in the critical section, the prev_mode of task2 is still the old data
+INSN_UNDEF of insn->current_mode. As a result, two tasks call
+update_insn_emulation_mode twice with prev_mode = INSN_UNDEF and
+current_mode = INSN_EMULATE, then call register_emulation_hooks twice,
+resulting in a list_add double problem.
+
+Call trace:
+ __list_add_valid+0xd8/0xe4
+ register_undef_hook+0x94/0x13c
+ update_insn_emulation_mode+0xd0/0x12c
+ emulation_proc_handler+0xd8/0xf4
+ proc_sys_call_handler+0x140/0x250
+ proc_sys_write+0x1c/0x2c
+ new_sync_write+0xec/0x18c
+ vfs_write+0x214/0x2ac
+ ksys_write+0x70/0xfc
+ __arm64_sys_write+0x24/0x30
+ el0_svc_common.constprop.0+0x7c/0x1bc
+ do_el0_svc+0x2c/0x94
+ el0_svc+0x20/0x30
+ el0_sync_handler+0xb0/0xb4
+ el0_sync+0x160/0x180
+
+Fixes: fcddf02ab0da ("arm64: fix oops in concurrently setting insn_emulation sysctls")
+Signed-off-by: ruanjinjie <ruanjinjie@huawei.com>
+Reviewed-by: Liao Chang <liaochang1@huawei.com>
+Reviewed-by: Zhang Jianhua <chris.zjh@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/kernel/armv8_deprecated.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm64/kernel/armv8_deprecated.c b/arch/arm64/kernel/armv8_deprecated.c
+index 4a0ba2800e45..ab955c249f37 100644
+--- a/arch/arm64/kernel/armv8_deprecated.c
++++ b/arch/arm64/kernel/armv8_deprecated.c
+@@ -208,10 +208,12 @@ static int emulation_proc_handler(struct ctl_table *table, int write,
+ 				  loff_t *ppos)
+ {
+ 	int ret = 0;
+-	struct insn_emulation *insn = container_of(table->data, struct insn_emulation, current_mode);
+-	enum insn_emulation_mode prev_mode = insn->current_mode;
++	struct insn_emulation *insn;
++	enum insn_emulation_mode prev_mode;
+ 
+ 	mutex_lock(&insn_emulation_mutex);
++	insn = container_of(table->data, struct insn_emulation, current_mode);
++	prev_mode = insn->current_mode;
+ 	ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+ 
+ 	if (ret || !write || prev_mode == insn->current_mode)
+-- 
+2.33.0
+

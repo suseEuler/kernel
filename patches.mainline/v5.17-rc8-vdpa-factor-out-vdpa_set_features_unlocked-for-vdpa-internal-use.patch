@@ -1,0 +1,106 @@
+From e0077cc13b831f8fad5557442f73bf7728683713 Mon Sep 17 00:00:00 2001
+From: Si-Wei Liu <si-wei.liu@oracle.com>
+Date: Fri, 14 Jan 2022 19:27:59 -0500
+Subject: [PATCH] vdpa: factor out vdpa_set_features_unlocked for vdpa internal
+ use
+Git-commit: e0077cc13b831f8fad5557442f73bf7728683713
+Patch-mainline: v5.17-rc8
+References: bsn#12
+Modified-by-SEL: No
+
+
+No functional change introduced. vdpa bus driver such as virtio_vdpa
+or vhost_vdpa is not supposed to take care of the locking for core
+by its own. The locked API vdpa_set_features should suffice the
+bus driver's need.
+
+Signed-off-by: Si-Wei Liu <si-wei.liu@oracle.com>
+Reviewed-by: Eli Cohen <elic@nvidia.com>
+Link: https://lore.kernel.org/r/1642206481-30721-2-git-send-email-si-wei.liu@oracle.com
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Acked-by: Jason Wang <jasowang@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/vdpa/vdpa.c          |  2 +-
+ drivers/vhost/vdpa.c         |  2 +-
+ drivers/virtio/virtio_vdpa.c |  2 +-
+ include/linux/vdpa.h         | 18 ++++++++++++------
+ 4 files changed, 15 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/vdpa/vdpa.c b/drivers/vdpa/vdpa.c
+index 9846c9de4bfa..1ea525433a5c 100644
+--- a/drivers/vdpa/vdpa.c
++++ b/drivers/vdpa/vdpa.c
+@@ -393,7 +393,7 @@ static void vdpa_get_config_unlocked(struct vdpa_device *vdev,
+ 	 * If it does happen we assume a legacy guest.
+ 	 */
+ 	if (!vdev->features_valid)
+-		vdpa_set_features(vdev, 0, true);
++		vdpa_set_features_unlocked(vdev, 0);
+ 	ops->get_config(vdev, offset, buf, len);
+ }
+ 
+diff --git a/drivers/vhost/vdpa.c b/drivers/vhost/vdpa.c
+index 851539807bc9..ec5249e8c32d 100644
+--- a/drivers/vhost/vdpa.c
++++ b/drivers/vhost/vdpa.c
+@@ -286,7 +286,7 @@ static long vhost_vdpa_set_features(struct vhost_vdpa *v, u64 __user *featurep)
+ 	if (copy_from_user(&features, featurep, sizeof(features)))
+ 		return -EFAULT;
+ 
+-	if (vdpa_set_features(vdpa, features, false))
++	if (vdpa_set_features(vdpa, features))
+ 		return -EINVAL;
+ 
+ 	return 0;
+diff --git a/drivers/virtio/virtio_vdpa.c b/drivers/virtio/virtio_vdpa.c
+index 7767a7f0119b..76504559bc25 100644
+--- a/drivers/virtio/virtio_vdpa.c
++++ b/drivers/virtio/virtio_vdpa.c
+@@ -317,7 +317,7 @@ static int virtio_vdpa_finalize_features(struct virtio_device *vdev)
+ 	/* Give virtio_ring a chance to accept features. */
+ 	vring_transport_features(vdev);
+ 
+-	return vdpa_set_features(vdpa, vdev->features, false);
++	return vdpa_set_features(vdpa, vdev->features);
+ }
+ 
+ static const char *virtio_vdpa_bus_name(struct virtio_device *vdev)
+diff --git a/include/linux/vdpa.h b/include/linux/vdpa.h
+index 2de442ececae..721089bb4c84 100644
+--- a/include/linux/vdpa.h
++++ b/include/linux/vdpa.h
+@@ -401,18 +401,24 @@ static inline int vdpa_reset(struct vdpa_device *vdev)
+ 	return ret;
+ }
+ 
+-static inline int vdpa_set_features(struct vdpa_device *vdev, u64 features, bool locked)
++static inline int vdpa_set_features_unlocked(struct vdpa_device *vdev, u64 features)
+ {
+ 	const struct vdpa_config_ops *ops = vdev->config;
+ 	int ret;
+ 
+-	if (!locked)
+-		mutex_lock(&vdev->cf_mutex);
+-
+ 	vdev->features_valid = true;
+ 	ret = ops->set_driver_features(vdev, features);
+-	if (!locked)
+-		mutex_unlock(&vdev->cf_mutex);
++
++	return ret;
++}
++
++static inline int vdpa_set_features(struct vdpa_device *vdev, u64 features)
++{
++	int ret;
++
++	mutex_lock(&vdev->cf_mutex);
++	ret = vdpa_set_features_unlocked(vdev, features);
++	mutex_unlock(&vdev->cf_mutex);
+ 
+ 	return ret;
+ }
+-- 
+2.33.0
+

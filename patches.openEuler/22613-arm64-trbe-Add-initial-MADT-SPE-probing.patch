@@ -1,0 +1,163 @@
+From 22c03d7a2680f35c43440f53bffdb675b14baa70 Mon Sep 17 00:00:00 2001
+From: Junhao He <hejunhao3@huawei.com>
+Date: Mon, 12 Dec 2022 20:27:56 +0800
+Subject: [PATCH] arm64/trbe: Add initial MADT/SPE probing
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: 22c03d7a2680f35c43440f53bffdb675b14baa70
+Modified-by-SEL: Yes, drop the change in openeuler_defconfig
+
+
+driver inclusion
+category: featurn
+bugzilla: https://gitee.com/openeuler/kernel/issues/I5YCYK
+
+--------------------------------------------------------------------------
+
+ACPI 6.5 adds additional fields to the MADT GICC
+structure to describe TRBE PPI's. We pick these out
+of the cached reference to the madt_gicc structure
+similarly to the arm SPE code. We then create a platform
+device referring to the IRQ and let the user/module loader
+decide whether to load the TRBE driver.
+
+Signed-off-by: Junhao He <hejunhao3@huawei.com>
+Reviewed-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ arch/arm64/include/asm/acpi.h       |    3 +
+ arch/arm64/kernel/Makefile          |    1 
+ arch/arm64/kernel/acpi_trbe.c       |   81 ++++++++++++++++++++++++++++++++++++
+ drivers/hwtracing/coresight/Kconfig |    4 +
+ include/linux/coresight.h           |    2 
+ 5 files changed, 91 insertions(+)
+ create mode 100644 arch/arm64/kernel/acpi_trbe.c
+
+--- a/arch/arm64/include/asm/acpi.h
++++ b/arch/arm64/include/asm/acpi.h
+@@ -42,6 +42,9 @@
+ #define ACPI_MADT_GICC_SPE  (offsetof(struct acpi_madt_generic_interrupt, \
+ 	spe_interrupt) + sizeof(u16))
+ 
++#define ACPI_MADT_GICC_TRBE  (offsetof(struct acpi_madt_generic_interrupt, \
++	trbe_interrupt) + sizeof(u16))
++
+ /* Basic configuration for ACPI */
+ #ifdef	CONFIG_ACPI
+ pgprot_t __acpi_get_mem_attribute(phys_addr_t addr);
+--- a/arch/arm64/kernel/Makefile
++++ b/arch/arm64/kernel/Makefile
+@@ -54,6 +54,7 @@ obj-$(CONFIG_PCI)			+= pci.o
+ obj-$(CONFIG_ARMV8_DEPRECATED)		+= armv8_deprecated.o
+ obj-$(CONFIG_ACPI)			+= acpi.o
+ obj-$(CONFIG_ACPI_NUMA)			+= acpi_numa.o
++obj-$(CONFIG_ACPI_TRBE)			+= acpi_trbe.o
+ obj-$(CONFIG_ARM64_ACPI_PARKING_PROTOCOL)	+= acpi_parking_protocol.o
+ obj-$(CONFIG_PARAVIRT)			+= paravirt.o paravirt-spinlocks.o
+ obj-$(CONFIG_PARAVIRT_SPINLOCKS)	+= paravirt.o paravirt-spinlocks.o
+--- /dev/null
++++ b/arch/arm64/kernel/acpi_trbe.c
+@@ -0,0 +1,81 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * ACPI probing code for ARM Trace Buffer Extension.
++ *
++ * Copyright (C) 2022 ARM Ltd.
++ */
++
++#include <linux/acpi.h>
++#include <linux/coresight.h>
++#include <linux/platform_device.h>
++#include <linux/init.h>
++
++static struct resource trbe_resources[] = {
++	{
++		/* irq */
++		.flags          = IORESOURCE_IRQ,
++	}
++};
++
++static struct platform_device trbe_dev = {
++	.name = ARMV9_TRBE_PDEV_NAME,
++	.id = -1,
++	.resource = trbe_resources,
++	.num_resources = ARRAY_SIZE(trbe_resources)
++};
++
++static void arm_trbe_acpi_register_device(void)
++{
++	int cpu, hetid, irq, ret;
++	bool first = true;
++	u16 gsi = 0;
++
++	/*
++	 * Sanity check all the GICC tables for the same interrupt number.
++	 * For now, we only support homogeneous machines.
++	 */
++	for_each_possible_cpu(cpu) {
++		struct acpi_madt_generic_interrupt *gicc;
++
++		gicc = acpi_cpu_get_madt_gicc(cpu);
++		if (gicc->header.length < ACPI_MADT_GICC_TRBE)
++			return;
++
++		if (first) {
++			gsi = gicc->trbe_interrupt;
++			if (!gsi)
++				return;
++			hetid = find_acpi_cpu_topology_hetero_id(cpu);
++			first = false;
++		} else if ((gsi != gicc->trbe_interrupt) ||
++				(hetid != find_acpi_cpu_topology_hetero_id(cpu))) {
++			pr_warn("ACPI: TRBE must be homogeneous\n");
++			return;
++		}
++	}
++
++	irq = acpi_register_gsi(NULL, gsi, ACPI_LEVEL_SENSITIVE,
++			ACPI_ACTIVE_HIGH);
++	if (irq < 0) {
++		pr_warn("ACPI: TRBE Unable to register interrupt: %d\n", gsi);
++		return;
++	}
++
++	trbe_resources[0].start = irq;
++	ret = platform_device_register(&trbe_dev);
++	if (ret < 0) {
++		pr_warn("ACPI: TRBE: Unable to register device\n");
++		acpi_unregister_gsi(gsi);
++	}
++}
++
++static int arm_acpi_trbe_init(void)
++{
++	if (acpi_disabled)
++		return 0;
++
++	arm_trbe_acpi_register_device();
++
++	return 0;
++}
++device_initcall(arm_acpi_trbe_init)
+--- a/drivers/hwtracing/coresight/Kconfig
++++ b/drivers/hwtracing/coresight/Kconfig
+@@ -200,3 +200,7 @@ config ULTRASOC_SMB
+ 	  called ultrasoc-smb.
+ 
+ endif
++
++config ACPI_TRBE
++	depends on ARM64 && ACPI
++	def_bool y
+--- a/include/linux/coresight.h
++++ b/include/linux/coresight.h
+@@ -33,6 +33,8 @@
+ 
+ #define CORESIGHT_UNLOCK	0xc5acce55
+ 
++#define ARMV9_TRBE_PDEV_NAME "arm,trbe-v1"
++
+ extern struct bus_type coresight_bustype;
+ 
+ enum coresight_dev_type {
