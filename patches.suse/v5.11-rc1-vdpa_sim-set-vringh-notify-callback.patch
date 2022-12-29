@@ -1,0 +1,82 @@
+From b240491b7a48028fb67e5377ffd1be21e9260c4e Mon Sep 17 00:00:00 2001
+From: Stefano Garzarella <sgarzare@redhat.com>
+Date: Tue, 15 Dec 2020 15:42:52 +0100
+Subject: [PATCH] vdpa_sim: set vringh notify callback
+Git-commit: b240491b7a48028fb67e5377ffd1be21e9260c4e
+Patch-mainline: v5.11-rc1
+References: bsn#12
+Modified-by-SEL: No
+
+
+Instead of calling the vq callback directly, we can leverage the
+vringh_notify() function, adding vdpasim_vq_notify() and setting it
+in the vringh notify callback.
+
+Suggested-by: Jason Wang <jasowang@redhat.com>
+Acked-by: Jason Wang <jasowang@redhat.com>
+Signed-off-by: Stefano Garzarella <sgarzare@redhat.com>
+Link: https://lore.kernel.org/r/20201215144256.155342-15-sgarzare@redhat.com
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/vdpa/vdpa_sim/vdpa_sim.c | 23 +++++++++++++++++++----
+ 1 file changed, 19 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/vdpa/vdpa_sim/vdpa_sim.c b/drivers/vdpa/vdpa_sim/vdpa_sim.c
+index e219aa852ef8..19ff5e352782 100644
+--- a/drivers/vdpa/vdpa_sim/vdpa_sim.c
++++ b/drivers/vdpa/vdpa_sim/vdpa_sim.c
+@@ -131,6 +131,17 @@ static struct vdpasim *dev_to_sim(struct device *dev)
+ 	return vdpa_to_sim(vdpa);
+ }
+ 
++static void vdpasim_vq_notify(struct vringh *vring)
++{
++	struct vdpasim_virtqueue *vq =
++		container_of(vring, struct vdpasim_virtqueue, vring);
++
++	if (!vq->cb)
++		return;
++
++	vq->cb(vq->private);
++}
++
+ static void vdpasim_queue_ready(struct vdpasim *vdpasim, unsigned int idx)
+ {
+ 	struct vdpasim_virtqueue *vq = &vdpasim->vqs[idx];
+@@ -142,6 +153,8 @@ static void vdpasim_queue_ready(struct vdpasim *vdpasim, unsigned int idx)
+ 			  (uintptr_t)vq->driver_addr,
+ 			  (struct vring_used *)
+ 			  (uintptr_t)vq->device_addr);
++
++	vq->vring.notify = vdpasim_vq_notify;
+ }
+ 
+ static void vdpasim_vq_reset(struct vdpasim *vdpasim,
+@@ -155,6 +168,8 @@ static void vdpasim_vq_reset(struct vdpasim *vdpasim,
+ 	vq->private = NULL;
+ 	vringh_init_iotlb(&vq->vring, vdpasim->dev_attr.supported_features,
+ 			  VDPASIM_QUEUE_MAX, false, NULL, NULL, NULL);
++
++	vq->vring.notify = NULL;
+ }
+ 
+ static void vdpasim_reset(struct vdpasim *vdpasim)
+@@ -231,10 +246,10 @@ static void vdpasim_net_work(struct work_struct *work)
+ 		smp_wmb();
+ 
+ 		local_bh_disable();
+-		if (txq->cb)
+-			txq->cb(txq->private);
+-		if (rxq->cb)
+-			rxq->cb(rxq->private);
++		if (vringh_need_notify_iotlb(&txq->vring) > 0)
++			vringh_notify(&txq->vring);
++		if (vringh_need_notify_iotlb(&rxq->vring) > 0)
++			vringh_notify(&rxq->vring);
+ 		local_bh_enable();
+ 
+ 		if (++pkts > 4) {
+-- 
+2.33.0
+

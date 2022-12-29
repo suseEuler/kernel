@@ -1,0 +1,157 @@
+From 539fec78edb4e084e7c532affc56cc42d4ceea4b Mon Sep 17 00:00:00 2001
+From: Stefano Garzarella <sgarzare@redhat.com>
+Date: Fri, 26 Nov 2021 17:47:53 +0100
+Subject: [PATCH] vdpa: add driver_override support
+Git-commit: 539fec78edb4e084e7c532affc56cc42d4ceea4b
+Patch-mainline: v5.17-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified due to different context
+
+
+`driver_override` allows to control which of the vDPA bus drivers
+binds to a vDPA device.
+
+If `driver_override` is not set, the previous behaviour is followed:
+devices use the first vDPA bus driver loaded (unless auto binding
+is disabled).
+
+Tested on Fedora 34 with driverctl(8):
+  $ modprobe virtio-vdpa
+  $ modprobe vhost-vdpa
+  $ modprobe vdpa-sim-net
+
+  $ vdpa dev add mgmtdev vdpasim_net name dev1
+
+  # dev1 is attached to the first vDPA bus driver loaded
+  $ driverctl -b vdpa list-devices
+    dev1 virtio_vdpa
+
+  $ driverctl -b vdpa set-override dev1 vhost_vdpa
+
+  $ driverctl -b vdpa list-devices
+    dev1 vhost_vdpa [*]
+
+  Note: driverctl(8) integrates with udev so the binding is
+  preserved.
+
+Suggested-by: Jason Wang <jasowang@redhat.com>
+Acked-by: Jason Wang <jasowang@redhat.com>
+Signed-off-by: Stefano Garzarella <sgarzare@redhat.com>
+Link: https://lore.kernel.org/r/20211126164753.181829-3-sgarzare@redhat.com
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/vdpa/vdpa.c  |   74 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ include/linux/vdpa.h |    2 +
+ 2 files changed, 76 insertions(+)
+
+--- a/drivers/vdpa/vdpa.c
++++ b/drivers/vdpa/vdpa.c
+@@ -45,8 +45,81 @@ static int vdpa_dev_remove(struct device
+ 	return 0;
+ }
+ 
++static int vdpa_dev_match(struct device *dev, struct device_driver *drv)
++{
++	struct vdpa_device *vdev = dev_to_vdpa(dev);
++
++	/* Check override first, and if set, only use the named driver */
++	if (vdev->driver_override)
++		return strcmp(vdev->driver_override, drv->name) == 0;
++
++	/* Currently devices must be supported by all vDPA bus drivers */
++	return 1;
++}
++
++static ssize_t driver_override_store(struct device *dev,
++				     struct device_attribute *attr,
++				     const char *buf, size_t count)
++{
++	struct vdpa_device *vdev = dev_to_vdpa(dev);
++	const char *driver_override, *old;
++	char *cp;
++
++	/* We need to keep extra room for a newline */
++	if (count >= (PAGE_SIZE - 1))
++		return -EINVAL;
++
++	driver_override = kstrndup(buf, count, GFP_KERNEL);
++	if (!driver_override)
++		return -ENOMEM;
++
++	cp = strchr(driver_override, '\n');
++	if (cp)
++		*cp = '\0';
++
++	device_lock(dev);
++	old = vdev->driver_override;
++	if (strlen(driver_override)) {
++		vdev->driver_override = driver_override;
++	} else {
++		kfree(driver_override);
++		vdev->driver_override = NULL;
++	}
++	device_unlock(dev);
++
++	kfree(old);
++
++	return count;
++}
++
++static ssize_t driver_override_show(struct device *dev,
++				    struct device_attribute *attr, char *buf)
++{
++	struct vdpa_device *vdev = dev_to_vdpa(dev);
++	ssize_t len;
++
++	device_lock(dev);
++	len = snprintf(buf, PAGE_SIZE, "%s\n", vdev->driver_override);
++	device_unlock(dev);
++
++	return len;
++}
++static DEVICE_ATTR_RW(driver_override);
++
++static struct attribute *vdpa_dev_attrs[] = {
++	&dev_attr_driver_override.attr,
++	NULL,
++};
++
++static const struct attribute_group vdpa_dev_group = {
++	.attrs  = vdpa_dev_attrs,
++};
++__ATTRIBUTE_GROUPS(vdpa_dev);
++
+ static struct bus_type vdpa_bus = {
+ 	.name  = "vdpa",
++	.dev_groups = vdpa_dev_groups,
++	.match = vdpa_dev_match,
+ 	.probe = vdpa_dev_probe,
+ 	.remove = vdpa_dev_remove,
+ };
+@@ -60,6 +133,7 @@ static void vdpa_release_dev(struct devi
+ 		ops->free(vdev);
+ 
+ 	ida_simple_remove(&vdpa_index_ida, vdev->index);
++	kfree(vdev->driver_override);
+ 	kfree(vdev);
+ }
+ 
+--- a/include/linux/vdpa.h
++++ b/include/linux/vdpa.h
+@@ -62,6 +62,7 @@ struct vdpa_mgmt_dev;
+  * vDPA device - representation of a vDPA device
+  * @dev: underlying device
+  * @dma_dev: the actual device that is performing DMA
++ * @driver_override: driver name to force a match
+  * @config: the configuration ops for this device.
+  * @index: device index
+  * @features_valid: were features initialized? for legacy guests
+@@ -72,6 +73,7 @@ struct vdpa_mgmt_dev;
+ struct vdpa_device {
+ 	struct device dev;
+ 	struct device *dma_dev;
++	const char *driver_override;
+ 	const struct vdpa_config_ops *config;
+ 	unsigned int index;
+ 	bool features_valid;

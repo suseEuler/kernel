@@ -1,0 +1,198 @@
+From f00bdce0455233a0b76dae6364442dca717a574c Mon Sep 17 00:00:00 2001
+From: Jason Wang <jasowang@redhat.com>
+Date: Tue, 23 Feb 2021 14:19:04 +0800
+Subject: [PATCH] vdpa: set the virtqueue num during register
+Git-commit: f00bdce0455233a0b76dae6364442dca717a574c
+Patch-mainline: v5.12-rc4
+References: bsn#12
+Modified-by-SEL: Yes, refreshed due to different context
+
+
+This patch delay the queue number setting to vDPA device
+registering. This allows us to probe the virtqueue numbers between
+device allocation and registering.
+
+Reviewed-by: Stefano Garzarella <sgarzare@redhat.com>
+Signed-off-by: Jason Wang <jasowang@redhat.com>
+Link: https://lore.kernel.org/r/20210223061905.422659-3-jasowang@redhat.com
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ drivers/vdpa/ifcvf/ifcvf_main.c      |    5 ++---
+ drivers/vdpa/mlx5/net/mlx5_vnet.c    |    4 ++--
+ drivers/vdpa/vdpa.c                  |   18 ++++++++++--------
+ drivers/vdpa/vdpa_sim/vdpa_sim.c     |    2 +-
+ drivers/vdpa/vdpa_sim/vdpa_sim_net.c |    2 +-
+ include/linux/vdpa.h                 |   10 +++++-----
+ 6 files changed, 21 insertions(+), 20 deletions(-)
+
+--- a/drivers/vdpa/ifcvf/ifcvf_main.c
++++ b/drivers/vdpa/ifcvf/ifcvf_main.c
+@@ -438,8 +438,7 @@ static int ifcvf_probe(struct pci_dev *p
+ 	}
+ 
+ 	adapter = vdpa_alloc_device(struct ifcvf_adapter, vdpa,
+-				    dev, &ifc_vdpa_ops,
+-				    IFCVF_MAX_QUEUE_PAIRS * 2, NULL);
++				    dev, &ifc_vdpa_ops, NULL);
+ 	if (adapter == NULL) {
+ 		IFCVF_ERR(pdev, "Failed to allocate vDPA structure");
+ 		return -ENOMEM;
+@@ -463,7 +462,7 @@ static int ifcvf_probe(struct pci_dev *p
+ 	for (i = 0; i < IFCVF_MAX_QUEUE_PAIRS * 2; i++)
+ 		vf->vring[i].irq = -EINVAL;
+ 
+-	ret = vdpa_register_device(&adapter->vdpa);
++	ret = vdpa_register_device(&adapter->vdpa, IFCVF_MAX_QUEUE_PAIRS * 2);
+ 	if (ret) {
+ 		IFCVF_ERR(pdev, "Failed to register ifcvf to vdpa bus");
+ 		goto err;
+--- a/drivers/vdpa/mlx5/net/mlx5_vnet.c
++++ b/drivers/vdpa/mlx5/net/mlx5_vnet.c
+@@ -1994,7 +1994,7 @@ void *mlx5_vdpa_add_dev(struct mlx5_core
+ 	max_vqs = min_t(u32, max_vqs, MLX5_MAX_SUPPORTED_VQS);
+ 
+ 	ndev = vdpa_alloc_device(struct mlx5_vdpa_net, mvdev.vdev, mdev->device, &mlx5_vdpa_ops,
+-				 2 * mlx5_vdpa_max_qps(max_vqs), NULL);
++				 NULL);
+ 	if (IS_ERR(ndev))
+ 		return ndev;
+ 
+@@ -2028,7 +2028,7 @@ void *mlx5_vdpa_add_dev(struct mlx5_core
+ 	if (err)
+ 		goto err_res;
+ 
+-	err = vdpa_register_device(&mvdev->vdev);
++	err = vdpa_register_device(&mvdev->vdev, 2 * mlx5_vdpa_max_qps(max_vqs));
+ 	if (err)
+ 		goto err_reg;
+ 
+--- a/drivers/vdpa/vdpa.c
++++ b/drivers/vdpa/vdpa.c
+@@ -69,7 +69,6 @@ static void vdpa_release_dev(struct devi
+  * initialized but before registered.
+  * @parent: the parent device
+  * @config: the bus operations that is supported by this device
+- * @nvqs: number of virtqueues supported by this device
+  * @size: size of the parent structure that contains private data
+  * @name: name of the vdpa device; optional.
+  *
+@@ -81,7 +80,7 @@ static void vdpa_release_dev(struct devi
+  */
+ struct vdpa_device *__vdpa_alloc_device(struct device *parent,
+ 					const struct vdpa_config_ops *config,
+-					int nvqs, size_t size, const char *name)
++					size_t size, const char *name)
+ {
+ 	struct vdpa_device *vdev;
+ 	int err = -EINVAL;
+@@ -107,7 +106,6 @@ struct vdpa_device *__vdpa_alloc_device(
+ 	vdev->index = err;
+ 	vdev->config = config;
+ 	vdev->features_valid = false;
+-	vdev->nvqs = nvqs;
+ 
+ 	if (name)
+ 		err = dev_set_name(&vdev->dev, "%s", name);
+@@ -136,10 +134,12 @@ static int vdpa_name_match(struct device
+ 	return (strcmp(dev_name(&vdev->dev), data) == 0);
+ }
+ 
+-static int __vdpa_register_device(struct vdpa_device *vdev)
++static int __vdpa_register_device(struct vdpa_device *vdev, int nvqs)
+ {
+ 	struct device *dev;
+ 
++	vdev->nvqs = nvqs;
++
+ 	lockdep_assert_held(&vdpa_dev_mutex);
+ 	dev = bus_find_device(&vdpa_bus, NULL, dev_name(&vdev->dev), vdpa_name_match);
+ 	if (dev) {
+@@ -155,15 +155,16 @@ static int __vdpa_register_device(struct
+  * Caller must invoke this routine in the management device dev_add()
+  * callback after setting up valid mgmtdev for this vdpa device.
+  * @vdev: the vdpa device to be registered to vDPA bus
++ * @nvqs: number of virtqueues supported by this device
+  *
+  * Returns an error when fail to add device to vDPA bus
+  */
+-int _vdpa_register_device(struct vdpa_device *vdev)
++int _vdpa_register_device(struct vdpa_device *vdev, int nvqs)
+ {
+ 	if (!vdev->mdev)
+ 		return -EINVAL;
+ 
+-	return __vdpa_register_device(vdev);
++	return __vdpa_register_device(vdev, nvqs);
+ }
+ EXPORT_SYMBOL_GPL(_vdpa_register_device);
+ 
+@@ -171,15 +172,16 @@ EXPORT_SYMBOL_GPL(_vdpa_register_device)
+  * vdpa_register_device - register a vDPA device
+  * Callers must have a succeed call of vdpa_alloc_device() before.
+  * @vdev: the vdpa device to be registered to vDPA bus
++ * @nvqs: number of virtqueues supported by this device
+  *
+  * Returns an error when fail to add to vDPA bus
+  */
+-int vdpa_register_device(struct vdpa_device *vdev)
++int vdpa_register_device(struct vdpa_device *vdev, int nvqs)
+ {
+ 	int err;
+ 
+ 	mutex_lock(&vdpa_dev_mutex);
+-	err = __vdpa_register_device(vdev);
++	err = __vdpa_register_device(vdev, nvqs);
+ 	mutex_unlock(&vdpa_dev_mutex);
+ 	return err;
+ }
+--- a/drivers/vdpa/vdpa_sim/vdpa_sim.c
++++ b/drivers/vdpa/vdpa_sim/vdpa_sim.c
+@@ -237,7 +237,7 @@ struct vdpasim *vdpasim_create(struct vd
+ 		ops = &vdpasim_net_config_ops;
+ 
+ 	vdpasim = vdpa_alloc_device(struct vdpasim, vdpa, NULL, ops,
+-				    dev_attr->nvqs, dev_attr->name);
++				    dev_attr->name);
+ 	if (!vdpasim)
+ 		goto err_alloc;
+ 
+--- a/drivers/vdpa/vdpa_sim/vdpa_sim_net.c
++++ b/drivers/vdpa/vdpa_sim/vdpa_sim_net.c
+@@ -147,7 +147,7 @@ static int vdpasim_net_dev_add(struct vd
+ 	if (IS_ERR(simdev))
+ 		return PTR_ERR(simdev);
+ 
+-	ret = _vdpa_register_device(&simdev->vdpa);
++	ret = _vdpa_register_device(&simdev->vdpa, VDPASIM_NET_VQ_NUM);
+ 	if (ret)
+ 		goto reg_err;
+ 
+--- a/include/linux/vdpa.h
++++ b/include/linux/vdpa.h
+@@ -250,20 +250,20 @@ struct vdpa_config_ops {
+ 
+ struct vdpa_device *__vdpa_alloc_device(struct device *parent,
+ 					const struct vdpa_config_ops *config,
+-					int nvqs, size_t size, const char *name);
++					size_t size, const char *name);
+ 
+-#define vdpa_alloc_device(dev_struct, member, parent, config, nvqs, name)   \
++#define vdpa_alloc_device(dev_struct, member, parent, config, name)   \
+ 			  container_of(__vdpa_alloc_device( \
+-				       parent, config, nvqs, \
++				       parent, config, \
+ 				       sizeof(dev_struct) + \
+ 				       BUILD_BUG_ON_ZERO(offsetof( \
+ 				       dev_struct, member)), name), \
+ 				       dev_struct, member)
+ 
+-int vdpa_register_device(struct vdpa_device *vdev);
++int vdpa_register_device(struct vdpa_device *vdev, int nvqs);
+ void vdpa_unregister_device(struct vdpa_device *vdev);
+ 
+-int _vdpa_register_device(struct vdpa_device *vdev);
++int _vdpa_register_device(struct vdpa_device *vdev, int nvqs);
+ void _vdpa_unregister_device(struct vdpa_device *vdev);
+ 
+ /**
