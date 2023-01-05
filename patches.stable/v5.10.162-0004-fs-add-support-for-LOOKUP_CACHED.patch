@@ -1,0 +1,84 @@
+Git-commit: c1fe7bd3e1aa85865396b464b31f28b094a4353c
+From: Jens Axboe <axboe@kernel.dk>
+Date: Thu, 17 Dec 2020 09:19:09 -0700
+Subject: [PATCH] fs: add support for LOOKUP_CACHED
+References: bsn#19
+Patch-mainline: v5.10.162
+
+[ Upstream commit 6c6ec2b0a3e0381d886d531bd1471dfdb1509237 ]
+
+io_uring always punts opens to async context, since there's no control
+over whether the lookup blocks or not. Add LOOKUP_CACHED to support
+just doing the fast RCU based lookups, which we know will not block. If
+we can do a cached path resolution of the filename, then we don't have
+to always punt lookups for a worker.
+
+During path resolution, we always do LOOKUP_RCU first. If that fails and
+we terminate LOOKUP_RCU, then fail a LOOKUP_CACHED attempt as well.
+
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ fs/namei.c            | 9 +++++++++
+ include/linux/namei.h | 1 +
+ 2 files changed, 10 insertions(+)
+
+diff --git a/fs/namei.c b/fs/namei.c
+index 276a84286108..d047778aff16 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -686,6 +686,8 @@ static bool try_to_unlazy(struct nameidata *nd)
+ 	BUG_ON(!(nd->flags & LOOKUP_RCU));
+ 
+ 	nd->flags &= ~LOOKUP_RCU;
++	if (nd->flags & LOOKUP_CACHED)
++		goto out1;
+ 	if (unlikely(!legitimize_links(nd)))
+ 		goto out1;
+ 	if (unlikely(!legitimize_path(nd, &nd->path, nd->seq)))
+@@ -722,6 +724,8 @@ static bool try_to_unlazy_next(struct nameidata *nd, struct dentry *dentry, unsi
+ 	BUG_ON(!(nd->flags & LOOKUP_RCU));
+ 
+ 	nd->flags &= ~LOOKUP_RCU;
++	if (nd->flags & LOOKUP_CACHED)
++		goto out2;
+ 	if (unlikely(!legitimize_links(nd)))
+ 		goto out2;
+ 	if (unlikely(!legitimize_mnt(nd->path.mnt, nd->m_seq)))
+@@ -792,6 +796,7 @@ static int complete_walk(struct nameidata *nd)
+ 		 */
+ 		if (!(nd->flags & (LOOKUP_ROOT | LOOKUP_IS_SCOPED)))
+ 			nd->root.mnt = NULL;
++		nd->flags &= ~LOOKUP_CACHED;
+ 		if (!try_to_unlazy(nd))
+ 			return -ECHILD;
+ 	}
+@@ -2204,6 +2209,10 @@ static const char *path_init(struct nameidata *nd, unsigned flags)
+ 	int error;
+ 	const char *s = nd->name->name;
+ 
++	/* LOOKUP_CACHED requires RCU, ask caller to retry */
++	if ((flags & (LOOKUP_RCU | LOOKUP_CACHED)) == LOOKUP_CACHED)
++		return ERR_PTR(-EAGAIN);
++
+ 	if (!*s)
+ 		flags &= ~LOOKUP_RCU;
+ 	if (flags & LOOKUP_RCU)
+diff --git a/include/linux/namei.h b/include/linux/namei.h
+index a4bb992623c4..b9605b2b46e7 100644
+--- a/include/linux/namei.h
++++ b/include/linux/namei.h
+@@ -46,6 +46,7 @@ enum {LAST_NORM, LAST_ROOT, LAST_DOT, LAST_DOTDOT};
+ #define LOOKUP_NO_XDEV		0x040000 /* No mountpoint crossing. */
+ #define LOOKUP_BENEATH		0x080000 /* No escaping from starting point. */
+ #define LOOKUP_IN_ROOT		0x100000 /* Treat dirfd as fs root. */
++#define LOOKUP_CACHED		0x200000 /* Only do cached lookup */
+ /* LOOKUP_* flags which do scope-related checks based on the dirfd. */
+ #define LOOKUP_IS_SCOPED (LOOKUP_BENEATH | LOOKUP_IN_ROOT)
+ 
+-- 
+2.35.3
+

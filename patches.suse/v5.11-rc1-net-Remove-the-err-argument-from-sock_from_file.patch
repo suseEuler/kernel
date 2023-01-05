@@ -6,7 +6,8 @@ Subject: [PATCH] net: Remove the err argument from sock_from_file
 Git-commit: dba4a9256bb4d78ef89aaad5f49787aa27fcd5b4
 Patch-mainline: v5.11-rc1
 References: bsn#127
-Modified-by-SEL: Yes, refreshed due to context changes
+Modified-by-SEL: Yes, refreshed due to context changes,
+                 fs/io_uring.c is moved to io_uring/io_uring.c.
 
 Currently, the sock_from_file prototype takes an "err" pointer that is
 either not set or set to -ENOTSOCK IFF the returned socket is NULL. This
@@ -23,7 +24,7 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
 Link: https://lore.kernel.org/bpf/20201204113609.1850150-1-revest@google.com
 ---
  fs/eventpoll.c               |  3 +--
- fs/io_uring.c                | 16 ++++++++--------
+ io_uring/io_uring.c          | 16 ++++++++--------
  include/linux/net.h          |  2 +-
  net/core/netclassid_cgroup.c |  3 +--
  net/core/netprio_cgroup.c    |  3 +--
@@ -47,59 +48,9 @@ Link: https://lore.kernel.org/bpf/20201204113609.1850150-1-revest@google.com
  	if (!sock)
  		return;
  
---- a/fs/io_uring.c
-+++ b/fs/io_uring.c
-@@ -4425,9 +4425,9 @@ static int io_sendmsg(struct io_kiocb *r
- 	int min_ret = 0;
- 	int ret;
- 
--	sock = sock_from_file(req->file, &ret);
-+	sock = sock_from_file(req->file);
- 	if (unlikely(!sock))
--		return ret;
-+		return -ENOTSOCK;
- 
- 	if (req->async_data) {
- 		kmsg = req->async_data;
-@@ -4478,9 +4478,9 @@ static int io_send(struct io_kiocb *req,
- 	int min_ret = 0;
- 	int ret;
- 
--	sock = sock_from_file(req->file, &ret);
-+	sock = sock_from_file(req->file);
- 	if (unlikely(!sock))
--		return ret;
-+		return -ENOTSOCK;
- 
- 	ret = import_single_range(WRITE, sr->buf, sr->len, &iov, &msg.msg_iter);
- 	if (unlikely(ret))
-@@ -4662,9 +4662,9 @@ static int io_recvmsg(struct io_kiocb *r
- 	int min_ret = 0;
- 	int ret, cflags = 0;
- 
--	sock = sock_from_file(req->file, &ret);
-+	sock = sock_from_file(req->file);
- 	if (unlikely(!sock))
--		return ret;
-+		return -ENOTSOCK;
- 
- 	if (req->async_data) {
- 		kmsg = req->async_data;
-@@ -4729,9 +4729,9 @@ static int io_recv(struct io_kiocb *req,
- 	int min_ret = 0;
- 	int ret, cflags = 0;
- 
--	sock = sock_from_file(req->file, &ret);
-+	sock = sock_from_file(req->file);
- 	if (unlikely(!sock))
--		return ret;
-+		return -ENOTSOCK;
- 
- 	if (req->flags & REQ_F_BUFFER_SELECT) {
- 		kbuf = io_recv_buffer_select(req, !force_nonblock);
 --- a/include/linux/net.h
 +++ b/include/linux/net.h
-@@ -240,7 +240,7 @@ int sock_sendmsg(struct socket *sock, st
+@@ -237,7 +237,7 @@ int sock_sendmsg(struct socket *sock, st
  int sock_recvmsg(struct socket *sock, struct msghdr *msg, int flags);
  struct file *sock_alloc_file(struct socket *sock, int flags, const char *dname);
  struct socket *sockfd_lookup(int fd, int *err);
@@ -135,7 +86,7 @@ Link: https://lore.kernel.org/bpf/20201204113609.1850150-1-revest@google.com
  		sock_cgroup_set_prioidx(&sock->sk->sk_cgrp_data,
 --- a/net/core/sock.c
 +++ b/net/core/sock.c
-@@ -2844,14 +2844,8 @@ EXPORT_SYMBOL(sock_no_mmap);
+@@ -2846,14 +2846,8 @@ EXPORT_SYMBOL(sock_no_mmap);
  void __receive_sock(struct file *file)
  {
  	struct socket *sock;
@@ -201,21 +152,19 @@ Link: https://lore.kernel.org/bpf/20201204113609.1850150-1-revest@google.com
  		fdput(f);
  	}
  	return NULL;
-@@ -1705,9 +1706,11 @@ int __sys_accept4_file(struct file *file
- 	if (SOCK_NONBLOCK != O_NONBLOCK && (flags & SOCK_NONBLOCK))
- 		flags = (flags & ~SOCK_NONBLOCK) | O_NONBLOCK;
+@@ -1698,9 +1699,9 @@ struct file *do_accept(struct file *file
+ 	int err, len;
+ 	struct sockaddr_storage address;
  
 -	sock = sock_from_file(file, &err);
--	if (!sock)
 +	sock = sock_from_file(file);
-+	if (!sock) {
-+		err = -ENOTSOCK;
- 		goto out;
-+	}
+ 	if (!sock)
+-		return ERR_PTR(err);
++		return ERR_PTR(-ENOTSOCK);
  
- 	err = -ENFILE;
  	newsock = sock_alloc();
-@@ -1830,9 +1833,11 @@ int __sys_connect_file(struct file *file
+ 	if (!newsock)
+@@ -1835,9 +1836,11 @@ int __sys_connect_file(struct file *file
  	struct socket *sock;
  	int err;
  
@@ -229,3 +178,65 @@ Link: https://lore.kernel.org/bpf/20201204113609.1850150-1-revest@google.com
  
  	err =
  	    security_socket_connect(sock, (struct sockaddr *)address, addrlen);
+--- a/io_uring/io_uring.c
++++ b/io_uring/io_uring.c
+@@ -3865,9 +3865,9 @@ static int io_shutdown(struct io_kiocb *
+ 	if (issue_flags & IO_URING_F_NONBLOCK)
+ 		return -EAGAIN;
+ 
+-	sock = sock_from_file(req->file, &ret);
++	sock = sock_from_file(req->file);
+ 	if (unlikely(!sock))
+-		return ret;
++		return -ENOTSOCK;
+ 
+ 	ret = __sys_shutdown_sock(sock, req->shutdown.how);
+ 	if (ret < 0)
+@@ -4687,9 +4687,9 @@ static int io_sendmsg(struct io_kiocb *r
+ 	int min_ret = 0;
+ 	int ret;
+ 
+-	sock = sock_from_file(req->file, &ret);
++	sock = sock_from_file(req->file);
+ 	if (unlikely(!sock))
+-		return ret;
++		return -ENOTSOCK;
+ 
+ 	kmsg = req->async_data;
+ 	if (!kmsg) {
+@@ -4731,9 +4731,9 @@ static int io_send(struct io_kiocb *req,
+ 	int min_ret = 0;
+ 	int ret;
+ 
+-	sock = sock_from_file(req->file, &ret);
++	sock = sock_from_file(req->file);
+ 	if (unlikely(!sock))
+-		return ret;
++		return -ENOTSOCK;
+ 
+ 	ret = import_single_range(WRITE, sr->buf, sr->len, &iov, &msg.msg_iter);
+ 	if (unlikely(ret))
+@@ -4915,9 +4915,9 @@ static int io_recvmsg(struct io_kiocb *r
+ 	int ret, cflags = 0;
+ 	bool force_nonblock = issue_flags & IO_URING_F_NONBLOCK;
+ 
+-	sock = sock_from_file(req->file, &ret);
++	sock = sock_from_file(req->file);
+ 	if (unlikely(!sock))
+-		return ret;
++		return -ENOTSOCK;
+ 
+ 	kmsg = req->async_data;
+ 	if (!kmsg) {
+@@ -4975,9 +4975,9 @@ static int io_recv(struct io_kiocb *req,
+ 	int ret, cflags = 0;
+ 	bool force_nonblock = issue_flags & IO_URING_F_NONBLOCK;
+ 
+-	sock = sock_from_file(req->file, &ret);
++	sock = sock_from_file(req->file);
+ 	if (unlikely(!sock))
+-		return ret;
++		return -ENOTSOCK;
+ 
+ 	if (req->flags & REQ_F_BUFFER_SELECT) {
+ 		kbuf = io_recv_buffer_select(req, !force_nonblock);
