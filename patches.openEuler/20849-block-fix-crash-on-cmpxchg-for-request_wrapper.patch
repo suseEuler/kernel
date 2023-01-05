@@ -1,0 +1,123 @@
+From a9a9ed4288404dbb7168c05cc952263835431a3c Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Wed, 4 Jan 2023 18:38:33 +0800
+Subject: [PATCH] block: fix crash on cmpxchg for request_wrapper
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: a9a9ed4288404dbb7168c05cc952263835431a3c
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I65K8D
+CVE: NA
+
+--------------------------------
+
+Now that address of request_wrapper is caculated by address of request
+plus cmd_size, if cmd_size is not aligned to 8 bytes, request_wrapper
+will end up not aligned to 8 bytes as well, which will crash in arm64
+because assembly instruction casal requires that operand address is
+aligned to 8 bytes:
+
+Internal error: Oops: 96000021 [#1] SMP
+pc : blk_account_io_latency+0x54/0x134
+Call trace:
+ blk_account_io_latency+0x54/0x134
+ blk_account_io_done+0x3c/0x4c
+ __blk_mq_end_request+0x78/0x134
+ scsi_end_request+0xcc/0x1f0
+ scsi_io_completion+0x88/0x240
+ scsi_finish_command+0x104/0x140
+ scsi_softirq_done+0x90/0x180
+ blk_mq_complete_request+0x5c/0x70
+ scsi_mq_done+0x4c/0x100
+
+Fix the problem by declaring request_wrapper as aligned to cachline, and
+placing it before request.
+
+Fixes: 9981c33db4da ("blk-mq: don't access request_wrapper if request is not allocated from block layer")
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Hou Tao <houtao1@huawei.com>
+Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ block/blk-flush.c | 8 +++++---
+ block/blk-mq.c    | 2 +-
+ block/blk-mq.h    | 9 +++------
+ 3 files changed, 9 insertions(+), 10 deletions(-)
+
+diff --git a/block/blk-flush.c b/block/blk-flush.c
+index 65753f781c20..093c581a2651 100644
+--- a/block/blk-flush.c
++++ b/block/blk-flush.c
+@@ -470,6 +470,7 @@ struct blk_flush_queue *blk_alloc_flush_queue(int node, int cmd_size,
+ 					      gfp_t flags)
+ {
+ 	struct blk_flush_queue *fq;
++	struct request_wrapper *wrapper;
+ 	int rq_sz = sizeof(struct request) + sizeof(struct request_wrapper);
+ 
+ 	fq = kzalloc_node(sizeof(*fq), flags, node);
+@@ -479,10 +480,11 @@ struct blk_flush_queue *blk_alloc_flush_queue(int node, int cmd_size,
+ 	spin_lock_init(&fq->mq_flush_lock);
+ 
+ 	rq_sz = round_up(rq_sz + cmd_size, cache_line_size());
+-	fq->flush_rq = kzalloc_node(rq_sz, flags, node);
+-	if (!fq->flush_rq)
++	wrapper = kzalloc_node(rq_sz, flags, node);
++	if (!wrapper)
+ 		goto fail_rq;
+ 
++	fq->flush_rq = (struct request *)(wrapper + 1);
+ 	INIT_LIST_HEAD(&fq->flush_queue[0]);
+ 	INIT_LIST_HEAD(&fq->flush_queue[1]);
+ 	INIT_LIST_HEAD(&fq->flush_data_in_flight);
+@@ -501,7 +503,7 @@ void blk_free_flush_queue(struct blk_flush_queue *fq)
+ 	if (!fq)
+ 		return;
+ 
+-	kfree(fq->flush_rq);
++	kfree(request_to_wrapper(fq->flush_rq));
+ 	kfree(fq);
+ }
+ 
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index a7e87451ce43..729cbf32842e 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -2634,7 +2634,7 @@ static int blk_mq_alloc_rqs(struct blk_mq_tag_set *set,
+ 		to_do = min(entries_per_page, depth - i);
+ 		left -= to_do * rq_size;
+ 		for (j = 0; j < to_do; j++) {
+-			struct request *rq = p;
++			struct request *rq = p + sizeof(struct request_wrapper);
+ 
+ 			tags->static_rqs[i] = rq;
+ 			if (blk_mq_init_request(set, rq, hctx_idx, node)) {
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index 6254abe9c112..dcb2077e4db6 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -40,14 +40,11 @@ struct blk_mq_ctx {
+ struct request_wrapper {
+ 	/* Time that I/O was counted in part_get_stat_info(). */
+ 	u64 stat_time_ns;
+-};
++} ____cacheline_aligned_in_smp;
+ 
+-static inline struct request_wrapper *request_to_wrapper(struct request *rq)
++static inline struct request_wrapper *request_to_wrapper(void *rq)
+ {
+-	unsigned long addr = (unsigned long)rq;
+-
+-	addr += sizeof(*rq) + rq->q->tag_set->cmd_size;
+-	return (struct request_wrapper *)addr;
++	return rq - sizeof(struct request_wrapper);
+ }
+ 
+ void blk_mq_exit_queue(struct request_queue *q);
+-- 
+2.33.0
+
