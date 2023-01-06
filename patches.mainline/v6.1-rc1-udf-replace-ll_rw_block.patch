@@ -1,0 +1,75 @@
+From 59a16786fa7a77dd383a62271e0102f1455bccea Mon Sep 17 00:00:00 2001
+From: Zhang Yi <yi.zhang@huawei.com>
+Date: Thu, 1 Sep 2022 21:35:01 +0800
+Subject: [PATCH] udf: replace ll_rw_block()
+Git-commit: 59a16786fa7a77dd383a62271e0102f1455bccea
+Patch-mainline: v6.1-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified per openEuler commit d691117fb
+
+
+ll_rw_block() is not safe for the sync read path because it cannot
+guarantee that submitting read IO if the buffer has been locked. We
+could get false positive EIO after wait_on_buffer() if the buffer has
+been locked by others. So stop using ll_rw_block(). We also switch to
+new bh_readahead_batch() helper for the buffer array readahead path.
+
+Link: https://lkml.kernel.org/r/20220901133505.2510834-11-yi.zhang@huawei.com
+Signed-off-by: Zhang Yi <yi.zhang@huawei.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/udf/dir.c       | 2 +-
+ fs/udf/directory.c | 2 +-
+ fs/udf/inode.c     | 8 +-------
+ 3 files changed, 3 insertions(+), 9 deletions(-)
+
+diff --git a/fs/udf/dir.c b/fs/udf/dir.c
+index d0f92a52e3ba..02bf94e3e666 100644
+--- a/fs/udf/dir.c
++++ b/fs/udf/dir.c
+@@ -131,7 +131,7 @@ static int udf_readdir(struct file *file, struct dir_context *ctx)
+ 					brelse(tmp);
+ 			}
+ 			if (num) {
+-				ll_rw_block(REQ_OP_READ, REQ_RAHEAD, num, bha);
++				bh_readahead_batch(num, bha, REQ_RAHEAD);
+ 				for (i = 0; i < num; i++)
+ 					brelse(bha[i]);
+ 			}
+diff --git a/fs/udf/directory.c b/fs/udf/directory.c
+index 73720320f0ab..16bcf2c6b8b3 100644
+--- a/fs/udf/directory.c
++++ b/fs/udf/directory.c
+@@ -89,7 +89,7 @@ struct fileIdentDesc *udf_fileident_read(struct inode *dir, loff_t *nf_pos,
+ 					brelse(tmp);
+ 			}
+ 			if (num) {
+-				ll_rw_block(REQ_OP_READ, REQ_RAHEAD, num, bha);
++				bh_readahead_batch(num, bha, REQ_RAHEAD);
+ 				for (i = 0; i < num; i++)
+ 					brelse(bha[i]);
+ 			}
+diff --git a/fs/udf/inode.c b/fs/udf/inode.c
+index d32b836f6ca7..3ae9955c42b0 100644
+--- a/fs/udf/inode.c
++++ b/fs/udf/inode.c
+@@ -1210,13 +1210,7 @@ struct buffer_head *udf_bread(struct inode *inode, udf_pblk_t block,
+ 	if (!bh)
+ 		return NULL;
+ 
+-	if (buffer_uptodate(bh))
+-		return bh;
+-
+-	ll_rw_block(REQ_OP_READ, 0, 1, &bh);
+-
+-	wait_on_buffer(bh);
+-	if (buffer_uptodate(bh))
++	if (bh_read(bh, 0) >= 0)
+ 		return bh;
+ 
+ 	brelse(bh);
+-- 
+2.33.0
+

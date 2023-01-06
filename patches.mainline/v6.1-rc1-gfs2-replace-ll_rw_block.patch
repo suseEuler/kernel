@@ -1,0 +1,75 @@
+From 86a020cc7232c3defad370852415876bbe4576dc Mon Sep 17 00:00:00 2001
+From: Zhang Yi <yi.zhang@huawei.com>
+Date: Thu, 1 Sep 2022 21:34:55 +0800
+Subject: [PATCH] gfs2: replace ll_rw_block()
+Git-commit: 86a020cc7232c3defad370852415876bbe4576dc
+Patch-mainline: v6.1-rc1
+References: bsn#12
+Modified-by-SEL: Yes, modified per openEuler commit 02f18fda
+
+
+ll_rw_block() is not safe for the sync read path because it cannot
+guarantee that always submitting read IO if the buffer has been locked,
+so stop using it. We also switch to new bh_readahead() helper for the
+readahead path.
+
+Link: https://lkml.kernel.org/r/20220901133505.2510834-5-yi.zhang@huawei.com
+Signed-off-by: Zhang Yi <yi.zhang@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Reviewed-by: Andreas Gruenbacher <agruenba@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ fs/gfs2/meta_io.c | 8 ++------
+ fs/gfs2/quota.c   | 8 ++------
+ 2 files changed, 4 insertions(+), 12 deletions(-)
+
+diff --git a/fs/gfs2/meta_io.c b/fs/gfs2/meta_io.c
+index 2db573e31f78..1ce73794a1aa 100644
+--- a/fs/gfs2/meta_io.c
++++ b/fs/gfs2/meta_io.c
+@@ -521,8 +521,7 @@ struct buffer_head *gfs2_meta_ra(struct gfs2_glock *gl, u64 dblock, u32 extlen)
+ 
+ 	if (buffer_uptodate(first_bh))
+ 		goto out;
+-	if (!buffer_locked(first_bh))
+-		ll_rw_block(REQ_OP_READ, REQ_META | REQ_PRIO, 1, &first_bh);
++	bh_read_nowait(first_bh, REQ_META | REQ_PRIO);
+ 
+ 	dblock++;
+ 	extlen--;
+@@ -530,10 +529,7 @@ struct buffer_head *gfs2_meta_ra(struct gfs2_glock *gl, u64 dblock, u32 extlen)
+ 	while (extlen) {
+ 		bh = gfs2_getbuf(gl, dblock, CREATE);
+ 
+-		if (!buffer_uptodate(bh) && !buffer_locked(bh))
+-			ll_rw_block(REQ_OP_READ,
+-				    REQ_RAHEAD | REQ_META | REQ_PRIO,
+-				    1, &bh);
++		bh_readahead(bh, REQ_RAHEAD | REQ_META | REQ_PRIO);
+ 		brelse(bh);
+ 		dblock++;
+ 		extlen--;
+diff --git a/fs/gfs2/quota.c b/fs/gfs2/quota.c
+index ad953ecb5853..065ddb8792f3 100644
+--- a/fs/gfs2/quota.c
++++ b/fs/gfs2/quota.c
+@@ -741,12 +741,8 @@ static int gfs2_write_buf_to_page(struct gfs2_inode *ip, unsigned long index,
+ 		}
+ 		if (PageUptodate(page))
+ 			set_buffer_uptodate(bh);
+-		if (!buffer_uptodate(bh)) {
+-			ll_rw_block(REQ_OP_READ, REQ_META | REQ_PRIO, 1, &bh);
+-			wait_on_buffer(bh);
+-			if (!buffer_uptodate(bh))
+-				goto unlock_out;
+-		}
++		if (bh_read(bh, REQ_META | REQ_PRIO) < 0)
++			goto unlock_out;
+ 		if (gfs2_is_jdata(ip))
+ 			gfs2_trans_add_data(ip->i_gl, bh);
+ 		else
+-- 
+2.33.0
+
