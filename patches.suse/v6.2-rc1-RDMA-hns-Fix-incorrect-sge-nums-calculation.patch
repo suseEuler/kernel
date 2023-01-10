@@ -1,43 +1,45 @@
-From 2a67a70dbd629dd807d5d694f681a3b2b4bb6834 Mon Sep 17 00:00:00 2001
+From 0c5e259b06a8efc69f929ad777ea49281bb58e37 Mon Sep 17 00:00:00 2001
 From: Luoyouming <luoyouming@huawei.com>
-Date: Thu, 27 Oct 2022 18:36:59 +0800
-Subject: [PATCH] RDMA/hns: Fix the problem of sge nums
-Patch-mainline: Not yet, from openEuler
-References: bsn#22
-openEuler-commit: 2a67a70dbd629dd807d5d694f681a3b2b4bb6834
-Modified-by-SEL: Yes, modfied due to different context
+Date: Tue, 8 Nov 2022 21:38:47 +0800
+Subject: [PATCH] RDMA/hns: Fix incorrect sge nums calculation
+Git-commit: 0c5e259b06a8efc69f929ad777ea49281bb58e37
+Patch-mainline: v6.2-rc1
+References: git-fix
+Modified-by-SEL: Yes, modified due to different context
 
 
-driver inclusion
-category: bugfix
-bugzilla: https://gitee.com/openeuler/kernel/issues/I5USIG
+The user usually configures the number of sge through the max_send_sge
+parameter when creating qp, and configures the maximum size of inline data
+that can be sent through max_inline_data. Inline uses sge to fill data to
+send. Expect the following:
 
-----------------------------------------------------------
+1) When the sge space cannot hold inline data, the sge space needs to be
+   expanded to accommodate all inline data
 
-Currently, the driver only uses max_send_sge to initialize sge num
-when creating_qp. So, in the sq inline scenario, the driver may not
-has enough sge to send data. For example, if max_send_sge is 16 and
-max_inline_data is 1024, the driver needs 1024/16=64 sge to send data.
-Therefore, the calculation method of sge num is modified to take the
-maximum value of max_send_sge and max_inline_data/16 to solve this
-problem.
+2) When the sge space is enough to accommodate inline data, the upper
+   limit of inline data can be increased so that users can send larger
+   inline data
 
-Fixes:05201e01be93("RDMA/hns: Refactor process of setting extended sge")
-Fixes:30b707886aeb("RDMA/hns: Support inline data in extented sge space for RC")
+Currently case one is not implemented. When the inline data is larger than
+the sge space, an error of insufficient sge space occurs.  This part of
+the code needs to be reimplemented according to the expected rules. The
+calculation method of sge num is modified to take the maximum value of
+max_send_sge and the sge for max_inline_data to solve this problem.
 
+Fixes: 05201e01be93 ("RDMA/hns: Refactor process of setting extended sge")
+Fixes: 30b707886aeb ("RDMA/hns: Support inline data in extented sge space for RC")
+Link: https://lore.kernel.org/r/20221108133847.2304539-3-xuhaoyue1@hisilicon.com
 Signed-off-by: Luoyouming <luoyouming@huawei.com>
-Reviewed-by: Yangyang Li <liyangyang20@huawei.com>
-Reviewed-by: Haoyue Xu <xuhaoyue1@hisilicon.com>
-Reviewed-by: YueHaibing <yuehaibing@huawei.com>
-Signed-off-by: Zheng Zengkai <zhengzengkai@huawei.com>
+Signed-off-by: Haoyue Xu <xuhaoyue1@hisilicon.com>
+Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
 Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
 ---
  drivers/infiniband/hw/hns/hns_roce_device.h |    3 
- drivers/infiniband/hw/hns/hns_roce_hw_v2.c  |   12 --
- drivers/infiniband/hw/hns/hns_roce_main.c   |   18 +++-
- drivers/infiniband/hw/hns/hns_roce_qp.c     |  115 +++++++++++++++++++++++-----
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.c  |   12 ---
+ drivers/infiniband/hw/hns/hns_roce_main.c   |   18 ++++
+ drivers/infiniband/hw/hns/hns_roce_qp.c     |  107 +++++++++++++++++++++++-----
  include/uapi/rdma/hns-abi.h                 |   15 +++
- 5 files changed, 133 insertions(+), 30 deletions(-)
+ 5 files changed, 125 insertions(+), 30 deletions(-)
 
 --- a/drivers/infiniband/hw/hns/hns_roce_device.h
 +++ b/drivers/infiniband/hw/hns/hns_roce_device.h
@@ -136,7 +138,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  		goto error_fail_uar_alloc;
 --- a/drivers/infiniband/hw/hns/hns_roce_qp.c
 +++ b/drivers/infiniband/hw/hns/hns_roce_qp.c
-@@ -479,38 +479,116 @@ static int set_rq_size(struct hns_roce_d
+@@ -479,38 +479,109 @@ static int set_rq_size(struct hns_roce_d
  	return 0;
  }
  
@@ -151,8 +153,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
 -	if (qp->sq.max_gs > HNS_ROCE_SGE_IN_WQE)
 -		return qp->sq.max_gs - HNS_ROCE_SGE_IN_WQE;
 +	if (cap->max_inline_data) {
-+		cap->max_inline_data = roundup_pow_of_two(
-+					cap->max_inline_data);
++		cap->max_inline_data = roundup_pow_of_two(cap->max_inline_data);
 +		return min(cap->max_inline_data,
 +			   hr_dev->caps.max_sq_inline);
 +	}
@@ -167,19 +168,16 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
 +
 +	if (hr_qp->config & HNS_ROCE_EXSGE_FLAGS) {
 +		if (!(hr_qp->ibqp.qp_type == IB_QPT_GSI ||
-+			hr_qp->ibqp.qp_type == IB_QPT_UD))
++		      hr_qp->ibqp.qp_type == IB_QPT_UD))
 +			sge_num = max((u32)HNS_ROCE_SGE_IN_WQE, sge_num);
 +
 +		cap->max_inline_data = max(cap->max_inline_data,
-+					sge_num * HNS_ROCE_SGE_SIZE);
++					   sge_num * HNS_ROCE_SGE_SIZE);
 +	}
 +
 +	hr_qp->max_inline_data = cap->max_inline_data;
 +}
 +
-+/**
-+ *  Calculated sge num according to attr's max_send_sge
-+ */
 +static u32 get_sge_num_from_max_send_sge(bool is_ud_or_gsi,
 +					 u32 max_send_sge)
 +{
@@ -192,9 +190,6 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
 +				min_sge;
 +}
 +
-+/**
-+ *  Calculated sge num according to attr's max_inline_data
-+ */
 +static unsigned int get_sge_num_from_max_inl_data(bool is_ud_or_gsi,
 +						  u32 max_inline_data)
 +{
@@ -207,7 +202,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
 +	 * HNS_ROCE_SGE_IN_WQE * HNS_ROCE_SGE_SIZE,
 +	 * In addition to ud's mode, no need to extend sge.
 +	 */
-+	if ((!is_ud_or_gsi) && (inline_sge <= HNS_ROCE_SGE_IN_WQE))
++	if (!is_ud_or_gsi && inline_sge <= HNS_ROCE_SGE_IN_WQE)
 +		inline_sge = 0;
 +
 +	return inline_sge;
@@ -233,9 +228,9 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
 +
 +	if (hr_qp->config & HNS_ROCE_EXSGE_FLAGS) {
 +		inline_ext_sge = max(ext_wqe_sge_cnt,
-+				 get_sge_num_from_max_inl_data(
-+				 is_ud_or_gsi, cap->max_inline_data));
-+		hr_qp->sq.ext_sge_cnt = !!(inline_ext_sge) ?
++				     get_sge_num_from_max_inl_data(is_ud_or_gsi,
++							 cap->max_inline_data));
++		hr_qp->sq.ext_sge_cnt = inline_ext_sge ?
 +					roundup_pow_of_two(inline_ext_sge) : 0;
  
 -	hr_qp->sq.max_gs = max(1U, cap->max_send_sge);
@@ -265,7 +260,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  }
  
  static int check_sq_size_with_integrity(struct hns_roce_dev *hr_dev,
-@@ -559,6 +637,7 @@ static int set_user_sq_size(struct hns_r
+@@ -559,6 +630,7 @@ static int set_user_sq_size(struct hns_r
  
  	hr_qp->sq.wqe_shift = ucmd->log_sq_stride;
  	hr_qp->sq.wqe_cnt = cnt;
@@ -273,7 +268,7 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  
  	return 0;
  }
-@@ -989,15 +1068,11 @@ static int set_qp_param(struct hns_roce_
+@@ -989,15 +1061,11 @@ static int set_qp_param(struct hns_roce_
  			struct hns_roce_ib_create_qp *ucmd)
  {
  	struct ib_device *ibdev = &hr_dev->ib_dev;
@@ -290,19 +285,17 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  	if (init_attr->sq_sig_type == IB_SIGNAL_ALL_WR)
  		hr_qp->sq_signal_bits = IB_SIGNAL_ALL_WR;
  	else
-@@ -1020,7 +1095,11 @@ static int set_qp_param(struct hns_roce_
+@@ -1020,6 +1088,9 @@ static int set_qp_param(struct hns_roce_
  			return ret;
  		}
  
 +		uctx = rdma_udata_to_drv_context(udata, struct hns_roce_ucontext,
-+						ibucontext);
++						 ibucontext);
 +		hr_qp->config = uctx->config;
  		ret = set_user_sq_size(hr_dev, &init_attr->cap, hr_qp, ucmd);
-+
  		if (ret)
  			ibdev_err(ibdev,
- 				  "failed to set user SQ size, ret = %d.\n",
-@@ -1037,6 +1116,8 @@ static int set_qp_param(struct hns_roce_
+@@ -1037,6 +1108,8 @@ static int set_qp_param(struct hns_roce_
  			return -EINVAL;
  		}
  
