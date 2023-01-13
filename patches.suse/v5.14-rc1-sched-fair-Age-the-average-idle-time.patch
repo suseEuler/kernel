@@ -1,0 +1,201 @@
+From 94aafc3ee31dc199d1078ffac9edd976b7f47b3d Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Tue, 15 Jun 2021 12:16:11 +0100
+Subject: [PATCH] sched/fair: Age the average idle time
+Git-commit: 94aafc3ee31dc199d1078ffac9edd976b7f47b3d
+Patch-mainline: v5.14-rc1
+References: bsn#315
+Modified-by-SEL: Yes, modified due to different context
+
+
+This is a partial forward-port of Peter Ziljstra's work first posted
+at:
+
+   https://lore.kernel.org/lkml/20180530142236.667774973@infradead.org/
+
+Currently select_idle_cpu()'s proportional scheme uses the average idle
+time *for when we are idle*, that is temporally challenged.  When a CPU
+is not at all idle, we'll happily continue using whatever value we did
+see when the CPU goes idle. To fix this, introduce a separate average
+idle and age it (the existing value still makes sense for things like
+new-idle balancing, which happens when we do go idle).
+
+The overall goal is to not spend more time scanning for idle CPUs than
+we're idle for. Otherwise we're inhibiting work. This means that we need to
+consider the cost over all the wake-ups between consecutive idle periods.
+To track this, the scan cost is subtracted from the estimated average
+idle time.
+
+The impact of this patch is related to workloads that have domains that
+are fully busy or overloaded. Without the patch, the scan depth may be
+too high because a CPU is not reaching idle.
+
+Due to the nature of the patch, this is a regression magnet. It
+potentially wins when domains are almost fully busy or overloaded --
+at that point searches are likely to fail but idle is not being aged
+as CPUs are active so search depth is too large and useless. It will
+potentially show regressions when there are idle CPUs and a deep search is
+beneficial. This tbench result on a 2-socket broadwell machine partially
+illustates the problem
+
+                          5.13.0-rc2             5.13.0-rc2
+                             vanilla     sched-avgidle-v1r5
+Hmean     1        445.02 (   0.00%)      451.36 *   1.42%*
+Hmean     2        830.69 (   0.00%)      846.03 *   1.85%*
+Hmean     4       1350.80 (   0.00%)     1505.56 *  11.46%*
+Hmean     8       2888.88 (   0.00%)     2586.40 * -10.47%*
+Hmean     16      5248.18 (   0.00%)     5305.26 *   1.09%*
+Hmean     32      8914.03 (   0.00%)     9191.35 *   3.11%*
+Hmean     64     10663.10 (   0.00%)    10192.65 *  -4.41%*
+Hmean     128    18043.89 (   0.00%)    18478.92 *   2.41%*
+Hmean     256    16530.89 (   0.00%)    17637.16 *   6.69%*
+Hmean     320    16451.13 (   0.00%)    17270.97 *   4.98%*
+
+Note that 8 was a regression point where a deeper search would have helped
+but it gains for high thread counts when searches are useless. Hackbench
+is a more extreme example although not perfect as the tasks idle rapidly
+
+hackbench-process-pipes
+                          5.13.0-rc2             5.13.0-rc2
+                             vanilla     sched-avgidle-v1r5
+Amean     1        0.3950 (   0.00%)      0.3887 (   1.60%)
+Amean     4        0.9450 (   0.00%)      0.9677 (  -2.40%)
+Amean     7        1.4737 (   0.00%)      1.4890 (  -1.04%)
+Amean     12       2.3507 (   0.00%)      2.3360 *   0.62%*
+Amean     21       4.0807 (   0.00%)      4.0993 *  -0.46%*
+Amean     30       5.6820 (   0.00%)      5.7510 *  -1.21%*
+Amean     48       8.7913 (   0.00%)      8.7383 (   0.60%)
+Amean     79      14.3880 (   0.00%)     13.9343 *   3.15%*
+Amean     110     21.2233 (   0.00%)     19.4263 *   8.47%*
+Amean     141     28.2930 (   0.00%)     25.1003 *  11.28%*
+Amean     172     34.7570 (   0.00%)     30.7527 *  11.52%*
+Amean     203     41.0083 (   0.00%)     36.4267 *  11.17%*
+Amean     234     47.7133 (   0.00%)     42.0623 *  11.84%*
+Amean     265     53.0353 (   0.00%)     47.7720 *   9.92%*
+Amean     296     60.0170 (   0.00%)     53.4273 *  10.98%*
+Stddev    1        0.0052 (   0.00%)      0.0025 (  51.57%)
+Stddev    4        0.0357 (   0.00%)      0.0370 (  -3.75%)
+Stddev    7        0.0190 (   0.00%)      0.0298 ( -56.64%)
+Stddev    12       0.0064 (   0.00%)      0.0095 ( -48.38%)
+Stddev    21       0.0065 (   0.00%)      0.0097 ( -49.28%)
+Stddev    30       0.0185 (   0.00%)      0.0295 ( -59.54%)
+Stddev    48       0.0559 (   0.00%)      0.0168 (  69.92%)
+Stddev    79       0.1559 (   0.00%)      0.0278 (  82.17%)
+Stddev    110      1.1728 (   0.00%)      0.0532 (  95.47%)
+Stddev    141      0.7867 (   0.00%)      0.0968 (  87.69%)
+Stddev    172      1.0255 (   0.00%)      0.0420 (  95.91%)
+Stddev    203      0.8106 (   0.00%)      0.1384 (  82.92%)
+Stddev    234      1.1949 (   0.00%)      0.1328 (  88.89%)
+Stddev    265      0.9231 (   0.00%)      0.0820 (  91.11%)
+Stddev    296      1.0456 (   0.00%)      0.1327 (  87.31%)
+
+Again, higher thread counts benefit and the standard deviation
+shows that results are also a lot more stable when the idle
+time is aged.
+
+The patch potentially matters when a socket was multiple LLCs as the
+maximum search depth is lower. However, some of the test results were
+suspiciously good (e.g. specjbb2005 gaining 50% on a Zen1 machine) and
+other results were not dramatically different to other mcahines.
+
+Given the nature of the patch, Peter's full series is not being forward
+ported as each part should stand on its own. Preferably they would be
+merged at different times to reduce the risk of false bisections.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20210615111611.GH30378@techsingularity.net
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ kernel/sched/core.c  |    5 +++++
+ kernel/sched/fair.c  |   25 +++++++++++++++++++++----
+ kernel/sched/sched.h |    3 +++
+ 3 files changed, 29 insertions(+), 4 deletions(-)
+
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -2485,6 +2485,9 @@ static void ttwu_do_wakeup(struct rq *rq
+ 		if (rq->avg_idle > max)
+ 			rq->avg_idle = max;
+ 
++		rq->wake_stamp = jiffies;
++		rq->wake_avg_idle = rq->avg_idle / 2;
++
+ 		rq->idle_stamp = 0;
+ 	}
+ #endif
+@@ -7381,6 +7384,8 @@ void __init sched_init(void)
+ 		rq->online = 0;
+ 		rq->idle_stamp = 0;
+ 		rq->avg_idle = 2*sysctl_sched_migration_cost;
++		rq->wake_stamp = jiffies;
++		rq->wake_avg_idle = rq->avg_idle;
+ 		rq->max_idle_balance_cost = sysctl_sched_migration_cost;
+ 
+ 		INIT_LIST_HEAD(&rq->cfs_tasks);
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -6162,9 +6162,10 @@ static int select_idle_cpu(struct task_s
+ {
+ 	struct cpumask *cpus = this_cpu_cpumask_var_ptr(select_idle_mask);
+ 	int i, cpu, idle_cpu = -1, nr = INT_MAX;
++	struct rq *this_rq = this_rq();
+ 	int this = smp_processor_id();
+ 	struct sched_domain *this_sd;
+-	u64 time;
++	u64 time = 0;
+ 
+ 	this_sd = rcu_dereference(*this_cpu_ptr(&sd_llc));
+ 	if (!this_sd)
+@@ -6174,12 +6175,21 @@ static int select_idle_cpu(struct task_s
+ 
+ 	if (sched_feat(SIS_PROP) && !has_idle_core) {
+ 		u64 avg_cost, avg_idle, span_avg;
++		unsigned long now = jiffies;
+ 
+ 		/*
+-		 * Due to large variance we need a large fuzz factor;
+-		 * hackbench in particularly is sensitive here.
++		 * If we're busy, the assumption that the last idle period
++		 * predicts the future is flawed; age away the remaining
++		 * predicted idle time.
+ 		 */
+-		avg_idle = this_rq()->avg_idle / 512;
++		if (unlikely(this_rq->wake_stamp < now)) {
++			while (this_rq->wake_stamp < now && this_rq->wake_avg_idle) {
++				this_rq->wake_stamp++;
++				this_rq->wake_avg_idle >>= 1;
++			}
++		}
++
++		avg_idle = this_rq->wake_avg_idle;
+ 		avg_cost = this_sd->avg_scan_cost + 1;
+ 
+ 		span_avg = sd->span_weight * avg_idle;
+@@ -6211,6 +6221,13 @@ static int select_idle_cpu(struct task_s
+ 
+ 	if (sched_feat(SIS_PROP) && !has_idle_core) {
+ 		time = cpu_clock(this) - time;
++
++		/*
++		 * Account for the scan cost of wakeups against the average
++		 * idle time.
++		 */
++		this_rq->wake_avg_idle -= min(this_rq->wake_avg_idle, time);
++
+ 		update_avg(&this_sd->avg_scan_cost, time);
+ 	}
+ 
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1003,6 +1003,9 @@ struct rq {
+ 	u64			idle_stamp;
+ 	u64			avg_idle;
+ 
++	unsigned long		wake_stamp;
++	u64			wake_avg_idle;
++
+ 	/* This is used to determine avg_idle's max value */
+ 	u64			max_idle_balance_cost;
+ #endif /* CONFIG_SMP */
