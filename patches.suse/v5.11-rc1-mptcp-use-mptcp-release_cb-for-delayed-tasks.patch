@@ -5,6 +5,7 @@ Date: Fri, 27 Nov 2020 11:10:27 +0100
 Subject: [PATCH] mptcp: use mptcp release_cb for delayed tasks
 References: bsn#2
 Patch-mainline: v5.11-rc1
+Modified-by-SEL: Yes, refreshed due to context changes
 
 We have some tasks triggered by the subflow receive path
 which require to access the msk socket status, specifically:
@@ -35,11 +36,9 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  net/mptcp/subflow.c  |  14 +--
  4 files changed, 168 insertions(+), 117 deletions(-)
 
-diff --git a/net/mptcp/options.c b/net/mptcp/options.c
-index 3986454a0340..6b7b4b67f18c 100644
 --- a/net/mptcp/options.c
 +++ b/net/mptcp/options.c
-@@ -830,7 +830,7 @@ static u64 expand_ack(u64 old_ack, u64 cur_ack, bool use_64bit)
+@@ -832,7 +832,7 @@ static u64 expand_ack(u64 old_ack, u64 c
  }
  
  static void ack_update_msk(struct mptcp_sock *msk,
@@ -48,7 +47,7 @@ index 3986454a0340..6b7b4b67f18c 100644
  			   struct mptcp_options_received *mp_opt)
  {
  	u64 new_wnd_end, new_snd_una, snd_nxt = READ_ONCE(msk->snd_nxt);
-@@ -854,8 +854,7 @@ static void ack_update_msk(struct mptcp_sock *msk,
+@@ -856,8 +856,7 @@ static void ack_update_msk(struct mptcp_
  
  	if (after64(new_wnd_end, msk->wnd_end)) {
  		msk->wnd_end = new_wnd_end;
@@ -58,7 +57,7 @@ index 3986454a0340..6b7b4b67f18c 100644
  	}
  
  	if (after64(new_snd_una, old_snd_una)) {
-@@ -915,8 +914,19 @@ void mptcp_incoming_options(struct sock *sk, struct sk_buff *skb)
+@@ -917,8 +916,19 @@ void mptcp_incoming_options(struct sock
  	struct mptcp_options_received mp_opt;
  	struct mptcp_ext *mpext;
  
@@ -79,11 +78,9 @@ index 3986454a0340..6b7b4b67f18c 100644
  
  	mptcp_get_options(skb, &mp_opt);
  	if (!check_fully_established(msk, sk, subflow, skb, &mp_opt))
-diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
-index 51f92f3096bf..221f7cdd416b 100644
 --- a/net/mptcp/protocol.c
 +++ b/net/mptcp/protocol.c
-@@ -348,17 +348,22 @@ static void mptcp_close_wake_up(struct sock *sk)
+@@ -350,17 +350,22 @@ static void mptcp_close_wake_up(struct s
  		sk_wake_async(sk, SOCK_WAKE_WAITD, POLL_IN);
  }
  
@@ -112,7 +109,7 @@ index 51f92f3096bf..221f7cdd416b 100644
  		mptcp_stop_timer(sk);
  
  		WRITE_ONCE(msk->snd_data_fin_enable, 0);
-@@ -764,16 +769,6 @@ bool mptcp_schedule_work(struct sock *sk)
+@@ -766,16 +771,6 @@ bool mptcp_schedule_work(struct sock *sk
  	return false;
  }
  
@@ -129,7 +126,7 @@ index 51f92f3096bf..221f7cdd416b 100644
  void mptcp_subflow_eof(struct sock *sk)
  {
  	if (!test_and_set_bit(MPTCP_WORK_EOF, &mptcp_sk(sk)->flags))
-@@ -986,7 +981,7 @@ static void dfrag_clear(struct sock *sk, struct mptcp_data_frag *dfrag)
+@@ -994,7 +989,7 @@ static void dfrag_clear(struct sock *sk,
  	put_page(dfrag->page);
  }
  
@@ -138,7 +135,7 @@ index 51f92f3096bf..221f7cdd416b 100644
  {
  	struct mptcp_sock *msk = mptcp_sk(sk);
  	struct mptcp_data_frag *dtmp, *dfrag;
-@@ -999,8 +994,6 @@ static void mptcp_clean_una(struct sock *sk)
+@@ -1007,8 +1002,6 @@ static void mptcp_clean_una(struct sock
  	if (__mptcp_check_fallback(msk))
  		msk->snd_una = READ_ONCE(msk->snd_nxt);
  
@@ -147,7 +144,7 @@ index 51f92f3096bf..221f7cdd416b 100644
  	snd_una = msk->snd_una;
  	list_for_each_entry_safe(dfrag, dtmp, &msk->rtx_queue, list) {
  		if (after64(dfrag->data_seq + dfrag->data_len, snd_una))
-@@ -1029,21 +1022,25 @@ static void mptcp_clean_una(struct sock *sk)
+@@ -1037,21 +1030,25 @@ static void mptcp_clean_una(struct sock
  	}
  
  out:
@@ -186,7 +183,7 @@ index 51f92f3096bf..221f7cdd416b 100644
  	}
  }
  
-@@ -1130,13 +1127,13 @@ static bool __mptcp_add_ext(struct sk_buff *skb, gfp_t gfp)
+@@ -1138,13 +1135,13 @@ static bool __mptcp_add_ext(struct sk_bu
  	return true;
  }
  
@@ -203,7 +200,7 @@ index 51f92f3096bf..221f7cdd416b 100644
  			skb_reserve(skb, MAX_TCP_HEADER);
  			skb->reserved_tailroom = skb->end - skb->tail;
  			return skb;
-@@ -1168,7 +1165,7 @@ static bool mptcp_tx_cache_refill(struct sock *sk, int size,
+@@ -1176,7 +1173,7 @@ static bool mptcp_tx_cache_refill(struct
  	}
  
  	while (space_needed > 0) {
@@ -212,7 +209,7 @@ index 51f92f3096bf..221f7cdd416b 100644
  		if (unlikely(!skb)) {
  			/* under memory pressure, try to pass the caller a
  			 * single skb to allow forward progress
-@@ -1187,7 +1184,7 @@ static bool mptcp_tx_cache_refill(struct sock *sk, int size,
+@@ -1195,7 +1192,7 @@ static bool mptcp_tx_cache_refill(struct
  	return true;
  }
  
@@ -221,7 +218,7 @@ index 51f92f3096bf..221f7cdd416b 100644
  {
  	struct mptcp_sock *msk = mptcp_sk(sk);
  	struct sk_buff *skb;
-@@ -1195,7 +1192,7 @@ static bool __mptcp_alloc_tx_skb(struct sock *sk, struct sock *ssk)
+@@ -1203,7 +1200,7 @@ static bool __mptcp_alloc_tx_skb(struct
  	if (ssk->sk_tx_skb_cache) {
  		skb = ssk->sk_tx_skb_cache;
  		if (unlikely(!skb_ext_find(skb, SKB_EXT_MPTCP) &&
@@ -230,7 +227,7 @@ index 51f92f3096bf..221f7cdd416b 100644
  			return false;
  		return true;
  	}
-@@ -1216,7 +1213,7 @@ static bool __mptcp_alloc_tx_skb(struct sock *sk, struct sock *ssk)
+@@ -1224,7 +1221,7 @@ static bool __mptcp_alloc_tx_skb(struct
  		return false;
  	}
  
@@ -239,7 +236,7 @@ index 51f92f3096bf..221f7cdd416b 100644
  	if (!skb)
  		return false;
  
-@@ -1239,7 +1236,7 @@ static bool mptcp_alloc_tx_skb(struct sock *sk, struct sock *ssk)
+@@ -1247,7 +1244,7 @@ static bool mptcp_alloc_tx_skb(struct so
  {
  	if (unlikely(mptcp_must_reclaim_memory(sk, ssk)))
  		mptcp_mem_reclaim_partial(sk);
@@ -248,7 +245,7 @@ index 51f92f3096bf..221f7cdd416b 100644
  }
  
  static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
-@@ -1340,31 +1337,6 @@ static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
+@@ -1348,31 +1345,6 @@ out:
  	return ret;
  }
  
@@ -280,7 +277,7 @@ index 51f92f3096bf..221f7cdd416b 100644
  #define MPTCP_SEND_BURST_SIZE		((1 << 16) - \
  					 sizeof(struct tcphdr) - \
  					 MAX_TCP_OPTION_SPACE - \
-@@ -1536,6 +1508,63 @@ static void mptcp_push_pending(struct sock *sk, unsigned int flags)
+@@ -1544,6 +1516,63 @@ out:
  	}
  }
  
@@ -344,7 +341,7 @@ index 51f92f3096bf..221f7cdd416b 100644
  static int mptcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
  {
  	struct mptcp_sock *msk = mptcp_sk(sk);
-@@ -1558,7 +1587,6 @@ static int mptcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
+@@ -1566,7 +1595,6 @@ static int mptcp_sendmsg(struct sock *sk
  	}
  
  	pfrag = sk_page_frag(sk);
@@ -352,7 +349,7 @@ index 51f92f3096bf..221f7cdd416b 100644
  
  	while (msg_data_left(msg)) {
  		int total_ts, frag_truesize = 0;
-@@ -1578,11 +1606,9 @@ static int mptcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
+@@ -1586,11 +1614,9 @@ static int mptcp_sendmsg(struct sock *sk
  		dfrag = mptcp_pending_tail(sk);
  		dfrag_collapsed = mptcp_frag_can_collapse_to(msk, pfrag, dfrag);
  		if (!dfrag_collapsed) {
@@ -367,7 +364,7 @@ index 51f92f3096bf..221f7cdd416b 100644
  			if (!mptcp_page_frag_refill(sk, pfrag))
  				goto wait_for_memory;
  
-@@ -1639,9 +1665,8 @@ static int mptcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
+@@ -1647,9 +1673,8 @@ static int mptcp_sendmsg(struct sock *sk
  		continue;
  
  wait_for_memory:
@@ -379,7 +376,7 @@ index 51f92f3096bf..221f7cdd416b 100644
  		ret = sk_stream_wait_memory(sk, &timeo);
  		if (ret)
  			goto out;
-@@ -2198,21 +2223,18 @@ static void mptcp_worker(struct work_struct *work)
+@@ -2206,21 +2231,18 @@ static void mptcp_worker(struct work_str
  	if (unlikely(state == TCP_CLOSE))
  		goto unlock;
  
@@ -402,7 +399,7 @@ index 51f92f3096bf..221f7cdd416b 100644
  	mptcp_check_data_fin(sk);
  
  	/* if the msk data is completely acked, or the socket timedout,
-@@ -2334,8 +2356,6 @@ static void __mptcp_clear_xmit(struct sock *sk)
+@@ -2342,8 +2364,6 @@ static void __mptcp_clear_xmit(struct so
  	struct mptcp_data_frag *dtmp, *dfrag;
  	struct sk_buff *skb;
  
@@ -411,7 +408,7 @@ index 51f92f3096bf..221f7cdd416b 100644
  	WRITE_ONCE(msk->first_pending, NULL);
  	list_for_each_entry_safe(dfrag, dtmp, &msk->rtx_queue, list)
  		dfrag_clear(sk, dfrag);
-@@ -2477,7 +2497,7 @@ static void __mptcp_destroy_sock(struct sock *sk)
+@@ -2485,7 +2505,7 @@ static void __mptcp_destroy_sock(struct
  	spin_unlock_bh(&msk->join_list_lock);
  	list_splice_init(&msk->conn_list, &conn_list);
  
@@ -420,7 +417,7 @@ index 51f92f3096bf..221f7cdd416b 100644
  	sk_stop_timer(sk, &sk->sk_timer);
  	msk->pm.status = 0;
  
-@@ -2709,6 +2729,8 @@ void mptcp_destroy_common(struct mptcp_sock *msk)
+@@ -2721,6 +2741,8 @@ void mptcp_destroy_common(struct mptcp_s
  {
  	struct sock *sk = (struct sock *)msk;
  
@@ -429,7 +426,7 @@ index 51f92f3096bf..221f7cdd416b 100644
  	/* move to sk_receive_queue, sk_stream_kill_queues will purge it */
  	skb_queue_splice_tail_init(&msk->receive_queue, &sk->sk_receive_queue);
  
-@@ -2835,6 +2857,28 @@ static int mptcp_getsockopt(struct sock *sk, int level, int optname,
+@@ -2892,6 +2914,28 @@ static int mptcp_getsockopt(struct sock
  	return -EOPNOTSUPP;
  }
  
@@ -458,7 +455,7 @@ index 51f92f3096bf..221f7cdd416b 100644
  #define MPTCP_DEFERRED_ALL (TCPF_WRITE_TIMER_DEFERRED)
  
  /* processes deferred events and flush wmem */
-@@ -2842,6 +2886,25 @@ static void mptcp_release_cb(struct sock *sk)
+@@ -2899,6 +2943,25 @@ static void mptcp_release_cb(struct sock
  {
  	unsigned long flags, nflags;
  
@@ -484,7 +481,7 @@ index 51f92f3096bf..221f7cdd416b 100644
  	/* clear any wmem reservation and errors */
  	__mptcp_update_wmem(sk);
  	__mptcp_update_rmem(sk);
-@@ -3177,24 +3240,9 @@ static __poll_t mptcp_check_readable(struct mptcp_sock *msk)
+@@ -3234,24 +3297,9 @@ static __poll_t mptcp_check_readable(str
  	       0;
  }
  
@@ -509,7 +506,7 @@ index 51f92f3096bf..221f7cdd416b 100644
  
  	if (unlikely(sk->sk_shutdown & SEND_SHUTDOWN))
  		return 0;
-@@ -3202,12 +3250,12 @@ static __poll_t mptcp_check_writeable(struct mptcp_sock *msk)
+@@ -3259,12 +3307,12 @@ static __poll_t mptcp_check_writeable(st
  	if (sk_stream_is_writeable(sk))
  		return EPOLLOUT | EPOLLWRNORM;
  
@@ -527,8 +524,6 @@ index 51f92f3096bf..221f7cdd416b 100644
  }
  
  static __poll_t mptcp_poll(struct file *file, struct socket *sock,
-diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
-index 3c07aafde10e..fc56e730fb35 100644
 --- a/net/mptcp/protocol.h
 +++ b/net/mptcp/protocol.h
 @@ -91,6 +91,8 @@
@@ -540,7 +535,7 @@ index 3c07aafde10e..fc56e730fb35 100644
  
  static inline bool before64(__u64 seq1, __u64 seq2)
  {
-@@ -495,6 +497,7 @@ void mptcp_rcv_space_init(struct mptcp_sock *msk, const struct sock *ssk);
+@@ -495,6 +497,7 @@ void mptcp_rcv_space_init(struct mptcp_s
  void mptcp_data_ready(struct sock *sk, struct sock *ssk);
  bool mptcp_finish_join(struct sock *sk);
  bool mptcp_schedule_work(struct sock *sk);
@@ -548,11 +543,9 @@ index 3c07aafde10e..fc56e730fb35 100644
  void __mptcp_data_acked(struct sock *sk);
  void mptcp_subflow_eof(struct sock *sk);
  bool mptcp_update_rcv_data_fin(struct mptcp_sock *msk, u64 data_fin_seq, bool use_64bit);
-diff --git a/net/mptcp/subflow.c b/net/mptcp/subflow.c
-index 2e5c3f4da3a4..023c856424b7 100644
 --- a/net/mptcp/subflow.c
 +++ b/net/mptcp/subflow.c
-@@ -995,19 +995,9 @@ static void subflow_data_ready(struct sock *sk)
+@@ -1029,19 +1029,9 @@ static void subflow_data_ready(struct so
  		mptcp_data_ready(parent, sk);
  }
  
@@ -573,7 +566,4 @@ index 2e5c3f4da3a4..023c856424b7 100644
 +	/* we take action in __mptcp_clean_una() */
  }
  
- static struct inet_connection_sock_af_ops *
--- 
-2.26.2
-
+ static const struct inet_connection_sock_af_ops *
