@@ -5,6 +5,7 @@ Date: Thu, 1 Apr 2021 16:19:44 -0700
 Subject: [PATCH] mptcp: add mptcp reset option support
 References: bsn#2
 Patch-mainline: v5.13-rc1
+Modified-by-SEL: Yes, refreshed due to context changes
 
 The MPTCP reset option allows to carry a mptcp-specific error code that
 provides more information on the nature of a connection reset.
@@ -35,8 +36,6 @@ Signed-off-by: Geliang Tang <geliang.tang@suse.com>
  net/mptcp/subflow.c        | 30 ++++++++++++++---
  9 files changed, 180 insertions(+), 19 deletions(-)
 
-diff --git a/include/net/mptcp.h b/include/net/mptcp.h
-index cea69c801595..16fe34d139c3 100644
 --- a/include/net/mptcp.h
 +++ b/include/net/mptcp.h
 @@ -30,8 +30,8 @@ struct mptcp_ext {
@@ -59,10 +58,10 @@ index cea69c801595..16fe34d139c3 100644
  	u32 nonce;
  	u64 thmac;
  	u32 token;
-@@ -156,6 +158,16 @@ void mptcp_seq_show(struct seq_file *seq);
- int mptcp_subflow_init_cookie_req(struct request_sock *req,
- 				  const struct sock *sk_listener,
- 				  struct sk_buff *skb);
+@@ -157,6 +159,16 @@ int mptcp_subflow_init_cookie_req(struct
+ struct request_sock *mptcp_subflow_reqsk_alloc(const struct request_sock_ops *ops,
+ 					       struct sock *sk_listener,
+ 					       bool attach_listener);
 +
 +__be32 mptcp_get_reset_option(const struct sk_buff *skb);
 +
@@ -76,17 +75,15 @@ index cea69c801595..16fe34d139c3 100644
  #else
  
  static inline void mptcp_init(void)
-@@ -236,6 +248,8 @@ static inline int mptcp_subflow_init_cookie_req(struct request_sock *req,
+@@ -244,6 +256,8 @@ static inline struct request_sock *mptcp
  {
- 	return 0; /* TCP fallback */
+ 	return NULL;
  }
 +
 +static inline __be32 mptcp_reset_option(const struct sk_buff *skb)  { return htonl(0u); }
  #endif /* CONFIG_MPTCP */
  
  #if IS_ENABLED(CONFIG_MPTCP_IPV6)
-diff --git a/include/uapi/linux/mptcp.h b/include/uapi/linux/mptcp.h
-index e1172c1ffdfd..8eb3c0844bff 100644
 --- a/include/uapi/linux/mptcp.h
 +++ b/include/uapi/linux/mptcp.h
 @@ -174,10 +174,21 @@ enum mptcp_event_attr {
@@ -111,11 +108,9 @@ index e1172c1ffdfd..8eb3c0844bff 100644
 +#define MPTCP_RST_EMIDDLEBOX	6
 +
  #endif /* _UAPI_MPTCP_H */
-diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
-index dfc6d1c0e710..312184cead57 100644
 --- a/net/ipv4/tcp_ipv4.c
 +++ b/net/ipv4/tcp_ipv4.c
-@@ -655,14 +655,18 @@ EXPORT_SYMBOL(tcp_v4_send_check);
+@@ -657,14 +657,18 @@ EXPORT_SYMBOL(tcp_v4_send_check);
   *	Exception: precedence violation. We do not implement it in any case.
   */
  
@@ -137,7 +132,7 @@ index dfc6d1c0e710..312184cead57 100644
  	} rep;
  	struct ip_reply_arg arg;
  #ifdef CONFIG_TCP_MD5SIG
-@@ -770,6 +774,17 @@ static void tcp_v4_send_reset(const struct sock *sk, struct sk_buff *skb)
+@@ -772,6 +776,17 @@ static void tcp_v4_send_reset(const stru
  				     ip_hdr(skb)->daddr, &rep.th);
  	}
  #endif
@@ -155,11 +150,9 @@ index dfc6d1c0e710..312184cead57 100644
  	arg.csum = csum_tcpudp_nofold(ip_hdr(skb)->daddr,
  				      ip_hdr(skb)->saddr, /* XXX */
  				      arg.iov[0].iov_len, IPPROTO_TCP, 0);
-diff --git a/net/ipv6/tcp_ipv6.c b/net/ipv6/tcp_ipv6.c
-index bff22d6ef516..5f47c0b6e3de 100644
 --- a/net/ipv6/tcp_ipv6.c
 +++ b/net/ipv6/tcp_ipv6.c
-@@ -879,8 +879,8 @@ static void tcp_v6_send_response(const struct sock *sk, struct sk_buff *skb, u32
+@@ -896,8 +896,8 @@ static void tcp_v6_send_response(const s
  	struct net *net = sk ? sock_net(sk) : dev_net(skb_dst(skb)->dev);
  	struct sock *ctl_sk = net->ipv6.tcp_sk;
  	unsigned int tot_len = sizeof(struct tcphdr);
@@ -169,7 +162,7 @@ index bff22d6ef516..5f47c0b6e3de 100644
  	__u32 mark = 0;
  
  	if (tsecr)
-@@ -890,6 +890,15 @@ static void tcp_v6_send_response(const struct sock *sk, struct sk_buff *skb, u32
+@@ -907,6 +907,15 @@ static void tcp_v6_send_response(const s
  		tot_len += TCPOLEN_MD5SIG_ALIGNED;
  #endif
  
@@ -185,7 +178,7 @@ index bff22d6ef516..5f47c0b6e3de 100644
  	buff = alloc_skb(MAX_HEADER + sizeof(struct ipv6hdr) + tot_len,
  			 GFP_ATOMIC);
  	if (!buff)
-@@ -920,6 +929,9 @@ static void tcp_v6_send_response(const struct sock *sk, struct sk_buff *skb, u32
+@@ -937,6 +946,9 @@ static void tcp_v6_send_response(const s
  		*topt++ = htonl(tsecr);
  	}
  
@@ -195,11 +188,9 @@ index bff22d6ef516..5f47c0b6e3de 100644
  #ifdef CONFIG_TCP_MD5SIG
  	if (key) {
  		*topt++ = htonl((TCPOPT_NOP << 24) | (TCPOPT_NOP << 16) |
-diff --git a/net/mptcp/options.c b/net/mptcp/options.c
-index 68361d28dc67..4b7119eb2c31 100644
 --- a/net/mptcp/options.c
 +++ b/net/mptcp/options.c
-@@ -305,6 +305,18 @@ static void mptcp_parse_option(const struct sk_buff *skb,
+@@ -304,6 +304,18 @@ static void mptcp_parse_option(const str
  		mp_opt->fastclose = 1;
  		break;
  
@@ -218,7 +209,7 @@ index 68361d28dc67..4b7119eb2c31 100644
  	default:
  		break;
  	}
-@@ -327,6 +339,7 @@ void mptcp_get_options(const struct sk_buff *skb,
+@@ -326,6 +338,7 @@ void mptcp_get_options(const struct sk_b
  	mp_opt->rm_addr = 0;
  	mp_opt->dss = 0;
  	mp_opt->mp_prio = 0;
@@ -226,7 +217,7 @@ index 68361d28dc67..4b7119eb2c31 100644
  
  	length = (th->doff * 4) - sizeof(struct tcphdr);
  	ptr = (const unsigned char *)(th + 1);
-@@ -726,6 +739,22 @@ static bool mptcp_established_options_mp_prio(struct sock *sk,
+@@ -728,6 +741,22 @@ static bool mptcp_established_options_mp
  	return true;
  }
  
@@ -249,7 +240,7 @@ index 68361d28dc67..4b7119eb2c31 100644
  bool mptcp_established_options(struct sock *sk, struct sk_buff *skb,
  			       unsigned int *size, unsigned int remaining,
  			       struct mptcp_out_options *opts)
-@@ -741,11 +770,10 @@ bool mptcp_established_options(struct sock *sk, struct sk_buff *skb,
+@@ -743,11 +772,10 @@ bool mptcp_established_options(struct so
  	if (unlikely(__mptcp_check_fallback(msk)))
  		return false;
  
@@ -265,7 +256,7 @@ index 68361d28dc67..4b7119eb2c31 100644
  
  	snd_data_fin = mptcp_data_fin_enabled(msk);
  	if (mptcp_established_options_mp(sk, skb, snd_data_fin, &opt_size, remaining, opts))
-@@ -1062,6 +1090,12 @@ void mptcp_incoming_options(struct sock *sk, struct sk_buff *skb)
+@@ -1064,6 +1092,12 @@ void mptcp_incoming_options(struct sock
  		mp_opt.mp_prio = 0;
  	}
  
@@ -278,7 +269,7 @@ index 68361d28dc67..4b7119eb2c31 100644
  	if (!mp_opt.dss)
  		return;
  
-@@ -1289,6 +1323,12 @@ void mptcp_write_options(__be32 *ptr, const struct tcp_sock *tp,
+@@ -1291,6 +1325,12 @@ mp_capable_done:
  		ptr += 5;
  	}
  
@@ -291,7 +282,7 @@ index 68361d28dc67..4b7119eb2c31 100644
  	if (opts->ext_copy.use_ack || opts->ext_copy.use_map) {
  		struct mptcp_ext *mpext = &opts->ext_copy;
  		u8 len = TCPOLEN_MPTCP_DSS_BASE;
-@@ -1340,3 +1380,20 @@ void mptcp_write_options(__be32 *ptr, const struct tcp_sock *tp,
+@@ -1342,3 +1382,20 @@ mp_capable_done:
  	if (tp)
  		mptcp_set_rwin(tp);
  }
@@ -312,11 +303,9 @@ index 68361d28dc67..4b7119eb2c31 100644
 +	return htonl(0u);
 +}
 +EXPORT_SYMBOL_GPL(mptcp_get_reset_option);
-diff --git a/net/mptcp/pm_netlink.c b/net/mptcp/pm_netlink.c
-index cadafafa1049..51be6c34b339 100644
 --- a/net/mptcp/pm_netlink.c
 +++ b/net/mptcp/pm_netlink.c
-@@ -1687,9 +1687,21 @@ static int mptcp_event_sub_closed(struct sk_buff *skb,
+@@ -1687,9 +1687,21 @@ static int mptcp_event_sub_closed(struct
  				  const struct mptcp_sock *msk,
  				  const struct sock *ssk)
  {
@@ -338,11 +327,9 @@ index cadafafa1049..51be6c34b339 100644
  	return 0;
  }
  
-diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
-index 531ee24aa827..e894345d10c1 100644
 --- a/net/mptcp/protocol.c
 +++ b/net/mptcp/protocol.c
-@@ -3090,14 +3090,18 @@ bool mptcp_finish_join(struct sock *ssk)
+@@ -3143,14 +3143,18 @@ bool mptcp_finish_join(struct sock *ssk)
  	pr_debug("msk=%p, subflow=%p", msk, subflow);
  
  	/* mptcp socket already closing? */
@@ -363,7 +350,7 @@ index 531ee24aa827..e894345d10c1 100644
  
  	/* active connections are already on conn_list, and we can't acquire
  	 * msk lock here.
-@@ -3111,8 +3115,10 @@ bool mptcp_finish_join(struct sock *ssk)
+@@ -3164,8 +3168,10 @@ bool mptcp_finish_join(struct sock *ssk)
  		sock_hold(ssk);
  	}
  	spin_unlock_bh(&msk->join_list_lock);
@@ -375,8 +362,6 @@ index 531ee24aa827..e894345d10c1 100644
  
  	/* attach to msk socket only after we are sure he will deal with us
  	 * at close time
-diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
-index e8c5ff2b8ace..40e9b05856cd 100644
 --- a/net/mptcp/protocol.h
 +++ b/net/mptcp/protocol.h
 @@ -26,6 +26,7 @@
@@ -440,7 +425,7 @@ index e8c5ff2b8ace..40e9b05856cd 100644
  
  	long	delegated_status;
  	struct	list_head delegated_node;   /* link into delegated_action, protected by local BH */
-@@ -742,7 +754,7 @@ unsigned int mptcp_pm_get_add_addr_accept_max(struct mptcp_sock *msk);
+@@ -742,7 +754,7 @@ unsigned int mptcp_pm_get_add_addr_accep
  unsigned int mptcp_pm_get_subflows_max(struct mptcp_sock *msk);
  unsigned int mptcp_pm_get_local_addr_max(struct mptcp_sock *msk);
  
@@ -449,11 +434,9 @@ index e8c5ff2b8ace..40e9b05856cd 100644
  {
  	return (struct mptcp_ext *)skb_ext_find(skb, SKB_EXT_MPTCP);
  }
-diff --git a/net/mptcp/subflow.c b/net/mptcp/subflow.c
-index 7a5f50d00d4b..223d6be5fc3b 100644
 --- a/net/mptcp/subflow.c
 +++ b/net/mptcp/subflow.c
-@@ -115,6 +115,16 @@ static bool subflow_use_different_sport(struct mptcp_sock *msk, const struct soc
+@@ -114,6 +114,16 @@ static bool subflow_use_different_sport(
  	return inet_sk(sk)->inet_sport != inet_sk((struct sock *)msk)->inet_sport;
  }
  
@@ -470,7 +453,7 @@ index 7a5f50d00d4b..223d6be5fc3b 100644
  /* Init mptcp request socket.
   *
   * Returns an error code if a JOIN has failed and a TCP reset
-@@ -190,8 +200,10 @@ static int subflow_check_req(struct request_sock *req,
+@@ -189,8 +199,10 @@ again:
  		subflow_req->msk = subflow_token_join_request(req);
  
  		/* Can't fall back to TCP in this case. */
@@ -482,7 +465,7 @@ index 7a5f50d00d4b..223d6be5fc3b 100644
  
  		if (subflow_use_different_sport(subflow_req->msk, sk_listener)) {
  			pr_debug("syn inet_sport=%d %d",
-@@ -400,8 +412,10 @@ static void subflow_finish_connect(struct sock *sk, const struct sk_buff *skb)
+@@ -399,8 +411,10 @@ static void subflow_finish_connect(struc
  	} else if (subflow->request_join) {
  		u8 hmac[SHA256_DIGEST_SIZE];
  
@@ -494,7 +477,7 @@ index 7a5f50d00d4b..223d6be5fc3b 100644
  
  		subflow->thmac = mp_opt.thmac;
  		subflow->remote_nonce = mp_opt.nonce;
-@@ -410,6 +424,7 @@ static void subflow_finish_connect(struct sock *sk, const struct sk_buff *skb)
+@@ -409,6 +423,7 @@ static void subflow_finish_connect(struc
  
  		if (!subflow_thmac_valid(subflow)) {
  			MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_JOINACKMAC);
@@ -502,7 +485,7 @@ index 7a5f50d00d4b..223d6be5fc3b 100644
  			goto do_reset;
  		}
  
-@@ -438,6 +453,7 @@ static void subflow_finish_connect(struct sock *sk, const struct sk_buff *skb)
+@@ -437,6 +452,7 @@ fallback:
  	return;
  
  do_reset:
@@ -510,7 +493,7 @@ index 7a5f50d00d4b..223d6be5fc3b 100644
  	mptcp_subflow_reset(sk);
  }
  
-@@ -654,8 +670,10 @@ static struct sock *subflow_syn_recv_sock(const struct sock *sk,
+@@ -678,8 +694,10 @@ create_child:
  		 * to reset the context to non MPTCP status.
  		 */
  		if (!ctx || fallback) {
@@ -522,7 +505,7 @@ index 7a5f50d00d4b..223d6be5fc3b 100644
  
  			subflow_drop_ctx(child);
  			goto out;
-@@ -690,8 +708,10 @@ static struct sock *subflow_syn_recv_sock(const struct sock *sk,
+@@ -714,8 +732,10 @@ create_child:
  			struct mptcp_sock *owner;
  
  			owner = subflow_req->msk;
@@ -534,7 +517,7 @@ index 7a5f50d00d4b..223d6be5fc3b 100644
  
  			/* move the msk reference ownership to the subflow */
  			subflow_req->msk = NULL;
-@@ -1056,6 +1076,8 @@ static bool subflow_check_data_avail(struct sock *ssk)
+@@ -1079,6 +1099,8 @@ fatal:
  	smp_wmb();
  	ssk->sk_error_report(ssk);
  	tcp_set_state(ssk, TCP_CLOSE);
@@ -543,6 +526,3 @@ index 7a5f50d00d4b..223d6be5fc3b 100644
  	tcp_send_active_reset(ssk, GFP_ATOMIC);
  	subflow->data_avail = 0;
  	return false;
--- 
-2.26.2
-
