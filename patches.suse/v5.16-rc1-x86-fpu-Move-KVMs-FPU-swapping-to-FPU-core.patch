@@ -5,7 +5,7 @@ Subject: [PATCH] x86/fpu: Move KVMs FPU swapping to FPU core
 Git-commit: a0ff0611c2fbde94f6c9db8351939b08f2cb6797
 Patch-mainline: v5.16-rc1
 References: bsn#178
-Modified-by-SEL: No
+Modified-by-SEL: Yes, refreshed due to context changes
 
 
 Swapping the host/guest FPU is directly fiddling with FPU internals which
@@ -30,8 +30,6 @@ Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
  arch/x86/mm/extable.c               |  2 +-
  7 files changed, 48 insertions(+), 60 deletions(-)
 
-diff --git a/arch/x86/include/asm/fpu/api.h b/arch/x86/include/asm/fpu/api.h
-index 23bef08a8388..d2b8603a9c7e 100644
 --- a/arch/x86/include/asm/fpu/api.h
 +++ b/arch/x86/include/asm/fpu/api.h
 @@ -12,6 +12,8 @@
@@ -43,7 +41,7 @@ index 23bef08a8388..d2b8603a9c7e 100644
  /*
   * Use kernel_fpu_begin/end() if you intend to use FPU in kernel context. It
   * disables preemption so be careful if you intend to use it for long periods
-@@ -108,4 +110,10 @@ extern int cpu_has_xfeatures(u64 xfeatures_mask, const char **feature_name);
+@@ -108,4 +110,10 @@ extern int cpu_has_xfeatures(u64 xfeatur
  
  static inline void update_pasid(void) { }
  
@@ -54,11 +52,9 @@ index 23bef08a8388..d2b8603a9c7e 100644
 +extern void fpu_swap_kvm_fpu(struct fpu *save, struct fpu *rstor, u64 restore_mask);
 +
  #endif /* _ASM_X86_FPU_API_H */
-diff --git a/arch/x86/include/asm/fpu/internal.h b/arch/x86/include/asm/fpu/internal.h
-index df57f1af3a4c..3ac55ba55782 100644
 --- a/arch/x86/include/asm/fpu/internal.h
 +++ b/arch/x86/include/asm/fpu/internal.h
-@@ -74,14 +74,8 @@ static __always_inline __pure bool use_fxsr(void)
+@@ -74,14 +74,8 @@ static __always_inline __pure bool use_f
  	return static_cpu_has(X86_FEATURE_FXSR);
  }
  
@@ -73,7 +69,7 @@ index df57f1af3a4c..3ac55ba55782 100644
  
  #ifdef CONFIG_MATH_EMULATION
  extern void fpstate_init_soft(struct swregs_state *soft);
-@@ -381,12 +375,7 @@ static inline int os_xrstor_safe(struct xregs_state *xstate, u64 mask)
+@@ -381,12 +375,7 @@ static inline int os_xrstor_safe(struct
  	return err;
  }
  
@@ -87,7 +83,7 @@ index df57f1af3a4c..3ac55ba55782 100644
  
  extern bool copy_fpstate_to_sigframe(void __user *buf, void __user *fp, int size);
  
-@@ -467,7 +456,7 @@ static inline void fpregs_restore_userregs(void)
+@@ -467,7 +456,7 @@ static inline void fpregs_restore_userre
  		 */
  		mask = xfeatures_mask_restore_user() |
  			xfeatures_mask_supervisor();
@@ -96,11 +92,9 @@ index df57f1af3a4c..3ac55ba55782 100644
  
  		fpregs_activate(fpu);
  		fpu->last_cpu = cpu;
-diff --git a/arch/x86/kernel/fpu/core.c b/arch/x86/kernel/fpu/core.c
-index 0789f0c3dca9..023bfe857907 100644
 --- a/arch/x86/kernel/fpu/core.c
 +++ b/arch/x86/kernel/fpu/core.c
-@@ -124,9 +124,8 @@ void save_fpregs_to_fpstate(struct fpu *fpu)
+@@ -124,9 +124,8 @@ void save_fpregs_to_fpstate(struct fpu *
  	asm volatile("fnsave %[fp]; fwait" : [fp] "=m" (fpu->state.fsave));
  	frstor(&fpu->state.fsave);
  }
@@ -111,7 +105,7 @@ index 0789f0c3dca9..023bfe857907 100644
  {
  	/*
  	 * AMD K7/K8 and later CPUs up to Zen don't save/restore
-@@ -151,7 +150,31 @@ void __restore_fpregs_from_fpstate(union fpregs_state *fpstate, u64 mask)
+@@ -151,7 +150,31 @@ void __restore_fpregs_from_fpstate(union
  			frstor(&fpstate->fsave);
  	}
  }
@@ -152,23 +146,19 @@ index 0789f0c3dca9..023bfe857907 100644
  
  /*
   * x87 math exception handling:
-diff --git a/arch/x86/kernel/fpu/init.c b/arch/x86/kernel/fpu/init.c
-index 37f872630a0e..545c91c723b8 100644
 --- a/arch/x86/kernel/fpu/init.c
 +++ b/arch/x86/kernel/fpu/init.c
-@@ -136,7 +136,6 @@ static void __init fpu__init_system_generic(void)
+@@ -136,7 +136,6 @@ static void __init fpu__init_system_gene
   * components into a single, continuous memory block:
   */
  unsigned int fpu_kernel_xstate_size __ro_after_init;
 -EXPORT_SYMBOL_GPL(fpu_kernel_xstate_size);
  
- /* Get alignment of the TYPE. */
- #define TYPE_ALIGN(TYPE) offsetof(struct { char x; TYPE test; }, test)
-diff --git a/arch/x86/kernel/fpu/xstate.c b/arch/x86/kernel/fpu/xstate.c
-index b35ecfa8d450..68355605ca75 100644
+ /*
+  * Enforce that 'MEMBER' is the last field of 'TYPE'.
 --- a/arch/x86/kernel/fpu/xstate.c
 +++ b/arch/x86/kernel/fpu/xstate.c
-@@ -65,7 +65,6 @@ static short xsave_cpuid_features[] __initdata = {
+@@ -65,7 +65,6 @@ static short xsave_cpuid_features[] __in
   * XSAVE buffer, both supervisor and user xstates.
   */
  u64 xfeatures_mask_all __ro_after_init;
@@ -176,11 +166,9 @@ index b35ecfa8d450..68355605ca75 100644
  
  static unsigned int xstate_offsets[XFEATURE_MAX] __ro_after_init =
  	{ [ 0 ... XFEATURE_MAX - 1] = -1};
-diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
-index 74712e5b473a..66eea4e314db 100644
 --- a/arch/x86/kvm/x86.c
 +++ b/arch/x86/kvm/x86.c
-@@ -68,7 +68,9 @@
+@@ -66,7 +66,9 @@
  #include <asm/mce.h>
  #include <asm/pkru.h>
  #include <linux/kernel_stat.h>
@@ -191,7 +179,7 @@ index 74712e5b473a..66eea4e314db 100644
  #include <asm/pvclock.h>
  #include <asm/div64.h>
  #include <asm/irq_remapping.h>
-@@ -9913,58 +9915,27 @@ static int complete_emulated_mmio(struct kvm_vcpu *vcpu)
+@@ -9529,58 +9531,27 @@ static int complete_emulated_mmio(struct
  	return 0;
  }
  
@@ -258,11 +246,9 @@ index 74712e5b473a..66eea4e314db 100644
  	++vcpu->stat.fpu_reload;
  	trace_kvm_fpu(0);
  }
-diff --git a/arch/x86/mm/extable.c b/arch/x86/mm/extable.c
-index f37e290e6d0a..043ec385af45 100644
 --- a/arch/x86/mm/extable.c
 +++ b/arch/x86/mm/extable.c
-@@ -47,7 +47,7 @@ static bool ex_handler_fprestore(const struct exception_table_entry *fixup,
+@@ -47,7 +47,7 @@ static bool ex_handler_fprestore(const s
  	WARN_ONCE(1, "Bad FPU state detected at %pB, reinitializing FPU registers.",
  		  (void *)instruction_pointer(regs));
  
@@ -271,6 +257,3 @@ index f37e290e6d0a..043ec385af45 100644
  	return true;
  }
  
--- 
-2.26.2
-
