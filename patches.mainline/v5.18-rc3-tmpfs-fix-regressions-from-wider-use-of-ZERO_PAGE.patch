@@ -1,0 +1,119 @@
+From 1bdec44b1eee32e311b44b5b06144bb7d9b33938 Mon Sep 17 00:00:00 2001
+From: Hugh Dickins <hughd@google.com>
+Date: Thu, 14 Apr 2022 19:13:27 -0700
+Subject: [PATCH] tmpfs: fix regressions from wider use of ZERO_PAGE
+Git-commit: 1bdec44b1eee32e311b44b5b06144bb7d9b33938
+Patch-mainline: v5.18-rc3
+References: bsn#12
+Modified-by-SEL: Yes, refreshed due to different context
+
+
+Chuck Lever reported fsx-based xfstests generic 075 091 112 127 failing
+when 5.18-rc1 NFS server exports tmpfs: bisected to recent tmpfs change.
+
+Whilst nfsd_splice_action() does contain some questionable handling of
+repeated pages, and Chuck was able to work around there, history from
+Mark Hemment makes clear that there might be similar dangers elsewhere:
+it was not a good idea for me to pass ZERO_PAGE down to unknown actors.
+
+Revert shmem_file_read_iter() to using ZERO_PAGE for holes only when
+iter_is_iovec(); in other cases, use the more natural iov_iter_zero()
+instead of copy_page_to_iter().
+
+We would use iov_iter_zero() throughout, but the x86 clear_user() is not
+nearly so well optimized as copy to user (dd of 1T sparse tmpfs file
+takes 57 seconds rather than 44 seconds).
+
+And now pagecache_init() does not need to SetPageUptodate(ZERO_PAGE(0)):
+which had caused boot failure on arm noMMU STM32F7 and STM32H7 boards
+
+Link: https://lkml.kernel.org/r/9a978571-8648-e830-5735-1f4748ce2e30@google.com
+Fixes: 56a8c8eb1eaf ("tmpfs: do not allocate pages on read")
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Reported-by: Patrice CHOTARD <patrice.chotard@foss.st.com>
+Reported-by: Chuck Lever III <chuck.lever@oracle.com>
+Tested-by: Chuck Lever III <chuck.lever@oracle.com>
+Cc: Mark Hemment <markhemm@googlemail.com>
+Cc: Patrice CHOTARD <patrice.chotard@foss.st.com>
+Cc: Mikulas Patocka <mpatocka@redhat.com>
+Cc: Lukas Czerner <lczerner@redhat.com>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: "Darrick J. Wong" <djwong@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ mm/filemap.c |    6 ------
+ mm/shmem.c   |   31 ++++++++++++++++++++-----------
+ 2 files changed, 20 insertions(+), 17 deletions(-)
+
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -994,12 +994,6 @@ void __init pagecache_init(void)
+ 		init_waitqueue_head(&page_wait_table[i]);
+ 
+ 	page_writeback_init();
+-
+-	/*
+-	 * tmpfs uses the ZERO_PAGE for reading holes: it is up-to-date,
+-	 * and splice's page_cache_pipe_buf_confirm() needs to see that.
+-	 */
+-	SetPageUptodate(ZERO_PAGE(0));
+ }
+ 
+ /*
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -2576,7 +2576,6 @@ static ssize_t shmem_file_read_iter(stru
+ 		pgoff_t end_index;
+ 		unsigned long nr, ret;
+ 		loff_t i_size = i_size_read(inode);
+-		bool got_page;
+ 
+ 		end_index = i_size >> PAGE_SHIFT;
+ 		if (index > end_index)
+@@ -2627,24 +2626,34 @@ static ssize_t shmem_file_read_iter(stru
+ 			 */
+ 			if (!offset)
+ 				mark_page_accessed(page);
+-			got_page = true;
++			/*
++			 * Ok, we have the page, and it's up-to-date, so
++			 * now we can copy it to user space...
++			 */
++			ret = copy_page_to_iter(page, offset, nr, to);
++			put_page(page);
++
++		} else if (iter_is_iovec(to)) {
++			/*
++			 * Copy to user tends to be so well optimized, but
++			 * clear_user() not so much, that it is noticeably
++			 * faster to copy the zero page instead of clearing.
++			 */
++			ret = copy_page_to_iter(ZERO_PAGE(0), offset, nr, to);
+ 		} else {
+-			page = ZERO_PAGE(0);
+-			got_page = false;
++			/*
++			 * But submitting the same page twice in a row to
++			 * splice() - or others? - can result in confusion:
++			 * so don't attempt that optimization on pipes etc.
++			 */
++			ret = iov_iter_zero(nr, to);
+ 		}
+ 
+-		/*
+-		 * Ok, we have the page, and it's up-to-date, so
+-		 * now we can copy it to user space...
+-		 */
+-		ret = copy_page_to_iter(page, offset, nr, to);
+ 		retval += ret;
+ 		offset += ret;
+ 		index += offset >> PAGE_SHIFT;
+ 		offset &= ~PAGE_MASK;
+ 
+-		if (got_page)
+-			put_page(page);
+ 		if (!iov_iter_count(to))
+ 			break;
+ 		if (ret < nr) {
