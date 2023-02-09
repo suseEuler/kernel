@@ -1,0 +1,142 @@
+From d22185351cedce82e7ddca0ecc2b3b1120754fd5 Mon Sep 17 00:00:00 2001
+From: Liu Shixin <liushixin2@huawei.com>
+Date: Tue, 7 Feb 2023 17:07:48 +0800
+Subject: [PATCH] mm/memcg_memfs_info: fix potential oom_lock recursion
+ deadlock
+Patch-mainline: Not yet, from openEuler
+References: bsn#22
+openEuler-commit: d22185351cedce82e7ddca0ecc2b3b1120754fd5
+Modified-by-SEL: No
+
+
+hulk inclusion
+category: bugfix
+bugzilla: https://gitee.com/openeuler/kernel/issues/I6ADCF
+CVE: NA
+
+--------------------------------
+
+syzbot is reporting GFP_KERNEL allocation with oom_lock held when
+reporting memcg OOM [1]. If this allocation triggers the global OOM
+situation then the system can livelock because the GFP_KERNEL
+allocation with oom_lock held cannot trigger the global OOM killer
+because __alloc_pages_may_oom() fails to hold oom_lock.
+
+The problem mentioned above has been fixed by patch[2]. The is the same
+problem in memcg_memfs_info feature too. Refer to the patch[2], fix it by
+removing the allocation from mem_cgroup_print_memfs_info() completely,
+and pass static buffer when calling from memcg OOM path.
+
+Link: https://syzkaller.appspot.com/bug?extid=2d2aeadc6ce1e1f11d45 [1]
+Link: https://lkml.kernel.org/r/86afb39f-8c65-bec2-6cfc-c5e3cd600c0b@I-love.SAKURA.ne.jp [2]
+Fixes: 6b1d4d3a3713 ("mm/memcg_memfs_info: show files that having pages charged in mem_cgroup")
+Signed-off-by: Liu Shixin <liushixin2@huawei.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Reviewed-by: Cai Xinchen <caixinchen1@huawei.com>
+Signed-off-by: Jialin Zhang <zhangjialin11@huawei.com>
+Signed-off-by: Guoqing Jiang <guoqing.jiang@suse.com>
+---
+ include/linux/memcg_memfs_info.h |  4 +++-
+ mm/memcg_memfs_info.c            | 20 ++++++++++----------
+ mm/memcontrol.c                  |  3 ++-
+ 3 files changed, 15 insertions(+), 12 deletions(-)
+
+diff --git a/include/linux/memcg_memfs_info.h b/include/linux/memcg_memfs_info.h
+index 658a91e22bd7..b5e3709baa9e 100644
+--- a/include/linux/memcg_memfs_info.h
++++ b/include/linux/memcg_memfs_info.h
+@@ -6,11 +6,13 @@
+ #include <linux/seq_file.h>
+ 
+ #ifdef CONFIG_MEMCG_MEMFS_INFO
+-void mem_cgroup_print_memfs_info(struct mem_cgroup *memcg, struct seq_file *m);
++void mem_cgroup_print_memfs_info(struct mem_cgroup *memcg, char *pathbuf,
++				 struct seq_file *m);
+ int mem_cgroup_memfs_files_show(struct seq_file *m, void *v);
+ void mem_cgroup_memfs_info_init(void);
+ #else
+ static inline void mem_cgroup_print_memfs_info(struct mem_cgroup *memcg,
++					       char *pathbuf,
+ 					       struct seq_file *m)
+ {
+ }
+diff --git a/mm/memcg_memfs_info.c b/mm/memcg_memfs_info.c
+index f404367ad08c..db7b0aee8053 100644
+--- a/mm/memcg_memfs_info.c
++++ b/mm/memcg_memfs_info.c
+@@ -157,7 +157,8 @@ static void memfs_show_files_in_mem_cgroup(struct super_block *sb, void *data)
+ 	mntput(pfc->vfsmnt);
+ }
+ 
+-void mem_cgroup_print_memfs_info(struct mem_cgroup *memcg, struct seq_file *m)
++void mem_cgroup_print_memfs_info(struct mem_cgroup *memcg, char *pathbuf,
++				 struct seq_file *m)
+ {
+ 	struct print_files_control pfc = {
+ 		.memcg = memcg,
+@@ -165,17 +166,11 @@ void mem_cgroup_print_memfs_info(struct mem_cgroup *memcg, struct seq_file *m)
+ 		.max_print_files = memfs_max_print_files,
+ 		.size_threshold = memfs_size_threshold,
+ 	};
+-	char *pathbuf;
+ 	int i;
+ 
+ 	if (!memfs_enable || !memcg)
+ 		return;
+ 
+-	pathbuf = kmalloc(PATH_MAX, GFP_KERNEL);
+-	if (!pathbuf) {
+-		SEQ_printf(m, "Show memfs failed due to OOM\n");
+-		return;
+-	}
+ 	pfc.pathbuf = pathbuf;
+ 	pfc.pathbuf_size = PATH_MAX;
+ 
+@@ -192,15 +187,20 @@ void mem_cgroup_print_memfs_info(struct mem_cgroup *memcg, struct seq_file *m)
+ 		SEQ_printf(m, "total files: %lu, total memory-size: %lukB\n",
+ 			   pfc.total_print_files, pfc.total_files_size >> 10);
+ 	}
+-
+-	kfree(pfc.pathbuf);
+ }
+ 
+ int mem_cgroup_memfs_files_show(struct seq_file *m, void *v)
+ {
+ 	struct mem_cgroup *memcg = mem_cgroup_from_css(seq_css(m));
++	char *pathbuf;
+ 
+-	mem_cgroup_print_memfs_info(memcg, m);
++	pathbuf = kmalloc(PATH_MAX, GFP_KERNEL);
++	if (!pathbuf) {
++		SEQ_printf(m, "Show memfs abort: failed to allocate memory\n");
++		return 0;
++	}
++	mem_cgroup_print_memfs_info(memcg, pathbuf, m);
++	kfree(pathbuf);
+ 	return 0;
+ }
+ 
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 6344fe257af6..635cb8b65b86 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -1611,6 +1611,7 @@ void mem_cgroup_print_oom_meminfo(struct mem_cgroup *memcg)
+ {
+ 	/* Use static buffer, for the caller is holding oom_lock. */
+ 	static char buf[PAGE_SIZE];
++	static char pathbuf[PATH_MAX];
+ 
+ 	lockdep_assert_held(&oom_lock);
+ 
+@@ -1636,7 +1637,7 @@ void mem_cgroup_print_oom_meminfo(struct mem_cgroup *memcg)
+ 	memory_stat_format(memcg, buf, sizeof(buf));
+ 	pr_info("%s", buf);
+ 
+-	mem_cgroup_print_memfs_info(memcg, NULL);
++	mem_cgroup_print_memfs_info(memcg, pathbuf, NULL);
+ }
+ 
+ /*
+-- 
+2.33.0
+
