@@ -1,0 +1,100 @@
+From d7f571188ecf25c244789b883c878ec7c64b5b08 Mon Sep 17 00:00:00 2001
+From: Cong Wang <cong.wang@bytedance.com>
+Date: Tue, 30 Mar 2021 19:32:32 -0700
+Subject: [PATCH] udp: Implement ->read_sock() for sockmap
+Git-commit: d7f571188ecf25c244789b883c878ec7c64b5b08
+Patch-mainline: v5.13-rc1
+References: bsn#391
+Modified-by-SEL: Yes, refreshed due to context changes
+
+
+This is similar to tcp_read_sock(), except we do not need
+to worry about connections, we just need to retrieve skb
+from UDP receive queue.
+
+Note, the return value of ->read_sock() is unused in
+sk_psock_verdict_data_ready(), and UDP still does not
+support splice() due to lack of ->splice_read(), so users
+can not reach udp_read_sock() directly.
+
+Signed-off-by: Cong Wang <cong.wang@bytedance.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: John Fastabend <john.fastabend@gmail.com>
+Link: https://lore.kernel.org/bpf/20210331023237.41094-12-xiyou.wangcong@gmail.com
+Signed-off-by: Geliang Tang <geliang.tang@suse.com>
+---
+ include/net/udp.h   |  2 ++
+ net/ipv4/af_inet.c  |  1 +
+ net/ipv4/udp.c      | 29 +++++++++++++++++++++++++++++
+ net/ipv6/af_inet6.c |  1 +
+ 4 files changed, 33 insertions(+)
+
+--- a/include/net/udp.h
++++ b/include/net/udp.h
+@@ -327,6 +327,8 @@ struct sock *__udp6_lib_lookup(struct ne
+ 			       struct sk_buff *skb);
+ struct sock *udp6_lib_lookup_skb(struct sk_buff *skb,
+ 				 __be16 sport, __be16 dport);
++int udp_read_sock(struct sock *sk, read_descriptor_t *desc,
++		  sk_read_actor_t recv_actor);
+ 
+ /* UDP uses skb->dev_scratch to cache as much information as possible and avoid
+  * possibly multiple cache miss on dequeue()
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -1070,6 +1070,7 @@ const struct proto_ops inet_dgram_ops =
+ 	.setsockopt	   = sock_common_setsockopt,
+ 	.getsockopt	   = sock_common_getsockopt,
+ 	.sendmsg	   = inet_sendmsg,
++	.read_sock	   = udp_read_sock,
+ 	.recvmsg	   = inet_recvmsg,
+ 	.mmap		   = sock_no_mmap,
+ 	.sendpage	   = inet_sendpage,
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -1784,6 +1784,35 @@ busy_check:
+ }
+ EXPORT_SYMBOL(__skb_recv_udp);
+ 
++int udp_read_sock(struct sock *sk, read_descriptor_t *desc,
++		  sk_read_actor_t recv_actor)
++{
++	int copied = 0;
++
++	while (1) {
++		struct sk_buff *skb;
++		int err, used;
++
++		skb = skb_recv_udp(sk, 0, 1, &err);
++		if (!skb)
++			return err;
++		used = recv_actor(desc, skb, 0, skb->len);
++		if (used <= 0) {
++			if (!copied)
++				copied = used;
++			break;
++		} else if (used <= skb->len) {
++			copied += used;
++		}
++
++		if (!desc->count)
++			break;
++	}
++
++	return copied;
++}
++EXPORT_SYMBOL(udp_read_sock);
++
+ /*
+  * 	This should be easy, if there is something there we
+  * 	return it, otherwise we block.
+--- a/net/ipv6/af_inet6.c
++++ b/net/ipv6/af_inet6.c
+@@ -714,6 +714,7 @@ const struct proto_ops inet6_dgram_ops =
+ 	.getsockopt	   = sock_common_getsockopt,	/* ok		*/
+ 	.sendmsg	   = inet6_sendmsg,		/* retpoline's sake */
+ 	.recvmsg	   = inet6_recvmsg,		/* retpoline's sake */
++	.read_sock	   = udp_read_sock,
+ 	.mmap		   = sock_no_mmap,
+ 	.sendpage	   = sock_no_sendpage,
+ 	.set_peek_off	   = sk_set_peek_off,
